@@ -6,11 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+axum.workspace = true
 bloom-broker-api = { path = "../bloom-broker-api" }
 bloom-triad-protocol.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
 num-bigint.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_jcs.workspace = true
@@ -18,6 +21,12 @@ serde_json.workspace = true
 sha2.workspace = true
 sha3.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
+bloom-broker-debug-driver = { path = "../bloom-broker-debug-driver" }
+bloom-signer = { path = "../../../bloom-signer/crates/bloom-signer" }
+futures = "0.3"
+http-body-util = "0.1"
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

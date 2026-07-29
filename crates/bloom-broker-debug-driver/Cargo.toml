@@ -8,4 +8,9 @@ publish = false
 
 [dependencies]
 bloom-broker-api = { path = "../bloom-broker-api" }
-
+ciborium.workspace = true
+hpke.workspace = true
+p256.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

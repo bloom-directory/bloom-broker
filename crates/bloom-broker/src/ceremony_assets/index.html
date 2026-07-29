@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Bloom approval</title>
+</head>
+<body>
+  <main>
+    <h1>Bloom security ceremony</h1>
+    <p id="status" role="status">Loading signed review…</p>
+    <section id="review" aria-live="polite"></section>
+    <fieldset id="recovery-fields" hidden>
+      <legend>Recovery factor</legend>
+      <label>Recovery record ID
+        <input id="recovery-id" autocomplete="off">
+      </label>
+      <label>Recovery secret
+        <input id="recovery-secret" type="password" autocomplete="off">
+      </label>
+    </fieldset>
+    <fieldset id="generic-fields" hidden>
+      <legend>Custody workflow input</legend>
+      <p>Enter the exact JSON requested by this signed custody workflow. It is encrypted directly to Signer.</p>
+      <textarea id="generic-input" rows="10" cols="72" autocomplete="off"></textarea>
+    </fieldset>
+    <button id="approve" type="button" disabled>Continue with passkey</button>
+    <button id="cancel" type="button">Cancel</button>
+  </main>
+  <script src="/assets/app.js"></script>
+</body>
+</html>
