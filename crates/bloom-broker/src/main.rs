@@ -20,7 +20,9 @@ use bloom_broker::{
 use bloom_triad_local_transport::{
     EndpointQuota, LocalIdentity, PeerAcl, load_identity_and_manifest,
 };
-use bloom_triad_protocol::{Base64UrlBytes, Digest32, ProtocolError, ProtocolErrorCode, Token};
+use bloom_triad_protocol::{
+    Base64UrlBytes, Digest32, ProtocolError, ProtocolErrorCode, ProvenanceCatalog, Token,
+};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use serde::Deserialize;
 use tokio::{net::UnixListener, sync::Semaphore};
@@ -45,6 +47,7 @@ struct BrokerConfig {
     signer_ceremony_public_key_hex: String,
     signer_revocation_key_id: String,
     signer_revocation_public_key_hex: String,
+    provenance_catalog_path: PathBuf,
     policy_keys: Vec<PolicyKeyConfig>,
     build_digest: String,
     maximum_connections: usize,
@@ -137,6 +140,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         verifying_key(&config.signer_revocation_public_key_hex)?,
         AssuranceRegistry::compiled(Vec::new())?,
     )?);
+    let provenance_catalog = load_provenance_catalog(&config.provenance_catalog_path)?;
+    for record in &provenance_catalog.records {
+        authority.install_provenance(record)?;
+    }
     let signer = BrokerSignerClient::connect_unix_from_files(
         &config.signer_socket_path,
         &identity_path,
@@ -350,6 +357,45 @@ fn load_config(path: &Path) -> Result<BrokerConfig, ProtocolError> {
     });
     bytes.zeroize();
     decoded
+}
+
+fn load_provenance_catalog(path: &Path) -> Result<ProvenanceCatalog, ProtocolError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            format!("inspect {}: {error}", path.display()),
+        )
+    })?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            "provenance catalog must be a root-owned, non-symlink regular file not writable by group or other",
+        ));
+    }
+    let bytes = fs::read(path).map_err(|error| {
+        ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            format!("read {}: {error}", path.display()),
+        )
+    })?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::LimitExceededFrame,
+            "provenance catalog exceeds 1 MiB",
+        ));
+    }
+    let catalog: ProvenanceCatalog = serde_json::from_slice(&bytes).map_err(|error| {
+        ProtocolError::new(
+            ProtocolErrorCode::MalformedFrame,
+            format!("parse provenance catalog: {error}"),
+        )
+    })?;
+    catalog.validate_shape()?;
+    Ok(catalog)
 }
 
 fn take_signing_key(encoded: &mut String) -> Result<SigningKey, ProtocolError> {

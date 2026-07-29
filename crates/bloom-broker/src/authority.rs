@@ -5,13 +5,16 @@ use crate::journal::{
 use bloom_triad_protocol::{
     ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
     ApprovalTombstone, Base64UrlBytes, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite,
-    CustodyResult, DeclaredFee, Digest32, MachineSignRequest, OperationId, PetalUseClaim,
-    PolicyAuthorityDiff, PolicyUpdateRequest, ProtocolErrorCode, RevocationState,
-    SealedApprovalTerms, SignOperationIdentity, SignedPolicySnapshot, SignerActivationReceipt,
-    SigningPayloads, Token,
+    CustodyResult, DeclaredFee, Digest32, MachineSignRequest, OperationId,
+    PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalUseClaim, PolicyAuthorityDiff, PolicyUpdateRequest,
+    ProtocolErrorCode, RevocationState, SealedApprovalTerms, SignOperationIdentity,
+    SignedPolicySnapshot, SignerActivationReceipt, SigningPayloads, Token,
 };
 pub use bloom_triad_protocol::{CanonicalWalletPolicy, PolicyDestination, RequiredVerifier};
-pub use bloom_triad_protocol::{ProvenanceSubject, canonical_policy_authority_diff};
+pub use bloom_triad_protocol::{
+    ProvenanceFeeAsset as PolicyAsset, ProvenanceOperationClass, ProvenanceRecord,
+    ProvenanceSubject, canonical_policy_authority_diff,
+};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use num_bigint::BigUint;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -25,7 +28,6 @@ use std::{
 };
 
 const POLICY_SIGNATURE_DOMAIN: &[u8] = b"bloom-policy-snapshot/v1";
-const PROVENANCE_SIGNATURE_DOMAIN: &[u8] = b"bloom-provenance-record/v1";
 const CEREMONY_GRANT_DOMAIN: &[u8] = b"bloom-broker-ceremony-grant/v1";
 const SIGNER_CEREMONY_RECEIPT_DOMAIN: &[u8] = b"bloom-signer-ceremony-receipt/v1";
 const REVOCATION_STATE_DOMAIN: &[u8] = b"bloom-revocation-state/v1";
@@ -46,30 +48,6 @@ impl From<rusqlite::Error> for AuthorityError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Storage(error.to_string())
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProvenanceRecord {
-    pub subject: ProvenanceSubject,
-    pub publisher: Token,
-    pub operation_classes: Vec<ProvenanceOperationClass>,
-    pub installer_key_id: Token,
-    pub installer_signature: Base64UrlBytes,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProvenanceOperationClass {
-    pub operation_class: Token,
-    pub fee_asset: Option<PolicyAsset>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PolicyAsset {
-    pub chain: Token,
-    pub asset: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1760,7 +1738,7 @@ fn verify_provenance(
     verify_zeroed_signature(
         record,
         |unsigned| &mut unsigned.installer_signature,
-        PROVENANCE_SIGNATURE_DOMAIN,
+        PROVENANCE_RECORD_SIGNATURE_DOMAIN,
         key,
     )?;
     let digest =
