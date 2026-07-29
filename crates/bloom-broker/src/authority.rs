@@ -2,16 +2,16 @@ use crate::journal::{
     BrokerJournal, BudgetLimits, JournalError, ReservationRequest, SlidingBudgetLimit,
     SlidingValueLimit,
 };
-pub use bloom_triad_protocol::ProvenanceSubject;
 use bloom_triad_protocol::{
     ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
     ApprovalTombstone, Base64UrlBytes, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite,
     CustodyResult, DeclaredFee, Digest32, MachineSignRequest, OperationId, PetalUseClaim,
-    PolicyAuthorityDestination, PolicyAuthorityDiff, PolicyAuthorityVerifier, PolicyUpdateRequest,
-    ProtocolErrorCode, RevocationState, SealedApprovalTerms, SignOperationIdentity,
-    SignedPolicySnapshot, SignerActivationReceipt, SigningPayloads, Token,
+    PolicyAuthorityDiff, PolicyUpdateRequest, ProtocolErrorCode, RevocationState,
+    SealedApprovalTerms, SignOperationIdentity, SignedPolicySnapshot, SignerActivationReceipt,
+    SigningPayloads, Token,
 };
 pub use bloom_triad_protocol::{CanonicalWalletPolicy, PolicyDestination, RequiredVerifier};
+pub use bloom_triad_protocol::{ProvenanceSubject, canonical_policy_authority_diff};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use num_bigint::BigUint;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -70,74 +70,6 @@ pub struct ProvenanceOperationClass {
 pub struct PolicyAsset {
     pub chain: Token,
     pub asset: String,
-}
-
-pub fn canonical_policy_authority_diff(
-    current: &CanonicalWalletPolicy,
-    proposed: &CanonicalWalletPolicy,
-) -> PolicyAuthorityDiff {
-    fn set_diff<T: Ord + Clone>(
-        before: impl IntoIterator<Item = T>,
-        after: impl IntoIterator<Item = T>,
-    ) -> (Vec<T>, Vec<T>) {
-        let before = before.into_iter().collect::<BTreeSet<_>>();
-        let after = after.into_iter().collect::<BTreeSet<_>>();
-        (
-            after.difference(&before).cloned().collect(),
-            before.difference(&after).cloned().collect(),
-        )
-    }
-
-    let (added_petal_packages, removed_petal_packages) = set_diff(
-        current.allowed_petal_packages.iter().cloned(),
-        proposed.allowed_petal_packages.iter().cloned(),
-    );
-    let (added_destinations, removed_destinations) = set_diff(
-        current
-            .allowed_destinations
-            .iter()
-            .map(|value| PolicyAuthorityDestination {
-                chain: value.chain.clone(),
-                destination: value.destination.clone(),
-            }),
-        proposed
-            .allowed_destinations
-            .iter()
-            .map(|value| PolicyAuthorityDestination {
-                chain: value.chain.clone(),
-                destination: value.destination.clone(),
-            }),
-    );
-    let (added_required_verifiers, removed_required_verifiers) = set_diff(
-        current
-            .required_verifiers
-            .iter()
-            .map(|value| PolicyAuthorityVerifier {
-                verifier_id: value.verifier_id.clone(),
-                verifier_digest: value.verifier_digest.clone(),
-            }),
-        proposed
-            .required_verifiers
-            .iter()
-            .map(|value| PolicyAuthorityVerifier {
-                verifier_id: value.verifier_id.clone(),
-                verifier_digest: value.verifier_digest.clone(),
-            }),
-    );
-    PolicyAuthorityDiff {
-        maximum_approval_lifetime_ms_before: bloom_triad_protocol::DecimalU64::new(
-            current.maximum_approval_lifetime_ms,
-        ),
-        maximum_approval_lifetime_ms_after: bloom_triad_protocol::DecimalU64::new(
-            proposed.maximum_approval_lifetime_ms,
-        ),
-        added_petal_packages,
-        removed_petal_packages,
-        added_destinations,
-        removed_destinations,
-        added_required_verifiers,
-        removed_required_verifiers,
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

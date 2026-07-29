@@ -814,12 +814,15 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         response => panic!("unexpected response: {response:?}"),
     };
     let registration_token = url_token(&registration.ceremony_url);
-    let registration_id = broker
+    let registration_status = broker
         .ceremony()
         .public_status(&registration_operation)
-        .unwrap()
-        .ceremony_id
-        .to_string();
+        .unwrap();
+    assert_eq!(
+        registration_status.ceremony_url.as_deref(),
+        Some(registration.ceremony_url.as_str())
+    );
+    let registration_id = registration_status.ceremony_id.to_string();
     let registration_app = broker.ceremony().router();
     let session_response = registration_app
         .clone()
@@ -919,6 +922,13 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     assert_eq!(
         restarted_ceremony.status(&operation("e1")),
         Some(CeremonyState::Completed)
+    );
+    assert!(
+        restarted_ceremony
+            .public_status(&operation("e1"))
+            .unwrap()
+            .ceremony_url
+            .is_none()
     );
     assert_eq!(adoption_observer.custody_attempts.load(Ordering::SeqCst), 2);
 

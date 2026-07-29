@@ -516,12 +516,18 @@ impl CeremonyBroker {
         let sessions = self.inner.sessions.lock();
         let session = sessions.get(&ceremony_id).ok_or_else(not_found)?;
         let receipt_digest = session.terminal_result.as_ref().map(digest).transpose()?;
+        let ceremony_url = if session.state == CeremonyState::AwaitingUser {
+            session.token.as_ref().map(session_url)
+        } else {
+            None
+        };
         Ok(bloom_triad_protocol::CeremonyPublicStatus {
             ceremony_id: session.projection.ceremony_id.clone(),
             ceremony_kind: session.ceremony_kind,
             operation_id: operation_id.clone(),
             state: session.state,
             expires_at_ms: bloom_triad_protocol::DecimalU64::new(session.expires_at_ms),
+            ceremony_url,
             receipt_digest,
         })
     }
