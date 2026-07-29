@@ -547,7 +547,7 @@ impl CeremonyBroker {
         let sessions = self.inner.sessions.lock();
         let session = sessions.get(&ceremony_id).ok_or_else(not_found)?;
         if session.ceremony_kind != CeremonyKind::PolicyUpdate
-            || session.state != CeremonyState::Completed
+            || session.state != CeremonyState::Succeeded
             || receipt.ceremony_kind != CeremonyKind::PolicyUpdate
             || &receipt.custody_operation_id != operation_id
         {
@@ -1329,7 +1329,10 @@ impl CeremonyBroker {
             finalized.state = CeremonyState::AwaitingRecoveryAck;
             finalized.expires_at_ms = now_ms.saturating_add(OUTPUT_ACK_TTL_MS);
         } else {
-            finalized.state = CeremonyState::Completed;
+            finalized.state = finalized
+                .ceremony_kind
+                .successful_terminal_state()
+                .unwrap_or(CeremonyState::Completed);
             finalized.terminal_at_ms = Some(now_ms);
             finalized.token = None;
             finalized.token_hash = [0_u8; 32];
@@ -1448,7 +1451,10 @@ async fn acknowledge_result(
             return StatusCode::CONFLICT.into_response();
         }
         let mut snapshot = session.clone();
-        snapshot.state = CeremonyState::Completed;
+        snapshot.state = snapshot
+            .ceremony_kind
+            .successful_terminal_state()
+            .unwrap_or(CeremonyState::Completed);
         snapshot.terminal_at_ms = Some(unix_time_ms());
         snapshot.token = None;
         snapshot.token_hash = [0_u8; 32];
@@ -1872,6 +1878,7 @@ fn is_terminal(state: CeremonyState) -> bool {
     matches!(
         state,
         CeremonyState::Completed
+            | CeremonyState::Succeeded
             | CeremonyState::Cancelled
             | CeremonyState::Expired
             | CeremonyState::Failed
@@ -1902,7 +1909,7 @@ fn validate_completion_identity(
             ));
         }
         if &receipt.custody_operation_id != operation_id
-            || receipt.public_status != CeremonyState::Completed
+            || Some(receipt.public_status) != ceremony_kind.successful_terminal_state()
         {
             return Err(protocol(
                 ProtocolErrorCode::OperationIdConflict,

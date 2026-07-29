@@ -481,7 +481,7 @@ impl CeremonySigner for MockSigner {
         Ok(CustodyResult {
             ceremony_kind: request.ceremony_kind,
             custody_operation_id: request.custody_operation_id,
-            public_status: CeremonyState::Completed,
+            public_status: request.ceremony_kind.successful_terminal_state().unwrap(),
             wallet_id: None,
             public_key_refs: Vec::new(),
             credential_summaries: Vec::new(),

@@ -479,7 +479,7 @@ impl BrokerAuthority {
     /// policy snapshot's self-signature alone is never sufficient to enroll it.
     pub fn adopt_custody_receipt(&self, receipt: &CustodyResult) -> Result<(), AuthorityError> {
         if receipt.signer_key_id != self.ceremony_key_id
-            || receipt.public_status != bloom_triad_protocol::CeremonyState::Completed
+            || Some(receipt.public_status) != receipt.ceremony_kind.successful_terminal_state()
         {
             return Err(denied(
                 "CUSTODY_RECEIPT_INVALID",
