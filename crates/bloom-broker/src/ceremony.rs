@@ -11,10 +11,12 @@ use bloom_triad_protocol::{
     ApprovalPrepareState, Base64UrlBytes, CeremonyChallenge, CeremonyCompleteRequest, CeremonyKind,
     CeremonyPrepareRequest, CeremonyState, CeremonyWebAuthnOptions, CustodyCompleteRequest,
     CustodyPrepareRequest, CustodyPrepareResponse, CustodyPrepareState, CustodyResult,
-    CustodySignerContribution, Digest32, OperationId, ProtocolError, ProtocolErrorCode,
-    ReviewManifest, SealedApprovalPrepareResponse, SignerActivationReceipt,
-    SignerCeremonyContribution, Token, WebAuthnCeremonyProof, WebAuthnCredential,
-    verify_webauthn_assertion, verify_webauthn_attestation,
+    CustodySignerContribution, Digest32, OperationId, PolicyUpdateCeremonyCompleteRequest,
+    PolicyUpdateCeremonyPrepareRequest, PolicyUpdatePrepareResponse, PolicyUpdateReviewManifest,
+    ProtocolError, ProtocolErrorCode, ReviewManifest, SealedApprovalPrepareResponse,
+    SignerActivationReceipt, SignerCeremonyContribution, SignerCeremonyStatus,
+    SignerPreparedApproval, SignerPreparedCustody, Token, WebAuthnCeremonyProof,
+    WebAuthnCredential, verify_webauthn_assertion, verify_webauthn_attestation,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use parking_lot::Mutex;
@@ -43,28 +45,6 @@ const OUTPUT_ACK_TTL_MS: u64 = 5 * 60 * 1_000;
 
 const SHELL_HTML: &str = include_str!("ceremony_assets/index.html");
 const APP_JS: &str = include_str!("ceremony_assets/app.js");
-
-#[derive(Clone, Debug)]
-pub struct SignerPreparedApproval {
-    pub contribution: SignerCeremonyContribution,
-    pub challenges: Vec<CeremonyChallenge>,
-    pub webauthn_options: CeremonyWebAuthnOptions,
-}
-
-#[derive(Clone, Debug)]
-pub struct SignerPreparedCustody {
-    pub contribution: CustodySignerContribution,
-    pub challenges: Vec<CeremonyChallenge>,
-    pub webauthn_options: CeremonyWebAuthnOptions,
-}
-
-#[derive(Clone, Debug)]
-pub enum SignerCeremonyStatus {
-    Pending,
-    CompletedApproval(Box<SignerActivationReceipt>),
-    CompletedCustody(Box<CustodyResult>),
-    Missing,
-}
 
 #[derive(Clone, Debug, Default)]
 pub struct ReviewManifestContext {
@@ -100,6 +80,30 @@ pub trait CeremonySigner: Send + Sync {
         now_ms: u64,
     ) -> Result<CustodyResult, ProtocolError>;
 
+    fn prepare_policy_update(
+        &self,
+        request: PolicyUpdateCeremonyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<SignerPreparedCustody, ProtocolError> {
+        let _ = (request, now_ms);
+        Err(protocol(
+            ProtocolErrorCode::BackendUnsupported,
+            "policy-update ceremony preparation is not implemented by this Signer seam",
+        ))
+    }
+
+    fn complete_policy_update(
+        &self,
+        request: PolicyUpdateCeremonyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<CustodyResult, ProtocolError> {
+        let _ = (request, now_ms);
+        Err(protocol(
+            ProtocolErrorCode::BackendUnsupported,
+            "policy-update ceremony completion is not implemented by this Signer seam",
+        ))
+    }
+
     fn bind_custody_output_recipient(
         &self,
         operation_id: &OperationId,
@@ -110,12 +114,18 @@ pub trait CeremonySigner: Send + Sync {
     fn cancel(&self, operation_id: &OperationId) -> Result<(), ProtocolError>;
 
     fn status(&self, operation_id: &OperationId) -> Result<SignerCeremonyStatus, ProtocolError>;
+}
 
-    fn credential(
+pub trait CeremonyCompletionObserver: Send + Sync {
+    fn approval_completed(
         &self,
-        wallet_id: &Token,
-        credential_id: &Base64UrlBytes,
-    ) -> Result<WebAuthnCredential, ProtocolError>;
+        receipt: &SignerActivationReceipt,
+        now_ms: u64,
+    ) -> Result<(), ProtocolError>;
+
+    fn custody_completed(&self, _receipt: &CustodyResult) -> Result<(), ProtocolError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -131,6 +141,7 @@ struct BrokerInner {
     invalid_attempts: Mutex<HashMap<IpAddr, u32>>,
     database: Option<Mutex<Connection>>,
     manifest_signer: Option<(Token, SigningKey)>,
+    completion_observer: Mutex<Option<Arc<dyn CeremonyCompletionObserver>>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -150,6 +161,10 @@ struct BrowserSession {
     terminal_at_ms: Option<u64>,
     state: CeremonyState,
     terminal_result: Option<serde_json::Value>,
+    #[serde(default)]
+    verification_credentials: Vec<WebAuthnCredential>,
+    #[serde(default)]
+    policy_update: Option<PolicyUpdateCeremonyPrepareRequest>,
     projection: BrowserProjection,
 }
 
@@ -160,10 +175,12 @@ struct NewBrowserSession {
     anonymous_registration: bool,
     ceremony_kind: CeremonyKind,
     ceremony_id: Digest32,
-    review_manifest: Option<ReviewManifest>,
+    review_manifest: Option<serde_json::Value>,
     challenges: Vec<CeremonyChallenge>,
     signer_contribution: serde_json::Value,
     webauthn_options: CeremonyWebAuthnOptions,
+    verification_credentials: Vec<WebAuthnCredential>,
+    policy_update: Option<PolicyUpdateCeremonyPrepareRequest>,
     expires_at_ms: u64,
     created_at_ms: u64,
 }
@@ -174,7 +191,7 @@ struct BrowserProjection {
     ceremony_id: Digest32,
     ceremony_kind: CeremonyKind,
     operation_id: OperationId,
-    review_manifest: Option<ReviewManifest>,
+    review_manifest: Option<serde_json::Value>,
     challenges: Vec<BrowserChallenge>,
     signer_contribution: serde_json::Value,
     webauthn_options: CeremonyWebAuthnOptions,
@@ -273,8 +290,41 @@ impl CeremonyBroker {
                 invalid_attempts: Mutex::new(HashMap::new()),
                 database: database.map(Mutex::new),
                 manifest_signer,
+                completion_observer: Mutex::new(None),
             }),
         }
+    }
+
+    pub fn set_completion_observer(
+        &self,
+        observer: Arc<dyn CeremonyCompletionObserver>,
+        now_ms: u64,
+    ) -> Result<(), ProtocolError> {
+        *self.inner.completion_observer.lock() = Some(observer.clone());
+        let sessions = self
+            .inner
+            .sessions
+            .lock()
+            .values()
+            .filter_map(|session| {
+                session.terminal_result.as_ref().map(|receipt| {
+                    (
+                        session.projection.ceremony_id.as_str().to_owned(),
+                        session.state,
+                        session.ceremony_kind,
+                        receipt.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for (ceremony_id, state, kind, receipt) in sessions {
+            if state == CeremonyState::WalletCommitted {
+                self.finalize_committed_session(&ceremony_id, now_ms)?;
+            } else {
+                self.notify_completion(kind, &receipt, now_ms)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn prepare_approval(
@@ -307,14 +357,16 @@ impl CeremonyBroker {
             anonymous_registration: false,
             ceremony_kind: CeremonyKind::SealedApproval,
             ceremony_id: ceremony_id.clone(),
-            review_manifest: Some(manifest),
+            review_manifest: Some(serde_json::to_value(&manifest).map_err(malformed)?),
             challenges: prepared.challenges,
             signer_contribution: serde_json::to_value(prepared.contribution).map_err(malformed)?,
             webauthn_options: prepared.webauthn_options,
+            verification_credentials: prepared.verification_credentials,
+            policy_update: None,
             expires_at_ms,
             created_at_ms: now_ms,
         })?;
-        let url = session_url(&ceremony_id, &token_for(&session));
+        let url = session_url(&token_for(&session));
         self.insert_session(ceremony_id.clone(), session)?;
         Ok(SealedApprovalPrepareResponse {
             approval_id: request.terms.approval_id()?,
@@ -331,7 +383,10 @@ impl CeremonyBroker {
         now_ms: u64,
     ) -> Result<CustodyPrepareResponse, ProtocolError> {
         self.expire_sessions(now_ms)?;
-        if request.ceremony_kind == CeremonyKind::SealedApproval {
+        if matches!(
+            request.ceremony_kind,
+            CeremonyKind::SealedApproval | CeremonyKind::PolicyUpdate
+        ) {
             return Err(kind_mismatch());
         }
         let request_digest = digest(&request)?;
@@ -358,10 +413,12 @@ impl CeremonyBroker {
             challenges: prepared.challenges,
             signer_contribution: serde_json::to_value(prepared.contribution).map_err(malformed)?,
             webauthn_options: prepared.webauthn_options,
+            verification_credentials: prepared.verification_credentials,
+            policy_update: None,
             expires_at_ms,
             created_at_ms: now_ms,
         })?;
-        let url = session_url(&ceremony_id, &token_for(&session));
+        let url = session_url(&token_for(&session));
         self.insert_session(ceremony_id, session)?;
         Ok(CustodyPrepareResponse {
             ceremony_kind: request.ceremony_kind,
@@ -373,6 +430,69 @@ impl CeremonyBroker {
         })
     }
 
+    pub fn prepare_policy_update(
+        &self,
+        request: PolicyUpdateCeremonyPrepareRequest,
+        review_manifest: PolicyUpdateReviewManifest,
+        now_ms: u64,
+    ) -> Result<PolicyUpdatePrepareResponse, ProtocolError> {
+        self.expire_sessions(now_ms)?;
+        if request.custody.ceremony_kind != CeremonyKind::PolicyUpdate
+            || request.custody.custody_operation_id != request.update.operation_id
+            || request.custody.wallet_id.as_ref() != Some(&request.update.wallet_id)
+            || request.custody.key_ref.is_some()
+            || request.custody.exact_terms_digest != request.update.terms_digest()?
+            || request.broker_validation_receipt.update_terms_digest
+                != request.custody.exact_terms_digest
+            || request.broker_validation_receipt.review_manifest_digest
+                != review_manifest.digest()?
+            || review_manifest.operation_id != request.update.operation_id
+            || review_manifest.wallet_id != request.update.wallet_id
+        {
+            return Err(kind_mismatch());
+        }
+        let request_digest = digest(&(request.clone(), review_manifest.clone()))?;
+        if let Some(response) = self.stable_policy_update_response(
+            &request.update.operation_id,
+            &request_digest,
+            &request.broker_validation_receipt.review_manifest_digest,
+        ) {
+            return response;
+        }
+        self.enforce_creation_bounds(Some(&request.update.wallet_id), false, now_ms)?;
+        let prepared = self
+            .inner
+            .signer
+            .prepare_policy_update(request.clone(), now_ms)?;
+        let ceremony_id = prepared.contribution.ceremony_id.clone();
+        let expires_at_ms = prepared.contribution.expires_at_ms.get();
+        let session = self.new_session(NewBrowserSession {
+            operation_id: request.update.operation_id.clone(),
+            request_digest,
+            wallet_id: Some(request.update.wallet_id.clone()),
+            anonymous_registration: false,
+            ceremony_kind: CeremonyKind::PolicyUpdate,
+            ceremony_id: ceremony_id.clone(),
+            review_manifest: Some(serde_json::to_value(review_manifest).map_err(malformed)?),
+            challenges: prepared.challenges,
+            signer_contribution: serde_json::to_value(prepared.contribution).map_err(malformed)?,
+            webauthn_options: prepared.webauthn_options,
+            verification_credentials: prepared.verification_credentials,
+            policy_update: Some(request.clone()),
+            expires_at_ms,
+            created_at_ms: now_ms,
+        })?;
+        let response = PolicyUpdatePrepareResponse {
+            operation_id: request.update.operation_id,
+            ceremony_kind: CeremonyKind::PolicyUpdate,
+            ceremony_url: session_url(&token_for(&session)),
+            ceremony_expires_at_ms: bloom_triad_protocol::DecimalU64::new(expires_at_ms),
+            review_manifest_digest: request.broker_validation_receipt.review_manifest_digest,
+        };
+        self.insert_session(ceremony_id, session)?;
+        Ok(response)
+    }
+
     pub fn status(&self, operation_id: &OperationId) -> Option<CeremonyState> {
         let ceremony_id = self.inner.operations.lock().get(operation_id)?.clone();
         self.inner
@@ -380,6 +500,63 @@ impl CeremonyBroker {
             .lock()
             .get(&ceremony_id)
             .map(|session| session.state)
+    }
+
+    pub fn public_status(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<bloom_triad_protocol::CeremonyPublicStatus, ProtocolError> {
+        let ceremony_id = self
+            .inner
+            .operations
+            .lock()
+            .get(operation_id)
+            .cloned()
+            .ok_or_else(not_found)?;
+        let sessions = self.inner.sessions.lock();
+        let session = sessions.get(&ceremony_id).ok_or_else(not_found)?;
+        let receipt_digest = session.terminal_result.as_ref().map(digest).transpose()?;
+        Ok(bloom_triad_protocol::CeremonyPublicStatus {
+            ceremony_id: session.projection.ceremony_id.clone(),
+            ceremony_kind: session.ceremony_kind,
+            operation_id: operation_id.clone(),
+            state: session.state,
+            expires_at_ms: bloom_triad_protocol::DecimalU64::new(session.expires_at_ms),
+            receipt_digest,
+        })
+    }
+
+    pub fn completed_policy_update(
+        &self,
+        operation_id: &OperationId,
+        receipt: &CustodyResult,
+    ) -> Result<PolicyUpdateCeremonyPrepareRequest, ProtocolError> {
+        let ceremony_id = self
+            .inner
+            .operations
+            .lock()
+            .get(operation_id)
+            .cloned()
+            .ok_or_else(not_found)?;
+        let sessions = self.inner.sessions.lock();
+        let session = sessions.get(&ceremony_id).ok_or_else(not_found)?;
+        if session.ceremony_kind != CeremonyKind::PolicyUpdate
+            || session.state != CeremonyState::Completed
+            || receipt.ceremony_kind != CeremonyKind::PolicyUpdate
+            || &receipt.custody_operation_id != operation_id
+        {
+            return Err(kind_mismatch());
+        }
+        let stored: CustodyResult =
+            serde_json::from_value(session.terminal_result.clone().ok_or_else(not_found)?)
+                .map_err(malformed)?;
+        if &stored != receipt {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "policy commit receipt differs from completed ceremony",
+            ));
+        }
+        session.policy_update.clone().ok_or_else(kind_mismatch)
     }
 
     pub fn cancel(&self, operation_id: &OperationId, now_ms: u64) -> Result<(), ProtocolError> {
@@ -419,7 +596,9 @@ impl CeremonyBroker {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/", get(shell))
+            .route("/ceremony/{token}", get(shell))
             .route("/assets/app.js", get(app_js))
+            .route("/api/session", get(read_session_by_token))
             .route("/api/session/{ceremony_id}", get(read_session))
             .route("/api/session/{ceremony_id}/result", get(read_result))
             .route(
@@ -452,6 +631,16 @@ impl CeremonyBroker {
                 .sessions
                 .lock()
                 .get(&ceremony_id)
+                .is_some_and(|session| session.state == CeremonyState::WalletCommitted)
+            {
+                self.finalize_committed_session(&ceremony_id, now_ms)?;
+                continue;
+            }
+            if self
+                .inner
+                .sessions
+                .lock()
+                .get(&ceremony_id)
                 .is_some_and(|session| session.state == CeremonyState::AwaitingRecoveryAck)
             {
                 let snapshot = {
@@ -471,38 +660,27 @@ impl CeremonyBroker {
                 continue;
             }
             let signer_status = self.inner.signer.status(&operation_id)?;
-            let (state, terminal_result, retain_token) = match signer_status {
+            let (state, terminal_result) = match signer_status {
                 SignerCeremonyStatus::CompletedApproval(receipt) => (
-                    CeremonyState::Completed,
+                    CeremonyState::WalletCommitted,
                     Some(serde_json::to_value(receipt).map_err(malformed)?),
-                    false,
                 ),
-                SignerCeremonyStatus::CompletedCustody(result) => {
-                    let retain_token = result.encrypted_browser_result.is_some();
-                    (
-                        if retain_token {
-                            CeremonyState::AwaitingRecoveryAck
-                        } else {
-                            CeremonyState::Completed
-                        },
-                        Some(serde_json::to_value(result).map_err(malformed)?),
-                        retain_token,
-                    )
-                }
+                SignerCeremonyStatus::CompletedCustody(result) => (
+                    CeremonyState::WalletCommitted,
+                    Some(serde_json::to_value(result).map_err(malformed)?),
+                ),
                 SignerCeremonyStatus::Pending => {
                     self.inner.signer.cancel(&operation_id)?;
-                    (CeremonyState::Expired, None, false)
+                    (CeremonyState::Expired, None)
                 }
-                SignerCeremonyStatus::Missing => (CeremonyState::Expired, None, false),
+                SignerCeremonyStatus::Missing => (CeremonyState::Expired, None),
             };
             let snapshot = {
                 let mut sessions = self.inner.sessions.lock();
                 let session = sessions.get_mut(&ceremony_id).ok_or_else(not_found)?;
                 session.state = state;
                 session.terminal_result = terminal_result;
-                if retain_token {
-                    session.expires_at_ms = now_ms.saturating_add(OUTPUT_ACK_TTL_MS);
-                } else {
+                if state == CeremonyState::Expired {
                     session.terminal_at_ms = Some(now_ms);
                     session.token = None;
                     session.token_hash = [0_u8; 32];
@@ -513,8 +691,18 @@ impl CeremonyBroker {
                 if let Some(wallet_id) = &snapshot.wallet_id {
                     self.record_backoff(wallet_id, now_ms);
                 }
+            } else if state == CeremonyState::WalletCommitted {
+                validate_completion_identity(
+                    snapshot.ceremony_kind,
+                    &snapshot.operation_id,
+                    &snapshot.projection.ceremony_id,
+                    snapshot.terminal_result.as_ref().ok_or_else(not_found)?,
+                )?;
             }
             self.persist_session(&snapshot)?;
+            if state == CeremonyState::WalletCommitted {
+                self.finalize_committed_session(&ceremony_id, now_ms)?;
+            }
         }
         Ok(())
     }
@@ -585,6 +773,8 @@ impl CeremonyBroker {
             terminal_at_ms: None,
             state: CeremonyState::AwaitingUser,
             terminal_result: None,
+            verification_credentials: new.verification_credentials,
+            policy_update: new.policy_update,
             projection: BrowserProjection {
                 ceremony_id: new.ceremony_id,
                 ceremony_kind: new.ceremony_kind,
@@ -711,13 +901,14 @@ impl CeremonyBroker {
         if session.state != CeremonyState::AwaitingUser {
             return Some(Err(replay()));
         }
-        let manifest = session.projection.review_manifest.as_ref()?;
+        let manifest: ReviewManifest =
+            serde_json::from_value(session.projection.review_manifest.clone()?).ok()?;
         Some(Ok(SealedApprovalPrepareResponse {
             approval_id: manifest.approval_id.clone(),
             state: ApprovalPrepareState::AwaitingCeremony,
-            ceremony_url: session_url(&session.projection.ceremony_id, &token_for(session)),
+            ceremony_url: session_url(&token_for(session)),
             ceremony_expires_at_ms: bloom_triad_protocol::DecimalU64::new(session.expires_at_ms),
-            review_manifest_digest: digest(manifest).ok()?,
+            review_manifest_digest: digest(&manifest).ok()?,
         }))
     }
 
@@ -741,9 +932,33 @@ impl CeremonyBroker {
             ceremony_kind: session.ceremony_kind,
             custody_operation_id: operation_id.clone(),
             state: CustodyPrepareState::AwaitingUser,
-            ceremony_url: session_url(&session.projection.ceremony_id, &token_for(session)),
+            ceremony_url: session_url(&token_for(session)),
             ceremony_expires_at_ms: bloom_triad_protocol::DecimalU64::new(session.expires_at_ms),
             signer_contribution_digest: contribution.digest().ok()?,
+        }))
+    }
+
+    fn stable_policy_update_response(
+        &self,
+        operation_id: &OperationId,
+        request_digest: &Digest32,
+        review_manifest_digest: &Digest32,
+    ) -> Option<Result<PolicyUpdatePrepareResponse, ProtocolError>> {
+        let id = self.inner.operations.lock().get(operation_id)?.clone();
+        let sessions = self.inner.sessions.lock();
+        let session = sessions.get(&id)?;
+        if &session.request_digest != request_digest {
+            return Some(Err(operation_conflict()));
+        }
+        if is_terminal(session.state) {
+            return Some(Err(replay()));
+        }
+        Some(Ok(PolicyUpdatePrepareResponse {
+            operation_id: operation_id.clone(),
+            ceremony_kind: CeremonyKind::PolicyUpdate,
+            ceremony_url: session_url(&token_for(session)),
+            ceremony_expires_at_ms: bloom_triad_protocol::DecimalU64::new(session.expires_at_ms),
+            review_manifest_digest: review_manifest_digest.clone(),
         }))
     }
 
@@ -800,21 +1015,18 @@ impl CeremonyBroker {
                 session.token = None;
                 session.token_hash = [0_u8; 32];
                 self.persist_session(&session)?;
-            } else if !preserve_awaiting && !is_terminal(session.state) {
-                let mut retain_token = false;
+            } else if !preserve_awaiting
+                && session.state != CeremonyState::WalletCommitted
+                && !is_terminal(session.state)
+            {
                 match self.inner.signer.status(&session.operation_id)? {
                     SignerCeremonyStatus::CompletedApproval(receipt) => {
-                        session.state = CeremonyState::Completed;
+                        session.state = CeremonyState::WalletCommitted;
                         session.terminal_result =
                             Some(serde_json::to_value(receipt).map_err(malformed)?);
                     }
                     SignerCeremonyStatus::CompletedCustody(result) => {
-                        retain_token = result.encrypted_browser_result.is_some();
-                        session.state = if retain_token {
-                            CeremonyState::AwaitingRecoveryAck
-                        } else {
-                            CeremonyState::Completed
-                        };
+                        session.state = CeremonyState::WalletCommitted;
                         session.terminal_result =
                             Some(serde_json::to_value(result).map_err(malformed)?);
                     }
@@ -826,12 +1038,17 @@ impl CeremonyBroker {
                         session.state = CeremonyState::Expired;
                     }
                 }
-                if retain_token {
-                    session.expires_at_ms = unix_time_ms().saturating_add(OUTPUT_ACK_TTL_MS);
-                } else {
+                if session.state == CeremonyState::Expired {
                     session.terminal_at_ms = Some(unix_time_ms());
                     session.token = None;
                     session.token_hash = [0_u8; 32];
+                } else if session.state == CeremonyState::WalletCommitted {
+                    validate_completion_identity(
+                        session.ceremony_kind,
+                        &session.operation_id,
+                        &session.projection.ceremony_id,
+                        session.terminal_result.as_ref().ok_or_else(not_found)?,
+                    )?;
                 }
                 self.persist_session(&session)?;
             }
@@ -941,6 +1158,7 @@ impl CeremonyBroker {
         &self,
         wallet_id: Option<&Token>,
         projection: &BrowserProjection,
+        verification_credentials: &[WebAuthnCredential],
         proof: &WebAuthnCeremonyProof,
     ) -> Result<(), ProtocolError> {
         let challenge = |index: usize| {
@@ -954,12 +1172,20 @@ impl CeremonyBroker {
         let verify_assertion = |assertion: &bloom_triad_protocol::WebAuthnAssertion,
                                 index: usize|
          -> Result<(), ProtocolError> {
-            let wallet_id = wallet_id.ok_or_else(kind_mismatch)?;
-            let credential = self
-                .inner
-                .signer
-                .credential(wallet_id, &assertion.credential_id)?;
-            verify_webauthn_assertion(assertion, &credential, &challenge(index)?, true)?;
+            wallet_id.ok_or_else(kind_mismatch)?;
+            let credential = verification_credentials
+                .iter()
+                .find(|credential| credential.credential_id == assertion.credential_id)
+                .ok_or_else(kind_mismatch)?;
+            if projection
+                .webauthn_options
+                .allowed_credentials
+                .iter()
+                .all(|allowed| allowed.credential_id != credential.credential_id)
+            {
+                return Err(kind_mismatch());
+            }
+            verify_webauthn_assertion(assertion, credential, &challenge(index)?, true)?;
             Ok(())
         };
         let verify_attestation = |attestation: &bloom_triad_protocol::WebAuthnAttestation,
@@ -1040,6 +1266,75 @@ impl CeremonyBroker {
             .map_err(storage)?;
         Ok(())
     }
+
+    fn notify_completion(
+        &self,
+        ceremony_kind: CeremonyKind,
+        receipt: &serde_json::Value,
+        now_ms: u64,
+    ) -> Result<(), ProtocolError> {
+        let Some(observer) = self.inner.completion_observer.lock().clone() else {
+            return Ok(());
+        };
+        if ceremony_kind == CeremonyKind::SealedApproval {
+            let receipt: SignerActivationReceipt =
+                serde_json::from_value(receipt.clone()).map_err(malformed)?;
+            observer.approval_completed(&receipt, now_ms)
+        } else {
+            let receipt: CustodyResult =
+                serde_json::from_value(receipt.clone()).map_err(malformed)?;
+            observer.custody_completed(&receipt)
+        }
+    }
+
+    fn finalize_committed_session(
+        &self,
+        ceremony_id: &str,
+        now_ms: u64,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let committed = {
+            let sessions = self.inner.sessions.lock();
+            let session = sessions.get(ceremony_id).ok_or_else(not_found)?;
+            if session.state != CeremonyState::WalletCommitted {
+                return Err(protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "ceremony receipt is not awaiting Broker adoption",
+                ));
+            }
+            session.clone()
+        };
+        let receipt = committed.terminal_result.clone().ok_or_else(|| {
+            protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                "committed ceremony omitted its durable Signer receipt",
+            )
+        })?;
+
+        // Adoption is deliberately after the signed receipt is durable. Every
+        // observer operation is idempotent, so a failure leaves WALLET_COMMITTED
+        // retryable across the same request and process restart.
+        self.notify_completion(committed.ceremony_kind, &receipt, now_ms)?;
+
+        let has_sensitive_output = receipt
+            .get("encrypted_browser_result")
+            .is_some_and(|value| !value.is_null());
+        let mut finalized = committed;
+        if has_sensitive_output {
+            finalized.state = CeremonyState::AwaitingRecoveryAck;
+            finalized.expires_at_ms = now_ms.saturating_add(OUTPUT_ACK_TTL_MS);
+        } else {
+            finalized.state = CeremonyState::Completed;
+            finalized.terminal_at_ms = Some(now_ms);
+            finalized.token = None;
+            finalized.token_hash = [0_u8; 32];
+        }
+        self.persist_session(&finalized)?;
+        self.inner
+            .sessions
+            .lock()
+            .insert(ceremony_id.to_owned(), finalized);
+        Ok(receipt)
+    }
 }
 
 async fn shell(headers: HeaderMap) -> Response {
@@ -1075,6 +1370,21 @@ async fn read_session(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let sessions = broker.inner.sessions.lock();
+    let Some(session) = sessions.get(&ceremony_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Json(&session.projection).into_response()
+}
+
+async fn read_session_by_token(
+    State(broker): State<CeremonyBroker>,
+    headers: HeaderMap,
+) -> Response {
+    let ceremony_id = match broker.authorize_browser_token(&headers) {
+        Ok(ceremony_id) => ceremony_id,
+        Err(_) => return StatusCode::FORBIDDEN.into_response(),
+    };
     let sessions = broker.inner.sessions.lock();
     let Some(session) = sessions.get(&ceremony_id) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -1162,15 +1472,19 @@ async fn complete_session(
         let Some(session) = sessions.get_mut(&ceremony_id) else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        if matches!(
-            session.state,
-            CeremonyState::WalletCommitted | CeremonyState::AwaitingRecoveryAck
-        ) {
+        if session.state == CeremonyState::AwaitingRecoveryAck {
             return session
                 .terminal_result
                 .as_ref()
                 .map(|result| Json(result).into_response())
                 .unwrap_or_else(|| StatusCode::CONFLICT.into_response());
+        }
+        if session.state == CeremonyState::WalletCommitted {
+            drop(sessions);
+            return match broker.finalize_committed_session(&ceremony_id, unix_time_ms()) {
+                Ok(result) => Json(result).into_response(),
+                Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response(),
+            };
         }
         if is_terminal(session.state) {
             return StatusCode::CONFLICT.into_response();
@@ -1187,7 +1501,12 @@ async fn complete_session(
     if broker.persist_session(&verifying_snapshot).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    if let Err(error) = broker.verify_browser_proof(wallet_id.as_ref(), &projection, &body.proof) {
+    if let Err(error) = broker.verify_browser_proof(
+        wallet_id.as_ref(),
+        &projection,
+        &verifying_snapshot.verification_credentials,
+        &body.proof,
+    ) {
         if broker.inner.signer.cancel(&operation_id).is_err() {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
@@ -1219,7 +1538,25 @@ async fn complete_session(
                 },
                 unix_time_ms(),
             )
-            .map(|receipt| serde_json::to_value(receipt).expect("receipt serializes"))
+            .and_then(|receipt| serde_json::to_value(receipt).map_err(malformed))
+    } else if ceremony_kind == CeremonyKind::PolicyUpdate {
+        broker
+            .inner
+            .signer
+            .complete_policy_update(
+                PolicyUpdateCeremonyCompleteRequest {
+                    custody: CustodyCompleteRequest {
+                        ceremony_kind,
+                        custody_operation_id: operation_id.clone(),
+                        ceremony_id: projection.ceremony_id.clone(),
+                        proof: body.proof,
+                        encrypted_input: body.encrypted_input,
+                        public_binding_digest: body.public_binding_digest,
+                    },
+                },
+                unix_time_ms(),
+            )
+            .and_then(|receipt| serde_json::to_value(receipt).map_err(malformed))
     } else {
         broker
             .inner
@@ -1227,47 +1564,54 @@ async fn complete_session(
             .complete_custody(
                 CustodyCompleteRequest {
                     ceremony_kind,
-                    custody_operation_id: operation_id,
-                    ceremony_id: projection.ceremony_id,
+                    custody_operation_id: operation_id.clone(),
+                    ceremony_id: projection.ceremony_id.clone(),
                     proof: body.proof,
                     encrypted_input: body.encrypted_input,
                     public_binding_digest: body.public_binding_digest,
                 },
                 unix_time_ms(),
             )
-            .map(|receipt| serde_json::to_value(receipt).expect("receipt serializes"))
-    };
-    let mut sessions = broker.inner.sessions.lock();
-    let Some(session) = sessions.get_mut(&ceremony_id) else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            .and_then(|receipt| serde_json::to_value(receipt).map_err(malformed))
     };
     match result {
         Ok(receipt) => {
-            session.state = CeremonyState::WalletCommitted;
-            session.terminal_result = Some(receipt.clone());
-            let snapshot = session.clone();
-            if broker.persist_session(&snapshot).is_err() {
+            if let Err(error) = validate_completion_identity(
+                ceremony_kind,
+                &operation_id,
+                &projection.ceremony_id,
+                &receipt,
+            ) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response();
+            }
+            let committed = {
+                let sessions = broker.inner.sessions.lock();
+                let Some(session) = sessions.get(&ceremony_id) else {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                };
+                let mut committed = session.clone();
+                committed.state = CeremonyState::WalletCommitted;
+                committed.terminal_result = Some(receipt);
+                committed
+            };
+            if broker.persist_session(&committed).is_err() {
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
-            let has_sensitive_output = receipt
-                .get("encrypted_browser_result")
-                .is_some_and(|value| !value.is_null());
-            if has_sensitive_output {
-                session.state = CeremonyState::AwaitingRecoveryAck;
-                session.expires_at_ms = unix_time_ms().saturating_add(OUTPUT_ACK_TTL_MS);
-            } else {
-                session.state = CeremonyState::Completed;
-                session.terminal_at_ms = Some(unix_time_ms());
-                session.token = None;
-                session.token_hash = [0_u8; 32];
+            broker
+                .inner
+                .sessions
+                .lock()
+                .insert(ceremony_id.clone(), committed);
+            match broker.finalize_committed_session(&ceremony_id, unix_time_ms()) {
+                Ok(receipt) => Json(receipt).into_response(),
+                Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response(),
             }
-            let snapshot = session.clone();
-            if broker.persist_session(&snapshot).is_err() {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-            Json(receipt).into_response()
         }
         Err(error) => {
+            let mut sessions = broker.inner.sessions.lock();
+            let Some(session) = sessions.get_mut(&ceremony_id) else {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            };
             session.state = CeremonyState::Failed;
             session.terminal_at_ms = Some(unix_time_ms());
             session.token = None;
@@ -1372,6 +1716,38 @@ async fn cancel_session(
 }
 
 impl CeremonyBroker {
+    fn authorize_browser_token(&self, headers: &HeaderMap) -> Result<String, ProtocolError> {
+        self.expire_sessions(unix_time_ms())?;
+        validate_host(headers)?;
+        let supplied = headers
+            .get("x-bloom-ceremony-token")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Base64UrlBytes::parse(value.to_owned()).ok())
+            .filter(|value| value.decode().len() == 32);
+        let supplied_hash = supplied.map(|token| <[u8; 32]>::from(Sha256::digest(token.decode())));
+        let ceremony_id = supplied_hash.and_then(|hash| {
+            self.inner
+                .sessions
+                .lock()
+                .iter()
+                .find_map(|(ceremony_id, session)| {
+                    (session.token_hash == hash).then(|| ceremony_id.clone())
+                })
+        });
+        if let Some(ceremony_id) = ceremony_id {
+            return Ok(ceremony_id);
+        }
+        let rate_limited = self.record_invalid_browser_token();
+        Err(protocol(
+            if rate_limited {
+                ProtocolErrorCode::CeremonyRateLimited
+            } else {
+                ProtocolErrorCode::UnauthenticatedPeer
+            },
+            "invalid ceremony session token",
+        ))
+    }
+
     fn authorize_browser(
         &self,
         ceremony_id: &str,
@@ -1400,12 +1776,9 @@ impl CeremonyBroker {
             .unwrap_or(false);
         drop(sessions);
         if !valid {
-            let source = IpAddr::V4(Ipv4Addr::LOCALHOST);
-            let mut attempts = self.inner.invalid_attempts.lock();
-            let count = attempts.entry(source).or_default();
-            *count = count.saturating_add(1);
+            let rate_limited = self.record_invalid_browser_token();
             return Err(protocol(
-                if *count > INVALID_ATTEMPT_LIMIT {
+                if rate_limited {
                     ProtocolErrorCode::CeremonyRateLimited
                 } else {
                     ProtocolErrorCode::UnauthenticatedPeer
@@ -1414,6 +1787,14 @@ impl CeremonyBroker {
             ));
         }
         Ok(())
+    }
+
+    fn record_invalid_browser_token(&self) -> bool {
+        let source = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut attempts = self.inner.invalid_attempts.lock();
+        let count = attempts.entry(source).or_default();
+        *count = count.saturating_add(1);
+        *count > INVALID_ATTEMPT_LIMIT
     }
 }
 
@@ -1470,12 +1851,8 @@ fn require_exact_header_name(
     require_exact_header(headers, HeaderName::from_static(name), expected)
 }
 
-fn session_url(ceremony_id: &Digest32, token: &Base64UrlBytes) -> String {
-    format!(
-        "{CEREMONY_ORIGIN}/?ceremony={}#{}",
-        ceremony_id.as_str(),
-        token.encoded()
-    )
+fn session_url(token: &Base64UrlBytes) -> String {
+    format!("{CEREMONY_ORIGIN}/ceremony/{}", token.encoded())
 }
 
 fn token_for(session: &BrowserSession) -> Base64UrlBytes {
@@ -1493,6 +1870,41 @@ fn is_terminal(state: CeremonyState) -> bool {
             | CeremonyState::Expired
             | CeremonyState::Failed
     )
+}
+
+fn validate_completion_identity(
+    ceremony_kind: CeremonyKind,
+    operation_id: &OperationId,
+    ceremony_id: &Digest32,
+    value: &serde_json::Value,
+) -> Result<(), ProtocolError> {
+    if ceremony_kind == CeremonyKind::SealedApproval {
+        let receipt: SignerActivationReceipt =
+            serde_json::from_value(value.clone()).map_err(malformed)?;
+        if &receipt.activation_operation_id != operation_id || &receipt.ceremony_id != ceremony_id {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "Signer approval receipt changed the prepared ceremony identity",
+            ));
+        }
+    } else {
+        let receipt: CustodyResult = serde_json::from_value(value.clone()).map_err(malformed)?;
+        if receipt.ceremony_kind != ceremony_kind {
+            return Err(protocol(
+                ProtocolErrorCode::CeremonyKindMismatch,
+                "Signer custody receipt changed the prepared ceremony kind",
+            ));
+        }
+        if &receipt.custody_operation_id != operation_id
+            || receipt.public_status != CeremonyState::Completed
+        {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "Signer custody receipt changed the prepared operation or completion state",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn digest(value: &impl Serialize) -> Result<Digest32, ProtocolError> {

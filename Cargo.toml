@@ -14,6 +14,8 @@ license = "MIT"
 
 [workspace.dependencies]
 bloom-triad-protocol = { path = "../bloom/crates/bloom-triad-protocol" }
+bloom-triad-local-transport = { path = "../bloom/crates/bloom-triad-local-transport" }
+bloom-service-activation = { path = "../bloom/crates/bloom-service-activation" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -28,6 +30,7 @@ parking_lot = "0.12"
 p256 = { version = "0.13", features = ["ecdsa"] }
 rand = "0.8"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "net", "rt", "sync"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
+zeroize = "1"
 ciborium = "0.2"
 hpke = { version = "0.11", features = ["x25519"] }

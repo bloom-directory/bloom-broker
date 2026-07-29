@@ -6,8 +6,9 @@ const cancel = document.getElementById("cancel");
 const recoveryFields = document.getElementById("recovery-fields");
 const genericFields = document.getElementById("generic-fields");
 const genericInput = document.getElementById("generic-input");
-const token = location.hash.slice(1);
-const ceremonyId = new URLSearchParams(location.search).get("ceremony");
+const token = location.pathname.startsWith("/ceremony/")
+  ? location.pathname.slice("/ceremony/".length) : "";
+let ceremonyId = null;
 history.replaceState(null, "", "/");
 const authHeaders = {"x-bloom-ceremony-token": token};
 const te = new TextEncoder();
@@ -119,15 +120,19 @@ async function ensureNewCredentialPrf(session, credential, confirmPhase) {
 
 async function load() {
   await cryptoSelfTest();
-  if (!ceremonyId || !/^[0-9a-f]{64}$/.test(ceremonyId) || token.length !== 43) {
+  if (token.length !== 43) {
     throw new Error("Invalid ceremony URL");
   }
-  const response = await fetch(`/api/session/${ceremonyId}`, {headers: authHeaders});
+  const response = await fetch("/api/session", {headers: authHeaders});
   if (!response.ok) throw new Error("Ceremony is unavailable");
   let session = await response.json();
+  ceremonyId = session.ceremony_id;
+  if (!/^[0-9a-f]{64}$/.test(ceremonyId)) {
+    throw new Error("Ceremony returned an invalid identity");
+  }
   if ([
     "wallet_registration", "wallet_import", "wallet_export",
-    "key_derive", "policy_update"
+    "key_derive"
   ].includes(
     session.ceremony_kind
   )) {
@@ -145,14 +150,16 @@ async function load() {
   statusNode.textContent = "Review every item before continuing.";
   const pre = document.createElement("pre");
   pre.textContent = session.review_manifest?.canonical_plan ||
-    canonicalJson({
-      ceremony_kind: session.ceremony_kind,
-      signer_contribution: session.signer_contribution
-    });
+    (session.review_manifest
+      ? canonicalJson(session.review_manifest)
+      : canonicalJson({
+          ceremony_kind: session.ceremony_kind,
+          signer_contribution: session.signer_contribution
+        }));
   reviewNode.replaceChildren(pre);
   recoveryFields.hidden = session.ceremony_kind !== "wallet_recovery";
   const typedInputKinds = new Set([
-    "wallet_import", "key_derive", "policy_update"
+    "wallet_import", "key_derive"
   ]);
   genericFields.hidden = !typedInputKinds.has(session.ceremony_kind);
   if (session.ceremony_kind === "wallet_import") {
@@ -160,8 +167,6 @@ async function load() {
   } else if (session.ceremony_kind === "key_derive") {
     genericInput.placeholder =
       '{"namespace_id":"...","grant":{...},"authority_signature":"..."}';
-  } else if (session.ceremony_kind === "policy_update") {
-    genericInput.placeholder = '{"request":{...}}';
   }
   approve.disabled = false;
   approve.onclick = () => run(session);

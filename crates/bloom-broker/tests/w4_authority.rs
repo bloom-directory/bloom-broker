@@ -3,16 +3,17 @@ use bloom_broker::{
         AssuranceRegistry, AssuranceVerifier, AuthorizationInput, BrokerAuthority,
         CanonicalWalletPolicy, CeremonyApprovalGrant, EpochReconciliation, PolicyAsset,
         PolicyDestination, ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject,
-        VerifierCapability,
+        VerifierCapability, canonical_policy_authority_diff,
     },
     journal::{AuditSigner, BrokerJournal},
 };
 use bloom_triad_protocol::{
     ActivationMode, ApprovalLimits, ApprovalSelector, ApprovalSubject, ApprovalTombstone, AssetId,
-    Base64UrlBytes, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite, DecimalU64, DecimalU256,
-    DeclaredDebit, DeclaredDestination, DeclaredFee, Digest32, KeyRef, KeySpec, MachineSignRequest,
-    OperationId, PetalUseClaim, RequestNonce, RevocationState, SealedApprovalTerms,
-    SignOperationIdentity, SignedPolicySnapshot, SigningPayloads, Token, ValueLimit,
+    Base64UrlBytes, CeremonyKind, CeremonyState, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite,
+    CustodyResult, DecimalU64, DecimalU256, DeclaredDebit, DeclaredDestination, DeclaredFee,
+    Digest32, KeyRef, KeySpec, MachineSignRequest, OperationId, PetalUseClaim, PolicyUpdateRequest,
+    RequestNonce, RevocationState, SealedApprovalTerms, SignOperationIdentity,
+    SignedPolicySnapshot, SigningPayloads, Token, ValueLimit,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
@@ -27,6 +28,7 @@ const PROVENANCE_DOMAIN: &[u8] = b"bloom-provenance-record/v1";
 const CEREMONY_DOMAIN: &[u8] = b"bloom-broker-ceremony-grant/v1";
 const REVOCATION_DOMAIN: &[u8] = b"bloom-revocation-state/v1";
 const APPROVAL_TOMBSTONE_DOMAIN: &[u8] = b"bloom-approval-tombstone/v1";
+const SIGNER_RECEIPT_DOMAIN: &[u8] = b"bloom-signer-ceremony-receipt/v1";
 
 #[derive(Clone)]
 struct TestAuditSigner;
@@ -196,6 +198,9 @@ impl Harness {
             canonical_policy: Base64UrlBytes::from_bytes(&canonical),
             policy_digest: Digest32::from_bytes(Sha256::digest(&canonical).into()),
             policy_signing_key_id: token("policy-key"),
+            policy_verifying_key: Base64UrlBytes::from_bytes(
+                &self.policy_key.verifying_key().to_bytes(),
+            ),
             signer_signature: Base64UrlBytes::from_bytes(&[]),
         };
         sign_zeroed(
@@ -304,12 +309,10 @@ impl Harness {
 #[test]
 fn signed_policy_is_canonical_monotonic_and_frozen() {
     let harness = Harness::new();
-    assert!(
-        harness
-            .authority
-            .install_policy(&harness.policy_snapshot(1))
-            .is_err()
-    );
+    harness
+        .authority
+        .install_policy(&harness.policy_snapshot(1))
+        .expect("an identical authenticated policy reread is idempotent");
     let mut forged = harness.policy_snapshot(2);
     forged.policy_digest = digest(6);
     assert!(harness.authority.install_policy(&forged).is_err());
@@ -326,6 +329,64 @@ fn signed_policy_is_canonical_monotonic_and_frozen() {
         error_code(harness.authority.authorize(&input).unwrap_err())
             .contains("POLICY_SNAPSHOT_MISMATCH")
     );
+}
+
+#[test]
+fn initial_policy_adoption_requires_outer_receipt_and_does_not_poison_key_pin() {
+    let harness = Harness::new();
+    let wallet = token("new-wallet");
+    let rejected_key = SigningKey::from_bytes(&[41; 32]);
+    let accepted_key = SigningKey::from_bytes(&[42; 32]);
+
+    let mut invalid_snapshot =
+        initial_policy_snapshot(&wallet, &rejected_key, token("rejected-policy-key"));
+    invalid_snapshot.signer_signature = Base64UrlBytes::from_bytes(&[0; 64]);
+    assert!(
+        harness
+            .authority
+            .install_initial_policy(&invalid_snapshot)
+            .is_err()
+    );
+
+    let accepted_snapshot =
+        initial_policy_snapshot(&wallet, &accepted_key, token("accepted-policy-key"));
+    let mut receipt = CustodyResult {
+        ceremony_kind: CeremonyKind::WalletRegistration,
+        custody_operation_id: operation(91),
+        public_status: CeremonyState::Completed,
+        wallet_id: Some(wallet.clone()),
+        public_key_refs: Vec::new(),
+        credential_summaries: Vec::new(),
+        initial_policy: Some(accepted_snapshot.clone()),
+        receipt_digest: digest(92),
+        encrypted_browser_result: None,
+        signer_key_id: token("ceremony-key"),
+        signer_signature: Base64UrlBytes::from_bytes(&[]),
+    };
+    sign_custody_receipt(&mut receipt, &harness.ceremony_key);
+
+    let mut tampered = receipt.clone();
+    tampered.receipt_digest = digest(93);
+    assert!(harness.authority.adopt_custody_receipt(&tampered).is_err());
+    assert!(harness.authority.policy_snapshot(&wallet).is_err());
+
+    let mut wrong_kind = receipt.clone();
+    wrong_kind.ceremony_kind = CeremonyKind::CredentialAdd;
+    sign_custody_receipt(&mut wrong_kind, &harness.ceremony_key);
+    assert!(
+        harness
+            .authority
+            .adopt_custody_receipt(&wrong_kind)
+            .is_err()
+    );
+    assert!(harness.authority.policy_snapshot(&wallet).is_err());
+
+    harness.authority.adopt_custody_receipt(&receipt).unwrap();
+    assert_eq!(
+        harness.authority.policy_snapshot(&wallet).unwrap(),
+        accepted_snapshot
+    );
+    harness.authority.adopt_custody_receipt(&receipt).unwrap();
 }
 
 #[test]
@@ -986,6 +1047,49 @@ fn quotas_leave_reads_available_and_revocation_reconciliation_is_monotonic() {
     );
 }
 
+#[test]
+fn policy_update_rejects_a_machine_claimed_diff_that_broker_did_not_derive() {
+    let harness = Harness::new();
+    let baseline_snapshot = harness.policy_snapshot(1);
+    let baseline: CanonicalWalletPolicy =
+        serde_json::from_slice(&baseline_snapshot.canonical_policy.decode()).unwrap();
+    let mut proposed = baseline.clone();
+    proposed.maximum_approval_lifetime_ms += 1;
+    proposed.allowed_destinations.push(PolicyDestination {
+        chain: token("ethereum"),
+        destination: "0xexpanded-authority".into(),
+    });
+    let proposed_bytes = serde_jcs::to_vec(&proposed).unwrap();
+
+    let stale_benign_diff = canonical_policy_authority_diff(&baseline, &baseline);
+    let mut request = PolicyUpdateRequest {
+        operation_id: operation(90),
+        wallet_id: harness.wallet.clone(),
+        baseline_version: baseline_snapshot.version,
+        baseline_digest: baseline_snapshot.policy_digest,
+        proposed_canonical_policy: Base64UrlBytes::from_bytes(&proposed_bytes),
+        proposed_policy_digest: Digest32::from_bytes(Sha256::digest(&proposed_bytes).into()),
+        authority_diff_digest: stale_benign_diff.digest().unwrap(),
+        assurance_level: token("user_verified"),
+    };
+    assert!(
+        error_code(
+            harness
+                .authority
+                .validate_policy_update(&request)
+                .unwrap_err()
+        )
+        .contains("authority diff digest")
+    );
+
+    let exact_diff = canonical_policy_authority_diff(&baseline, &proposed);
+    request.authority_diff_digest = exact_diff.digest().unwrap();
+    assert_eq!(
+        harness.authority.validate_policy_update(&request).unwrap(),
+        exact_diff
+    );
+}
+
 fn exact_terms(harness: &Harness, payload: &[u8]) -> SealedApprovalTerms {
     harness
         .authority
@@ -1319,6 +1423,44 @@ fn sign_zeroed<T: Clone + serde::Serialize>(
     let mut message = domain.to_vec();
     message.extend_from_slice(&serde_jcs::to_vec(value).unwrap());
     *signature(value) = Base64UrlBytes::from_bytes(&key.sign(&message).to_bytes());
+}
+
+fn initial_policy_snapshot(
+    wallet: &Token,
+    key: &SigningKey,
+    key_id: Token,
+) -> SignedPolicySnapshot {
+    let policy = CanonicalWalletPolicy {
+        wallet_id: wallet.clone(),
+        maximum_approval_lifetime_ms: 86_400_000,
+        allowed_petal_packages: Vec::new(),
+        allowed_destinations: Vec::new(),
+        required_verifiers: Vec::new(),
+    };
+    let canonical = serde_jcs::to_vec(&policy).unwrap();
+    let mut snapshot = SignedPolicySnapshot {
+        wallet_id: wallet.clone(),
+        version: DecimalU64::new(1),
+        canonical_policy: Base64UrlBytes::from_bytes(&canonical),
+        policy_digest: Digest32::from_bytes(Sha256::digest(&canonical).into()),
+        policy_signing_key_id: key_id,
+        policy_verifying_key: Base64UrlBytes::from_bytes(&key.verifying_key().to_bytes()),
+        signer_signature: Base64UrlBytes::from_bytes(&[]),
+    };
+    sign_zeroed(
+        &mut snapshot,
+        |value| &mut value.signer_signature,
+        POLICY_DOMAIN,
+        key,
+    );
+    snapshot
+}
+
+fn sign_custody_receipt(receipt: &mut CustodyResult, key: &SigningKey) {
+    receipt.signer_signature = Base64UrlBytes::from_bytes(&[]);
+    let mut message = SIGNER_RECEIPT_DOMAIN.to_vec();
+    message.extend_from_slice(&receipt.unsigned_canonical_bytes().unwrap());
+    receipt.signer_signature = Base64UrlBytes::from_bytes(&key.sign(&message).to_bytes());
 }
 
 fn value_limit(chain: &str, asset: &str, lifetime: &str) -> ValueLimit {

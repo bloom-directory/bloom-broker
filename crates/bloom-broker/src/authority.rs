@@ -4,11 +4,14 @@ use crate::journal::{
 };
 pub use bloom_triad_protocol::ProvenanceSubject;
 use bloom_triad_protocol::{
-    ApprovalLifecycleState, ApprovalSelector, ApprovalSubject, ApprovalTombstone, Base64UrlBytes,
-    ClaimAssurance, ClaimAssuranceLevel, CryptoSuite, DeclaredFee, Digest32, MachineSignRequest,
-    OperationId, PetalUseClaim, ProtocolErrorCode, RevocationState, SealedApprovalTerms,
-    SignOperationIdentity, SignedPolicySnapshot, SigningPayloads, Token,
+    ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
+    ApprovalTombstone, Base64UrlBytes, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite,
+    CustodyResult, DeclaredFee, Digest32, MachineSignRequest, OperationId, PetalUseClaim,
+    PolicyAuthorityDestination, PolicyAuthorityDiff, PolicyAuthorityVerifier, PolicyUpdateRequest,
+    ProtocolErrorCode, RevocationState, SealedApprovalTerms, SignOperationIdentity,
+    SignedPolicySnapshot, SignerActivationReceipt, SigningPayloads, Token,
 };
+pub use bloom_triad_protocol::{CanonicalWalletPolicy, PolicyDestination, RequiredVerifier};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use num_bigint::BigUint;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -24,6 +27,7 @@ use std::{
 const POLICY_SIGNATURE_DOMAIN: &[u8] = b"bloom-policy-snapshot/v1";
 const PROVENANCE_SIGNATURE_DOMAIN: &[u8] = b"bloom-provenance-record/v1";
 const CEREMONY_GRANT_DOMAIN: &[u8] = b"bloom-broker-ceremony-grant/v1";
+const SIGNER_CEREMONY_RECEIPT_DOMAIN: &[u8] = b"bloom-signer-ceremony-receipt/v1";
 const REVOCATION_STATE_DOMAIN: &[u8] = b"bloom-revocation-state/v1";
 const APPROVAL_TOMBSTONE_DOMAIN: &[u8] = b"bloom-approval-tombstone/v1";
 const WALLET_TOMBSTONE_DOMAIN: &[u8] = b"bloom-wallet-tombstone/v1";
@@ -42,30 +46,6 @@ impl From<rusqlite::Error> for AuthorityError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Storage(error.to_string())
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CanonicalWalletPolicy {
-    pub wallet_id: Token,
-    pub maximum_approval_lifetime_ms: u64,
-    pub allowed_petal_packages: Vec<Digest32>,
-    pub allowed_destinations: Vec<PolicyDestination>,
-    pub required_verifiers: Vec<RequiredVerifier>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PolicyDestination {
-    pub chain: Token,
-    pub destination: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RequiredVerifier {
-    pub verifier_id: Token,
-    pub verifier_digest: Digest32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -90,6 +70,74 @@ pub struct ProvenanceOperationClass {
 pub struct PolicyAsset {
     pub chain: Token,
     pub asset: String,
+}
+
+pub fn canonical_policy_authority_diff(
+    current: &CanonicalWalletPolicy,
+    proposed: &CanonicalWalletPolicy,
+) -> PolicyAuthorityDiff {
+    fn set_diff<T: Ord + Clone>(
+        before: impl IntoIterator<Item = T>,
+        after: impl IntoIterator<Item = T>,
+    ) -> (Vec<T>, Vec<T>) {
+        let before = before.into_iter().collect::<BTreeSet<_>>();
+        let after = after.into_iter().collect::<BTreeSet<_>>();
+        (
+            after.difference(&before).cloned().collect(),
+            before.difference(&after).cloned().collect(),
+        )
+    }
+
+    let (added_petal_packages, removed_petal_packages) = set_diff(
+        current.allowed_petal_packages.iter().cloned(),
+        proposed.allowed_petal_packages.iter().cloned(),
+    );
+    let (added_destinations, removed_destinations) = set_diff(
+        current
+            .allowed_destinations
+            .iter()
+            .map(|value| PolicyAuthorityDestination {
+                chain: value.chain.clone(),
+                destination: value.destination.clone(),
+            }),
+        proposed
+            .allowed_destinations
+            .iter()
+            .map(|value| PolicyAuthorityDestination {
+                chain: value.chain.clone(),
+                destination: value.destination.clone(),
+            }),
+    );
+    let (added_required_verifiers, removed_required_verifiers) = set_diff(
+        current
+            .required_verifiers
+            .iter()
+            .map(|value| PolicyAuthorityVerifier {
+                verifier_id: value.verifier_id.clone(),
+                verifier_digest: value.verifier_digest.clone(),
+            }),
+        proposed
+            .required_verifiers
+            .iter()
+            .map(|value| PolicyAuthorityVerifier {
+                verifier_id: value.verifier_id.clone(),
+                verifier_digest: value.verifier_digest.clone(),
+            }),
+    );
+    PolicyAuthorityDiff {
+        maximum_approval_lifetime_ms_before: bloom_triad_protocol::DecimalU64::new(
+            current.maximum_approval_lifetime_ms,
+        ),
+        maximum_approval_lifetime_ms_after: bloom_triad_protocol::DecimalU64::new(
+            proposed.maximum_approval_lifetime_ms,
+        ),
+        added_petal_packages,
+        removed_petal_packages,
+        added_destinations,
+        removed_destinations,
+        added_required_verifiers,
+        removed_required_verifiers,
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -245,7 +293,7 @@ pub struct BrokerAuthority {
     connection: Mutex<Connection>,
     authorization_barrier: Mutex<()>,
     journal: Arc<BrokerJournal>,
-    policy_keys: BTreeMap<String, (Token, VerifyingKey)>,
+    policy_keys: Mutex<BTreeMap<String, (Token, VerifyingKey)>>,
     installer_key_id: Token,
     installer_key: VerifyingKey,
     ceremony_key_id: Token,
@@ -355,11 +403,22 @@ impl BrokerAuthority {
             );
             ",
         )?;
+        let mut policy_keys = policy_keys;
+        {
+            let mut statement =
+                connection.prepare("SELECT snapshot_jcs FROM policies ORDER BY wallet_id")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let snapshot: SignedPolicySnapshot =
+                    serde_json::from_str(&row?).map_err(storage)?;
+                enroll_policy_key_from_snapshot(&snapshot, &mut policy_keys)?;
+            }
+        }
         Ok(Self {
             connection: Mutex::new(connection),
             authorization_barrier: Mutex::new(()),
             journal,
-            policy_keys,
+            policy_keys: Mutex::new(policy_keys),
             installer_key_id,
             installer_key,
             ceremony_key_id,
@@ -376,7 +435,50 @@ impl BrokerAuthority {
 
     pub fn install_policy(&self, snapshot: &SignedPolicySnapshot) -> Result<(), AuthorityError> {
         let _barrier = self.lock_authorization_barrier()?;
-        let policy = verify_policy_snapshot(snapshot, &self.policy_keys)?;
+        self.install_policy_locked(snapshot)
+    }
+
+    /// Enrolls the per-wallet policy verification key only from the signed
+    /// initial snapshot carried by completed wallet registration/import.
+    /// Ordinary policy reads cannot call this path.
+    pub fn install_initial_policy(
+        &self,
+        snapshot: &SignedPolicySnapshot,
+    ) -> Result<(), AuthorityError> {
+        let _barrier = self.lock_authorization_barrier()?;
+        if snapshot.version.get() != 1 {
+            return Err(denied(
+                "POLICY_INVALID",
+                "initial wallet custody must install policy version 1",
+            ));
+        }
+        let mut keys = self
+            .policy_keys
+            .lock()
+            .map_err(|_| storage("policy key registry lock poisoned"))?;
+        let mut candidate_keys = keys.clone();
+        enroll_policy_key_from_snapshot(snapshot, &mut candidate_keys)?;
+        let policy = verify_policy_snapshot(snapshot, &candidate_keys)?;
+        self.persist_verified_policy(snapshot, &policy)?;
+        *keys = candidate_keys;
+        Ok(())
+    }
+
+    fn install_policy_locked(&self, snapshot: &SignedPolicySnapshot) -> Result<(), AuthorityError> {
+        let keys = self
+            .policy_keys
+            .lock()
+            .map_err(|_| storage("policy key registry lock poisoned"))?;
+        let policy = verify_policy_snapshot(snapshot, &keys)?;
+        drop(keys);
+        self.persist_verified_policy(snapshot, &policy)
+    }
+
+    fn persist_verified_policy(
+        &self,
+        snapshot: &SignedPolicySnapshot,
+        policy: &CanonicalWalletPolicy,
+    ) -> Result<(), AuthorityError> {
         for required in &policy.required_verifiers {
             if !self.assurance.verifiers.contains_key(&(
                 required.verifier_id.as_str().to_owned(),
@@ -392,20 +494,30 @@ impl BrokerAuthority {
         let policy_jcs = serde_jcs::to_string(&policy).map_err(storage)?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
-        let existing: Option<u64> = transaction
+        let existing: Option<(u64, String)> = transaction
             .query_row(
-                "SELECT version FROM policies WHERE wallet_id = ?1",
+                "SELECT version, snapshot_jcs FROM policies WHERE wallet_id = ?1",
                 [snapshot.wallet_id.as_str()],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
-            .map(|value| value.parse().map_err(storage))
+            .map(|(version, stored)| {
+                version
+                    .parse()
+                    .map(|version| (version, stored))
+                    .map_err(storage)
+            })
             .transpose()?;
-        if existing.is_some_and(|version| snapshot.version.get() <= version) {
-            return Err(denied(
-                "POLICY_ROLLBACK",
-                "policy version must advance monotonically",
-            ));
+        if let Some((version, stored)) = existing {
+            if snapshot.version.get() == version && snapshot_jcs == stored {
+                return Ok(());
+            }
+            if snapshot.version.get() <= version {
+                return Err(denied(
+                    "POLICY_ROLLBACK",
+                    "policy version must advance monotonically",
+                ));
+            }
         }
         transaction.execute(
             "INSERT INTO policies(wallet_id, version, digest, snapshot_jcs, policy_jcs)
@@ -430,6 +542,72 @@ impl BrokerAuthority {
         Ok(())
     }
 
+    /// Verifies and adopts a completed Signer custody receipt. The outer
+    /// ceremony signature is the trust bridge for an initial policy key; the
+    /// policy snapshot's self-signature alone is never sufficient to enroll it.
+    pub fn adopt_custody_receipt(&self, receipt: &CustodyResult) -> Result<(), AuthorityError> {
+        if receipt.signer_key_id != self.ceremony_key_id
+            || receipt.public_status != bloom_triad_protocol::CeremonyState::Completed
+        {
+            return Err(denied(
+                "CUSTODY_RECEIPT_INVALID",
+                "Signer custody receipt key or completion state is invalid",
+            ));
+        }
+        let signature =
+            Signature::from_slice(&receipt.signer_signature.decode()).map_err(|_| {
+                denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "Signer custody receipt signature is malformed",
+                )
+            })?;
+        self.ceremony_key
+            .verify(
+                &[
+                    SIGNER_CEREMONY_RECEIPT_DOMAIN,
+                    receipt
+                        .unsigned_canonical_bytes()
+                        .map_err(|error| denied("CUSTODY_RECEIPT_INVALID", error.to_string()))?
+                        .as_slice(),
+                ]
+                .concat(),
+                &signature,
+            )
+            .map_err(|_| {
+                denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "Signer custody receipt signature is invalid",
+                )
+            })?;
+
+        if !matches!(
+            receipt.ceremony_kind,
+            bloom_triad_protocol::CeremonyKind::WalletRegistration
+                | bloom_triad_protocol::CeremonyKind::WalletImport
+        ) {
+            if receipt.initial_policy.is_some() {
+                return Err(denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "only wallet registration or import may carry an initial policy",
+                ));
+            }
+            return Ok(());
+        }
+        let snapshot = receipt.initial_policy.as_ref().ok_or_else(|| {
+            denied(
+                "CUSTODY_RECEIPT_INVALID",
+                "initial wallet custody omitted its initial signed policy",
+            )
+        })?;
+        if receipt.wallet_id.as_ref() != Some(&snapshot.wallet_id) {
+            return Err(denied(
+                "CUSTODY_RECEIPT_INVALID",
+                "registration receipt wallet differs from its initial policy",
+            ));
+        }
+        self.install_initial_policy(snapshot)
+    }
+
     pub fn prepare_approval(
         &self,
         terms: &SealedApprovalTerms,
@@ -442,6 +620,19 @@ impl BrokerAuthority {
         let approval_id = terms
             .approval_id()
             .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?;
+        if let Some(existing) = self.journal.approval_record(&approval_id)? {
+            let existing_terms: SealedApprovalTerms =
+                serde_json::from_str(&existing.terms_jcs).map_err(storage)?;
+            if existing_terms == *terms
+                && existing.review_manifest_digest == review_manifest_digest.as_str()
+            {
+                return Ok(approval_id);
+            }
+            return Err(denied(
+                "OPERATION_ID_CONFLICT",
+                "approval identity is already bound to different prepared bytes",
+            ));
+        }
         if self.is_tombstoned(&approval_id)? {
             return Err(denied(
                 "APPROVAL_REVOKED",
@@ -633,6 +824,98 @@ impl BrokerAuthority {
         Ok(())
     }
 
+    /// Adopt the exact Signer receipt returned by the production ceremony RPC.
+    /// This is the process-separated activation path; it verifies the Signer
+    /// ceremony key and every immutable prepared field before making Broker
+    /// authority active.
+    pub fn activate_signer_receipt(
+        &self,
+        receipt: &SignerActivationReceipt,
+        now_ms: u64,
+    ) -> Result<(), AuthorityError> {
+        let _barrier = self.lock_authorization_barrier()?;
+        if receipt.signer_key_id != self.ceremony_key_id
+            || now_ms < receipt.activated_at_ms.get()
+            || now_ms > receipt.expires_at_ms.get()
+        {
+            return Err(denied(
+                "CEREMONY_GRANT_INVALID",
+                "Signer activation receipt key or validity interval is invalid",
+            ));
+        }
+        let signature =
+            Signature::from_slice(&receipt.signer_signature.decode()).map_err(|_| {
+                denied(
+                    "CEREMONY_GRANT_INVALID",
+                    "Signer activation receipt signature is malformed",
+                )
+            })?;
+        self.ceremony_key
+            .verify(
+                &[
+                    SIGNER_CEREMONY_RECEIPT_DOMAIN,
+                    receipt
+                        .unsigned_canonical_bytes()
+                        .map_err(|error| denied("CEREMONY_GRANT_INVALID", error.to_string()))?
+                        .as_slice(),
+                ]
+                .concat(),
+                &signature,
+            )
+            .map_err(|_| {
+                denied(
+                    "CEREMONY_GRANT_INVALID",
+                    "Signer activation receipt signature is invalid",
+                )
+            })?;
+        let record = self
+            .journal
+            .approval_record(&receipt.approval_id)?
+            .ok_or_else(|| denied("APPROVAL_NOT_FOUND", "approval is not prepared"))?;
+        if self.is_tombstoned(&receipt.approval_id)? {
+            return Err(denied(
+                "APPROVAL_REVOKED",
+                "tombstoned approval cannot be activated",
+            ));
+        }
+        let terms: SealedApprovalTerms =
+            serde_json::from_str(&record.terms_jcs).map_err(storage)?;
+        let review_digest = Digest32::new(record.review_manifest_digest)
+            .map_err(|error| denied("STORAGE_CORRUPTION", error.to_string()))?;
+        let (current_epoch, reconciled) = self.epoch_state(&terms.wallet_id)?;
+        if !reconciled || current_epoch != terms.wallet_revocation_epoch.get() {
+            return Err(denied(
+                "REVOCATION_EPOCH_UNRECONCILED",
+                "Signer receipt cannot activate authority at an unreconciled epoch",
+            ));
+        }
+        if receipt.approval_digest != receipt.approval_id
+            || receipt.approval_id
+                != terms
+                    .approval_id()
+                    .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?
+            || receipt.review_manifest_digest != review_digest
+            || receipt.replaced_approval_id != terms.renewal_of
+            || receipt.wallet_revocation_epoch != terms.wallet_revocation_epoch
+            || receipt.key_ref != terms.key_ref
+            || receipt.allowed_crypto_suites != terms.allowed_crypto_suites
+            || receipt.activation_mode != terms.activation_mode
+            || receipt.expires_at_ms != terms.expires_at_ms
+        {
+            return Err(denied(
+                "CEREMONY_GRANT_MISMATCH",
+                "Signer receipt changed immutable reviewed authority",
+            ));
+        }
+        let receipt_jcs = serde_jcs::to_string(receipt).map_err(storage)?;
+        self.journal.activate_approval_record(
+            &receipt.approval_id,
+            &receipt.activation_operation_id,
+            &receipt_jcs,
+        )?;
+        Ok(())
+    }
+
     pub fn approval_terms(
         &self,
         approval_id: &Digest32,
@@ -641,6 +924,134 @@ impl BrokerAuthority {
             .approval_record(approval_id)?
             .map(|record| serde_json::from_str(&record.terms_jcs).map_err(storage))
             .transpose()
+    }
+
+    pub fn approval_public_status(
+        &self,
+        approval_id: &Digest32,
+    ) -> Result<ApprovalPublicStatus, AuthorityError> {
+        let terms = self
+            .approval_terms(approval_id)?
+            .ok_or_else(|| denied("APPROVAL_NOT_FOUND", "approval does not exist"))?;
+        let state = self
+            .journal
+            .approval_state(approval_id)?
+            .ok_or_else(|| denied("APPROVAL_NOT_FOUND", "approval state does not exist"))?;
+        Ok(ApprovalPublicStatus {
+            approval_id: approval_id.clone(),
+            wallet_id: terms.wallet_id,
+            state,
+            effective_claim_assurance: match terms.selector {
+                ApprovalSelector::Petal {
+                    required_claim_assurance,
+                    ..
+                } => Some(required_claim_assurance),
+                ApprovalSelector::Exact { .. } => None,
+            },
+            ceremony_url: None,
+            ceremony_expires_at_ms: None,
+        })
+    }
+
+    pub fn approval_public_list(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<Vec<ApprovalPublicStatus>, AuthorityError> {
+        self.journal
+            .approval_records()?
+            .into_iter()
+            .filter_map(|(approval_id, record)| {
+                match serde_json::from_str::<SealedApprovalTerms>(&record.terms_jcs) {
+                    Ok(terms) if &terms.wallet_id == wallet_id => {
+                        Some(self.approval_public_status(&approval_id))
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(Err(storage(error))),
+                }
+            })
+            .collect()
+    }
+
+    pub fn policy_snapshot(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<SignedPolicySnapshot, AuthorityError> {
+        self.current_policy(wallet_id).map(|(snapshot, _)| snapshot)
+    }
+
+    pub fn validate_policy_update(
+        &self,
+        request: &PolicyUpdateRequest,
+    ) -> Result<PolicyAuthorityDiff, AuthorityError> {
+        let (baseline, current) = self.current_policy(&request.wallet_id)?;
+        if baseline.version != request.baseline_version
+            || baseline.policy_digest != request.baseline_digest
+        {
+            return Err(denied(
+                "POLICY_BASELINE_STALE",
+                "policy update baseline differs from Broker's verified snapshot",
+            ));
+        }
+        let proposed_bytes = request.proposed_canonical_policy.decode();
+        if Digest32::from_bytes(Sha256::digest(&proposed_bytes).into())
+            != request.proposed_policy_digest
+        {
+            return Err(denied(
+                "POLICY_INVALID",
+                "proposed policy digest does not match its canonical bytes",
+            ));
+        }
+        let proposed: CanonicalWalletPolicy = serde_json::from_slice(&proposed_bytes)
+            .map_err(|error| denied("POLICY_INVALID", error.to_string()))?;
+        if serde_jcs::to_vec(&proposed).map_err(storage)? != proposed_bytes
+            || proposed.wallet_id != request.wallet_id
+            || proposed.maximum_approval_lifetime_ms == 0
+        {
+            return Err(denied(
+                "POLICY_INVALID",
+                "proposed policy is noncanonical, names another wallet, or has invalid limits",
+            ));
+        }
+        for required in &proposed.required_verifiers {
+            if !self.assurance.verifiers.contains_key(&(
+                required.verifier_id.as_str().to_owned(),
+                required.verifier_digest.as_str().to_owned(),
+            )) {
+                return Err(denied(
+                    "POLICY_VERIFIER_UNAVAILABLE",
+                    "proposed policy requires a verifier absent from this build",
+                ));
+            }
+        }
+        let authority_diff = canonical_policy_authority_diff(&current, &proposed);
+        if authority_diff.digest().map_err(storage)? != request.authority_diff_digest {
+            return Err(denied(
+                "POLICY_INVALID",
+                "authority diff digest does not match Broker-derived policy changes",
+            ));
+        }
+        Ok(authority_diff)
+    }
+
+    pub fn wallet_ids(&self) -> Result<Vec<Token>, AuthorityError> {
+        let connection = self.lock()?;
+        let mut statement =
+            connection.prepare("SELECT wallet_id FROM policies ORDER BY wallet_id")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|wallet_id| Token::new(wallet_id).map_err(|error| storage(error.to_string())))
+            .collect()
+    }
+
+    pub fn revoke_local_approval(&self, approval_id: &Digest32) -> Result<(), AuthorityError> {
+        let _barrier = self.lock_authorization_barrier()?;
+        self.stop_approval(approval_id)
+    }
+
+    pub fn wallet_epoch(&self, wallet_id: &Token) -> Result<u64, AuthorityError> {
+        self.local_epoch(wallet_id)
     }
 
     pub fn authorize(
@@ -1340,6 +1751,12 @@ fn verify_policy_snapshot(
             "policy snapshot key ID differs from pinned wallet key",
         ));
     }
+    if snapshot.policy_verifying_key.decode() != key.to_bytes() {
+        return Err(denied(
+            "POLICY_KEY_MISMATCH",
+            "policy snapshot public key differs from the pinned wallet key",
+        ));
+    }
     verify_zeroed_signature(
         snapshot,
         |unsigned| &mut unsigned.signer_signature,
@@ -1361,6 +1778,39 @@ fn verify_policy_snapshot(
         ));
     }
     Ok(policy)
+}
+
+fn enroll_policy_key_from_snapshot(
+    snapshot: &SignedPolicySnapshot,
+    keys: &mut BTreeMap<String, (Token, VerifyingKey)>,
+) -> Result<(), AuthorityError> {
+    let bytes: [u8; 32] = snapshot
+        .policy_verifying_key
+        .decode()
+        .try_into()
+        .map_err(|_| {
+            denied(
+                "POLICY_KEY_MISMATCH",
+                "policy verification key must contain 32 bytes",
+            )
+        })?;
+    let key = VerifyingKey::from_bytes(&bytes)
+        .map_err(|_| denied("POLICY_KEY_MISMATCH", "policy verification key is invalid"))?;
+    if let Some((key_id, pinned)) = keys.get(snapshot.wallet_id.as_str()) {
+        if key_id != &snapshot.policy_signing_key_id || pinned != &key {
+            return Err(denied(
+                "POLICY_KEY_MISMATCH",
+                "registration policy key differs from the pinned wallet key",
+            ));
+        }
+    } else {
+        keys.insert(
+            snapshot.wallet_id.as_str().to_owned(),
+            (snapshot.policy_signing_key_id.clone(), key),
+        );
+    }
+    verify_policy_snapshot(snapshot, keys)?;
+    Ok(())
 }
 
 fn verify_provenance(

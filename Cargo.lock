@@ -156,7 +156,9 @@ dependencies = [
  "axum",
  "bloom-broker-api",
  "bloom-broker-debug-driver",
+ "bloom-service-activation",
  "bloom-signer",
+ "bloom-triad-local-transport",
  "bloom-triad-protocol",
  "ed25519-dalek",
  "futures",
@@ -175,6 +177,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tower",
+ "zeroize",
 ]
 
 [[package]]
@@ -198,11 +201,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-service-activation"
+version = "0.1.1"
+dependencies = [
+ "libc",
+ "thiserror",
+]
+
+[[package]]
 name = "bloom-signer"
 version = "0.1.0"
 dependencies = [
+ "bloom-service-activation",
  "bloom-signer-backend-api",
  "bloom-signer-backend-local",
+ "bloom-triad-local-transport",
  "bloom-triad-protocol",
  "chacha20poly1305",
  "ed25519-dalek",
@@ -210,6 +223,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hpke",
+ "k256",
  "parking_lot",
  "rand",
  "rusqlite",
@@ -217,6 +231,8 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2",
+ "sha3",
+ "tokio",
  "zeroize",
 ]
 
@@ -249,6 +265,21 @@ dependencies = [
  "sha2",
  "sha3",
  "zeroize",
+]
+
+[[package]]
+name = "bloom-triad-local-transport"
+version = "0.1.1"
+dependencies = [
+ "bloom-triad-protocol",
+ "ed25519-dalek",
+ "hex",
+ "rand",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]
@@ -1438,6 +1469,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "signature"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1564,9 +1605,11 @@ version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys",

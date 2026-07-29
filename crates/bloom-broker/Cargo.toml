@@ -9,6 +9,8 @@ license.workspace = true
 axum.workspace = true
 bloom-broker-api = { path = "../bloom-broker-api" }
 bloom-triad-protocol.workspace = true
+bloom-triad-local-transport.workspace = true
+bloom-service-activation.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
 num-bigint.workspace = true
@@ -22,6 +24,7 @@ sha2.workspace = true
 sha3.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 bloom-broker-debug-driver = { path = "../bloom-broker-debug-driver" }

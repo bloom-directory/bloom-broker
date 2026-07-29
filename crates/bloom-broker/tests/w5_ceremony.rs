@@ -2,9 +2,17 @@ use axum::{
     body::Body,
     http::{Request, StatusCode, header},
 };
-use bloom_broker::ceremony::{
-    CEREMONY_ADDR, CeremonyBroker, CeremonySigner, ReviewManifestContext, SignerCeremonyStatus,
-    SignerPreparedApproval, SignerPreparedCustody,
+use bloom_broker::{
+    authority::{
+        AssuranceRegistry, BrokerAuthority, CanonicalWalletPolicy, canonical_policy_authority_diff,
+    },
+    ceremony::{
+        CEREMONY_ADDR, CeremonyBroker, CeremonyCompletionObserver, CeremonySigner,
+        ReviewManifestContext,
+    },
+    journal::{AuditSigner, BrokerJournal},
+    service::BrokerRpcService,
+    signer_client::BrokerSignerClient,
 };
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer::{
@@ -12,18 +20,50 @@ use bloom_signer::{
     engine::SignerEngine,
     hpke::{CUSTODY_OUTPUT_INFO, HpkeRecipient},
     registry::BackendRegistry,
+    service::SignerRpcService,
 };
+use bloom_triad_local_transport::{EndpointQuota, LocalIdentity, PeerAcl};
 use bloom_triad_protocol::*;
 use ed25519_dalek::SigningKey;
 use http_body_util::BodyExt as _;
 use sha2::Digest as _;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::fs;
+use std::os::unix::fs::MetadataExt as _;
 use std::process::Command;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use tower::ServiceExt as _;
+
+#[derive(Clone)]
+struct ServiceTestAuditSigner;
+
+impl AuditSigner for ServiceTestAuditSigner {
+    fn key_id(&self) -> Token {
+        Token::new("broker-audit-key").unwrap()
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String> {
+        Ok(Base64UrlBytes::from_bytes(&sha2::Sha256::digest(message)))
+    }
+
+    fn verify(
+        &self,
+        key_id: &Token,
+        message: &[u8],
+        signature: &Base64UrlBytes,
+    ) -> Result<(), String> {
+        if key_id == &self.key_id()
+            && signature.decode() == sha2::Sha256::digest(message).as_slice()
+        {
+            Ok(())
+        } else {
+            Err("audit signature mismatch".into())
+        }
+    }
+}
 
 #[test]
 fn browser_crypto_self_test_executes_the_shipped_asset() {
@@ -36,7 +76,7 @@ fn browser_crypto_self_test_executes_the_shipped_asset() {
         r#"
 globalThis.crypto = require("node:crypto").webcrypto;
 globalThis.document = {{getElementById: () => ({{}})}};
-globalThis.location = {{hash: "", search: ""}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
 globalThis.history = {{replaceState: () => {{}}}};
 {executable}
 cryptoSelfTest().then(
@@ -124,17 +164,58 @@ struct RealSigner {
     service: Arc<SignerCeremonyService>,
 }
 
+struct FailOnceAdoptionObserver {
+    authority: Arc<BrokerAuthority>,
+    custody_attempts: AtomicUsize,
+}
+
+impl CeremonyCompletionObserver for FailOnceAdoptionObserver {
+    fn approval_completed(
+        &self,
+        receipt: &SignerActivationReceipt,
+        now_ms: u64,
+    ) -> Result<(), ProtocolError> {
+        self.authority
+            .activate_signer_receipt(receipt, now_ms)
+            .map_err(|error| {
+                ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, error.to_string())
+            })
+    }
+
+    fn custody_completed(&self, receipt: &CustodyResult) -> Result<(), ProtocolError> {
+        if self.custody_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                "injected transient initial-policy storage failure",
+            ));
+        }
+        self.authority
+            .adopt_custody_receipt(receipt)
+            .map_err(|error| {
+                ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, error.to_string())
+            })
+    }
+}
+
 impl CeremonySigner for RealSigner {
     fn prepare_approval(
         &self,
         request: CeremonyPrepareRequest,
         now_ms: u64,
     ) -> Result<SignerPreparedApproval, ProtocolError> {
+        let wallet_id = request.terms.wallet_id.clone();
         let prepared = self.service.prepare_approval(request, now_ms)?;
+        let verification_credentials = prepared
+            .webauthn_options
+            .allowed_credentials
+            .iter()
+            .map(|allowed| self.service.credential(&wallet_id, &allowed.credential_id))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(SignerPreparedApproval {
             contribution: prepared.contribution,
             challenges: prepared.challenges,
             webauthn_options: prepared.webauthn_options,
+            verification_credentials,
         })
     }
 
@@ -152,10 +233,25 @@ impl CeremonySigner for RealSigner {
         now_ms: u64,
     ) -> Result<SignerPreparedCustody, ProtocolError> {
         let prepared = self.service.prepare_custody(request, now_ms)?;
+        let verification_credentials = prepared
+            .contribution
+            .wallet_id
+            .as_ref()
+            .map(|wallet_id| {
+                prepared
+                    .webauthn_options
+                    .allowed_credentials
+                    .iter()
+                    .map(|allowed| self.service.credential(wallet_id, &allowed.credential_id))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(SignerPreparedCustody {
             contribution: prepared.contribution,
             challenges: prepared.challenges,
             webauthn_options: prepared.webauthn_options,
+            verification_credentials,
         })
     }
 
@@ -180,11 +276,62 @@ impl CeremonySigner for RealSigner {
         let prepared =
             self.service
                 .bind_custody_output_recipient(operation_id, recipient_key, now_ms)?;
+        let verification_credentials = prepared
+            .contribution
+            .wallet_id
+            .as_ref()
+            .map(|wallet_id| {
+                prepared
+                    .webauthn_options
+                    .allowed_credentials
+                    .iter()
+                    .map(|allowed| self.service.credential(wallet_id, &allowed.credential_id))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(SignerPreparedCustody {
             contribution: prepared.contribution,
             challenges: prepared.challenges,
             webauthn_options: prepared.webauthn_options,
+            verification_credentials,
         })
+    }
+
+    fn prepare_policy_update(
+        &self,
+        request: PolicyUpdateCeremonyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<SignerPreparedCustody, ProtocolError> {
+        let prepared = self.service.prepare_policy_update(request, now_ms)?;
+        let verification_credentials = prepared
+            .contribution
+            .wallet_id
+            .as_ref()
+            .map(|wallet_id| {
+                prepared
+                    .webauthn_options
+                    .allowed_credentials
+                    .iter()
+                    .map(|allowed| self.service.credential(wallet_id, &allowed.credential_id))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(SignerPreparedCustody {
+            contribution: prepared.contribution,
+            challenges: prepared.challenges,
+            webauthn_options: prepared.webauthn_options,
+            verification_credentials,
+        })
+    }
+
+    fn complete_policy_update(
+        &self,
+        request: PolicyUpdateCeremonyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<CustodyResult, ProtocolError> {
+        self.service.complete_policy_update(request, now_ms)
     }
 
     fn status(&self, operation_id: &OperationId) -> Result<SignerCeremonyStatus, ProtocolError> {
@@ -198,14 +345,6 @@ impl CeremonySigner for RealSigner {
             }
             bloom_signer::ceremony::SignerCeremonyStatus::Missing => SignerCeremonyStatus::Missing,
         })
-    }
-
-    fn credential(
-        &self,
-        wallet_id: &Token,
-        credential_id: &Base64UrlBytes,
-    ) -> Result<WebAuthnCredential, ProtocolError> {
-        self.service.credential(wallet_id, credential_id)
     }
 }
 
@@ -265,6 +404,7 @@ impl CeremonySigner for MockSigner {
                 registration_user_handle: None,
                 registration_prf_salt: None,
             },
+            verification_credentials: Vec::new(),
         })
     }
 
@@ -328,6 +468,7 @@ impl CeremonySigner for MockSigner {
                 registration_user_handle: None,
                 registration_prf_salt: None,
             },
+            verification_credentials: Vec::new(),
         })
     }
 
@@ -344,11 +485,40 @@ impl CeremonySigner for MockSigner {
             wallet_id: None,
             public_key_refs: Vec::new(),
             credential_summaries: Vec::new(),
+            initial_policy: None,
             receipt_digest: digest("44"),
             encrypted_browser_result: None,
             signer_key_id: Token::new("mock-signer-key").unwrap(),
             signer_signature: Base64UrlBytes::from_bytes(&[0; 64]),
         })
+    }
+
+    fn prepare_policy_update(
+        &self,
+        request: PolicyUpdateCeremonyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<SignerPreparedCustody, ProtocolError> {
+        let review_manifest_digest = request
+            .broker_validation_receipt
+            .review_manifest_digest
+            .clone();
+        let mut prepared = self.prepare_custody(request.custody, now_ms)?;
+        prepared.contribution.review_manifest_digest = review_manifest_digest.clone();
+        prepared.contribution.signer_signature = Base64UrlBytes::from_bytes(&[9; 64]);
+        let contribution_digest = prepared.contribution.digest()?;
+        for challenge in &mut prepared.challenges {
+            challenge.review_manifest_digest = review_manifest_digest.clone();
+            challenge.signer_contribution_digest = contribution_digest.clone();
+        }
+        Ok(prepared)
+    }
+
+    fn complete_policy_update(
+        &self,
+        request: PolicyUpdateCeremonyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<CustodyResult, ProtocolError> {
+        self.complete_custody(request.custody, now_ms)
     }
 
     fn cancel(&self, operation_id: &OperationId) -> Result<(), ProtocolError> {
@@ -376,17 +546,96 @@ impl CeremonySigner for MockSigner {
             SignerCeremonyStatus::Missing
         })
     }
+}
 
-    fn credential(
-        &self,
-        _wallet_id: &Token,
-        _credential_id: &Base64UrlBytes,
-    ) -> Result<WebAuthnCredential, ProtocolError> {
-        Err(ProtocolError::new(
-            ProtocolErrorCode::UnauthenticatedPeer,
-            "mock credential is not enrolled",
-        ))
-    }
+#[test]
+fn policy_validate_update_returns_the_standard_launch_projection_without_a_new_method() {
+    let broker = CeremonyBroker::new(Arc::new(MockSigner::new()));
+    let proposed = Base64UrlBytes::from_bytes(br#"{"wallet_id":"wallet-review"}"#);
+    let update = PolicyUpdateRequest {
+        operation_id: operation("c1"),
+        wallet_id: Token::new("wallet-review").unwrap(),
+        baseline_version: DecimalU64::new(1),
+        baseline_digest: digest("c2"),
+        proposed_policy_digest: Digest32::from_bytes(
+            sha2::Sha256::digest(proposed.decode()).into(),
+        ),
+        proposed_canonical_policy: proposed,
+        authority_diff_digest: digest("c3"),
+        assurance_level: Token::new("user_verified").unwrap(),
+    };
+    let mut review = PolicyUpdateReviewManifest {
+        schema: Token::new("bloom.policy-update-review/1").unwrap(),
+        operation_id: update.operation_id.clone(),
+        wallet_id: update.wallet_id.clone(),
+        baseline_version: update.baseline_version.clone(),
+        baseline_digest: update.baseline_digest.clone(),
+        proposed_policy_digest: update.proposed_policy_digest.clone(),
+        authority_diff_digest: update.authority_diff_digest.clone(),
+        authority_diff: PolicyAuthorityDiff {
+            maximum_approval_lifetime_ms_before: DecimalU64::new(100),
+            maximum_approval_lifetime_ms_after: DecimalU64::new(200),
+            added_petal_packages: vec![],
+            removed_petal_packages: vec![],
+            added_destinations: vec![],
+            removed_destinations: vec![],
+            added_required_verifiers: vec![],
+            removed_required_verifiers: vec![],
+        },
+        assurance_level: update.assurance_level.clone(),
+        issued_at_ms: DecimalU64::new(1_000),
+        expires_at_ms: DecimalU64::new(11_000),
+        broker_key_id: Token::new("broker-app-1").unwrap(),
+        broker_signature: Base64UrlBytes::from_bytes(&[1; 64]),
+    };
+    let review_digest = review.digest().unwrap();
+    let request = PolicyUpdateCeremonyPrepareRequest {
+        custody: CustodyPrepareRequest {
+            ceremony_kind: CeremonyKind::PolicyUpdate,
+            custody_operation_id: update.operation_id.clone(),
+            wallet_id: Some(update.wallet_id.clone()),
+            key_ref: None,
+            exact_terms_digest: update.terms_digest().unwrap(),
+            expected_input_class: Token::new("policy_update_credential_prf").unwrap(),
+            browser_output_recipient_key: None,
+        },
+        broker_validation_receipt: PolicyValidationReceipt {
+            update_terms_digest: update.terms_digest().unwrap(),
+            review_manifest_digest: review_digest.clone(),
+            broker_key_id: Token::new("broker-app-1").unwrap(),
+            broker_signature: Base64UrlBytes::from_bytes(&[2; 64]),
+        },
+        update,
+    };
+    let response = broker
+        .prepare_policy_update(request.clone(), review.clone(), 1_000)
+        .unwrap();
+    assert_eq!(response.ceremony_kind, CeremonyKind::PolicyUpdate);
+    assert_eq!(response.operation_id, request.update.operation_id);
+    assert_eq!(response.review_manifest_digest, review_digest);
+    assert!(response.ceremony_url.starts_with("http://localhost:18734/"));
+    assert_eq!(
+        broker
+            .prepare_policy_update(request.clone(), review.clone(), 1_001)
+            .unwrap()
+            .ceremony_url,
+        response.ceremony_url
+    );
+    assert_eq!(
+        broker
+            .prepare_custody(request.custody.clone(), 1_002)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::CeremonyKindMismatch
+    );
+    review.authority_diff_digest = digest("c4");
+    assert_eq!(
+        broker
+            .prepare_policy_update(request, review, 1_003)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::CeremonyKindMismatch
+    );
 }
 
 fn prepare(
@@ -398,7 +647,7 @@ fn prepare(
     broker
         .prepare_custody(
             CustodyPrepareRequest {
-                ceremony_kind: CeremonyKind::PolicyUpdate,
+                ceremony_kind: CeremonyKind::WalletDelete,
                 custody_operation_id: operation_id,
                 wallet_id,
                 key_ref: None,
@@ -411,10 +660,451 @@ fn prepare(
         .unwrap()
 }
 
-fn url_parts(url: &str) -> (String, String) {
-    let query = url.split("?ceremony=").nth(1).unwrap();
-    let (id, token) = query.split_once('#').unwrap();
-    (id.to_owned(), token.to_owned())
+fn url_token(url: &str) -> String {
+    url.strip_prefix("http://localhost:18734/ceremony/")
+        .unwrap()
+        .to_owned()
+}
+
+fn local_identity(service_id: &str, seed: [u8; 32], epoch: &str) -> LocalIdentity {
+    LocalIdentity {
+        service_id: Token::new(service_id).unwrap(),
+        boot_epoch: BootEpoch::new(epoch.repeat(16)).unwrap(),
+        application_key_id: Token::new(format!("{service_id}-app")).unwrap(),
+        signing_key: Arc::new(SigningKey::from_bytes(&seed)),
+    }
+}
+
+fn peer_acl(identity: &LocalIdentity, effective_uid: u32) -> PeerAcl {
+    PeerAcl {
+        effective_uid,
+        service_id: identity.service_id.clone(),
+        boot_epoch: identity.boot_epoch.clone(),
+        application_key_id: identity.application_key_id.clone(),
+        application_public_key: identity.signing_key.verifying_key().to_bytes(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_service_requires_completion_then_commits_and_replays_over_authenticated_rpc() {
+    let authenticator = VirtualAuthenticator::generate();
+    let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
+    let signer_engine = Arc::new(
+        SignerEngine::open_in_memory(
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
+            SigningKey::from_bytes(&[6; 32]).verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            registry,
+        )
+        .unwrap(),
+    );
+    let signer_ceremony = Arc::new(
+        SignerCeremonyService::new(
+            signer_engine.clone(),
+            Token::new("signer-ceremony-key").unwrap(),
+            SigningKey::from_bytes(&[9; 32]),
+        )
+        .unwrap(),
+    );
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    let socket_path = directory.path().join("signer.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+    let effective_uid = fs::metadata(directory.path()).unwrap().uid();
+    let broker_identity = local_identity("bloom-broker", [0x31; 32], "31");
+    let signer_identity = local_identity("bloom-signer", [0x32; 32], "32");
+    let signer_acl = peer_acl(&signer_identity, effective_uid);
+    let broker_acl = peer_acl(&broker_identity, effective_uid);
+    let signer_rpc = Arc::new(SignerRpcService::new(
+        signer_engine.clone(),
+        signer_ceremony.clone(),
+        signer_identity.boot_epoch.clone(),
+        digest("e2"),
+        "test",
+    ));
+    let signer_server = tokio::spawn({
+        let signer_identity = signer_identity.clone();
+        async move {
+            let quota = EndpointQuota::new(16, 1_000, 60_000, 1_000, 60_000).unwrap();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                bloom_triad_local_transport::dispatch_broker_signer_connection(
+                    &mut stream,
+                    &signer_identity,
+                    &broker_acl,
+                    &quota,
+                    signer_rpc.as_ref(),
+                )
+                .await
+                .unwrap();
+            }
+        }
+    });
+    let signer_client =
+        BrokerSignerClient::connect_unix(&socket_path, broker_identity.clone(), signer_acl)
+            .unwrap();
+
+    let journal =
+        Arc::new(BrokerJournal::open_in_memory(Arc::new(ServiceTestAuditSigner)).unwrap());
+    let authority = Arc::new(
+        BrokerAuthority::open_in_memory(
+            journal.clone(),
+            BTreeMap::new(),
+            Token::new("installer-key").unwrap(),
+            SigningKey::from_bytes(&[5; 32]).verifying_key(),
+            Token::new("signer-ceremony-key").unwrap(),
+            SigningKey::from_bytes(&[9; 32]).verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]).verifying_key(),
+            AssuranceRegistry::compiled(Vec::new()).unwrap(),
+        )
+        .unwrap(),
+    );
+    let ceremony = CeremonyBroker::open(
+        directory.path().join("ceremony.sqlite"),
+        Arc::new(signer_client.clone()),
+    )
+    .unwrap();
+    let broker = BrokerRpcService::new(
+        authority.clone(),
+        journal,
+        ceremony,
+        signer_client.clone(),
+        Token::new("broker-app-1").unwrap(),
+        SigningKey::from_bytes(&[7; 32]),
+        broker_identity.boot_epoch,
+        digest("e3"),
+        "test",
+    )
+    .unwrap();
+    let adoption_observer = Arc::new(FailOnceAdoptionObserver {
+        authority: authority.clone(),
+        custody_attempts: AtomicUsize::new(0),
+    });
+    broker
+        .ceremony()
+        .set_completion_observer(adoption_observer.clone(), now_ms)
+        .unwrap();
+
+    let registration_operation = operation("e1");
+    let registration = match MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::WalletRegistrationPrepare(CustodyPrepareRequest {
+            ceremony_kind: CeremonyKind::WalletRegistration,
+            custody_operation_id: registration_operation.clone(),
+            wallet_id: None,
+            key_ref: None,
+            exact_terms_digest: digest("a1"),
+            expected_input_class: Token::new("passkey-prf").unwrap(),
+            browser_output_recipient_key: None,
+        }),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::WalletRegistrationPrepare(prepared) => prepared,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let registration_token = url_token(&registration.ceremony_url);
+    let registration_id = broker
+        .ceremony()
+        .public_status(&registration_operation)
+        .unwrap()
+        .ceremony_id
+        .to_string();
+    let registration_app = broker.ceremony().router();
+    let session_response = registration_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", &registration_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let session: serde_json::Value = serde_json::from_slice(
+        &session_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    let first_challenge: CeremonyChallenge =
+        serde_json::from_value(session["challenges"][0]["binding"].clone()).unwrap();
+    let second_challenge: CeremonyChallenge =
+        serde_json::from_value(session["challenges"][1]["binding"].clone()).unwrap();
+    let contribution: CustodySignerContribution =
+        serde_json::from_value(session["signer_contribution"].clone()).unwrap();
+    let attestation = authenticator.attestation(&first_challenge.canonical_bytes().unwrap());
+    let assertion = authenticator.assertion(&second_challenge.canonical_bytes().unwrap(), 1);
+    let aad = CustodyHpkeAad {
+        ceremony_id: contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::WalletRegistration,
+        custody_operation_id: registration_operation,
+        signer_nonce: contribution.signer_nonce.clone(),
+        signer_contribution_digest: contribution.digest().unwrap(),
+        wallet_id: contribution.wallet_id.clone(),
+        key_ref: None,
+        credential_id: Some(attestation.credential_id.clone()),
+        expected_input_class: Token::new("passkey-prf").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &authenticator.deterministic_prf(),
+    )
+    .unwrap();
+    let registration_request = || {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/session/{registration_id}/complete"))
+            .header(header::HOST, "localhost:18734")
+            .header(header::ORIGIN, "http://localhost:18734")
+            .header("x-bloom-ceremony-token", &registration_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("sec-fetch-site", "same-origin")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "proof": {
+                        "kind": "registration",
+                        "attestation": attestation,
+                        "prf_assertion": assertion
+                    },
+                    "encrypted_input": encrypted_input,
+                    "public_binding_digest": digest("a1")
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+    let first_registration_response = registration_app
+        .clone()
+        .oneshot(registration_request())
+        .await
+        .unwrap();
+    assert_eq!(
+        first_registration_response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        broker.ceremony().status(&operation("e1")),
+        Some(CeremonyState::WalletCommitted)
+    );
+    assert_eq!(adoption_observer.custody_attempts.load(Ordering::SeqCst), 1);
+
+    let restarted_ceremony = CeremonyBroker::open(
+        directory.path().join("ceremony.sqlite"),
+        Arc::new(signer_client),
+    )
+    .unwrap();
+    restarted_ceremony
+        .set_completion_observer(adoption_observer.clone(), now_ms)
+        .unwrap();
+    assert_eq!(
+        restarted_ceremony.status(&operation("e1")),
+        Some(CeremonyState::Completed)
+    );
+    assert_eq!(adoption_observer.custody_attempts.load(Ordering::SeqCst), 2);
+
+    let registration_response = registration_app
+        .oneshot(registration_request())
+        .await
+        .unwrap();
+    assert_eq!(registration_response.status(), StatusCode::OK);
+    assert_eq!(adoption_observer.custody_attempts.load(Ordering::SeqCst), 3);
+    let registration_result: CustodyResult = serde_json::from_slice(
+        &registration_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    let wallet_id = registration_result.wallet_id.clone().unwrap();
+    let baseline = registration_result.initial_policy.clone().unwrap();
+    assert_eq!(authority.policy_snapshot(&wallet_id).unwrap(), baseline);
+
+    let baseline_policy: CanonicalWalletPolicy =
+        serde_json::from_slice(&baseline.canonical_policy.decode()).unwrap();
+    let mut proposed_policy = baseline_policy.clone();
+    proposed_policy.maximum_approval_lifetime_ms += 1;
+    proposed_policy
+        .allowed_destinations
+        .push(PolicyDestination {
+            chain: Token::new("ethereum").unwrap(),
+            destination: "0xexpanded-authority".into(),
+        });
+    let proposed_bytes = serde_jcs::to_vec(&proposed_policy).unwrap();
+    let authority_diff = canonical_policy_authority_diff(&baseline_policy, &proposed_policy);
+    let update = PolicyUpdateRequest {
+        operation_id: operation("e4"),
+        wallet_id: wallet_id.clone(),
+        baseline_version: baseline.version.clone(),
+        baseline_digest: baseline.policy_digest.clone(),
+        proposed_canonical_policy: Base64UrlBytes::from_bytes(&proposed_bytes),
+        proposed_policy_digest: Digest32::from_bytes(sha2::Sha256::digest(&proposed_bytes).into()),
+        authority_diff_digest: authority_diff.digest().unwrap(),
+        assurance_level: Token::new("user_verified").unwrap(),
+    };
+    let prepared = match MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::PolicyValidateUpdate(update.clone()),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::PolicyValidateUpdate(prepared) => prepared,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let premature = CustodyResult {
+        ceremony_kind: CeremonyKind::PolicyUpdate,
+        custody_operation_id: update.operation_id.clone(),
+        public_status: CeremonyState::Succeeded,
+        wallet_id: Some(wallet_id.clone()),
+        public_key_refs: Vec::new(),
+        credential_summaries: Vec::new(),
+        initial_policy: None,
+        receipt_digest: digest("e5"),
+        encrypted_browser_result: None,
+        signer_key_id: Token::new("signer-ceremony-key").unwrap(),
+        signer_signature: Base64UrlBytes::from_bytes(&[0; 64]),
+    };
+    assert!(
+        MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::PolicyCommitUpdate(PolicyCommitUpdateRequest {
+                operation_id: update.operation_id.clone(),
+                ceremony_receipt: premature,
+            }),
+        )
+        .await
+        .is_err()
+    );
+
+    let token = url_token(&prepared.ceremony_url);
+    let session_response = broker
+        .ceremony()
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let session: serde_json::Value = serde_json::from_slice(
+        &session_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        session["review_manifest"]["authority_diff"],
+        serde_json::to_value(&authority_diff).unwrap()
+    );
+    let challenge: CeremonyChallenge =
+        serde_json::from_value(session["challenges"][0]["binding"].clone()).unwrap();
+    let contribution: CustodySignerContribution =
+        serde_json::from_value(session["signer_contribution"].clone()).unwrap();
+    let assertion = authenticator.assertion(&challenge.canonical_bytes().unwrap(), 2);
+    let aad = CustodyHpkeAad {
+        ceremony_id: contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::PolicyUpdate,
+        custody_operation_id: update.operation_id.clone(),
+        signer_nonce: contribution.signer_nonce.clone(),
+        signer_contribution_digest: contribution.digest().unwrap(),
+        wallet_id: Some(wallet_id.clone()),
+        key_ref: None,
+        credential_id: Some(assertion.credential_id.clone()),
+        expected_input_class: Token::new("policy_update_credential_prf").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+        "effect": {"kind": "policy_update"},
+    }))
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )
+    .unwrap();
+    let completed = signer_ceremony
+        .complete_policy_update(
+            PolicyUpdateCeremonyCompleteRequest {
+                custody: CustodyCompleteRequest {
+                    ceremony_kind: CeremonyKind::PolicyUpdate,
+                    custody_operation_id: update.operation_id.clone(),
+                    ceremony_id: contribution.ceremony_id,
+                    proof: WebAuthnCeremonyProof::Assertion { assertion },
+                    encrypted_input: Some(encrypted_input),
+                    public_binding_digest: update.terms_digest().unwrap(),
+                },
+            },
+            now_ms + 1_000,
+        )
+        .unwrap();
+    broker
+        .ceremony()
+        .expire_sessions(contribution.expires_at_ms.get() + 1)
+        .unwrap();
+    let commit_request = PolicyCommitUpdateRequest {
+        operation_id: update.operation_id,
+        ceremony_receipt: completed,
+    };
+    let committed = match MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::PolicyCommitUpdate(commit_request.clone()),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::PolicyCommitUpdate(receipt) => receipt,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let replay = match MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::PolicyCommitUpdate(commit_request),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::PolicyCommitUpdate(receipt) => receipt,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    assert_eq!(replay, committed);
+    assert_eq!(committed.committed.version.get(), 2);
+    assert_eq!(
+        authority.policy_snapshot(&wallet_id).unwrap(),
+        committed.committed
+    );
+    signer_server.abort();
 }
 
 #[test]
@@ -437,7 +1127,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
     let conflicting = broker
         .prepare_custody(
             CustodyPrepareRequest {
-                ceremony_kind: CeremonyKind::PolicyUpdate,
+                ceremony_kind: CeremonyKind::WalletDelete,
                 custody_operation_id: operation("01"),
                 wallet_id: Some(Token::new("wallet-1").unwrap()),
                 key_ref: None,
@@ -453,7 +1143,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
         broker
             .prepare_custody(
                 CustodyPrepareRequest {
-                    ceremony_kind: CeremonyKind::PolicyUpdate,
+                    ceremony_kind: CeremonyKind::WalletDelete,
                     custody_operation_id: operation("02"),
                     wallet_id: Some(Token::new("wallet-1").unwrap()),
                     key_ref: None,
@@ -480,7 +1170,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
         broker
             .prepare_custody(
                 CustodyPrepareRequest {
-                    ceremony_kind: CeremonyKind::PolicyUpdate,
+                    ceremony_kind: CeremonyKind::WalletDelete,
                     custody_operation_id: operation("03"),
                     wallet_id: Some(Token::new("wallet-1").unwrap()),
                     key_ref: None,
@@ -523,12 +1213,12 @@ async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
         )
         .unwrap();
     assert_ne!(response.review_manifest_digest, digest("00"));
-    let (ceremony_id, token) = url_parts(&response.ceremony_url);
+    let token = url_token(&response.ceremony_url);
     let session = broker
         .router()
         .oneshot(
             Request::builder()
-                .uri(format!("/api/session/{ceremony_id}"))
+                .uri("/api/session")
                 .header(header::HOST, "localhost:18734")
                 .header("x-bloom-ceremony-token", token)
                 .body(Body::empty())
@@ -594,12 +1284,12 @@ async fn machine_asserted_reusable_plan_carries_primary_surface_warning() {
             now_ms,
         )
         .unwrap();
-    let (ceremony_id, token) = url_parts(&response.ceremony_url);
+    let token = url_token(&response.ceremony_url);
     let session = broker
         .router()
         .oneshot(
             Request::builder()
-                .uri(format!("/api/session/{ceremony_id}"))
+                .uri("/api/session")
                 .header(header::HOST, "localhost:18734")
                 .header("x-bloom-ceremony-token", token)
                 .body(Body::empty())
@@ -633,14 +1323,21 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         Some(Token::new("wallet-2").unwrap()),
         now_ms,
     );
-    let (ceremony_id, token) = url_parts(&prepared.ceremony_url);
+    let ceremony_id = broker
+        .public_status(&operation("11"))
+        .unwrap()
+        .ceremony_id
+        .to_string();
+    let token = url_token(&prepared.ceremony_url);
+    assert_eq!(token.len(), 43);
+    assert!(!prepared.ceremony_url.contains(['?', '#']));
     let app = broker.router();
 
     let response = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/")
+                .uri(format!("/ceremony/{token}"))
                 .header(header::HOST, "localhost:18734")
                 .body(Body::empty())
                 .unwrap(),
@@ -682,6 +1379,20 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         .unwrap();
     assert_eq!(no_token.status(), StatusCode::FORBIDDEN);
 
+    let session_by_launch_token = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", &token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session_by_launch_token.status(), StatusCode::OK);
+
     let session = app
         .clone()
         .oneshot(
@@ -697,7 +1408,7 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
     assert_eq!(session.status(), StatusCode::OK);
     let session_json: serde_json::Value =
         serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(session_json["ceremony_kind"], "policy_update");
+    assert_eq!(session_json["ceremony_kind"], "wallet_delete");
     assert!(session_json["challenges"][0]["challenge"].is_string());
 
     let body = serde_json::json!({
@@ -786,7 +1497,7 @@ fn restart_expires_nonterminal_session_and_persists_only_token_hash() {
         Some(Token::new("wallet-restart").unwrap()),
         50_000,
     );
-    let (_, token) = url_parts(&prepared.ceremony_url);
+    let token = url_token(&prepared.ceremony_url);
     drop(broker);
 
     let bytes = std::fs::read(&path).unwrap();
@@ -806,7 +1517,7 @@ fn restart_expires_nonterminal_session_and_persists_only_token_hash() {
     let error = restarted
         .prepare_custody(
             CustodyPrepareRequest {
-                ceremony_kind: CeremonyKind::PolicyUpdate,
+                ceremony_kind: CeremonyKind::WalletDelete,
                 custody_operation_id: operation("31"),
                 wallet_id: Some(Token::new("wallet-restart").unwrap()),
                 key_ref: None,
@@ -834,7 +1545,7 @@ fn rolling_creation_limits_survive_terminal_sessions_and_bound_anonymous_registr
     let error = broker
         .prepare_custody(
             CustodyPrepareRequest {
-                ceremony_kind: CeremonyKind::PolicyUpdate,
+                ceremony_kind: CeremonyKind::WalletDelete,
                 custody_operation_id: operation("f1"),
                 wallet_id: Some(wallet),
                 key_ref: None,
@@ -994,7 +1705,12 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
             now_ms,
         )
         .unwrap();
-    let (ceremony_id, token) = url_parts(&prepared.ceremony_url);
+    let ceremony_id = broker
+        .public_status(&operation_id)
+        .unwrap()
+        .ceremony_id
+        .to_string();
+    let token = url_token(&prepared.ceremony_url);
     let app = broker.router();
     let session_response = app
         .clone()
@@ -1095,7 +1811,12 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
             now_ms + 1_000,
         )
         .unwrap();
-    let (export_id, export_token) = url_parts(&export.ceremony_url);
+    let export_id = broker
+        .public_status(&export_operation)
+        .unwrap()
+        .ceremony_id
+        .to_string();
+    let export_token = url_token(&export.ceremony_url);
     let output_recipient = HpkeRecipient::generate();
     let export_app = broker.router();
     let bound = export_app

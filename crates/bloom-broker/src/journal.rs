@@ -1,6 +1,7 @@
 use bloom_triad_protocol::{
-    ApprovalLifecycleState, Base64UrlBytes, DecimalU256, Digest32, OperationId, OperationState,
-    ProtocolError, ProtocolErrorCode, SigningResult, Token, UnsignedSignRequest,
+    ApprovalLifecycleState, ApprovalLimitState, Base64UrlBytes, DecimalU64, DecimalU256, Digest32,
+    OperationId, OperationState, ProtocolError, ProtocolErrorCode, SigningResult, Token,
+    UnsignedSignRequest,
 };
 use num_bigint::BigUint;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -548,6 +549,57 @@ impl BrokerJournal {
             .transpose()
     }
 
+    pub fn approval_limit_state(
+        &self,
+        approval_id: &Digest32,
+    ) -> Result<ApprovalLimitState, JournalError> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare("SELECT state, signature_count FROM reservations WHERE approval_id = ?1")?;
+        let rows = statement.query_map([approval_id.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut committed_operations = 0_u64;
+        let mut reserved_operations = 0_u64;
+        let mut quarantined_operations = 0_u64;
+        let mut committed_signatures = 0_u64;
+        let mut reserved_signatures = 0_u64;
+        let mut quarantined_signatures = 0_u64;
+        for row in rows {
+            let (state, signatures) = row?;
+            let signatures = signatures.parse::<u64>().map_err(storage)?;
+            match state.as_str() {
+                "COMMITTED" => {
+                    committed_operations += 1;
+                    committed_signatures = committed_signatures.saturating_add(signatures);
+                }
+                "RESERVED" => {
+                    reserved_operations += 1;
+                    reserved_signatures = reserved_signatures.saturating_add(signatures);
+                }
+                "QUARANTINED" => {
+                    quarantined_operations += 1;
+                    quarantined_signatures = quarantined_signatures.saturating_add(signatures);
+                }
+                "RELEASED" => {}
+                _ => {
+                    return Err(JournalError::Storage(
+                        "reservation contains an unknown state".into(),
+                    ));
+                }
+            }
+        }
+        Ok(ApprovalLimitState {
+            approval_id: approval_id.clone(),
+            committed_operations: DecimalU64::new(committed_operations),
+            reserved_operations: DecimalU64::new(reserved_operations),
+            quarantined_operations: DecimalU64::new(quarantined_operations),
+            committed_signatures: DecimalU64::new(committed_signatures),
+            reserved_signatures: DecimalU64::new(reserved_signatures),
+            quarantined_signatures: DecimalU64::new(quarantined_signatures),
+        })
+    }
+
     pub fn begin_sign_attempt(
         &self,
         request: &UnsignedSignRequest,
@@ -906,6 +958,23 @@ impl BrokerJournal {
             .optional()?;
         value
             .map(|value| parse_reservation_state(&value))
+            .transpose()
+    }
+
+    pub fn reservation_signature_count(
+        &self,
+        approval_id: &Digest32,
+        operation_id: &OperationId,
+    ) -> Result<Option<u64>, JournalError> {
+        self.lock()?
+            .query_row(
+                "SELECT signature_count FROM reservations
+                 WHERE approval_id = ?1 AND operation_id = ?2",
+                params![approval_id.as_str(), operation_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| value.parse::<u64>().map_err(storage))
             .transpose()
     }
 
