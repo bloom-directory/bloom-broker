@@ -30,3 +30,31 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
+  privileged-w0:
+    name: privileged W0 listener ownership
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: bloom-directory/bloom
+          path: bloom
+      - name: Arrange sibling checkout
+        run: |
+          mv bloom ../bloom
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Build cross-UID canonical-listener test
+        id: w0-test
+        run: |
+          executable="$(
+            cargo test -p bloom-broker --test w0_listener_ownership \
+              --locked --no-run --message-format=json |
+              jq -r 'select(.profile.test == true and .target.name == "w0_listener_ownership") | .executable' |
+              tail -n 1
+          )"
+          test -n "$executable"
+          test -x "$executable"
+          echo "executable=$executable" >> "$GITHUB_OUTPUT"
+      - name: Run cross-UID canonical-listener test
+        run: sudo "${{ steps.w0-test.outputs.executable }}" --nocapture

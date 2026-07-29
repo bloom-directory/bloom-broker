@@ -34,6 +34,8 @@ use std::{
 pub const CEREMONY_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_734);
 pub const CEREMONY_ORIGIN: &str = "http://localhost:18734";
 pub const MAX_CEREMONY_BODY_BYTES: usize = 16 * 1024;
+pub const CEREMONY_OWNER_HEADER: &str = "x-bloom-ceremony-owner";
+pub const CEREMONY_OWNER_VALUE: &str = "bloom-broker-v1";
 pub const MAX_CONCURRENT_SESSIONS: usize = 16;
 const INVALID_ATTEMPT_LIMIT: u32 = 8;
 const CANCELLATION_BACKOFF_MS: u64 = 2_000;
@@ -602,7 +604,7 @@ impl CeremonyBroker {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/", get(shell))
-            .route("/ceremony/{token}", get(shell))
+            .route("/ceremony/{token}", get(ceremony_shell))
             .route("/assets/app.js", get(app_js))
             .route("/api/session", get(read_session_by_token))
             .route("/api/session/{ceremony_id}", get(read_session))
@@ -719,7 +721,9 @@ impl CeremonyBroker {
         let listener = StdTcpListener::bind(CEREMONY_ADDR).map_err(|error| {
             protocol(
                 ProtocolErrorCode::ServiceUnavailable,
-                format!("canonical ceremony listener {CEREMONY_ADDR} unavailable: {error}"),
+                format!(
+                    "fatal canonical ceremony listener ownership conflict at {CEREMONY_ADDR}; no fallback port will be used: {error}"
+                ),
             )
         })?;
         listener.set_nonblocking(true).map_err(|error| {
@@ -1353,6 +1357,24 @@ async fn shell(headers: HeaderMap) -> Response {
     Html(SHELL_HTML).into_response()
 }
 
+async fn ceremony_shell(
+    State(broker): State<CeremonyBroker>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if validate_host(&headers).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if broker.expire_sessions(unix_time_ms()).is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if broker.ceremony_for_encoded_token(&token).is_none() {
+        broker.record_invalid_browser_token();
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Html(SHELL_HTML).into_response()
+}
+
 async fn app_js(headers: HeaderMap) -> Response {
     if validate_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
@@ -1728,24 +1750,27 @@ async fn cancel_session(
 }
 
 impl CeremonyBroker {
+    fn ceremony_for_encoded_token(&self, encoded: &str) -> Option<String> {
+        let supplied = Base64UrlBytes::parse(encoded.to_owned())
+            .ok()
+            .filter(|value| value.decode().len() == 32)?;
+        let hash = <[u8; 32]>::from(Sha256::digest(supplied.decode()));
+        self.inner
+            .sessions
+            .lock()
+            .iter()
+            .find_map(|(ceremony_id, session)| {
+                (session.token_hash == hash).then(|| ceremony_id.clone())
+            })
+    }
+
     fn authorize_browser_token(&self, headers: &HeaderMap) -> Result<String, ProtocolError> {
         self.expire_sessions(unix_time_ms())?;
         validate_host(headers)?;
-        let supplied = headers
+        let ceremony_id = headers
             .get("x-bloom-ceremony-token")
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| Base64UrlBytes::parse(value.to_owned()).ok())
-            .filter(|value| value.decode().len() == 32);
-        let supplied_hash = supplied.map(|token| <[u8; 32]>::from(Sha256::digest(token.decode())));
-        let ceremony_id = supplied_hash.and_then(|hash| {
-            self.inner
-                .sessions
-                .lock()
-                .iter()
-                .find_map(|(ceremony_id, session)| {
-                    (session.token_hash == hash).then(|| ceremony_id.clone())
-                })
-        });
+            .and_then(|value| self.ceremony_for_encoded_token(value));
         if let Some(ceremony_id) = ceremony_id {
             return Ok(ceremony_id);
         }
@@ -1813,6 +1838,14 @@ impl CeremonyBroker {
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
+    // This marker is diagnostic only. It lets a Machine whose authenticated
+    // Unix edge is unavailable report that a Bloom-shaped listener appears to
+    // occupy the canonical port. It conveys no authority, can be imitated by
+    // a foreign process, and never substitutes for the session token.
+    headers.insert(
+        HeaderName::from_static(CEREMONY_OWNER_HEADER),
+        HeaderValue::from_static(CEREMONY_OWNER_VALUE),
+    );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
     headers.insert(

@@ -7,8 +7,8 @@ use bloom_broker::{
         AssuranceRegistry, BrokerAuthority, CanonicalWalletPolicy, canonical_policy_authority_diff,
     },
     ceremony::{
-        CEREMONY_ADDR, CeremonyBroker, CeremonyCompletionObserver, CeremonySigner,
-        ReviewManifestContext,
+        CEREMONY_ADDR, CEREMONY_OWNER_HEADER, CEREMONY_OWNER_VALUE, CeremonyBroker,
+        CeremonyCompletionObserver, CeremonySigner, ReviewManifestContext,
     },
     journal::{AuditSigner, BrokerJournal},
     service::BrokerRpcService,
@@ -1445,10 +1445,31 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     assert_eq!(response.headers()["x-frame-options"], "DENY");
+    assert_eq!(
+        response.headers()[CEREMONY_OWNER_HEADER],
+        CEREMONY_OWNER_VALUE
+    );
     assert!(
         response
             .headers()
             .contains_key(header::CONTENT_SECURITY_POLICY)
+    );
+    let unknown_token = Base64UrlBytes::from_bytes(&[99; 32]);
+    let unknown = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/ceremony/{}", unknown_token.encoded()))
+                .header(header::HOST, "localhost:18734")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        unknown.status(),
+        StatusCode::NOT_FOUND,
+        "another local user cannot discover a ceremony without its 256-bit token"
     );
 
     let wrong_host = app
