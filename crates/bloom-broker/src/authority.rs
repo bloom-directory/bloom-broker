@@ -2,6 +2,7 @@ use crate::journal::{
     BrokerJournal, BudgetLimits, JournalError, ReservationRequest, SlidingBudgetLimit,
     SlidingValueLimit,
 };
+pub use bloom_triad_protocol::ProvenanceSubject;
 use bloom_triad_protocol::{
     ApprovalLifecycleState, ApprovalSelector, ApprovalSubject, ApprovalTombstone, Base64UrlBytes,
     ClaimAssurance, ClaimAssuranceLevel, CryptoSuite, DeclaredFee, Digest32, MachineSignRequest,
@@ -78,23 +79,6 @@ pub struct ProvenanceRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ProvenanceSubject {
-    Petal {
-        package_hash: Digest32,
-        route: String,
-    },
-    Cli {
-        client_id: Token,
-        command_class: Token,
-    },
-    System {
-        component_id: Token,
-        operation_class: Token,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceOperationClass {
     pub operation_class: Token,
@@ -125,10 +109,7 @@ pub struct CeremonyApprovalGrant {
 
 #[derive(Clone, Debug)]
 pub struct AuthorizationInput {
-    pub operation_id: OperationId,
     pub request: MachineSignRequest,
-    pub claim_nonce: Option<bloom_triad_protocol::RequestNonce>,
-    pub provenance: Option<ProvenanceRecord>,
     pub reserved_at_ms: u64,
 }
 
@@ -160,7 +141,7 @@ pub struct VerifierCapability {
 /// There is deliberately no path, library name, or runtime loading API.
 pub trait AssuranceVerifier: Send + Sync {
     fn capability(&self) -> VerifierCapability;
-    fn verify(&self, claim: &PetalUseClaim) -> Result<(), String>;
+    fn verify(&self, claim: &PetalUseClaim, evidence: Option<&[u8]>) -> Result<(), String>;
 }
 
 #[derive(Default)]
@@ -194,7 +175,11 @@ impl AssuranceRegistry {
             .collect()
     }
 
-    fn verify(&self, claim: &PetalUseClaim) -> Result<Option<VerifierCapability>, AuthorityError> {
+    fn verify(
+        &self,
+        claim: &PetalUseClaim,
+        evidence: Option<&[u8]>,
+    ) -> Result<Option<VerifierCapability>, AuthorityError> {
         match &claim.claim_assurance {
             ClaimAssurance::MachineAsserted => Ok(None),
             ClaimAssurance::ProofVerified {
@@ -221,7 +206,7 @@ impl AssuranceRegistry {
                     ));
                 }
                 verifier
-                    .verify(claim)
+                    .verify(claim, evidence)
                     .map_err(|message| denied("ASSURANCE_VERIFICATION_FAILED", message))?;
                 Ok(Some(verifier.capability()))
             }
@@ -248,7 +233,7 @@ impl AssuranceRegistry {
                     ));
                 }
                 verifier
-                    .verify(claim)
+                    .verify(claim, evidence)
                     .map_err(|message| denied("ASSURANCE_VERIFICATION_FAILED", message))?;
                 Ok(Some(verifier.capability()))
             }
@@ -353,6 +338,11 @@ impl BrokerAuthority {
                 epoch TEXT NOT NULL,
                 reconciled INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS provenance_catalog (
+                subject_jcs TEXT PRIMARY KEY,
+                record_digest TEXT NOT NULL,
+                record_jcs TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS mutation_quota (
                 principal TEXT PRIMARY KEY,
                 window_started_ms TEXT NOT NULL,
@@ -444,7 +434,6 @@ impl BrokerAuthority {
         &self,
         terms: &SealedApprovalTerms,
         review_manifest_digest: &Digest32,
-        provenance: Option<&ProvenanceRecord>,
     ) -> Result<Digest32, AuthorityError> {
         let _barrier = self.lock_authorization_barrier()?;
         terms
@@ -485,14 +474,9 @@ impl BrokerAuthority {
                 "approval epoch differs from Broker's reconciled wallet epoch",
             ));
         }
-        let record = provenance.ok_or_else(|| {
-            denied(
-                "PROVENANCE_REQUIRED",
-                "every approval requires current installer-signed provenance",
-            )
-        })?;
+        let record = self.catalog_provenance(&subject_for(&terms.subject))?;
         verify_provenance(
-            record,
+            &record,
             &self.installer_key_id,
             &self.installer_key,
             &terms.provenance_digest,
@@ -532,7 +516,7 @@ impl BrokerAuthority {
                 ));
             }
         }
-        let provenance_jcs = serde_jcs::to_string(record).map_err(storage)?;
+        let provenance_jcs = serde_jcs::to_string(&record).map_err(storage)?;
         if let Some(predecessor) = &terms.renewal_of {
             let predecessor_terms = self
                 .approval_terms(predecessor)?
@@ -555,6 +539,33 @@ impl BrokerAuthority {
             terms.renewal_of.as_ref(),
         )?;
         Ok(approval_id)
+    }
+
+    /// Replace the current installer-owned catalog entry for one exact
+    /// provenance subject. Machine callers cannot reach this method; the
+    /// installer supplies records out of band and Broker verifies them before
+    /// making them current.
+    pub fn install_provenance(
+        &self,
+        record: &ProvenanceRecord,
+    ) -> Result<Digest32, AuthorityError> {
+        let _barrier = self.lock_authorization_barrier()?;
+        let digest = Digest32::from_bytes(
+            Sha256::digest(serde_jcs::to_vec(record).map_err(storage)?).into(),
+        );
+        verify_provenance(record, &self.installer_key_id, &self.installer_key, &digest)?;
+        let subject_jcs = serde_jcs::to_string(&record.subject).map_err(storage)?;
+        let record_jcs = serde_jcs::to_string(record).map_err(storage)?;
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO provenance_catalog(subject_jcs, record_digest, record_jcs)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(subject_jcs) DO UPDATE SET
+                record_digest=excluded.record_digest,
+                record_jcs=excluded.record_jcs",
+            params![subject_jcs, digest.as_str(), record_jcs],
+        )?;
+        Ok(digest)
     }
 
     pub fn activate_approval(
@@ -698,19 +709,21 @@ impl BrokerAuthority {
             .iter()
             .map(|payload| suite_hash(input.request.crypto_suite, payload))
             .collect();
-        let current_provenance = input.provenance.as_ref().ok_or_else(|| {
-            denied(
-                "PROVENANCE_REQUIRED",
-                "each use must carry current installer-signed provenance",
-            )
-        })?;
+        let current_provenance = self.catalog_provenance(&input.request.provenance)?;
+        let frozen_provenance = self.frozen_provenance_for(&terms)?;
         verify_provenance(
-            current_provenance,
+            &current_provenance,
             &self.installer_key_id,
             &self.installer_key,
             &terms.provenance_digest,
         )?;
-        if current_provenance != &self.provenance_for(&terms)?
+        if current_provenance != frozen_provenance {
+            return Err(denied(
+                "PROVENANCE_MISMATCH",
+                "current installer catalog record differs from the approval-frozen record",
+            ));
+        }
+        if current_provenance.subject != input.request.provenance
             || !provenance_subject_matches(&terms.subject, &current_provenance.subject)
         {
             return Err(denied(
@@ -758,7 +771,7 @@ impl BrokerAuthority {
                     &ordered_hashes,
                 )?;
                 (
-                    account_claim_values(&terms, claim, current_provenance)?,
+                    account_claim_values(&terms, claim, &current_provenance)?,
                     Some(claim.claim_assurance.clone()),
                     declared_fee_asset(claim),
                 )
@@ -783,7 +796,7 @@ impl BrokerAuthority {
             .map(|claim| jcs_digest(&claim.claim_assurance))
             .transpose()?;
         let operation_digest = SignOperationIdentity {
-            operation_id: input.operation_id.clone(),
+            operation_id: input.request.operation_id.clone(),
             approval_id: input.request.approval_id.clone(),
             key_ref: input.request.key_ref.clone(),
             crypto_suite: input.request.crypto_suite,
@@ -805,7 +818,7 @@ impl BrokerAuthority {
         let reservation = self.journal.reserve(
             &ReservationRequest {
                 approval_id: input.request.approval_id.clone(),
-                operation_id: input.operation_id.clone(),
+                operation_id: input.request.operation_id.clone(),
                 operation_digest,
                 signature_count: ordered_hashes.len() as u64,
                 reserved_at_ms: input.reserved_at_ms,
@@ -855,7 +868,6 @@ impl BrokerAuthority {
             || !terms.allowed_crypto_suites.contains(&claim.crypto_suite)
             || claim.payload_digest != combined_payload_digest(payload_digests)
             || claim.ordered_hashes != ordered_hashes
-            || input.claim_nonce.as_ref() != Some(&claim.nonce)
         {
             return Err(denied(
                 "PETAL_CLAIM_MISMATCH",
@@ -879,7 +891,12 @@ impl BrokerAuthority {
                 "claim does not use a verifier required by wallet policy",
             ));
         }
-        let capability = self.assurance.verify(claim)?;
+        let evidence = input
+            .request
+            .claim_assurance_evidence
+            .as_ref()
+            .map(Base64UrlBytes::decode);
+        let capability = self.assurance.verify(claim, evidence.as_deref())?;
         if (required_assurance != ClaimAssuranceLevel::MachineAsserted
             || !policy.required_verifiers.is_empty())
             && capability
@@ -1224,7 +1241,7 @@ impl BrokerAuthority {
             })
     }
 
-    fn provenance_for(
+    fn frozen_provenance_for(
         &self,
         terms: &SealedApprovalTerms,
     ) -> Result<ProvenanceRecord, AuthorityError> {
@@ -1236,6 +1253,28 @@ impl BrokerAuthority {
             .ok_or_else(|| denied("APPROVAL_NOT_FOUND", "approval has no durable record"))?
             .provenance_jcs
             .ok_or_else(|| denied("PROVENANCE_REQUIRED", "approval has no frozen provenance"))
+            .and_then(|value| serde_json::from_str(&value).map_err(storage))
+    }
+
+    fn catalog_provenance(
+        &self,
+        subject: &ProvenanceSubject,
+    ) -> Result<ProvenanceRecord, AuthorityError> {
+        let subject_jcs = serde_jcs::to_string(subject).map_err(storage)?;
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT record_jcs FROM provenance_catalog WHERE subject_jcs = ?1",
+                [subject_jcs],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                denied(
+                    "PROVENANCE_REQUIRED",
+                    "subject is absent from Broker's installer-owned current catalog",
+                )
+            })
             .and_then(|value| serde_json::from_str(&value).map_err(storage))
     }
 
@@ -1400,6 +1439,33 @@ fn provenance_subject_matches(approval: &ApprovalSubject, provenance: &Provenanc
             },
         ) => component_id == installed_id && operation_class == installed_class,
         _ => false,
+    }
+}
+
+fn subject_for(approval: &ApprovalSubject) -> ProvenanceSubject {
+    match approval {
+        ApprovalSubject::Petal {
+            package_hash,
+            route,
+            ..
+        } => ProvenanceSubject::Petal {
+            package_hash: package_hash.clone(),
+            route: route.clone(),
+        },
+        ApprovalSubject::Cli {
+            client_id,
+            command_class,
+        } => ProvenanceSubject::Cli {
+            client_id: client_id.clone(),
+            command_class: command_class.clone(),
+        },
+        ApprovalSubject::System {
+            component_id,
+            operation_class,
+        } => ProvenanceSubject::System {
+            component_id: component_id.clone(),
+            operation_class: operation_class.clone(),
+        },
     }
 }
 

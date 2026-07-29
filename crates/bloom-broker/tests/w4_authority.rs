@@ -18,7 +18,8 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Barrier},
+    sync::{Arc, Barrier, mpsc},
+    time::Duration,
 };
 
 const POLICY_DOMAIN: &[u8] = b"bloom-policy-snapshot/v1";
@@ -72,7 +73,7 @@ impl AssuranceVerifier for BlockingProofVerifier {
         }
     }
 
-    fn verify(&self, claim: &PetalUseClaim) -> Result<(), String> {
+    fn verify(&self, claim: &PetalUseClaim, _evidence: Option<&[u8]>) -> Result<(), String> {
         if !matches!(claim.claim_assurance, ClaimAssurance::ProofVerified { .. }) {
             return Err("proof required".into());
         }
@@ -92,7 +93,10 @@ impl AssuranceVerifier for TestProofVerifier {
         }
     }
 
-    fn verify(&self, claim: &PetalUseClaim) -> Result<(), String> {
+    fn verify(&self, claim: &PetalUseClaim, evidence: Option<&[u8]>) -> Result<(), String> {
+        if evidence != Some(b"proof-evidence".as_slice()) {
+            return Err("proof evidence was not forwarded intact".into());
+        }
         match &claim.claim_assurance {
             ClaimAssurance::ProofVerified { proof_digest, .. } if proof_digest == &digest(3) => {
                 Ok(())
@@ -260,10 +264,10 @@ impl Harness {
 
     fn activate(&self, terms: &SealedApprovalTerms, provenance: Option<&ProvenanceRecord>) {
         let review = digest(7);
-        let approval_id = self
-            .authority
-            .prepare_approval(terms, &review, provenance)
+        self.authority
+            .install_provenance(provenance.expect("test approval provenance"))
             .unwrap();
+        let approval_id = self.authority.prepare_approval(terms, &review).unwrap();
         let grant = self.signed_grant(terms, approval_id, operation(3));
         self.authority.activate_approval(&grant, 1_500).unwrap();
         self.authority.activate_approval(&grant, 1_500).unwrap();
@@ -388,6 +392,114 @@ fn ac08_exact_selector_rejects_payload_hash_order_count_key_and_suite_changes() 
 }
 
 #[test]
+fn authorization_rechecks_broker_owned_current_provenance_catalog() {
+    let harness = Harness::new();
+    let provenance = harness.provenance();
+    let terms = petal_terms(&harness, &provenance);
+    harness.activate(&terms, Some(&provenance));
+
+    let mut replacement = provenance.clone();
+    replacement.publisher = token("replacement-publisher");
+    replacement.installer_signature = Base64UrlBytes::from_bytes(&[]);
+    sign_zeroed(
+        &mut replacement,
+        |value| &mut value.installer_signature,
+        PROVENANCE_DOMAIN,
+        &harness.installer_key,
+    );
+    harness.authority.install_provenance(&replacement).unwrap();
+
+    let input = petal_input(
+        &terms,
+        &provenance,
+        operation(20),
+        CryptoSuite::Secp256k1Sha256Recoverable,
+    );
+    assert!(
+        error_code(harness.authority.authorize(&input).unwrap_err())
+            .contains("PROVENANCE_MISMATCH")
+    );
+}
+
+#[test]
+fn provenance_rotation_linearizes_with_authorization_reservation() {
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let harness = Harness::new_with_verifiers(vec![Arc::new(BlockingProofVerifier {
+        entered: entered.clone(),
+        release: release.clone(),
+    })]);
+    let provenance = harness.provenance();
+    let mut terms = petal_terms(&harness, &provenance);
+    if let ApprovalSelector::Petal {
+        required_claim_assurance,
+        ..
+    } = &mut terms.selector
+    {
+        *required_claim_assurance = ClaimAssuranceLevel::ProofVerified;
+    }
+    harness.activate(&terms, Some(&provenance));
+    let mut input = petal_input(
+        &terms,
+        &provenance,
+        operation(19),
+        CryptoSuite::Secp256k1Sha256Recoverable,
+    );
+    input
+        .request
+        .petal_use_claim
+        .as_mut()
+        .unwrap()
+        .claim_assurance = ClaimAssurance::ProofVerified {
+        verifier_id: token("test-proof"),
+        verifier_digest: digest(2),
+        proof_digest: digest(3),
+    };
+    bind_operation_digest(&mut input, &terms);
+
+    let mut replacement = provenance.clone();
+    replacement.publisher = token("replacement-publisher");
+    replacement.installer_signature = Base64UrlBytes::from_bytes(&[]);
+    sign_zeroed(
+        &mut replacement,
+        |value| &mut value.installer_signature,
+        PROVENANCE_DOMAIN,
+        &harness.installer_key,
+    );
+    let authority = Arc::new(harness.authority);
+    let authorizing = {
+        let authority = authority.clone();
+        std::thread::spawn(move || authority.authorize(&input))
+    };
+    entered.wait();
+    let (rotated_tx, rotated_rx) = mpsc::channel();
+    let rotating = {
+        let authority = authority.clone();
+        std::thread::spawn(move || {
+            let result = authority.install_provenance(&replacement);
+            rotated_tx.send(()).unwrap();
+            result
+        })
+    };
+    assert!(
+        rotated_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+        "catalog rotation must wait for the in-flight authorization reservation"
+    );
+    release.wait();
+    authorizing.join().unwrap().unwrap();
+    rotating.join().unwrap().unwrap();
+    rotated_rx.recv().unwrap();
+
+    let denied = petal_input(
+        &terms,
+        &provenance,
+        operation(18),
+        CryptoSuite::Secp256k1Sha256Recoverable,
+    );
+    assert!(error_code(authority.authorize(&denied).unwrap_err()).contains("PROVENANCE_MISMATCH"));
+}
+
+#[test]
 fn ac09_ac29_ac30_petal_claim_fee_and_multi_suite_are_fail_closed() {
     let harness = Harness::new();
     let provenance = harness.provenance();
@@ -413,7 +525,6 @@ fn ac09_ac29_ac30_petal_claim_fee_and_multi_suite_are_fail_closed() {
         .as_mut()
         .unwrap()
         .nonce = nonce(99);
-    conflicting_retry.claim_nonce = Some(nonce(99));
     bind_operation_digest(&mut conflicting_retry, &terms);
     assert!(
         error_code(harness.authority.authorize(&conflicting_retry).unwrap_err())
@@ -517,6 +628,7 @@ fn assurance_contract_fields_and_proof_evidence_are_enforced() {
         verifier_digest: digest(2),
         proof_digest: digest(3),
     };
+    input.request.claim_assurance_evidence = Some(Base64UrlBytes::from_bytes(b"proof-evidence"));
     bind_operation_digest(&mut input, &terms);
     assert!(
         error_code(incomplete.authority.authorize(&input).unwrap_err())
@@ -552,6 +664,7 @@ fn assurance_contract_fields_and_proof_evidence_are_enforced() {
         verifier_digest: digest(2),
         proof_digest: digest(3),
     };
+    verified.request.claim_assurance_evidence = Some(Base64UrlBytes::from_bytes(b"proof-evidence"));
     bind_operation_digest(&mut verified, &terms);
     complete.authority.authorize(&verified).unwrap();
     let mut altered = petal_input(
@@ -570,6 +683,7 @@ fn assurance_contract_fields_and_proof_evidence_are_enforced() {
         verifier_digest: digest(2),
         proof_digest: digest(4),
     };
+    altered.request.claim_assurance_evidence = Some(Base64UrlBytes::from_bytes(b"proof-evidence"));
     bind_operation_digest(&mut altered, &terms);
     assert!(
         error_code(complete.authority.authorize(&altered).unwrap_err())
@@ -592,11 +706,11 @@ fn concurrent_renewal_has_one_atomic_winner_and_never_reactivates_predecessor() 
     second.request_nonce = nonce(11);
     let first_id = harness
         .authority
-        .prepare_approval(&first, &digest(7), Some(&provenance))
+        .prepare_approval(&first, &digest(7))
         .unwrap();
     let second_id = harness
         .authority
-        .prepare_approval(&second, &digest(7), Some(&provenance))
+        .prepare_approval(&second, &digest(7))
         .unwrap();
     let first_grant = harness.signed_grant(&first, first_id, operation(70));
     let second_grant = harness.signed_grant(&second, second_id, operation(71));
@@ -779,7 +893,7 @@ fn quotas_leave_reads_available_and_revocation_reconciliation_is_monotonic() {
         error_code(
             harness
                 .authority
-                .prepare_approval(&epoch_two_terms, &digest(7), Some(&provenance))
+                .prepare_approval(&epoch_two_terms, &digest(7))
                 .unwrap_err()
         )
         .contains("REVOCATION_EPOCH_UNRECONCILED")
@@ -793,7 +907,7 @@ fn quotas_leave_reads_available_and_revocation_reconciliation_is_monotonic() {
     );
     harness
         .authority
-        .prepare_approval(&epoch_two_terms, &digest(7), Some(&provenance))
+        .prepare_approval(&epoch_two_terms, &digest(7))
         .unwrap();
     let mut forged =
         signed_revocation_with_tombstones(&harness, 3, std::slice::from_ref(&tombstone));
@@ -815,11 +929,7 @@ fn quotas_leave_reads_available_and_revocation_reconciliation_is_monotonic() {
     assert!(
         reverse
             .authority
-            .prepare_approval(
-                &epoch_one_terms,
-                &digest(7),
-                Some(&reverse.system_provenance()),
-            )
+            .prepare_approval(&epoch_one_terms, &digest(7))
             .is_err()
     );
     assert_eq!(
@@ -831,19 +941,14 @@ fn quotas_leave_reads_available_and_revocation_reconciliation_is_monotonic() {
     );
     reverse
         .authority
-        .prepare_approval(
-            &epoch_one_terms,
-            &digest(7),
-            Some(&reverse.system_provenance()),
-        )
+        .prepare_approval(&epoch_one_terms, &digest(7))
         .unwrap();
 
     let stale = Harness::new();
     let stale_terms = exact_terms(&stale, b"stale");
-    let stale_provenance = stale.system_provenance();
     let stale_id = stale
         .authority
-        .prepare_approval(&stale_terms, &digest(7), Some(&stale_provenance))
+        .prepare_approval(&stale_terms, &digest(7))
         .unwrap();
     let stale_grant = stale.signed_grant(&stale_terms, stale_id, operation(77));
     stale
@@ -876,16 +981,16 @@ fn quotas_leave_reads_available_and_revocation_reconciliation_is_monotonic() {
     assert!(
         preempted
             .authority
-            .prepare_approval(
-                &preempted_terms,
-                &digest(7),
-                Some(&preempted.system_provenance()),
-            )
+            .prepare_approval(&preempted_terms, &digest(7))
             .is_err()
     );
 }
 
 fn exact_terms(harness: &Harness, payload: &[u8]) -> SealedApprovalTerms {
+    harness
+        .authority
+        .install_provenance(&harness.system_provenance())
+        .unwrap();
     let hash = Digest32::from_bytes(Sha256::digest(payload).into());
     SealedApprovalTerms {
         subject: ApprovalSubject::System {
@@ -922,6 +1027,7 @@ fn exact_terms(harness: &Harness, payload: &[u8]) -> SealedApprovalTerms {
 }
 
 fn petal_terms(harness: &Harness, provenance: &ProvenanceRecord) -> SealedApprovalTerms {
+    harness.authority.install_provenance(provenance).unwrap();
     let (package_hash, route) = match &provenance.subject {
         ProvenanceSubject::Petal {
             package_hash,
@@ -979,8 +1085,8 @@ fn exact_input(
     payload: &[u8],
 ) -> AuthorizationInput {
     let mut input = AuthorizationInput {
-        operation_id,
         request: MachineSignRequest {
+            operation_id,
             operation_digest: digest(5),
             approval_id: terms.approval_id().unwrap(),
             key_ref: terms.key_ref.clone(),
@@ -989,9 +1095,9 @@ fn exact_input(
                 payload: Base64UrlBytes::from_bytes(payload),
             },
             petal_use_claim: None,
+            claim_assurance_evidence: None,
+            provenance: harness.system_provenance().subject,
         },
-        claim_nonce: None,
-        provenance: Some(harness.system_provenance()),
         reserved_at_ms: 1_500,
     };
     bind_operation_digest(&mut input, terms);
@@ -1005,8 +1111,8 @@ fn exact_batch_input(
     payloads: &[&[u8]],
 ) -> AuthorizationInput {
     let mut input = AuthorizationInput {
-        operation_id,
         request: MachineSignRequest {
+            operation_id,
             operation_digest: digest(5),
             approval_id: terms.approval_id().unwrap(),
             key_ref: terms.key_ref.clone(),
@@ -1018,9 +1124,9 @@ fn exact_batch_input(
                     .collect(),
             },
             petal_use_claim: None,
+            claim_assurance_evidence: None,
+            provenance: harness.system_provenance().subject,
         },
-        claim_nonce: None,
-        provenance: Some(harness.system_provenance()),
         reserved_at_ms: 1_500,
     };
     bind_operation_digest(&mut input, terms);
@@ -1051,8 +1157,8 @@ fn petal_input(
     };
     let claim_nonce = nonce(operation_id.to_bytes()[31]);
     let mut input = AuthorizationInput {
-        operation_id,
         request: MachineSignRequest {
+            operation_id,
             operation_digest: digest(5),
             approval_id: terms.approval_id().unwrap(),
             key_ref: terms.key_ref.clone(),
@@ -1095,9 +1201,9 @@ fn petal_input(
                 nonce: claim_nonce.clone(),
                 claim_assurance: ClaimAssurance::MachineAsserted,
             }),
+            claim_assurance_evidence: None,
+            provenance: provenance.subject.clone(),
         },
-        claim_nonce: Some(claim_nonce),
-        provenance: Some(provenance.clone()),
         reserved_at_ms: 1_500,
     };
     bind_operation_digest(&mut input, terms);
@@ -1134,7 +1240,7 @@ fn bind_operation_digest(input: &mut AuthorizationInput, terms: &SealedApprovalT
         )
     });
     input.request.operation_digest = SignOperationIdentity {
-        operation_id: input.operation_id.clone(),
+        operation_id: input.request.operation_id.clone(),
         approval_id: input.request.approval_id.clone(),
         key_ref: input.request.key_ref.clone(),
         crypto_suite: input.request.crypto_suite,
