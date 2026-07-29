@@ -1,0 +1,1675 @@
+use bloom_triad_protocol::{
+    ApprovalLifecycleState, Base64UrlBytes, DecimalU256, Digest32, OperationId, OperationState,
+    ProtocolError, ProtocolErrorCode, SigningResult, Token, UnsignedSignRequest,
+};
+use num_bigint::BigUint;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    str::FromStr,
+    sync::{Arc, Mutex, MutexGuard},
+};
+
+const AUDIT_DOMAIN: &[u8] = b"bloom-broker-audit/v1";
+const AUDIT_SIGNATURE_DOMAIN: &[u8] = b"bloom-broker-audit-signature/v1";
+const ATTEMPT_BINDING_DOMAIN: &[u8] = b"bloom-broker-attempt-binding/v1";
+const BATCH_CHILD_DOMAIN: &[u8] = b"bloom-batch-child/v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurablePoint {
+    ApprovalTransition,
+    OperationReceived,
+    OperationTransition,
+    ReservationCreated,
+    ReservationFinalized,
+    BatchPublished,
+}
+
+pub trait FaultHook: Send + Sync {
+    fn after_durable(&self, point: DurablePoint) -> Result<(), String>;
+}
+
+pub trait AuditSigner: Send + Sync {
+    fn key_id(&self) -> Token;
+    fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String>;
+    fn verify(
+        &self,
+        key_id: &Token,
+        message: &[u8],
+        signature: &Base64UrlBytes,
+    ) -> Result<(), String>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum JournalError {
+    #[error("{0}")]
+    Protocol(#[from] ProtocolError),
+    #[error("durable transition completed before injected crash at {point:?}: {message}")]
+    InjectedCrash {
+        point: DurablePoint,
+        message: String,
+    },
+    #[error("journal storage failure: {0}")]
+    Storage(String),
+}
+
+impl From<rusqlite::Error> for JournalError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationSnapshot {
+    pub operation_id: OperationId,
+    pub operation_digest: Digest32,
+    pub state: OperationState,
+    pub is_batch: bool,
+    pub retry_binding_digest: Digest32,
+    pub result: Option<SigningResult>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReservationState {
+    Reserved,
+    Committed,
+    Released,
+    Quarantined,
+}
+
+impl ReservationState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "RESERVED",
+            Self::Committed => "COMMITTED",
+            Self::Released => "RELEASED",
+            Self::Quarantined => "QUARANTINED",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReservationRequest {
+    pub approval_id: Digest32,
+    pub operation_id: OperationId,
+    pub signature_count: u64,
+    pub reserved_at_ms: u64,
+    pub values: BTreeMap<String, DecimalU256>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BudgetLimits {
+    pub max_operations: u64,
+    pub max_signatures: u64,
+    pub rate_limits: Vec<SlidingBudgetLimit>,
+    pub value_limits: BTreeMap<String, DecimalU256>,
+    pub rolling_value_limits: Vec<SlidingValueLimit>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlidingBudgetLimit {
+    pub max_operations: u64,
+    pub max_signatures: u64,
+    pub duration_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlidingValueLimit {
+    pub asset_id: String,
+    pub maximum: DecimalU256,
+    pub duration_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimeReading {
+    pub utc_ms: Option<u64>,
+    pub monotonic_elapsed_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClockCondition {
+    Healthy,
+    ForwardJumpRejected,
+    Untrusted,
+    RollbackFrozen,
+    Repaired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClockDecision {
+    pub effective_now_ms: u64,
+    pub condition: ClockCondition,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditEntry {
+    pub sequence: u64,
+    pub event_type: String,
+    pub payload_jcs: String,
+    pub previous_hash: Digest32,
+    pub entry_hash: Digest32,
+    pub signing_key_id: Token,
+    pub signature: Base64UrlBytes,
+}
+
+pub struct BrokerJournal {
+    connection: Mutex<Connection>,
+    audit_signer: Arc<dyn AuditSigner>,
+    fault_hook: Option<Arc<dyn FaultHook>>,
+}
+
+impl BrokerJournal {
+    pub fn open(
+        path: impl AsRef<Path>,
+        audit_signer: Arc<dyn AuditSigner>,
+    ) -> Result<Self, JournalError> {
+        Self::from_connection(Connection::open(path)?, audit_signer)
+    }
+
+    pub fn open_in_memory(audit_signer: Arc<dyn AuditSigner>) -> Result<Self, JournalError> {
+        Self::from_connection(Connection::open_in_memory()?, audit_signer)
+    }
+
+    fn from_connection(
+        connection: Connection,
+        audit_signer: Arc<dyn AuditSigner>,
+    ) -> Result<Self, JournalError> {
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS approvals (
+                approval_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS operations (
+                operation_id TEXT PRIMARY KEY,
+                operation_digest TEXT NOT NULL,
+                retry_binding_digest TEXT NOT NULL,
+                state TEXT NOT NULL,
+                is_batch INTEGER NOT NULL,
+                result_jcs TEXT
+            );
+            CREATE TABLE IF NOT EXISTS operation_attempts (
+                operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+                attempt_id TEXT NOT NULL,
+                attempt_digest TEXT NOT NULL,
+                PRIMARY KEY (operation_id, attempt_id),
+                UNIQUE (operation_id, attempt_digest)
+            );
+            CREATE TABLE IF NOT EXISTS batch_children (
+                parent_operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+                child_operation_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                result_jcs TEXT NOT NULL,
+                PRIMARY KEY (parent_operation_id, child_operation_id),
+                UNIQUE (parent_operation_id, ordinal),
+                UNIQUE (child_operation_id)
+            );
+            CREATE TABLE IF NOT EXISTS reservations (
+                approval_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                signature_count TEXT NOT NULL,
+                reserved_at_ms TEXT NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (approval_id, operation_id)
+            );
+            CREATE TABLE IF NOT EXISTS reservation_values (
+                approval_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                asset_id TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                PRIMARY KEY (approval_id, operation_id, asset_id),
+                FOREIGN KEY (approval_id, operation_id)
+                    REFERENCES reservations(approval_id, operation_id)
+            );
+            CREATE TABLE IF NOT EXISTS audit_chain (
+                sequence INTEGER PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                payload_jcs TEXT NOT NULL,
+                previous_hash TEXT NOT NULL,
+                entry_hash TEXT NOT NULL,
+                signing_key_id TEXT NOT NULL,
+                signature TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS clock_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                last_effective_ms TEXT NOT NULL,
+                condition TEXT NOT NULL
+            );
+            ",
+        )?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+            audit_signer,
+            fault_hook: None,
+        })
+    }
+
+    pub fn with_fault_hook(mut self, fault_hook: Arc<dyn FaultHook>) -> Self {
+        self.fault_hook = Some(fault_hook);
+        self
+    }
+
+    pub fn create_approval(
+        &self,
+        approval_id: &Digest32,
+        state: ApprovalLifecycleState,
+    ) -> Result<(), JournalError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO approvals(approval_id, state) VALUES (?1, ?2)",
+            params![approval_id.as_str(), approval_state_text(state)?],
+        )?;
+        append_audit(
+            &transaction,
+            "approval.created",
+            &serde_json::json!({"approval_id": approval_id, "state": state}),
+            self.audit_signer.as_ref(),
+        )?;
+        transaction.commit()?;
+        self.after_durable(DurablePoint::ApprovalTransition)
+    }
+
+    pub fn transition_approval(
+        &self,
+        approval_id: &Digest32,
+        next: ApprovalLifecycleState,
+    ) -> Result<(), JournalError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let current_text: String = transaction
+            .query_row(
+                "SELECT state FROM approvals WHERE approval_id = ?1",
+                [approval_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| protocol(ProtocolErrorCode::ApprovalNotFound, "approval not found"))?;
+        let current = parse_approval_state(&current_text)?;
+        if !valid_approval_transition(current, next) {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                format!(
+                    "invalid approval transition {current_text} -> {}",
+                    approval_state_text(next)?
+                ),
+            )
+            .into());
+        }
+        transaction.execute(
+            "UPDATE approvals SET state = ?2 WHERE approval_id = ?1",
+            params![approval_id.as_str(), approval_state_text(next)?],
+        )?;
+        append_audit(
+            &transaction,
+            "approval.transition",
+            &serde_json::json!({"approval_id": approval_id, "from": current, "to": next}),
+            self.audit_signer.as_ref(),
+        )?;
+        transaction.commit()?;
+        self.after_durable(DurablePoint::ApprovalTransition)
+    }
+
+    pub fn approval_state(
+        &self,
+        approval_id: &Digest32,
+    ) -> Result<Option<ApprovalLifecycleState>, JournalError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT state FROM approvals WHERE approval_id = ?1",
+                [approval_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|state| parse_approval_state(&state))
+            .transpose()
+    }
+
+    pub fn begin_sign_attempt(
+        &self,
+        request: &UnsignedSignRequest,
+        is_batch: bool,
+    ) -> Result<OperationSnapshot, JournalError> {
+        if request.operation_digest != request.operation_identity().digest()?
+            || request.attempt_digest != request.computed_attempt_digest()?
+        {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "operation or attempt digest does not match its canonical preimage",
+            )
+            .into());
+        }
+        let retry_binding_digest = attempt_retry_binding_digest(request)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let existing = read_operation(&transaction, &request.operation_id)?;
+        let snapshot = if let Some(existing) = existing {
+            if existing.operation_digest != request.operation_digest {
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "operation ID was reused with a different stable digest",
+                )
+                .into());
+            }
+            if existing.is_batch != is_batch {
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "operation ID changed between single and batch semantics",
+                )
+                .into());
+            }
+            if existing.retry_binding_digest != retry_binding_digest {
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "retry changed a field outside the permitted attempt envelope",
+                )
+                .into());
+            }
+            existing
+        } else {
+            transaction.execute(
+                "INSERT INTO operations(
+                    operation_id, operation_digest, retry_binding_digest, state, is_batch
+                 ) VALUES (?1, ?2, ?3, 'RECEIVED', ?4)",
+                params![
+                    request.operation_id.as_str(),
+                    request.operation_digest.as_str(),
+                    retry_binding_digest.as_str(),
+                    is_batch
+                ],
+            )?;
+            append_audit(
+                &transaction,
+                "operation.received",
+                &serde_json::json!({
+                    "operation_id": request.operation_id,
+                    "operation_digest": request.operation_digest,
+                    "is_batch": is_batch
+                }),
+                self.audit_signer.as_ref(),
+            )?;
+            OperationSnapshot {
+                operation_id: request.operation_id.clone(),
+                operation_digest: request.operation_digest.clone(),
+                state: OperationState::Received,
+                is_batch,
+                retry_binding_digest,
+                result: None,
+            }
+        };
+        let prior_attempt: Option<String> = transaction
+            .query_row(
+                "SELECT attempt_digest FROM operation_attempts
+                 WHERE operation_id = ?1 AND attempt_id = ?2",
+                params![request.operation_id.as_str(), request.attempt_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if prior_attempt
+            .as_deref()
+            .is_some_and(|digest| digest != request.attempt_digest.as_str())
+        {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "attempt ID was reused with a different attempt digest",
+            )
+            .into());
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO operation_attempts(operation_id, attempt_id, attempt_digest)
+             VALUES (?1, ?2, ?3)",
+            params![
+                request.operation_id.as_str(),
+                request.attempt_id.as_str(),
+                request.attempt_digest.as_str()
+            ],
+        )?;
+        transaction.commit()?;
+        self.after_durable(DurablePoint::OperationReceived)?;
+        Ok(snapshot)
+    }
+
+    pub fn operation(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<OperationSnapshot>, JournalError> {
+        let connection = self.lock()?;
+        read_operation(&connection, operation_id)
+    }
+
+    pub fn transition_operation(
+        &self,
+        operation_id: &OperationId,
+        next: OperationState,
+    ) -> Result<(), JournalError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let current = read_operation(&transaction, operation_id)?
+            .ok_or_else(|| protocol(ProtocolErrorCode::ApprovalNotFound, "operation not found"))?;
+        if current.result.is_some() || !valid_operation_transition(current.state, next) {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "invalid or post-publication operation transition",
+            )
+            .into());
+        }
+        transaction.execute(
+            "UPDATE operations SET state = ?2 WHERE operation_id = ?1",
+            params![operation_id.as_str(), operation_state_text(next)?],
+        )?;
+        append_audit(
+            &transaction,
+            "operation.transition",
+            &serde_json::json!({"operation_id": operation_id, "from": current.state, "to": next}),
+            self.audit_signer.as_ref(),
+        )?;
+        transaction.commit()?;
+        self.after_durable(DurablePoint::OperationTransition)
+    }
+
+    pub fn reserve(
+        &self,
+        request: &ReservationRequest,
+        limits: &BudgetLimits,
+    ) -> Result<(), JournalError> {
+        if request.signature_count == 0 {
+            return Err(protocol(
+                ProtocolErrorCode::BackendInvalidRequest,
+                "reservation signature count must be positive",
+            )
+            .into());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        validate_reservation_clock(
+            &transaction,
+            request.reserved_at_ms,
+            !limits.rate_limits.is_empty() || !limits.rolling_value_limits.is_empty(),
+        )?;
+        if let Some(existing) = reservation_state(&transaction, request)? {
+            if existing == ReservationState::Reserved {
+                if reservation_matches(&transaction, request)? {
+                    transaction.commit()?;
+                    return Ok(());
+                }
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "same reservation operation changed immutable accounting",
+                )
+                .into());
+            }
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "reservation operation is already finalized",
+            )
+            .into());
+        }
+        let operations: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM reservations
+             WHERE approval_id = ?1 AND state != 'RELEASED'",
+            [request.approval_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let operations = u64::try_from(operations).map_err(storage)?;
+        let mut signatures = 0_u64;
+        {
+            let mut statement = transaction.prepare(
+                "SELECT signature_count FROM reservations
+                 WHERE approval_id = ?1 AND state != 'RELEASED'",
+            )?;
+            let rows = statement.query_map([request.approval_id.as_str()], |row| {
+                row.get::<_, String>(0)
+            })?;
+            for row in rows {
+                signatures = signatures
+                    .checked_add(row?.parse::<u64>().map_err(storage)?)
+                    .ok_or_else(|| {
+                        protocol(
+                            ProtocolErrorCode::LimitExceededSignatures,
+                            "signature counter overflow",
+                        )
+                    })?;
+            }
+        }
+        if operations
+            .checked_add(1)
+            .is_none_or(|value| value > limits.max_operations)
+        {
+            return Err(protocol(
+                ProtocolErrorCode::LimitExceededOperations,
+                "operation lifetime limit exceeded",
+            )
+            .into());
+        }
+        if signatures
+            .checked_add(request.signature_count)
+            .is_none_or(|value| value > limits.max_signatures)
+        {
+            return Err(protocol(
+                ProtocolErrorCode::LimitExceededSignatures,
+                "signature lifetime limit exceeded",
+            )
+            .into());
+        }
+        validate_rate_limits(&transaction, request, limits)?;
+        validate_value_limits(&transaction, request, limits)?;
+        validate_rolling_value_limits(&transaction, request, limits)?;
+        transaction.execute(
+            "INSERT INTO reservations(
+                approval_id, operation_id, signature_count, reserved_at_ms, state
+             ) VALUES (?1, ?2, ?3, ?4, 'RESERVED')",
+            params![
+                request.approval_id.as_str(),
+                request.operation_id.as_str(),
+                request.signature_count.to_string(),
+                request.reserved_at_ms.to_string()
+            ],
+        )?;
+        for (asset_id, amount) in &request.values {
+            transaction.execute(
+                "INSERT INTO reservation_values(approval_id, operation_id, asset_id, amount)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    request.approval_id.as_str(),
+                    request.operation_id.as_str(),
+                    asset_id,
+                    amount.as_str()
+                ],
+            )?;
+        }
+        append_audit(
+            &transaction,
+            "reservation.created",
+            &serde_json::json!({
+                "approval_id": request.approval_id,
+                "operation_id": request.operation_id,
+                "signature_count": request.signature_count,
+                "values": request.values
+            }),
+            self.audit_signer.as_ref(),
+        )?;
+        transaction.commit()?;
+        self.after_durable(DurablePoint::ReservationCreated)
+    }
+
+    pub fn finalize_reservation(
+        &self,
+        approval_id: &Digest32,
+        operation_id: &OperationId,
+        next: ReservationState,
+    ) -> Result<(), JournalError> {
+        if next == ReservationState::Reserved {
+            return Err(protocol(
+                ProtocolErrorCode::BackendInvalidRequest,
+                "reservation finalization requires a terminal ledger state",
+            )
+            .into());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM reservations
+                 WHERE approval_id = ?1 AND operation_id = ?2",
+                params![approval_id.as_str(), operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match current.as_deref() {
+            Some("RESERVED") => {}
+            Some(value) if value == next.as_str() => {
+                transaction.commit()?;
+                return Ok(());
+            }
+            _ => {
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "reservation is missing or already finalized differently",
+                )
+                .into());
+            }
+        }
+        transaction.execute(
+            "UPDATE reservations SET state = ?3
+             WHERE approval_id = ?1 AND operation_id = ?2",
+            params![approval_id.as_str(), operation_id.as_str(), next.as_str()],
+        )?;
+        append_audit(
+            &transaction,
+            "reservation.finalized",
+            &serde_json::json!({
+                "approval_id": approval_id,
+                "operation_id": operation_id,
+                "state": next.as_str()
+            }),
+            self.audit_signer.as_ref(),
+        )?;
+        transaction.commit()?;
+        self.after_durable(DurablePoint::ReservationFinalized)
+    }
+
+    pub fn reservation_status(
+        &self,
+        approval_id: &Digest32,
+        operation_id: &OperationId,
+    ) -> Result<Option<ReservationState>, JournalError> {
+        let connection = self.lock()?;
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT state FROM reservations
+                 WHERE approval_id = ?1 AND operation_id = ?2",
+                params![approval_id.as_str(), operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .map(|value| parse_reservation_state(&value))
+            .transpose()
+    }
+
+    pub fn publish_result(
+        &self,
+        approval_id: &Digest32,
+        result: &SigningResult,
+    ) -> Result<(), JournalError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let operation = read_operation(&transaction, &result.operation_id)?
+            .ok_or_else(|| protocol(ProtocolErrorCode::ApprovalNotFound, "operation not found"))?;
+        if operation.operation_digest != result.operation_digest {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "result changed the stable operation digest",
+            )
+            .into());
+        }
+        let result_jcs = jcs_string(result)?;
+        if let Some(prior) = operation.result {
+            if jcs_string(&prior)? == result_jcs
+                && reservation_state_by_id(&transaction, approval_id, &result.operation_id)?
+                    == Some(ReservationState::Committed)
+            {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "a different result is already published",
+            )
+            .into());
+        }
+        if operation.state != OperationState::Committed {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "result publication requires COMMITTED state",
+            )
+            .into());
+        }
+        require_reserved(&transaction, approval_id, &result.operation_id)?;
+        transaction.execute(
+            "UPDATE operations SET state = 'SUCCEEDED', result_jcs = ?2
+             WHERE operation_id = ?1",
+            params![result.operation_id.as_str(), result_jcs],
+        )?;
+        transaction.execute(
+            "UPDATE reservations SET state = 'COMMITTED'
+             WHERE approval_id = ?1 AND operation_id = ?2",
+            params![approval_id.as_str(), result.operation_id.as_str()],
+        )?;
+        append_audit(
+            &transaction,
+            "operation.published",
+            &serde_json::json!({
+                "approval_id": approval_id,
+                "operation_id": result.operation_id,
+                "reservation_state": "COMMITTED"
+            }),
+            self.audit_signer.as_ref(),
+        )?;
+        transaction.commit()?;
+        self.after_durable(DurablePoint::OperationTransition)
+    }
+
+    pub fn publish_batch(
+        &self,
+        approval_id: &Digest32,
+        parent_result: &SigningResult,
+        child_results: &[SigningResult],
+    ) -> Result<(), JournalError> {
+        if child_results.is_empty() || child_results.len() > 32 {
+            return Err(protocol(
+                ProtocolErrorCode::BackendInvalidRequest,
+                "batch publication requires 1-32 children",
+            )
+            .into());
+        }
+        for (ordinal, child) in child_results.iter().enumerate() {
+            if child.operation_id
+                != derive_batch_child_operation_id(&parent_result.operation_id, ordinal)?
+            {
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "batch child operation ID is not the deterministic parent/index derivation",
+                )
+                .into());
+            }
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let parent =
+            read_operation(&transaction, &parent_result.operation_id)?.ok_or_else(|| {
+                protocol(
+                    ProtocolErrorCode::ApprovalNotFound,
+                    "batch parent operation not found",
+                )
+            })?;
+        if parent.operation_digest != parent_result.operation_digest {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "batch result changed the stable operation digest",
+            )
+            .into());
+        }
+        let prior: Option<String> = transaction
+            .query_row(
+                "SELECT result_jcs FROM operations WHERE operation_id = ?1",
+                [parent_result.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let parent_jcs = jcs_string(parent_result)?;
+        if let Some(prior) = prior {
+            let mut statement = transaction.prepare(
+                "SELECT result_jcs FROM batch_children
+                 WHERE parent_operation_id = ?1 ORDER BY ordinal",
+            )?;
+            let rows = statement.query_map([parent_result.operation_id.as_str()], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let existing_children = rows.collect::<Result<Vec<_>, _>>()?;
+            let requested_children = child_results
+                .iter()
+                .map(jcs_string)
+                .collect::<Result<Vec<_>, _>>()?;
+            if prior == parent_jcs
+                && existing_children == requested_children
+                && reservation_state_by_id(&transaction, approval_id, &parent_result.operation_id)?
+                    == Some(ReservationState::Committed)
+            {
+                drop(statement);
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "a different batch result is already published",
+            )
+            .into());
+        }
+        if !parent.is_batch || parent.state != OperationState::Committed {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "batch publication requires a committed batch parent",
+            )
+            .into());
+        }
+        require_reserved(&transaction, approval_id, &parent_result.operation_id)?;
+        for (ordinal, child) in child_results.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO batch_children(
+                    parent_operation_id, child_operation_id, ordinal, result_jcs
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    parent_result.operation_id.as_str(),
+                    child.operation_id.as_str(),
+                    i64::try_from(ordinal).map_err(storage)?,
+                    jcs_string(child)?
+                ],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE operations SET state = 'SUCCEEDED', result_jcs = ?2
+             WHERE operation_id = ?1",
+            params![parent_result.operation_id.as_str(), parent_jcs],
+        )?;
+        transaction.execute(
+            "UPDATE reservations SET state = 'COMMITTED'
+             WHERE approval_id = ?1 AND operation_id = ?2",
+            params![approval_id.as_str(), parent_result.operation_id.as_str()],
+        )?;
+        append_audit(
+            &transaction,
+            "batch.published",
+            &serde_json::json!({
+                "approval_id": approval_id,
+                "parent_operation_id": parent_result.operation_id,
+                "child_count": child_results.len(),
+                "reservation_state": "COMMITTED"
+            }),
+            self.audit_signer.as_ref(),
+        )?;
+        transaction.commit()?;
+        self.after_durable(DurablePoint::BatchPublished)
+    }
+
+    pub fn batch_children(
+        &self,
+        parent_operation_id: &OperationId,
+    ) -> Result<Vec<SigningResult>, JournalError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT result_jcs FROM batch_children
+             WHERE parent_operation_id = ?1 ORDER BY ordinal",
+        )?;
+        let rows = statement.query_map([parent_operation_id.as_str()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(serde_json::from_str(&row?).map_err(storage)?);
+        }
+        Ok(results)
+    }
+
+    pub fn batch_child(
+        &self,
+        child_operation_id: &OperationId,
+    ) -> Result<Option<SigningResult>, JournalError> {
+        let connection = self.lock()?;
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT result_jcs FROM batch_children WHERE child_operation_id = ?1",
+                [child_operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(storage))
+            .transpose()
+    }
+
+    pub fn audit_entries(&self) -> Result<Vec<AuditEntry>, JournalError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT sequence, event_type, payload_jcs, previous_hash, entry_hash,
+                    signing_key_id, signature
+             FROM audit_chain ORDER BY sequence",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (
+                sequence,
+                event_type,
+                payload_jcs,
+                previous_hash,
+                entry_hash,
+                signing_key_id,
+                signature,
+            ) = row?;
+            entries.push(AuditEntry {
+                sequence: u64::try_from(sequence).map_err(storage)?,
+                event_type,
+                payload_jcs,
+                previous_hash: Digest32::new(previous_hash)?,
+                entry_hash: Digest32::new(entry_hash)?,
+                signing_key_id: Token::new(signing_key_id)?,
+                signature: Base64UrlBytes::parse(signature)?,
+            });
+        }
+        Ok(entries)
+    }
+
+    pub fn verify_audit_chain(&self) -> Result<(), JournalError> {
+        let mut expected_previous = Digest32::new("00".repeat(32))?;
+        for entry in self.audit_entries()? {
+            if entry.previous_hash != expected_previous
+                || compute_audit_hash(
+                    entry.sequence,
+                    &entry.event_type,
+                    &entry.payload_jcs,
+                    &entry.previous_hash,
+                ) != entry.entry_hash
+                || self
+                    .audit_signer
+                    .verify(
+                        &entry.signing_key_id,
+                        &audit_signature_message(&entry.entry_hash),
+                        &entry.signature,
+                    )
+                    .is_err()
+            {
+                return Err(protocol(
+                    ProtocolErrorCode::MalformedFrame,
+                    "audit hash chain verification failed",
+                )
+                .into());
+            }
+            expected_previous = entry.entry_hash;
+        }
+        Ok(())
+    }
+
+    pub fn observe_time(
+        &self,
+        reading: TimeReading,
+        max_forward_step_ms: u64,
+        rate_limited_mutation: bool,
+    ) -> Result<ClockDecision, JournalError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let stored: Option<String> = transaction
+            .query_row(
+                "SELECT last_effective_ms FROM clock_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(utc_ms) = reading.utc_ms else {
+            let effective_now_ms = stored
+                .map(|value| value.parse().map_err(storage))
+                .transpose()?
+                .unwrap_or(0);
+            write_clock_state(&transaction, effective_now_ms, ClockCondition::Untrusted)?;
+            append_audit(
+                &transaction,
+                "clock.untrusted",
+                &serde_json::json!({"effective_now_ms": effective_now_ms.to_string()}),
+                self.audit_signer.as_ref(),
+            )?;
+            transaction.commit()?;
+            if rate_limited_mutation {
+                return Err(protocol(
+                    ProtocolErrorCode::ClockUntrusted,
+                    "trusted platform time source is unavailable",
+                )
+                .into());
+            }
+            return Ok(ClockDecision {
+                effective_now_ms,
+                condition: ClockCondition::Untrusted,
+            });
+        };
+        let Some(last_effective_ms) = stored
+            .map(|value| value.parse::<u64>().map_err(storage))
+            .transpose()?
+        else {
+            write_clock_state(&transaction, utc_ms, ClockCondition::Healthy)?;
+            append_audit(
+                &transaction,
+                "clock.initialized",
+                &serde_json::json!({"effective_now_ms": utc_ms.to_string()}),
+                self.audit_signer.as_ref(),
+            )?;
+            transaction.commit()?;
+            return Ok(ClockDecision {
+                effective_now_ms: utc_ms,
+                condition: ClockCondition::Healthy,
+            });
+        };
+        let monotonic_now = last_effective_ms
+            .checked_add(reading.monotonic_elapsed_ms)
+            .ok_or_else(|| {
+                protocol(
+                    ProtocolErrorCode::ClockUntrusted,
+                    "monotonic clock arithmetic overflow",
+                )
+            })?;
+        if utc_ms < last_effective_ms {
+            write_clock_state(
+                &transaction,
+                last_effective_ms,
+                ClockCondition::RollbackFrozen,
+            )?;
+            append_audit(
+                &transaction,
+                "clock.rollback",
+                &serde_json::json!({
+                    "observed_utc_ms": utc_ms.to_string(),
+                    "effective_now_ms": last_effective_ms.to_string()
+                }),
+                self.audit_signer.as_ref(),
+            )?;
+            transaction.commit()?;
+            if rate_limited_mutation {
+                return Err(protocol(
+                    ProtocolErrorCode::ClockRollback,
+                    "UTC rollback detected; effective time is frozen",
+                )
+                .into());
+            }
+            return Ok(ClockDecision {
+                effective_now_ms: last_effective_ms,
+                condition: ClockCondition::RollbackFrozen,
+            });
+        }
+        let maximum_automatic = monotonic_now.saturating_add(max_forward_step_ms);
+        if utc_ms > maximum_automatic {
+            write_clock_state(
+                &transaction,
+                monotonic_now,
+                ClockCondition::ForwardJumpRejected,
+            )?;
+            append_audit(
+                &transaction,
+                "clock.forward_jump",
+                &serde_json::json!({
+                    "observed_utc_ms": utc_ms.to_string(),
+                    "effective_now_ms": monotonic_now.to_string()
+                }),
+                self.audit_signer.as_ref(),
+            )?;
+            transaction.commit()?;
+            return Ok(ClockDecision {
+                effective_now_ms: monotonic_now,
+                condition: ClockCondition::ForwardJumpRejected,
+            });
+        }
+        let effective_now_ms = utc_ms.max(monotonic_now);
+        write_clock_state(&transaction, effective_now_ms, ClockCondition::Healthy)?;
+        transaction.commit()?;
+        Ok(ClockDecision {
+            effective_now_ms,
+            condition: ClockCondition::Healthy,
+        })
+    }
+
+    pub fn repair_clock(&self, accepted_utc_ms: u64) -> Result<ClockDecision, JournalError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let prior: Option<String> = transaction
+            .query_row(
+                "SELECT last_effective_ms FROM clock_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let prior = prior
+            .map(|value| value.parse::<u64>().map_err(storage))
+            .transpose()?
+            .unwrap_or(0);
+        if accepted_utc_ms < prior {
+            return Err(protocol(
+                ProtocolErrorCode::ClockRollback,
+                "clock repair cannot move effective time backwards",
+            )
+            .into());
+        }
+        write_clock_state(&transaction, accepted_utc_ms, ClockCondition::Repaired)?;
+        append_audit(
+            &transaction,
+            "clock.repaired",
+            &serde_json::json!({
+                "prior_effective_ms": prior.to_string(),
+                "accepted_utc_ms": accepted_utc_ms.to_string()
+            }),
+            self.audit_signer.as_ref(),
+        )?;
+        transaction.commit()?;
+        Ok(ClockDecision {
+            effective_now_ms: accepted_utc_ms,
+            condition: ClockCondition::Repaired,
+        })
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, Connection>, JournalError> {
+        self.connection
+            .lock()
+            .map_err(|_| JournalError::Storage("journal mutex poisoned".into()))
+    }
+
+    fn after_durable(&self, point: DurablePoint) -> Result<(), JournalError> {
+        if let Some(hook) = &self.fault_hook {
+            hook.after_durable(point)
+                .map_err(|message| JournalError::InjectedCrash { point, message })?;
+        }
+        Ok(())
+    }
+}
+
+pub fn derive_batch_child_operation_id(
+    parent_operation_id: &OperationId,
+    ordinal: usize,
+) -> Result<OperationId, JournalError> {
+    let ordinal = u32::try_from(ordinal).map_err(storage)?;
+    let mut hasher = Sha256::new();
+    hasher.update(BATCH_CHILD_DOMAIN);
+    hasher.update(parent_operation_id.as_str().as_bytes());
+    hasher.update(ordinal.to_be_bytes());
+    OperationId::new(hex::encode(hasher.finalize())).map_err(Into::into)
+}
+
+fn protocol(code: ProtocolErrorCode, message: impl Into<String>) -> ProtocolError {
+    ProtocolError::new(code, message)
+}
+
+fn storage(error: impl std::fmt::Display) -> JournalError {
+    JournalError::Storage(error.to_string())
+}
+
+fn jcs_string(value: &impl Serialize) -> Result<String, JournalError> {
+    String::from_utf8(serde_jcs::to_vec(value).map_err(storage)?).map_err(storage)
+}
+
+fn attempt_retry_binding_digest(request: &UnsignedSignRequest) -> Result<Digest32, JournalError> {
+    let mut value = serde_json::to_value(request).map_err(storage)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| JournalError::Storage("sign attempt must serialize as an object".into()))?;
+    for permitted_retry_field in [
+        "attempt_id",
+        "attempt_digest",
+        "issuer_boot_epoch",
+        "issued_at_ms",
+        "not_before_ms",
+        "expires_at_ms",
+    ] {
+        object.remove(permitted_retry_field);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(ATTEMPT_BINDING_DOMAIN);
+    hasher.update(serde_jcs::to_vec(&value).map_err(storage)?);
+    Ok(Digest32::from_bytes(hasher.finalize().into()))
+}
+
+fn append_audit(
+    transaction: &Transaction<'_>,
+    event_type: &str,
+    payload: &impl Serialize,
+    audit_signer: &dyn AuditSigner,
+) -> Result<(), JournalError> {
+    let (sequence, previous_hash) = transaction
+        .query_row(
+            "SELECT sequence, entry_hash FROM audit_chain ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)? + 1, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .unwrap_or((0_i64, "00".repeat(32)));
+    let sequence = u64::try_from(sequence).map_err(storage)?;
+    let previous_hash = Digest32::new(previous_hash)?;
+    let payload_jcs = jcs_string(payload)?;
+    let entry_hash = compute_audit_hash(sequence, event_type, &payload_jcs, &previous_hash);
+    let signing_key_id = audit_signer.key_id();
+    let signature = audit_signer
+        .sign(&audit_signature_message(&entry_hash))
+        .map_err(storage)?;
+    transaction.execute(
+        "INSERT INTO audit_chain(
+            sequence, event_type, payload_jcs, previous_hash, entry_hash,
+            signing_key_id, signature
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            i64::try_from(sequence).map_err(storage)?,
+            event_type,
+            payload_jcs,
+            previous_hash.as_str(),
+            entry_hash.as_str(),
+            signing_key_id.as_str(),
+            signature.encoded()
+        ],
+    )?;
+    Ok(())
+}
+
+fn audit_signature_message(entry_hash: &Digest32) -> Vec<u8> {
+    [AUDIT_SIGNATURE_DOMAIN, entry_hash.as_str().as_bytes()].concat()
+}
+
+fn write_clock_state(
+    transaction: &Transaction<'_>,
+    effective_now_ms: u64,
+    condition: ClockCondition,
+) -> Result<(), JournalError> {
+    transaction.execute(
+        "INSERT INTO clock_state(singleton, last_effective_ms, condition)
+         VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET
+             last_effective_ms = excluded.last_effective_ms,
+             condition = excluded.condition",
+        params![
+            effective_now_ms.to_string(),
+            match condition {
+                ClockCondition::Healthy => "HEALTHY",
+                ClockCondition::ForwardJumpRejected => "FORWARD_JUMP_REJECTED",
+                ClockCondition::Untrusted => "UNTRUSTED",
+                ClockCondition::RollbackFrozen => "ROLLBACK_FROZEN",
+                ClockCondition::Repaired => "REPAIRED",
+            }
+        ],
+    )?;
+    Ok(())
+}
+
+fn compute_audit_hash(
+    sequence: u64,
+    event_type: &str,
+    payload_jcs: &str,
+    previous_hash: &Digest32,
+) -> Digest32 {
+    let mut hasher = Sha256::new();
+    hasher.update(AUDIT_DOMAIN);
+    hasher.update(sequence.to_be_bytes());
+    hasher.update(previous_hash.as_str().as_bytes());
+    hasher.update(event_type.as_bytes());
+    hasher.update(payload_jcs.as_bytes());
+    Digest32::from_bytes(hasher.finalize().into())
+}
+
+fn read_operation(
+    connection: &Connection,
+    operation_id: &OperationId,
+) -> Result<Option<OperationSnapshot>, JournalError> {
+    let row = connection
+        .query_row(
+            "SELECT operation_digest, retry_binding_digest, state, is_batch, result_jcs
+             FROM operations WHERE operation_id = ?1",
+            [operation_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|(digest, retry_binding_digest, state, is_batch, result)| {
+        Ok(OperationSnapshot {
+            operation_id: operation_id.clone(),
+            operation_digest: Digest32::new(digest)?,
+            state: parse_operation_state(&state)?,
+            is_batch,
+            retry_binding_digest: Digest32::new(retry_binding_digest)?,
+            result: result
+                .map(|value| serde_json::from_str(&value).map_err(storage))
+                .transpose()?,
+        })
+    })
+    .transpose()
+}
+
+fn reservation_state(
+    transaction: &Transaction<'_>,
+    request: &ReservationRequest,
+) -> Result<Option<ReservationState>, JournalError> {
+    let value: Option<String> = transaction
+        .query_row(
+            "SELECT state FROM reservations WHERE approval_id = ?1 AND operation_id = ?2",
+            params![request.approval_id.as_str(), request.operation_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    value
+        .map(|value| parse_reservation_state(&value))
+        .transpose()
+}
+
+fn reservation_state_by_id(
+    transaction: &Transaction<'_>,
+    approval_id: &Digest32,
+    operation_id: &OperationId,
+) -> Result<Option<ReservationState>, JournalError> {
+    let value: Option<String> = transaction
+        .query_row(
+            "SELECT state FROM reservations WHERE approval_id = ?1 AND operation_id = ?2",
+            params![approval_id.as_str(), operation_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    value
+        .map(|value| parse_reservation_state(&value))
+        .transpose()
+}
+
+fn require_reserved(
+    transaction: &Transaction<'_>,
+    approval_id: &Digest32,
+    operation_id: &OperationId,
+) -> Result<(), JournalError> {
+    if reservation_state_by_id(transaction, approval_id, operation_id)?
+        != Some(ReservationState::Reserved)
+    {
+        return Err(protocol(
+            ProtocolErrorCode::OperationIdConflict,
+            "result publication requires an active accounting reservation",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn parse_reservation_state(value: &str) -> Result<ReservationState, JournalError> {
+    match value {
+        "RESERVED" => Ok(ReservationState::Reserved),
+        "COMMITTED" => Ok(ReservationState::Committed),
+        "RELEASED" => Ok(ReservationState::Released),
+        "QUARANTINED" => Ok(ReservationState::Quarantined),
+        _ => Err(JournalError::Storage("invalid reservation state".into())),
+    }
+}
+
+fn validate_value_limits(
+    transaction: &Transaction<'_>,
+    request: &ReservationRequest,
+    limits: &BudgetLimits,
+) -> Result<(), JournalError> {
+    for (asset_id, requested) in &request.values {
+        let limit = limits.value_limits.get(asset_id).ok_or_else(|| {
+            protocol(
+                ProtocolErrorCode::LimitExceededValue,
+                format!("asset {asset_id} is not approved"),
+            )
+        })?;
+        let mut statement = transaction.prepare(
+            "SELECT value.amount
+             FROM reservation_values value
+             JOIN reservations reservation
+               ON reservation.approval_id = value.approval_id
+              AND reservation.operation_id = value.operation_id
+             WHERE value.approval_id = ?1 AND value.asset_id = ?2
+               AND reservation.state != 'RELEASED'",
+        )?;
+        let rows = statement.query_map(params![request.approval_id.as_str(), asset_id], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut total = BigUint::from(0_u8);
+        for row in rows {
+            total += BigUint::from_str(&row?).map_err(storage)?;
+        }
+        total += BigUint::from_str(requested.as_str()).map_err(storage)?;
+        if total > BigUint::from_str(limit.as_str()).map_err(storage)? {
+            return Err(protocol(
+                ProtocolErrorCode::LimitExceededValue,
+                format!("value limit exceeded for asset {asset_id}"),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_reservation_clock(
+    transaction: &Transaction<'_>,
+    reserved_at_ms: u64,
+    trusted_time_required: bool,
+) -> Result<(), JournalError> {
+    let clock: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT last_effective_ms, condition FROM clock_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if trusted_time_required && clock.is_none() {
+        return Err(protocol(
+            ProtocolErrorCode::ClockUntrusted,
+            "rate-limited reservation requires initialized trusted time",
+        )
+        .into());
+    }
+    if let Some((effective, condition)) = clock {
+        if trusted_time_required
+            && !matches!(
+                condition.as_str(),
+                "HEALTHY" | "FORWARD_JUMP_REJECTED" | "REPAIRED"
+            )
+        {
+            return Err(protocol(
+                ProtocolErrorCode::ClockUntrusted,
+                format!("rate-limited reservation denied while clock is {condition}"),
+            )
+            .into());
+        }
+        if effective != reserved_at_ms.to_string() {
+            return Err(protocol(
+                ProtocolErrorCode::ClockUntrusted,
+                "reservation timestamp is not the journal's durable effective time",
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn reservation_matches(
+    transaction: &Transaction<'_>,
+    request: &ReservationRequest,
+) -> Result<bool, JournalError> {
+    let header: (String, String) = transaction.query_row(
+        "SELECT signature_count, reserved_at_ms FROM reservations
+         WHERE approval_id = ?1 AND operation_id = ?2",
+        params![request.approval_id.as_str(), request.operation_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if header.0 != request.signature_count.to_string()
+        || header.1 != request.reserved_at_ms.to_string()
+    {
+        return Ok(false);
+    }
+    let mut statement = transaction.prepare(
+        "SELECT asset_id, amount FROM reservation_values
+         WHERE approval_id = ?1 AND operation_id = ?2 ORDER BY asset_id",
+    )?;
+    let rows = statement.query_map(
+        params![request.approval_id.as_str(), request.operation_id.as_str()],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    let stored = rows.collect::<Result<BTreeMap<_, _>, _>>()?;
+    Ok(stored
+        == request
+            .values
+            .iter()
+            .map(|(asset, amount)| (asset.clone(), amount.as_str().to_owned()))
+            .collect())
+}
+
+fn validate_rate_limits(
+    transaction: &Transaction<'_>,
+    request: &ReservationRequest,
+    limits: &BudgetLimits,
+) -> Result<(), JournalError> {
+    if limits.rate_limits.is_empty() {
+        return Ok(());
+    }
+    let mut statement = transaction.prepare(
+        "SELECT signature_count, reserved_at_ms FROM reservations
+         WHERE approval_id = ?1 AND state != 'RELEASED'",
+    )?;
+    let rows = statement.query_map([request.approval_id.as_str()], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let existing = rows
+        .map(|row| {
+            let (signatures, reserved_at) = row?;
+            Ok((
+                signatures.parse::<u64>().map_err(storage)?,
+                reserved_at.parse::<u64>().map_err(storage)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, JournalError>>()?;
+    for limit in &limits.rate_limits {
+        if limit.duration_ms == 0 || limit.max_operations == 0 || limit.max_signatures == 0 {
+            return Err(protocol(
+                ProtocolErrorCode::BackendInvalidRequest,
+                "sliding-window limits must be positive",
+            )
+            .into());
+        }
+        let window_start = request.reserved_at_ms.saturating_sub(limit.duration_ms);
+        let mut operations = 0_u64;
+        let mut signatures = 0_u64;
+        for (entry_signatures, reserved_at) in &existing {
+            if *reserved_at > window_start && *reserved_at <= request.reserved_at_ms {
+                operations = operations.checked_add(1).ok_or_else(|| {
+                    protocol(
+                        ProtocolErrorCode::LimitExceededRate,
+                        "rolling operation counter overflow",
+                    )
+                })?;
+                signatures = signatures.checked_add(*entry_signatures).ok_or_else(|| {
+                    protocol(
+                        ProtocolErrorCode::LimitExceededRate,
+                        "rolling signature counter overflow",
+                    )
+                })?;
+            }
+        }
+        if operations
+            .checked_add(1)
+            .is_none_or(|value| value > limit.max_operations)
+            || signatures
+                .checked_add(request.signature_count)
+                .is_none_or(|value| value > limit.max_signatures)
+        {
+            return Err(protocol(
+                ProtocolErrorCode::LimitExceededRate,
+                "exact continuous sliding-window limit exceeded",
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_rolling_value_limits(
+    transaction: &Transaction<'_>,
+    request: &ReservationRequest,
+    limits: &BudgetLimits,
+) -> Result<(), JournalError> {
+    for limit in &limits.rolling_value_limits {
+        if limit.duration_ms == 0 {
+            return Err(protocol(
+                ProtocolErrorCode::BackendInvalidRequest,
+                "rolling value-window duration must be positive",
+            )
+            .into());
+        }
+        let Some(requested) = request.values.get(&limit.asset_id) else {
+            continue;
+        };
+        let window_start = request.reserved_at_ms.saturating_sub(limit.duration_ms);
+        let mut statement = transaction.prepare(
+            "SELECT value.amount, reservation.reserved_at_ms
+             FROM reservation_values value
+             JOIN reservations reservation
+               ON reservation.approval_id = value.approval_id
+              AND reservation.operation_id = value.operation_id
+             WHERE value.approval_id = ?1 AND value.asset_id = ?2
+               AND reservation.state != 'RELEASED'",
+        )?;
+        let rows = statement.query_map(
+            params![request.approval_id.as_str(), limit.asset_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let mut total = BigUint::from_str(requested.as_str()).map_err(storage)?;
+        for row in rows {
+            let (amount, reserved_at) = row?;
+            let reserved_at = reserved_at.parse::<u64>().map_err(storage)?;
+            if reserved_at > window_start && reserved_at <= request.reserved_at_ms {
+                total += BigUint::from_str(&amount).map_err(storage)?;
+            }
+        }
+        if total > BigUint::from_str(limit.maximum.as_str()).map_err(storage)? {
+            return Err(protocol(
+                ProtocolErrorCode::LimitExceededValue,
+                format!("rolling value limit exceeded for asset {}", limit.asset_id),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn approval_state_text(state: ApprovalLifecycleState) -> Result<String, JournalError> {
+    json_enum_text(state)
+}
+
+fn operation_state_text(state: OperationState) -> Result<String, JournalError> {
+    json_enum_text(state)
+}
+
+fn json_enum_text(value: impl Serialize) -> Result<String, JournalError> {
+    serde_json::to_value(value)
+        .map_err(storage)?
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| JournalError::Storage("enum did not serialize as a string".into()))
+}
+
+fn parse_approval_state(value: &str) -> Result<ApprovalLifecycleState, JournalError> {
+    serde_json::from_value(serde_json::Value::String(value.into())).map_err(storage)
+}
+
+fn parse_operation_state(value: &str) -> Result<OperationState, JournalError> {
+    serde_json::from_value(serde_json::Value::String(value.into())).map_err(storage)
+}
+
+fn valid_approval_transition(
+    current: ApprovalLifecycleState,
+    next: ApprovalLifecycleState,
+) -> bool {
+    use ApprovalLifecycleState as State;
+    matches!(
+        (current, next),
+        (
+            State::Prepared,
+            State::AwaitingCeremony | State::Cancelled | State::Failed | State::Expired
+        ) | (
+            State::AwaitingCeremony,
+            State::Active | State::Orphaned | State::Cancelled | State::Failed | State::Expired
+        ) | (
+            State::Orphaned,
+            State::Active | State::Revoked | State::Failed
+        ) | (
+            State::Active,
+            State::Exhausted | State::Expired | State::Revoked
+        )
+    )
+}
+
+fn valid_operation_transition(current: OperationState, next: OperationState) -> bool {
+    use OperationState as State;
+    matches!(
+        (current, next),
+        (
+            State::Received,
+            State::Validated | State::Denied | State::Cancelled | State::Failed
+        ) | (
+            State::Validated,
+            State::Reserved | State::Denied | State::Cancelled | State::Failed
+        ) | (
+            State::Reserved,
+            State::Dispatched | State::Denied | State::Cancelled | State::Failed
+        ) | (
+            State::Dispatched,
+            State::DownstreamAccepted | State::Failed | State::Quarantined
+        ) | (
+            State::DownstreamAccepted,
+            State::Committed | State::Failed | State::Quarantined
+        ) | (
+            State::Committed,
+            State::Succeeded | State::Failed | State::Quarantined
+        )
+    )
+}
