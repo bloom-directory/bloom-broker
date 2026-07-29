@@ -60,6 +60,16 @@ fn open_journal(path: &std::path::Path) -> BrokerJournal {
     BrokerJournal::open(path, audit_signer()).unwrap()
 }
 
+fn install_reservation_approval(journal: &BrokerJournal) {
+    let approval_id = digest("22");
+    journal
+        .create_approval_record(&approval_id, "{}", &digest("aa"), None, None)
+        .unwrap();
+    journal
+        .activate_approval_record(&approval_id, &operation_id(250), "{}")
+        .unwrap();
+}
+
 fn digest(byte: &str) -> Digest32 {
     Digest32::new(byte.repeat(32)).unwrap()
 }
@@ -165,6 +175,7 @@ fn limits(maximum: u64) -> BudgetLimits {
 #[test]
 fn ac10_sliding_windows_use_exact_continuous_boundaries() {
     let journal = memory_journal();
+    install_reservation_approval(&journal);
     let mut bounded = limits(10);
     bounded.rate_limits = vec![SlidingBudgetLimit {
         max_operations: 2,
@@ -232,8 +243,18 @@ fn ac10_sliding_windows_use_exact_continuous_boundaries() {
 }
 
 #[test]
+fn reservation_fails_closed_without_canonical_active_approval() {
+    let journal = memory_journal();
+    assert_eq!(
+        protocol_code(journal.reserve(&reservation(1), &limits(2)).unwrap_err()),
+        bloom_triad_protocol::ProtocolErrorCode::ApprovalRevoked
+    );
+}
+
+#[test]
 fn ac10_clock_faults_freeze_or_advance_effective_time_fail_closed() {
     let journal = memory_journal();
+    install_reservation_approval(&journal);
     let mut rate_limited = limits(10);
     rate_limited.rate_limits = vec![SlidingBudgetLimit {
         max_operations: 10,
@@ -314,6 +335,7 @@ fn ac10_clock_faults_freeze_or_advance_effective_time_fail_closed() {
 #[test]
 fn ac10_rolling_asset_windows_are_atomic_and_release_aware() {
     let journal = memory_journal();
+    install_reservation_approval(&journal);
     let mut bounded = limits(100);
     bounded.rolling_value_limits = vec![SlidingValueLimit {
         asset_id: "eip155:1/slip44:60".into(),
@@ -371,7 +393,9 @@ fn ac10_rolling_asset_windows_are_atomic_and_release_aware() {
         .unwrap();
     journal.reserve(&third, &bounded).unwrap();
 
-    let concurrent = Arc::new(memory_journal());
+    let concurrent = memory_journal();
+    install_reservation_approval(&concurrent);
+    let concurrent = Arc::new(concurrent);
     concurrent
         .observe_time(
             TimeReading {
@@ -410,6 +434,7 @@ fn reservation(value: u8) -> ReservationRequest {
     ReservationRequest {
         approval_id: digest("22"),
         operation_id: operation_id(value),
+        operation_digest: digest("33"),
         signature_count: 1,
         reserved_at_ms: 1_900_000_000_000 + u64::from(value),
         values: BTreeMap::from([(
@@ -429,6 +454,7 @@ fn protocol_code(error: JournalError) -> bloom_triad_protocol::ProtocolErrorCode
 #[test]
 fn ac06_same_operation_retry_is_stable_and_conflicts_fail_closed() {
     let journal = memory_journal();
+    install_reservation_approval(&journal);
     let first = request(1);
     journal.begin_sign_attempt(&first, false).unwrap();
 
@@ -526,7 +552,9 @@ fn ac06_same_operation_retry_is_stable_and_conflicts_fail_closed() {
 
 #[test]
 fn ac10_concurrent_reservations_cannot_overspend_and_release_is_full() {
-    let journal = Arc::new(memory_journal());
+    let journal = memory_journal();
+    install_reservation_approval(&journal);
+    let journal = Arc::new(journal);
     let barrier = Arc::new(Barrier::new(21));
     let mut handles = Vec::new();
     for value in 1..=20 {
@@ -573,7 +601,7 @@ fn ac10_concurrent_reservations_cannot_overspend_and_release_is_full() {
 #[test]
 fn approval_lifecycle_and_audit_chain_are_closed_and_durable() {
     let journal = memory_journal();
-    let approval_id = digest("22");
+    let approval_id = digest("21");
     journal
         .create_approval(&approval_id, ApprovalLifecycleState::Prepared)
         .unwrap();
@@ -701,6 +729,9 @@ fn ac07_fault_matrix_recovers_every_non_batch_durable_transition() {
 
     let reserve_path = directory.path().join("reserve.sqlite");
     let reserve_request = reservation(5);
+    let reserve_setup = open_journal(&reserve_path);
+    install_reservation_approval(&reserve_setup);
+    drop(reserve_setup);
     let journal = open_journal(&reserve_path)
         .with_fault_hook(Arc::new(CrashAt(DurablePoint::ReservationCreated)));
     assert!(matches!(
@@ -742,6 +773,7 @@ fn ac12_batch_parent_and_children_publish_in_one_transaction() {
     let path = directory.path().join("broker.sqlite");
     let parent = request(1);
     let setup = open_journal(&path);
+    install_reservation_approval(&setup);
     setup.begin_sign_attempt(&parent, true).unwrap();
     setup.reserve(&reservation(1), &limits(2)).unwrap();
     advance_to_committed(&setup, &parent.operation_id);

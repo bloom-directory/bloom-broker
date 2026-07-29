@@ -72,6 +72,16 @@ pub struct OperationSnapshot {
     pub result: Option<SigningResult>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalRecord {
+    pub terms_jcs: String,
+    pub review_manifest_digest: String,
+    pub provenance_jcs: Option<String>,
+    pub renewal_of: Option<String>,
+    pub activation_operation_id: Option<String>,
+    pub ceremony_grant_jcs: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReservationState {
     Reserved,
@@ -95,6 +105,7 @@ impl ReservationState {
 pub struct ReservationRequest {
     pub approval_id: Digest32,
     pub operation_id: OperationId,
+    pub operation_digest: Digest32,
     pub signature_count: u64,
     pub reserved_at_ms: u64,
     pub values: BTreeMap<String, DecimalU256>,
@@ -186,6 +197,15 @@ impl BrokerJournal {
                 approval_id TEXT PRIMARY KEY,
                 state TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS approval_metadata (
+                approval_id TEXT PRIMARY KEY REFERENCES approvals(approval_id),
+                terms_jcs TEXT NOT NULL,
+                review_manifest_digest TEXT NOT NULL,
+                provenance_jcs TEXT,
+                renewal_of TEXT REFERENCES approvals(approval_id),
+                activation_operation_id TEXT UNIQUE,
+                ceremony_grant_jcs TEXT
+            );
             CREATE TABLE IF NOT EXISTS operations (
                 operation_id TEXT PRIMARY KEY,
                 operation_digest TEXT NOT NULL,
@@ -213,6 +233,7 @@ impl BrokerJournal {
             CREATE TABLE IF NOT EXISTS reservations (
                 approval_id TEXT NOT NULL,
                 operation_id TEXT NOT NULL,
+                operation_digest TEXT NOT NULL,
                 signature_count TEXT NOT NULL,
                 reserved_at_ms TEXT NOT NULL,
                 state TEXT NOT NULL,
@@ -270,6 +291,201 @@ impl BrokerJournal {
             &transaction,
             "approval.created",
             &serde_json::json!({"approval_id": approval_id, "state": state}),
+            self.audit_signer.as_ref(),
+        )?;
+        transaction.commit()?;
+        self.after_durable(DurablePoint::ApprovalTransition)
+    }
+
+    pub fn create_approval_record(
+        &self,
+        approval_id: &Digest32,
+        terms_jcs: &str,
+        review_manifest_digest: &Digest32,
+        provenance_jcs: Option<&str>,
+        renewal_of: Option<&Digest32>,
+    ) -> Result<(), JournalError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO approvals(approval_id, state) VALUES (?1, 'AWAITING_CEREMONY')",
+            [approval_id.as_str()],
+        )?;
+        transaction.execute(
+            "INSERT INTO approval_metadata(
+                approval_id, terms_jcs, review_manifest_digest, provenance_jcs, renewal_of
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                approval_id.as_str(),
+                terms_jcs,
+                review_manifest_digest.as_str(),
+                provenance_jcs,
+                renewal_of.map(Digest32::as_str)
+            ],
+        )?;
+        append_audit(
+            &transaction,
+            "approval.prepared",
+            &serde_json::json!({
+                "approval_id": approval_id,
+                "state": ApprovalLifecycleState::AwaitingCeremony,
+                "review_manifest_digest": review_manifest_digest
+            }),
+            self.audit_signer.as_ref(),
+        )?;
+        transaction.commit()?;
+        self.after_durable(DurablePoint::ApprovalTransition)
+    }
+
+    pub fn approval_record(
+        &self,
+        approval_id: &Digest32,
+    ) -> Result<Option<ApprovalRecord>, JournalError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT terms_jcs, review_manifest_digest, provenance_jcs, renewal_of,
+                        activation_operation_id, ceremony_grant_jcs
+                 FROM approval_metadata WHERE approval_id = ?1",
+                [approval_id.as_str()],
+                |row| {
+                    Ok(ApprovalRecord {
+                        terms_jcs: row.get(0)?,
+                        review_manifest_digest: row.get(1)?,
+                        provenance_jcs: row.get(2)?,
+                        renewal_of: row.get(3)?,
+                        activation_operation_id: row.get(4)?,
+                        ceremony_grant_jcs: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn approval_records(&self) -> Result<Vec<(Digest32, ApprovalRecord)>, JournalError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT approval_id, terms_jcs, review_manifest_digest, provenance_jcs, renewal_of,
+                    activation_operation_id, ceremony_grant_jcs
+             FROM approval_metadata ORDER BY approval_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                ApprovalRecord {
+                    terms_jcs: row.get(1)?,
+                    review_manifest_digest: row.get(2)?,
+                    provenance_jcs: row.get(3)?,
+                    renewal_of: row.get(4)?,
+                    activation_operation_id: row.get(5)?,
+                    ceremony_grant_jcs: row.get(6)?,
+                },
+            ))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (approval_id, record) = row?;
+            records.push((
+                Digest32::new(approval_id).map_err(JournalError::Protocol)?,
+                record,
+            ));
+        }
+        Ok(records)
+    }
+
+    pub fn activate_approval_record(
+        &self,
+        approval_id: &Digest32,
+        activation_operation_id: &OperationId,
+        ceremony_grant_jcs: &str,
+    ) -> Result<(), JournalError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let (state, existing_operation, renewal_of): (String, Option<String>, Option<String>) =
+            transaction
+                .query_row(
+                    "SELECT approvals.state, approval_metadata.activation_operation_id,
+                        approval_metadata.renewal_of
+                 FROM approvals JOIN approval_metadata USING (approval_id)
+                 WHERE approval_id = ?1",
+                    [approval_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    protocol(ProtocolErrorCode::ApprovalNotFound, "approval not found")
+                })?;
+        if let Some(existing_operation) = existing_operation {
+            if existing_operation == activation_operation_id.as_str()
+                && parse_approval_state(&state)? == ApprovalLifecycleState::Active
+            {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "approval ceremony activation was replayed with conflicting authority",
+            )
+            .into());
+        }
+        if parse_approval_state(&state)? != ApprovalLifecycleState::AwaitingCeremony {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "approval is not awaiting ceremony activation",
+            )
+            .into());
+        }
+        if let Some(replacement) = &renewal_of {
+            let replacement_state: String = transaction
+                .query_row(
+                    "SELECT state FROM approvals WHERE approval_id = ?1",
+                    [replacement],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    protocol(
+                        ProtocolErrorCode::ApprovalNotFound,
+                        "renewal predecessor is missing",
+                    )
+                })?;
+            if parse_approval_state(&replacement_state)? != ApprovalLifecycleState::Active {
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "renewal predecessor is no longer active",
+                )
+                .into());
+            }
+            transaction.execute(
+                "UPDATE approvals SET state = 'REVOKED' WHERE approval_id = ?1",
+                [replacement],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE approval_metadata
+             SET activation_operation_id = ?2, ceremony_grant_jcs = ?3
+             WHERE approval_id = ?1",
+            params![
+                approval_id.as_str(),
+                activation_operation_id.as_str(),
+                ceremony_grant_jcs
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE approvals SET state = 'ACTIVE' WHERE approval_id = ?1",
+            [approval_id.as_str()],
+        )?;
+        append_audit(
+            &transaction,
+            "approval.transition",
+            &serde_json::json!({
+                "approval_id": approval_id,
+                "from": ApprovalLifecycleState::AwaitingCeremony,
+                "to": ApprovalLifecycleState::Active,
+                "activation_operation_id": activation_operation_id
+                ,"renewal_of": renewal_of
+            }),
             self.audit_signer.as_ref(),
         )?;
         transaction.commit()?;
@@ -488,6 +704,22 @@ impl BrokerJournal {
         }
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
+        let approval_state: Option<String> = transaction
+            .query_row(
+                "SELECT approvals.state
+                 FROM approvals JOIN approval_metadata USING (approval_id)
+                 WHERE approvals.approval_id = ?1",
+                [request.approval_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if approval_state.as_deref() != Some("ACTIVE") {
+            return Err(protocol(
+                ProtocolErrorCode::ApprovalRevoked,
+                "reservation requires an active canonical approval",
+            )
+            .into());
+        }
         validate_reservation_clock(
             &transaction,
             request.reserved_at_ms,
@@ -563,11 +795,13 @@ impl BrokerJournal {
         validate_rolling_value_limits(&transaction, request, limits)?;
         transaction.execute(
             "INSERT INTO reservations(
-                approval_id, operation_id, signature_count, reserved_at_ms, state
-             ) VALUES (?1, ?2, ?3, ?4, 'RESERVED')",
+                approval_id, operation_id, operation_digest,
+                signature_count, reserved_at_ms, state
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'RESERVED')",
             params![
                 request.approval_id.as_str(),
                 request.operation_id.as_str(),
+                request.operation_digest.as_str(),
                 request.signature_count.to_string(),
                 request.reserved_at_ms.to_string()
             ],
@@ -590,6 +824,7 @@ impl BrokerJournal {
             &serde_json::json!({
                 "approval_id": request.approval_id,
                 "operation_id": request.operation_id,
+                "operation_digest": request.operation_digest,
                 "signature_count": request.signature_count,
                 "values": request.values
             }),
@@ -1456,14 +1691,15 @@ fn reservation_matches(
     transaction: &Transaction<'_>,
     request: &ReservationRequest,
 ) -> Result<bool, JournalError> {
-    let header: (String, String) = transaction.query_row(
-        "SELECT signature_count, reserved_at_ms FROM reservations
+    let header: (String, String, String) = transaction.query_row(
+        "SELECT operation_digest, signature_count, reserved_at_ms FROM reservations
          WHERE approval_id = ?1 AND operation_id = ?2",
         params![request.approval_id.as_str(), request.operation_id.as_str()],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
-    if header.0 != request.signature_count.to_string()
-        || header.1 != request.reserved_at_ms.to_string()
+    if header.0 != request.operation_digest.as_str()
+        || header.1 != request.signature_count.to_string()
+        || header.2 != request.reserved_at_ms.to_string()
     {
         return Ok(false);
     }
@@ -1493,8 +1729,17 @@ fn validate_rate_limits(
         return Ok(());
     }
     let mut statement = transaction.prepare(
-        "SELECT signature_count, reserved_at_ms FROM reservations
-         WHERE approval_id = ?1 AND state != 'RELEASED'",
+        "WITH RECURSIVE lineage(approval_id) AS (
+            VALUES (?1)
+            UNION ALL
+            SELECT metadata.renewal_of
+            FROM approval_metadata metadata
+            JOIN lineage ON metadata.approval_id = lineage.approval_id
+            WHERE metadata.renewal_of IS NOT NULL
+         )
+         SELECT signature_count, reserved_at_ms FROM reservations
+         WHERE approval_id IN (SELECT approval_id FROM lineage)
+           AND state != 'RELEASED'",
     )?;
     let rows = statement.query_map([request.approval_id.as_str()], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1570,12 +1815,21 @@ fn validate_rolling_value_limits(
         };
         let window_start = request.reserved_at_ms.saturating_sub(limit.duration_ms);
         let mut statement = transaction.prepare(
-            "SELECT value.amount, reservation.reserved_at_ms
+            "WITH RECURSIVE lineage(approval_id) AS (
+                VALUES (?1)
+                UNION ALL
+                SELECT metadata.renewal_of
+                FROM approval_metadata metadata
+                JOIN lineage ON metadata.approval_id = lineage.approval_id
+                WHERE metadata.renewal_of IS NOT NULL
+             )
+             SELECT value.amount, reservation.reserved_at_ms
              FROM reservation_values value
              JOIN reservations reservation
                ON reservation.approval_id = value.approval_id
               AND reservation.operation_id = value.operation_id
-             WHERE value.approval_id = ?1 AND value.asset_id = ?2
+             WHERE value.approval_id IN (SELECT approval_id FROM lineage)
+               AND value.asset_id = ?2
                AND reservation.state != 'RELEASED'",
         )?;
         let rows = statement.query_map(
