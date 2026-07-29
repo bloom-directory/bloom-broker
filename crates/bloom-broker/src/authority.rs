@@ -69,6 +69,9 @@ pub struct CeremonyApprovalGrant {
 pub struct AuthorizationInput {
     pub request: MachineSignRequest,
     pub reserved_at_ms: u64,
+    pub observed_utc_ms: Option<u64>,
+    pub monotonic_anchor_ns: u64,
+    pub clock_boot_epoch: bloom_triad_protocol::BootEpoch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1143,6 +1146,9 @@ impl BrokerAuthority {
                 operation_digest,
                 signature_count: ordered_hashes.len() as u64,
                 reserved_at_ms: input.reserved_at_ms,
+                observed_utc_ms: input.observed_utc_ms,
+                monotonic_anchor_ns: input.monotonic_anchor_ns,
+                clock_boot_epoch: input.clock_boot_epoch.clone(),
                 values: values.clone(),
             },
             &budget_limits(&terms),

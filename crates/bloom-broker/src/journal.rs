@@ -1,7 +1,7 @@
 use bloom_triad_protocol::{
-    ApprovalLifecycleState, ApprovalLimitState, Base64UrlBytes, DecimalU64, DecimalU256, Digest32,
-    OperationId, OperationState, ProtocolError, ProtocolErrorCode, SigningResult, Token,
-    UnsignedSignRequest,
+    ApprovalLifecycleState, ApprovalLimitState, Base64UrlBytes, BootEpoch, DecimalU64, DecimalU256,
+    Digest32, OperationId, OperationState, ProtocolError, ProtocolErrorCode, SealedApprovalTerms,
+    SigningResult, Token, UnsignedSignRequest,
 };
 use num_bigint::BigUint;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -109,6 +109,9 @@ pub struct ReservationRequest {
     pub operation_digest: Digest32,
     pub signature_count: u64,
     pub reserved_at_ms: u64,
+    pub observed_utc_ms: Option<u64>,
+    pub monotonic_anchor_ns: u64,
+    pub clock_boot_epoch: BootEpoch,
     pub values: BTreeMap<String, DecimalU256>,
 }
 
@@ -135,10 +138,12 @@ pub struct SlidingValueLimit {
     pub duration_ms: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TimeReading {
     pub utc_ms: Option<u64>,
     pub monotonic_elapsed_ms: u64,
+    pub monotonic_anchor_ns: u64,
+    pub boot_epoch: BootEpoch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,10 +155,13 @@ pub enum ClockCondition {
     Repaired,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClockDecision {
     pub effective_now_ms: u64,
     pub condition: ClockCondition,
+    pub observed_utc_ms: Option<u64>,
+    pub monotonic_anchor_ns: u64,
+    pub boot_epoch: BootEpoch,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -237,6 +245,9 @@ impl BrokerJournal {
                 operation_digest TEXT NOT NULL,
                 signature_count TEXT NOT NULL,
                 reserved_at_ms TEXT NOT NULL,
+                observed_utc_ms TEXT,
+                monotonic_anchor_ns TEXT NOT NULL,
+                clock_boot_epoch TEXT NOT NULL,
                 state TEXT NOT NULL,
                 PRIMARY KEY (approval_id, operation_id)
             );
@@ -261,9 +272,38 @@ impl BrokerJournal {
             CREATE TABLE IF NOT EXISTS clock_state (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                 last_effective_ms TEXT NOT NULL,
-                condition TEXT NOT NULL
+                condition TEXT NOT NULL,
+                observed_utc_ms TEXT,
+                monotonic_anchor_ns TEXT NOT NULL,
+                boot_epoch TEXT NOT NULL
             );
             ",
+        )?;
+        ensure_column(&connection, "reservations", "observed_utc_ms", "TEXT")?;
+        ensure_column(
+            &connection,
+            "reservations",
+            "monotonic_anchor_ns",
+            "TEXT NOT NULL DEFAULT '0'",
+        )?;
+        ensure_column(
+            &connection,
+            "reservations",
+            "clock_boot_epoch",
+            "TEXT NOT NULL DEFAULT '00000000000000000000000000000000'",
+        )?;
+        ensure_column(&connection, "clock_state", "observed_utc_ms", "TEXT")?;
+        ensure_column(
+            &connection,
+            "clock_state",
+            "monotonic_anchor_ns",
+            "TEXT NOT NULL DEFAULT '0'",
+        )?;
+        ensure_column(
+            &connection,
+            "clock_state",
+            "boot_epoch",
+            "TEXT NOT NULL DEFAULT '00000000000000000000000000000000'",
         )?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -848,14 +888,18 @@ impl BrokerJournal {
         transaction.execute(
             "INSERT INTO reservations(
                 approval_id, operation_id, operation_digest,
-                signature_count, reserved_at_ms, state
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'RESERVED')",
+                signature_count, reserved_at_ms, observed_utc_ms,
+                monotonic_anchor_ns, clock_boot_epoch, state
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'RESERVED')",
             params![
                 request.approval_id.as_str(),
                 request.operation_id.as_str(),
                 request.operation_digest.as_str(),
                 request.signature_count.to_string(),
-                request.reserved_at_ms.to_string()
+                request.reserved_at_ms.to_string(),
+                request.observed_utc_ms.map(|value| value.to_string()),
+                request.monotonic_anchor_ns.to_string(),
+                request.clock_boot_epoch.as_str(),
             ],
         )?;
         for (asset_id, amount) in &request.values {
@@ -1280,25 +1324,46 @@ impl BrokerJournal {
     ) -> Result<ClockDecision, JournalError> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
-        let stored: Option<String> = transaction
+        let decision = |effective_now_ms, condition| ClockDecision {
+            effective_now_ms,
+            condition,
+            observed_utc_ms: reading.utc_ms,
+            monotonic_anchor_ns: reading.monotonic_anchor_ns,
+            boot_epoch: reading.boot_epoch.clone(),
+        };
+        let stored: Option<(String, String)> = transaction
             .query_row(
-                "SELECT last_effective_ms FROM clock_state WHERE singleton = 1",
+                "SELECT last_effective_ms, condition FROM clock_state WHERE singleton = 1",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
+        let stored_condition = stored.as_ref().map(|(_, condition)| condition.as_str());
         let Some(utc_ms) = reading.utc_ms else {
             let effective_now_ms = stored
-                .map(|value| value.parse().map_err(storage))
+                .as_ref()
+                .map(|(value, _)| value.parse().map_err(storage))
                 .transpose()?
                 .unwrap_or(0);
-            write_clock_state(&transaction, effective_now_ms, ClockCondition::Untrusted)?;
-            append_audit(
+            write_clock_state(
                 &transaction,
-                "clock.untrusted",
-                &serde_json::json!({"effective_now_ms": effective_now_ms.to_string()}),
-                self.audit_signer.as_ref(),
+                effective_now_ms,
+                ClockCondition::Untrusted,
+                &reading,
             )?;
+            if stored_condition != Some("UNTRUSTED") {
+                append_audit(
+                    &transaction,
+                    "clock.untrusted",
+                    &serde_json::json!({
+                        "effective_now_ms": effective_now_ms.to_string(),
+                        "observed_utc_ms": null,
+                        "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                        "boot_epoch": reading.boot_epoch
+                    }),
+                    self.audit_signer.as_ref(),
+                )?;
+            }
             transaction.commit()?;
             if rate_limited_mutation {
                 return Err(protocol(
@@ -1307,27 +1372,27 @@ impl BrokerJournal {
                 )
                 .into());
             }
-            return Ok(ClockDecision {
-                effective_now_ms,
-                condition: ClockCondition::Untrusted,
-            });
+            return Ok(decision(effective_now_ms, ClockCondition::Untrusted));
         };
         let Some(last_effective_ms) = stored
-            .map(|value| value.parse::<u64>().map_err(storage))
+            .as_ref()
+            .map(|(value, _)| value.parse::<u64>().map_err(storage))
             .transpose()?
         else {
-            write_clock_state(&transaction, utc_ms, ClockCondition::Healthy)?;
+            write_clock_state(&transaction, utc_ms, ClockCondition::Healthy, &reading)?;
             append_audit(
                 &transaction,
                 "clock.initialized",
-                &serde_json::json!({"effective_now_ms": utc_ms.to_string()}),
+                &serde_json::json!({
+                    "effective_now_ms": utc_ms.to_string(),
+                    "observed_utc_ms": utc_ms.to_string(),
+                    "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                    "boot_epoch": reading.boot_epoch
+                }),
                 self.audit_signer.as_ref(),
             )?;
             transaction.commit()?;
-            return Ok(ClockDecision {
-                effective_now_ms: utc_ms,
-                condition: ClockCondition::Healthy,
-            });
+            return Ok(decision(utc_ms, ClockCondition::Healthy));
         };
         let monotonic_now = last_effective_ms
             .checked_add(reading.monotonic_elapsed_ms)
@@ -1342,16 +1407,21 @@ impl BrokerJournal {
                 &transaction,
                 last_effective_ms,
                 ClockCondition::RollbackFrozen,
+                &reading,
             )?;
-            append_audit(
-                &transaction,
-                "clock.rollback",
-                &serde_json::json!({
-                    "observed_utc_ms": utc_ms.to_string(),
-                    "effective_now_ms": last_effective_ms.to_string()
-                }),
-                self.audit_signer.as_ref(),
-            )?;
+            if stored_condition != Some("ROLLBACK_FROZEN") {
+                append_audit(
+                    &transaction,
+                    "clock.rollback",
+                    &serde_json::json!({
+                        "observed_utc_ms": utc_ms.to_string(),
+                        "effective_now_ms": last_effective_ms.to_string(),
+                        "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                        "boot_epoch": reading.boot_epoch
+                    }),
+                    self.audit_signer.as_ref(),
+                )?;
+            }
             transaction.commit()?;
             if rate_limited_mutation {
                 return Err(protocol(
@@ -1360,10 +1430,7 @@ impl BrokerJournal {
                 )
                 .into());
             }
-            return Ok(ClockDecision {
-                effective_now_ms: last_effective_ms,
-                condition: ClockCondition::RollbackFrozen,
-            });
+            return Ok(decision(last_effective_ms, ClockCondition::RollbackFrozen));
         }
         let maximum_automatic = monotonic_now.saturating_add(max_forward_step_ms);
         if utc_ms > maximum_automatic {
@@ -1371,45 +1438,59 @@ impl BrokerJournal {
                 &transaction,
                 monotonic_now,
                 ClockCondition::ForwardJumpRejected,
+                &reading,
             )?;
-            append_audit(
-                &transaction,
-                "clock.forward_jump",
-                &serde_json::json!({
-                    "observed_utc_ms": utc_ms.to_string(),
-                    "effective_now_ms": monotonic_now.to_string()
-                }),
-                self.audit_signer.as_ref(),
-            )?;
+            if stored_condition != Some("FORWARD_JUMP_REJECTED") {
+                append_audit(
+                    &transaction,
+                    "clock.forward_jump",
+                    &serde_json::json!({
+                        "observed_utc_ms": utc_ms.to_string(),
+                        "effective_now_ms": monotonic_now.to_string(),
+                        "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                        "boot_epoch": reading.boot_epoch
+                    }),
+                    self.audit_signer.as_ref(),
+                )?;
+            }
             transaction.commit()?;
-            return Ok(ClockDecision {
-                effective_now_ms: monotonic_now,
-                condition: ClockCondition::ForwardJumpRejected,
-            });
+            return Ok(decision(monotonic_now, ClockCondition::ForwardJumpRejected));
         }
         let effective_now_ms = utc_ms.max(monotonic_now);
-        write_clock_state(&transaction, effective_now_ms, ClockCondition::Healthy)?;
-        transaction.commit()?;
-        Ok(ClockDecision {
+        write_clock_state(
+            &transaction,
             effective_now_ms,
-            condition: ClockCondition::Healthy,
-        })
+            ClockCondition::Healthy,
+            &reading,
+        )?;
+        transaction.commit()?;
+        Ok(decision(effective_now_ms, ClockCondition::Healthy))
     }
 
     pub fn repair_clock(&self, accepted_utc_ms: u64) -> Result<ClockDecision, JournalError> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
-        let prior: Option<String> = transaction
+        let prior: Option<(String, String, String)> = transaction
             .query_row(
-                "SELECT last_effective_ms FROM clock_state WHERE singleton = 1",
+                "SELECT last_effective_ms, monotonic_anchor_ns, boot_epoch
+                 FROM clock_state WHERE singleton = 1",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let prior = prior
-            .map(|value| value.parse::<u64>().map_err(storage))
-            .transpose()?
-            .unwrap_or(0);
+        let (prior, monotonic_anchor_ns, boot_epoch) = prior.ok_or_else(|| {
+            protocol(
+                ProtocolErrorCode::ClockUntrusted,
+                "clock repair requires an initialized durable clock",
+            )
+        })?;
+        let prior = prior.parse::<u64>().map_err(storage)?;
+        let reading = TimeReading {
+            utc_ms: Some(accepted_utc_ms),
+            monotonic_elapsed_ms: 0,
+            monotonic_anchor_ns: monotonic_anchor_ns.parse::<u64>().map_err(storage)?,
+            boot_epoch: BootEpoch::new(boot_epoch)?,
+        };
         if accepted_utc_ms < prior {
             return Err(protocol(
                 ProtocolErrorCode::ClockRollback,
@@ -1417,13 +1498,20 @@ impl BrokerJournal {
             )
             .into());
         }
-        write_clock_state(&transaction, accepted_utc_ms, ClockCondition::Repaired)?;
+        write_clock_state(
+            &transaction,
+            accepted_utc_ms,
+            ClockCondition::Repaired,
+            &reading,
+        )?;
         append_audit(
             &transaction,
             "clock.repaired",
             &serde_json::json!({
                 "prior_effective_ms": prior.to_string(),
-                "accepted_utc_ms": accepted_utc_ms.to_string()
+                "accepted_utc_ms": accepted_utc_ms.to_string(),
+                "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                "boot_epoch": reading.boot_epoch
             }),
             self.audit_signer.as_ref(),
         )?;
@@ -1431,7 +1519,34 @@ impl BrokerJournal {
         Ok(ClockDecision {
             effective_now_ms: accepted_utc_ms,
             condition: ClockCondition::Repaired,
+            observed_utc_ms: reading.utc_ms,
+            monotonic_anchor_ns: reading.monotonic_anchor_ns,
+            boot_epoch: reading.boot_epoch,
         })
+    }
+
+    pub fn active_approvals_expiring_by(
+        &self,
+        accepted_utc_ms: u64,
+    ) -> Result<Vec<Digest32>, JournalError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT approvals.approval_id, approval_metadata.terms_jcs
+             FROM approvals JOIN approval_metadata USING(approval_id)
+             WHERE approvals.state = 'ACTIVE' ORDER BY approvals.approval_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut expiring = Vec::new();
+        for row in rows {
+            let (approval_id, terms_jcs) = row?;
+            let terms: SealedApprovalTerms = serde_json::from_str(&terms_jcs).map_err(storage)?;
+            if terms.expires_at_ms.get() <= accepted_utc_ms {
+                expiring.push(Digest32::new(approval_id)?);
+            }
+        }
+        Ok(expiring)
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, JournalError> {
@@ -1447,6 +1562,26 @@ impl BrokerJournal {
         }
         Ok(())
     }
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), JournalError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    if !columns.iter().any(|candidate| candidate == column) {
+        connection.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 pub fn derive_batch_child_operation_id(
@@ -1542,13 +1677,20 @@ fn write_clock_state(
     transaction: &Transaction<'_>,
     effective_now_ms: u64,
     condition: ClockCondition,
+    reading: &TimeReading,
 ) -> Result<(), JournalError> {
     transaction.execute(
-        "INSERT INTO clock_state(singleton, last_effective_ms, condition)
-         VALUES (1, ?1, ?2)
+        "INSERT INTO clock_state(
+             singleton, last_effective_ms, condition, observed_utc_ms,
+             monotonic_anchor_ns, boot_epoch
+         )
+         VALUES (1, ?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(singleton) DO UPDATE SET
              last_effective_ms = excluded.last_effective_ms,
-             condition = excluded.condition",
+             condition = excluded.condition,
+             observed_utc_ms = excluded.observed_utc_ms,
+             monotonic_anchor_ns = excluded.monotonic_anchor_ns,
+             boot_epoch = excluded.boot_epoch",
         params![
             effective_now_ms.to_string(),
             match condition {
@@ -1557,7 +1699,10 @@ fn write_clock_state(
                 ClockCondition::Untrusted => "UNTRUSTED",
                 ClockCondition::RollbackFrozen => "ROLLBACK_FROZEN",
                 ClockCondition::Repaired => "REPAIRED",
-            }
+            },
+            reading.utc_ms.map(|value| value.to_string()),
+            reading.monotonic_anchor_ns.to_string(),
+            reading.boot_epoch.as_str(),
         ],
     )?;
     Ok(())
@@ -1760,15 +1905,15 @@ fn reservation_matches(
     transaction: &Transaction<'_>,
     request: &ReservationRequest,
 ) -> Result<bool, JournalError> {
-    let header: (String, String, String) = transaction.query_row(
-        "SELECT operation_digest, signature_count, reserved_at_ms FROM reservations
+    let header: (String, String) = transaction.query_row(
+        "SELECT operation_digest, signature_count
+         FROM reservations
          WHERE approval_id = ?1 AND operation_id = ?2",
         params![request.approval_id.as_str(), request.operation_id.as_str()],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     if header.0 != request.operation_digest.as_str()
         || header.1 != request.signature_count.to_string()
-        || header.2 != request.reserved_at_ms.to_string()
     {
         return Ok(false);
     }

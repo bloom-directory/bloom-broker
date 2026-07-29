@@ -160,6 +160,7 @@ dependencies = [
  "bloom-signer",
  "bloom-triad-local-transport",
  "bloom-triad-protocol",
+ "bloom-trusted-time",
  "ed25519-dalek",
  "futures",
  "hex",
@@ -217,6 +218,7 @@ dependencies = [
  "bloom-signer-backend-local",
  "bloom-triad-local-transport",
  "bloom-triad-protocol",
+ "bloom-trusted-time",
  "chacha20poly1305",
  "ed25519-dalek",
  "futures",
@@ -272,6 +274,7 @@ name = "bloom-triad-local-transport"
 version = "0.1.1"
 dependencies = [
  "bloom-triad-protocol",
+ "bloom-trusted-time",
  "ed25519-dalek",
  "hex",
  "rand",
@@ -295,6 +298,14 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "bloom-trusted-time"
+version = "0.1.1"
+dependencies = [
+ "libc",
  "thiserror",
 ]
 

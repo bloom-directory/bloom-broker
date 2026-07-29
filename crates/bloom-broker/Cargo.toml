@@ -11,6 +11,7 @@ bloom-broker-api = { path = "../bloom-broker-api" }
 bloom-triad-protocol.workspace = true
 bloom-triad-local-transport.workspace = true
 bloom-service-activation.workspace = true
+bloom-trusted-time.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
 num-bigint.workspace = true

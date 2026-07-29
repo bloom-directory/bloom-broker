@@ -1,9 +1,6 @@
 //! Production Machine→Broker and revoke-control RPC implementation.
 
-use std::{
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::sync::Arc;
 
 use bloom_triad_protocol::{
     ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector, Base64UrlBytes, BootEpoch,
@@ -12,10 +9,9 @@ use bloom_triad_protocol::{
     MachineBrokerService, MachineSignRequest, OperationId, OperationPublicStatus, OperationState,
     PolicyCompareAndSwapRequest, PolicyUpdateCeremonyPrepareRequest, PolicyUpdateRequest,
     PolicyUpdateReviewManifest, PolicyValidationReceipt, ProtocolError, ProtocolErrorCode,
-    RPC_ENVELOPE_SCHEMA_V1, Readiness, ReadinessState, RevocationControlService,
-    SealedApprovalPrepareResponse, SelectorKind, ServiceCapabilities, ServiceFuture, SignRequest,
-    SigningPayloads, Token, UnsignedSignRequest, VerifierPublicCapability, WalletPublic,
-    WalletRequest,
+    RPC_ENVELOPE_SCHEMA_V1, Readiness, RevocationControlService, SealedApprovalPrepareResponse,
+    SelectorKind, ServiceCapabilities, ServiceFuture, SignRequest, SigningPayloads, Token,
+    UnsignedSignRequest, VerifierPublicCapability, WalletPublic, WalletRequest,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use rand::{RngCore, rngs::OsRng};
@@ -24,6 +20,7 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     authority::{AuthorityError, AuthorizationInput, BrokerAuthority, EpochReconciliation},
     ceremony::{CeremonyBroker, CeremonyCompletionObserver, ReviewManifestContext},
+    clock::BrokerClock,
     journal::{BrokerJournal, JournalError, ReservationState},
     signer_client::BrokerSignerClient,
 };
@@ -35,6 +32,7 @@ const POLICY_VALIDATION_DOMAIN: &[u8] = b"bloom-policy-validation-receipt/v1";
 pub struct BrokerRpcService {
     authority: Arc<BrokerAuthority>,
     journal: Arc<BrokerJournal>,
+    clock: Arc<BrokerClock>,
     ceremony: CeremonyBroker,
     signer: BrokerSignerClient,
     signing_key_id: Token,
@@ -49,6 +47,7 @@ impl BrokerRpcService {
     pub fn new(
         authority: Arc<BrokerAuthority>,
         journal: Arc<BrokerJournal>,
+        clock: Arc<BrokerClock>,
         ceremony: CeremonyBroker,
         signer: BrokerSignerClient,
         signing_key_id: Token,
@@ -60,6 +59,7 @@ impl BrokerRpcService {
         let service = Self {
             authority,
             journal,
+            clock,
             ceremony,
             signer,
             signing_key_id,
@@ -72,7 +72,7 @@ impl BrokerRpcService {
             Arc::new(AuthorityCompletionObserver {
                 authority: service.authority.clone(),
             }),
-            now_ms()?,
+            service.clock.now_ms(false)?,
         )?;
         Ok(service)
     }
@@ -93,7 +93,7 @@ impl BrokerRpcService {
                 ProtocolErrorCode::UnknownMethod,
                 "system.hello is consumed by the authenticated transport",
             )),
-            Request::BrokerReadiness(_) => Ok(Response::BrokerReadiness(self.readiness())),
+            Request::BrokerReadiness(_) => Ok(Response::BrokerReadiness(self.readiness()?)),
             Request::BrokerCapabilities(_) => {
                 Ok(Response::BrokerCapabilities(self.capabilities()?))
             }
@@ -253,7 +253,8 @@ impl BrokerRpcService {
                     bloom_triad_protocol::CeremonyKind::WalletRegistration,
                 )?;
                 Ok(Response::WalletRegistrationPrepare(
-                    self.ceremony.prepare_custody(request, now_ms()?)?,
+                    self.ceremony
+                        .prepare_custody(request, self.clock.now_ms(false)?)?,
                 ))
             }
             Request::WalletUnlockPrepare(_) => Err(ProtocolError::new(
@@ -266,7 +267,8 @@ impl BrokerRpcService {
                     bloom_triad_protocol::CeremonyKind::WalletImport,
                 )?;
                 Ok(Response::WalletImportPrepare(
-                    self.ceremony.prepare_custody(request, now_ms()?)?,
+                    self.ceremony
+                        .prepare_custody(request, self.clock.now_ms(false)?)?,
                 ))
             }
             Request::WalletExportPrepare(request) => {
@@ -275,7 +277,8 @@ impl BrokerRpcService {
                     bloom_triad_protocol::CeremonyKind::WalletExport,
                 )?;
                 Ok(Response::WalletExportPrepare(
-                    self.ceremony.prepare_custody(request, now_ms()?)?,
+                    self.ceremony
+                        .prepare_custody(request, self.clock.now_ms(false)?)?,
                 ))
             }
             Request::WalletDeletePrepare(request) => {
@@ -284,7 +287,8 @@ impl BrokerRpcService {
                     bloom_triad_protocol::CeremonyKind::WalletDelete,
                 )?;
                 Ok(Response::WalletDeletePrepare(
-                    self.ceremony.prepare_custody(request, now_ms()?)?,
+                    self.ceremony
+                        .prepare_custody(request, self.clock.now_ms(false)?)?,
                 ))
             }
             Request::KeyDerivePrepare(request) => {
@@ -293,7 +297,8 @@ impl BrokerRpcService {
                     bloom_triad_protocol::CeremonyKind::KeyDerive,
                 )?;
                 Ok(Response::KeyDerivePrepare(
-                    self.ceremony.prepare_custody(request, now_ms()?)?,
+                    self.ceremony
+                        .prepare_custody(request, self.clock.now_ms(false)?)?,
                 ))
             }
             Request::KeyEnrollPrepare(request) => {
@@ -302,7 +307,8 @@ impl BrokerRpcService {
                     bloom_triad_protocol::CeremonyKind::BackendEnrollment,
                 )?;
                 Ok(Response::KeyEnrollPrepare(
-                    self.ceremony.prepare_custody(request, now_ms()?)?,
+                    self.ceremony
+                        .prepare_custody(request, self.clock.now_ms(false)?)?,
                 ))
             }
             Request::CredentialAddPrepare(request) => {
@@ -311,7 +317,8 @@ impl BrokerRpcService {
                     bloom_triad_protocol::CeremonyKind::CredentialAdd,
                 )?;
                 Ok(Response::CredentialAddPrepare(
-                    self.ceremony.prepare_custody(request, now_ms()?)?,
+                    self.ceremony
+                        .prepare_custody(request, self.clock.now_ms(false)?)?,
                 ))
             }
             Request::CredentialReplacePrepare(request) => {
@@ -320,7 +327,8 @@ impl BrokerRpcService {
                     bloom_triad_protocol::CeremonyKind::CredentialReplace,
                 )?;
                 Ok(Response::CredentialReplacePrepare(
-                    self.ceremony.prepare_custody(request, now_ms()?)?,
+                    self.ceremony
+                        .prepare_custody(request, self.clock.now_ms(false)?)?,
                 ))
             }
             Request::CredentialRemovePrepare(request) => {
@@ -329,7 +337,8 @@ impl BrokerRpcService {
                     bloom_triad_protocol::CeremonyKind::CredentialRemove,
                 )?;
                 Ok(Response::CredentialRemovePrepare(
-                    self.ceremony.prepare_custody(request, now_ms()?)?,
+                    self.ceremony
+                        .prepare_custody(request, self.clock.now_ms(false)?)?,
                 ))
             }
             Request::RecoveryPrepare(request) => {
@@ -338,7 +347,8 @@ impl BrokerRpcService {
                     bloom_triad_protocol::CeremonyKind::WalletRecovery,
                 )?;
                 Ok(Response::RecoveryPrepare(
-                    self.ceremony.prepare_custody(request, now_ms()?)?,
+                    self.ceremony
+                        .prepare_custody(request, self.clock.now_ms(false)?)?,
                 ))
             }
             Request::KeyListPublic(request) => {
@@ -405,7 +415,8 @@ impl BrokerRpcService {
             }
             Request::CeremonyCancel(request) => {
                 let operation_id = OperationId::new(request.id.as_str().to_owned())?;
-                self.ceremony.cancel(&operation_id, now_ms()?)?;
+                self.ceremony
+                    .cancel(&operation_id, self.clock.now_ms(false)?)?;
                 Ok(Response::CeremonyCancel(
                     self.ceremony.public_status(&operation_id)?,
                 ))
@@ -448,14 +459,16 @@ impl BrokerRpcService {
         let response = self.ceremony.prepare_approval(
             ceremony_request,
             ReviewManifestContext::default(),
-            now_ms()?,
+            self.clock.now_ms(false)?,
         )?;
         if let Err(error) = self
             .authority
             .prepare_approval(&request.terms, &response.review_manifest_digest)
             .map_err(authority_error)
         {
-            let _ = self.ceremony.cancel(&request.operation_id, now_ms()?);
+            let _ = self
+                .ceremony
+                .cancel(&request.operation_id, self.clock.now_ms(false)?);
             return Err(error);
         }
         Ok(response)
@@ -482,7 +495,7 @@ impl BrokerRpcService {
                 "Signer-authenticated policy baseline is stale",
             ));
         }
-        let now = now_ms()?;
+        let now = self.clock.now_ms(false)?;
         let mut review = PolicyUpdateReviewManifest {
             schema: Token::new("bloom.policy-update-review/1")?,
             operation_id: request.operation_id.clone(),
@@ -561,7 +574,6 @@ impl BrokerRpcService {
         request: MachineSignRequest,
         is_batch: bool,
     ) -> Result<bloom_triad_protocol::SigningResult, ProtocolError> {
-        let reserved_at_ms = now_ms()?;
         let signature_count = match &request.payloads {
             SigningPayloads::Single { .. } => 1,
             SigningPayloads::Batch { children } => children.len(),
@@ -573,12 +585,24 @@ impl BrokerRpcService {
             .ok_or_else(|| {
                 ProtocolError::new(ProtocolErrorCode::ApprovalNotFound, "approval not found")
             })?;
+        let trusted_time_required = !terms.limits.operation_rate_limits.is_empty()
+            || !terms.limits.signature_rate_limits.is_empty()
+            || terms
+                .limits
+                .value_limits
+                .iter()
+                .any(|limit| !limit.rolling_windows.is_empty());
+        let clock = self.clock.observe(trusted_time_required)?;
+        let reserved_at_ms = clock.effective_now_ms;
         self.reconcile_wallet(&terms.wallet_id).await?;
         let decision = self
             .authority
             .authorize(&AuthorizationInput {
                 request: request.clone(),
                 reserved_at_ms,
+                observed_utc_ms: clock.observed_utc_ms,
+                monotonic_anchor_ns: clock.monotonic_anchor_ns,
+                clock_boot_epoch: clock.boot_epoch,
             })
             .map_err(authority_error)?;
         let mut attempt_bytes = [0_u8; 32];
@@ -1065,15 +1089,16 @@ impl BrokerRpcService {
         })
     }
 
-    fn readiness(&self) -> Readiness {
-        Readiness {
+    fn readiness(&self) -> Result<Readiness, ProtocolError> {
+        let (state, conditions) = self.clock.readiness()?;
+        Ok(Readiness {
             service_id: Token::new("bloom-broker").expect("static service ID"),
             service_version: self.service_version.clone(),
             build_digest: self.build_digest.clone(),
             boot_epoch: self.boot_epoch.clone(),
-            state: ReadinessState::Ready,
-            conditions: Vec::new(),
-        }
+            state,
+            conditions,
+        })
     }
 
     fn capabilities(&self) -> Result<ServiceCapabilities, ProtocolError> {
@@ -1278,15 +1303,6 @@ fn response_mismatch(method: &str) -> ProtocolError {
 
 fn malformed(error: impl std::fmt::Display) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string())
-}
-
-fn now_ms() -> Result<u64, ProtocolError> {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| ProtocolError::new(ProtocolErrorCode::ClockRollback, "clock rolled back"))?
-        .as_millis();
-    u64::try_from(millis)
-        .map_err(|_| ProtocolError::new(ProtocolErrorCode::ClockUntrusted, "clock overflowed"))
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ use bloom_broker::{
         CEREMONY_ADDR, CEREMONY_OWNER_HEADER, CEREMONY_OWNER_VALUE, CeremonyBroker,
         CeremonyCompletionObserver, CeremonySigner, ReviewManifestContext,
     },
+    clock::BrokerClock,
     journal::{AuditSigner, BrokerJournal},
     service::BrokerRpcService,
     signer_client::BrokerSignerClient,
@@ -17,6 +18,7 @@ use bloom_broker::{
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer::{
     ceremony::SignerCeremonyService,
+    clock::SignerClock,
     engine::SignerEngine,
     hpke::{CUSTODY_OUTPUT_INFO, HpkeRecipient},
     registry::BackendRegistry,
@@ -36,6 +38,15 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use tower::ServiceExt as _;
+
+fn test_time_source() -> &'static str {
+    #[cfg(target_os = "linux")]
+    return "linux-chrony-nts";
+    #[cfg(target_os = "macos")]
+    return "macos-managed-timed";
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    panic!("W5 ceremony tests require a reviewed trusted-time platform");
+}
 
 #[derive(Clone)]
 struct ServiceTestAuditSigner;
@@ -726,6 +737,14 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let signer_rpc = Arc::new(SignerRpcService::new(
         signer_engine.clone(),
         signer_ceremony.clone(),
+        Arc::new(
+            SignerClock::new(
+                signer_engine.clone(),
+                test_time_source(),
+                signer_identity.boot_epoch.clone(),
+            )
+            .unwrap(),
+        ),
         signer_identity.boot_epoch.clone(),
         digest("e2"),
         "test",
@@ -777,6 +796,14 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let broker = BrokerRpcService::new(
         authority.clone(),
         journal.clone(),
+        Arc::new(
+            BrokerClock::new(
+                journal.clone(),
+                test_time_source(),
+                broker_identity.boot_epoch.clone(),
+            )
+            .unwrap(),
+        ),
         ceremony,
         signer_client.clone(),
         Token::new("broker-app-1").unwrap(),
@@ -1166,7 +1193,15 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
 
     let restarted_broker = BrokerRpcService::new(
         authority.clone(),
-        journal,
+        journal.clone(),
+        Arc::new(
+            BrokerClock::new(
+                journal.clone(),
+                test_time_source(),
+                broker_identity.boot_epoch.clone(),
+            )
+            .unwrap(),
+        ),
         CeremonyBroker::open(
             directory.path().join("restarted-ceremony.sqlite"),
             Arc::new(signer_client.clone()),

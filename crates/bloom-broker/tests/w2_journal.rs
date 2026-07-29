@@ -10,6 +10,7 @@ use bloom_triad_protocol::{
     UnsignedSignRequest,
 };
 use ed25519_dalek::{Signer as _, SigningKey, Verifier as _};
+use rusqlite::Connection;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Barrier},
@@ -191,6 +192,8 @@ fn ac10_sliding_windows_use_exact_continuous_boundaries() {
             TimeReading {
                 utc_ms: Some(1_000),
                 monotonic_elapsed_ms: 0,
+                monotonic_anchor_ns: 1_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
             },
             3_600_000,
             true,
@@ -204,6 +207,8 @@ fn ac10_sliding_windows_use_exact_continuous_boundaries() {
             TimeReading {
                 utc_ms: Some(1_500),
                 monotonic_elapsed_ms: 500,
+                monotonic_anchor_ns: 1_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
             },
             3_600_000,
             true,
@@ -217,6 +222,8 @@ fn ac10_sliding_windows_use_exact_continuous_boundaries() {
             TimeReading {
                 utc_ms: Some(1_999),
                 monotonic_elapsed_ms: 499,
+                monotonic_anchor_ns: 1_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
             },
             3_600_000,
             true,
@@ -233,6 +240,8 @@ fn ac10_sliding_windows_use_exact_continuous_boundaries() {
             TimeReading {
                 utc_ms: Some(2_000),
                 monotonic_elapsed_ms: 1,
+                monotonic_anchor_ns: 1_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
             },
             3_600_000,
             true,
@@ -267,6 +276,8 @@ fn ac10_clock_faults_freeze_or_advance_effective_time_fail_closed() {
                 TimeReading {
                     utc_ms: Some(10_000),
                     monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 1_000_000,
+                    boot_epoch: BootEpoch::from_bytes([1; 16]),
                 },
                 3_600_000,
                 true,
@@ -282,6 +293,8 @@ fn ac10_clock_faults_freeze_or_advance_effective_time_fail_closed() {
                     TimeReading {
                         utc_ms: Some(9_999),
                         monotonic_elapsed_ms: 10,
+                        monotonic_anchor_ns: 1_000_000,
+                        boot_epoch: BootEpoch::from_bytes([1; 16]),
                     },
                     3_600_000,
                     true,
@@ -303,6 +316,8 @@ fn ac10_clock_faults_freeze_or_advance_effective_time_fail_closed() {
                     TimeReading {
                         utc_ms: None,
                         monotonic_elapsed_ms: 20,
+                        monotonic_anchor_ns: 1_000_000,
+                        boot_epoch: BootEpoch::from_bytes([1; 16]),
                     },
                     3_600_000,
                     true,
@@ -320,6 +335,8 @@ fn ac10_clock_faults_freeze_or_advance_effective_time_fail_closed() {
             TimeReading {
                 utc_ms: Some(10_000_000),
                 monotonic_elapsed_ms: 100,
+                monotonic_anchor_ns: 1_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
             },
             3_600_000,
             true,
@@ -327,6 +344,31 @@ fn ac10_clock_faults_freeze_or_advance_effective_time_fail_closed() {
         .unwrap();
     assert_eq!(forward.effective_now_ms, 10_100);
     assert_eq!(forward.condition, ClockCondition::ForwardJumpRejected);
+    let repeated_forward = journal
+        .observe_time(
+            TimeReading {
+                utc_ms: Some(10_000_001),
+                monotonic_elapsed_ms: 1,
+                monotonic_anchor_ns: 2_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
+            },
+            3_600_000,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        repeated_forward.condition,
+        ClockCondition::ForwardJumpRejected
+    );
+    assert_eq!(
+        journal
+            .audit_entries()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.event_type == "clock.forward_jump")
+            .count(),
+        1
+    );
     let repaired = journal.repair_clock(10_000_000).unwrap();
     assert_eq!(repaired.condition, ClockCondition::Repaired);
     journal.verify_audit_chain().unwrap();
@@ -347,6 +389,8 @@ fn ac10_rolling_asset_windows_are_atomic_and_release_aware() {
             TimeReading {
                 utc_ms: Some(1_000),
                 monotonic_elapsed_ms: 0,
+                monotonic_anchor_ns: 1_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
             },
             3_600_000,
             true,
@@ -360,6 +404,8 @@ fn ac10_rolling_asset_windows_are_atomic_and_release_aware() {
             TimeReading {
                 utc_ms: Some(1_500),
                 monotonic_elapsed_ms: 500,
+                monotonic_anchor_ns: 1_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
             },
             3_600_000,
             true,
@@ -373,6 +419,8 @@ fn ac10_rolling_asset_windows_are_atomic_and_release_aware() {
             TimeReading {
                 utc_ms: Some(1_999),
                 monotonic_elapsed_ms: 499,
+                monotonic_anchor_ns: 1_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
             },
             3_600_000,
             true,
@@ -401,6 +449,8 @@ fn ac10_rolling_asset_windows_are_atomic_and_release_aware() {
             TimeReading {
                 utc_ms: Some(5_000),
                 monotonic_elapsed_ms: 0,
+                monotonic_anchor_ns: 1_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
             },
             3_600_000,
             true,
@@ -437,6 +487,9 @@ fn reservation(value: u8) -> ReservationRequest {
         operation_digest: digest("33"),
         signature_count: 1,
         reserved_at_ms: 1_900_000_000_000 + u64::from(value),
+        observed_utc_ms: Some(1_900_000_000_000 + u64::from(value)),
+        monotonic_anchor_ns: 1_000_000,
+        clock_boot_epoch: BootEpoch::from_bytes([1; 16]),
         values: BTreeMap::from([(
             "eip155:1/slip44:60".into(),
             DecimalU256::parse("10").unwrap(),
@@ -590,12 +643,77 @@ fn ac10_concurrent_reservations_cannot_overspend_and_release_is_full() {
         .unwrap();
     journal.reserve(&reservation(21), &limits(5)).unwrap();
 
+    let mut same_operation_retry = reservation(21);
+    same_operation_retry.reserved_at_ms += 1_000;
+    same_operation_retry.observed_utc_ms = Some(same_operation_retry.reserved_at_ms);
+    same_operation_retry.monotonic_anchor_ns += 1_000_000;
+    same_operation_retry.clock_boot_epoch = BootEpoch::from_bytes([2; 16]);
+    journal.reserve(&same_operation_retry, &limits(5)).unwrap();
+
     let mut changed_retry = reservation(21);
     changed_retry.signature_count = 2;
     assert_eq!(
         protocol_code(journal.reserve(&changed_retry, &limits(5)).unwrap_err()),
         bloom_triad_protocol::ProtocolErrorCode::OperationIdConflict
     );
+}
+
+#[test]
+fn clock_schema_migrates_an_existing_broker_database() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("broker.sqlite3");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE reservations (
+                approval_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                operation_digest TEXT NOT NULL,
+                signature_count TEXT NOT NULL,
+                reserved_at_ms TEXT NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (approval_id, operation_id)
+            );
+            CREATE TABLE clock_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                last_effective_ms TEXT NOT NULL,
+                condition TEXT NOT NULL
+            );
+            INSERT INTO clock_state(singleton, last_effective_ms, condition)
+            VALUES (1, '1000', 'HEALTHY');
+            ",
+        )
+        .unwrap();
+    drop(connection);
+
+    let journal = open_journal(&path);
+    let decision = journal
+        .observe_time(
+            TimeReading {
+                utc_ms: Some(1_001),
+                monotonic_elapsed_ms: 1,
+                monotonic_anchor_ns: 2_000_000,
+                boot_epoch: BootEpoch::from_bytes([3; 16]),
+            },
+            3_600_000,
+            false,
+        )
+        .unwrap();
+    assert_eq!(decision.effective_now_ms, 1_001);
+
+    let connection = Connection::open(path).unwrap();
+    for table in ["reservations", "clock_state"] {
+        let columns = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "observed_utc_ms"));
+        assert!(columns.iter().any(|column| column == "monotonic_anchor_ns"));
+    }
 }
 
 #[test]

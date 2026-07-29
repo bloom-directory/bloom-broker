@@ -9,10 +9,10 @@ use bloom_broker::{
 };
 use bloom_triad_protocol::{
     ActivationMode, ApprovalLimits, ApprovalSelector, ApprovalSubject, ApprovalTombstone, AssetId,
-    Base64UrlBytes, CeremonyKind, CeremonyState, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite,
-    CustodyResult, DecimalU64, DecimalU256, DeclaredDebit, DeclaredDestination, DeclaredFee,
-    Digest32, KeyRef, KeySpec, MachineSignRequest, OperationId, PetalUseClaim, PolicyUpdateRequest,
-    RequestNonce, RevocationState, SealedApprovalTerms, SignOperationIdentity,
+    Base64UrlBytes, BootEpoch, CeremonyKind, CeremonyState, ClaimAssurance, ClaimAssuranceLevel,
+    CryptoSuite, CustodyResult, DecimalU64, DecimalU256, DeclaredDebit, DeclaredDestination,
+    DeclaredFee, Digest32, KeyRef, KeySpec, MachineSignRequest, OperationId, PetalUseClaim,
+    PolicyUpdateRequest, RequestNonce, RevocationState, SealedApprovalTerms, SignOperationIdentity,
     SignedPolicySnapshot, SigningPayloads, Token, ValueLimit,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
@@ -1203,6 +1203,9 @@ fn exact_input(
             provenance: harness.system_provenance().subject,
         },
         reserved_at_ms: 1_500,
+        observed_utc_ms: Some(1_500),
+        monotonic_anchor_ns: 1_000_000,
+        clock_boot_epoch: BootEpoch::from_bytes([1; 16]),
     };
     bind_operation_digest(&mut input, terms);
     input
@@ -1232,6 +1235,9 @@ fn exact_batch_input(
             provenance: harness.system_provenance().subject,
         },
         reserved_at_ms: 1_500,
+        observed_utc_ms: Some(1_500),
+        monotonic_anchor_ns: 1_000_000,
+        clock_boot_epoch: BootEpoch::from_bytes([1; 16]),
     };
     bind_operation_digest(&mut input, terms);
     input
@@ -1309,6 +1315,9 @@ fn petal_input(
             provenance: provenance.subject.clone(),
         },
         reserved_at_ms: 1_500,
+        observed_utc_ms: Some(1_500),
+        monotonic_anchor_ns: 1_000_000,
+        clock_boot_epoch: BootEpoch::from_bytes([1; 16]),
     };
     bind_operation_digest(&mut input, terms);
     input
