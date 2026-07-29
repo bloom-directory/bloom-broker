@@ -1,0 +1,11 @@
+[package]
+name = "bloom-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bloom-broker-api = { path = "../bloom-broker-api" }
+bloom-triad-protocol.workspace = true
+

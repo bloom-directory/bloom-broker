@@ -1,0 +1,19 @@
+[workspace]
+members = [
+  "crates/bloom-broker-api",
+  "crates/bloom-broker",
+  "crates/bloom-broker-debug-driver",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+bloom-triad-protocol = { path = "../bloom/crates/bloom-triad-protocol" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
