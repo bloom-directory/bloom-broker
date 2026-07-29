@@ -732,6 +732,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     ));
     let signer_server = tokio::spawn({
         let signer_identity = signer_identity.clone();
+        let signer_rpc = signer_rpc.clone();
         async move {
             let quota = EndpointQuota::new(16, 1_000, 60_000, 1_000, 60_000).unwrap();
             loop {
@@ -749,7 +750,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         }
     });
     let signer_client =
-        BrokerSignerClient::connect_unix(&socket_path, broker_identity.clone(), signer_acl)
+        BrokerSignerClient::connect_unix(&socket_path, broker_identity.clone(), signer_acl.clone())
             .unwrap();
 
     let journal =
@@ -775,12 +776,12 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     .unwrap();
     let broker = BrokerRpcService::new(
         authority.clone(),
-        journal,
+        journal.clone(),
         ceremony,
         signer_client.clone(),
         Token::new("broker-app-1").unwrap(),
         SigningKey::from_bytes(&[7; 32]),
-        broker_identity.boot_epoch,
+        broker_identity.boot_epoch.clone(),
         digest("e3"),
         "test",
     )
@@ -913,7 +914,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
 
     let restarted_ceremony = CeremonyBroker::open(
         directory.path().join("ceremony.sqlite"),
-        Arc::new(signer_client),
+        Arc::new(signer_client.clone()),
     )
     .unwrap();
     restarted_ceremony
@@ -1113,6 +1114,93 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     assert_eq!(
         authority.policy_snapshot(&wallet_id).unwrap(),
         committed.committed
+    );
+
+    // Stop Broker before panic-revoking through Signer's independently
+    // authenticated control socket. Recreate Broker afterwards and prove its
+    // first reconciliation adopts the higher Signer epoch.
+    drop(broker);
+    drop(restarted_ceremony);
+    let control_socket_path = directory.path().join("signer-control.sock");
+    let control_listener = tokio::net::UnixListener::bind(&control_socket_path).unwrap();
+    let revoke_identity = local_identity("bloom-revoke-client", [0x33; 32], "33");
+    let revoke_acl = peer_acl(&revoke_identity, effective_uid);
+    let control_server = tokio::spawn({
+        let signer_identity = signer_identity.clone();
+        let signer_rpc = signer_rpc.clone();
+        async move {
+            let (mut stream, _) = control_listener.accept().await.unwrap();
+            let quota = EndpointQuota::new(16, 1_000, 60_000, 1_000, 60_000).unwrap();
+            bloom_triad_local_transport::dispatch_control_connection(
+                &mut stream,
+                &signer_identity,
+                &revoke_acl,
+                &quota,
+                signer_rpc.as_ref(),
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let mut control_stream = tokio::net::UnixStream::connect(&control_socket_path)
+        .await
+        .unwrap();
+    let signer_only_revoke: ControlResponse = bloom_triad_local_transport::call(
+        &mut control_stream,
+        &revoke_identity,
+        &signer_acl,
+        ControlRequest::RevokeAll(WalletOperationRequest {
+            operation_id: operation("e6"),
+            wallet_id: wallet_id.clone(),
+        }),
+        5_000,
+    )
+    .await
+    .unwrap();
+    control_server.await.unwrap();
+    let ControlResponse::RevokeAll(signer_only_state) = signer_only_revoke else {
+        panic!("unexpected Signer control response");
+    };
+    assert_eq!(signer_only_state.wallet_revocation_epoch.get(), 1);
+    assert_eq!(authority.wallet_epoch(&wallet_id).unwrap(), 0);
+
+    let restarted_broker = BrokerRpcService::new(
+        authority.clone(),
+        journal,
+        CeremonyBroker::open(
+            directory.path().join("restarted-ceremony.sqlite"),
+            Arc::new(signer_client.clone()),
+        )
+        .unwrap(),
+        signer_client,
+        Token::new("broker-app-1").unwrap(),
+        SigningKey::from_bytes(&[7; 32]),
+        broker_identity.boot_epoch,
+        digest("e3"),
+        "test",
+    )
+    .unwrap();
+    restarted_broker.reconcile_all().await.unwrap();
+    assert_eq!(authority.wallet_epoch(&wallet_id).unwrap(), 1);
+    assert_eq!(
+        signer_engine
+            .revocation_state(&wallet_id, now_ms + 2_000)
+            .unwrap()
+            .wallet_revocation_epoch
+            .get(),
+        1
+    );
+
+    authority.advance_local_epoch(&wallet_id, 1, 2).unwrap();
+    restarted_broker.reconcile_all().await.unwrap();
+    assert_eq!(authority.wallet_epoch(&wallet_id).unwrap(), 2);
+    assert_eq!(
+        signer_engine
+            .revocation_state(&wallet_id, now_ms + 3_000)
+            .unwrap()
+            .wallet_revocation_epoch
+            .get(),
+        2
     );
     signer_server.abort();
 }
