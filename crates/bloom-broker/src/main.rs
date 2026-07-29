@@ -84,6 +84,12 @@ impl Drop for BrokerConfig {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args_os().len() == 2
+        && std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--version"))
+    {
+        println!("bloom-broker {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let identity_path = env_path(
         "BLOOM_BROKER_IDENTITY",
         "/var/run/bloom/broker-identity.json",
