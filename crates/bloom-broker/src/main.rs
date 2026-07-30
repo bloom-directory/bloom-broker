@@ -5,8 +5,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::{ErrorKind, Read as _, Write as _},
-    net::{SocketAddr, TcpStream},
+    io::{ErrorKind, Write as _},
     os::unix::fs::{MetadataExt, OpenOptionsExt as _, PermissionsExt as _, chown},
     path::{Path, PathBuf},
     sync::Arc,
@@ -237,7 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         build_digest,
         env!("CARGO_PKG_VERSION"),
     )?;
-    if let Some(containment) = containment {
+    if let Some(containment) = containment.clone() {
         service = service.with_network_containment(containment);
     }
     let service = Arc::new(service);
@@ -281,7 +280,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(error) => {
             if let Some(path) = startup_status_path.as_deref() {
-                write_listener_conflict(path, broker_effective_uid)?;
+                write_listener_conflict(path, broker_effective_uid, containment.as_ref())?;
             }
             return Err(error.into());
         }
@@ -338,8 +337,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn write_listener_conflict(path: &Path, broker_uid: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let bloom_shaped = canonical_listener_is_bloom_shaped();
+fn write_listener_conflict(
+    path: &Path,
+    broker_uid: u32,
+    containment: Option<&NetworkContainmentGuard>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bloom_shaped = canonical_listener_is_bloom_shaped(containment);
     let (incident, message) = if bloom_shaped {
         (
             "another_login_session",
@@ -365,46 +368,19 @@ fn write_listener_conflict(path: &Path, broker_uid: u32) -> Result<(), Box<dyn s
     )
 }
 
-fn canonical_listener_is_bloom_shaped() -> bool {
-    let address: SocketAddr = match "127.0.0.1:18734".parse() {
-        Ok(address) => address,
-        Err(_) => return false,
-    };
-    let mut stream = match TcpStream::connect_timeout(&address, Duration::from_millis(250)) {
-        Ok(stream) => stream,
-        Err(_) => return false,
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
-    if stream
-        .write_all(b"GET / HTTP/1.0\r\nHost: 127.0.0.1:18734\r\n\r\n")
-        .is_err()
-    {
+fn canonical_listener_is_bloom_shaped(containment: Option<&NetworkContainmentGuard>) -> bool {
+    let Some(containment) = containment else {
         return false;
-    }
-    let mut response = Vec::with_capacity(4096);
-    let mut chunk = [0_u8; 512];
-    while response.len() < 4096 {
-        let remaining = 4096 - response.len();
-        let read_length = remaining.min(chunk.len());
-        match stream.read(&mut chunk[..read_length]) {
-            Ok(0) => return false,
-            Ok(count) => {
-                response.extend_from_slice(&chunk[..count]);
-                if response_has_bloom_owner_marker(&response) {
-                    return true;
-                }
-            }
-            Err(_) => return false,
+    };
+    for attempt in 0..4 {
+        if matches!(containment.ceremony_listener_bloom_shaped(), Ok(true)) {
+            return true;
+        }
+        if attempt != 3 {
+            std::thread::sleep(Duration::from_millis(750));
         }
     }
     false
-}
-
-fn response_has_bloom_owner_marker(response: &[u8]) -> bool {
-    String::from_utf8_lossy(response)
-        .to_ascii_lowercase()
-        .contains("x-bloom-ceremony-owner: bloom-broker-v1")
 }
 
 fn write_startup_failure(
@@ -857,16 +833,6 @@ fn verifying_key(encoded: &str) -> Result<VerifyingKey, ProtocolError> {
 #[cfg(test)]
 mod startup_failure_tests {
     use super::*;
-
-    #[test]
-    fn bloom_owner_marker_is_case_insensitive_but_requires_the_exact_value() {
-        assert!(response_has_bloom_owner_marker(
-            b"HTTP/1.0 404 Not Found\r\nX-Bloom-Ceremony-Owner: bloom-broker-v1\r\n\r\n"
-        ));
-        assert!(!response_has_bloom_owner_marker(
-            b"HTTP/1.0 404 Not Found\r\nX-Bloom-Ceremony-Owner: other\r\n\r\n"
-        ));
-    }
 
     #[test]
     fn startup_failure_is_bounded_atomic_and_substitution_safe() {
