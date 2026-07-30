@@ -5,9 +5,11 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::ErrorKind,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bloom_broker::{
@@ -27,7 +29,11 @@ use bloom_triad_protocol::{
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
-use tokio::{net::UnixListener, sync::Semaphore};
+use tokio::{
+    io::AsyncReadExt as _,
+    net::{UnixListener, UnixStream},
+    sync::{Semaphore, watch},
+};
 use zeroize::Zeroize;
 
 #[derive(Deserialize)]
@@ -104,13 +110,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (identity, manifest) =
         load_identity_and_manifest(&identity_path, &manifest_path, "bloom-broker")?;
     let trusted_time_source = manifest.trusted_time_source.clone();
+    let session_acl = manifest
+        .session
+        .clone()
+        .ok_or("edge manifest has no login-session identity")?
+        .into_acl()?;
     let machine_acl = manifest.machine.into_acl()?;
     let revoke_client_acl = manifest.revoke_client.into_acl()?;
     if machine_acl.service_id.as_str() != "bloom-machine"
         || revoke_client_acl.service_id.as_str() != "bloom-revoke-client"
+        || session_acl.service_id.as_str() != "bloom-session"
     {
         return Err("edge manifest has the wrong Broker endpoint principals".into());
     }
+    let session_socket_path = env_path(
+        "BLOOM_SESSION_SOCKET",
+        "/var/run/bloom/session/session.sock",
+    );
     let mut config = load_config(&config_path)?;
     let broker_signing_key = take_signing_key(&mut config.broker_signing_seed_hex)?;
     let audit_signing_key = take_signing_key(&mut config.audit_signing_seed_hex)?;
@@ -216,6 +232,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if config.maximum_connections == 0 || config.control_maximum_connections == 0 {
         return Err("Broker connection quotas must be nonzero".into());
     }
+    let mut session_stream =
+        connect_authenticated_session(&session_socket_path, &identity, &session_acl).await?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut rpc_shutdown = shutdown_rx.clone();
+    let mut control_shutdown = shutdown_rx.clone();
+    let mut ceremony_shutdown = shutdown_rx;
+    let ceremony_for_shutdown = ceremony.clone();
     tokio::try_join!(
         serve_rpc(
             rpc_listener,
@@ -224,6 +247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rpc_quota,
             service.clone(),
             config.maximum_connections,
+            &mut rpc_shutdown,
         ),
         serve_control(
             control_listener,
@@ -232,14 +256,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             control_quota,
             service,
             config.control_maximum_connections,
+            &mut control_shutdown,
         ),
         async move {
-            ceremony
-                .serve_canonical()
+            ceremony_for_shutdown
+                .serve_canonical_until(async move {
+                    wait_for_shutdown(&mut ceremony_shutdown).await;
+                })
                 .await
                 .map_err(std::io::Error::other)
         },
+        async move {
+            let mut unexpected = [0_u8; 1];
+            match session_stream.read(&mut unexpected).await {
+                Ok(0) => shutdown_tx
+                    .send(true)
+                    .map_err(|_| std::io::Error::other("Broker shutdown receivers disappeared")),
+                Ok(_) => Err(std::io::Error::other(
+                    "session sentinel sent unexpected channel data",
+                )),
+                Err(error) => Err(std::io::Error::new(
+                    error.kind(),
+                    format!("monitor login-session sentinel: {error}"),
+                )),
+            }
+        },
     )?;
+    ceremony.terminate_live_sessions(unix_time_ms()?)?;
     Ok(())
 }
 
@@ -289,15 +332,20 @@ async fn serve_rpc(
     quota: Arc<EndpointQuota>,
     service: Arc<BrokerRpcService>,
     maximum_connections: usize,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let connections = Arc::new(Semaphore::new(maximum_connections));
     loop {
-        let permit = connections
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| std::io::Error::other("Broker RPC connection gate closed"))?;
-        let (mut stream, _) = listener.accept().await?;
+        let permit = tokio::select! {
+            _ = wait_for_shutdown(shutdown) => return Ok(()),
+            permit = connections.clone().acquire_owned() => {
+                permit.map_err(|_| std::io::Error::other("Broker RPC connection gate closed"))?
+            }
+        };
+        let (mut stream, _) = tokio::select! {
+            _ = wait_for_shutdown(shutdown) => return Ok(()),
+            accepted = listener.accept() => accepted?,
+        };
         let identity = identity.clone();
         let machine_acl = machine_acl.clone();
         let quota = quota.clone();
@@ -323,15 +371,20 @@ async fn serve_control(
     quota: Arc<EndpointQuota>,
     service: Arc<BrokerRpcService>,
     maximum_connections: usize,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let connections = Arc::new(Semaphore::new(maximum_connections));
     loop {
-        let permit = connections
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| std::io::Error::other("Broker control connection gate closed"))?;
-        let (mut stream, _) = listener.accept().await?;
+        let permit = tokio::select! {
+            _ = wait_for_shutdown(shutdown) => return Ok(()),
+            permit = connections.clone().acquire_owned() => {
+                permit.map_err(|_| std::io::Error::other("Broker control connection gate closed"))?
+            }
+        };
+        let (mut stream, _) = tokio::select! {
+            _ = wait_for_shutdown(shutdown) => return Ok(()),
+            accepted = listener.accept() => accepted?,
+        };
         let identity = identity.clone();
         let revoke_client_acl = revoke_client_acl.clone();
         let quota = quota.clone();
@@ -348,6 +401,67 @@ async fn serve_control(
             .await;
         });
     }
+}
+
+async fn connect_authenticated_session(
+    path: &Path,
+    identity: &LocalIdentity,
+    session_acl: &PeerAcl,
+) -> Result<UnixStream, ProtocolError> {
+    loop {
+        match UnixStream::connect(path).await {
+            Ok(mut stream) => {
+                bloom_triad_local_transport::authenticate_client(
+                    &mut stream,
+                    identity,
+                    session_acl,
+                )
+                .await?;
+                return Ok(stream);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::NotFound | ErrorKind::ConnectionRefused
+                ) =>
+            {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(error) => {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!("connect login-session sentinel {}: {error}", path.display()),
+                ));
+            }
+        }
+    }
+}
+
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn unix_time_ms() -> Result<u64, ProtocolError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| {
+            ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                "system clock is before Unix epoch",
+            )
+        })?
+        .as_millis()
+        .try_into()
+        .map_err(|_| {
+            ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                "system clock does not fit the protocol range",
+            )
+        })?)
 }
 
 struct Ed25519AuditSigner {

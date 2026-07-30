@@ -1628,6 +1628,26 @@ fn prebound_canonical_listener_is_a_fatal_no_fallback_failure() {
     drop(listener);
 }
 
+#[test]
+fn login_session_disconnect_terminalizes_every_live_browser_session() {
+    let signer = Arc::new(MockSigner::new());
+    let broker = CeremonyBroker::new(signer.clone());
+    let operation_id = operation("af");
+    prepare(
+        &broker,
+        operation_id.clone(),
+        Some(Token::new("wallet-logout").unwrap()),
+        10_000,
+    );
+
+    broker.terminate_live_sessions(10_001).unwrap();
+
+    let status = broker.public_status(&operation_id).unwrap();
+    assert_eq!(status.state, CeremonyState::Cancelled);
+    assert!(status.ceremony_url.is_none());
+    assert_eq!(signer.cancellations.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn inherited_listener_handover_rejects_every_noncanonical_socket() {
     let signer = Arc::new(MockSigner::new());

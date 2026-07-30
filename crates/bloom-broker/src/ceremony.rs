@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::HashMap,
+    future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener},
     path::Path as FsPath,
     sync::Arc,
@@ -601,6 +602,62 @@ impl CeremonyBroker {
         Ok(())
     }
 
+    /// Make every browser-facing session terminal after the authenticated
+    /// login sentinel disappears. The HTTP listener is stopped and drained
+    /// before this is called, so no new browser transition can race the
+    /// snapshots below.
+    pub fn terminate_live_sessions(&self, now_ms: u64) -> Result<(), ProtocolError> {
+        let live = self
+            .inner
+            .sessions
+            .lock()
+            .iter()
+            .filter(|(_, session)| !is_terminal(session.state))
+            .map(|(id, session)| {
+                (
+                    id.clone(),
+                    session.operation_id.clone(),
+                    session.state,
+                    session.wallet_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (ceremony_id, operation_id, state, wallet_id) in live {
+            if state == CeremonyState::WalletCommitted {
+                self.finalize_committed_session(&ceremony_id, now_ms)?;
+                continue;
+            }
+            if state == CeremonyState::AwaitingUser {
+                self.inner.signer.cancel(&operation_id)?;
+            }
+            let snapshot = {
+                let mut sessions = self.inner.sessions.lock();
+                let Some(session) = sessions.get_mut(&ceremony_id) else {
+                    continue;
+                };
+                if is_terminal(session.state) {
+                    continue;
+                }
+                session.state = if state == CeremonyState::AwaitingUser {
+                    CeremonyState::Cancelled
+                } else {
+                    CeremonyState::Failed
+                };
+                session.terminal_at_ms = Some(now_ms);
+                session.token = None;
+                session.token_hash = [0_u8; 32];
+                session.clone()
+            };
+            self.persist_session(&snapshot)?;
+            if state == CeremonyState::AwaitingUser
+                && let Some(wallet_id) = &wallet_id
+            {
+                self.record_backoff(wallet_id, now_ms);
+            }
+        }
+        Ok(())
+    }
+
     pub fn router(&self) -> Router {
         Router::new()
             .route("/", get(shell))
@@ -740,9 +797,29 @@ impl CeremonyBroker {
         self.serve_listener(listener).await
     }
 
+    pub async fn serve_canonical_until<F>(self, shutdown: F) -> Result<(), ProtocolError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let listener = Self::bind_canonical()?;
+        self.serve_listener_until(listener, shutdown).await
+    }
+
     /// Accept a canonical listener inherited from a launch/socket activation
     /// manager. A listener for any other address is rejected.
     pub async fn serve_listener(self, listener: StdTcpListener) -> Result<(), ProtocolError> {
+        self.serve_listener_until(listener, std::future::pending())
+            .await
+    }
+
+    pub async fn serve_listener_until<F>(
+        self,
+        listener: StdTcpListener,
+        shutdown: F,
+    ) -> Result<(), ProtocolError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         if listener
             .local_addr()
             .map_err(|error| protocol(ProtocolErrorCode::ServiceUnavailable, error.to_string()))?
@@ -763,6 +840,7 @@ impl CeremonyBroker {
             )
         })?;
         axum::serve(listener, self.router())
+            .with_graceful_shutdown(shutdown)
             .await
             .map_err(|error| protocol(ProtocolErrorCode::ServiceUnavailable, error.to_string()))
     }
