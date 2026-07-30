@@ -21,7 +21,7 @@ use bloom_broker::{
     signer_client::BrokerSignerClient,
 };
 use bloom_triad_local_transport::{
-    EndpointQuota, LocalIdentity, PeerAcl, load_identity_and_manifest,
+    EndpointQuota, LocalIdentity, NetworkContainmentGuard, PeerAcl, load_identity_and_manifest,
 };
 use bloom_triad_protocol::{
     Base64UrlBytes, Digest32, ProtocolError, ProtocolErrorCode, ProvenanceCatalog, Token,
@@ -58,6 +58,7 @@ struct BrokerConfig {
     provenance_catalog_path: PathBuf,
     policy_keys: Vec<PolicyKeyConfig>,
     build_digest: String,
+    network_containment: Option<NetworkContainmentConfig>,
     maximum_connections: usize,
     maximum_in_flight_mutations: usize,
     maximum_requests_per_window: usize,
@@ -70,6 +71,14 @@ struct BrokerConfig {
     control_request_window_ms: u64,
     control_maximum_journal_admissions_per_window: usize,
     control_journal_window_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkContainmentConfig {
+    status_path: PathBuf,
+    login_uid: u32,
+    maximum_age_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -195,7 +204,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Token::new(config.review_manifest_key_id.clone())?,
         review_manifest_signing_key,
     )?;
-    let service = Arc::new(BrokerRpcService::new(
+    let build_digest = Digest32::new(config.build_digest.clone())?;
+    let containment = config
+        .network_containment
+        .as_ref()
+        .map(|containment| {
+            NetworkContainmentGuard::new(
+                containment.status_path.clone(),
+                containment.login_uid,
+                build_digest.clone(),
+                containment.maximum_age_ms,
+            )
+        })
+        .transpose()?;
+    let mut service = BrokerRpcService::new(
         authority,
         journal,
         clock,
@@ -204,9 +226,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Token::new(config.broker_signing_key_id.clone())?,
         broker_signing_key,
         identity.boot_epoch.clone(),
-        Digest32::new(config.build_digest.clone())?,
+        build_digest,
         env!("CARGO_PKG_VERSION"),
-    )?);
+    )?;
+    if let Some(containment) = containment {
+        service = service.with_network_containment(containment);
+    }
+    let service = Arc::new(service);
     service.reconcile_all().await?;
 
     let rpc_listener = UnixListener::from_std(bloom_service_activation::take_unix_listener(

@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use bloom_triad_local_transport::NetworkContainmentGuard;
 use bloom_triad_protocol::{
     ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector, Base64UrlBytes, BootEpoch,
     BrokerSignerRequest, BrokerSignerResponse, ControlRequest, ControlResponse, DecimalU64,
@@ -41,6 +42,7 @@ pub struct BrokerRpcService {
     boot_epoch: BootEpoch,
     build_digest: Digest32,
     service_version: String,
+    network_containment: Option<NetworkContainmentGuard>,
 }
 
 impl BrokerRpcService {
@@ -68,6 +70,7 @@ impl BrokerRpcService {
             boot_epoch,
             build_digest,
             service_version: service_version.into(),
+            network_containment: None,
         };
         service.ceremony.set_completion_observer(
             Arc::new(AuthorityCompletionObserver {
@@ -76,6 +79,11 @@ impl BrokerRpcService {
             service.clock.now_ms(false)?,
         )?;
         Ok(service)
+    }
+
+    pub fn with_network_containment(mut self, guard: NetworkContainmentGuard) -> Self {
+        self.network_containment = Some(guard);
+        self
     }
 
     pub fn ceremony(&self) -> &CeremonyBroker {
@@ -89,6 +97,9 @@ impl BrokerRpcService {
         use MachineBrokerRequest as Request;
         use MachineBrokerResponse as Response;
 
+        if machine_request_requires_containment(&request) {
+            self.require_network_containment()?;
+        }
         match request {
             Request::SystemHello(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::UnknownMethod,
@@ -1093,7 +1104,11 @@ impl BrokerRpcService {
     }
 
     fn readiness(&self) -> Result<Readiness, ProtocolError> {
-        let (state, conditions) = self.clock.readiness()?;
+        let (mut state, mut conditions) = self.clock.readiness()?;
+        if self.require_network_containment().is_err() {
+            state = ReadinessState::Unavailable;
+            conditions.push(Token::new("network_containment_unavailable")?);
+        }
         Ok(Readiness {
             service_id: Token::new("bloom-broker").expect("static service ID"),
             service_version: self.service_version.clone(),
@@ -1106,6 +1121,9 @@ impl BrokerRpcService {
 
     async fn triad_readiness(&self) -> Result<Readiness, ProtocolError> {
         let broker = self.readiness()?;
+        if broker.state != ReadinessState::Ready {
+            return Ok(broker);
+        }
         let signer = match self
             .signer
             .request_async(BrokerSignerRequest::SignerReadiness(Empty {}))
@@ -1121,6 +1139,13 @@ impl BrokerRpcService {
         };
         validate_signer_readiness(&broker, &signer)?;
         Ok(broker)
+    }
+
+    fn require_network_containment(&self) -> Result<(), ProtocolError> {
+        match &self.network_containment {
+            Some(guard) => guard.check(),
+            None => Ok(()),
+        }
     }
 
     fn capabilities(&self) -> Result<ServiceCapabilities, ProtocolError> {
@@ -1149,6 +1174,31 @@ impl BrokerRpcService {
             frame_max_bytes: DecimalU64::new(bloom_triad_protocol::FRAME_MAX_BYTES as u64),
         })
     }
+}
+
+fn machine_request_requires_containment(request: &MachineBrokerRequest) -> bool {
+    use MachineBrokerRequest as Request;
+
+    matches!(
+        request,
+        Request::SealedApprovalPrepare(_)
+            | Request::SealedApprovalRenew(_)
+            | Request::SigningSign(_)
+            | Request::SigningSignBatch(_)
+            | Request::PolicyValidateUpdate(_)
+            | Request::PolicyCommitUpdate(_)
+            | Request::WalletRegistrationPrepare(_)
+            | Request::WalletUnlockPrepare(_)
+            | Request::WalletImportPrepare(_)
+            | Request::WalletExportPrepare(_)
+            | Request::WalletDeletePrepare(_)
+            | Request::KeyDerivePrepare(_)
+            | Request::KeyEnrollPrepare(_)
+            | Request::CredentialAddPrepare(_)
+            | Request::CredentialReplacePrepare(_)
+            | Request::CredentialRemovePrepare(_)
+            | Request::RecoveryPrepare(_)
+    )
 }
 
 fn validate_signer_readiness(broker: &Readiness, signer: &Readiness) -> Result<(), ProtocolError> {
