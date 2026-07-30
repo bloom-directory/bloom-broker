@@ -100,8 +100,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("BLOOM_BROKER_ACTIVATION_NAME").unwrap_or_else(|_| "broker".into());
     let control_activation = std::env::var("BLOOM_BROKER_CONTROL_ACTIVATION_NAME")
         .unwrap_or_else(|_| "broker-control".into());
-    let ceremony_activation = std::env::var("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME")
-        .unwrap_or_else(|_| "broker-ceremony".into());
 
     let (identity, manifest) =
         load_identity_and_manifest(&identity_path, &manifest_path, "bloom-broker")?;
@@ -201,7 +199,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let control_listener = UnixListener::from_std(bloom_service_activation::take_unix_listener(
         &control_activation,
     )?)?;
-    let ceremony_listener = bloom_service_activation::take_tcp_listener(&ceremony_activation)?;
     let rpc_quota = Arc::new(EndpointQuota::new(
         config.maximum_in_flight_mutations,
         config.maximum_requests_per_window,
@@ -238,7 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         async move {
             ceremony
-                .serve_listener(ceremony_listener)
+                .serve_canonical()
                 .await
                 .map_err(std::io::Error::other)
         },
