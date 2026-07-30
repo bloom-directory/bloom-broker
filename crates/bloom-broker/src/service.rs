@@ -5,13 +5,14 @@ use std::sync::Arc;
 use bloom_triad_protocol::{
     ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector, Base64UrlBytes, BootEpoch,
     BrokerSignerRequest, BrokerSignerResponse, ControlRequest, ControlResponse, DecimalU64,
-    Digest32, MachineBrokerMethod, MachineBrokerRequest, MachineBrokerResponse,
+    Digest32, Empty, MachineBrokerMethod, MachineBrokerRequest, MachineBrokerResponse,
     MachineBrokerService, MachineSignRequest, OperationId, OperationPublicStatus, OperationState,
     PolicyCompareAndSwapRequest, PolicyUpdateCeremonyPrepareRequest, PolicyUpdateRequest,
     PolicyUpdateReviewManifest, PolicyValidationReceipt, ProtocolError, ProtocolErrorCode,
-    RPC_ENVELOPE_SCHEMA_V1, Readiness, RevocationControlService, SealedApprovalPrepareResponse,
-    SelectorKind, ServiceCapabilities, ServiceFuture, SignRequest, SigningPayloads, Token,
-    UnsignedSignRequest, VerifierPublicCapability, WalletPublic, WalletRequest,
+    RPC_ENVELOPE_SCHEMA_V1, Readiness, ReadinessState, RevocationControlService,
+    SealedApprovalPrepareResponse, SelectorKind, ServiceCapabilities, ServiceFuture, SignRequest,
+    SigningPayloads, Token, UnsignedSignRequest, VerifierPublicCapability, WalletPublic,
+    WalletRequest,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use rand::{RngCore, rngs::OsRng};
@@ -93,7 +94,9 @@ impl BrokerRpcService {
                 ProtocolErrorCode::UnknownMethod,
                 "system.hello is consumed by the authenticated transport",
             )),
-            Request::BrokerReadiness(_) => Ok(Response::BrokerReadiness(self.readiness()?)),
+            Request::BrokerReadiness(_) => {
+                Ok(Response::BrokerReadiness(self.triad_readiness().await?))
+            }
             Request::BrokerCapabilities(_) => {
                 Ok(Response::BrokerCapabilities(self.capabilities()?))
             }
@@ -1101,6 +1104,25 @@ impl BrokerRpcService {
         })
     }
 
+    async fn triad_readiness(&self) -> Result<Readiness, ProtocolError> {
+        let broker = self.readiness()?;
+        let signer = match self
+            .signer
+            .request_async(BrokerSignerRequest::SignerReadiness(Empty {}))
+            .await?
+        {
+            BrokerSignerResponse::SignerReadiness(readiness) => readiness,
+            _ => {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "Signer returned the wrong readiness response",
+                ));
+            }
+        };
+        validate_signer_readiness(&broker, &signer)?;
+        Ok(broker)
+    }
+
     fn capabilities(&self) -> Result<ServiceCapabilities, ProtocolError> {
         Ok(ServiceCapabilities {
             service_id: Token::new("bloom-broker")?,
@@ -1127,6 +1149,19 @@ impl BrokerRpcService {
             frame_max_bytes: DecimalU64::new(bloom_triad_protocol::FRAME_MAX_BYTES as u64),
         })
     }
+}
+
+fn validate_signer_readiness(broker: &Readiness, signer: &Readiness) -> Result<(), ProtocolError> {
+    if signer.service_id.as_str() != "bloom-signer"
+        || signer.build_digest != broker.build_digest
+        || signer.state != ReadinessState::Ready
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::ServiceUnavailable,
+            "Signer is not ready on the exact Broker build",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_signer_result_shape(
@@ -1310,6 +1345,40 @@ mod tests {
     use super::*;
     use crate::journal::OperationSnapshot;
     use bloom_triad_protocol::{CryptoSuite, NormalizedSignature, OperationState, SigningResult};
+
+    fn readiness(service_id: &str, build: u8, state: ReadinessState) -> Readiness {
+        Readiness {
+            service_id: Token::new(service_id).unwrap(),
+            service_version: "test".into(),
+            build_digest: Digest32::from_bytes([build; 32]),
+            boot_epoch: BootEpoch::from_bytes([0x91; 16]),
+            state,
+            conditions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn broker_readiness_requires_a_ready_signer_on_the_exact_build() {
+        let broker = readiness("bloom-broker", 0x81, ReadinessState::Ready);
+        validate_signer_readiness(
+            &broker,
+            &readiness("bloom-signer", 0x81, ReadinessState::Ready),
+        )
+        .unwrap();
+
+        for signer in [
+            readiness("bloom-signer", 0x82, ReadinessState::Ready),
+            readiness("bloom-signer", 0x81, ReadinessState::DegradedReadOnly),
+            readiness("wrong-signer", 0x81, ReadinessState::Ready),
+        ] {
+            assert_eq!(
+                validate_signer_readiness(&broker, &signer)
+                    .unwrap_err()
+                    .code,
+                ProtocolErrorCode::ServiceUnavailable
+            );
+        }
+    }
 
     fn result(signature_count: usize) -> (OperationSnapshot, SigningResult) {
         let operation_id = OperationId::from_bytes([0x51; 32]);
