@@ -105,7 +105,6 @@ mod linux {
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn cross_uid_listener_ownership_is_exercised_in_the_linux_privileged_lane() {
-    // macOS exercises the equivalent behavior through the rendered,
-    // code-signed LaunchAgent because changing effective UIDs is not the
-    // selected macOS sandbox construction.
+    // macOS exercises the equivalent behavior with two installer-provisioned
+    // Unix service principals in the guarded disposable two-login W0 lane.
 }

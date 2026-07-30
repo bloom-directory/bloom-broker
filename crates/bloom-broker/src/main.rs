@@ -4,9 +4,10 @@
 
 use std::{
     collections::BTreeMap,
-    fs,
-    io::ErrorKind,
-    os::unix::fs::MetadataExt,
+    fs::{self, OpenOptions},
+    io::{ErrorKind, Read as _, Write as _},
+    net::{SocketAddr, TcpStream},
+    os::unix::fs::{MetadataExt, OpenOptionsExt as _, PermissionsExt as _, chown},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -27,7 +28,7 @@ use bloom_triad_protocol::{
     Base64UrlBytes, Digest32, ProtocolError, ProtocolErrorCode, ProvenanceCatalog, Token,
 };
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::{
     io::AsyncReadExt as _,
@@ -89,6 +90,16 @@ struct PolicyKeyConfig {
     public_key_hex: String,
 }
 
+#[derive(Serialize)]
+struct StartupFailure {
+    schema: &'static str,
+    state: &'static str,
+    incident: &'static str,
+    address: &'static str,
+    message: &'static str,
+    observed_at_ms: u64,
+}
+
 impl Drop for BrokerConfig {
     fn drop(&mut self) {
         self.broker_signing_seed_hex.zeroize();
@@ -118,6 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (identity, manifest) =
         load_identity_and_manifest(&identity_path, &manifest_path, "bloom-broker")?;
+    let broker_effective_uid = manifest.broker.effective_uid;
     let trusted_time_source = manifest.trusted_time_source.clone();
     let session_acl = manifest
         .session
@@ -136,6 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "BLOOM_SESSION_SOCKET",
         "/var/run/bloom/session/session.sock",
     );
+    let startup_status_path = std::env::var_os("BLOOM_BROKER_STARTUP_STATUS").map(PathBuf::from);
     let mut config = load_config(&config_path)?;
     let broker_signing_key = take_signing_key(&mut config.broker_signing_seed_hex)?;
     let audit_signing_key = take_signing_key(&mut config.audit_signing_seed_hex)?;
@@ -260,6 +273,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut session_stream =
         connect_authenticated_session(&session_socket_path, &identity, &session_acl).await?;
+    let ceremony_listener = match CeremonyBroker::bind_canonical() {
+        Ok(listener) => {
+            if let Some(path) = startup_status_path.as_deref() {
+                clear_startup_failure(path, broker_effective_uid)?;
+            }
+            listener
+        }
+        Err(error) => {
+            if let Some(path) = startup_status_path.as_deref() {
+                write_listener_conflict(path, broker_effective_uid)?;
+            }
+            return Err(error.into());
+        }
+    };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut rpc_shutdown = shutdown_rx.clone();
     let mut control_shutdown = shutdown_rx.clone();
@@ -286,7 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         async move {
             ceremony_for_shutdown
-                .serve_canonical_until(async move {
+                .serve_listener_until(ceremony_listener, async move {
                     wait_for_shutdown(&mut ceremony_shutdown).await;
                 })
                 .await
@@ -310,6 +337,168 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     ceremony.terminate_live_sessions(unix_time_ms()?)?;
     Ok(())
+}
+
+fn write_listener_conflict(path: &Path, broker_uid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let bloom_shaped = canonical_listener_is_bloom_shaped();
+    let (incident, message) = if bloom_shaped {
+        (
+            "another_login_session",
+            "another login session owns the Bloom ceremony listener",
+        )
+    } else {
+        (
+            "foreign_or_unverifiable_process",
+            "a foreign or unverifiable process owns the Bloom ceremony listener",
+        )
+    };
+    write_startup_failure(
+        path,
+        broker_uid,
+        &StartupFailure {
+            schema: "bloom.broker-startup.1",
+            state: "fatal",
+            incident,
+            address: "127.0.0.1:18734",
+            message,
+            observed_at_ms: unix_time_ms()?,
+        },
+    )
+}
+
+fn canonical_listener_is_bloom_shaped() -> bool {
+    let address: SocketAddr = match "127.0.0.1:18734".parse() {
+        Ok(address) => address,
+        Err(_) => return false,
+    };
+    let mut stream = match TcpStream::connect_timeout(&address, Duration::from_millis(250)) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+    if stream
+        .write_all(b"GET / HTTP/1.0\r\nHost: 127.0.0.1:18734\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut response = Vec::with_capacity(4096);
+    let mut chunk = [0_u8; 512];
+    while response.len() < 4096 {
+        let remaining = 4096 - response.len();
+        let read_length = remaining.min(chunk.len());
+        match stream.read(&mut chunk[..read_length]) {
+            Ok(0) => return false,
+            Ok(count) => {
+                response.extend_from_slice(&chunk[..count]);
+                if response_has_bloom_owner_marker(&response) {
+                    return true;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+fn response_has_bloom_owner_marker(response: &[u8]) -> bool {
+    String::from_utf8_lossy(response)
+        .to_ascii_lowercase()
+        .contains("x-bloom-ceremony-owner: bloom-broker-v1")
+}
+
+fn write_startup_failure(
+    path: &Path,
+    broker_uid: u32,
+    failure: &StartupFailure,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (parent, parent_gid) = verified_status_parent(path, broker_uid)?;
+    let bytes = serde_json::to_vec(failure)?;
+    if bytes.len() > 1024 {
+        return Err("Broker startup diagnostic exceeds its bounded size".into());
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != broker_uid
+                || metadata.gid() != parent_gid
+                || metadata.mode() & 0o777 != 0o640
+                || metadata.nlink() != 1
+            {
+                return Err("refusing to replace a substituted Broker startup diagnostic".into());
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let temporary = parent.join(format!(".broker-startup.new.{}", std::process::id()));
+    if temporary.exists() {
+        let metadata = fs::symlink_metadata(&temporary)?;
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != broker_uid
+            || metadata.nlink() != 1
+        {
+            return Err("refusing to replace a substituted Broker startup temporary".into());
+        }
+        fs::remove_file(&temporary)?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o640))?;
+    chown(&temporary, None, Some(parent_gid))?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn clear_startup_failure(path: &Path, broker_uid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let (parent, parent_gid) = verified_status_parent(path, broker_uid)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != broker_uid
+                || metadata.gid() != parent_gid
+                || metadata.mode() & 0o777 != 0o640
+                || metadata.nlink() != 1
+            {
+                return Err("refusing to remove a substituted Broker startup diagnostic".into());
+            }
+            fs::remove_file(path)?;
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn verified_status_parent(
+    path: &Path,
+    broker_uid: u32,
+) -> Result<(&Path, u32), Box<dyn std::error::Error>> {
+    let parent = path
+        .parent()
+        .ok_or("Broker startup diagnostic has no parent directory")?;
+    let metadata = fs::symlink_metadata(parent)?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != broker_uid
+        || metadata.mode() & 0o7777 != 0o750
+        || metadata.nlink() < 2
+    {
+        return Err("Broker startup status directory has unsafe metadata".into());
+    }
+    Ok((parent, metadata.gid()))
 }
 
 fn require_clock_repair_confirmation(
@@ -472,7 +661,7 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 }
 
 fn unix_time_ms() -> Result<u64, ProtocolError> {
-    Ok(SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| {
             ProtocolError::new(
@@ -487,7 +676,7 @@ fn unix_time_ms() -> Result<u64, ProtocolError> {
                 ProtocolErrorCode::ServiceUnavailable,
                 "system clock does not fit the protocol range",
             )
-        })?)
+        })
 }
 
 struct Ed25519AuditSigner {
@@ -641,4 +830,53 @@ fn verifying_key(encoded: &str) -> Result<VerifyingKey, ProtocolError> {
             "public key is not canonical Ed25519",
         )
     })
+}
+
+#[cfg(test)]
+mod startup_failure_tests {
+    use super::*;
+
+    #[test]
+    fn bloom_owner_marker_is_case_insensitive_but_requires_the_exact_value() {
+        assert!(response_has_bloom_owner_marker(
+            b"HTTP/1.0 404 Not Found\r\nX-Bloom-Ceremony-Owner: bloom-broker-v1\r\n\r\n"
+        ));
+        assert!(!response_has_bloom_owner_marker(
+            b"HTTP/1.0 404 Not Found\r\nX-Bloom-Ceremony-Owner: other\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn startup_failure_is_bounded_atomic_and_substitution_safe() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o750))
+            .expect("set status directory permissions");
+        let metadata = fs::symlink_metadata(temporary.path()).expect("status directory metadata");
+        let path = temporary.path().join("broker-startup.json");
+        let failure = StartupFailure {
+            schema: "bloom.broker-startup.1",
+            state: "fatal",
+            incident: "foreign_or_unverifiable_process",
+            address: "127.0.0.1:18734",
+            message: "a foreign or unverifiable process owns the Bloom ceremony listener",
+            observed_at_ms: 1,
+        };
+
+        write_startup_failure(&path, metadata.uid(), &failure).expect("write startup failure");
+        let written = fs::symlink_metadata(&path).expect("startup failure metadata");
+        assert_eq!(written.uid(), metadata.uid());
+        assert_eq!(written.gid(), metadata.gid());
+        assert_eq!(written.mode() & 0o777, 0o640);
+        assert_eq!(written.nlink(), 1);
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read startup failure"))
+                .expect("parse startup failure");
+        assert_eq!(value["incident"], "foreign_or_unverifiable_process");
+
+        clear_startup_failure(&path, metadata.uid()).expect("clear startup failure");
+        assert!(!path.exists());
+
+        std::os::unix::fs::symlink("/dev/null", &path).expect("substitute status path");
+        assert!(write_startup_failure(&path, metadata.uid(), &failure).is_err());
+    }
 }
