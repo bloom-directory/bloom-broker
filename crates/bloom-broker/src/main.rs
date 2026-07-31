@@ -20,6 +20,8 @@ use bloom_broker::{
     service::BrokerRpcService,
     signer_client::BrokerSignerClient,
 };
+#[cfg(feature = "triad-dev-harness")]
+use bloom_triad_local_transport::load_developer_identity_and_manifest;
 use bloom_triad_local_transport::{
     EndpointQuota, LocalIdentity, NetworkContainmentGuard, PeerAcl, load_identity_and_manifest,
 };
@@ -121,10 +123,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let manifest_path = env_path("BLOOM_EDGE_MANIFEST", "/etc/bloom/edge-manifest.json");
     let config_path = env_path("BLOOM_BROKER_CONFIG", "/etc/bloom/broker.json");
-    let (identity, manifest) =
+    #[cfg(feature = "triad-dev-harness")]
+    let loaded_identity = match std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT") {
+        Some(root) => load_developer_identity_and_manifest(
+            Path::new(&root),
+            &identity_path,
+            &manifest_path,
+            "bloom-broker",
+        )?,
+        None => load_identity_and_manifest(&identity_path, &manifest_path, "bloom-broker")?,
+    };
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let loaded_identity =
         load_identity_and_manifest(&identity_path, &manifest_path, "bloom-broker")?;
+    let (identity, manifest) = loaded_identity;
     let broker_effective_uid = manifest.broker.effective_uid;
     let trusted_time_source = manifest.trusted_time_source.clone();
+    let signer_acl = manifest.signer.clone().into_acl()?;
     let session_acl = manifest
         .session
         .clone()
@@ -196,13 +211,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         verifying_key(&config.signer_revocation_public_key_hex)?,
         AssuranceRegistry::compiled(Vec::new())?,
     )?);
+    #[cfg(feature = "triad-dev-harness")]
+    let provenance_catalog = match std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT") {
+        Some(root) => {
+            load_developer_provenance_catalog(Path::new(&root), &config.provenance_catalog_path)
+        }
+        None => load_provenance_catalog(&config.provenance_catalog_path),
+    }?;
+    #[cfg(not(feature = "triad-dev-harness"))]
     let provenance_catalog = load_provenance_catalog(&config.provenance_catalog_path)?;
     authority.synchronize_provenance_catalog(&provenance_catalog)?;
-    let signer = BrokerSignerClient::connect_unix_from_files(
-        &config.signer_socket_path,
-        &identity_path,
-        &manifest_path,
-    )?;
+    if signer_acl.service_id.as_str() != "bloom-signer" {
+        return Err("edge manifest does not pin bloom-signer for the Broker edge".into());
+    }
+    let signer =
+        BrokerSignerClient::connect_unix(&config.signer_socket_path, identity.clone(), signer_acl)?;
     let ceremony = CeremonyBroker::open_with_manifest_signer(
         &config.ceremony_path,
         Arc::new(signer.clone()),
@@ -778,6 +801,23 @@ fn load_provenance_catalog(path: &Path) -> Result<ProvenanceCatalog, ProtocolErr
             "provenance catalog must be a root-owned, non-symlink regular file not writable by group or other",
         ));
     }
+    decode_provenance_catalog(path)
+}
+
+#[cfg(feature = "triad-dev-harness")]
+fn load_developer_provenance_catalog(
+    root: &Path,
+    path: &Path,
+) -> Result<ProvenanceCatalog, ProtocolError> {
+    bloom_triad_local_transport::validate_developer_security_file(
+        root,
+        path,
+        "provenance catalog",
+    )?;
+    decode_provenance_catalog(path)
+}
+
+fn decode_provenance_catalog(path: &Path) -> Result<ProvenanceCatalog, ProtocolError> {
     let bytes = fs::read(path).map_err(|error| {
         ProtocolError::new(
             ProtocolErrorCode::UnauthenticatedPeer,
