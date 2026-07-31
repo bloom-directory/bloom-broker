@@ -38,6 +38,36 @@ impl VirtualAuthenticator {
         }
     }
 
+    /// Construct a repeatable software authenticator for an out-of-process
+    /// integration run. The seed is test input, never production credential
+    /// material. Domain-separated hashes keep the credential ID and user
+    /// handle independent from the signing scalar.
+    pub fn from_seed(seed: &[u8]) -> Self {
+        let credential_id =
+            Sha256::digest([b"bloom-debug-driver-credential/v1".as_slice(), seed].concat());
+        let user_handle = Sha256::digest([b"bloom-debug-driver-user/v1".as_slice(), seed].concat());
+        let mut counter = 0_u32;
+        let signing_key = loop {
+            let candidate = Sha256::digest(
+                [
+                    b"bloom-debug-driver-signing/v1".as_slice(),
+                    seed,
+                    &counter.to_be_bytes(),
+                ]
+                .concat(),
+            );
+            if let Ok(key) = SigningKey::from_slice(&candidate) {
+                break key;
+            }
+            counter = counter.checked_add(1).expect("debug seed search bounded");
+        };
+        Self {
+            signing_key,
+            credential_id: Base64UrlBytes::from_bytes(&credential_id),
+            user_handle: Base64UrlBytes::from_bytes(&user_handle),
+        }
+    }
+
     pub fn credential(&self, sign_count: u32) -> WebAuthnCredential {
         WebAuthnCredential {
             credential_id: self.credential_id.clone(),
@@ -173,4 +203,20 @@ fn driver_error() -> ProtocolError {
         ProtocolErrorCode::BackendInvalidRequest,
         "debug driver could not construct standards-compliant proof",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VirtualAuthenticator;
+
+    #[test]
+    fn seeded_authenticator_is_repeatable_and_domain_separated() {
+        let first = VirtualAuthenticator::from_seed(b"matrix-seed");
+        let replay = VirtualAuthenticator::from_seed(b"matrix-seed");
+        let other = VirtualAuthenticator::from_seed(b"other-seed");
+        assert_eq!(first.credential(0), replay.credential(0));
+        assert_eq!(first.deterministic_prf(), replay.deterministic_prf());
+        assert_ne!(first.credential(0), other.credential(0));
+        assert_ne!(first.deterministic_prf(), other.deterministic_prf());
+    }
 }

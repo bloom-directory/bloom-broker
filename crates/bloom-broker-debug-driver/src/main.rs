@@ -1,0 +1,227 @@
+use std::{
+    env,
+    io::{Read as _, Write as _},
+    net::TcpStream,
+};
+
+use bloom_broker_api::{
+    Base64UrlBytes, CeremonyChallenge, CeremonyKind, CustodyHpkeAad, CustodySignerContribution,
+    Digest32, WebAuthnCeremonyProof,
+};
+use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = env::args().skip(1);
+    let command = args
+        .next()
+        .ok_or("usage: bloom-broker-debug-driver complete URL SEED [options]")?;
+    if command != "complete" {
+        return Err(format!("unsupported debug-driver command: {command}").into());
+    }
+    let url = args.next().ok_or("complete requires a ceremony URL")?;
+    let seed = args
+        .next()
+        .ok_or("complete requires an authenticator seed")?;
+    let mut new_seed = None;
+    let mut raw_private_key = None;
+    let mut sign_count = 1_u32;
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--new-authenticator-seed" => {
+                new_seed = Some(
+                    args.next()
+                        .ok_or("--new-authenticator-seed requires a value")?,
+                );
+            }
+            "--raw-private-key" => {
+                raw_private_key = Some(args.next().ok_or("--raw-private-key requires a value")?);
+            }
+            "--sign-count" => {
+                sign_count = args
+                    .next()
+                    .ok_or("--sign-count requires a value")?
+                    .parse()?;
+            }
+            _ => return Err(format!("unknown debug-driver option: {flag}").into()),
+        }
+    }
+
+    let token = ceremony_token(&url)?;
+    let session = request("GET", "/api/session", token, None)?;
+    let kind: CeremonyKind = serde_json::from_value(session["ceremony_kind"].clone())?;
+    let contribution: CustodySignerContribution =
+        serde_json::from_value(session["signer_contribution"].clone())?;
+    let challenges = session["challenges"]
+        .as_array()
+        .ok_or("ceremony session omitted challenges")?
+        .iter()
+        .map(|challenge| serde_json::from_value::<CeremonyChallenge>(challenge["binding"].clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let public_binding_digest: Digest32 =
+        serde_json::from_value(session["challenges"][0]["binding"]["exact_terms_digest"].clone())?;
+    let authenticator = VirtualAuthenticator::from_seed(seed.as_bytes());
+
+    let (proof, credential_id, plaintext) = match kind {
+        CeremonyKind::WalletRegistration | CeremonyKind::WalletImport => {
+            if challenges.len() < 2 {
+                return Err("registration ceremony omitted a proof phase".into());
+            }
+            let attestation = authenticator.attestation(&challenges[0].canonical_bytes()?);
+            let assertion = authenticator.assertion(&challenges[1].canonical_bytes()?, sign_count);
+            let credential_id = attestation.credential_id.clone();
+            let plaintext = if kind == CeremonyKind::WalletImport {
+                let raw_private_key =
+                    raw_private_key.ok_or("wallet_import requires --raw-private-key")?;
+                serde_jcs::to_vec(&serde_json::json!({
+                    "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+                    "raw_private_key": raw_private_key,
+                }))?
+            } else {
+                authenticator.deterministic_prf().to_vec()
+            };
+            (
+                WebAuthnCeremonyProof::Registration {
+                    attestation,
+                    prf_assertion: Some(assertion),
+                },
+                credential_id,
+                plaintext,
+            )
+        }
+        CeremonyKind::CredentialAdd | CeremonyKind::CredentialReplace => {
+            if challenges.len() < 3 {
+                return Err("credential-change ceremony omitted a proof phase".into());
+            }
+            let new_seed = new_seed.ok_or("credential change requires --new-authenticator-seed")?;
+            let replacement = VirtualAuthenticator::from_seed(new_seed.as_bytes());
+            let authority_assertion =
+                authenticator.assertion(&challenges[0].canonical_bytes()?, sign_count);
+            let new_credential_attestation =
+                replacement.attestation(&challenges[1].canonical_bytes()?);
+            let new_credential_prf_assertion =
+                replacement.assertion(&challenges[2].canonical_bytes()?, 1);
+            let credential_id = new_credential_attestation.credential_id.clone();
+            let plaintext = serde_jcs::to_vec(&serde_json::json!({
+                "authority_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+                "new_credential_prf": Base64UrlBytes::from_bytes(&replacement.deterministic_prf()),
+            }))?;
+            (
+                WebAuthnCeremonyProof::AuthorityCredentialChange {
+                    authority_assertion,
+                    new_credential_attestation,
+                    new_credential_prf_assertion: Some(new_credential_prf_assertion),
+                },
+                credential_id,
+                plaintext,
+            )
+        }
+        CeremonyKind::WalletDelete
+        | CeremonyKind::KeyDerive
+        | CeremonyKind::PolicyUpdate
+        | CeremonyKind::WalletExport
+        | CeremonyKind::BackendEnrollment => {
+            let assertion = authenticator.assertion(&challenges[0].canonical_bytes()?, sign_count);
+            let credential_id = assertion.credential_id.clone();
+            let plaintext = serde_jcs::to_vec(&serde_json::json!({
+                "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+                "effect": {"kind": kind},
+            }))?;
+            (
+                WebAuthnCeremonyProof::Assertion { assertion },
+                credential_id,
+                plaintext,
+            )
+        }
+        unsupported => {
+            return Err(format!("debug driver does not complete {unsupported:?}").into());
+        }
+    };
+
+    let aad = CustodyHpkeAad {
+        ceremony_id: contribution.ceremony_id.clone(),
+        ceremony_kind: contribution.ceremony_kind,
+        custody_operation_id: contribution.custody_operation_id.clone(),
+        signer_nonce: contribution.signer_nonce.clone(),
+        signer_contribution_digest: contribution.digest()?,
+        wallet_id: contribution.wallet_id.clone(),
+        key_ref: contribution.key_ref.clone(),
+        credential_id: Some(credential_id),
+        expected_input_class: contribution.expected_input_class.clone(),
+    }
+    .canonical_bytes()?;
+    let encrypted_input = seal_hpke(
+        &contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )?;
+    let body = serde_json::to_vec(&serde_json::json!({
+        "proof": proof,
+        "encrypted_input": encrypted_input,
+        "public_binding_digest": public_binding_digest,
+    }))?;
+    let result = request(
+        "POST",
+        &format!("/api/session/{}/complete", contribution.ceremony_id),
+        token,
+        Some(&body),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+fn ceremony_token(url: &str) -> Result<&str, Box<dyn std::error::Error>> {
+    let prefix = "http://localhost:18734/ceremony/";
+    let token = url
+        .strip_prefix(prefix)
+        .ok_or("ceremony URL is not the canonical Broker origin")?;
+    if token.len() != 43 || token.contains('/') {
+        return Err("ceremony URL has an invalid session token".into());
+    }
+    Ok(token)
+}
+
+fn request(
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<&[u8]>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let body = body.unwrap_or_default();
+    let mut stream = TcpStream::connect("127.0.0.1:18734")?;
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: localhost:18734\r\nConnection: close\r\nX-Bloom-Ceremony-Token: {token}\r\n"
+    )?;
+    if method == "POST" {
+        write!(
+            stream,
+            "Origin: http://localhost:18734\r\nSec-Fetch-Site: same-origin\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        )?;
+    }
+    stream.write_all(b"\r\n")?;
+    stream.write_all(body)?;
+    stream.flush()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or("Broker returned a malformed HTTP response")?;
+    let headers = std::str::from_utf8(&response[..split])?;
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or("Broker returned no HTTP status")?;
+    let response_body = &response[split + 4..];
+    if status != "200" {
+        return Err(format!(
+            "Broker ceremony request failed with HTTP {status}: {}",
+            String::from_utf8_lossy(response_body)
+        )
+        .into());
+    }
+    Ok(serde_json::from_slice(response_body)?)
+}
