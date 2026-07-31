@@ -197,9 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         AssuranceRegistry::compiled(Vec::new())?,
     )?);
     let provenance_catalog = load_provenance_catalog(&config.provenance_catalog_path)?;
-    for record in &provenance_catalog.records {
-        authority.install_provenance(record)?;
-    }
+    authority.synchronize_provenance_catalog(&provenance_catalog)?;
     let signer = BrokerSignerClient::connect_unix_from_files(
         &config.signer_socket_path,
         &identity_path,

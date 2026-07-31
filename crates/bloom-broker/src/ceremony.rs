@@ -126,7 +126,11 @@ pub trait CeremonyCompletionObserver: Send + Sync {
         now_ms: u64,
     ) -> Result<(), ProtocolError>;
 
-    fn custody_completed(&self, _receipt: &CustodyResult) -> Result<(), ProtocolError> {
+    fn custody_completed(
+        &self,
+        _receipt: &CustodyResult,
+        _now_ms: u64,
+    ) -> Result<(), ProtocolError> {
         Ok(())
     }
 }
@@ -316,15 +320,16 @@ impl CeremonyBroker {
                         session.state,
                         session.ceremony_kind,
                         receipt.clone(),
+                        session.terminal_at_ms.unwrap_or(now_ms),
                     )
                 })
             })
             .collect::<Vec<_>>();
-        for (ceremony_id, state, kind, receipt) in sessions {
+        for (ceremony_id, state, kind, receipt, completed_at_ms) in sessions {
             if state == CeremonyState::WalletCommitted {
-                self.finalize_committed_session(&ceremony_id, now_ms)?;
+                self.finalize_committed_session(&ceremony_id, completed_at_ms)?;
             } else {
-                self.notify_completion(kind, &receipt, now_ms)?;
+                self.notify_completion(kind, &receipt, completed_at_ms)?;
             }
         }
         Ok(())
@@ -386,6 +391,7 @@ impl CeremonyBroker {
         now_ms: u64,
     ) -> Result<CustodyPrepareResponse, ProtocolError> {
         self.expire_sessions(now_ms)?;
+        request.validate_petal_key_scope_binding()?;
         if matches!(
             request.ceremony_kind,
             CeremonyKind::SealedApproval | CeremonyKind::PolicyUpdate
@@ -402,6 +408,9 @@ impl CeremonyBroker {
             && request.wallet_id.is_none();
         self.enforce_creation_bounds(request.wallet_id.as_ref(), anonymous_registration, now_ms)?;
         let prepared = self.inner.signer.prepare_custody(request.clone(), now_ms)?;
+        prepared
+            .contribution
+            .validate_petal_key_scope_binding(&request)?;
         let ceremony_id = prepared.contribution.ceremony_id.clone();
         let contribution_digest = prepared.contribution.digest()?;
         let expires_at_ms = prepared.contribution.expires_at_ms.get();
@@ -412,7 +421,12 @@ impl CeremonyBroker {
             anonymous_registration,
             ceremony_kind: request.ceremony_kind,
             ceremony_id: ceremony_id.clone(),
-            review_manifest: None,
+            review_manifest: request
+                .petal_key_scope
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(malformed)?,
             challenges: prepared.challenges,
             signer_contribution: serde_json::to_value(prepared.contribution).map_err(malformed)?,
             webauthn_options: prepared.webauthn_options,
@@ -1371,7 +1385,7 @@ impl CeremonyBroker {
         } else {
             let receipt: CustodyResult =
                 serde_json::from_value(receipt.clone()).map_err(malformed)?;
-            observer.custody_completed(&receipt)
+            observer.custody_completed(&receipt, now_ms)
         }
     }
 

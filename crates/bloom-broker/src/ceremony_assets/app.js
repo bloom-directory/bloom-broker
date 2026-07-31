@@ -130,12 +130,14 @@ async function load() {
   if (!/^[0-9a-f]{64}$/.test(ceremonyId)) {
     throw new Error("Ceremony returned an invalid identity");
   }
+  const scopedPetalKey = session.ceremony_kind === "key_derive" &&
+    session.signer_contribution?.petal_key_scope;
   if ([
     "wallet_registration", "wallet_import", "wallet_export",
     "key_derive"
   ].includes(
     session.ceremony_kind
-  )) {
+  ) && !scopedPetalKey) {
     const keyPair = await crypto.subtle.generateKey(
       {name: "X25519"}, true, ["deriveBits"]
     );
@@ -161,7 +163,8 @@ async function load() {
   const typedInputKinds = new Set([
     "wallet_import", "key_derive"
   ]);
-  genericFields.hidden = !typedInputKinds.has(session.ceremony_kind);
+  genericFields.hidden = !typedInputKinds.has(session.ceremony_kind) ||
+    Boolean(scopedPetalKey);
   if (session.ceremony_kind === "wallet_import") {
     genericInput.placeholder = '{"raw_private_key":"base64url-encoded-key"}';
   } else if (session.ceremony_kind === "key_derive") {
@@ -282,7 +285,7 @@ async function run(session) {
     ]);
     if (genericKinds.has(kind)) {
       let effect = {kind};
-      if (!genericFields.hidden) {
+      if (!scopedPetalKey && !genericFields.hidden) {
         const supplied = JSON.parse(genericInput.value);
         if (!supplied || Array.isArray(supplied) || typeof supplied !== "object") {
           throw new Error("Custody input must be a JSON object");

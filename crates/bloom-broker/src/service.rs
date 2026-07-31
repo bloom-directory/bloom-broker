@@ -310,6 +310,12 @@ impl BrokerRpcService {
                     request.ceremony_kind,
                     bloom_triad_protocol::CeremonyKind::KeyDerive,
                 )?;
+                request.validate_petal_key_scope_binding()?;
+                if let Some(scope) = &request.petal_key_scope {
+                    self.authority
+                        .prepare_petal_key_scope(scope)
+                        .map_err(authority_error)?;
+                }
                 Ok(Response::KeyDerivePrepare(
                     self.ceremony
                         .prepare_custody(request, self.clock.now_ms(false)?)?,
@@ -549,6 +555,7 @@ impl BrokerRpcService {
                     exact_terms_digest: update_terms_digest,
                     expected_input_class: Token::new("policy_update_credential_prf")?,
                     browser_output_recipient_key: None,
+                    petal_key_scope: None,
                 },
                 update: request,
                 broker_validation_receipt: validation,
@@ -1317,9 +1324,10 @@ impl CeremonyCompletionObserver for AuthorityCompletionObserver {
     fn custody_completed(
         &self,
         receipt: &bloom_triad_protocol::CustodyResult,
+        now_ms: u64,
     ) -> Result<(), ProtocolError> {
         self.authority
-            .adopt_custody_receipt(receipt)
+            .adopt_custody_receipt(receipt, now_ms)
             .map_err(authority_error)
     }
 }

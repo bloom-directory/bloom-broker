@@ -11,8 +11,9 @@ use bloom_triad_protocol::{
     ActivationMode, ApprovalLimits, ApprovalSelector, ApprovalSubject, ApprovalTombstone, AssetId,
     Base64UrlBytes, BootEpoch, CeremonyKind, CeremonyState, ClaimAssurance, ClaimAssuranceLevel,
     CryptoSuite, CustodyResult, DecimalU64, DecimalU256, DeclaredDebit, DeclaredDestination,
-    DeclaredFee, Digest32, KeyRef, KeySpec, MachineSignRequest, OperationId, PetalUseClaim,
-    PolicyUpdateRequest, RequestNonce, RevocationState, SealedApprovalTerms, SignOperationIdentity,
+    DeclaredFee, Digest32, KeyRef, KeySpec, MachineSignRequest, OperationId,
+    PROVENANCE_CATALOG_SCHEMA, PetalKeyScope, PetalUseClaim, PolicyUpdateRequest,
+    ProvenanceCatalog, RequestNonce, RevocationState, SealedApprovalTerms, SignOperationIdentity,
     SignedPolicySnapshot, SigningPayloads, Token, ValueLimit,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
@@ -367,7 +368,12 @@ fn initial_policy_adoption_requires_outer_receipt_and_does_not_poison_key_pin() 
 
     let mut tampered = receipt.clone();
     tampered.receipt_digest = digest(93);
-    assert!(harness.authority.adopt_custody_receipt(&tampered).is_err());
+    assert!(
+        harness
+            .authority
+            .adopt_custody_receipt(&tampered, 1_000)
+            .is_err()
+    );
     assert!(harness.authority.policy_snapshot(&wallet).is_err());
 
     let mut wrong_kind = receipt.clone();
@@ -376,17 +382,182 @@ fn initial_policy_adoption_requires_outer_receipt_and_does_not_poison_key_pin() 
     assert!(
         harness
             .authority
-            .adopt_custody_receipt(&wrong_kind)
+            .adopt_custody_receipt(&wrong_kind, 1_000)
             .is_err()
     );
     assert!(harness.authority.policy_snapshot(&wallet).is_err());
 
-    harness.authority.adopt_custody_receipt(&receipt).unwrap();
+    harness
+        .authority
+        .adopt_custody_receipt(&receipt, 1_000)
+        .unwrap();
     assert_eq!(
         harness.authority.policy_snapshot(&wallet).unwrap(),
         accepted_snapshot
     );
-    harness.authority.adopt_custody_receipt(&receipt).unwrap();
+    harness
+        .authority
+        .adopt_custody_receipt(&receipt, 1_000)
+        .unwrap();
+}
+
+#[test]
+fn petal_scoped_key_is_frozen_to_installer_provenance_and_petal_approvals() {
+    let harness = Harness::new();
+    let provenance = harness.provenance();
+    harness.authority.install_provenance(&provenance).unwrap();
+    let scope = PetalKeyScope {
+        wallet_id: harness.wallet.clone(),
+        parent_key_ref: key_ref(),
+        package_hash: digest(9),
+        route: "/sign".into(),
+        agent_id: Some("advisory".into()),
+        purpose: token("transfer"),
+        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
+        maximum_lifetime_ms: DecimalU64::new(10_000),
+        custody_operation_id: operation(94),
+    };
+    harness.authority.prepare_petal_key_scope(&scope).unwrap();
+    harness
+        .authority
+        .prepare_petal_key_scope(&scope)
+        .expect("an exact custody retry is idempotent");
+
+    let mut rebound = scope.clone();
+    rebound.route = "/other".into();
+    assert!(
+        error_code(
+            harness
+                .authority
+                .prepare_petal_key_scope(&rebound)
+                .unwrap_err()
+        )
+        .contains("PROVENANCE")
+    );
+    let mut undeclared = scope.clone();
+    undeclared.purpose = token("undeclared-purpose");
+    assert!(
+        error_code(
+            harness
+                .authority
+                .prepare_petal_key_scope(&undeclared)
+                .unwrap_err()
+        )
+        .contains("PROVENANCE_CLASS_MISMATCH")
+    );
+
+    let mut child = key_ref();
+    child.locator = "petal-child-1".into();
+    child.public_key_fingerprint = digest(95);
+    let mut receipt = CustodyResult {
+        ceremony_kind: CeremonyKind::KeyDerive,
+        custody_operation_id: scope.custody_operation_id.clone(),
+        public_status: CeremonyState::Succeeded,
+        wallet_id: Some(harness.wallet.clone()),
+        public_key_refs: vec![child.clone()],
+        credential_summaries: vec![],
+        initial_policy: None,
+        receipt_digest: digest(96),
+        encrypted_browser_result: None,
+        signer_key_id: token("ceremony-key"),
+        signer_signature: Base64UrlBytes::from_bytes(&[]),
+    };
+    sign_custody_receipt(&mut receipt, &harness.ceremony_key);
+    harness
+        .authority
+        .adopt_custody_receipt(&receipt, 1_000)
+        .unwrap();
+
+    let mut non_petal = exact_terms(&harness, b"approved");
+    non_petal.key_ref = child.clone();
+    assert!(
+        error_code(
+            harness
+                .authority
+                .prepare_approval(&non_petal, &digest(7))
+                .unwrap_err()
+        )
+        .contains("PETAL_KEY_SCOPE_MISMATCH")
+    );
+
+    let mut terms = petal_terms(&harness, &provenance);
+    terms.key_ref = child;
+    terms.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Sha256Recoverable];
+    if let ApprovalSelector::Petal {
+        allowed_operation_classes,
+        ..
+    } = &mut terms.selector
+    {
+        *allowed_operation_classes = vec![token("transfer")];
+    }
+    harness.activate(&terms, Some(&provenance));
+    harness
+        .authority
+        .authorize(&petal_input(
+            &terms,
+            &provenance,
+            operation(97),
+            CryptoSuite::Secp256k1Sha256Recoverable,
+        ))
+        .unwrap();
+
+    let mut wrong_provenance = petal_input(
+        &terms,
+        &provenance,
+        operation(98),
+        CryptoSuite::Secp256k1Sha256Recoverable,
+    );
+    wrong_provenance.request.provenance = ProvenanceSubject::Petal {
+        package_hash: digest(8),
+        route: "/sign".into(),
+    };
+    assert!(
+        error_code(harness.authority.authorize(&wrong_provenance).unwrap_err())
+            .contains("PROVENANCE")
+    );
+
+    let mut invalid_replacement = harness.system_provenance();
+    invalid_replacement.installer_signature = Base64UrlBytes::from_bytes(&[0; 64]);
+    assert!(
+        harness
+            .authority
+            .synchronize_provenance_catalog(&ProvenanceCatalog {
+                schema: PROVENANCE_CATALOG_SCHEMA.into(),
+                records: vec![invalid_replacement],
+            })
+            .is_err()
+    );
+    harness
+        .authority
+        .authorize(&petal_input(
+            &terms,
+            &provenance,
+            operation(99),
+            CryptoSuite::Secp256k1Sha256Recoverable,
+        ))
+        .expect("an invalid replacement must leave the current catalog intact");
+
+    harness
+        .authority
+        .synchronize_provenance_catalog(&ProvenanceCatalog {
+            schema: PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![harness.system_provenance()],
+        })
+        .unwrap();
+    assert!(
+        error_code(
+            harness
+                .authority
+                .authorize(&petal_input(
+                    &terms,
+                    &provenance,
+                    operation(100),
+                    CryptoSuite::Secp256k1Sha256Recoverable,
+                ))
+                .unwrap_err()
+        )
+        .contains("PROVENANCE")
+    );
 }
 
 #[test]

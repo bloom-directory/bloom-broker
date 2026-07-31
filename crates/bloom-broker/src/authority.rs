@@ -5,15 +5,15 @@ use crate::journal::{
 use bloom_triad_protocol::{
     ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
     ApprovalTombstone, Base64UrlBytes, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite,
-    CustodyResult, DeclaredFee, Digest32, MachineSignRequest, OperationId,
-    PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalUseClaim, PolicyAuthorityDiff, PolicyUpdateRequest,
-    ProtocolErrorCode, RevocationState, SealedApprovalTerms, SignOperationIdentity,
-    SignedPolicySnapshot, SignerActivationReceipt, SigningPayloads, Token,
+    CustodyResult, DeclaredFee, Digest32, KeyRef, MachineSignRequest, OperationId,
+    PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope, PetalUseClaim, PolicyAuthorityDiff,
+    PolicyUpdateRequest, ProtocolErrorCode, RevocationState, SealedApprovalTerms,
+    SignOperationIdentity, SignedPolicySnapshot, SignerActivationReceipt, SigningPayloads, Token,
 };
 pub use bloom_triad_protocol::{CanonicalWalletPolicy, PolicyDestination, RequiredVerifier};
 pub use bloom_triad_protocol::{
-    ProvenanceFeeAsset as PolicyAsset, ProvenanceOperationClass, ProvenanceRecord,
-    ProvenanceSubject, canonical_policy_authority_diff,
+    ProvenanceCatalog, ProvenanceFeeAsset as PolicyAsset, ProvenanceOperationClass,
+    ProvenanceRecord, ProvenanceSubject, canonical_policy_authority_diff,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use num_bigint::BigUint;
@@ -314,6 +314,19 @@ impl BrokerAuthority {
                 wallet_id TEXT NOT NULL,
                 tombstone_jcs TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS pending_petal_key_scopes (
+                custody_operation_id TEXT PRIMARY KEY,
+                scope_digest TEXT NOT NULL,
+                scope_jcs TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS petal_key_scopes (
+                key_ref_jcs TEXT PRIMARY KEY,
+                scope_digest TEXT NOT NULL,
+                scope_jcs TEXT NOT NULL,
+                activated_at_ms TEXT NOT NULL,
+                expires_at_ms TEXT NOT NULL,
+                custody_receipt_digest TEXT NOT NULL
+            );
             ",
         )?;
         let mut policy_keys = policy_keys;
@@ -458,7 +471,11 @@ impl BrokerAuthority {
     /// Verifies and adopts a completed Signer custody receipt. The outer
     /// ceremony signature is the trust bridge for an initial policy key; the
     /// policy snapshot's self-signature alone is never sufficient to enroll it.
-    pub fn adopt_custody_receipt(&self, receipt: &CustodyResult) -> Result<(), AuthorityError> {
+    pub fn adopt_custody_receipt(
+        &self,
+        receipt: &CustodyResult,
+        now_ms: u64,
+    ) -> Result<(), AuthorityError> {
         if receipt.signer_key_id != self.ceremony_key_id
             || Some(receipt.public_status) != receipt.ceremony_kind.successful_terminal_state()
         {
@@ -504,6 +521,9 @@ impl BrokerAuthority {
                     "only wallet registration or import may carry an initial policy",
                 ));
             }
+            if receipt.ceremony_kind == bloom_triad_protocol::CeremonyKind::KeyDerive {
+                self.adopt_petal_key_scope(receipt, now_ms)?;
+            }
             return Ok(());
         }
         let snapshot = receipt.initial_policy.as_ref().ok_or_else(|| {
@@ -521,6 +541,234 @@ impl BrokerAuthority {
         self.install_initial_policy(snapshot)
     }
 
+    /// Validate and durably freeze a Petal-scoped derivation before Broker
+    /// originates its exact custody ceremony. Exact retries are idempotent;
+    /// an operation identity can never be rebound to another Petal.
+    pub fn prepare_petal_key_scope(&self, scope: &PetalKeyScope) -> Result<(), AuthorityError> {
+        scope
+            .validate()
+            .map_err(|error| denied("PETAL_KEY_SCOPE_INVALID", error.to_string()))?;
+        let (_snapshot, policy) = self.current_policy(&scope.wallet_id)?;
+        if !policy.allowed_petal_packages.contains(&scope.package_hash) {
+            return Err(denied(
+                "PROVENANCE_MISMATCH",
+                "wallet policy does not permit this Petal package",
+            ));
+        }
+        if scope.maximum_lifetime_ms.get() > policy.maximum_approval_lifetime_ms {
+            return Err(denied(
+                "POLICY_LIFETIME_EXCEEDED",
+                "Petal key scope exceeds the wallet policy approval lifetime",
+            ));
+        }
+
+        let subject = ProvenanceSubject::Petal {
+            package_hash: scope.package_hash.clone(),
+            route: scope.route.clone(),
+        };
+        let record = self.catalog_provenance(&subject)?;
+        let record_digest = record.digest().map_err(storage)?;
+        verify_provenance(
+            &record,
+            &self.installer_key_id,
+            &self.installer_key,
+            &record_digest,
+        )?;
+        if !record
+            .operation_classes
+            .iter()
+            .any(|declared| declared.operation_class == scope.purpose)
+        {
+            return Err(denied(
+                "PROVENANCE_CLASS_MISMATCH",
+                "Petal key purpose is absent from installer-signed provenance",
+            ));
+        }
+
+        let scope_digest = scope.digest().map_err(storage)?;
+        let scope_jcs = serde_jcs::to_string(scope).map_err(storage)?;
+        let connection = self.lock()?;
+        let existing = connection
+            .query_row(
+                "SELECT scope_digest, scope_jcs FROM pending_petal_key_scopes
+                 WHERE custody_operation_id = ?1",
+                [scope.custody_operation_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((existing_digest, existing_jcs)) = existing {
+            if existing_digest == scope_digest.as_str() && existing_jcs == scope_jcs {
+                return Ok(());
+            }
+            return Err(denied(
+                "OPERATION_ID_CONFLICT",
+                "custody operation is already bound to a different Petal key scope",
+            ));
+        }
+        connection.execute(
+            "INSERT INTO pending_petal_key_scopes(
+                custody_operation_id, scope_digest, scope_jcs
+             ) VALUES (?1, ?2, ?3)",
+            params![
+                scope.custody_operation_id.as_str(),
+                scope_digest.as_str(),
+                scope_jcs
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn adopt_petal_key_scope(
+        &self,
+        receipt: &CustodyResult,
+        now_ms: u64,
+    ) -> Result<(), AuthorityError> {
+        let connection = self.lock()?;
+        let pending = connection
+            .query_row(
+                "SELECT scope_digest, scope_jcs FROM pending_petal_key_scopes
+                 WHERE custody_operation_id = ?1",
+                [receipt.custody_operation_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((scope_digest, scope_jcs)) = pending else {
+            // Legacy/unscoped key derivation remains distinguishable and gains
+            // no Petal-only signing authority.
+            return Ok(());
+        };
+        let scope: PetalKeyScope = serde_json::from_str(&scope_jcs).map_err(storage)?;
+        if receipt.wallet_id.as_ref() != Some(&scope.wallet_id)
+            || receipt.public_key_refs.len() != 1
+            || receipt.public_key_refs[0].key_spec != scope.parent_key_ref.key_spec
+        {
+            return Err(denied(
+                "CUSTODY_RECEIPT_INVALID",
+                "scoped Petal derivation receipt has a different wallet or child key shape",
+            ));
+        }
+        let expires_at_ms = now_ms
+            .checked_add(scope.maximum_lifetime_ms.get())
+            .ok_or_else(|| {
+                denied(
+                    "PETAL_KEY_SCOPE_INVALID",
+                    "Petal key scope expiry overflowed",
+                )
+            })?;
+        let key_ref_jcs = serde_jcs::to_string(&receipt.public_key_refs[0]).map_err(storage)?;
+        let existing = connection
+            .query_row(
+                "SELECT scope_digest, scope_jcs, custody_receipt_digest
+                 FROM petal_key_scopes WHERE key_ref_jcs = ?1",
+                [&key_ref_jcs],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((existing_digest, existing_scope, existing_receipt)) = existing {
+            if existing_digest == scope_digest
+                && existing_scope == scope_jcs
+                && existing_receipt == receipt.receipt_digest.as_str()
+            {
+                return Ok(());
+            }
+            return Err(denied(
+                "CUSTODY_RECEIPT_INVALID",
+                "derived KeyRef is already bound to different Petal authority",
+            ));
+        }
+        connection.execute(
+            "INSERT INTO petal_key_scopes(
+                key_ref_jcs, scope_digest, scope_jcs, activated_at_ms,
+                expires_at_ms, custody_receipt_digest
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                key_ref_jcs,
+                scope_digest,
+                scope_jcs,
+                now_ms.to_string(),
+                expires_at_ms.to_string(),
+                receipt.receipt_digest.as_str()
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn scoped_key_record(
+        &self,
+        key_ref: &KeyRef,
+    ) -> Result<Option<(PetalKeyScope, u64)>, AuthorityError> {
+        let key_ref_jcs = serde_jcs::to_string(key_ref).map_err(storage)?;
+        let connection = self.lock()?;
+        let record = connection
+            .query_row(
+                "SELECT scope_jcs, expires_at_ms FROM petal_key_scopes
+                 WHERE key_ref_jcs = ?1",
+                [&key_ref_jcs],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        record
+            .map(|(scope_jcs, expires)| {
+                Ok((
+                    serde_json::from_str(&scope_jcs).map_err(storage)?,
+                    expires.parse::<u64>().map_err(storage)?,
+                ))
+            })
+            .transpose()
+    }
+
+    fn validate_scoped_key_terms(&self, terms: &SealedApprovalTerms) -> Result<(), AuthorityError> {
+        let Some((scope, expires_at_ms)) = self.scoped_key_record(&terms.key_ref)? else {
+            return Ok(());
+        };
+        let identity_matches = matches!(
+            &terms.subject,
+            ApprovalSubject::Petal { package_hash, route, agent_id }
+                if package_hash == &scope.package_hash
+                    && route == &scope.route
+                    && agent_id == &scope.agent_id
+        );
+        if !identity_matches
+            || terms.wallet_id != scope.wallet_id
+            || terms.expires_at_ms.get() > expires_at_ms
+            || terms
+                .allowed_crypto_suites
+                .iter()
+                .any(|suite| !scope.allowed_crypto_suites.contains(suite))
+            || matches!(
+                &terms.selector,
+                ApprovalSelector::Petal { allowed_operation_classes, .. }
+                    if allowed_operation_classes.iter().any(|class| class != &scope.purpose)
+            )
+        {
+            return Err(denied(
+                "PETAL_KEY_SCOPE_MISMATCH",
+                "approval exceeds or changes the derived Petal key scope",
+            ));
+        }
+        let provenance = self.catalog_provenance(&ProvenanceSubject::Petal {
+            package_hash: scope.package_hash,
+            route: scope.route,
+        })?;
+        if !provenance
+            .operation_classes
+            .iter()
+            .any(|declared| declared.operation_class == scope.purpose)
+        {
+            return Err(denied(
+                "PROVENANCE_CLASS_MISMATCH",
+                "current installer provenance no longer declares the Petal key purpose",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn prepare_approval(
         &self,
         terms: &SealedApprovalTerms,
@@ -530,6 +778,7 @@ impl BrokerAuthority {
         terms
             .validate()
             .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?;
+        self.validate_scoped_key_terms(terms)?;
         let approval_id = terms
             .approval_id()
             .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?;
@@ -670,6 +919,45 @@ impl BrokerAuthority {
             params![subject_jcs, digest.as_str(), record_jcs],
         )?;
         Ok(digest)
+    }
+
+    /// Atomically replace the complete installer-owned provenance catalog.
+    /// Records absent from the root-owned package catalog are withdrawals,
+    /// not stale grants retained in Broker's durable cache.
+    pub fn synchronize_provenance_catalog(
+        &self,
+        catalog: &ProvenanceCatalog,
+    ) -> Result<(), AuthorityError> {
+        let _barrier = self.lock_authorization_barrier()?;
+        catalog.validate_shape().map_err(storage)?;
+        let mut verified = Vec::with_capacity(catalog.records.len());
+        for record in &catalog.records {
+            let record_digest = record.digest().map_err(storage)?;
+            verify_provenance(
+                record,
+                &self.installer_key_id,
+                &self.installer_key,
+                &record_digest,
+            )?;
+            verified.push((
+                serde_jcs::to_string(&record.subject).map_err(storage)?,
+                record_digest,
+                serde_jcs::to_string(record).map_err(storage)?,
+            ));
+        }
+
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM provenance_catalog", [])?;
+        for (subject_jcs, record_digest, record_jcs) in verified {
+            transaction.execute(
+                "INSERT INTO provenance_catalog(subject_jcs, record_digest, record_jcs)
+                 VALUES (?1, ?2, ?3)",
+                params![subject_jcs, record_digest.as_str(), record_jcs],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn activate_approval(
@@ -1000,6 +1288,7 @@ impl BrokerAuthority {
                 "request changed the approved KeyRef",
             ));
         }
+        self.validate_scoped_key_terms(&terms)?;
         if !terms
             .allowed_crypto_suites
             .contains(&input.request.crypto_suite)
