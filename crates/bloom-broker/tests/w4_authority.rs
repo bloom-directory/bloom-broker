@@ -308,6 +308,73 @@ impl Harness {
 }
 
 #[test]
+fn active_approval_survives_broker_authority_and_journal_restart() {
+    let fixture = Harness::new();
+    let directory = tempfile::tempdir().unwrap();
+    let authority_path = directory.path().join("authority.sqlite");
+    let journal_path = directory.path().join("journal.sqlite");
+    let policy_snapshot = fixture.policy_snapshot(1);
+    let provenance = fixture.system_provenance();
+    let terms = exact_terms(&fixture, b"restart-persistent approval");
+    let approval_id = terms.approval_id().unwrap();
+
+    let open = || {
+        let journal = Arc::new(
+            BrokerJournal::open(&journal_path, Arc::new(TestAuditSigner)).expect("journal"),
+        );
+        let mut policy_keys = BTreeMap::new();
+        policy_keys.insert(
+            fixture.wallet.as_str().to_owned(),
+            (token("policy-key"), fixture.policy_key.verifying_key()),
+        );
+        let authority = BrokerAuthority::open(
+            &authority_path,
+            journal,
+            policy_keys,
+            token("installer-key"),
+            fixture.installer_key.verifying_key(),
+            token("ceremony-key"),
+            fixture.ceremony_key.verifying_key(),
+            token("revocation-key"),
+            fixture.revocation_key.verifying_key(),
+            AssuranceRegistry::compiled(vec![]).unwrap(),
+        )
+        .expect("authority");
+        authority
+    };
+
+    {
+        let authority = open();
+        authority.install_policy(&policy_snapshot).unwrap();
+        authority.install_provenance(&provenance).unwrap();
+        authority.prepare_approval(&terms, &digest(7)).unwrap();
+        authority
+            .activate_approval(
+                &fixture.signed_grant(&terms, approval_id.clone(), operation(3)),
+                1_500,
+            )
+            .unwrap();
+        assert_eq!(
+            authority
+                .approval_public_status(&approval_id)
+                .unwrap()
+                .state,
+            bloom_triad_protocol::ApprovalLifecycleState::Active
+        );
+    }
+
+    let restarted = open();
+    assert_eq!(restarted.approval_terms(&approval_id).unwrap(), Some(terms));
+    assert_eq!(
+        restarted
+            .approval_public_status(&approval_id)
+            .unwrap()
+            .state,
+        bloom_triad_protocol::ApprovalLifecycleState::Active
+    );
+}
+
+#[test]
 fn signed_policy_is_canonical_monotonic_and_frozen() {
     let harness = Harness::new();
     harness
