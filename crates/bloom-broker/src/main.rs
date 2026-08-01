@@ -186,6 +186,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let startup_status_path = std::env::var_os("BLOOM_BROKER_STARTUP_STATUS").map(PathBuf::from);
     let mut config = load_config(&config_path)?;
+    let build_digest = Digest32::new(config.build_digest.clone())?;
+    let containment = config
+        .network_containment
+        .as_ref()
+        .map(|containment| {
+            NetworkContainmentGuard::new(
+                containment.status_path.clone(),
+                containment.login_uid,
+                build_digest.clone(),
+                containment.maximum_age_ms,
+            )
+        })
+        .transpose()?;
+    // Own the canonical origin before opening or mutating any durable Broker
+    // authority state. A losing AC-31 contender must die without racing the
+    // owning Broker's journal or checkpoint store.
+    let ceremony_listener = match CeremonyBroker::bind_canonical() {
+        Ok(listener) => {
+            if let Some(path) = startup_status_path.as_deref() {
+                clear_startup_failure(path, broker_effective_uid)?;
+            }
+            listener
+        }
+        Err(error) => {
+            if let Some(path) = startup_status_path.as_deref() {
+                write_listener_conflict(path, broker_effective_uid, containment.as_ref())?;
+            }
+            return Err(error.into());
+        }
+    };
     let broker_signing_key = take_signing_key(&mut config.broker_signing_seed_hex)?;
     let audit_signing_key = take_signing_key(&mut config.audit_signing_seed_hex)?;
     let previous_audit_signing_key = config
@@ -351,19 +381,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         review_manifest_signing_key,
         journal.clone(),
     )?;
-    let build_digest = Digest32::new(config.build_digest.clone())?;
-    let containment = config
-        .network_containment
-        .as_ref()
-        .map(|containment| {
-            NetworkContainmentGuard::new(
-                containment.status_path.clone(),
-                containment.login_uid,
-                build_digest.clone(),
-                containment.maximum_age_ms,
-            )
-        })
-        .transpose()?;
     let machine_journal = journal.clone();
     let mut service = BrokerRpcService::new(
         authority,
@@ -414,20 +431,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut session_stream =
         connect_authenticated_session(&session_socket_path, &identity, &session_acl).await?;
-    let ceremony_listener = match CeremonyBroker::bind_canonical() {
-        Ok(listener) => {
-            if let Some(path) = startup_status_path.as_deref() {
-                clear_startup_failure(path, broker_effective_uid)?;
-            }
-            listener
-        }
-        Err(error) => {
-            if let Some(path) = startup_status_path.as_deref() {
-                write_listener_conflict(path, broker_effective_uid, containment.as_ref())?;
-            }
-            return Err(error.into());
-        }
-    };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut rpc_shutdown = shutdown_rx.clone();
     let mut control_shutdown = shutdown_rx.clone();
