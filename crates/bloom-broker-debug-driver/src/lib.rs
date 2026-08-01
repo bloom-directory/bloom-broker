@@ -87,6 +87,10 @@ impl VirtualAuthenticator {
         }
     }
 
+    pub fn credential_id(&self) -> &Base64UrlBytes {
+        &self.credential_id
+    }
+
     pub fn assertion(&self, challenge: &[u8], sign_count: u32) -> WebAuthnAssertion {
         let client_data = client_data("webauthn.get", challenge);
         let authenticator_data = authenticator_data(0x05, sign_count);

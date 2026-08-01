@@ -28,7 +28,9 @@ impl BrokerClock {
             boot_epoch,
             observation_lock: Mutex::new(()),
         };
-        clock.observe(false)?;
+        if !clock.journal.audit_degraded() {
+            clock.observe(false)?;
+        }
         Ok(clock)
     }
 
@@ -56,6 +58,12 @@ impl BrokerClock {
     }
 
     pub fn readiness(&self) -> Result<(ReadinessState, Vec<Token>), ProtocolError> {
+        if self.journal.audit_degraded() {
+            return Ok((
+                ReadinessState::DegradedReadOnly,
+                vec![Token::new("audit_journal_degraded")?],
+            ));
+        }
         let decision = match self.observe(false) {
             Ok(decision) => decision,
             Err(_) => {

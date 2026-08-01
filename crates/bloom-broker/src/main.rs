@@ -12,6 +12,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use bloom_audit_checkpoint::{
+    AppendOutcome, AuthorityEdgeHistory, CheckpointError, CheckpointSink, CheckpointStore,
+    PinnedAuditKey,
+};
 use bloom_broker::{
     authority::{AssuranceRegistry, BrokerAuthority},
     ceremony::CeremonyBroker,
@@ -23,10 +27,12 @@ use bloom_broker::{
 #[cfg(feature = "triad-dev-harness")]
 use bloom_triad_local_transport::load_developer_identity_and_manifest;
 use bloom_triad_local_transport::{
-    EndpointQuota, LocalIdentity, NetworkContainmentGuard, PeerAcl, load_identity_and_manifest,
+    EndpointQuota, LocalIdentity, MachineBrokerJournalExchange, NetworkContainmentGuard, PeerAcl,
+    is_read_only_method, load_identity_and_manifest,
 };
 use bloom_triad_protocol::{
-    Base64UrlBytes, Digest32, ProtocolError, ProtocolErrorCode, ProvenanceCatalog, Token,
+    Base64UrlBytes, BrokerSignerRequest, BrokerSignerResponse, Digest32, Empty, ProtocolError,
+    ProtocolErrorCode, ProvenanceCatalog, Token,
 };
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -49,6 +55,10 @@ struct BrokerConfig {
     broker_signing_seed_hex: String,
     audit_key_id: String,
     audit_signing_seed_hex: String,
+    #[serde(default)]
+    audit_historical_public_keys: Vec<AuditPublicKeyConfig>,
+    #[serde(default)]
+    audit_rotation_previous_key: Option<AuditPreviousSigningKeyConfig>,
     review_manifest_key_id: String,
     review_manifest_signing_seed_hex: String,
     installer_key_id: String,
@@ -73,6 +83,20 @@ struct BrokerConfig {
     control_request_window_ms: u64,
     control_maximum_journal_admissions_per_window: usize,
     control_journal_window_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditPublicKeyConfig {
+    key_id: String,
+    public_key_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditPreviousSigningKeyConfig {
+    key_id: String,
+    signing_seed_hex: String,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +129,9 @@ impl Drop for BrokerConfig {
     fn drop(&mut self) {
         self.broker_signing_seed_hex.zeroize();
         self.audit_signing_seed_hex.zeroize();
+        if let Some(previous) = &mut self.audit_rotation_previous_key {
+            previous.signing_seed_hex.zeroize();
+        }
         self.review_manifest_signing_seed_hex.zeroize();
     }
 }
@@ -161,6 +188,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = load_config(&config_path)?;
     let broker_signing_key = take_signing_key(&mut config.broker_signing_seed_hex)?;
     let audit_signing_key = take_signing_key(&mut config.audit_signing_seed_hex)?;
+    let previous_audit_signing_key = config
+        .audit_rotation_previous_key
+        .as_mut()
+        .map(|previous| -> Result<(Token, SigningKey), ProtocolError> {
+            Ok((
+                Token::new(previous.key_id.clone())?,
+                take_signing_key(&mut previous.signing_seed_hex)?,
+            ))
+        })
+        .transpose()?;
     let review_manifest_signing_key =
         take_signing_key(&mut config.review_manifest_signing_seed_hex)?;
     let policy_keys = config
@@ -177,11 +214,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect::<Result<BTreeMap<_, _>, ProtocolError>>()?;
 
-    let audit_signer = Arc::new(Ed25519AuditSigner {
-        key_id: Token::new(config.audit_key_id.clone())?,
-        signing_key: audit_signing_key,
-    });
-    let journal = Arc::new(BrokerJournal::open(&config.journal_path, audit_signer)?);
+    let journal = Arc::new(open_operational_audit_journal(
+        &config.journal_path,
+        Token::new(config.audit_key_id.clone())?,
+        audit_signing_key,
+        &config.audit_historical_public_keys,
+        previous_audit_signing_key,
+    )?);
+    if signer_acl.service_id.as_str() != "bloom-signer" {
+        return Err("edge manifest does not pin bloom-signer for the Broker edge".into());
+    }
+    let authority_history_path = env_path(
+        "BLOOM_AUTHORITY_EDGE_HISTORY",
+        "/etc/bloom/authority-edge-history.json",
+    );
+    #[cfg(feature = "triad-dev-harness")]
+    let history_owner = if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
+        broker_effective_uid
+    } else {
+        0
+    };
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let history_owner = 0;
+    let checkpoint_store = (|| -> Result<CheckpointStore, CheckpointError> {
+        let authority_history =
+            AuthorityEdgeHistory::load_trusted(&authority_history_path, history_owner)?;
+        let checkpoint_services = [
+            &machine_acl.service_id,
+            &signer_acl.service_id,
+            &identity.service_id,
+        ];
+        let historical_checkpoint_keys =
+            authority_history.historical_pins_for(&checkpoint_services)?;
+        let authority_handovers = authority_history.handovers_for(&checkpoint_services);
+        CheckpointStore::open_with_history(
+            env_path(
+                "BLOOM_BROKER_AUDIT_CHECKPOINT_DIR",
+                "/var/db/bloom/broker/audit-checkpoints",
+            ),
+            broker_effective_uid,
+            identity.service_id.clone(),
+            [
+                PinnedAuditKey {
+                    service_id: machine_acl.service_id.clone(),
+                    key_id: machine_acl.application_key_id.clone(),
+                    verifying_key: VerifyingKey::from_bytes(&machine_acl.application_public_key)
+                        .map_err(|_| CheckpointError::InvalidSignature)?,
+                },
+                PinnedAuditKey {
+                    service_id: signer_acl.service_id.clone(),
+                    key_id: signer_acl.application_key_id.clone(),
+                    verifying_key: VerifyingKey::from_bytes(&signer_acl.application_public_key)
+                        .map_err(|_| CheckpointError::InvalidSignature)?,
+                },
+                PinnedAuditKey {
+                    service_id: identity.service_id.clone(),
+                    key_id: identity.application_key_id.clone(),
+                    verifying_key: identity.signing_key.verifying_key(),
+                },
+            ],
+            historical_checkpoint_keys,
+            authority_handovers,
+        )
+    })();
+    let signer_checkpoints: Arc<dyn CheckpointSink> = match checkpoint_store {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            journal.latch_audit_degradation();
+            eprintln!("Bloom Broker authority-edge checkpoint degradation: {error}");
+            Arc::new(UnavailableCheckpointSink {
+                reason: error.to_string(),
+            })
+        }
+    };
+    journal.install_self_checkpoint(identity.clone(), signer_checkpoints.clone())?;
     let clock = Arc::new(BrokerClock::new(
         journal.clone(),
         &trusted_time_source,
@@ -220,17 +326,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }?;
     #[cfg(not(feature = "triad-dev-harness"))]
     let provenance_catalog = load_provenance_catalog(&config.provenance_catalog_path)?;
-    authority.synchronize_provenance_catalog(&provenance_catalog)?;
-    if signer_acl.service_id.as_str() != "bloom-signer" {
-        return Err("edge manifest does not pin bloom-signer for the Broker edge".into());
+    if !journal.audit_degraded() {
+        authority.synchronize_provenance_catalog(&provenance_catalog)?;
     }
-    let signer =
-        BrokerSignerClient::connect_unix(&config.signer_socket_path, identity.clone(), signer_acl)?;
-    let ceremony = CeremonyBroker::open_with_manifest_signer(
+    let signer = BrokerSignerClient::connect_unix(
+        &config.signer_socket_path,
+        identity.clone(),
+        signer_acl,
+        journal.clone(),
+        signer_checkpoints.clone(),
+    )?;
+    if !journal.audit_degraded()
+        || signer_checkpoints
+            .latest_peer_head(&identity.service_id)?
+            .is_some()
+    {
+        if let Err(error) = require_signer_head_exchange(&signer).await {
+            // A peer-detected rollback must leave the authenticated listener
+            // available for readiness/status while all mutations remain
+            // latched. Periodic exchange will recover only after an operator
+            // resolves the monotonicity incident.
+            journal.latch_audit_degradation();
+            eprintln!("Bloom Broker authority-edge head exchange degraded: {error}");
+        }
+    }
+    let signer_head_exchange = signer.clone();
+    let ceremony = CeremonyBroker::open_with_manifest_signer_audited(
         &config.ceremony_path,
         Arc::new(signer.clone()),
         Token::new(config.review_manifest_key_id.clone())?,
         review_manifest_signing_key,
+        journal.clone(),
     )?;
     let build_digest = Digest32::new(config.build_digest.clone())?;
     let containment = config
@@ -245,6 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .transpose()?;
+    let machine_journal = journal.clone();
     let mut service = BrokerRpcService::new(
         authority,
         journal,
@@ -261,7 +388,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         service = service.with_network_containment(containment);
     }
     let service = Arc::new(service);
-    service.reconcile_all().await?;
+    if !service.journal_is_audit_degraded() {
+        service.reconcile_all().await?;
+    }
 
     let rpc_listener = UnixListener::from_std(acquire_unix_listener(
         "BLOOM_BROKER_SOCKET",
@@ -309,8 +438,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut rpc_shutdown = shutdown_rx.clone();
     let mut control_shutdown = shutdown_rx.clone();
+    let mut head_exchange_shutdown = shutdown_rx.clone();
     let mut ceremony_shutdown = shutdown_rx;
     let ceremony_for_shutdown = ceremony.clone();
+    let machine_journals = Arc::new(BrokerMachineJournals {
+        journal: machine_journal,
+        checkpoints: signer_checkpoints.clone(),
+        identity: identity.clone(),
+    });
     tokio::try_join!(
         serve_rpc(
             rpc_listener,
@@ -318,6 +453,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             machine_acl,
             rpc_quota,
             service.clone(),
+            machine_journals,
             config.maximum_connections,
             &mut rpc_shutdown,
         ),
@@ -330,6 +466,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.control_maximum_connections,
             &mut control_shutdown,
         ),
+        periodically_exchange_signer_head(signer_head_exchange, &mut head_exchange_shutdown),
         async move {
             ceremony_for_shutdown
                 .serve_listener_until(ceremony_listener, async move {
@@ -359,6 +496,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     ceremony.terminate_live_sessions(unix_time_ms()?)?;
     Ok(())
+}
+
+async fn require_signer_head_exchange(signer: &BrokerSignerClient) -> Result<(), ProtocolError> {
+    match signer
+        .request_async(BrokerSignerRequest::SignerReadiness(Empty {}))
+        .await?
+    {
+        BrokerSignerResponse::SignerReadiness(_) => Ok(()),
+        _ => Err(ProtocolError::new(
+            ProtocolErrorCode::ServiceUnavailable,
+            "Signer returned the wrong journal-head readiness response",
+        )),
+    }
+}
+
+const AUTHORITY_HEAD_EXCHANGE_CADENCE: Duration = Duration::from_secs(45);
+const AUTHORITY_HEAD_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn run_periodic_signer_head_exchange<F, Fut>(
+    shutdown: &mut watch::Receiver<bool>,
+    mut exchange: F,
+) -> std::io::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), ProtocolError>>,
+{
+    let mut interval = tokio::time::interval(AUTHORITY_HEAD_EXCHANGE_CADENCE);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = wait_for_shutdown(shutdown) => return Ok(()),
+            _ = interval.tick() => {
+                match tokio::time::timeout(AUTHORITY_HEAD_EXCHANGE_TIMEOUT, exchange()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        eprintln!("Bloom Broker periodic Signer audit-head exchange failed: {error}");
+                    }
+                    Err(_) => {
+                        eprintln!("Bloom Broker periodic Signer audit-head exchange timed out");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn periodically_exchange_signer_head(
+    signer: BrokerSignerClient,
+    shutdown: &mut watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    run_periodic_signer_head_exchange(shutdown, || {
+        let signer = signer.clone();
+        async move { require_signer_head_exchange(&signer).await }
+    })
+    .await
 }
 
 fn is_session_disconnect(error: &std::io::Error) -> bool {
@@ -573,12 +766,14 @@ fn clock_repair_request() -> Result<Option<u64>, Box<dyn std::error::Error>> {
         .transpose()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_rpc(
     listener: UnixListener,
     identity: LocalIdentity,
     machine_acl: PeerAcl,
     quota: Arc<EndpointQuota>,
     service: Arc<BrokerRpcService>,
+    journals: Arc<BrokerMachineJournals>,
     maximum_connections: usize,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()> {
@@ -598,17 +793,80 @@ async fn serve_rpc(
         let machine_acl = machine_acl.clone();
         let quota = quota.clone();
         let service = service.clone();
+        let journals = journals.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _ = bloom_triad_local_transport::dispatch_machine_broker_connection(
-                &mut stream,
-                &identity,
-                &machine_acl,
-                &quota,
-                service.as_ref(),
-            )
-            .await;
+            let _ =
+                bloom_triad_local_transport::dispatch_machine_broker_connection_with_journal_heads(
+                    &mut stream,
+                    &identity,
+                    &machine_acl,
+                    &quota,
+                    service.as_ref(),
+                    journals.as_ref(),
+                )
+                .await;
         });
+    }
+}
+
+struct BrokerMachineJournals {
+    journal: Arc<BrokerJournal>,
+    checkpoints: Arc<dyn CheckpointSink>,
+    identity: LocalIdentity,
+}
+
+impl MachineBrokerJournalExchange for BrokerMachineJournals {
+    fn checkpoint_request_head(
+        &self,
+        method: &Token,
+        peer_head: &bloom_triad_protocol::SignedJournalHead,
+    ) -> Result<(), ProtocolError> {
+        if let Err(error) = self.checkpoints.append_peer_head(peer_head) {
+            self.journal.latch_audit_degradation();
+            if !is_read_only_method(method) {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!(
+                        "persist Machine audit checkpoint before Broker mutation dispatch: {error}"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn local_journal_head(&self) -> Result<(u64, Digest32), ProtocolError> {
+        self.journal.verified_audit_head().or_else(|_| {
+            self.checkpoints
+                .latest_peer_head(&self.identity.service_id)
+                .map_err(|error| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        format!("load retained Broker audit head: {error}"),
+                    )
+                })?
+                .map(|head| (head.sequence.get(), head.head_hash))
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "no independently retained Broker audit head is available",
+                    )
+                })
+        })
+    }
+}
+
+struct UnavailableCheckpointSink {
+    reason: String,
+}
+
+impl CheckpointSink for UnavailableCheckpointSink {
+    fn append_peer_head(
+        &self,
+        _peer_head: &bloom_triad_protocol::SignedJournalHead,
+    ) -> Result<AppendOutcome, CheckpointError> {
+        Err(CheckpointError::Malformed(self.reason.clone()))
     }
 }
 
@@ -715,6 +973,7 @@ fn unix_time_ms() -> Result<u64, ProtocolError> {
 struct Ed25519AuditSigner {
     key_id: Token,
     signing_key: SigningKey,
+    verifying_keys: BTreeMap<String, VerifyingKey>,
 }
 
 impl AuditSigner for Ed25519AuditSigner {
@@ -734,16 +993,106 @@ impl AuditSigner for Ed25519AuditSigner {
         message: &[u8],
         signature: &Base64UrlBytes,
     ) -> Result<(), String> {
-        if key_id != &self.key_id {
-            return Err("audit key ID mismatch".into());
-        }
+        let verifying_key = self
+            .verifying_keys
+            .get(key_id.as_str())
+            .ok_or_else(|| "audit key ID is not retained in the configured keyring".to_owned())?;
         let signature =
             Signature::from_slice(&signature.decode()).map_err(|error| error.to_string())?;
-        self.signing_key
-            .verifying_key()
+        verifying_key
             .verify(message, &signature)
             .map_err(|error| error.to_string())
     }
+}
+
+fn open_operational_audit_journal(
+    path: &Path,
+    current_key_id: Token,
+    current_signing_key: SigningKey,
+    historical: &[AuditPublicKeyConfig],
+    previous: Option<(Token, SigningKey)>,
+) -> Result<BrokerJournal, ProtocolError> {
+    let mut verifying_keys = BTreeMap::new();
+    insert_audit_verifying_key(
+        &mut verifying_keys,
+        current_key_id.as_str(),
+        current_signing_key.verifying_key(),
+    )?;
+    for entry in historical {
+        let key_id = Token::new(entry.key_id.clone())?;
+        insert_audit_verifying_key(
+            &mut verifying_keys,
+            key_id.as_str(),
+            verifying_key(&entry.public_key_hex)?,
+        )?;
+    }
+    if let Some((previous_key_id, previous_signing_key)) = &previous {
+        if previous_key_id == &current_key_id {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "audit rotation previous key must differ from the current key",
+            ));
+        }
+        insert_audit_verifying_key(
+            &mut verifying_keys,
+            previous_key_id.as_str(),
+            previous_signing_key.verifying_key(),
+        )?;
+    }
+
+    let current_signer = Arc::new(Ed25519AuditSigner {
+        key_id: current_key_id,
+        signing_key: current_signing_key,
+        verifying_keys: verifying_keys.clone(),
+    });
+    let journal = BrokerJournal::open(path, current_signer.clone()).map_err(audit_startup)?;
+    if !journal.audit_degraded() {
+        return Ok(journal);
+    }
+
+    let Some((previous_key_id, previous_signing_key)) = previous else {
+        return Ok(journal);
+    };
+    let previous_signer = Arc::new(Ed25519AuditSigner {
+        key_id: previous_key_id,
+        signing_key: previous_signing_key,
+        verifying_keys,
+    });
+    let journal = BrokerJournal::open(path, previous_signer).map_err(audit_startup)?;
+    if journal.audit_degraded() {
+        // Preserve status/read-only startup on corrupted history. Reopening
+        // with the configured current signer produces the same durable view
+        // with a mutation-denial latch and cannot publish a rotation.
+        return BrokerJournal::open(path, current_signer).map_err(audit_startup);
+    }
+    journal
+        .rotate_audit_key(current_signer)
+        .map_err(audit_startup)?;
+    journal.verify_audit_chain().map_err(audit_startup)?;
+    Ok(journal)
+}
+
+fn insert_audit_verifying_key(
+    keys: &mut BTreeMap<String, VerifyingKey>,
+    key_id: &str,
+    key: VerifyingKey,
+) -> Result<(), ProtocolError> {
+    if let Some(existing) = keys.insert(key_id.to_owned(), key) {
+        if existing != key {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                format!("audit key ID {key_id} has conflicting public keys"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn audit_startup(error: impl std::fmt::Display) -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCode::ServiceUnavailable,
+        format!("open Broker audit journal: {error}"),
+    )
 }
 
 fn env_path(name: &str, default: &str) -> PathBuf {
@@ -885,6 +1234,257 @@ fn verifying_key(encoded: &str) -> Result<VerifyingKey, ProtocolError> {
 #[cfg(test)]
 mod startup_failure_tests {
     use super::*;
+
+    #[test]
+    fn unchanged_machine_head_keeps_broker_rpc_checkpoint_admission_bounded() {
+        let temporary = tempfile::tempdir().unwrap();
+        let journal = Arc::new(
+            open_operational_audit_journal(
+                &temporary.path().join("broker.sqlite"),
+                Token::new("broker-audit-1").unwrap(),
+                SigningKey::from_bytes(&[71; 32]),
+                &[],
+                None,
+            )
+            .unwrap(),
+        );
+        let checkpoint_root = temporary.path().join("machine-checkpoints");
+        fs::create_dir(&checkpoint_root).unwrap();
+        fs::set_permissions(&checkpoint_root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let machine = LocalIdentity {
+            service_id: Token::new("bloom-machine").unwrap(),
+            boot_epoch: bloom_triad_protocol::BootEpoch::new("11".repeat(16)).unwrap(),
+            application_key_id: Token::new("machine-app-1").unwrap(),
+            signing_key: Arc::new(SigningKey::from_bytes(&[72; 32])),
+        };
+        let broker = LocalIdentity {
+            service_id: Token::new("bloom-broker").unwrap(),
+            boot_epoch: bloom_triad_protocol::BootEpoch::new("22".repeat(16)).unwrap(),
+            application_key_id: Token::new("broker-app-1").unwrap(),
+            signing_key: Arc::new(SigningKey::from_bytes(&[73; 32])),
+        };
+        let checkpoints = CheckpointStore::open(
+            &checkpoint_root,
+            fs::metadata(&checkpoint_root).unwrap().uid(),
+            broker.service_id.clone(),
+            [PinnedAuditKey {
+                service_id: machine.service_id.clone(),
+                key_id: machine.application_key_id.clone(),
+                verifying_key: machine.signing_key.verifying_key(),
+            }],
+        )
+        .unwrap();
+        let exchange = BrokerMachineJournals {
+            journal,
+            checkpoints: Arc::new(checkpoints),
+            identity: broker,
+        };
+        let head = bloom_triad_local_transport::sign_journal_head(
+            &machine,
+            7,
+            Digest32::from_bytes([7; 32]),
+        );
+        let readiness = Token::new("broker.readiness").unwrap();
+
+        let started = std::time::Instant::now();
+        for _ in 0..1_000 {
+            exchange.checkpoint_request_head(&readiness, &head).unwrap();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "unchanged Machine journal heads must not starve Broker RPC admission"
+        );
+        assert!(!exchange.journal.audit_degraded());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_broker_signer_exchange_completes_with_margin_inside_sixty_seconds() {
+        let completions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = completions.clone();
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            run_periodic_signer_head_exchange(&mut shutdown, move || {
+                let observed = observed.clone();
+                async move {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(44)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(completions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(completions.load(std::sync::atomic::Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(45)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(completions.load(std::sync::atomic::Ordering::SeqCst), 2);
+        task.abort();
+    }
+
+    #[test]
+    fn production_audit_rotation_is_restartable_with_retained_public_keys() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("broker.sqlite");
+        let old = SigningKey::from_bytes(&[81; 32]);
+        let new = SigningKey::from_bytes(&[82; 32]);
+        let old_id = Token::new("broker-audit-old").unwrap();
+        let new_id = Token::new("broker-audit-new").unwrap();
+
+        let journal =
+            open_operational_audit_journal(&path, old_id.clone(), old.clone(), &[], None).unwrap();
+        journal
+            .create_approval(
+                &Digest32::from_bytes([1; 32]),
+                bloom_triad_protocol::ApprovalLifecycleState::Prepared,
+            )
+            .unwrap();
+        drop(journal);
+
+        let retained = vec![AuditPublicKeyConfig {
+            key_id: old_id.as_str().to_owned(),
+            public_key_hex: hex::encode(old.verifying_key().to_bytes()),
+        }];
+        let rotated = open_operational_audit_journal(
+            &path,
+            new_id.clone(),
+            new.clone(),
+            &retained,
+            Some((old_id, old)),
+        )
+        .unwrap();
+        rotated
+            .create_approval(
+                &Digest32::from_bytes([2; 32]),
+                bloom_triad_protocol::ApprovalLifecycleState::Prepared,
+            )
+            .unwrap();
+        assert_eq!(
+            rotated
+                .audit_entries()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.event_type == "audit.key_rotated")
+                .count(),
+            1
+        );
+        drop(rotated);
+
+        let restarted =
+            open_operational_audit_journal(&path, new_id, new, &retained, None).unwrap();
+        restarted.verify_audit_chain().unwrap();
+        assert!(!restarted.audit_degraded());
+    }
+
+    #[test]
+    fn production_startup_preserves_reads_on_signing_mismatch_but_refuses_conflicting_pins() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("broker.sqlite");
+        let old = SigningKey::from_bytes(&[83; 32]);
+        let new = SigningKey::from_bytes(&[84; 32]);
+        let old_id = Token::new("broker-audit-old").unwrap();
+        let new_id = Token::new("broker-audit-new").unwrap();
+        let journal = open_operational_audit_journal(&path, old_id, old, &[], None).unwrap();
+        journal
+            .create_approval(
+                &Digest32::from_bytes([3; 32]),
+                bloom_triad_protocol::ApprovalLifecycleState::Prepared,
+            )
+            .unwrap();
+        drop(journal);
+        let degraded =
+            open_operational_audit_journal(&path, new_id.clone(), new.clone(), &[], None).unwrap();
+        assert!(degraded.audit_degraded());
+        assert_eq!(
+            degraded
+                .approval_state(&Digest32::from_bytes([3; 32]))
+                .unwrap(),
+            Some(bloom_triad_protocol::ApprovalLifecycleState::Prepared)
+        );
+        assert!(
+            degraded
+                .transition_approval(
+                    &Digest32::from_bytes([3; 32]),
+                    bloom_triad_protocol::ApprovalLifecycleState::AwaitingCeremony,
+                )
+                .is_err()
+        );
+        let clock = BrokerClock::new(
+            Arc::new(degraded),
+            test_time_source(),
+            bloom_triad_protocol::BootEpoch::new("01".repeat(16)).unwrap(),
+        )
+        .expect("degraded production clock construction must not mutate");
+        let readiness = clock.readiness().unwrap();
+        assert_eq!(
+            readiness.0,
+            bloom_triad_protocol::ReadinessState::DegradedReadOnly
+        );
+        assert_eq!(
+            readiness.1,
+            vec![Token::new("audit_journal_degraded").unwrap()]
+        );
+        let conflicting = vec![AuditPublicKeyConfig {
+            key_id: new_id.as_str().to_owned(),
+            public_key_hex: hex::encode(SigningKey::from_bytes(&[85; 32]).verifying_key()),
+        }];
+        assert!(open_operational_audit_journal(&path, new_id, new, &conflicting, None).is_err());
+    }
+
+    #[test]
+    fn production_startup_preserves_reads_after_audit_payload_tamper() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("broker.sqlite");
+        let signing_key = SigningKey::from_bytes(&[86; 32]);
+        let key_id = Token::new("broker-audit-current").unwrap();
+        let approval_id = Digest32::from_bytes([4; 32]);
+        let journal =
+            open_operational_audit_journal(&path, key_id.clone(), signing_key.clone(), &[], None)
+                .unwrap();
+        journal
+            .create_approval(
+                &approval_id,
+                bloom_triad_protocol::ApprovalLifecycleState::Prepared,
+            )
+            .unwrap();
+        drop(journal);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE audit_chain SET payload_jcs='{}' WHERE sequence=0",
+                [],
+            )
+            .unwrap();
+
+        let degraded =
+            open_operational_audit_journal(&path, key_id, signing_key, &[], None).unwrap();
+        assert!(degraded.audit_degraded());
+        assert_eq!(
+            degraded.approval_state(&approval_id).unwrap(),
+            Some(bloom_triad_protocol::ApprovalLifecycleState::Prepared)
+        );
+        assert!(
+            degraded
+                .transition_approval(
+                    &approval_id,
+                    bloom_triad_protocol::ApprovalLifecycleState::AwaitingCeremony,
+                )
+                .is_err()
+        );
+    }
+
+    fn test_time_source() -> &'static str {
+        #[cfg(target_os = "linux")]
+        return "linux-chrony-nts";
+        #[cfg(target_os = "macos")]
+        return "macos-managed-timed";
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        panic!("Broker startup tests require a reviewed trusted-time platform");
+    }
 
     #[test]
     fn session_disconnect_errors_exit_cleanly_without_keepalive_retry() {

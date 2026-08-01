@@ -1,3 +1,4 @@
+use crate::journal::BrokerJournal;
 use axum::{
     Json, Router,
     body::Body,
@@ -146,7 +147,8 @@ struct BrokerInner {
     operations: Mutex<HashMap<OperationId, String>>,
     cancellation_backoff: Mutex<HashMap<Token, (u32, u64)>>,
     invalid_attempts: Mutex<HashMap<IpAddr, u32>>,
-    database: Option<Mutex<Connection>>,
+    database: Option<Arc<std::sync::Mutex<Connection>>>,
+    journal: Option<Arc<BrokerJournal>>,
     manifest_signer: Option<(Token, SigningKey)>,
     completion_observer: Mutex<Option<Arc<dyn CeremonyCompletionObserver>>>,
 }
@@ -232,7 +234,7 @@ struct BrowserAck {}
 
 impl CeremonyBroker {
     pub fn new(signer: Arc<dyn CeremonySigner>) -> Self {
-        Self::from_parts(signer, None, None)
+        Self::from_parts(signer, None, None, None)
     }
 
     pub fn new_with_manifest_signer(
@@ -240,24 +242,16 @@ impl CeremonyBroker {
         broker_key_id: Token,
         signing_key: SigningKey,
     ) -> Self {
-        Self::from_parts(signer, None, Some((broker_key_id, signing_key)))
+        Self::from_parts(signer, None, Some((broker_key_id, signing_key)), None)
     }
 
     pub fn open(
-        path: impl AsRef<FsPath>,
+        legacy_path: impl AsRef<FsPath>,
         signer: Arc<dyn CeremonySigner>,
+        journal: Arc<BrokerJournal>,
     ) -> Result<Self, ProtocolError> {
-        let connection = Connection::open(path).map_err(storage)?;
-        connection
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS ceremony_sessions (
-                    ceremony_id TEXT PRIMARY KEY,
-                    operation_id TEXT NOT NULL UNIQUE,
-                    session_jcs TEXT NOT NULL
-                );",
-            )
-            .map_err(storage)?;
-        let broker = Self::from_parts(signer, Some(connection), None);
+        let database = open_audited_ceremony_store(legacy_path, &journal)?;
+        let broker = Self::from_parts(signer, Some(database), None, Some(journal));
         broker.reload_and_reconcile_nonterminal()?;
         Ok(broker)
     }
@@ -267,26 +261,34 @@ impl CeremonyBroker {
         signer: Arc<dyn CeremonySigner>,
         broker_key_id: Token,
         signing_key: SigningKey,
+        journal: Arc<BrokerJournal>,
     ) -> Result<Self, ProtocolError> {
-        let connection = Connection::open(path).map_err(storage)?;
-        connection
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS ceremony_sessions (
-                    ceremony_id TEXT PRIMARY KEY,
-                    operation_id TEXT NOT NULL UNIQUE,
-                    session_jcs TEXT NOT NULL
-                );",
-            )
-            .map_err(storage)?;
-        let broker = Self::from_parts(signer, Some(connection), Some((broker_key_id, signing_key)));
+        Self::open_with_manifest_signer_audited(path, signer, broker_key_id, signing_key, journal)
+    }
+
+    pub fn open_with_manifest_signer_audited(
+        legacy_path: impl AsRef<FsPath>,
+        signer: Arc<dyn CeremonySigner>,
+        broker_key_id: Token,
+        signing_key: SigningKey,
+        journal: Arc<BrokerJournal>,
+    ) -> Result<Self, ProtocolError> {
+        let database = open_audited_ceremony_store(legacy_path, &journal)?;
+        let broker = Self::from_parts(
+            signer,
+            Some(database),
+            Some((broker_key_id, signing_key)),
+            Some(journal),
+        );
         broker.reload_and_reconcile_nonterminal()?;
         Ok(broker)
     }
 
     fn from_parts(
         signer: Arc<dyn CeremonySigner>,
-        database: Option<Connection>,
+        database: Option<Arc<std::sync::Mutex<Connection>>>,
         manifest_signer: Option<(Token, SigningKey)>,
+        journal: Option<Arc<BrokerJournal>>,
     ) -> Self {
         Self {
             inner: Arc::new(BrokerInner {
@@ -295,7 +297,8 @@ impl CeremonyBroker {
                 operations: Mutex::new(HashMap::new()),
                 cancellation_backoff: Mutex::new(HashMap::new()),
                 invalid_attempts: Mutex::new(HashMap::new()),
-                database: database.map(Mutex::new),
+                database,
+                journal,
                 manifest_signer,
                 completion_observer: Mutex::new(None),
             }),
@@ -313,26 +316,25 @@ impl CeremonyBroker {
             .sessions
             .lock()
             .values()
-            .filter_map(|session| {
-                session.terminal_result.as_ref().map(|receipt| {
-                    (
-                        session.projection.ceremony_id.as_str().to_owned(),
-                        session.state,
-                        session.ceremony_kind,
-                        receipt.clone(),
-                        session.terminal_at_ms.unwrap_or(now_ms),
-                    )
-                })
+            .filter(|session| session.state == CeremonyState::WalletCommitted)
+            .map(|session| {
+                (
+                    session.projection.ceremony_id.as_str().to_owned(),
+                    session.terminal_at_ms.unwrap_or(now_ms),
+                )
             })
             .collect::<Vec<_>>();
-        for (ceremony_id, state, kind, receipt, completed_at_ms) in sessions {
-            if state == CeremonyState::WalletCommitted {
-                self.finalize_committed_session(&ceremony_id, completed_at_ms)?;
-            } else {
-                self.notify_completion(kind, &receipt, completed_at_ms)?;
-            }
+        for (ceremony_id, completed_at_ms) in sessions {
+            self.finalize_committed_session(&ceremony_id, completed_at_ms)?;
         }
         Ok(())
+    }
+
+    /// Install the observer without replaying durable completion effects.
+    /// Used only while the Broker audit journal is latched read-only; replay
+    /// would be a security mutation and is deferred until a clean restart.
+    pub fn set_completion_observer_read_only(&self, observer: Arc<dyn CeremonyCompletionObserver>) {
+        *self.inner.completion_observer.lock() = Some(observer);
     }
 
     pub fn prepare_approval(
@@ -590,26 +592,25 @@ impl CeremonyBroker {
             .get(operation_id)
             .cloned()
             .ok_or_else(not_found)?;
-        let wallet_id = {
-            let mut sessions = self.inner.sessions.lock();
-            let session = sessions.get_mut(&ceremony_id).ok_or_else(not_found)?;
+        let (wallet_id, snapshot) = {
+            let sessions = self.inner.sessions.lock();
+            let session = sessions.get(&ceremony_id).ok_or_else(not_found)?;
             if session.state != CeremonyState::AwaitingUser {
                 return Err(protocol(
                     ProtocolErrorCode::OperationIdConflict,
                     "terminal ceremony cannot be cancelled",
                 ));
             }
-            session.wallet_id.clone()
+            let mut snapshot = session.clone();
+            snapshot.state = CeremonyState::Cancelled;
+            snapshot.terminal_at_ms = Some(now_ms);
+            snapshot.token = None;
+            snapshot.token_hash = [0_u8; 32];
+            (session.wallet_id.clone(), snapshot)
         };
         self.inner.signer.cancel(operation_id)?;
-        if let Some(session) = self.inner.sessions.lock().get_mut(&ceremony_id) {
-            session.state = CeremonyState::Cancelled;
-            session.terminal_at_ms = Some(now_ms);
-            session.token = None;
-            session.token_hash = [0_u8; 32];
-            let snapshot = session.clone();
-            self.persist_session(&snapshot)?;
-        }
+        self.persist_session(&snapshot)?;
+        self.inner.sessions.lock().insert(ceremony_id, snapshot);
         if let Some(wallet_id) = &wallet_id {
             self.record_backoff(wallet_id, now_ms);
         }
@@ -645,24 +646,26 @@ impl CeremonyBroker {
                 self.inner.signer.cancel(&operation_id)?;
             }
             let snapshot = {
-                let mut sessions = self.inner.sessions.lock();
-                let Some(session) = sessions.get_mut(&ceremony_id) else {
+                let sessions = self.inner.sessions.lock();
+                let Some(session) = sessions.get(&ceremony_id) else {
                     continue;
                 };
                 if is_terminal(session.state) {
                     continue;
                 }
-                session.state = if state == CeremonyState::AwaitingUser {
+                let mut snapshot = session.clone();
+                snapshot.state = if state == CeremonyState::AwaitingUser {
                     CeremonyState::Cancelled
                 } else {
                     CeremonyState::Failed
                 };
-                session.terminal_at_ms = Some(now_ms);
-                session.token = None;
-                session.token_hash = [0_u8; 32];
-                session.clone()
+                snapshot.terminal_at_ms = Some(now_ms);
+                snapshot.token = None;
+                snapshot.token_hash = [0_u8; 32];
+                snapshot
             };
             self.persist_session(&snapshot)?;
+            self.inner.sessions.lock().insert(ceremony_id, snapshot);
             if state == CeremonyState::AwaitingUser
                 && let Some(wallet_id) = &wallet_id
             {
@@ -755,16 +758,17 @@ impl CeremonyBroker {
                 SignerCeremonyStatus::Missing => (CeremonyState::Expired, None),
             };
             let snapshot = {
-                let mut sessions = self.inner.sessions.lock();
-                let session = sessions.get_mut(&ceremony_id).ok_or_else(not_found)?;
-                session.state = state;
-                session.terminal_result = terminal_result;
+                let sessions = self.inner.sessions.lock();
+                let session = sessions.get(&ceremony_id).ok_or_else(not_found)?;
+                let mut snapshot = session.clone();
+                snapshot.state = state;
+                snapshot.terminal_result = terminal_result;
                 if state == CeremonyState::Expired {
-                    session.terminal_at_ms = Some(now_ms);
-                    session.token = None;
-                    session.token_hash = [0_u8; 32];
+                    snapshot.terminal_at_ms = Some(now_ms);
+                    snapshot.token = None;
+                    snapshot.token_hash = [0_u8; 32];
                 }
-                session.clone()
+                snapshot
             };
             if state == CeremonyState::Expired {
                 if let Some(wallet_id) = &snapshot.wallet_id {
@@ -779,6 +783,10 @@ impl CeremonyBroker {
                 )?;
             }
             self.persist_session(&snapshot)?;
+            self.inner
+                .sessions
+                .lock()
+                .insert(ceremony_id.clone(), snapshot);
             if state == CeremonyState::WalletCommitted {
                 self.finalize_committed_session(&ceremony_id, now_ms)?;
             }
@@ -1086,7 +1094,8 @@ impl CeremonyBroker {
             .database
             .as_ref()
             .expect("open installs a ceremony database")
-            .lock();
+            .lock()
+            .map_err(|_| storage("ceremony database mutex poisoned"))?;
         let mut statement = database
             .prepare(
                 "SELECT ceremony_id, operation_id, session_jcs
@@ -1106,12 +1115,20 @@ impl CeremonyBroker {
             .map_err(storage)?;
         drop(statement);
         drop(database);
+        let audit_degraded = self
+            .inner
+            .journal
+            .as_ref()
+            .is_some_and(|journal| journal.audit_degraded());
 
         for (ceremony_id, operation_id, encoded) in rows {
             let mut session: BrowserSession = serde_json::from_str(&encoded).map_err(malformed)?;
             let preserve_awaiting = session.state == CeremonyState::AwaitingRecoveryAck
                 && session.expires_at_ms > unix_time_ms();
-            if session.state == CeremonyState::AwaitingRecoveryAck && !preserve_awaiting {
+            if audit_degraded {
+                // AC-18 keeps the exact durable read/status projection
+                // available while every security mutation remains latched.
+            } else if session.state == CeremonyState::AwaitingRecoveryAck && !preserve_awaiting {
                 session.state = CeremonyState::Failed;
                 session.terminal_at_ms = Some(unix_time_ms());
                 session.token = None;
@@ -1351,8 +1368,16 @@ impl CeremonyBroker {
         };
         let encoded =
             String::from_utf8(serde_jcs::to_vec(session).map_err(malformed)?).map_err(malformed)?;
-        database
+        let mut database = database
             .lock()
+            .map_err(|_| storage("ceremony database mutex poisoned"))?;
+        if let Some(journal) = &self.inner.journal {
+            journal
+                .verify_before_external_mutation(&database)
+                .map_err(storage)?;
+        }
+        let transaction = database.transaction().map_err(storage)?;
+        transaction
             .execute(
                 "INSERT INTO ceremony_sessions(ceremony_id, operation_id, session_jcs)
                  VALUES (?1, ?2, ?3)
@@ -1366,6 +1391,30 @@ impl CeremonyBroker {
                 ],
             )
             .map_err(storage)?;
+        if let Some(journal) = &self.inner.journal {
+            journal
+                .append_external_audit(
+                    &transaction,
+                    "ceremony.session_persisted",
+                    &serde_json::json!({
+                        "ceremony_id": session.projection.ceremony_id,
+                        "operation_id": session.operation_id,
+                        "ceremony_kind": session.ceremony_kind,
+                        "state": session.state,
+                        "request_digest": session.request_digest,
+                        "receipt_digest": session
+                            .terminal_result
+                            .as_ref()
+                            .and_then(|receipt| receipt.get("receipt_digest"))
+                    }),
+                )
+                .map_err(storage)?;
+        }
+        transaction.commit().map_err(storage)?;
+        drop(database);
+        if let Some(journal) = &self.inner.journal {
+            journal.checkpoint_committed_head().map_err(storage)?;
+        }
         Ok(())
     }
 
@@ -1594,8 +1643,8 @@ async fn complete_session(
         return StatusCode::FORBIDDEN.into_response();
     }
     let (ceremony_kind, operation_id, wallet_id, projection, verifying_snapshot) = {
-        let mut sessions = broker.inner.sessions.lock();
-        let Some(session) = sessions.get_mut(&ceremony_id) else {
+        let sessions = broker.inner.sessions.lock();
+        let Some(session) = sessions.get(&ceremony_id) else {
             return StatusCode::NOT_FOUND.into_response();
         };
         if session.state == CeremonyState::AwaitingRecoveryAck {
@@ -1615,18 +1664,24 @@ async fn complete_session(
         if is_terminal(session.state) {
             return StatusCode::CONFLICT.into_response();
         }
-        session.state = CeremonyState::Verifying;
+        let mut verifying_snapshot = session.clone();
+        verifying_snapshot.state = CeremonyState::Verifying;
         (
             session.ceremony_kind,
             session.operation_id.clone(),
             session.wallet_id.clone(),
             session.projection.clone(),
-            session.clone(),
+            verifying_snapshot,
         )
     };
     if broker.persist_session(&verifying_snapshot).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    broker
+        .inner
+        .sessions
+        .lock()
+        .insert(ceremony_id.clone(), verifying_snapshot.clone());
     if let Err(error) = broker.verify_browser_proof(
         wallet_id.as_ref(),
         &projection,
@@ -1636,14 +1691,22 @@ async fn complete_session(
         if broker.inner.signer.cancel(&operation_id).is_err() {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        if let Some(session) = broker.inner.sessions.lock().get_mut(&ceremony_id) {
-            session.state = CeremonyState::Failed;
-            session.terminal_at_ms = Some(unix_time_ms());
-            session.token = None;
-            session.token_hash = [0_u8; 32];
-            let snapshot = session.clone();
-            let _ = broker.persist_session(&snapshot);
+        let failed = {
+            let sessions = broker.inner.sessions.lock();
+            let Some(session) = sessions.get(&ceremony_id) else {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            };
+            let mut failed = session.clone();
+            failed.state = CeremonyState::Failed;
+            failed.terminal_at_ms = Some(unix_time_ms());
+            failed.token = None;
+            failed.token_hash = [0_u8; 32];
+            failed
+        };
+        if broker.persist_session(&failed).is_err() {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+        broker.inner.sessions.lock().insert(ceremony_id, failed);
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
     }
     let result = if ceremony_kind == CeremonyKind::SealedApproval {
@@ -1734,18 +1797,22 @@ async fn complete_session(
             }
         }
         Err(error) => {
-            let mut sessions = broker.inner.sessions.lock();
-            let Some(session) = sessions.get_mut(&ceremony_id) else {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            let snapshot = {
+                let sessions = broker.inner.sessions.lock();
+                let Some(session) = sessions.get(&ceremony_id) else {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                };
+                let mut snapshot = session.clone();
+                snapshot.state = CeremonyState::Failed;
+                snapshot.terminal_at_ms = Some(unix_time_ms());
+                snapshot.token = None;
+                snapshot.token_hash = [0_u8; 32];
+                snapshot
             };
-            session.state = CeremonyState::Failed;
-            session.terminal_at_ms = Some(unix_time_ms());
-            session.token = None;
-            session.token_hash = [0_u8; 32];
-            let snapshot = session.clone();
             if broker.persist_session(&snapshot).is_err() {
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
+            broker.inner.sessions.lock().insert(ceremony_id, snapshot);
             (StatusCode::BAD_REQUEST, Json(error)).into_response()
         }
     }
@@ -1781,19 +1848,21 @@ async fn bind_output_key(
         Ok(prepared) => prepared,
         Err(error) => return (StatusCode::BAD_REQUEST, Json(error)).into_response(),
     };
-    let projection = {
-        let mut sessions = broker.inner.sessions.lock();
-        let Some(session) = sessions.get_mut(&ceremony_id) else {
+    let snapshot = {
+        let sessions = broker.inner.sessions.lock();
+        let Some(session) = sessions.get(&ceremony_id) else {
             return StatusCode::NOT_FOUND.into_response();
         };
         if prepared.contribution.ceremony_id != session.projection.ceremony_id {
             return StatusCode::CONFLICT.into_response();
         }
-        session.projection.signer_contribution = match serde_json::to_value(prepared.contribution) {
+        let mut snapshot = session.clone();
+        snapshot.projection.signer_contribution = match serde_json::to_value(prepared.contribution)
+        {
             Ok(value) => value,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
-        session.projection.challenges = match prepared
+        snapshot.projection.challenges = match prepared
             .challenges
             .into_iter()
             .map(|binding| {
@@ -1805,13 +1874,14 @@ async fn bind_output_key(
             Ok(challenges) => challenges,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
-        session.projection.webauthn_options = prepared.webauthn_options;
-        let snapshot = session.clone();
-        if broker.persist_session(&snapshot).is_err() {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        session.projection.clone()
+        snapshot.projection.webauthn_options = prepared.webauthn_options;
+        snapshot
     };
+    if broker.persist_session(&snapshot).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let projection = snapshot.projection.clone();
+    broker.inner.sessions.lock().insert(ceremony_id, snapshot);
     Json(projection).into_response()
 }
 
@@ -2152,6 +2222,133 @@ fn storage(error: impl std::fmt::Display) -> ProtocolError {
         ProtocolErrorCode::ServiceUnavailable,
         format!("ceremony durability failure: {error}"),
     )
+}
+
+// See the authority migration: ceremony state formerly lived in a separate
+// SQLite file, which cannot commit atomically with the Broker audit chain.
+// Import it once into the consolidated journal database and retain the source
+// file untouched as a rollback artifact.
+fn open_audited_ceremony_store(
+    legacy_path: impl AsRef<FsPath>,
+    journal: &Arc<BrokerJournal>,
+) -> Result<Arc<std::sync::Mutex<Connection>>, ProtocolError> {
+    let legacy = Connection::open(legacy_path).map_err(storage)?;
+    legacy
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS ceremony_sessions (
+                ceremony_id TEXT PRIMARY KEY,
+                operation_id TEXT NOT NULL UNIQUE,
+                session_jcs TEXT NOT NULL
+            );",
+        )
+        .map_err(storage)?;
+    let database = journal.shared_connection();
+    {
+        let mut connection = database.lock().map_err(|_| {
+            protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                "ceremony database mutex poisoned",
+            )
+        })?;
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS ceremony_sessions (
+                    ceremony_id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL UNIQUE,
+                    session_jcs TEXT NOT NULL
+                );",
+            )
+            .map_err(storage)?;
+        migrate_legacy_ceremonies(&mut connection, &legacy, journal)?;
+    }
+    Ok(database)
+}
+
+fn migrate_legacy_ceremonies(
+    target: &mut Connection,
+    legacy: &Connection,
+    journal: &BrokerJournal,
+) -> Result<(), ProtocolError> {
+    let legacy_path: String = legacy
+        .query_row(
+            "SELECT file FROM pragma_database_list WHERE name='main'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    let legacy_session_count: i64 = legacy
+        .query_row("SELECT COUNT(*) FROM ceremony_sessions", [], |row| {
+            row.get(0)
+        })
+        .map_err(storage)?;
+    let target_path: String = target
+        .query_row(
+            "SELECT file FROM pragma_database_list WHERE name='main'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if legacy_path.is_empty() || legacy_path == target_path || legacy_session_count == 0 {
+        return Ok(());
+    }
+    target
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS broker_store_migrations (
+                source_kind TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                PRIMARY KEY(source_kind, source_path)
+            );",
+        )
+        .map_err(storage)?;
+    let migrated: bool = target
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM broker_store_migrations
+                WHERE source_kind='ceremony' AND source_path=?1
+            )",
+            [&legacy_path],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if migrated {
+        return Ok(());
+    }
+    target
+        .execute("ATTACH DATABASE ?1 AS ceremony_legacy", [&legacy_path])
+        .map_err(storage)?;
+    journal
+        .verify_before_external_mutation(target)
+        .map_err(storage)?;
+    let migration = (|| -> Result<(), ProtocolError> {
+        let transaction = target.transaction().map_err(storage)?;
+        transaction
+            .execute(
+                "INSERT INTO ceremony_sessions
+                 SELECT * FROM ceremony_legacy.ceremony_sessions",
+                [],
+            )
+            .map_err(storage)?;
+        transaction
+            .execute(
+                "INSERT INTO broker_store_migrations(source_kind, source_path)
+                 VALUES ('ceremony', ?1)",
+                [&legacy_path],
+            )
+            .map_err(storage)?;
+        journal
+            .append_external_audit(
+                &transaction,
+                "storage.ceremony_migrated",
+                &serde_json::json!({"legacy_path": legacy_path}),
+            )
+            .map_err(storage)?;
+        transaction.commit().map_err(storage)?;
+        Ok(())
+    })();
+    let detach = target.execute_batch("DETACH DATABASE ceremony_legacy;");
+    migration?;
+    detach.map_err(storage)?;
+    Ok(())
 }
 
 fn protocol(code: ProtocolErrorCode, message: impl Into<String>) -> ProtocolError {

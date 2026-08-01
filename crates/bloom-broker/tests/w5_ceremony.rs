@@ -2,6 +2,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode, header},
 };
+use bloom_audit_checkpoint::{AppendOutcome, CheckpointError, CheckpointSink};
 use bloom_broker::{
     authority::{
         AssuranceRegistry, BrokerAuthority, CanonicalWalletPolicy, canonical_policy_authority_diff,
@@ -19,14 +20,16 @@ use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer::{
     ceremony::SignerCeremonyService,
     clock::SignerClock,
-    engine::SignerEngine,
+    engine::{SignerAuditKeys, SignerEngine},
     hpke::{CUSTODY_OUTPUT_INFO, HpkeRecipient},
     registry::BackendRegistry,
     service::SignerRpcService,
 };
-use bloom_triad_local_transport::{EndpointQuota, LocalIdentity, PeerAcl};
+use bloom_triad_local_transport::{
+    BrokerSignerJournalExchange, EndpointQuota, LocalIdentity, PeerAcl,
+};
 use bloom_triad_protocol::*;
-use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use http_body_util::BodyExt as _;
 use sha2::Digest as _;
 use std::collections::{BTreeMap, HashSet};
@@ -35,7 +38,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::process::Command;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tower::ServiceExt as _;
 
@@ -58,6 +61,64 @@ impl AuditSigner for ServiceTestAuditSigner {
 
     fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String> {
         Ok(Base64UrlBytes::from_bytes(&sha2::Sha256::digest(message)))
+    }
+
+    fn verify(
+        &self,
+        key_id: &Token,
+        message: &[u8],
+        signature: &Base64UrlBytes,
+    ) -> Result<(), String> {
+        if key_id == &self.key_id()
+            && signature.decode() == sha2::Sha256::digest(message).as_slice()
+        {
+            Ok(())
+        } else {
+            Err("audit signature mismatch".into())
+        }
+    }
+}
+
+struct AcceptingCheckpointSink;
+
+impl CheckpointSink for AcceptingCheckpointSink {
+    fn append_peer_head(
+        &self,
+        _peer_head: &SignedJournalHead,
+    ) -> Result<AppendOutcome, CheckpointError> {
+        Ok(AppendOutcome::Appended)
+    }
+}
+
+struct SwitchableAuditSigner(Arc<AtomicBool>);
+
+struct TestSignerJournalExchange(Arc<SignerEngine>);
+
+impl BrokerSignerJournalExchange for TestSignerJournalExchange {
+    fn checkpoint_request_head(
+        &self,
+        _method: &Token,
+        _peer_head: &SignedJournalHead,
+    ) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+
+    fn local_journal_head(&self, _method: &Token) -> Result<(u64, Digest32), ProtocolError> {
+        self.0.verified_audit_head()
+    }
+}
+
+impl AuditSigner for SwitchableAuditSigner {
+    fn key_id(&self) -> Token {
+        Token::new("broker-audit-key").unwrap()
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String> {
+        if self.0.load(Ordering::SeqCst) {
+            Err("forced ceremony audit failure".into())
+        } else {
+            Ok(Base64UrlBytes::from_bytes(&sha2::Sha256::digest(message)))
+        }
     }
 
     fn verify(
@@ -119,6 +180,14 @@ fn scoped_petal_key_browser_flow_never_collects_a_namespace_grant() {
 
 fn digest(byte: &str) -> Digest32 {
     Digest32::new(byte.repeat(32)).unwrap()
+}
+
+fn signer_audit_keys() -> SignerAuditKeys {
+    SignerAuditKeys {
+        current_key_id: Token::new("signer-audit-key").unwrap(),
+        current_signing_key: SigningKey::from_bytes(&[14; 32]),
+        historical_verifying_keys: BTreeMap::new(),
+    }
 }
 
 fn operation(byte: &str) -> OperationId {
@@ -822,6 +891,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             SigningKey::from_bytes(&[6; 32]).verifying_key(),
             Token::new("signer-revocation-key").unwrap(),
             SigningKey::from_bytes(&[4; 32]),
+            signer_audit_keys(),
             registry,
         )
         .unwrap(),
@@ -847,6 +917,11 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let signer_identity = local_identity("bloom-signer", [0x32; 32], "32");
     let signer_acl = peer_acl(&signer_identity, effective_uid);
     let broker_acl = peer_acl(&broker_identity, effective_uid);
+    let broker_journal_path = directory.path().join("broker-journal.sqlite");
+    let broker_authority_path = directory.path().join("broker-authority.sqlite");
+    let journal = Arc::new(
+        BrokerJournal::open(&broker_journal_path, Arc::new(ServiceTestAuditSigner)).unwrap(),
+    );
     let signer_rpc = Arc::new(SignerRpcService::new(
         signer_engine.clone(),
         signer_ceremony.clone(),
@@ -865,31 +940,32 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let signer_server = tokio::spawn({
         let signer_identity = signer_identity.clone();
         let signer_rpc = signer_rpc.clone();
+        let signer_journals = TestSignerJournalExchange(signer_engine.clone());
         async move {
             let quota = EndpointQuota::new(16, 1_000, 60_000, 1_000, 60_000).unwrap();
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                bloom_triad_local_transport::dispatch_broker_signer_connection(
+                bloom_triad_local_transport::dispatch_broker_signer_connection_with_journal_heads(
                     &mut stream,
                     &signer_identity,
                     &broker_acl,
                     &quota,
                     signer_rpc.as_ref(),
+                    &signer_journals,
                 )
                 .await
                 .unwrap();
             }
         }
     });
-    let signer_client =
-        BrokerSignerClient::connect_unix(&socket_path, broker_identity.clone(), signer_acl.clone())
-            .unwrap();
-
-    let broker_journal_path = directory.path().join("broker-journal.sqlite");
-    let broker_authority_path = directory.path().join("broker-authority.sqlite");
-    let journal = Arc::new(
-        BrokerJournal::open(&broker_journal_path, Arc::new(ServiceTestAuditSigner)).unwrap(),
-    );
+    let signer_client = BrokerSignerClient::connect_unix(
+        &socket_path,
+        broker_identity.clone(),
+        signer_acl.clone(),
+        journal.clone(),
+        Arc::new(AcceptingCheckpointSink),
+    )
+    .unwrap();
     let authority = Arc::new(
         BrokerAuthority::open(
             &broker_authority_path,
@@ -910,6 +986,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         Arc::new(signer_client.clone()),
         Token::new("broker-app-1").unwrap(),
         SigningKey::from_bytes(&[7; 32]),
+        journal.clone(),
     )
     .unwrap();
     let broker = BrokerRpcService::new(
@@ -1062,6 +1139,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let restarted_ceremony = CeremonyBroker::open(
         directory.path().join("ceremony.sqlite"),
         Arc::new(signer_client.clone()),
+        journal.clone(),
     )
     .unwrap();
     restarted_ceremony
@@ -1241,6 +1319,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         operation_id: update.operation_id,
         ceremony_receipt: completed,
     };
+    let expected_policy_ceremony_receipt_digest =
+        commit_request.ceremony_receipt.receipt_digest.clone();
     let committed = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::PolicyCommitUpdate(commit_request.clone()),
@@ -1849,6 +1929,29 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     };
     assert_eq!(first_result.signatures.len(), 1);
     assert_eq!(first_result.signatures[0].bytes.decode().len(), 65);
+    let validation_receipt = journal
+        .validation_receipt(&first_sign.operation_id)
+        .unwrap()
+        .expect("production sign flow must retain its signed validation receipt");
+    assert_eq!(validation_receipt.approval_id, first_sign.approval_id);
+    assert_eq!(
+        validation_receipt.operation_digest,
+        first_result.operation_digest
+    );
+    assert!(!validation_receipt.reservation_ids.is_empty());
+    assert_eq!(validation_receipt.broker_key_id.as_str(), "broker-app-1");
+    let validation_signature: [u8; 64] = validation_receipt
+        .broker_signature
+        .decode()
+        .try_into()
+        .unwrap();
+    SigningKey::from_bytes(&[7; 32])
+        .verifying_key()
+        .verify(
+            &validation_receipt.signature_message().unwrap(),
+            &ed25519_dalek::Signature::from_bytes(&validation_signature),
+        )
+        .unwrap();
 
     // A consumed operation cannot issue another signature; a changed replay,
     // cross-Petal provenance, and first-party provenance fail closed too.
@@ -1947,6 +2050,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             SigningKey::from_bytes(&[6; 32]).verifying_key(),
             Token::new("signer-revocation-key").unwrap(),
             SigningKey::from_bytes(&[4; 32]),
+            signer_audit_keys(),
             Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap()),
         )
         .unwrap(),
@@ -1981,31 +2085,35 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let restarted_signer_server = tokio::spawn({
         let signer_identity = signer_identity.clone();
         let signer_rpc = restarted_signer_rpc;
+        let signer_journals = TestSignerJournalExchange(restarted_signer_engine.clone());
         async move {
             let quota = EndpointQuota::new(16, 1_000, 60_000, 1_000, 60_000).unwrap();
             loop {
                 let (mut stream, _) = restarted_signer_listener.accept().await.unwrap();
-                bloom_triad_local_transport::dispatch_broker_signer_connection(
+                bloom_triad_local_transport::dispatch_broker_signer_connection_with_journal_heads(
                     &mut stream,
                     &signer_identity,
                     &restarted_broker_acl,
                     &quota,
                     signer_rpc.as_ref(),
+                    &signer_journals,
                 )
                 .await
                 .unwrap();
             }
         }
     });
+    let restarted_journal = Arc::new(
+        BrokerJournal::open(&broker_journal_path, Arc::new(ServiceTestAuditSigner)).unwrap(),
+    );
     let restarted_signer_client = BrokerSignerClient::connect_unix(
         &restarted_signer_socket,
         broker_identity.clone(),
         signer_acl.clone(),
+        restarted_journal.clone(),
+        Arc::new(AcceptingCheckpointSink),
     )
     .unwrap();
-    let restarted_journal = Arc::new(
-        BrokerJournal::open(&broker_journal_path, Arc::new(ServiceTestAuditSigner)).unwrap(),
-    );
     let policy_key_bytes: [u8; 32] = committed
         .committed
         .policy_verifying_key
@@ -2040,7 +2148,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         restarted_journal.clone(),
         Arc::new(
             BrokerClock::new(
-                restarted_journal,
+                restarted_journal.clone(),
                 test_time_source(),
                 broker_identity.boot_epoch.clone(),
             )
@@ -2051,6 +2159,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             Arc::new(restarted_signer_client.clone()),
             Token::new("broker-app-1").unwrap(),
             SigningKey::from_bytes(&[7; 32]),
+            restarted_journal.clone(),
         )
         .unwrap(),
         restarted_signer_client,
@@ -2205,6 +2314,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         CeremonyBroker::open(
             directory.path().join("restarted-ceremony.sqlite"),
             Arc::new(signer_client.clone()),
+            journal.clone(),
         )
         .unwrap(),
         signer_client,
@@ -2237,6 +2347,51 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             .get(),
         2
     );
+
+    let policy_install = journal
+        .audit_entries()
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|entry| {
+            entry.event_type == "policy.installed"
+                && serde_json::from_str::<serde_json::Value>(&entry.payload_jcs)
+                    .is_ok_and(|payload| payload["version"] == serde_json::json!("2"))
+        })
+        .expect("policy commit must have a correlated install audit record");
+    let policy_install: serde_json::Value =
+        serde_json::from_str(&policy_install.payload_jcs).unwrap();
+    assert_eq!(
+        policy_install["operation_id"],
+        serde_json::json!(operation("e4"))
+    );
+    assert_eq!(
+        policy_install["ceremony_receipt_digest"],
+        serde_json::json!(expected_policy_ceremony_receipt_digest)
+    );
+    assert!(!policy_install["validation_receipt_digest"].is_null());
+    assert!(!policy_install["commit_receipt_digest"].is_null());
+
+    journal.latch_audit_degradation();
+    let read_policy = MachineBrokerService::dispatch(
+        &restarted_broker,
+        MachineBrokerRequest::PolicyRead(WalletRequest {
+            wallet_id: wallet_id.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(read_policy, MachineBrokerResponse::PolicyRead(_)));
+    let read_wallet = MachineBrokerService::dispatch(
+        &restarted_broker,
+        MachineBrokerRequest::WalletGetPublic(WalletRequest { wallet_id }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_wallet,
+        MachineBrokerResponse::WalletGetPublic(_)
+    ));
     restarted_signer_server.abort();
     signer_server.abort();
 }
@@ -2748,11 +2903,301 @@ async fn inherited_listener_handover_rejects_every_noncanonical_socket() {
 }
 
 #[test]
+fn ac18_forced_ceremony_audit_write_failure_rolls_back_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let fail = Arc::new(AtomicBool::new(false));
+    let journal = Arc::new(
+        BrokerJournal::open(
+            directory.path().join("journal.sqlite"),
+            Arc::new(SwitchableAuditSigner(fail.clone())),
+        )
+        .unwrap(),
+    );
+    let signer = Arc::new(MockSigner::new());
+    let broker = CeremonyBroker::open_with_manifest_signer_audited(
+        directory.path().join("ceremonies.sqlite"),
+        signer,
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[7; 32]),
+        journal.clone(),
+    )
+    .unwrap();
+    let operation_id = operation("30");
+    let request = CustodyPrepareRequest {
+        ceremony_kind: CeremonyKind::WalletDelete,
+        custody_operation_id: operation_id.clone(),
+        wallet_id: Some(Token::new("wallet-audit-rollback").unwrap()),
+        key_ref: None,
+        exact_terms_digest: digest("33"),
+        expected_input_class: Token::new("policy-document").unwrap(),
+        browser_output_recipient_key: None,
+        petal_key_scope: None,
+    };
+
+    fail.store(true, Ordering::SeqCst);
+    assert!(broker.prepare_custody(request.clone(), 40_000).is_err());
+    assert_eq!(broker.status(&operation_id), None);
+    assert!(journal.audit_entries().unwrap().is_empty());
+
+    fail.store(false, Ordering::SeqCst);
+    broker.prepare_custody(request, 40_001).unwrap();
+    assert_eq!(
+        broker.status(&operation_id),
+        Some(CeremonyState::AwaitingUser)
+    );
+    assert_eq!(journal.audit_entries().unwrap().len(), 1);
+
+    fail.store(true, Ordering::SeqCst);
+    assert!(broker.cancel(&operation_id, 40_002).is_err());
+    assert_eq!(
+        broker.status(&operation_id),
+        Some(CeremonyState::AwaitingUser),
+        "a failed session+journal transaction must not publish cancellation in memory"
+    );
+    assert_eq!(journal.audit_entries().unwrap().len(), 1);
+}
+
+#[test]
+fn ac18_populated_ceremony_migration_is_atomic_idempotent_and_retains_source() {
+    let directory = tempfile::tempdir().unwrap();
+    let legacy_path = directory.path().join("legacy-ceremony.sqlite");
+    let legacy_journal =
+        Arc::new(BrokerJournal::open(&legacy_path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let operation_id = operation("39");
+    let legacy_broker = CeremonyBroker::open_with_manifest_signer_audited(
+        &legacy_path,
+        Arc::new(MockSigner::new()),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[7; 32]),
+        legacy_journal,
+    )
+    .unwrap();
+    legacy_broker
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::WalletDelete,
+                custody_operation_id: operation_id.clone(),
+                wallet_id: Some(Token::new("wallet-migrated").unwrap()),
+                key_ref: None,
+                exact_terms_digest: digest("39"),
+                expected_input_class: Token::new("policy-document").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+            },
+            50_000,
+        )
+        .unwrap();
+    legacy_broker.cancel(&operation_id, 50_001).unwrap();
+    drop(legacy_broker);
+    let source = rusqlite::Connection::open(&legacy_path).unwrap();
+    let source_jcs: String = source
+        .query_row(
+            "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
+            [operation_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(source);
+
+    let failed_target_path = directory.path().join("failed-target-journal.sqlite");
+    let fail = Arc::new(AtomicBool::new(false));
+    let failed_journal = Arc::new(
+        BrokerJournal::open(
+            &failed_target_path,
+            Arc::new(SwitchableAuditSigner(fail.clone())),
+        )
+        .unwrap(),
+    );
+    fail.store(true, Ordering::SeqCst);
+    assert!(
+        CeremonyBroker::open(
+            &legacy_path,
+            Arc::new(MockSigner::new()),
+            failed_journal.clone(),
+        )
+        .is_err()
+    );
+    let failed_target = rusqlite::Connection::open(&failed_target_path).unwrap();
+    assert_eq!(
+        failed_target
+            .query_row("SELECT COUNT(*) FROM ceremony_sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        failed_target
+            .query_row("SELECT COUNT(*) FROM broker_store_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    assert!(failed_journal.audit_entries().unwrap().is_empty());
+    let source = rusqlite::Connection::open(&legacy_path).unwrap();
+    assert_eq!(
+        source
+            .query_row(
+                "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        source_jcs
+    );
+    drop(source);
+    drop(failed_target);
+    drop(failed_journal);
+
+    let target_path = directory.path().join("target-journal.sqlite");
+    let target_journal =
+        Arc::new(BrokerJournal::open(&target_path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let migrated = CeremonyBroker::open(
+        &legacy_path,
+        Arc::new(MockSigner::new()),
+        target_journal.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        migrated.status(&operation_id),
+        Some(CeremonyState::Cancelled)
+    );
+    assert_eq!(
+        target_journal
+            .audit_entries()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.event_type == "storage.ceremony_migrated")
+            .count(),
+        1
+    );
+    drop(migrated);
+    let reopened = CeremonyBroker::open(
+        &legacy_path,
+        Arc::new(MockSigner::new()),
+        target_journal.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.status(&operation_id),
+        Some(CeremonyState::Cancelled)
+    );
+    assert_eq!(
+        target_journal
+            .audit_entries()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.event_type == "storage.ceremony_migrated")
+            .count(),
+        1
+    );
+    let source = rusqlite::Connection::open(&legacy_path).unwrap();
+    assert_eq!(
+        source
+            .query_row(
+                "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        source_jcs
+    );
+    drop(source);
+
+    let conflict_path = directory.path().join("conflict-ceremony.sqlite");
+    std::fs::copy(&legacy_path, &conflict_path).unwrap();
+    assert!(
+        CeremonyBroker::open(
+            &conflict_path,
+            Arc::new(MockSigner::new()),
+            target_journal.clone(),
+        )
+        .is_err()
+    );
+    let target = rusqlite::Connection::open(&target_path).unwrap();
+    let marker: i64 = target
+        .query_row(
+            "SELECT COUNT(*) FROM broker_store_migrations WHERE source_kind='ceremony' AND source_path=?1",
+            [conflict_path.to_string_lossy().as_ref()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(marker, 0);
+}
+
+#[test]
+fn ac18_ceremony_status_survives_latched_audit_tamper_while_new_sessions_fail() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("journal.sqlite");
+    let ceremony_path = directory.path().join("ceremonies.sqlite");
+    let journal =
+        Arc::new(BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let broker = CeremonyBroker::open_with_manifest_signer_audited(
+        &ceremony_path,
+        Arc::new(MockSigner::new()),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[7; 32]),
+        journal,
+    )
+    .unwrap();
+    let existing_operation = operation("39");
+    prepare(
+        &broker,
+        existing_operation.clone(),
+        Some(Token::new("wallet-audit-status").unwrap()),
+        41_000,
+    );
+    drop(broker);
+
+    rusqlite::Connection::open(&journal_path)
+        .unwrap()
+        .execute(
+            "UPDATE audit_chain SET payload_jcs='{}' WHERE sequence=0",
+            [],
+        )
+        .unwrap();
+    let degraded_journal =
+        Arc::new(BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    assert!(degraded_journal.audit_degraded());
+    let restarted = CeremonyBroker::open_with_manifest_signer_audited(
+        &ceremony_path,
+        Arc::new(MockSigner::new()),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[7; 32]),
+        degraded_journal,
+    )
+    .unwrap();
+    assert_eq!(
+        restarted.status(&existing_operation),
+        Some(CeremonyState::AwaitingUser)
+    );
+    assert!(
+        restarted
+            .prepare_custody(
+                CustodyPrepareRequest {
+                    ceremony_kind: CeremonyKind::WalletDelete,
+                    custody_operation_id: operation("3a"),
+                    wallet_id: Some(Token::new("wallet-audit-new").unwrap()),
+                    key_ref: None,
+                    exact_terms_digest: digest("33"),
+                    expected_input_class: Token::new("policy-document").unwrap(),
+                    browser_output_recipient_key: None,
+                    petal_key_scope: None,
+                },
+                41_001,
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn restart_expires_nonterminal_session_and_persists_only_token_hash() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("ceremonies.sqlite");
     let signer = Arc::new(MockSigner::new());
-    let broker = CeremonyBroker::open(&path, signer.clone()).unwrap();
+    let journal = Arc::new(BrokerJournal::open(&path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let broker = CeremonyBroker::open(&path, signer.clone(), journal.clone()).unwrap();
     let prepared = prepare(
         &broker,
         operation("31"),
@@ -2770,7 +3215,7 @@ fn restart_expires_nonterminal_session_and_persists_only_token_hash() {
         "launch token plaintext must not be durable"
     );
 
-    let restarted = CeremonyBroker::open(&path, signer.clone()).unwrap();
+    let restarted = CeremonyBroker::open(&path, signer.clone(), journal).unwrap();
     assert_eq!(signer.cancellations.load(Ordering::SeqCst), 1);
     assert_eq!(
         restarted.status(&operation("31")),
@@ -2874,6 +3319,7 @@ fn real_signer_generated_wallet_ids_still_count_as_anonymous_registration_attemp
             SigningKey::from_bytes(&[6; 32]).verifying_key(),
             Token::new("signer-revocation-key").unwrap(),
             SigningKey::from_bytes(&[4; 32]),
+            signer_audit_keys(),
             registry,
         )
         .unwrap(),
@@ -2939,6 +3385,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
             SigningKey::from_bytes(&[6; 32]).verifying_key(),
             Token::new("signer-revocation-key").unwrap(),
             SigningKey::from_bytes(&[4; 32]),
+            signer_audit_keys(),
             registry,
         )
         .unwrap(),

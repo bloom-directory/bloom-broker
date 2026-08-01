@@ -81,6 +81,7 @@ pub struct AuthorizationDecision {
     pub ordered_hashes: Vec<Digest32>,
     pub reserved_values: BTreeMap<String, bloom_triad_protocol::DecimalU256>,
     pub effective_assurance: Option<ClaimAssurance>,
+    pub reservation_ids: Vec<Digest32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,7 +204,7 @@ impl AssuranceRegistry {
 }
 
 pub struct BrokerAuthority {
-    connection: Mutex<Connection>,
+    connection: Arc<Mutex<Connection>>,
     authorization_barrier: Mutex<()>,
     journal: Arc<BrokerJournal>,
     policy_keys: Mutex<BTreeMap<String, (Token, VerifyingKey)>>,
@@ -214,6 +215,14 @@ pub struct BrokerAuthority {
     revocation_key_id: Token,
     revocation_key: VerifyingKey,
     assurance: AssuranceRegistry,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PolicyInstallCorrelation {
+    pub operation_id: Option<OperationId>,
+    pub ceremony_receipt_digest: Option<Digest32>,
+    pub validation_receipt_digest: Option<Digest32>,
+    pub commit_receipt_digest: Option<Digest32>,
 }
 
 impl BrokerAuthority {
@@ -272,7 +281,7 @@ impl BrokerAuthority {
 
     #[allow(clippy::too_many_arguments)]
     fn from_connection(
-        connection: Connection,
+        legacy_connection: Connection,
         journal: Arc<BrokerJournal>,
         policy_keys: BTreeMap<String, (Token, VerifyingKey)>,
         installer_key_id: Token,
@@ -283,10 +292,14 @@ impl BrokerAuthority {
         revocation_key: VerifyingKey,
         assurance: AssuranceRegistry,
     ) -> Result<Self, AuthorityError> {
-        connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.execute_batch(
-            "
+        let connection = journal.shared_connection();
+        {
+            let mut connection = connection
+                .lock()
+                .map_err(|_| AuthorityError::Storage("authority mutex poisoned".into()))?;
+            connection.pragma_update(None, "foreign_keys", "ON")?;
+            connection.execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS policies (
                 wallet_id TEXT PRIMARY KEY,
                 version TEXT NOT NULL,
@@ -328,9 +341,14 @@ impl BrokerAuthority {
                 custody_receipt_digest TEXT NOT NULL
             );
             ",
-        )?;
+            )?;
+            migrate_legacy_authority(&mut connection, &legacy_connection, &journal)?;
+        }
         let mut policy_keys = policy_keys;
         {
+            let connection = connection
+                .lock()
+                .map_err(|_| AuthorityError::Storage("authority mutex poisoned".into()))?;
             let mut statement =
                 connection.prepare("SELECT snapshot_jcs FROM policies ORDER BY wallet_id")?;
             let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
@@ -341,7 +359,7 @@ impl BrokerAuthority {
             }
         }
         Ok(Self {
-            connection: Mutex::new(connection),
+            connection,
             authorization_barrier: Mutex::new(()),
             journal,
             policy_keys: Mutex::new(policy_keys),
@@ -361,7 +379,16 @@ impl BrokerAuthority {
 
     pub fn install_policy(&self, snapshot: &SignedPolicySnapshot) -> Result<(), AuthorityError> {
         let _barrier = self.lock_authorization_barrier()?;
-        self.install_policy_locked(snapshot)
+        self.install_policy_locked(snapshot, &PolicyInstallCorrelation::default())
+    }
+
+    pub fn install_policy_with_correlation(
+        &self,
+        snapshot: &SignedPolicySnapshot,
+        correlation: &PolicyInstallCorrelation,
+    ) -> Result<(), AuthorityError> {
+        let _barrier = self.lock_authorization_barrier()?;
+        self.install_policy_locked(snapshot, correlation)
     }
 
     /// Enrolls the per-wallet policy verification key only from the signed
@@ -370,6 +397,14 @@ impl BrokerAuthority {
     pub fn install_initial_policy(
         &self,
         snapshot: &SignedPolicySnapshot,
+    ) -> Result<(), AuthorityError> {
+        self.install_initial_policy_correlated(snapshot, &PolicyInstallCorrelation::default())
+    }
+
+    fn install_initial_policy_correlated(
+        &self,
+        snapshot: &SignedPolicySnapshot,
+        correlation: &PolicyInstallCorrelation,
     ) -> Result<(), AuthorityError> {
         let _barrier = self.lock_authorization_barrier()?;
         if snapshot.version.get() != 1 {
@@ -385,25 +420,30 @@ impl BrokerAuthority {
         let mut candidate_keys = keys.clone();
         enroll_policy_key_from_snapshot(snapshot, &mut candidate_keys)?;
         let policy = verify_policy_snapshot(snapshot, &candidate_keys)?;
-        self.persist_verified_policy(snapshot, &policy)?;
+        self.persist_verified_policy(snapshot, &policy, correlation)?;
         *keys = candidate_keys;
         Ok(())
     }
 
-    fn install_policy_locked(&self, snapshot: &SignedPolicySnapshot) -> Result<(), AuthorityError> {
+    fn install_policy_locked(
+        &self,
+        snapshot: &SignedPolicySnapshot,
+        correlation: &PolicyInstallCorrelation,
+    ) -> Result<(), AuthorityError> {
         let keys = self
             .policy_keys
             .lock()
             .map_err(|_| storage("policy key registry lock poisoned"))?;
         let policy = verify_policy_snapshot(snapshot, &keys)?;
         drop(keys);
-        self.persist_verified_policy(snapshot, &policy)
+        self.persist_verified_policy(snapshot, &policy, correlation)
     }
 
     fn persist_verified_policy(
         &self,
         snapshot: &SignedPolicySnapshot,
         policy: &CanonicalWalletPolicy,
+        correlation: &PolicyInstallCorrelation,
     ) -> Result<(), AuthorityError> {
         for required in &policy.required_verifiers {
             if !self.assurance.verifiers.contains_key(&(
@@ -419,6 +459,26 @@ impl BrokerAuthority {
         let snapshot_jcs = serde_jcs::to_string(snapshot).map_err(storage)?;
         let policy_jcs = serde_jcs::to_string(&policy).map_err(storage)?;
         let mut connection = self.lock()?;
+        let exact: Option<(u64, String)> = connection
+            .query_row(
+                "SELECT version, snapshot_jcs FROM policies WHERE wallet_id = ?1",
+                [snapshot.wallet_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(|(version, stored)| {
+                version
+                    .parse()
+                    .map(|version| (version, stored))
+                    .map_err(storage)
+            })
+            .transpose()?;
+        if exact.as_ref().is_some_and(|(version, stored)| {
+            *version == snapshot.version.get() && stored == &snapshot_jcs
+        }) {
+            return Ok(());
+        }
+        self.journal.verify_before_external_mutation(&connection)?;
         let transaction = connection.transaction()?;
         let existing: Option<(u64, String)> = transaction
             .query_row(
@@ -464,7 +524,23 @@ impl BrokerAuthority {
              VALUES (?1, '0', 1)",
             [snapshot.wallet_id.as_str()],
         )?;
+        self.journal.append_external_audit(
+            &transaction,
+            "policy.installed",
+            &serde_json::json!({
+                "wallet_id": snapshot.wallet_id,
+                "version": snapshot.version,
+                "policy_digest": snapshot.policy_digest,
+                "policy_signing_key_id": snapshot.policy_signing_key_id,
+                "operation_id": correlation.operation_id,
+                "ceremony_receipt_digest": correlation.ceremony_receipt_digest,
+                "validation_receipt_digest": correlation.validation_receipt_digest,
+                "commit_receipt_digest": correlation.commit_receipt_digest
+            }),
+        )?;
         transaction.commit()?;
+        drop(connection);
+        self.journal.checkpoint_committed_head()?;
         Ok(())
     }
 
@@ -510,6 +586,47 @@ impl BrokerAuthority {
                 )
             })?;
 
+        if receipt.ceremony_kind == bloom_triad_protocol::CeremonyKind::WalletDelete {
+            let wallet_id = receipt.wallet_id.as_ref().ok_or_else(|| {
+                denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "wallet deletion receipt omitted its wallet identity",
+                )
+            })?;
+            if !receipt.public_key_refs.is_empty()
+                || !receipt.credential_summaries.is_empty()
+                || receipt.initial_policy.is_some()
+            {
+                return Err(denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "wallet deletion receipt retained public custody projections",
+                ));
+            }
+            let mut connection = self.lock()?;
+            self.journal.verify_before_external_mutation(&connection)?;
+            let transaction = connection.transaction()?;
+            let removed = transaction.execute(
+                "DELETE FROM policies WHERE wallet_id = ?1",
+                [wallet_id.as_str()],
+            )?;
+            if removed != 0 {
+                self.journal.append_external_audit(
+                    &transaction,
+                    "wallet.projection_deleted",
+                    &serde_json::json!({
+                        "wallet_id": wallet_id,
+                        "custody_operation_id": receipt.custody_operation_id,
+                        "receipt_digest": receipt.receipt_digest,
+                        "observed_at_ms": now_ms.to_string()
+                    }),
+                )?;
+            }
+            transaction.commit()?;
+            drop(connection);
+            self.journal.checkpoint_committed_head()?;
+            return Ok(());
+        }
+
         if !matches!(
             receipt.ceremony_kind,
             bloom_triad_protocol::CeremonyKind::WalletRegistration
@@ -538,7 +655,15 @@ impl BrokerAuthority {
                 "registration receipt wallet differs from its initial policy",
             ));
         }
-        self.install_initial_policy(snapshot)
+        self.install_initial_policy_correlated(
+            snapshot,
+            &PolicyInstallCorrelation {
+                operation_id: Some(receipt.custody_operation_id.clone()),
+                ceremony_receipt_digest: Some(receipt.receipt_digest.clone()),
+                validation_receipt_digest: None,
+                commit_receipt_digest: None,
+            },
+        )
     }
 
     /// Validate and durably freeze a Petal-scoped derivation before Broker
@@ -587,8 +712,10 @@ impl BrokerAuthority {
 
         let scope_digest = scope.digest().map_err(storage)?;
         let scope_jcs = serde_jcs::to_string(scope).map_err(storage)?;
-        let connection = self.lock()?;
-        let existing = connection
+        let mut connection = self.lock()?;
+        self.journal.verify_before_external_mutation(&connection)?;
+        let transaction = connection.transaction()?;
+        let existing = transaction
             .query_row(
                 "SELECT scope_digest, scope_jcs FROM pending_petal_key_scopes
                  WHERE custody_operation_id = ?1",
@@ -605,7 +732,7 @@ impl BrokerAuthority {
                 "custody operation is already bound to a different Petal key scope",
             ));
         }
-        connection.execute(
+        transaction.execute(
             "INSERT INTO pending_petal_key_scopes(
                 custody_operation_id, scope_digest, scope_jcs
              ) VALUES (?1, ?2, ?3)",
@@ -615,6 +742,17 @@ impl BrokerAuthority {
                 scope_jcs
             ],
         )?;
+        self.journal.append_external_audit(
+            &transaction,
+            "petal_key_scope.prepared",
+            &serde_json::json!({
+                "custody_operation_id": scope.custody_operation_id,
+                "scope_digest": scope_digest
+            }),
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.journal.checkpoint_committed_head()?;
         Ok(())
     }
 
@@ -623,8 +761,10 @@ impl BrokerAuthority {
         receipt: &CustodyResult,
         now_ms: u64,
     ) -> Result<(), AuthorityError> {
-        let connection = self.lock()?;
-        let pending = connection
+        let mut connection = self.lock()?;
+        self.journal.verify_before_external_mutation(&connection)?;
+        let transaction = connection.transaction()?;
+        let pending = transaction
             .query_row(
                 "SELECT scope_digest, scope_jcs FROM pending_petal_key_scopes
                  WHERE custody_operation_id = ?1",
@@ -656,7 +796,7 @@ impl BrokerAuthority {
                 )
             })?;
         let key_ref_jcs = serde_jcs::to_string(&receipt.public_key_refs[0]).map_err(storage)?;
-        let existing = connection
+        let existing = transaction
             .query_row(
                 "SELECT scope_digest, scope_jcs, custody_receipt_digest
                  FROM petal_key_scopes WHERE key_ref_jcs = ?1",
@@ -682,7 +822,7 @@ impl BrokerAuthority {
                 "derived KeyRef is already bound to different Petal authority",
             ));
         }
-        connection.execute(
+        transaction.execute(
             "INSERT INTO petal_key_scopes(
                 key_ref_jcs, scope_digest, scope_jcs, activated_at_ms,
                 expires_at_ms, custody_receipt_digest
@@ -696,6 +836,18 @@ impl BrokerAuthority {
                 receipt.receipt_digest.as_str()
             ],
         )?;
+        self.journal.append_external_audit(
+            &transaction,
+            "petal_key_scope.activated",
+            &serde_json::json!({
+                "custody_operation_id": receipt.custody_operation_id,
+                "scope_digest": scope_digest,
+                "custody_receipt_digest": receipt.receipt_digest
+            }),
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.journal.checkpoint_committed_head()?;
         Ok(())
     }
 
@@ -909,8 +1061,10 @@ impl BrokerAuthority {
         verify_provenance(record, &self.installer_key_id, &self.installer_key, &digest)?;
         let subject_jcs = serde_jcs::to_string(&record.subject).map_err(storage)?;
         let record_jcs = serde_jcs::to_string(record).map_err(storage)?;
-        let connection = self.lock()?;
-        connection.execute(
+        let mut connection = self.lock()?;
+        self.journal.verify_before_external_mutation(&connection)?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
             "INSERT INTO provenance_catalog(subject_jcs, record_digest, record_jcs)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(subject_jcs) DO UPDATE SET
@@ -918,6 +1072,14 @@ impl BrokerAuthority {
                 record_jcs=excluded.record_jcs",
             params![subject_jcs, digest.as_str(), record_jcs],
         )?;
+        self.journal.append_external_audit(
+            &transaction,
+            "provenance.installed",
+            &serde_json::json!({"record_digest": digest}),
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.journal.checkpoint_committed_head()?;
         Ok(digest)
     }
 
@@ -947,6 +1109,7 @@ impl BrokerAuthority {
         }
 
         let mut connection = self.lock()?;
+        self.journal.verify_before_external_mutation(&connection)?;
         let transaction = connection.transaction()?;
         transaction.execute("DELETE FROM provenance_catalog", [])?;
         for (subject_jcs, record_digest, record_jcs) in verified {
@@ -956,7 +1119,18 @@ impl BrokerAuthority {
                 params![subject_jcs, record_digest.as_str(), record_jcs],
             )?;
         }
+        self.journal.append_external_audit(
+            &transaction,
+            "provenance.synchronized",
+            &serde_json::json!({
+                "catalog_digest": Digest32::from_bytes(
+                    Sha256::digest(serde_jcs::to_vec(catalog).map_err(storage)?).into()
+                )
+            }),
+        )?;
         transaction.commit()?;
+        drop(connection);
+        self.journal.checkpoint_committed_head()?;
         Ok(())
     }
 
@@ -1454,12 +1628,25 @@ impl BrokerAuthority {
             ));
         }
         reservation?;
+        let reservation_id = Digest32::from_bytes(
+            Sha256::digest(
+                [
+                    b"bloom-broker-reservation/v1".as_slice(),
+                    input.request.approval_id.as_str().as_bytes(),
+                    input.request.operation_id.as_str().as_bytes(),
+                    input.request.operation_digest.as_str().as_bytes(),
+                ]
+                .concat(),
+            )
+            .into(),
+        );
         Ok(AuthorizationDecision {
             approval_id: input.request.approval_id.clone(),
             ordered_payload_digests: payload_digests,
             ordered_hashes,
             reserved_values: values,
             effective_assurance: assurance,
+            reservation_ids: vec![reservation_id],
         })
     }
 
@@ -1551,6 +1738,7 @@ impl BrokerAuthority {
             return Err(denied("QUOTA_INVALID", "quota bounds must be positive"));
         }
         let mut connection = self.lock()?;
+        self.journal.verify_before_external_mutation(&connection)?;
         let transaction = connection.transaction()?;
         let current: Option<(u64, u64)> = transaction
             .query_row(
@@ -1589,7 +1777,18 @@ impl BrokerAuthority {
                 mutations=excluded.mutations",
             params![principal, start.to_string(), next.to_string()],
         )?;
+        self.journal.append_external_audit(
+            &transaction,
+            "mutation_quota.consumed",
+            &serde_json::json!({
+                "principal": principal,
+                "window_started_ms": start,
+                "mutations": next
+            }),
+        )?;
         transaction.commit()?;
+        drop(connection);
+        self.journal.checkpoint_committed_head()?;
         Ok(())
     }
 
@@ -1669,31 +1868,52 @@ impl BrokerAuthority {
         let local = self.local_epoch(&state.wallet_id)?;
         let signer = state.wallet_revocation_epoch.get();
         if signer < local {
-            let connection = self.lock()?;
-            connection.execute(
-                "UPDATE wallet_epochs SET reconciled = 0 WHERE wallet_id = ?1",
-                [state.wallet_id.as_str()],
-            )?;
+            self.store_epoch_reconciliation(&state.wallet_id, local, false, "push_local")?;
             return Ok(EpochReconciliation::PushLocalEpoch);
         }
         if signer == local {
-            let connection = self.lock()?;
-            connection.execute(
-                "UPDATE wallet_epochs SET reconciled = 1 WHERE wallet_id = ?1",
-                [state.wallet_id.as_str()],
-            )?;
+            self.store_epoch_reconciliation(&state.wallet_id, local, true, "converged")?;
             return Ok(EpochReconciliation::Converged);
         }
-        let connection = self.lock()?;
-        connection.execute(
-            "INSERT INTO wallet_epochs(wallet_id, epoch, reconciled) VALUES (?1, ?2, 1)
-             ON CONFLICT(wallet_id) DO UPDATE SET
-                epoch=excluded.epoch, reconciled=excluded.reconciled",
-            params![state.wallet_id.as_str(), signer.to_string()],
-        )?;
-        drop(connection);
+        self.store_epoch_reconciliation(&state.wallet_id, signer, true, "adopt_signer")?;
         self.revoke_older_approvals(&state.wallet_id, signer)?;
         Ok(EpochReconciliation::AdoptedSignerEpoch)
+    }
+
+    fn store_epoch_reconciliation(
+        &self,
+        wallet_id: &Token,
+        epoch: u64,
+        reconciled: bool,
+        outcome: &str,
+    ) -> Result<(), AuthorityError> {
+        let mut connection = self.lock()?;
+        self.journal.verify_before_external_mutation(&connection)?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO wallet_epochs(wallet_id, epoch, reconciled) VALUES (?1, ?2, ?3)
+             ON CONFLICT(wallet_id) DO UPDATE SET
+                epoch=excluded.epoch, reconciled=excluded.reconciled",
+            params![
+                wallet_id.as_str(),
+                epoch.to_string(),
+                if reconciled { 1_i64 } else { 0_i64 }
+            ],
+        )?;
+        self.journal.append_external_audit(
+            &transaction,
+            "revocation.epoch_reconciled",
+            &serde_json::json!({
+                "wallet_id": wallet_id,
+                "epoch": epoch,
+                "reconciled": reconciled,
+                "outcome": outcome
+            }),
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.journal.checkpoint_committed_head()?;
+        Ok(())
     }
 
     fn store_signer_tombstones(
@@ -1702,6 +1922,7 @@ impl BrokerAuthority {
         tombstones: &[ApprovalTombstone],
     ) -> Result<(), AuthorityError> {
         let mut connection = self.lock()?;
+        self.journal.verify_before_external_mutation(&connection)?;
         let transaction = connection.transaction()?;
         let mut statement = transaction.prepare(
             "SELECT approval_id, tombstone_jcs FROM signer_approval_tombstones
@@ -1758,7 +1979,23 @@ impl BrokerAuthority {
                 ],
             )?;
         }
+        self.journal.append_external_audit(
+            &transaction,
+            "revocation.tombstones_reconciled",
+            &serde_json::json!({
+                "wallet_id": wallet_id,
+                "tombstones": tombstones
+                    .iter()
+                    .map(|tombstone| serde_json::json!({
+                        "approval_id": tombstone.approval_id,
+                        "operation_id": tombstone.operation_id
+                    }))
+                    .collect::<Vec<_>>()
+            }),
+        )?;
         transaction.commit()?;
+        drop(connection);
+        self.journal.checkpoint_committed_head()?;
         Ok(())
     }
 
@@ -1776,6 +2013,7 @@ impl BrokerAuthority {
             ));
         }
         let mut connection = self.lock()?;
+        self.journal.verify_before_external_mutation(&connection)?;
         let transaction = connection.transaction()?;
         let current: u64 = transaction
             .query_row(
@@ -1797,8 +2035,18 @@ impl BrokerAuthority {
             "UPDATE wallet_epochs SET epoch = ?2, reconciled = 0 WHERE wallet_id = ?1",
             params![wallet_id.as_str(), next_epoch.to_string()],
         )?;
+        self.journal.append_external_audit(
+            &transaction,
+            "revocation.epoch_advanced",
+            &serde_json::json!({
+                "wallet_id": wallet_id,
+                "from": expected_epoch,
+                "to": next_epoch
+            }),
+        )?;
         transaction.commit()?;
         drop(connection);
+        self.journal.checkpoint_committed_head()?;
         self.revoke_older_approvals(wallet_id, next_epoch)
     }
 
@@ -1941,6 +2189,90 @@ impl BrokerAuthority {
             .lock()
             .map_err(|_| AuthorityError::Storage("authorization barrier poisoned".into()))
     }
+}
+
+// AC-18 requires Broker authority effects and the Broker audit record to share
+// one SQLite commit. Older packages stored authority tables in a second file.
+// On first open, copy that file into the journal database and record the source
+// path so subsequent starts are idempotent. The legacy file is intentionally
+// left untouched as a rollback artifact; all subsequent reads and writes use
+// the consolidated database.
+fn migrate_legacy_authority(
+    target: &mut Connection,
+    legacy: &Connection,
+    journal: &BrokerJournal,
+) -> Result<(), AuthorityError> {
+    let legacy_has_schema: bool = legacy.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='policies')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !legacy_has_schema {
+        return Ok(());
+    }
+    let legacy_path: String = legacy.query_row(
+        "SELECT file FROM pragma_database_list WHERE name='main'",
+        [],
+        |row| row.get(0),
+    )?;
+    let target_path: String = target.query_row(
+        "SELECT file FROM pragma_database_list WHERE name='main'",
+        [],
+        |row| row.get(0),
+    )?;
+    if legacy_path.is_empty() || legacy_path == target_path {
+        return Ok(());
+    }
+    target.execute_batch(
+        "CREATE TABLE IF NOT EXISTS broker_store_migrations (
+            source_kind TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            PRIMARY KEY(source_kind, source_path)
+        );",
+    )?;
+    let migrated: bool = target.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM broker_store_migrations
+            WHERE source_kind='authority' AND source_path=?1
+        )",
+        [&legacy_path],
+        |row| row.get(0),
+    )?;
+    if migrated {
+        return Ok(());
+    }
+    target.execute("ATTACH DATABASE ?1 AS authority_legacy", [&legacy_path])?;
+    journal.verify_before_external_mutation(target)?;
+    let migration = (|| -> Result<(), AuthorityError> {
+        let transaction = target.transaction()?;
+        transaction.execute_batch(
+            "INSERT INTO policies SELECT * FROM authority_legacy.policies;
+             INSERT INTO wallet_epochs SELECT * FROM authority_legacy.wallet_epochs;
+             INSERT INTO provenance_catalog SELECT * FROM authority_legacy.provenance_catalog;
+             INSERT INTO mutation_quota SELECT * FROM authority_legacy.mutation_quota;
+             INSERT INTO signer_approval_tombstones
+                SELECT * FROM authority_legacy.signer_approval_tombstones;
+             INSERT INTO pending_petal_key_scopes
+                SELECT * FROM authority_legacy.pending_petal_key_scopes;
+             INSERT INTO petal_key_scopes SELECT * FROM authority_legacy.petal_key_scopes;",
+        )?;
+        transaction.execute(
+            "INSERT INTO broker_store_migrations(source_kind, source_path)
+             VALUES ('authority', ?1)",
+            [&legacy_path],
+        )?;
+        journal.append_external_audit(
+            &transaction,
+            "storage.authority_migrated",
+            &serde_json::json!({"legacy_path": legacy_path}),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })();
+    let detach = target.execute_batch("DETACH DATABASE authority_legacy;");
+    migration?;
+    detach?;
+    Ok(())
 }
 
 fn verify_policy_snapshot(

@@ -4,10 +4,11 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{Arc, mpsc},
     thread,
 };
 
+use bloom_audit_checkpoint::CheckpointSink;
 use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
 use bloom_triad_protocol::{
     Base64UrlBytes, BrokerSignerRequest, BrokerSignerResponse, CeremonyCompleteRequest,
@@ -16,10 +17,10 @@ use bloom_triad_protocol::{
     PolicyUpdateCeremonyPrepareRequest, ProtocolError, ProtocolErrorCode, SignerActivationReceipt,
     SignerCeremonyCompleteRequest, SignerCeremonyCompleteResponse, SignerCeremonyPrepareRequest,
     SignerCeremonyPrepareResponse, SignerCeremonyStatus, SignerPreparedApproval,
-    SignerPreparedCustody,
+    SignerPreparedCustody, TypedRequestMethod,
 };
 
-use crate::ceremony::CeremonySigner;
+use crate::{ceremony::CeremonySigner, journal::BrokerJournal};
 
 type Job = (
     BrokerSignerRequest,
@@ -38,12 +39,23 @@ impl BrokerSignerClient {
         socket_path: impl Into<PathBuf>,
         identity: LocalIdentity,
         signer: PeerAcl,
+        journal: Arc<BrokerJournal>,
+        checkpoints: Arc<dyn CheckpointSink>,
     ) -> Result<Self, ProtocolError> {
         let socket_path = socket_path.into();
         let (jobs, receiver) = mpsc::channel::<Job>();
         thread::Builder::new()
             .name("bloom-broker-signer-rpc".into())
-            .spawn(move || worker(receiver, socket_path, identity, signer))
+            .spawn(move || {
+                worker(
+                    receiver,
+                    socket_path,
+                    identity,
+                    signer,
+                    journal,
+                    checkpoints,
+                )
+            })
             .map_err(|error| unavailable(format!("start Signer RPC worker: {error}")))?;
         Ok(Self { jobs })
     }
@@ -52,6 +64,8 @@ impl BrokerSignerClient {
         socket_path: impl Into<PathBuf>,
         identity_path: impl AsRef<Path>,
         edge_manifest_path: impl AsRef<Path>,
+        journal: Arc<BrokerJournal>,
+        checkpoints: Arc<dyn CheckpointSink>,
     ) -> Result<Self, ProtocolError> {
         let (identity, manifest) = bloom_triad_local_transport::load_identity_and_manifest(
             identity_path.as_ref(),
@@ -65,7 +79,7 @@ impl BrokerSignerClient {
                 "edge manifest Signer service ID is invalid",
             ));
         }
-        Self::connect_unix(socket_path, identity, signer)
+        Self::connect_unix(socket_path, identity, signer, journal, checkpoints)
     }
 
     pub fn request(
@@ -97,6 +111,8 @@ fn worker(
     socket_path: PathBuf,
     identity: LocalIdentity,
     signer: PeerAcl,
+    journal: Arc<BrokerJournal>,
+    checkpoints: Arc<dyn CheckpointSink>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -105,16 +121,104 @@ fn worker(
         Ok(runtime) => runtime,
         Err(_) => return,
     };
+    let mut last_verified_head = match journal.verified_audit_head() {
+        Ok((sequence, head_hash)) => {
+            let head =
+                bloom_triad_local_transport::sign_journal_head(&identity, sequence, head_hash);
+            let _ = checkpoints.append_peer_head(&head);
+            Some(head)
+        }
+        Err(_) => checkpoints
+            .latest_peer_head(&identity.service_id)
+            .ok()
+            .flatten(),
+    };
     for (request, reply) in receiver {
+        let method = match request.method() {
+            Ok(method) => method,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                continue;
+            }
+        };
+        let sender_head = match journal.verified_audit_head() {
+            Ok((sequence, head_hash)) => {
+                let head =
+                    bloom_triad_local_transport::sign_journal_head(&identity, sequence, head_hash);
+                if let Err(error) = checkpoints.append_peer_head(&head) {
+                    journal.latch_audit_degradation();
+                    if !bloom_triad_local_transport::is_read_only_method(&method) {
+                        let _ = reply.send(Err(unavailable(format!(
+                            "persist Broker audit head before dispatch: {error}"
+                        ))));
+                        continue;
+                    }
+                } else {
+                    last_verified_head = Some(head.clone());
+                }
+                head
+            }
+            Err(_) if bloom_triad_local_transport::is_read_only_method(&method) => {
+                let Some(head) = last_verified_head.clone() else {
+                    let _ = reply.send(Err(unavailable(
+                        "no independently retained Broker audit head is available",
+                    )));
+                    continue;
+                };
+                head
+            }
+            Err(error) => {
+                let _ = reply.send(Err(journal_error(error)));
+                continue;
+            }
+        };
+        let journal_for_checkpoint = journal.clone();
+        let checkpoints_for_response = checkpoints.clone();
         let result = runtime.block_on(async {
             let mut stream = tokio::net::UnixStream::connect(&socket_path)
                 .await
                 .map_err(|error| unavailable(format!("connect Signer: {error}")))?;
-            bloom_triad_local_transport::call(&mut stream, &identity, &signer, request, 30_000)
-                .await
+            bloom_triad_local_transport::call_with_journal_head(
+                &mut stream,
+                &identity,
+                &signer,
+                request,
+                30_000,
+                sender_head,
+                move |peer_head| {
+                    persist_response_checkpoint(
+                        journal_for_checkpoint.as_ref(),
+                        checkpoints_for_response.as_ref(),
+                        &method,
+                        peer_head,
+                    )
+                },
+            )
+            .await
         });
         let _ = reply.send(result);
     }
+}
+
+fn persist_response_checkpoint(
+    journal: &BrokerJournal,
+    checkpoints: &dyn CheckpointSink,
+    method: &bloom_triad_protocol::Token,
+    peer_head: &bloom_triad_protocol::SignedJournalHead,
+) -> Result<(), ProtocolError> {
+    if let Err(error) = checkpoints.append_peer_head(peer_head) {
+        journal.latch_audit_degradation();
+        if !bloom_triad_local_transport::is_read_only_method(method) {
+            return Err(unavailable(format!(
+                "persist Signer audit checkpoint before publishing mutation result: {error}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn journal_error(error: crate::journal::JournalError) -> ProtocolError {
+    unavailable(format!("verify Broker audit head: {error}"))
 }
 
 impl CeremonySigner for BrokerSignerClient {
@@ -283,4 +387,278 @@ fn response_mismatch(method: &str) -> ProtocolError {
 
 fn unavailable(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::AuditSigner;
+    use bloom_audit_checkpoint::{AppendOutcome, CheckpointError};
+    use bloom_triad_local_transport::{
+        BrokerSignerJournalExchange, EndpointQuota,
+        dispatch_broker_signer_connection_with_journal_heads,
+    };
+    use bloom_triad_protocol::{
+        BootEpoch, BrokerSignerService, DecimalU64, Empty, Readiness, ReadinessState,
+        ServiceFuture, SignedJournalHead, Token,
+    };
+    use ed25519_dalek::SigningKey;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    struct TestAuditSigner;
+
+    impl AuditSigner for TestAuditSigner {
+        fn key_id(&self) -> Token {
+            Token::new("broker-audit-test").unwrap()
+        }
+
+        fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String> {
+            Ok(Base64UrlBytes::from_bytes(message))
+        }
+
+        fn verify(
+            &self,
+            key_id: &Token,
+            message: &[u8],
+            signature: &Base64UrlBytes,
+        ) -> Result<(), String> {
+            (key_id == &self.key_id() && signature.decode() == message)
+                .then_some(())
+                .ok_or_else(|| "test audit signature mismatch".into())
+        }
+    }
+
+    struct FailingCheckpointSink;
+
+    #[derive(Default)]
+    struct RetainingCheckpointSink(Mutex<BTreeMap<Token, SignedJournalHead>>);
+
+    impl CheckpointSink for RetainingCheckpointSink {
+        fn append_peer_head(
+            &self,
+            peer_head: &SignedJournalHead,
+        ) -> Result<AppendOutcome, CheckpointError> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(peer_head.service_id.clone(), peer_head.clone());
+            Ok(AppendOutcome::Appended)
+        }
+
+        fn latest_peer_head(
+            &self,
+            service_id: &Token,
+        ) -> Result<Option<SignedJournalHead>, CheckpointError> {
+            Ok(self.0.lock().unwrap().get(service_id).cloned())
+        }
+    }
+
+    struct ReadinessService;
+
+    impl BrokerSignerService for ReadinessService {
+        fn dispatch<'a>(
+            &'a self,
+            request: BrokerSignerRequest,
+        ) -> ServiceFuture<'a, BrokerSignerResponse> {
+            Box::pin(async move {
+                match request {
+                    BrokerSignerRequest::SignerReadiness(_) => {
+                        Ok(BrokerSignerResponse::SignerReadiness(Readiness {
+                            service_id: Token::new("bloom-signer").unwrap(),
+                            service_version: "test".into(),
+                            build_digest: Digest32::from_bytes([0x41; 32]),
+                            boot_epoch: BootEpoch::from_bytes([0x42; 16]),
+                            state: ReadinessState::Ready,
+                            conditions: Vec::new(),
+                        }))
+                    }
+                    _ => Err(ProtocolError::new(
+                        ProtocolErrorCode::UnknownMethod,
+                        "test supports only signer.readiness",
+                    )),
+                }
+            })
+        }
+    }
+
+    struct RecordingJournalExchange(Mutex<Vec<SignedJournalHead>>);
+
+    impl BrokerSignerJournalExchange for RecordingJournalExchange {
+        fn checkpoint_request_head(
+            &self,
+            _method: &Token,
+            peer_head: &SignedJournalHead,
+        ) -> Result<(), ProtocolError> {
+            self.0.lock().unwrap().push(peer_head.clone());
+            Ok(())
+        }
+
+        fn local_journal_head(&self, _method: &Token) -> Result<(u64, Digest32), ProtocolError> {
+            Ok((1, Digest32::from_bytes([0x43; 32])))
+        }
+    }
+
+    impl CheckpointSink for FailingCheckpointSink {
+        fn append_peer_head(
+            &self,
+            _peer_head: &SignedJournalHead,
+        ) -> Result<AppendOutcome, CheckpointError> {
+            Err(CheckpointError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "forced response checkpoint failure",
+            )))
+        }
+    }
+
+    fn peer_head() -> SignedJournalHead {
+        SignedJournalHead {
+            service_id: Token::new("bloom-signer").unwrap(),
+            sequence: DecimalU64::new(1),
+            head_hash: Digest32::from_bytes([1; 32]),
+            key_id: Token::new("signer-app").unwrap(),
+            signature: Base64UrlBytes::from_bytes(&[1; 64]),
+        }
+    }
+
+    #[test]
+    fn response_checkpoint_failure_latches_mutations_but_preserves_reads() {
+        let journal = BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).unwrap();
+        let sink = FailingCheckpointSink;
+        assert!(
+            persist_response_checkpoint(
+                &journal,
+                &sink,
+                &Token::new("signer.readiness").unwrap(),
+                &peer_head(),
+            )
+            .is_ok()
+        );
+        assert!(journal.audit_degraded());
+        assert_eq!(
+            persist_response_checkpoint(
+                &journal,
+                &sink,
+                &Token::new("signer.sign").unwrap(),
+                &peer_head(),
+            )
+            .unwrap_err()
+            .code,
+            ProtocolErrorCode::ServiceUnavailable
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn degraded_restart_uses_retained_nonzero_broker_head_for_real_rpc_read() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("signer.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let broker_identity = LocalIdentity {
+            service_id: Token::new("bloom-broker").unwrap(),
+            boot_epoch: BootEpoch::from_bytes([0x31; 16]),
+            application_key_id: Token::new("broker-app").unwrap(),
+            signing_key: Arc::new(SigningKey::from_bytes(&[0x32; 32])),
+        };
+        let signer_identity = LocalIdentity {
+            service_id: Token::new("bloom-signer").unwrap(),
+            boot_epoch: BootEpoch::from_bytes([0x33; 16]),
+            application_key_id: Token::new("signer-app").unwrap(),
+            signing_key: Arc::new(SigningKey::from_bytes(&[0x34; 32])),
+        };
+        let effective_uid = std::fs::metadata(directory.path()).unwrap().uid();
+        let broker_acl = PeerAcl {
+            effective_uid,
+            service_id: broker_identity.service_id.clone(),
+            boot_epoch: broker_identity.boot_epoch.clone(),
+            application_key_id: broker_identity.application_key_id.clone(),
+            application_public_key: broker_identity.signing_key.verifying_key().to_bytes(),
+        };
+        let signer_acl = PeerAcl {
+            effective_uid,
+            service_id: signer_identity.service_id.clone(),
+            boot_epoch: signer_identity.boot_epoch.clone(),
+            application_key_id: signer_identity.application_key_id.clone(),
+            application_public_key: signer_identity.signing_key.verifying_key().to_bytes(),
+        };
+        let observed = Arc::new(RecordingJournalExchange(Mutex::new(Vec::new())));
+        let server = tokio::spawn({
+            let observed = observed.clone();
+            let signer_identity = signer_identity.clone();
+            async move {
+                let quota = EndpointQuota::new(8, 100, 60_000, 100, 60_000).unwrap();
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    dispatch_broker_signer_connection_with_journal_heads(
+                        &mut stream,
+                        &signer_identity,
+                        &broker_acl,
+                        &quota,
+                        &ReadinessService,
+                        observed.as_ref(),
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        });
+
+        let journal_path = directory.path().join("broker.sqlite");
+        let journal =
+            Arc::new(BrokerJournal::open(&journal_path, Arc::new(TestAuditSigner)).unwrap());
+        journal
+            .create_approval(
+                &Digest32::from_bytes([0x35; 32]),
+                bloom_triad_protocol::ApprovalLifecycleState::Prepared,
+            )
+            .unwrap();
+        let checkpoints = Arc::new(RetainingCheckpointSink::default());
+        let client = BrokerSignerClient::connect_unix(
+            &socket_path,
+            broker_identity.clone(),
+            signer_acl.clone(),
+            journal,
+            checkpoints.clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            client
+                .request(BrokerSignerRequest::SignerReadiness(Empty {}))
+                .unwrap(),
+            BrokerSignerResponse::SignerReadiness(_)
+        ));
+        drop(client);
+
+        rusqlite::Connection::open(&journal_path)
+            .unwrap()
+            .execute(
+                "UPDATE audit_chain SET payload_jcs='{}' WHERE sequence=0",
+                [],
+            )
+            .unwrap();
+        let degraded =
+            Arc::new(BrokerJournal::open(&journal_path, Arc::new(TestAuditSigner)).unwrap());
+        assert!(degraded.audit_degraded());
+        let restarted = BrokerSignerClient::connect_unix(
+            &socket_path,
+            broker_identity,
+            signer_acl,
+            degraded,
+            checkpoints,
+        )
+        .unwrap();
+        assert!(matches!(
+            restarted
+                .request(BrokerSignerRequest::SignerReadiness(Empty {}))
+                .unwrap(),
+            BrokerSignerResponse::SignerReadiness(_)
+        ));
+        server.await.unwrap();
+        let heads = observed.0.lock().unwrap();
+        assert_eq!(heads.len(), 2);
+        assert!(heads[0].sequence.get() > 0);
+        assert_eq!(heads[1].sequence, heads[0].sequence);
+        assert_eq!(heads[1].head_hash, heads[0].head_hash);
+    }
 }

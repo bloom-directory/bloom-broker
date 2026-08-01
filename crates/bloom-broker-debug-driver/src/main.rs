@@ -2,19 +2,25 @@ use std::{
     env,
     io::{Read as _, Write as _},
     net::TcpStream,
+    path::PathBuf,
 };
 
 use bloom_broker_api::{
     Base64UrlBytes, CeremonyChallenge, CeremonyKind, CustodyHpkeAad, CustodySignerContribution,
-    Digest32, WebAuthnCeremonyProof,
+    Digest32, LocalPrfHpkeAad, SignerCeremonyContribution, WebAuthnCeremonyProof,
 };
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
+
+mod artifact_scan;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let command = args
         .next()
-        .ok_or("usage: bloom-broker-debug-driver complete URL SEED [options]")?;
+        .ok_or("usage: bloom-broker-debug-driver complete URL SEED [options] | assert-machine-secret-confinement --signer-db PATH --authenticator-seed SEED --artifact PATH [...]")?;
+    if command == "assert-machine-secret-confinement" {
+        return assert_machine_secret_confinement_command(args);
+    }
     if command != "complete" {
         return Err(format!("unsupported debug-driver command: {command}").into());
     }
@@ -49,8 +55,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token = ceremony_token(&url)?;
     let session = request("GET", "/api/session", token, None)?;
     let kind: CeremonyKind = serde_json::from_value(session["ceremony_kind"].clone())?;
-    let contribution: CustodySignerContribution =
-        serde_json::from_value(session["signer_contribution"].clone())?;
     let challenges = session["challenges"]
         .as_array()
         .ok_or("ceremony session omitted challenges")?
@@ -60,6 +64,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let public_binding_digest: Digest32 =
         serde_json::from_value(session["challenges"][0]["binding"]["exact_terms_digest"].clone())?;
     let authenticator = VirtualAuthenticator::from_seed(seed.as_bytes());
+
+    if kind == CeremonyKind::SealedApproval {
+        let contribution: SignerCeremonyContribution =
+            serde_json::from_value(session["signer_contribution"].clone())?;
+        let assertion = authenticator.assertion(&challenges[0].canonical_bytes()?, sign_count);
+        let aad = LocalPrfHpkeAad {
+            ceremony_id: contribution.ceremony_id.clone(),
+            signer_nonce: contribution.signer_nonce.clone(),
+            approval_id: serde_json::from_value(session["review_manifest"]["approval_id"].clone())?,
+            approval_digest: contribution.approval_digest.clone(),
+            review_manifest_digest: contribution.review_manifest_digest.clone(),
+            key_ref: contribution.key_ref.clone(),
+            allowed_crypto_suites: contribution.allowed_crypto_suites.clone(),
+            credential_id: assertion.credential_id.clone(),
+            activation_mode: contribution.activation_mode.clone(),
+            wallet_revocation_epoch: contribution.wallet_revocation_epoch.clone(),
+        }
+        .canonical_bytes()?;
+        let recipient = contribution
+            .ephemeral_encryption_public_key
+            .as_ref()
+            .ok_or("sealed approval omitted its local PRF encryption recipient")?;
+        let encrypted_input = seal_hpke(
+            recipient,
+            b"bloom-local-prf/v1",
+            &aad,
+            &authenticator.deterministic_prf(),
+        )?;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "proof": WebAuthnCeremonyProof::Assertion { assertion },
+            "encrypted_input": encrypted_input,
+            "public_binding_digest": public_binding_digest,
+        }))?;
+        let result = request(
+            "POST",
+            &format!("/api/session/{}/complete", contribution.ceremony_id),
+            token,
+            Some(&body),
+        )?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    let contribution: CustodySignerContribution =
+        serde_json::from_value(session["signer_contribution"].clone())?;
 
     let (proof, credential_id, plaintext) = match kind {
         CeremonyKind::WalletRegistration | CeremonyKind::WalletImport => {
@@ -167,6 +216,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(&body),
     )?;
     println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+fn assert_machine_secret_confinement_command(
+    mut args: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut signer_database: Option<PathBuf> = None;
+    let mut authenticator_seed = None;
+    let mut artifacts: Vec<PathBuf> = Vec::new();
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--signer-db" => {
+                signer_database = Some(args.next().ok_or("--signer-db requires a path")?.into());
+            }
+            "--authenticator-seed" => {
+                authenticator_seed =
+                    Some(args.next().ok_or("--authenticator-seed requires a value")?);
+            }
+            "--artifact" => {
+                artifacts.push(args.next().ok_or("--artifact requires a path")?.into());
+            }
+            _ => return Err(format!("unknown artifact-scanner option: {flag}").into()),
+        }
+    }
+    let signer_database = signer_database.ok_or("--signer-db is required")?;
+    let authenticator_seed = authenticator_seed.ok_or("--authenticator-seed is required")?;
+    let (file_count, byte_count) = artifact_scan::assert_machine_secret_confinement(
+        &signer_database,
+        authenticator_seed.as_bytes(),
+        &artifacts,
+    )?;
+    println!(
+        "MA-08 Machine secret-artifact confinement passed: scanned {file_count} stable files ({byte_count} bytes); deterministic credential PRF and verified-decryptable Signer key records were absent"
+    );
     Ok(())
 }
 

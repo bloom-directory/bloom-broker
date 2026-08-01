@@ -13,6 +13,7 @@ axum.workspace = true
 bloom-broker-api = { path = "../bloom-broker-api" }
 bloom-triad-protocol.workspace = true
 bloom-triad-local-transport.workspace = true
+bloom-audit-checkpoint.workspace = true
 bloom-service-activation.workspace = true
 bloom-trusted-time.workspace = true
 ed25519-dalek.workspace = true
@@ -37,3 +38,4 @@ futures = "0.3"
 http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+tokio = { workspace = true, features = ["test-util"] }

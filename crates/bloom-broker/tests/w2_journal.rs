@@ -1,24 +1,95 @@
+use bloom_audit_checkpoint::{AppendOutcome, CheckpointError, CheckpointSink};
 use bloom_broker::journal::{
     AuditSigner, BrokerJournal, BudgetLimits, ClockCondition, DurablePoint, FaultHook,
     JournalError, ReservationRequest, ReservationState, SlidingBudgetLimit, SlidingValueLimit,
     TimeReading, derive_batch_child_operation_id,
 };
+use bloom_triad_local_transport::LocalIdentity;
 use bloom_triad_protocol::{
-    ApprovalLifecycleState, Base64UrlBytes, BootEpoch, CryptoSuite, DecimalU64, DecimalU256,
-    DerivationRef, Digest32, KeyRef, KeySpec, NormalizedSignature, OperationId, OperationState,
-    SelectorKind, SignOperationIdentity, SignatureEncoding, SigningResult, Token,
-    UnsignedSignRequest,
+    ApprovalLifecycleState, Base64UrlBytes, BootEpoch, BrokerValidationReceipt, CryptoSuite,
+    DecimalU64, DecimalU256, DerivationRef, Digest32, KeyRef, KeySpec, NormalizedSignature,
+    OperationId, OperationState, SelectorKind, SignOperationIdentity, SignatureEncoding,
+    SigningResult, Token, UnsignedSignRequest,
 };
 use ed25519_dalek::{Signer as _, SigningKey, Verifier as _};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Barrier},
+    sync::{
+        Arc, Barrier, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread,
+    time::Duration,
 };
 use tempfile::TempDir;
 
 struct TestAuditSigner(SigningKey);
+
+#[derive(Default)]
+struct RecordingSelfCheckpoint(Mutex<Vec<bloom_triad_protocol::SignedJournalHead>>);
+
+impl CheckpointSink for RecordingSelfCheckpoint {
+    fn append_peer_head(
+        &self,
+        peer_head: &bloom_triad_protocol::SignedJournalHead,
+    ) -> Result<AppendOutcome, CheckpointError> {
+        self.0.lock().unwrap().push(peer_head.clone());
+        Ok(AppendOutcome::Appended)
+    }
+}
+
+struct FailingSelfCheckpoint;
+
+impl CheckpointSink for FailingSelfCheckpoint {
+    fn append_peer_head(
+        &self,
+        _peer_head: &bloom_triad_protocol::SignedJournalHead,
+    ) -> Result<AppendOutcome, CheckpointError> {
+        Err(CheckpointError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "forced self-checkpoint failure",
+        )))
+    }
+}
+
+#[derive(Default)]
+struct ReorderingCheckpoint {
+    calls: AtomicUsize,
+    sequences: Mutex<Vec<u64>>,
+}
+
+impl CheckpointSink for ReorderingCheckpoint {
+    fn append_peer_head(
+        &self,
+        peer_head: &bloom_triad_protocol::SignedJournalHead,
+    ) -> Result<AppendOutcome, CheckpointError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            // Without journal/checkpoint serialization this lets a later
+            // mutation publish first and deterministically exposes rollback.
+            thread::sleep(Duration::from_millis(100));
+        }
+        let sequence = peer_head.sequence.get();
+        let mut sequences = self.sequences.lock().unwrap();
+        if sequences
+            .last()
+            .is_some_and(|previous| sequence < *previous)
+        {
+            return Err(CheckpointError::SequenceRollback);
+        }
+        sequences.push(sequence);
+        Ok(AppendOutcome::Appended)
+    }
+}
+
+fn broker_identity() -> LocalIdentity {
+    LocalIdentity {
+        service_id: Token::new("bloom-broker").unwrap(),
+        boot_epoch: BootEpoch::from_bytes([0x41; 16]),
+        application_key_id: Token::new("broker-app").unwrap(),
+        signing_key: Arc::new(SigningKey::from_bytes(&[0x42; 32])),
+    }
+}
 
 impl AuditSigner for TestAuditSigner {
     fn key_id(&self) -> Token {
@@ -131,8 +202,25 @@ fn request(value: u8) -> UnsignedSignRequest {
         not_before_ms: DecimalU64::new(1_900_000_000_000),
         expires_at_ms: DecimalU64::new(1_900_000_030_000),
     };
+    request.validation_receipt_digest = validation_receipt(&request).digest().unwrap();
     request.attempt_digest = request.computed_attempt_digest().unwrap();
     request
+}
+
+fn validation_receipt(request: &UnsignedSignRequest) -> BrokerValidationReceipt {
+    BrokerValidationReceipt {
+        approval_id: request.approval_id.clone(),
+        approval_digest: request.approval_id.clone(),
+        operation_digest: request.operation_digest.clone(),
+        policy_version: request.policy_version.clone(),
+        policy_digest: request.policy_digest.clone(),
+        claim_digest: request.petal_use_claim_digest.clone(),
+        assurance_digest: request.claim_assurance_digest.clone(),
+        reservation_ids: vec![digest("77")],
+        effective_claim_assurance: None,
+        broker_key_id: request.broker_signing_key_id.clone(),
+        broker_signature: Base64UrlBytes::from_bytes(&[7; 64]),
+    }
 }
 
 fn result(request: &UnsignedSignRequest, receipt_byte: &str) -> SigningResult {
@@ -509,7 +597,9 @@ fn ac06_same_operation_retry_is_stable_and_conflicts_fail_closed() {
     let journal = memory_journal();
     install_reservation_approval(&journal);
     let first = request(1);
-    journal.begin_sign_attempt(&first, false).unwrap();
+    journal
+        .begin_sign_attempt(&first, false, &validation_receipt(&first))
+        .unwrap();
 
     let mut retry = first.clone();
     retry.attempt_id = digest("ab");
@@ -521,7 +611,7 @@ fn ac06_same_operation_retry_is_stable_and_conflicts_fail_closed() {
     retry.attempt_digest = retry.computed_attempt_digest().unwrap();
     assert_eq!(
         journal
-            .begin_sign_attempt(&retry, false)
+            .begin_sign_attempt(&retry, false, &validation_receipt(&retry))
             .unwrap()
             .operation_digest,
         first.operation_digest
@@ -554,7 +644,11 @@ fn ac06_same_operation_retry_is_stable_and_conflicts_fail_closed() {
         changed.attempt_digest = digest("00");
         changed.attempt_digest = changed.computed_attempt_digest().unwrap();
         assert_eq!(
-            protocol_code(journal.begin_sign_attempt(&changed, false).unwrap_err()),
+            protocol_code(
+                journal
+                    .begin_sign_attempt(&changed, false, &validation_receipt(&changed))
+                    .unwrap_err(),
+            ),
             bloom_triad_protocol::ProtocolErrorCode::OperationIdConflict,
             "{field}"
         );
@@ -566,13 +660,21 @@ fn ac06_same_operation_retry_is_stable_and_conflicts_fail_closed() {
     assert_eq!(
         protocol_code(
             journal
-                .begin_sign_attempt(&reused_attempt_id, false)
+                .begin_sign_attempt(
+                    &reused_attempt_id,
+                    false,
+                    &validation_receipt(&reused_attempt_id),
+                )
                 .unwrap_err()
         ),
         bloom_triad_protocol::ProtocolErrorCode::OperationIdConflict
     );
     assert_eq!(
-        protocol_code(journal.begin_sign_attempt(&retry, true).unwrap_err()),
+        protocol_code(
+            journal
+                .begin_sign_attempt(&retry, true, &validation_receipt(&retry))
+                .unwrap_err(),
+        ),
         bloom_triad_protocol::ProtocolErrorCode::OperationIdConflict
     );
 
@@ -582,7 +684,11 @@ fn ac06_same_operation_retry_is_stable_and_conflicts_fail_closed() {
     conflict.attempt_digest = digest("00");
     conflict.attempt_digest = conflict.computed_attempt_digest().unwrap();
     assert_eq!(
-        protocol_code(journal.begin_sign_attempt(&conflict, false).unwrap_err()),
+        protocol_code(
+            journal
+                .begin_sign_attempt(&conflict, false, &validation_receipt(&conflict))
+                .unwrap_err(),
+        ),
         bloom_triad_protocol::ProtocolErrorCode::OperationIdConflict
     );
 
@@ -601,6 +707,65 @@ fn ac06_same_operation_retry_is_stable_and_conflicts_fail_closed() {
         ),
         bloom_triad_protocol::ProtocolErrorCode::OperationIdConflict
     );
+}
+
+#[test]
+fn ac18_validation_receipt_is_exactly_bound_and_retained_tamper_degrades_audit() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("broker.sqlite");
+    let journal = BrokerJournal::open(
+        &path,
+        Arc::new(TestAuditSigner(SigningKey::from_bytes(&[42; 32]))),
+    )
+    .unwrap();
+    install_reservation_approval(&journal);
+    let request = request(14);
+    let receipt = validation_receipt(&request);
+
+    let mut changed = receipt.clone();
+    changed.reservation_ids.push(digest("78"));
+    assert_eq!(
+        protocol_code(
+            journal
+                .begin_sign_attempt(&request, false, &changed)
+                .unwrap_err()
+        ),
+        bloom_triad_protocol::ProtocolErrorCode::OperationIdConflict
+    );
+    journal
+        .begin_sign_attempt(&request, false, &receipt)
+        .unwrap();
+    drop(journal);
+
+    let mut retained: BrokerValidationReceipt = serde_json::from_str(
+        &Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT validation_receipt_jcs FROM operations WHERE operation_id=?1",
+                [request.operation_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    retained.reservation_ids.push(digest("79"));
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE operations SET validation_receipt_jcs=?1 WHERE operation_id=?2",
+            params![
+                serde_json::to_string(&retained).unwrap(),
+                request.operation_id.as_str()
+            ],
+        )
+        .unwrap();
+    let reopened = BrokerJournal::open(
+        &path,
+        Arc::new(TestAuditSigner(SigningKey::from_bytes(&[42; 32]))),
+    )
+    .unwrap();
+    assert!(reopened.audit_degraded());
+    assert!(reopened.verify_audit_chain().is_err());
 }
 
 #[test]
@@ -767,6 +932,505 @@ fn audit_chain_rejects_a_valid_hash_with_a_forged_service_signature() {
     assert!(open_journal(&path).verify_audit_chain().is_err());
 }
 
+#[test]
+fn ac18_every_internal_chain_tamper_latches_writes_but_preserves_reads() {
+    let mutations: &[&str] = &[
+        "UPDATE audit_chain SET payload_jcs = '{}' WHERE sequence = 1",
+        "UPDATE audit_chain SET entry_hash = printf('%064x', 1) WHERE sequence = 1",
+        "UPDATE audit_chain SET signature = 'AA' WHERE sequence = 1",
+        "UPDATE audit_chain SET signing_key_id = 'foreign-audit-key' WHERE sequence = 1",
+        "DELETE FROM audit_chain WHERE sequence = 1",
+        "UPDATE audit_chain SET sequence = -1 WHERE sequence = 0;
+         UPDATE audit_chain SET sequence = 0 WHERE sequence = 1;
+         UPDATE audit_chain SET sequence = 1 WHERE sequence = -1;",
+    ];
+    for (index, mutation) in mutations.iter().enumerate() {
+        let directory = TempDir::new().unwrap();
+        let path = directory
+            .path()
+            .join(format!("audit-tamper-{index}.sqlite"));
+        let journal = open_journal(&path);
+        let approval_id = digest("31");
+        journal
+            .create_approval(&approval_id, ApprovalLifecycleState::Prepared)
+            .unwrap();
+        journal
+            .transition_approval(&approval_id, ApprovalLifecycleState::AwaitingCeremony)
+            .unwrap();
+        journal
+            .transition_approval(&approval_id, ApprovalLifecycleState::Active)
+            .unwrap();
+        drop(journal);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(mutation)
+            .unwrap();
+
+        let degraded = open_journal(&path);
+        assert!(
+            degraded.audit_degraded(),
+            "tamper case {index} was not latched"
+        );
+        assert_eq!(
+            degraded.approval_state(&approval_id).unwrap(),
+            Some(ApprovalLifecycleState::Active),
+            "read/status must remain available in tamper case {index}"
+        );
+        assert!(
+            degraded
+                .transition_approval(&approval_id, ApprovalLifecycleState::Revoked)
+                .is_err(),
+            "security mutation did not fail closed in tamper case {index}"
+        );
+    }
+}
+
+struct SwitchableAuditSigner {
+    fail: Arc<AtomicBool>,
+    signing_key: SigningKey,
+}
+
+struct RotatedAuditKeyring {
+    old: SigningKey,
+    new: SigningKey,
+}
+
+impl AuditSigner for RotatedAuditKeyring {
+    fn key_id(&self) -> Token {
+        Token::new("broker-audit-key-v2").unwrap()
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String> {
+        Ok(Base64UrlBytes::from_bytes(
+            &self.new.sign(message).to_bytes(),
+        ))
+    }
+
+    fn verify(
+        &self,
+        key_id: &Token,
+        message: &[u8],
+        signature: &Base64UrlBytes,
+    ) -> Result<(), String> {
+        let key = match key_id.as_str() {
+            "broker-audit-test-1" => &self.old,
+            "broker-audit-key-v2" => &self.new,
+            _ => return Err("unknown audit signing key".into()),
+        };
+        let bytes: [u8; 64] = signature
+            .decode()
+            .try_into()
+            .map_err(|_| "invalid signature length")?;
+        key.verifying_key()
+            .verify(message, &ed25519_dalek::Signature::from_bytes(&bytes))
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[test]
+fn ac18_audit_key_rotation_is_cross_signed_and_continuous_across_reopen() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("broker.sqlite");
+    let old = SigningKey::from_bytes(&[42; 32]);
+    let new = SigningKey::from_bytes(&[44; 32]);
+    let journal = BrokerJournal::open(&path, Arc::new(TestAuditSigner(old.clone()))).unwrap();
+    journal
+        .create_approval(&digest("71"), ApprovalLifecycleState::Prepared)
+        .unwrap();
+    journal
+        .rotate_audit_key(Arc::new(RotatedAuditKeyring {
+            old: old.clone(),
+            new: new.clone(),
+        }))
+        .unwrap();
+    journal
+        .create_approval(&digest("72"), ApprovalLifecycleState::Prepared)
+        .unwrap();
+    let entries = journal.audit_entries().unwrap();
+    assert_eq!(entries[1].event_type, "audit.key_rotated");
+    assert_eq!(entries[2].event_type, "audit.key_rotation_completed");
+    assert_eq!(entries[0].signing_key_id.as_str(), "broker-audit-test-1");
+    assert_eq!(entries[1].signing_key_id.as_str(), "broker-audit-test-1");
+    assert_eq!(entries[2].signing_key_id.as_str(), "broker-audit-key-v2");
+    assert_eq!(entries[3].signing_key_id.as_str(), "broker-audit-key-v2");
+    let completion: serde_json::Value = serde_json::from_str(&entries[2].payload_jcs).unwrap();
+    assert_eq!(
+        completion["final_old_head"],
+        serde_json::json!(entries[1].entry_hash)
+    );
+    assert_eq!(entries[2].previous_hash, entries[1].entry_hash);
+    drop(journal);
+
+    let reopened = BrokerJournal::open(
+        &path,
+        Arc::new(RotatedAuditKeyring {
+            old: old.clone(),
+            new: new.clone(),
+        }),
+    )
+    .unwrap();
+    reopened.verify_audit_chain().unwrap();
+    assert!(!reopened.audit_degraded());
+    drop(reopened);
+
+    // A crash or tamper that leaves only the old-key half of the transition is
+    // a cryptographically valid prefix, but not a completed key rotation.
+    Connection::open(&path)
+        .unwrap()
+        .execute("DELETE FROM audit_chain WHERE sequence > 1", [])
+        .unwrap();
+    let incomplete =
+        BrokerJournal::open(&path, Arc::new(RotatedAuditKeyring { old, new })).unwrap();
+    assert!(incomplete.audit_degraded());
+    assert!(incomplete.verify_audit_chain().is_err());
+}
+
+#[test]
+fn ac18_every_security_mutation_synchronously_persists_its_self_head() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("broker.sqlite");
+    let checkpoint = Arc::new(RecordingSelfCheckpoint::default());
+    let journal = BrokerJournal::open(
+        &path,
+        Arc::new(TestAuditSigner(SigningKey::from_bytes(&[42; 32]))),
+    )
+    .unwrap();
+    journal
+        .install_self_checkpoint(broker_identity(), checkpoint.clone())
+        .unwrap();
+    journal
+        .create_approval(&digest("73"), ApprovalLifecycleState::Prepared)
+        .unwrap();
+    let heads = checkpoint.0.lock().unwrap();
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0].sequence.get(), 1);
+    assert_ne!(heads[0].head_hash, Digest32::from_bytes([0; 32]));
+    drop(heads);
+    drop(journal);
+
+    // Corrupt immediately after the mutation, with no timer or subsequent
+    // cross-service call available to advance the retained self-checkpoint.
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE audit_chain SET payload_jcs='{}' WHERE sequence=0",
+            [],
+        )
+        .unwrap();
+    let degraded = BrokerJournal::open(
+        &path,
+        Arc::new(TestAuditSigner(SigningKey::from_bytes(&[42; 32]))),
+    )
+    .unwrap();
+    assert!(degraded.audit_degraded());
+}
+
+#[test]
+fn ac18_postcommit_self_checkpoint_failure_suppresses_success_but_is_reconcilable() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("broker.sqlite");
+    let journal = BrokerJournal::open(
+        &path,
+        Arc::new(TestAuditSigner(SigningKey::from_bytes(&[42; 32]))),
+    )
+    .unwrap();
+    journal
+        .install_self_checkpoint(broker_identity(), Arc::new(FailingSelfCheckpoint))
+        .unwrap();
+    let approval_id = digest("74");
+    assert!(
+        journal
+            .create_approval(&approval_id, ApprovalLifecycleState::Prepared)
+            .is_err()
+    );
+    assert!(journal.audit_degraded());
+    assert_eq!(
+        journal.approval_state(&approval_id).unwrap(),
+        Some(ApprovalLifecycleState::Prepared)
+    );
+    assert_eq!(journal.audit_entries().unwrap().len(), 1);
+    drop(journal);
+
+    // Restart recovers the durable mutation. A fresh independently durable
+    // sink accepts the following committed head without seeing a speculative
+    // checkpoint from a rolled-back SQLite transaction.
+    let checkpoint = Arc::new(RecordingSelfCheckpoint::default());
+    let restarted = BrokerJournal::open(
+        &path,
+        Arc::new(TestAuditSigner(SigningKey::from_bytes(&[42; 32]))),
+    )
+    .unwrap();
+    restarted
+        .install_self_checkpoint(broker_identity(), checkpoint.clone())
+        .unwrap();
+    assert_eq!(
+        restarted.approval_state(&approval_id).unwrap(),
+        Some(ApprovalLifecycleState::Prepared)
+    );
+    let second = digest("75");
+    restarted
+        .create_approval(&second, ApprovalLifecycleState::Prepared)
+        .unwrap();
+    let heads = checkpoint.0.lock().unwrap();
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0].sequence.get(), 2);
+}
+
+#[test]
+fn ac18_concurrent_commits_cannot_publish_self_checkpoints_out_of_order() {
+    let journal = Arc::new(
+        BrokerJournal::open_in_memory(Arc::new(TestAuditSigner(SigningKey::from_bytes(&[42; 32]))))
+            .unwrap(),
+    );
+    let checkpoint = Arc::new(ReorderingCheckpoint::default());
+    journal
+        .install_self_checkpoint(broker_identity(), checkpoint.clone())
+        .unwrap();
+    let start = Arc::new(Barrier::new(3));
+    let workers = [digest("76"), digest("77")]
+        .into_iter()
+        .map(|approval_id| {
+            let journal = journal.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                journal.create_approval(&approval_id, ApprovalLifecycleState::Prepared)
+            })
+        })
+        .collect::<Vec<_>>();
+    start.wait();
+    for worker in workers {
+        worker.join().unwrap().unwrap();
+    }
+
+    let sequences = checkpoint.sequences.lock().unwrap();
+    assert_eq!(sequences.len(), 2);
+    assert!(sequences.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert_eq!(*sequences.last().unwrap(), 2);
+}
+
+impl AuditSigner for SwitchableAuditSigner {
+    fn key_id(&self) -> Token {
+        Token::new("switchable-audit-key").unwrap()
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err("forced audit write failure".into());
+        }
+        Ok(Base64UrlBytes::from_bytes(
+            &self.signing_key.sign(message).to_bytes(),
+        ))
+    }
+
+    fn verify(
+        &self,
+        key_id: &Token,
+        message: &[u8],
+        signature: &Base64UrlBytes,
+    ) -> Result<(), String> {
+        if key_id != &self.key_id() {
+            return Err("unexpected key ID".into());
+        }
+        let bytes: [u8; 64] = signature
+            .decode()
+            .try_into()
+            .map_err(|_| "invalid signature length")?;
+        self.signing_key
+            .verifying_key()
+            .verify(message, &ed25519_dalek::Signature::from_bytes(&bytes))
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[test]
+fn ac18_forced_journal_audit_write_failure_rolls_back_local_effect() {
+    let fail = Arc::new(AtomicBool::new(true));
+    let checkpoint = Arc::new(RecordingSelfCheckpoint::default());
+    let journal = BrokerJournal::open_in_memory(Arc::new(SwitchableAuditSigner {
+        fail: fail.clone(),
+        signing_key: SigningKey::from_bytes(&[43; 32]),
+    }))
+    .unwrap();
+    journal
+        .install_self_checkpoint(broker_identity(), checkpoint.clone())
+        .unwrap();
+    let approval_id = digest("32");
+    assert!(
+        journal
+            .create_approval(&approval_id, ApprovalLifecycleState::Prepared)
+            .is_err()
+    );
+    assert_eq!(journal.approval_state(&approval_id).unwrap(), None);
+    assert!(journal.audit_entries().unwrap().is_empty());
+    assert!(checkpoint.0.lock().unwrap().is_empty());
+
+    fail.store(false, Ordering::SeqCst);
+    journal
+        .create_approval(&approval_id, ApprovalLifecycleState::Prepared)
+        .unwrap();
+    assert_eq!(
+        journal.approval_state(&approval_id).unwrap(),
+        Some(ApprovalLifecycleState::Prepared)
+    );
+    let heads = checkpoint.0.lock().unwrap();
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0].sequence.get(), 1);
+}
+
+#[test]
+fn ac18_audit_correlation_detects_persisted_receipt_and_result_tamper() {
+    let directory = TempDir::new().unwrap();
+
+    let approval_path = directory.path().join("approval-correlation.sqlite");
+    let approval = open_journal(&approval_path);
+    install_reservation_approval(&approval);
+    let activation = approval
+        .audit_entries()
+        .unwrap()
+        .into_iter()
+        .find(|entry| {
+            entry.event_type == "approval.transition"
+                && entry
+                    .payload_jcs
+                    .contains("signer_activation_receipt_digest")
+        })
+        .expect("activation audit correlation");
+    let activation_payload: serde_json::Value =
+        serde_json::from_str(&activation.payload_jcs).unwrap();
+    assert_eq!(activation_payload["correlation_schema"], "v1");
+    assert_eq!(
+        activation_payload["activation_operation_id"],
+        serde_json::json!(operation_id(250))
+    );
+    drop(approval);
+    Connection::open(&approval_path)
+        .unwrap()
+        .execute(
+            "UPDATE approval_metadata SET ceremony_grant_jcs='{\"tampered\":true}'",
+            [],
+        )
+        .unwrap();
+    let degraded = open_journal(&approval_path);
+    assert!(degraded.audit_degraded());
+    assert_eq!(
+        degraded.approval_state(&digest("22")).unwrap(),
+        Some(ApprovalLifecycleState::Active)
+    );
+
+    let result_path = directory.path().join("result-correlation.sqlite");
+    let single_request = request(41);
+    let journal = open_journal(&result_path);
+    install_reservation_approval(&journal);
+    journal
+        .begin_sign_attempt(&single_request, false, &validation_receipt(&single_request))
+        .unwrap();
+    let mut single_reservation = reservation(41);
+    single_reservation.operation_id = single_request.operation_id.clone();
+    single_reservation.operation_digest = single_request.operation_digest.clone();
+    journal.reserve(&single_reservation, &limits(2)).unwrap();
+    advance_to_committed(&journal, &single_request.operation_id);
+    let published = result(&single_request, "b1");
+    journal.publish_result(&digest("22"), &published).unwrap();
+    let event = journal
+        .audit_entries()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.event_type == "operation.published")
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&event.payload_jcs).unwrap();
+    assert_eq!(
+        payload["signer_receipt_digest"],
+        serde_json::json!(published.signer_receipt_digest)
+    );
+    assert_eq!(
+        payload["broker_receipt_digest"],
+        serde_json::json!(published.broker_receipt_digest)
+    );
+    drop(journal);
+    let mut tampered = published.clone();
+    tampered.signer_receipt_digest = digest("b2");
+    Connection::open(&result_path)
+        .unwrap()
+        .execute(
+            "UPDATE operations SET result_jcs=?2 WHERE operation_id=?1",
+            params![
+                single_request.operation_id.as_str(),
+                serde_jcs::to_string(&tampered).unwrap()
+            ],
+        )
+        .unwrap();
+    assert!(open_journal(&result_path).audit_degraded());
+
+    let batch_path = directory.path().join("batch-correlation.sqlite");
+    let parent = request(51);
+    let journal = open_journal(&batch_path);
+    install_reservation_approval(&journal);
+    journal
+        .begin_sign_attempt(&parent, true, &validation_receipt(&parent))
+        .unwrap();
+    let mut batch_reservation = reservation(51);
+    batch_reservation.operation_id = parent.operation_id.clone();
+    batch_reservation.operation_digest = parent.operation_digest.clone();
+    journal.reserve(&batch_reservation, &limits(2)).unwrap();
+    advance_to_committed(&journal, &parent.operation_id);
+    let parent_result = result(&parent, "c1");
+    let mut child = result(&request(52), "c2");
+    child.operation_id = derive_batch_child_operation_id(&parent.operation_id, 0).unwrap();
+    journal
+        .publish_batch(&digest("22"), &parent_result, &[child.clone()])
+        .unwrap();
+    let event = journal
+        .audit_entries()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.event_type == "batch.published")
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&event.payload_jcs).unwrap();
+    assert_eq!(
+        payload["children"][0]["operation_id"],
+        serde_json::json!(child.operation_id)
+    );
+    assert_eq!(
+        payload["children"][0]["signer_receipt_digest"],
+        serde_json::json!(child.signer_receipt_digest)
+    );
+    drop(journal);
+    child.broker_receipt_digest = digest("c3");
+    Connection::open(&batch_path)
+        .unwrap()
+        .execute(
+            "UPDATE batch_children SET result_jcs=?1 WHERE ordinal=0",
+            [serde_jcs::to_string(&child).unwrap()],
+        )
+        .unwrap();
+    assert!(open_journal(&batch_path).audit_degraded());
+}
+
+#[test]
+fn verified_head_convention_and_checkpoint_failure_latch_preserve_reads() {
+    let journal = memory_journal();
+    assert_eq!(journal.verified_audit_head().unwrap(), (0, digest("00")));
+    let approval_id = digest("34");
+    journal
+        .create_approval(&approval_id, ApprovalLifecycleState::Prepared)
+        .unwrap();
+    let (sequence, head_hash) = journal.verified_audit_head().unwrap();
+    assert_eq!(sequence, 1);
+    assert_ne!(head_hash, digest("00"));
+
+    journal.latch_audit_degradation();
+    assert_eq!(
+        journal.approval_state(&approval_id).unwrap(),
+        Some(ApprovalLifecycleState::Prepared)
+    );
+    assert!(
+        journal
+            .transition_approval(&approval_id, ApprovalLifecycleState::AwaitingCeremony)
+            .is_err()
+    );
+}
+
 struct CrashAt(DurablePoint);
 
 impl FaultHook for CrashAt {
@@ -787,7 +1451,7 @@ fn ac07_durable_operation_survives_crash_after_ack_boundary() {
     let journal =
         open_journal(&path).with_fault_hook(Arc::new(CrashAt(DurablePoint::OperationReceived)));
     assert!(matches!(
-        journal.begin_sign_attempt(&first, false),
+        journal.begin_sign_attempt(&first, false, &validation_receipt(&first)),
         Err(JournalError::InjectedCrash { .. })
     ));
     drop(journal);
@@ -827,7 +1491,7 @@ fn ac07_fault_matrix_recovers_every_non_batch_durable_transition() {
     let operation_path = directory.path().join("operation.sqlite");
     let sign_request = request(4);
     open_journal(&operation_path)
-        .begin_sign_attempt(&sign_request, false)
+        .begin_sign_attempt(&sign_request, false, &validation_receipt(&sign_request))
         .unwrap();
     let journal = open_journal(&operation_path)
         .with_fault_hook(Arc::new(CrashAt(DurablePoint::OperationTransition)));
@@ -892,7 +1556,9 @@ fn ac12_batch_parent_and_children_publish_in_one_transaction() {
     let parent = request(1);
     let setup = open_journal(&path);
     install_reservation_approval(&setup);
-    setup.begin_sign_attempt(&parent, true).unwrap();
+    setup
+        .begin_sign_attempt(&parent, true, &validation_receipt(&parent))
+        .unwrap();
     setup.reserve(&reservation(1), &limits(2)).unwrap();
     advance_to_committed(&setup, &parent.operation_id);
     drop(setup);

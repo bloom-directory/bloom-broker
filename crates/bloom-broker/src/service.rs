@@ -5,22 +5,25 @@ use std::sync::Arc;
 use bloom_triad_local_transport::NetworkContainmentGuard;
 use bloom_triad_protocol::{
     ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector, Base64UrlBytes, BootEpoch,
-    BrokerSignerRequest, BrokerSignerResponse, ControlRequest, ControlResponse, DecimalU64,
-    Digest32, Empty, MachineBrokerMethod, MachineBrokerRequest, MachineBrokerResponse,
-    MachineBrokerService, MachineSignRequest, OperationId, OperationPublicStatus, OperationState,
-    PolicyCompareAndSwapRequest, PolicyUpdateCeremonyPrepareRequest, PolicyUpdateRequest,
-    PolicyUpdateReviewManifest, PolicyValidationReceipt, ProtocolError, ProtocolErrorCode,
-    RPC_ENVELOPE_SCHEMA_V1, Readiness, ReadinessState, RevocationControlService,
-    SealedApprovalPrepareResponse, SelectorKind, ServiceCapabilities, ServiceFuture, SignRequest,
-    SigningPayloads, Token, UnsignedSignRequest, VerifierPublicCapability, WalletPublic,
-    WalletRequest,
+    BrokerSignerRequest, BrokerSignerResponse, BrokerValidationReceipt, ControlRequest,
+    ControlResponse, DecimalU64, Digest32, Empty, MachineBrokerMethod, MachineBrokerRequest,
+    MachineBrokerResponse, MachineBrokerService, MachineSignRequest, OperationId,
+    OperationPublicStatus, OperationState, PolicyCompareAndSwapRequest,
+    PolicyUpdateCeremonyPrepareRequest, PolicyUpdateRequest, PolicyUpdateReviewManifest,
+    PolicyValidationReceipt, ProtocolError, ProtocolErrorCode, RPC_ENVELOPE_SCHEMA_V1, Readiness,
+    ReadinessState, RevocationControlService, SealedApprovalPrepareResponse, SelectorKind,
+    ServiceCapabilities, ServiceFuture, SignRequest, SigningPayloads, Token, UnsignedSignRequest,
+    VerifierPublicCapability, WalletPublic, WalletRequest,
 };
-use ed25519_dalek::{Signer as _, SigningKey};
+use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _};
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    authority::{AuthorityError, AuthorizationInput, BrokerAuthority, EpochReconciliation},
+    authority::{
+        AuthorityError, AuthorizationInput, BrokerAuthority, EpochReconciliation,
+        PolicyInstallCorrelation,
+    },
     ceremony::{CeremonyBroker, CeremonyCompletionObserver, ReviewManifestContext},
     clock::BrokerClock,
     journal::{BrokerJournal, JournalError, ReservationState},
@@ -72,13 +75,21 @@ impl BrokerRpcService {
             service_version: service_version.into(),
             network_containment: None,
         };
-        service.ceremony.set_completion_observer(
-            Arc::new(AuthorityCompletionObserver {
-                authority: service.authority.clone(),
-            }),
-            service.clock.now_ms(false)?,
-        )?;
+        let observer = Arc::new(AuthorityCompletionObserver {
+            authority: service.authority.clone(),
+        });
+        if service.journal.audit_degraded() {
+            service.ceremony.set_completion_observer_read_only(observer);
+        } else {
+            service
+                .ceremony
+                .set_completion_observer(observer, service.clock.now_ms(false)?)?;
+        }
         Ok(service)
+    }
+
+    pub fn journal_is_audit_degraded(&self) -> bool {
+        self.journal.audit_degraded()
     }
 
     pub fn with_network_containment(mut self, guard: NetworkContainmentGuard) -> Self {
@@ -216,6 +227,9 @@ impl BrokerRpcService {
                 let staged = self
                     .ceremony
                     .completed_policy_update(&request.operation_id, &request.ceremony_receipt)?;
+                let operation_id = request.operation_id.clone();
+                let ceremony_receipt_digest = request.ceremony_receipt.receipt_digest.clone();
+                let validation_receipt_digest = staged.broker_validation_receipt.digest()?;
                 let compare = PolicyCompareAndSwapRequest {
                     update: staged.update,
                     ceremony_receipt: request.ceremony_receipt,
@@ -227,6 +241,15 @@ impl BrokerRpcService {
                     .await?
                 {
                     BrokerSignerResponse::PolicyCompareAndSwap(receipt) => {
+                        let commit_receipt_digest = Digest32::from_bytes(
+                            Sha256::digest(serde_jcs::to_vec(&receipt).map_err(|error| {
+                                ProtocolError::new(
+                                    ProtocolErrorCode::MalformedFrame,
+                                    format!("canonicalize policy commit receipt: {error}"),
+                                )
+                            })?)
+                            .into(),
+                        );
                         let committed = match self
                             .signer
                             .request_async(BrokerSignerRequest::PolicyRead(WalletRequest {
@@ -244,7 +267,15 @@ impl BrokerRpcService {
                             ));
                         }
                         self.authority
-                            .install_policy(&committed)
+                            .install_policy_with_correlation(
+                                &committed,
+                                &PolicyInstallCorrelation {
+                                    operation_id: Some(operation_id),
+                                    ceremony_receipt_digest: Some(ceremony_receipt_digest),
+                                    validation_receipt_digest: Some(validation_receipt_digest),
+                                    commit_receipt_digest: Some(commit_receipt_digest),
+                                },
+                            )
                             .map_err(authority_error)?;
                         Ok(Response::PolicyCommitUpdate(receipt))
                     }
@@ -638,7 +669,26 @@ impl BrokerRpcService {
             .as_ref()
             .map(|claim| jcs_digest(&claim.claim_assurance))
             .transpose()?;
-        let validation_receipt_digest = jcs_digest(&request)?;
+        let mut validation_receipt = BrokerValidationReceipt {
+            approval_id: request.approval_id.clone(),
+            approval_digest: terms.approval_digest()?,
+            operation_digest: request.operation_digest.clone(),
+            policy_version: terms.policy_version.clone(),
+            policy_digest: terms.policy_digest.clone(),
+            claim_digest: claim_digest.clone(),
+            assurance_digest: assurance_digest.clone(),
+            reservation_ids: decision.reservation_ids.clone(),
+            effective_claim_assurance: decision.effective_assurance.clone(),
+            broker_key_id: self.signing_key_id.clone(),
+            broker_signature: Base64UrlBytes::from_bytes(&[]),
+        };
+        validation_receipt.broker_signature = Base64UrlBytes::from_bytes(
+            &self
+                .signing_key
+                .sign(&validation_receipt.signature_message()?)
+                .to_bytes(),
+        );
+        let validation_receipt_digest = validation_receipt.digest()?;
         let mut unsigned = UnsignedSignRequest {
             schema: Token::new(BROKER_SIGN_REQUEST_SCHEMA)?,
             attempt_id: Digest32::from_bytes(attempt_bytes),
@@ -676,7 +726,7 @@ impl BrokerRpcService {
         unsigned.attempt_digest = unsigned.computed_attempt_digest()?;
         let snapshot = self
             .journal
-            .begin_sign_attempt(&unsigned, is_batch)
+            .begin_sign_attempt(&unsigned, is_batch, &validation_receipt)
             .map_err(journal_error)?;
         if let Some(result) = snapshot.result {
             return Ok(result);
@@ -849,6 +899,17 @@ impl BrokerRpcService {
         result: bloom_triad_protocol::SigningResult,
         is_batch: bool,
     ) -> Result<(), ProtocolError> {
+        let validation_receipt = self
+            .journal
+            .validation_receipt(&result.operation_id)
+            .map_err(journal_error)?
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "operation omitted its retained Broker validation receipt",
+                )
+            })?;
+        self.verify_validation_receipt(&validation_receipt)?;
         let snapshot = self
             .journal
             .operation(&result.operation_id)
@@ -916,6 +977,46 @@ impl BrokerRpcService {
         }
     }
 
+    fn verify_validation_receipt(
+        &self,
+        receipt: &BrokerValidationReceipt,
+    ) -> Result<(), ProtocolError> {
+        verify_broker_validation_receipt(
+            receipt,
+            &self.signing_key_id,
+            &self.signing_key.verifying_key(),
+        )
+    }
+}
+
+fn verify_broker_validation_receipt(
+    receipt: &BrokerValidationReceipt,
+    expected_key_id: &Token,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+) -> Result<(), ProtocolError> {
+    if &receipt.broker_key_id != expected_key_id {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            "Broker validation receipt key ID changed",
+        ));
+    }
+    let signature = Signature::from_slice(&receipt.broker_signature.decode()).map_err(|_| {
+        ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            "Broker validation receipt signature is malformed",
+        )
+    })?;
+    verifying_key
+        .verify(&receipt.signature_message()?, &signature)
+        .map_err(|_| {
+            ProtocolError::new(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "Broker validation receipt signature is invalid",
+            )
+        })
+}
+
+impl BrokerRpcService {
     fn transition_operation(
         &self,
         operation_id: &OperationId,
@@ -1413,6 +1514,104 @@ mod tests {
             state,
             conditions: Vec::new(),
         }
+    }
+
+    fn signed_validation_receipt(key: &SigningKey) -> BrokerValidationReceipt {
+        let mut receipt = BrokerValidationReceipt {
+            approval_id: Digest32::from_bytes([0x11; 32]),
+            approval_digest: Digest32::from_bytes([0x12; 32]),
+            operation_digest: Digest32::from_bytes([0x13; 32]),
+            policy_version: DecimalU64::new(7),
+            policy_digest: Digest32::from_bytes([0x14; 32]),
+            claim_digest: Some(Digest32::from_bytes([0x15; 32])),
+            assurance_digest: Some(Digest32::from_bytes([0x16; 32])),
+            reservation_ids: vec![Digest32::from_bytes([0x17; 32])],
+            effective_claim_assurance: Some(bloom_triad_protocol::ClaimAssurance::MachineAsserted),
+            broker_key_id: Token::new("broker-validation-test").unwrap(),
+            broker_signature: Base64UrlBytes::from_bytes(&[0; 64]),
+        };
+        receipt.broker_signature =
+            Base64UrlBytes::from_bytes(&key.sign(&receipt.signature_message().unwrap()).to_bytes());
+        receipt
+    }
+
+    #[test]
+    fn validation_receipt_signature_binds_every_authorization_field_and_key() {
+        let key = SigningKey::from_bytes(&[0x61; 32]);
+        let receipt = signed_validation_receipt(&key);
+        verify_broker_validation_receipt(&receipt, &receipt.broker_key_id, &key.verifying_key())
+            .unwrap();
+
+        let mut changes = Vec::new();
+        let mut changed = receipt.clone();
+        changed.approval_id = Digest32::from_bytes([0x21; 32]);
+        changes.push(changed);
+        let mut changed = receipt.clone();
+        changed.approval_digest = Digest32::from_bytes([0x22; 32]);
+        changes.push(changed);
+        let mut changed = receipt.clone();
+        changed.operation_digest = Digest32::from_bytes([0x23; 32]);
+        changes.push(changed);
+        let mut changed = receipt.clone();
+        changed.policy_version = DecimalU64::new(8);
+        changes.push(changed);
+        let mut changed = receipt.clone();
+        changed.policy_digest = Digest32::from_bytes([0x24; 32]);
+        changes.push(changed);
+        let mut changed = receipt.clone();
+        changed.claim_digest = None;
+        changes.push(changed);
+        let mut changed = receipt.clone();
+        changed.assurance_digest = None;
+        changes.push(changed);
+        let mut changed = receipt.clone();
+        changed
+            .reservation_ids
+            .push(Digest32::from_bytes([0x25; 32]));
+        changes.push(changed);
+        let mut changed = receipt.clone();
+        changed.effective_claim_assurance = None;
+        changes.push(changed);
+        let mut changed = receipt.clone();
+        changed.broker_key_id = Token::new("broker-validation-other").unwrap();
+        changes.push(changed);
+
+        for changed in changes {
+            assert_eq!(
+                verify_broker_validation_receipt(
+                    &changed,
+                    &receipt.broker_key_id,
+                    &key.verifying_key(),
+                )
+                .unwrap_err()
+                .code,
+                ProtocolErrorCode::UnauthenticatedPeer
+            );
+        }
+
+        let mut changed = receipt.clone();
+        changed.broker_signature = Base64UrlBytes::from_bytes(&[0x62; 64]);
+        assert_eq!(
+            verify_broker_validation_receipt(
+                &changed,
+                &receipt.broker_key_id,
+                &key.verifying_key(),
+            )
+            .unwrap_err()
+            .code,
+            ProtocolErrorCode::UnauthenticatedPeer
+        );
+        let other_key = SigningKey::from_bytes(&[0x63; 32]);
+        assert_eq!(
+            verify_broker_validation_receipt(
+                &receipt,
+                &receipt.broker_key_id,
+                &other_key.verifying_key(),
+            )
+            .unwrap_err()
+            .code,
+            ProtocolErrorCode::UnauthenticatedPeer
+        );
     }
 
     #[test]

@@ -1,7 +1,9 @@
+use bloom_audit_checkpoint::CheckpointSink;
+use bloom_triad_local_transport::{LocalIdentity, sign_journal_head};
 use bloom_triad_protocol::{
-    ApprovalLifecycleState, ApprovalLimitState, Base64UrlBytes, BootEpoch, DecimalU64, DecimalU256,
-    Digest32, OperationId, OperationState, ProtocolError, ProtocolErrorCode, SealedApprovalTerms,
-    SigningResult, Token, UnsignedSignRequest,
+    ApprovalLifecycleState, ApprovalLimitState, Base64UrlBytes, BootEpoch, BrokerValidationReceipt,
+    DecimalU64, DecimalU256, Digest32, OperationId, OperationState, ProtocolError,
+    ProtocolErrorCode, SealedApprovalTerms, SigningResult, Token, UnsignedSignRequest,
 };
 use num_bigint::BigUint;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -11,11 +13,15 @@ use std::{
     collections::BTreeMap,
     path::Path,
     str::FromStr,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 const AUDIT_DOMAIN: &[u8] = b"bloom-broker-audit/v1";
 const AUDIT_SIGNATURE_DOMAIN: &[u8] = b"bloom-broker-audit-signature/v1";
+const AUDIT_ROTATION_DOMAIN: &[u8] = b"bloom-broker-audit-key-rotation/v1";
 const ATTEMPT_BINDING_DOMAIN: &[u8] = b"bloom-broker-attempt-binding/v1";
 const BATCH_CHILD_DOMAIN: &[u8] = b"bloom-batch-child/v1";
 
@@ -42,6 +48,62 @@ pub trait AuditSigner: Send + Sync {
         message: &[u8],
         signature: &Base64UrlBytes,
     ) -> Result<(), String>;
+}
+
+struct ActiveAuditSigner {
+    current: Mutex<Arc<dyn AuditSigner>>,
+    trusted: Mutex<Vec<Arc<dyn AuditSigner>>>,
+}
+
+impl ActiveAuditSigner {
+    fn new(current: Arc<dyn AuditSigner>) -> Self {
+        Self {
+            current: Mutex::new(current.clone()),
+            trusted: Mutex::new(vec![current]),
+        }
+    }
+
+    fn install(&self, signer: Arc<dyn AuditSigner>) -> Result<(), JournalError> {
+        self.trusted
+            .lock()
+            .map_err(|_| storage("audit signer registry mutex poisoned"))?
+            .push(signer.clone());
+        *self
+            .current
+            .lock()
+            .map_err(|_| storage("active audit signer mutex poisoned"))? = signer;
+        Ok(())
+    }
+}
+
+impl AuditSigner for ActiveAuditSigner {
+    fn key_id(&self) -> Token {
+        self.current
+            .lock()
+            .expect("audit signer mutex poisoned")
+            .key_id()
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String> {
+        self.current
+            .lock()
+            .map_err(|_| "audit signer mutex poisoned".to_owned())?
+            .sign(message)
+    }
+
+    fn verify(
+        &self,
+        key_id: &Token,
+        message: &[u8],
+        signature: &Base64UrlBytes,
+    ) -> Result<(), String> {
+        self.trusted
+            .lock()
+            .map_err(|_| "audit signer registry mutex poisoned".to_owned())?
+            .iter()
+            .find_map(|signer| signer.verify(key_id, message, signature).ok())
+            .ok_or_else(|| "unknown or invalid audit signing key".to_owned())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -177,9 +239,17 @@ pub struct AuditEntry {
 }
 
 pub struct BrokerJournal {
-    connection: Mutex<Connection>,
-    audit_signer: Arc<dyn AuditSigner>,
+    connection: Arc<Mutex<Connection>>,
+    audit_signer: Arc<ActiveAuditSigner>,
+    audit_degraded: Arc<AtomicBool>,
     fault_hook: Option<Arc<dyn FaultHook>>,
+    self_checkpoint: Arc<Mutex<Option<SelfCheckpoint>>>,
+}
+
+#[derive(Clone)]
+struct SelfCheckpoint {
+    identity: LocalIdentity,
+    checkpoints: Arc<dyn CheckpointSink>,
 }
 
 impl BrokerJournal {
@@ -221,7 +291,8 @@ impl BrokerJournal {
                 retry_binding_digest TEXT NOT NULL,
                 state TEXT NOT NULL,
                 is_batch INTEGER NOT NULL,
-                result_jcs TEXT
+                result_jcs TEXT,
+                validation_receipt_jcs TEXT
             );
             CREATE TABLE IF NOT EXISTS operation_attempts (
                 operation_id TEXT NOT NULL REFERENCES operations(operation_id),
@@ -293,6 +364,7 @@ impl BrokerJournal {
             "TEXT NOT NULL DEFAULT '00000000000000000000000000000000'",
         )?;
         ensure_column(&connection, "clock_state", "observed_utc_ms", "TEXT")?;
+        ensure_column(&connection, "operations", "validation_receipt_jcs", "TEXT")?;
         ensure_column(
             &connection,
             "clock_state",
@@ -305,11 +377,17 @@ impl BrokerJournal {
             "boot_epoch",
             "TEXT NOT NULL DEFAULT '00000000000000000000000000000000'",
         )?;
-        Ok(Self {
-            connection: Mutex::new(connection),
-            audit_signer,
+        let journal = Self {
+            connection: Arc::new(Mutex::new(connection)),
+            audit_signer: Arc::new(ActiveAuditSigner::new(audit_signer)),
+            audit_degraded: Arc::new(AtomicBool::new(false)),
             fault_hook: None,
-        })
+            self_checkpoint: Arc::new(Mutex::new(None)),
+        };
+        if journal.verify_audit_chain().is_err() {
+            journal.audit_degraded.store(true, Ordering::SeqCst);
+        }
+        Ok(journal)
     }
 
     pub fn with_fault_hook(mut self, fault_hook: Arc<dyn FaultHook>) -> Self {
@@ -317,24 +395,154 @@ impl BrokerJournal {
         self
     }
 
+    /// Install the independently durable sink for Broker's own authenticated
+    /// audit head. Every subsequently appended security event is checkpointed
+    /// before its enclosing transaction may report success.
+    pub fn install_self_checkpoint(
+        &self,
+        identity: LocalIdentity,
+        checkpoints: Arc<dyn CheckpointSink>,
+    ) -> Result<(), JournalError> {
+        *self
+            .self_checkpoint
+            .lock()
+            .map_err(|_| storage("Broker self-checkpoint mutex poisoned"))? =
+            Some(SelfCheckpoint {
+                identity,
+                checkpoints,
+            });
+        Ok(())
+    }
+
+    pub fn audit_degraded(&self) -> bool {
+        self.audit_degraded.load(Ordering::SeqCst)
+    }
+
+    /// Return the current head only after fully verifying the local chain.
+    /// `(0, 00..00)` is the explicit empty-chain convention. The externally
+    /// reported sequence is the entry count, so DB sequence `N` is exposed as
+    /// `N + 1` and the first mutation advances the checkpoint from 0 to 1.
+    pub fn verified_audit_head(&self) -> Result<(u64, Digest32), JournalError> {
+        let connection = self.lock()?;
+        if let Err(error) = verify_audit_chain_connection(&connection, self.audit_signer.as_ref()) {
+            self.audit_degraded.store(true, Ordering::SeqCst);
+            return Err(error);
+        }
+        connection
+            .query_row(
+                "SELECT sequence, entry_hash FROM audit_chain ORDER BY sequence DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(|(sequence, hash)| -> Result<_, JournalError> {
+                Ok((
+                    u64::try_from(sequence)
+                        .map_err(storage)?
+                        .checked_add(1)
+                        .ok_or_else(|| JournalError::Storage("audit head overflow".into()))?,
+                    Digest32::new(hash)?,
+                ))
+            })
+            .transpose()
+            .map(|head| {
+                head.unwrap_or_else(|| {
+                    (
+                        0,
+                        Digest32::new("00".repeat(32)).expect("fixed zero digest is valid"),
+                    )
+                })
+            })
+    }
+
+    /// Latch local security mutations after a required peer/OS checkpoint
+    /// cannot be persisted. Read and status methods intentionally remain live.
+    pub fn latch_audit_degradation(&self) {
+        self.audit_degraded.store(true, Ordering::SeqCst);
+    }
+
+    /// Append an old-key-signed transition containing proof of possession of
+    /// the replacement key, then atomically select it for subsequent entries.
+    /// The supplied signer must remain capable of verifying the historical
+    /// key set when used to reopen a rotated journal.
+    pub fn rotate_audit_key(&self, replacement: Arc<dyn AuditSigner>) -> Result<(), JournalError> {
+        let old_key_id = self.audit_signer.key_id();
+        let new_key_id = replacement.key_id();
+        if old_key_id == new_key_id {
+            return Err(JournalError::Storage(
+                "replacement audit key ID must differ".into(),
+            ));
+        }
+        let mut connection = self.lock_for_mutation()?;
+        let transaction = connection.transaction()?;
+        let previous_hash = transaction
+            .query_row(
+                "SELECT entry_hash FROM audit_chain ORDER BY sequence DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| "00".repeat(32));
+        let previous_hash = Digest32::new(previous_hash)?;
+        let confirmation_message = audit_rotation_message(&old_key_id, &new_key_id, &previous_hash);
+        let new_key_confirmation = replacement.sign(&confirmation_message).map_err(storage)?;
+        self.append_audit_transaction(
+            &transaction,
+            "audit.key_rotated",
+            &serde_json::json!({
+                "old_key_id": old_key_id,
+                "new_key_id": new_key_id,
+                "prior_head": previous_hash,
+                "new_key_confirmation": new_key_confirmation
+            }),
+            self.audit_signer.as_ref(),
+        )?;
+        let final_old_head = transaction.query_row(
+            "SELECT entry_hash FROM audit_chain ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )?;
+        let final_old_head = Digest32::new(final_old_head)?;
+        self.append_audit_transaction(
+            &transaction,
+            "audit.key_rotation_completed",
+            &serde_json::json!({
+                "old_key_id": old_key_id,
+                "new_key_id": new_key_id,
+                "final_old_head": final_old_head
+            }),
+            replacement.as_ref(),
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        // The committed completion entry is signed by the replacement key, so
+        // install it before verifying and checkpointing the committed chain.
+        // A checkpoint failure still latches mutations and suppresses success,
+        // but the durable rotation remains readable and restart-reconcilable.
+        self.audit_signer.install(replacement)?;
+        self.checkpoint_committed_head()
+    }
+
     pub fn create_approval(
         &self,
         approval_id: &Digest32,
         state: ApprovalLifecycleState,
     ) -> Result<(), JournalError> {
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         transaction.execute(
             "INSERT INTO approvals(approval_id, state) VALUES (?1, ?2)",
             params![approval_id.as_str(), approval_state_text(state)?],
         )?;
-        append_audit(
+        self.append_audit_transaction(
             &transaction,
             "approval.created",
             &serde_json::json!({"approval_id": approval_id, "state": state}),
             self.audit_signer.as_ref(),
         )?;
         transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
         self.after_durable(DurablePoint::ApprovalTransition)
     }
 
@@ -346,7 +554,7 @@ impl BrokerJournal {
         provenance_jcs: Option<&str>,
         renewal_of: Option<&Digest32>,
     ) -> Result<(), JournalError> {
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         transaction.execute(
             "INSERT INTO approvals(approval_id, state) VALUES (?1, 'AWAITING_CEREMONY')",
@@ -364,7 +572,7 @@ impl BrokerJournal {
                 renewal_of.map(Digest32::as_str)
             ],
         )?;
-        append_audit(
+        self.append_audit_transaction(
             &transaction,
             "approval.prepared",
             &serde_json::json!({
@@ -375,6 +583,8 @@ impl BrokerJournal {
             self.audit_signer.as_ref(),
         )?;
         transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
         self.after_durable(DurablePoint::ApprovalTransition)
     }
 
@@ -441,7 +651,7 @@ impl BrokerJournal {
         activation_operation_id: &OperationId,
         ceremony_grant_jcs: &str,
     ) -> Result<(), JournalError> {
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         let (state, existing_operation, renewal_of): (String, Option<String>, Option<String>) =
             transaction
@@ -462,6 +672,8 @@ impl BrokerJournal {
                 && parse_approval_state(&state)? == ApprovalLifecycleState::Active
             {
                 transaction.commit()?;
+                drop(connection);
+                self.checkpoint_committed_head()?;
                 return Ok(());
             }
             return Err(protocol(
@@ -517,19 +729,30 @@ impl BrokerJournal {
             "UPDATE approvals SET state = 'ACTIVE' WHERE approval_id = ?1",
             [approval_id.as_str()],
         )?;
-        append_audit(
+        let signer_receipt_digest =
+            Digest32::from_bytes(Sha256::digest(ceremony_grant_jcs.as_bytes()).into());
+        let signer_receipt: serde_json::Value =
+            serde_json::from_str(ceremony_grant_jcs).map_err(storage)?;
+        self.append_audit_transaction(
             &transaction,
             "approval.transition",
             &serde_json::json!({
                 "approval_id": approval_id,
                 "from": ApprovalLifecycleState::AwaitingCeremony,
                 "to": ApprovalLifecycleState::Active,
-                "activation_operation_id": activation_operation_id
-                ,"renewal_of": renewal_of
+                "activation_operation_id": activation_operation_id,
+                "renewal_of": renewal_of,
+                "correlation_schema": "v1",
+                "signer_activation_receipt_digest": signer_receipt_digest,
+                "ceremony_id": signer_receipt.get("ceremony_id"),
+                "review_manifest_digest": signer_receipt.get("review_manifest_digest"),
+                "signer_key_id": signer_receipt.get("signer_key_id")
             }),
             self.audit_signer.as_ref(),
         )?;
         transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
         self.after_durable(DurablePoint::ApprovalTransition)
     }
 
@@ -538,7 +761,7 @@ impl BrokerJournal {
         approval_id: &Digest32,
         next: ApprovalLifecycleState,
     ) -> Result<(), JournalError> {
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         let current_text: String = transaction
             .query_row(
@@ -563,13 +786,15 @@ impl BrokerJournal {
             "UPDATE approvals SET state = ?2 WHERE approval_id = ?1",
             params![approval_id.as_str(), approval_state_text(next)?],
         )?;
-        append_audit(
+        self.append_audit_transaction(
             &transaction,
             "approval.transition",
             &serde_json::json!({"approval_id": approval_id, "from": current, "to": next}),
             self.audit_signer.as_ref(),
         )?;
         transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
         self.after_durable(DurablePoint::ApprovalTransition)
     }
 
@@ -644,9 +869,19 @@ impl BrokerJournal {
         &self,
         request: &UnsignedSignRequest,
         is_batch: bool,
+        validation_receipt: &BrokerValidationReceipt,
     ) -> Result<OperationSnapshot, JournalError> {
         if request.operation_digest != request.operation_identity().digest()?
             || request.attempt_digest != request.computed_attempt_digest()?
+            || request.validation_receipt_digest != validation_receipt.digest()?
+            || validation_receipt.approval_id != request.approval_id
+            || validation_receipt.operation_digest != request.operation_digest
+            || validation_receipt.policy_version != request.policy_version
+            || validation_receipt.policy_digest != request.policy_digest
+            || validation_receipt.claim_digest != request.petal_use_claim_digest
+            || validation_receipt.assurance_digest != request.claim_assurance_digest
+            || validation_receipt.broker_key_id != request.broker_signing_key_id
+            || validation_receipt.broker_signature.decode().len() != 64
         {
             return Err(protocol(
                 ProtocolErrorCode::OperationIdConflict,
@@ -655,7 +890,8 @@ impl BrokerJournal {
             .into());
         }
         let retry_binding_digest = attempt_retry_binding_digest(request)?;
-        let mut connection = self.lock()?;
+        let validation_receipt_jcs = jcs_string(validation_receipt)?;
+        let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         let existing = read_operation(&transaction, &request.operation_id)?;
         let snapshot = if let Some(existing) = existing {
@@ -680,25 +916,41 @@ impl BrokerJournal {
                 )
                 .into());
             }
+            let retained: String = transaction.query_row(
+                "SELECT validation_receipt_jcs FROM operations WHERE operation_id=?1",
+                [request.operation_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if retained != validation_receipt_jcs {
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "retry changed the signed Broker validation receipt",
+                )
+                .into());
+            }
             existing
         } else {
             transaction.execute(
                 "INSERT INTO operations(
-                    operation_id, operation_digest, retry_binding_digest, state, is_batch
-                 ) VALUES (?1, ?2, ?3, 'RECEIVED', ?4)",
+                    operation_id, operation_digest, retry_binding_digest, state, is_batch,
+                    validation_receipt_jcs
+                 ) VALUES (?1, ?2, ?3, 'RECEIVED', ?4, ?5)",
                 params![
                     request.operation_id.as_str(),
                     request.operation_digest.as_str(),
                     retry_binding_digest.as_str(),
-                    is_batch
+                    is_batch,
+                    validation_receipt_jcs
                 ],
             )?;
-            append_audit(
+            self.append_audit_transaction(
                 &transaction,
                 "operation.received",
                 &serde_json::json!({
+                    "correlation_schema": "v1",
                     "operation_id": request.operation_id,
                     "operation_digest": request.operation_digest,
+                    "validation_receipt_digest": request.validation_receipt_digest,
                     "is_batch": is_batch
                 }),
                 self.audit_signer.as_ref(),
@@ -740,6 +992,8 @@ impl BrokerJournal {
             ],
         )?;
         transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
         self.after_durable(DurablePoint::OperationReceived)?;
         Ok(snapshot)
     }
@@ -752,12 +1006,28 @@ impl BrokerJournal {
         read_operation(&connection, operation_id)
     }
 
+    pub fn validation_receipt(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<BrokerValidationReceipt>, JournalError> {
+        self.lock()?
+            .query_row(
+                "SELECT validation_receipt_jcs FROM operations WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .map(|canonical| serde_json::from_str(&canonical).map_err(storage))
+            .transpose()
+    }
+
     pub fn transition_operation(
         &self,
         operation_id: &OperationId,
         next: OperationState,
     ) -> Result<(), JournalError> {
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         let current = read_operation(&transaction, operation_id)?
             .ok_or_else(|| protocol(ProtocolErrorCode::ApprovalNotFound, "operation not found"))?;
@@ -772,13 +1042,15 @@ impl BrokerJournal {
             "UPDATE operations SET state = ?2 WHERE operation_id = ?1",
             params![operation_id.as_str(), operation_state_text(next)?],
         )?;
-        append_audit(
+        self.append_audit_transaction(
             &transaction,
             "operation.transition",
             &serde_json::json!({"operation_id": operation_id, "from": current.state, "to": next}),
             self.audit_signer.as_ref(),
         )?;
         transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
         self.after_durable(DurablePoint::OperationTransition)
     }
 
@@ -794,7 +1066,7 @@ impl BrokerJournal {
             )
             .into());
         }
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         let approval_state: Option<String> = transaction
             .query_row(
@@ -821,6 +1093,8 @@ impl BrokerJournal {
             if existing == ReservationState::Reserved {
                 if reservation_matches(&transaction, request)? {
                     transaction.commit()?;
+                    drop(connection);
+                    self.checkpoint_committed_head()?;
                     return Ok(());
                 }
                 return Err(protocol(
@@ -914,7 +1188,7 @@ impl BrokerJournal {
                 ],
             )?;
         }
-        append_audit(
+        self.append_audit_transaction(
             &transaction,
             "reservation.created",
             &serde_json::json!({
@@ -927,6 +1201,8 @@ impl BrokerJournal {
             self.audit_signer.as_ref(),
         )?;
         transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
         self.after_durable(DurablePoint::ReservationCreated)
     }
 
@@ -943,7 +1219,7 @@ impl BrokerJournal {
             )
             .into());
         }
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         let current: Option<String> = transaction
             .query_row(
@@ -957,6 +1233,8 @@ impl BrokerJournal {
             Some("RESERVED") => {}
             Some(value) if value == next.as_str() => {
                 transaction.commit()?;
+                drop(connection);
+                self.checkpoint_committed_head()?;
                 return Ok(());
             }
             _ => {
@@ -972,7 +1250,7 @@ impl BrokerJournal {
              WHERE approval_id = ?1 AND operation_id = ?2",
             params![approval_id.as_str(), operation_id.as_str(), next.as_str()],
         )?;
-        append_audit(
+        self.append_audit_transaction(
             &transaction,
             "reservation.finalized",
             &serde_json::json!({
@@ -983,6 +1261,8 @@ impl BrokerJournal {
             self.audit_signer.as_ref(),
         )?;
         transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
         self.after_durable(DurablePoint::ReservationFinalized)
     }
 
@@ -1027,7 +1307,7 @@ impl BrokerJournal {
         approval_id: &Digest32,
         result: &SigningResult,
     ) -> Result<(), JournalError> {
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         let operation = read_operation(&transaction, &result.operation_id)?
             .ok_or_else(|| protocol(ProtocolErrorCode::ApprovalNotFound, "operation not found"))?;
@@ -1045,6 +1325,8 @@ impl BrokerJournal {
                     == Some(ReservationState::Committed)
             {
                 transaction.commit()?;
+                drop(connection);
+                self.checkpoint_committed_head()?;
                 return Ok(());
             }
             return Err(protocol(
@@ -1061,6 +1343,16 @@ impl BrokerJournal {
             .into());
         }
         require_reserved(&transaction, approval_id, &result.operation_id)?;
+        let validation_receipt = retained_validation_receipt(&transaction, &result.operation_id)?;
+        if validation_receipt.approval_id != *approval_id
+            || validation_receipt.operation_digest != result.operation_digest
+        {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "published result differs from its retained Broker validation receipt",
+            )
+            .into());
+        }
         transaction.execute(
             "UPDATE operations SET state = 'SUCCEEDED', result_jcs = ?2
              WHERE operation_id = ?1",
@@ -1071,17 +1363,25 @@ impl BrokerJournal {
              WHERE approval_id = ?1 AND operation_id = ?2",
             params![approval_id.as_str(), result.operation_id.as_str()],
         )?;
-        append_audit(
+        self.append_audit_transaction(
             &transaction,
             "operation.published",
             &serde_json::json!({
                 "approval_id": approval_id,
                 "operation_id": result.operation_id,
+                "operation_digest": result.operation_digest,
+                "result_digest": Digest32::from_bytes(Sha256::digest(result_jcs.as_bytes()).into()),
+                "signer_receipt_digest": result.signer_receipt_digest,
+                "broker_receipt_digest": result.broker_receipt_digest,
+                "validation_receipt_digest": validation_receipt.digest()?,
                 "reservation_state": "COMMITTED"
+                ,"correlation_schema": "v1"
             }),
             self.audit_signer.as_ref(),
         )?;
         transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
         self.after_durable(DurablePoint::OperationTransition)
     }
 
@@ -1109,7 +1409,7 @@ impl BrokerJournal {
                 .into());
             }
         }
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         let parent =
             read_operation(&transaction, &parent_result.operation_id)?.ok_or_else(|| {
@@ -1154,6 +1454,8 @@ impl BrokerJournal {
             {
                 drop(statement);
                 transaction.commit()?;
+                drop(connection);
+                self.checkpoint_committed_head()?;
                 return Ok(());
             }
             return Err(protocol(
@@ -1170,6 +1472,17 @@ impl BrokerJournal {
             .into());
         }
         require_reserved(&transaction, approval_id, &parent_result.operation_id)?;
+        let validation_receipt =
+            retained_validation_receipt(&transaction, &parent_result.operation_id)?;
+        if validation_receipt.approval_id != *approval_id
+            || validation_receipt.operation_digest != parent_result.operation_digest
+        {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "batch result differs from its retained Broker validation receipt",
+            )
+            .into());
+        }
         for (ordinal, child) in child_results.iter().enumerate() {
             transaction.execute(
                 "INSERT INTO batch_children(
@@ -1193,18 +1506,37 @@ impl BrokerJournal {
              WHERE approval_id = ?1 AND operation_id = ?2",
             params![approval_id.as_str(), parent_result.operation_id.as_str()],
         )?;
-        append_audit(
+        self.append_audit_transaction(
             &transaction,
             "batch.published",
             &serde_json::json!({
                 "approval_id": approval_id,
                 "parent_operation_id": parent_result.operation_id,
+                "parent_operation_digest": parent_result.operation_digest,
+                "parent_result_digest": Digest32::from_bytes(Sha256::digest(parent_jcs.as_bytes()).into()),
+                "parent_signer_receipt_digest": parent_result.signer_receipt_digest,
+                "parent_broker_receipt_digest": parent_result.broker_receipt_digest,
+                "validation_receipt_digest": validation_receipt.digest()?,
+                "children": child_results.iter().enumerate().map(|(ordinal, child)| {
+                    let canonical = jcs_string(child).expect("validated SigningResult serializes");
+                    serde_json::json!({
+                        "ordinal": ordinal,
+                        "operation_id": child.operation_id,
+                        "operation_digest": child.operation_digest,
+                        "result_digest": Digest32::from_bytes(Sha256::digest(canonical.as_bytes()).into()),
+                        "signer_receipt_digest": child.signer_receipt_digest,
+                        "broker_receipt_digest": child.broker_receipt_digest
+                    })
+                }).collect::<Vec<_>>(),
                 "child_count": child_results.len(),
-                "reservation_state": "COMMITTED"
+                "reservation_state": "COMMITTED",
+                "correlation_schema": "v1"
             }),
             self.audit_signer.as_ref(),
         )?;
         transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
         self.after_durable(DurablePoint::BatchPublished)
     }
 
@@ -1287,33 +1619,12 @@ impl BrokerJournal {
     }
 
     pub fn verify_audit_chain(&self) -> Result<(), JournalError> {
-        let mut expected_previous = Digest32::new("00".repeat(32))?;
-        for entry in self.audit_entries()? {
-            if entry.previous_hash != expected_previous
-                || compute_audit_hash(
-                    entry.sequence,
-                    &entry.event_type,
-                    &entry.payload_jcs,
-                    &entry.previous_hash,
-                ) != entry.entry_hash
-                || self
-                    .audit_signer
-                    .verify(
-                        &entry.signing_key_id,
-                        &audit_signature_message(&entry.entry_hash),
-                        &entry.signature,
-                    )
-                    .is_err()
-            {
-                return Err(protocol(
-                    ProtocolErrorCode::MalformedFrame,
-                    "audit hash chain verification failed",
-                )
-                .into());
-            }
-            expected_previous = entry.entry_hash;
+        let connection = self.lock()?;
+        let result = verify_audit_chain_connection(&connection, self.audit_signer.as_ref());
+        if result.is_err() {
+            self.audit_degraded.store(true, Ordering::SeqCst);
         }
-        Ok(())
+        result
     }
 
     pub fn observe_time(
@@ -1322,7 +1633,7 @@ impl BrokerJournal {
         max_forward_step_ms: u64,
         rate_limited_mutation: bool,
     ) -> Result<ClockDecision, JournalError> {
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         let decision = |effective_now_ms, condition| ClockDecision {
             effective_now_ms,
@@ -1352,7 +1663,7 @@ impl BrokerJournal {
                 &reading,
             )?;
             if stored_condition != Some("UNTRUSTED") {
-                append_audit(
+                self.append_audit_transaction(
                     &transaction,
                     "clock.untrusted",
                     &serde_json::json!({
@@ -1365,6 +1676,8 @@ impl BrokerJournal {
                 )?;
             }
             transaction.commit()?;
+            drop(connection);
+            self.checkpoint_committed_head()?;
             if rate_limited_mutation {
                 return Err(protocol(
                     ProtocolErrorCode::ClockUntrusted,
@@ -1380,7 +1693,7 @@ impl BrokerJournal {
             .transpose()?
         else {
             write_clock_state(&transaction, utc_ms, ClockCondition::Healthy, &reading)?;
-            append_audit(
+            self.append_audit_transaction(
                 &transaction,
                 "clock.initialized",
                 &serde_json::json!({
@@ -1392,6 +1705,8 @@ impl BrokerJournal {
                 self.audit_signer.as_ref(),
             )?;
             transaction.commit()?;
+            drop(connection);
+            self.checkpoint_committed_head()?;
             return Ok(decision(utc_ms, ClockCondition::Healthy));
         };
         let monotonic_now = last_effective_ms
@@ -1410,7 +1725,7 @@ impl BrokerJournal {
                 &reading,
             )?;
             if stored_condition != Some("ROLLBACK_FROZEN") {
-                append_audit(
+                self.append_audit_transaction(
                     &transaction,
                     "clock.rollback",
                     &serde_json::json!({
@@ -1423,6 +1738,8 @@ impl BrokerJournal {
                 )?;
             }
             transaction.commit()?;
+            drop(connection);
+            self.checkpoint_committed_head()?;
             if rate_limited_mutation {
                 return Err(protocol(
                     ProtocolErrorCode::ClockRollback,
@@ -1441,7 +1758,7 @@ impl BrokerJournal {
                 &reading,
             )?;
             if stored_condition != Some("FORWARD_JUMP_REJECTED") {
-                append_audit(
+                self.append_audit_transaction(
                     &transaction,
                     "clock.forward_jump",
                     &serde_json::json!({
@@ -1454,6 +1771,8 @@ impl BrokerJournal {
                 )?;
             }
             transaction.commit()?;
+            drop(connection);
+            self.checkpoint_committed_head()?;
             return Ok(decision(monotonic_now, ClockCondition::ForwardJumpRejected));
         }
         let effective_now_ms = utc_ms.max(monotonic_now);
@@ -1464,11 +1783,13 @@ impl BrokerJournal {
             &reading,
         )?;
         transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
         Ok(decision(effective_now_ms, ClockCondition::Healthy))
     }
 
     pub fn repair_clock(&self, accepted_utc_ms: u64) -> Result<ClockDecision, JournalError> {
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         let prior: Option<(String, String, String)> = transaction
             .query_row(
@@ -1504,7 +1825,7 @@ impl BrokerJournal {
             ClockCondition::Repaired,
             &reading,
         )?;
-        append_audit(
+        self.append_audit_transaction(
             &transaction,
             "clock.repaired",
             &serde_json::json!({
@@ -1516,6 +1837,8 @@ impl BrokerJournal {
             self.audit_signer.as_ref(),
         )?;
         transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
         Ok(ClockDecision {
             effective_now_ms: accepted_utc_ms,
             condition: ClockCondition::Repaired,
@@ -1553,6 +1876,131 @@ impl BrokerJournal {
         self.connection
             .lock()
             .map_err(|_| JournalError::Storage("journal mutex poisoned".into()))
+    }
+
+    fn lock_for_mutation(&self) -> Result<MutexGuard<'_, Connection>, JournalError> {
+        if self.audit_degraded.load(Ordering::SeqCst) {
+            return Err(audit_degraded());
+        }
+        let connection = self.lock()?;
+        if let Err(error) = verify_audit_chain_connection(&connection, self.audit_signer.as_ref()) {
+            self.audit_degraded.store(true, Ordering::SeqCst);
+            return Err(error);
+        }
+        Ok(connection)
+    }
+
+    pub(crate) fn shared_connection(&self) -> Arc<Mutex<Connection>> {
+        self.connection.clone()
+    }
+
+    pub(crate) fn verify_before_external_mutation(
+        &self,
+        connection: &Connection,
+    ) -> Result<(), JournalError> {
+        if self.audit_degraded.load(Ordering::SeqCst) {
+            return Err(audit_degraded());
+        }
+        if let Err(error) = verify_audit_chain_connection(connection, self.audit_signer.as_ref()) {
+            self.audit_degraded.store(true, Ordering::SeqCst);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn append_external_audit(
+        &self,
+        transaction: &Transaction<'_>,
+        event_type: &str,
+        payload: &impl Serialize,
+    ) -> Result<(), JournalError> {
+        self.append_audit_transaction(transaction, event_type, payload, self.audit_signer.as_ref())
+    }
+
+    fn append_audit_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        event_type: &str,
+        payload: &impl Serialize,
+        audit_signer: &dyn AuditSigner,
+    ) -> Result<(), JournalError> {
+        append_audit(transaction, event_type, payload, audit_signer)?;
+        Ok(())
+    }
+
+    /// Persist the fully committed local head. This must run only after the
+    /// SQLite transaction commits: checkpointing a speculative transaction
+    /// can retain a head for a rollback and permanently reject the next
+    /// legitimate mutation as a sequence rollback.
+    pub(crate) fn checkpoint_committed_head(&self) -> Result<(), JournalError> {
+        // Keep the journal mutex until the independently durable append has
+        // completed. Otherwise mutation A can read head N, mutation B can
+        // commit and checkpoint N+1, and then A can publish stale head N. The
+        // checkpoint store correctly rejects that ordering as a rollback.
+        let connection = self.lock()?;
+        if let Err(error) = verify_audit_chain_connection(&connection, self.audit_signer.as_ref()) {
+            self.audit_degraded.store(true, Ordering::SeqCst);
+            return Err(error);
+        }
+        let (sequence, head_hash) = connection
+            .query_row(
+                "SELECT sequence, entry_hash FROM audit_chain ORDER BY sequence DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(
+                |(sequence, hash)| -> Result<(u64, Digest32), JournalError> {
+                    Ok((
+                        u64::try_from(sequence)
+                            .map_err(storage)?
+                            .checked_add(1)
+                            .ok_or_else(|| JournalError::Storage("audit head overflow".into()))?,
+                        Digest32::new(hash)?,
+                    ))
+                },
+            )
+            .transpose()?
+            .unwrap_or_else(|| {
+                (
+                    0,
+                    Digest32::new("00".repeat(32)).expect("fixed zero digest is valid"),
+                )
+            });
+        let installed = self
+            .self_checkpoint
+            .lock()
+            .map_err(|_| storage("Broker self-checkpoint mutex poisoned"))?
+            .clone();
+        if let Some(installed) = installed {
+            let signed_head = sign_journal_head(&installed.identity, sequence, head_hash);
+            if let Err(error) = installed.checkpoints.append_peer_head(&signed_head) {
+                self.audit_degraded.store(true, Ordering::SeqCst);
+                let retained = installed
+                    .checkpoints
+                    .latest_peer_head(&signed_head.service_id)
+                    .ok()
+                    .flatten()
+                    .map(|head| {
+                        format!(
+                            "{}:{}:{}:{}",
+                            head.service_id,
+                            head.key_id,
+                            head.sequence.get(),
+                            head.head_hash
+                        )
+                    })
+                    .unwrap_or_else(|| "none".into());
+                return Err(storage(format!(
+                    "persist Broker self-checkpoint before publishing mutation success: {error}; attempted={}:{}:{}:{} retained={retained}",
+                    signed_head.service_id,
+                    signed_head.key_id,
+                    signed_head.sequence.get(),
+                    signed_head.head_hash
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn after_durable(&self, point: DurablePoint) -> Result<(), JournalError> {
@@ -1634,7 +2082,7 @@ fn append_audit(
     event_type: &str,
     payload: &impl Serialize,
     audit_signer: &dyn AuditSigner,
-) -> Result<(), JournalError> {
+) -> Result<(u64, Digest32), JournalError> {
     let (sequence, previous_hash) = transaction
         .query_row(
             "SELECT sequence, entry_hash FROM audit_chain ORDER BY sequence DESC LIMIT 1",
@@ -1666,11 +2114,294 @@ fn append_audit(
             signature.encoded()
         ],
     )?;
+    Ok((sequence + 1, entry_hash))
+}
+
+fn verify_audit_chain_connection(
+    connection: &Connection,
+    audit_signer: &dyn AuditSigner,
+) -> Result<(), JournalError> {
+    let mut statement = connection.prepare(
+        "SELECT sequence, event_type, payload_jcs, previous_hash, entry_hash,
+                signing_key_id, signature
+         FROM audit_chain ORDER BY sequence",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut expected_sequence = 0_u64;
+    let mut expected_previous = Digest32::new("00".repeat(32))?;
+    let mut expected_key_id: Option<Token> = None;
+    let mut pending_rotation: Option<(Token, Token, Digest32)> = None;
+    for row in rows {
+        let (sequence, event_type, payload_jcs, previous_hash, entry_hash, key_id, signature) =
+            row?;
+        let sequence = u64::try_from(sequence).map_err(storage)?;
+        let previous_hash = Digest32::new(previous_hash)?;
+        let entry_hash = Digest32::new(entry_hash)?;
+        let key_id = Token::new(key_id)?;
+        let signature = Base64UrlBytes::parse(signature)?;
+        if expected_key_id.is_none() {
+            expected_key_id = Some(key_id.clone());
+        }
+        if sequence != expected_sequence
+            || previous_hash != expected_previous
+            || compute_audit_hash(sequence, &event_type, &payload_jcs, &previous_hash) != entry_hash
+            || expected_key_id.as_ref() != Some(&key_id)
+            || audit_signer
+                .verify(&key_id, &audit_signature_message(&entry_hash), &signature)
+                .is_err()
+        {
+            return Err(audit_degraded());
+        }
+        verify_audit_correlation(connection, &event_type, &payload_jcs)?;
+        if pending_rotation.is_some() && event_type != "audit.key_rotation_completed" {
+            return Err(audit_degraded());
+        }
+        if event_type == "audit.key_rotated" {
+            #[derive(Deserialize)]
+            struct Rotation {
+                old_key_id: Token,
+                new_key_id: Token,
+                prior_head: Digest32,
+                new_key_confirmation: Base64UrlBytes,
+            }
+            let rotation: Rotation = serde_json::from_str(&payload_jcs).map_err(storage)?;
+            if rotation.old_key_id != key_id
+                || rotation.prior_head != previous_hash
+                || rotation.new_key_id == rotation.old_key_id
+                || audit_signer
+                    .verify(
+                        &rotation.new_key_id,
+                        &audit_rotation_message(
+                            &rotation.old_key_id,
+                            &rotation.new_key_id,
+                            &rotation.prior_head,
+                        ),
+                        &rotation.new_key_confirmation,
+                    )
+                    .is_err()
+            {
+                return Err(audit_degraded());
+            }
+            pending_rotation = Some((
+                rotation.old_key_id.clone(),
+                rotation.new_key_id.clone(),
+                entry_hash.clone(),
+            ));
+            expected_key_id = Some(rotation.new_key_id);
+        } else if event_type == "audit.key_rotation_completed" {
+            #[derive(Deserialize)]
+            struct Completion {
+                old_key_id: Token,
+                new_key_id: Token,
+                final_old_head: Digest32,
+            }
+            let completion: Completion =
+                serde_json::from_str(&payload_jcs).map_err(|_| audit_degraded())?;
+            let Some((old_key_id, new_key_id, final_old_head)) = pending_rotation.take() else {
+                return Err(audit_degraded());
+            };
+            if completion.old_key_id != old_key_id
+                || completion.new_key_id != new_key_id
+                || completion.new_key_id != key_id
+                || completion.old_key_id == completion.new_key_id
+                || completion.final_old_head != final_old_head
+                || completion.final_old_head != previous_hash
+            {
+                return Err(audit_degraded());
+            }
+        }
+        expected_sequence = expected_sequence
+            .checked_add(1)
+            .ok_or_else(|| JournalError::Storage("audit sequence overflow".into()))?;
+        expected_previous = entry_hash;
+    }
+    if pending_rotation.is_some()
+        || expected_key_id
+            .as_ref()
+            .is_some_and(|expected| expected != &audit_signer.key_id())
+    {
+        return Err(audit_degraded());
+    }
     Ok(())
+}
+
+fn verify_audit_correlation(
+    connection: &Connection,
+    event_type: &str,
+    payload_jcs: &str,
+) -> Result<(), JournalError> {
+    let payload: serde_json::Value =
+        serde_json::from_str(payload_jcs).map_err(|_| audit_degraded())?;
+    if payload
+        .get("correlation_schema")
+        .and_then(|value| value.as_str())
+        != Some("v1")
+    {
+        return Ok(());
+    }
+    let correlated = match event_type {
+        "operation.received" => {
+            let operation_id = payload
+                .get("operation_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(audit_degraded)?;
+            let operation_id =
+                OperationId::new(operation_id.to_owned()).map_err(|_| audit_degraded())?;
+            let validation_receipt = retained_validation_receipt(connection, &operation_id)?;
+            payload.get("operation_digest")
+                == Some(&serde_json::json!(validation_receipt.operation_digest))
+                && payload.get("validation_receipt_digest")
+                    == Some(&serde_json::json!(validation_receipt.digest()?))
+        }
+        "operation.published" => {
+            let operation_id = payload
+                .get("operation_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(audit_degraded)?;
+            let result_jcs: String = connection
+                .query_row(
+                    "SELECT result_jcs FROM operations WHERE operation_id=?1",
+                    [operation_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| audit_degraded())?;
+            let result: SigningResult =
+                serde_json::from_str(&result_jcs).map_err(|_| audit_degraded())?;
+            let validation_receipt = retained_validation_receipt(
+                connection,
+                &OperationId::new(operation_id.to_owned()).map_err(|_| audit_degraded())?,
+            )?;
+            payload.get("operation_digest") == Some(&serde_json::json!(result.operation_digest))
+                && payload.get("result_digest")
+                    == Some(&serde_json::json!(Digest32::from_bytes(
+                        Sha256::digest(result_jcs.as_bytes()).into()
+                    )))
+                && payload.get("signer_receipt_digest")
+                    == Some(&serde_json::json!(result.signer_receipt_digest))
+                && payload.get("broker_receipt_digest")
+                    == Some(&serde_json::json!(result.broker_receipt_digest))
+                && payload.get("validation_receipt_digest")
+                    == Some(&serde_json::json!(validation_receipt.digest()?))
+        }
+        "batch.published" => {
+            let parent_id = payload
+                .get("parent_operation_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(audit_degraded)?;
+            let parent_jcs: String = connection
+                .query_row(
+                    "SELECT result_jcs FROM operations WHERE operation_id=?1",
+                    [parent_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| audit_degraded())?;
+            let parent: SigningResult =
+                serde_json::from_str(&parent_jcs).map_err(|_| audit_degraded())?;
+            let validation_receipt = retained_validation_receipt(
+                connection,
+                &OperationId::new(parent_id.to_owned()).map_err(|_| audit_degraded())?,
+            )?;
+            let mut statement = connection
+                .prepare(
+                    "SELECT ordinal, result_jcs FROM batch_children
+                     WHERE parent_operation_id=?1 ORDER BY ordinal",
+                )
+                .map_err(|_| audit_degraded())?;
+            let rows = statement
+                .query_map([parent_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|_| audit_degraded())?;
+            let mut children = Vec::new();
+            for row in rows {
+                let (ordinal, canonical) = row.map_err(|_| audit_degraded())?;
+                let child: SigningResult =
+                    serde_json::from_str(&canonical).map_err(|_| audit_degraded())?;
+                children.push(serde_json::json!({
+                    "ordinal": ordinal,
+                    "operation_id": child.operation_id,
+                    "operation_digest": child.operation_digest,
+                    "result_digest": Digest32::from_bytes(Sha256::digest(canonical.as_bytes()).into()),
+                    "signer_receipt_digest": child.signer_receipt_digest,
+                    "broker_receipt_digest": child.broker_receipt_digest
+                }));
+            }
+            payload.get("parent_operation_digest")
+                == Some(&serde_json::json!(parent.operation_digest))
+                && payload.get("parent_result_digest")
+                    == Some(&serde_json::json!(Digest32::from_bytes(
+                        Sha256::digest(parent_jcs.as_bytes()).into()
+                    )))
+                && payload.get("parent_signer_receipt_digest")
+                    == Some(&serde_json::json!(parent.signer_receipt_digest))
+                && payload.get("parent_broker_receipt_digest")
+                    == Some(&serde_json::json!(parent.broker_receipt_digest))
+                && payload.get("validation_receipt_digest")
+                    == Some(&serde_json::json!(validation_receipt.digest()?))
+                && payload.get("children") == Some(&serde_json::Value::Array(children))
+        }
+        "approval.transition"
+            if payload.get("to").and_then(|value| value.as_str()) == Some("ACTIVE") =>
+        {
+            let approval_id = payload
+                .get("approval_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(audit_degraded)?;
+            let receipt_jcs: String = connection
+                .query_row(
+                    "SELECT ceremony_grant_jcs FROM approval_metadata WHERE approval_id=?1",
+                    [approval_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| audit_degraded())?;
+            payload.get("signer_activation_receipt_digest")
+                == Some(&serde_json::json!(Digest32::from_bytes(
+                    Sha256::digest(receipt_jcs.as_bytes()).into()
+                )))
+        }
+        _ => true,
+    };
+    if correlated {
+        Ok(())
+    } else {
+        Err(audit_degraded())
+    }
+}
+
+fn audit_degraded() -> JournalError {
+    protocol(
+        ProtocolErrorCode::MalformedFrame,
+        "Broker audit chain verification failed; security mutations are disabled",
+    )
+    .into()
 }
 
 fn audit_signature_message(entry_hash: &Digest32) -> Vec<u8> {
     [AUDIT_SIGNATURE_DOMAIN, entry_hash.as_str().as_bytes()].concat()
+}
+
+fn audit_rotation_message(
+    old_key_id: &Token,
+    new_key_id: &Token,
+    prior_head: &Digest32,
+) -> Vec<u8> {
+    [
+        AUDIT_ROTATION_DOMAIN,
+        old_key_id.as_str().as_bytes(),
+        new_key_id.as_str().as_bytes(),
+        prior_head.as_str().as_bytes(),
+    ]
+    .concat()
 }
 
 fn write_clock_state(
@@ -1756,6 +2487,20 @@ fn read_operation(
         })
     })
     .transpose()
+}
+
+fn retained_validation_receipt(
+    connection: &Connection,
+    operation_id: &OperationId,
+) -> Result<BrokerValidationReceipt, JournalError> {
+    let canonical: String = connection
+        .query_row(
+            "SELECT validation_receipt_jcs FROM operations WHERE operation_id=?1",
+            [operation_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|_| audit_degraded())?;
+    serde_json::from_str(&canonical).map_err(|_| audit_degraded())
 }
 
 fn reservation_state(

@@ -20,7 +20,11 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Barrier, mpsc},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 
@@ -41,6 +45,35 @@ impl AuditSigner for TestAuditSigner {
 
     fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String> {
         Ok(Base64UrlBytes::from_bytes(&Sha256::digest(message)))
+    }
+
+    fn verify(
+        &self,
+        key_id: &Token,
+        message: &[u8],
+        signature: &Base64UrlBytes,
+    ) -> Result<(), String> {
+        if key_id == &self.key_id() && signature.decode() == Sha256::digest(message).as_slice() {
+            Ok(())
+        } else {
+            Err("audit signature mismatch".into())
+        }
+    }
+}
+
+struct SwitchableAuditSigner(Arc<AtomicBool>);
+
+impl AuditSigner for SwitchableAuditSigner {
+    fn key_id(&self) -> Token {
+        token("audit-key")
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String> {
+        if self.0.load(Ordering::SeqCst) {
+            Err("forced authority audit failure".into())
+        } else {
+            Ok(Base64UrlBytes::from_bytes(&Sha256::digest(message)))
+        }
     }
 
     fn verify(
@@ -129,6 +162,7 @@ fn authority_fields() -> Vec<Token> {
 
 struct Harness {
     authority: BrokerAuthority,
+    journal: Arc<BrokerJournal>,
     policy_key: SigningKey,
     installer_key: SigningKey,
     ceremony_key: SigningKey,
@@ -155,7 +189,7 @@ impl Harness {
             (token("policy-key"), policy_key.verifying_key()),
         );
         let authority = BrokerAuthority::open_in_memory(
-            journal,
+            journal.clone(),
             policy_keys,
             token("installer-key"),
             installer_key.verifying_key(),
@@ -168,6 +202,7 @@ impl Harness {
         .unwrap();
         let harness = Self {
             authority,
+            journal,
             policy_key,
             installer_key,
             ceremony_key,
@@ -308,6 +343,283 @@ impl Harness {
 }
 
 #[test]
+fn ac18_wallet_delete_fails_closed_under_audit_degradation() {
+    let harness = Harness::new();
+    let baseline = harness
+        .authority
+        .policy_snapshot(&harness.wallet)
+        .expect("baseline policy");
+    let mut receipt = CustodyResult {
+        ceremony_kind: CeremonyKind::WalletDelete,
+        custody_operation_id: operation(90),
+        public_status: CeremonyState::Completed,
+        wallet_id: Some(harness.wallet.clone()),
+        public_key_refs: Vec::new(),
+        credential_summaries: Vec::new(),
+        initial_policy: None,
+        receipt_digest: digest(90),
+        encrypted_browser_result: None,
+        signer_key_id: token("ceremony-key"),
+        signer_signature: Base64UrlBytes::from_bytes(&[]),
+    };
+    sign_custody_receipt(&mut receipt, &harness.ceremony_key);
+    harness.journal.latch_audit_degradation();
+
+    assert!(
+        harness
+            .authority
+            .adopt_custody_receipt(&receipt, 1_000)
+            .is_err()
+    );
+    assert_eq!(
+        harness.authority.policy_snapshot(&harness.wallet).unwrap(),
+        baseline,
+        "audit degradation must not delete the public policy projection"
+    );
+}
+
+#[test]
+fn ac18_forced_authority_audit_write_failure_rolls_back_quota_effect() {
+    let fail = Arc::new(AtomicBool::new(true));
+    let journal = Arc::new(
+        BrokerJournal::open_in_memory(Arc::new(SwitchableAuditSigner(fail.clone()))).unwrap(),
+    );
+    let authority = BrokerAuthority::open_in_memory(
+        journal.clone(),
+        BTreeMap::new(),
+        token("installer-key"),
+        SigningKey::from_bytes(&[2; 32]).verifying_key(),
+        token("ceremony-key"),
+        SigningKey::from_bytes(&[3; 32]).verifying_key(),
+        token("revocation-key"),
+        SigningKey::from_bytes(&[4; 32]).verifying_key(),
+        AssuranceRegistry::compiled(vec![]).unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        authority
+            .consume_mutation_quota("machine-501", 1_000, 60_000, 1)
+            .is_err()
+    );
+    assert!(journal.audit_entries().unwrap().is_empty());
+
+    fail.store(false, Ordering::SeqCst);
+    authority
+        .consume_mutation_quota("machine-501", 1_000, 60_000, 1)
+        .unwrap();
+    assert_eq!(journal.audit_entries().unwrap().len(), 1);
+    assert!(
+        authority
+            .consume_mutation_quota("machine-501", 1_001, 60_000, 1)
+            .is_err(),
+        "the failed audited mutation must not have consumed quota"
+    );
+}
+
+#[test]
+fn ac18_authority_reads_survive_latched_audit_tamper_while_mutations_fail() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("journal.sqlite");
+    let authority_path = directory.path().join("authority.sqlite");
+    let open = || {
+        let journal = Arc::new(
+            BrokerJournal::open(&journal_path, Arc::new(TestAuditSigner)).expect("journal"),
+        );
+        let authority = BrokerAuthority::open(
+            &authority_path,
+            journal.clone(),
+            BTreeMap::new(),
+            token("installer-key"),
+            SigningKey::from_bytes(&[2; 32]).verifying_key(),
+            token("ceremony-key"),
+            SigningKey::from_bytes(&[3; 32]).verifying_key(),
+            token("revocation-key"),
+            SigningKey::from_bytes(&[4; 32]).verifying_key(),
+            AssuranceRegistry::compiled(vec![]).unwrap(),
+        )
+        .unwrap();
+        (journal, authority)
+    };
+    let (journal, authority) = open();
+    authority
+        .consume_mutation_quota("machine-501", 1_000, 60_000, 2)
+        .unwrap();
+    drop(authority);
+    drop(journal);
+
+    rusqlite::Connection::open(&journal_path)
+        .unwrap()
+        .execute(
+            "UPDATE audit_chain SET signing_key_id='foreign-key' WHERE sequence=0",
+            [],
+        )
+        .unwrap();
+    let (degraded_journal, degraded_authority) = open();
+    assert!(degraded_journal.audit_degraded());
+    assert_eq!(
+        degraded_authority
+            .wallet_epoch(&token("wallet-read-only"))
+            .unwrap(),
+        0
+    );
+    assert!(
+        degraded_authority
+            .consume_mutation_quota("machine-501", 1_001, 60_000, 2)
+            .is_err()
+    );
+}
+
+#[test]
+fn ac18_populated_authority_migration_is_atomic_idempotent_and_retains_source() {
+    let directory = tempfile::tempdir().unwrap();
+    let legacy_path = directory.path().join("legacy-authority.sqlite");
+    let journal_path = directory.path().join("journal.sqlite");
+    let legacy = rusqlite::Connection::open(&legacy_path).unwrap();
+    legacy
+        .execute_batch(
+            "CREATE TABLE policies(wallet_id TEXT PRIMARY KEY, version TEXT NOT NULL, digest TEXT NOT NULL, snapshot_jcs TEXT NOT NULL, policy_jcs TEXT NOT NULL);
+             CREATE TABLE wallet_epochs(wallet_id TEXT PRIMARY KEY, epoch TEXT NOT NULL, reconciled INTEGER NOT NULL);
+             CREATE TABLE provenance_catalog(subject_jcs TEXT PRIMARY KEY, record_digest TEXT NOT NULL, record_jcs TEXT NOT NULL);
+             CREATE TABLE mutation_quota(principal TEXT PRIMARY KEY, window_started_ms TEXT NOT NULL, mutations TEXT NOT NULL);
+             CREATE TABLE signer_approval_tombstones(approval_id TEXT PRIMARY KEY, wallet_id TEXT NOT NULL, tombstone_jcs TEXT NOT NULL);
+             CREATE TABLE pending_petal_key_scopes(custody_operation_id TEXT PRIMARY KEY, scope_digest TEXT NOT NULL, scope_jcs TEXT NOT NULL);
+             CREATE TABLE petal_key_scopes(key_ref_jcs TEXT PRIMARY KEY, scope_digest TEXT NOT NULL, scope_jcs TEXT NOT NULL, activated_at_ms TEXT NOT NULL, expires_at_ms TEXT NOT NULL, custody_receipt_digest TEXT NOT NULL);
+             INSERT INTO mutation_quota VALUES ('legacy-principal', '100', '2');",
+        )
+        .unwrap();
+    drop(legacy);
+    let source_before = std::fs::read(&legacy_path).unwrap();
+
+    let failed_target_path = directory.path().join("failed-journal.sqlite");
+    let fail = Arc::new(AtomicBool::new(false));
+    let failed_journal = Arc::new(
+        BrokerJournal::open(
+            &failed_target_path,
+            Arc::new(SwitchableAuditSigner(fail.clone())),
+        )
+        .unwrap(),
+    );
+    fail.store(true, Ordering::SeqCst);
+    assert!(
+        BrokerAuthority::open(
+            &legacy_path,
+            failed_journal.clone(),
+            BTreeMap::new(),
+            token("installer-key"),
+            SigningKey::from_bytes(&[2; 32]).verifying_key(),
+            token("ceremony-key"),
+            SigningKey::from_bytes(&[3; 32]).verifying_key(),
+            token("revocation-key"),
+            SigningKey::from_bytes(&[4; 32]).verifying_key(),
+            AssuranceRegistry::compiled(vec![]).unwrap(),
+        )
+        .is_err()
+    );
+    let failed_target = rusqlite::Connection::open(&failed_target_path).unwrap();
+    assert_eq!(
+        failed_target
+            .query_row("SELECT COUNT(*) FROM mutation_quota", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        failed_target
+            .query_row("SELECT COUNT(*) FROM broker_store_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    assert!(failed_journal.audit_entries().unwrap().is_empty());
+    assert_eq!(std::fs::read(&legacy_path).unwrap(), source_before);
+    drop(failed_target);
+    drop(failed_journal);
+
+    let open = || {
+        let journal =
+            Arc::new(BrokerJournal::open(&journal_path, Arc::new(TestAuditSigner)).unwrap());
+        let authority = BrokerAuthority::open(
+            &legacy_path,
+            journal.clone(),
+            BTreeMap::new(),
+            token("installer-key"),
+            SigningKey::from_bytes(&[2; 32]).verifying_key(),
+            token("ceremony-key"),
+            SigningKey::from_bytes(&[3; 32]).verifying_key(),
+            token("revocation-key"),
+            SigningKey::from_bytes(&[4; 32]).verifying_key(),
+            AssuranceRegistry::compiled(vec![]).unwrap(),
+        )
+        .unwrap();
+        (journal, authority)
+    };
+    let (journal, authority) = open();
+    assert!(
+        authority
+            .consume_mutation_quota("legacy-principal", 101, 1_000, 2)
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&legacy_path).unwrap(), source_before);
+    let migration_events = journal
+        .audit_entries()
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.event_type == "storage.authority_migrated")
+        .count();
+    assert_eq!(migration_events, 1);
+    drop(authority);
+    drop(journal);
+    let (journal, _authority) = open();
+    assert_eq!(
+        journal
+            .audit_entries()
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.event_type == "storage.authority_migrated")
+            .count(),
+        1
+    );
+
+    let conflict_legacy_path = directory.path().join("conflict-authority.sqlite");
+    std::fs::copy(&legacy_path, &conflict_legacy_path).unwrap();
+    let target = rusqlite::Connection::open(&journal_path).unwrap();
+    target
+        .execute(
+            "INSERT OR REPLACE INTO mutation_quota VALUES ('legacy-principal', '999', '9')",
+            [],
+        )
+        .unwrap();
+    drop(target);
+    let journal = Arc::new(BrokerJournal::open(&journal_path, Arc::new(TestAuditSigner)).unwrap());
+    assert!(
+        BrokerAuthority::open(
+            &conflict_legacy_path,
+            journal.clone(),
+            BTreeMap::new(),
+            token("installer-key"),
+            SigningKey::from_bytes(&[2; 32]).verifying_key(),
+            token("ceremony-key"),
+            SigningKey::from_bytes(&[3; 32]).verifying_key(),
+            token("revocation-key"),
+            SigningKey::from_bytes(&[4; 32]).verifying_key(),
+            AssuranceRegistry::compiled(vec![]).unwrap(),
+        )
+        .is_err()
+    );
+    let target = rusqlite::Connection::open(&journal_path).unwrap();
+    let marker: i64 = target
+        .query_row(
+            "SELECT COUNT(*) FROM broker_store_migrations WHERE source_kind='authority' AND source_path=?1",
+            [conflict_legacy_path.to_string_lossy().as_ref()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(marker, 0);
+}
+
+#[test]
 fn active_approval_survives_broker_authority_and_journal_restart() {
     let fixture = Harness::new();
     let directory = tempfile::tempdir().unwrap();
@@ -327,7 +639,7 @@ fn active_approval_survives_broker_authority_and_journal_restart() {
             fixture.wallet.as_str().to_owned(),
             (token("policy-key"), fixture.policy_key.verifying_key()),
         );
-        let authority = BrokerAuthority::open(
+        BrokerAuthority::open(
             &authority_path,
             journal,
             policy_keys,
@@ -339,8 +651,7 @@ fn active_approval_survives_broker_authority_and_journal_restart() {
             fixture.revocation_key.verifying_key(),
             AssuranceRegistry::compiled(vec![]).unwrap(),
         )
-        .expect("authority");
-        authority
+        .expect("authority")
     };
 
     {
