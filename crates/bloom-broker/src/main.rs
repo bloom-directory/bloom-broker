@@ -341,14 +341,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .latest_peer_head(&identity.service_id)?
             .is_some()
     {
-        if let Err(error) = require_signer_head_exchange(&signer).await {
-            // A peer-detected rollback must leave the authenticated listener
-            // available for readiness/status while all mutations remain
-            // latched. Periodic exchange will recover only after an operator
-            // resolves the monotonicity incident.
-            journal.latch_audit_degradation();
-            eprintln!("Bloom Broker authority-edge head exchange degraded: {error}");
-        }
+        attempt_initial_signer_head_exchange(&signer).await;
     }
     let signer_head_exchange = signer.clone();
     let ceremony = CeremonyBroker::open_with_manifest_signer_audited(
@@ -508,6 +501,16 @@ async fn require_signer_head_exchange(signer: &BrokerSignerClient) -> Result<(),
             ProtocolErrorCode::ServiceUnavailable,
             "Signer returned the wrong journal-head readiness response",
         )),
+    }
+}
+
+async fn attempt_initial_signer_head_exchange(signer: &BrokerSignerClient) {
+    if let Err(error) = require_signer_head_exchange(signer).await {
+        // Signer may still be starting. Transport/authentication failure fails
+        // readiness and every Signer-backed mutation, but is not evidence that
+        // Broker's local audit journal is corrupt. Actual checkpoint failures
+        // latch degradation at the append site.
+        eprintln!("Bloom Broker authority-edge head exchange deferred: {error}");
     }
 }
 
@@ -1234,6 +1237,67 @@ fn verifying_key(encoded: &str) -> Result<VerifyingKey, ProtocolError> {
 #[cfg(test)]
 mod startup_failure_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn initial_signer_absence_does_not_latch_local_audit_degradation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let journal = Arc::new(
+            open_operational_audit_journal(
+                &temporary.path().join("broker.sqlite"),
+                Token::new("broker-audit-1").unwrap(),
+                SigningKey::from_bytes(&[61; 32]),
+                &[],
+                None,
+            )
+            .unwrap(),
+        );
+        let identity = LocalIdentity {
+            service_id: Token::new("bloom-broker").unwrap(),
+            boot_epoch: bloom_triad_protocol::BootEpoch::from_bytes([62; 16]),
+            application_key_id: Token::new("broker-app-1").unwrap(),
+            signing_key: Arc::new(SigningKey::from_bytes(&[63; 32])),
+        };
+        let checkpoint_root = temporary.path().join("checkpoints");
+        fs::create_dir(&checkpoint_root).unwrap();
+        fs::set_permissions(&checkpoint_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let checkpoints: Arc<dyn CheckpointSink> = Arc::new(
+            CheckpointStore::open(
+                &checkpoint_root,
+                fs::metadata(&checkpoint_root).unwrap().uid(),
+                identity.service_id.clone(),
+                [PinnedAuditKey {
+                    service_id: identity.service_id.clone(),
+                    key_id: identity.application_key_id.clone(),
+                    verifying_key: identity.signing_key.verifying_key(),
+                }],
+            )
+            .unwrap(),
+        );
+        journal
+            .install_self_checkpoint(identity.clone(), checkpoints.clone())
+            .unwrap();
+        assert!(!journal.audit_degraded());
+        let signer_key = SigningKey::from_bytes(&[64; 32]);
+        let signer_acl = PeerAcl {
+            effective_uid: fs::metadata(temporary.path()).unwrap().uid(),
+            service_id: Token::new("bloom-signer").unwrap(),
+            boot_epoch: bloom_triad_protocol::BootEpoch::from_bytes([65; 16]),
+            application_key_id: Token::new("signer-app-1").unwrap(),
+            application_public_key: signer_key.verifying_key().to_bytes(),
+        };
+        let signer = BrokerSignerClient::connect_unix(
+            temporary.path().join("missing-signer.sock"),
+            identity,
+            signer_acl,
+            journal.clone(),
+            checkpoints,
+        )
+        .unwrap();
+
+        attempt_initial_signer_head_exchange(&signer).await;
+
+        assert!(!journal.audit_degraded());
+    }
 
     #[test]
     fn unchanged_machine_head_keeps_broker_rpc_checkpoint_admission_bounded() {
