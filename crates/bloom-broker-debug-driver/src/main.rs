@@ -5,11 +5,11 @@ use std::{
     path::PathBuf,
 };
 
-use bloom_broker_api::{
+use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
+use bloom_signer_api::{
     Base64UrlBytes, CeremonyChallenge, CeremonyKind, CustodyHpkeAad, CustodySignerContribution,
     Digest32, LocalPrfHpkeAad, SignerCeremonyContribution, WebAuthnCeremonyProof,
 };
-use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 
 mod artifact_scan;
 

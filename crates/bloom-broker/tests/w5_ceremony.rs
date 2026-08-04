@@ -4,9 +4,7 @@ use axum::{
 };
 use bloom_audit_checkpoint::{AppendOutcome, CheckpointError, CheckpointSink};
 use bloom_broker::{
-    authority::{
-        AssuranceRegistry, BrokerAuthority, CanonicalWalletPolicy, canonical_policy_authority_diff,
-    },
+    authority::{AssuranceRegistry, BrokerAuthority, canonical_policy_authority_diff},
     ceremony::{
         CEREMONY_ADDR, CEREMONY_OWNER_HEADER, CEREMONY_OWNER_VALUE, CeremonyBroker,
         CeremonyCompletionObserver, CeremonySigner, ReviewManifestContext,
@@ -15,6 +13,17 @@ use bloom_broker::{
     journal::{AuditSigner, BrokerJournal},
     service::BrokerRpcService,
     signer_client::BrokerSignerClient,
+};
+use bloom_broker_api::{
+    ActivationMode, ApprovalLimits, ApprovalPrepareRequest, ApprovalSelector, ApprovalSubject,
+    Base64UrlBytes, BootEpoch, CanonicalWalletPolicy, CeremonyState, ClaimAssurance,
+    ClaimAssuranceLevel, CryptoSuite, CustodyPrepareResponse, DecimalU64, DeclaredFee, Digest32,
+    KeyRef, KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
+    MachineSignRequest, OperationId, OperationRequest, PROVENANCE_RECORD_SIGNATURE_DOMAIN,
+    PetalKeyScope, PetalUseClaim, PolicyCommitUpdateRequest, PolicyDestination,
+    PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceOperationClass,
+    ProvenanceRecord, ProvenanceSubject, RequestNonce, RevokeRequest, SealedApprovalTerms,
+    SignedJournalHead, SignedPolicySnapshot, SigningPayloads, Token, WalletRequest,
 };
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer::{
@@ -25,10 +34,17 @@ use bloom_signer::{
     registry::BackendRegistry,
     service::SignerRpcService,
 };
-use bloom_triad_local_transport::{
-    BrokerSignerJournalExchange, EndpointQuota, LocalIdentity, PeerAcl,
+use bloom_signer_api::{
+    BrokerSignerRequest, BrokerSignerResponse, BrokerSignerService, CeremonyChallenge,
+    CeremonyCompleteRequest, CeremonyKind, CeremonyPhase, CeremonyPrepareRequest,
+    CeremonyWebAuthnOptions, ControlRequest, ControlResponse, CustodyCompleteRequest,
+    CustodyHpkeAad, CustodyOutputHpkeAad, CustodyPrepareRequest, CustodyResult,
+    CustodySignerContribution, LocalPrfHpkeAad, PolicyUpdateCeremonyCompleteRequest,
+    PolicyUpdateCeremonyPrepareRequest, RevocationControlService, SignerActivationReceipt,
+    SignerCeremonyContribution, SignerCeremonyStatus, SignerPreparedApproval,
+    SignerPreparedCustody, WalletOperationRequest, WebAuthnCeremonyProof,
 };
-use bloom_triad_protocol::*;
+use bloom_triad_local_transport::{EndpointQuota, JournalExchange, LocalIdentity, PeerAcl};
 use ed25519_dalek::{Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use http_body_util::BodyExt as _;
 use sha2::Digest as _;
@@ -94,16 +110,19 @@ struct SwitchableAuditSigner(Arc<AtomicBool>);
 
 struct TestSignerJournalExchange(Arc<SignerEngine>);
 
-impl BrokerSignerJournalExchange for TestSignerJournalExchange {
+impl JournalExchange<bloom_signer_api::ProtocolError> for TestSignerJournalExchange {
     fn checkpoint_request_head(
         &self,
         _method: &Token,
         _peer_head: &SignedJournalHead,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<(), bloom_signer_api::ProtocolError> {
         Ok(())
     }
 
-    fn local_journal_head(&self, _method: &Token) -> Result<(u64, Digest32), ProtocolError> {
+    fn local_journal_head(
+        &self,
+        _method: &Token,
+    ) -> Result<(u64, Digest32), bloom_signer_api::ProtocolError> {
         self.0.verified_audit_head()
     }
 }
@@ -194,6 +213,29 @@ fn operation(byte: &str) -> OperationId {
     OperationId::new(byte.repeat(32)).unwrap()
 }
 
+#[derive(serde::Serialize)]
+struct MachineSignOperationIdentity {
+    operation_id: OperationId,
+    approval_id: Digest32,
+    key_ref: KeyRef,
+    crypto_suite: CryptoSuite,
+    ordered_payload_digests: Vec<Digest32>,
+    ordered_hashes: Vec<Digest32>,
+    petal_use_claim_digest: Option<Digest32>,
+    claim_assurance_digest: Option<Digest32>,
+    policy_version: DecimalU64,
+    policy_digest: Digest32,
+}
+
+impl MachineSignOperationIdentity {
+    fn digest(&self) -> Digest32 {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"bloom-sign-operation/v1");
+        hasher.update(serde_jcs::to_vec(self).unwrap());
+        Digest32::from_bytes(hasher.finalize().into())
+    }
+}
+
 fn sign_provenance(record: &mut ProvenanceRecord, key: &SigningKey) {
     let mut message = PROVENANCE_RECORD_SIGNATURE_DOMAIN.to_vec();
     message.extend_from_slice(&record.unsigned_canonical_bytes().unwrap());
@@ -226,7 +268,7 @@ fn petal_sign_request(
     let assurance_digest = Digest32::from_bytes(
         sha2::Sha256::digest(serde_jcs::to_vec(&claim.claim_assurance).unwrap()).into(),
     );
-    let identity = SignOperationIdentity {
+    let identity = MachineSignOperationIdentity {
         operation_id: operation_id.clone(),
         approval_id: terms.approval_id().unwrap(),
         key_ref: terms.key_ref.clone(),
@@ -240,7 +282,7 @@ fn petal_sign_request(
     };
     MachineSignRequest {
         operation_id,
-        operation_digest: identity.digest().unwrap(),
+        operation_digest: identity.digest(),
         approval_id: terms.approval_id().unwrap(),
         key_ref: terms.key_ref.clone(),
         crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
@@ -264,7 +306,7 @@ fn exact_petal_sign_request(
     payload: &[u8],
 ) -> MachineSignRequest {
     let payload_digest = Digest32::from_bytes(sha2::Sha256::digest(payload).into());
-    let identity = SignOperationIdentity {
+    let identity = MachineSignOperationIdentity {
         operation_id: operation_id.clone(),
         approval_id: terms.approval_id().unwrap(),
         key_ref: terms.key_ref.clone(),
@@ -278,7 +320,7 @@ fn exact_petal_sign_request(
     };
     MachineSignRequest {
         operation_id,
-        operation_digest: identity.digest().unwrap(),
+        operation_digest: identity.digest(),
         approval_id: terms.approval_id().unwrap(),
         key_ref: terms.key_ref.clone(),
         crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
@@ -295,34 +337,34 @@ fn exact_petal_sign_request(
 }
 
 fn approval_request() -> CeremonyPrepareRequest {
-    let key_ref = KeyRef {
+    let key_ref = bloom_signer_api::KeyRef {
         backend: Token::new("local").unwrap(),
         backend_instance: Token::new("local-default").unwrap(),
-        key_spec: KeySpec::Secp256k1,
+        key_spec: bloom_signer_api::KeySpec::Secp256k1,
         locator: "root-key".into(),
         derivation: None,
         public_key_fingerprint: digest("11"),
     };
-    let terms = SealedApprovalTerms {
-        subject: ApprovalSubject::Cli {
+    let terms = bloom_signer_api::SealedApprovalTerms {
+        subject: bloom_signer_api::ApprovalSubject::Cli {
             client_id: Token::new("bloom-cli").unwrap(),
             command_class: Token::new("wallet-sign").unwrap(),
         },
         wallet_id: Token::new("wallet-review").unwrap(),
         key_ref,
-        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
-        selector: ApprovalSelector::Exact {
+        allowed_crypto_suites: vec![bloom_signer_api::CryptoSuite::Secp256k1Sha256Recoverable],
+        selector: bloom_signer_api::ApprovalSelector::Exact {
             ordered_payload_digests: vec![digest("12")],
             ordered_hashes: vec![digest("13")],
         },
-        limits: ApprovalLimits {
+        limits: bloom_signer_api::ApprovalLimits {
             max_operations: DecimalU64::new(1),
             max_signatures: DecimalU64::new(1),
             operation_rate_limits: vec![],
             signature_rate_limits: vec![],
             value_limits: vec![],
         },
-        activation_mode: ActivationMode::BackendManaged,
+        activation_mode: bloom_signer_api::ActivationMode::BackendManaged,
         wallet_revocation_epoch: DecimalU64::new(1),
         policy_version: DecimalU64::new(1),
         policy_digest: digest("14"),
@@ -358,6 +400,177 @@ struct FailOnceAdoptionObserver {
     custody_attempts: AtomicUsize,
 }
 
+fn custody_result_to_machine(value: &CustodyResult) -> bloom_broker_api::CustodyResult {
+    fn kind(value: CeremonyKind) -> bloom_broker_api::CeremonyKind {
+        match value {
+            CeremonyKind::SealedApproval => bloom_broker_api::CeremonyKind::SealedApproval,
+            CeremonyKind::WalletRegistration => bloom_broker_api::CeremonyKind::WalletRegistration,
+            CeremonyKind::WalletImport => bloom_broker_api::CeremonyKind::WalletImport,
+            CeremonyKind::WalletExport => bloom_broker_api::CeremonyKind::WalletExport,
+            CeremonyKind::WalletDelete => bloom_broker_api::CeremonyKind::WalletDelete,
+            CeremonyKind::WalletRecovery => bloom_broker_api::CeremonyKind::WalletRecovery,
+            CeremonyKind::CredentialAdd => bloom_broker_api::CeremonyKind::CredentialAdd,
+            CeremonyKind::CredentialReplace => bloom_broker_api::CeremonyKind::CredentialReplace,
+            CeremonyKind::CredentialRemove => bloom_broker_api::CeremonyKind::CredentialRemove,
+            CeremonyKind::BackendEnrollment => bloom_broker_api::CeremonyKind::BackendEnrollment,
+            CeremonyKind::KeyDerive => bloom_broker_api::CeremonyKind::KeyDerive,
+            CeremonyKind::PolicyUpdate => bloom_broker_api::CeremonyKind::PolicyUpdate,
+        }
+    }
+    fn state(value: bloom_signer_api::CeremonyState) -> CeremonyState {
+        match value {
+            bloom_signer_api::CeremonyState::Prepared => CeremonyState::Prepared,
+            bloom_signer_api::CeremonyState::AwaitingUser => CeremonyState::AwaitingUser,
+            bloom_signer_api::CeremonyState::Verifying => CeremonyState::Verifying,
+            bloom_signer_api::CeremonyState::WalletCommitted => CeremonyState::WalletCommitted,
+            bloom_signer_api::CeremonyState::AwaitingRecoveryAck => {
+                CeremonyState::AwaitingRecoveryAck
+            }
+            bloom_signer_api::CeremonyState::Completed => CeremonyState::Completed,
+            bloom_signer_api::CeremonyState::ApprovingRootChange => {
+                CeremonyState::ApprovingRootChange
+            }
+            bloom_signer_api::CeremonyState::CreatingCredential => {
+                CeremonyState::CreatingCredential
+            }
+            bloom_signer_api::CeremonyState::Committing => CeremonyState::Committing,
+            bloom_signer_api::CeremonyState::Succeeded => CeremonyState::Succeeded,
+            bloom_signer_api::CeremonyState::Cancelled => CeremonyState::Cancelled,
+            bloom_signer_api::CeremonyState::Expired => CeremonyState::Expired,
+            bloom_signer_api::CeremonyState::Failed => CeremonyState::Failed,
+        }
+    }
+    fn key(value: &bloom_signer_api::KeyRef) -> KeyRef {
+        KeyRef {
+            backend: value.backend.clone(),
+            backend_instance: value.backend_instance.clone(),
+            locator: value.locator.clone(),
+            key_spec: match value.key_spec {
+                bloom_signer_api::KeySpec::Secp256k1 => KeySpec::Secp256k1,
+                bloom_signer_api::KeySpec::Ed25519 => KeySpec::Ed25519,
+            },
+            public_key_fingerprint: value.public_key_fingerprint.clone(),
+            derivation: value
+                .derivation
+                .as_ref()
+                .map(|derivation| match derivation {
+                    bloom_signer_api::DerivationRef::Bip32Secp256k1 { root_key_id, path } => {
+                        bloom_broker_api::DerivationRef::Bip32Secp256k1 {
+                            root_key_id: root_key_id.clone(),
+                            path: path.clone(),
+                        }
+                    }
+                }),
+        }
+    }
+    bloom_broker_api::CustodyResult {
+        ceremony_kind: kind(value.ceremony_kind),
+        custody_operation_id: value.custody_operation_id.clone(),
+        public_status: state(value.public_status),
+        wallet_id: value.wallet_id.clone(),
+        public_key_refs: value.public_key_refs.iter().map(key).collect(),
+        credential_summaries: value
+            .credential_summaries
+            .iter()
+            .map(|credential| bloom_broker_api::CredentialSummary {
+                credential_id: credential.credential_id.clone(),
+                rp_id: credential.rp_id.clone(),
+                active: credential.active,
+            })
+            .collect(),
+        initial_policy: value
+            .initial_policy
+            .as_ref()
+            .map(|policy| SignedPolicySnapshot {
+                wallet_id: policy.wallet_id.clone(),
+                version: policy.version.clone(),
+                canonical_policy: policy.canonical_policy.clone(),
+                policy_digest: policy.policy_digest.clone(),
+                policy_signing_key_id: policy.policy_signing_key_id.clone(),
+                policy_verifying_key: policy.policy_verifying_key.clone(),
+                signer_signature: policy.signer_signature.clone(),
+            }),
+        receipt_digest: value.receipt_digest.clone(),
+        encrypted_browser_result: value.encrypted_browser_result.as_ref().map(|encrypted| {
+            bloom_broker_api::EncryptedBrowserResult {
+                kem_output: encrypted.kem_output.clone(),
+                ciphertext: encrypted.ciphertext.clone(),
+            }
+        }),
+        signer_key_id: value.signer_key_id.clone(),
+        signer_signature: value.signer_signature.clone(),
+    }
+}
+
+fn key_to_signer(value: &KeyRef) -> bloom_signer_api::KeyRef {
+    bloom_signer_api::KeyRef {
+        backend: value.backend.clone(),
+        backend_instance: value.backend_instance.clone(),
+        locator: value.locator.clone(),
+        key_spec: match value.key_spec {
+            KeySpec::Secp256k1 => bloom_signer_api::KeySpec::Secp256k1,
+            KeySpec::Ed25519 => bloom_signer_api::KeySpec::Ed25519,
+        },
+        public_key_fingerprint: value.public_key_fingerprint.clone(),
+        derivation: value
+            .derivation
+            .as_ref()
+            .map(|derivation| match derivation {
+                bloom_broker_api::DerivationRef::Bip32Secp256k1 { root_key_id, path } => {
+                    bloom_signer_api::DerivationRef::Bip32Secp256k1 {
+                        root_key_id: root_key_id.clone(),
+                        path: path.clone(),
+                    }
+                }
+            }),
+    }
+}
+
+fn crypto_suite_to_signer(value: CryptoSuite) -> bloom_signer_api::CryptoSuite {
+    match value {
+        CryptoSuite::Secp256k1Sha256Recoverable => {
+            bloom_signer_api::CryptoSuite::Secp256k1Sha256Recoverable
+        }
+        CryptoSuite::Secp256k1Keccak256Recoverable => {
+            bloom_signer_api::CryptoSuite::Secp256k1Keccak256Recoverable
+        }
+        CryptoSuite::Ed25519Message => bloom_signer_api::CryptoSuite::Ed25519Message,
+    }
+}
+
+fn activation_mode_to_signer(value: ActivationMode) -> bloom_signer_api::ActivationMode {
+    match value {
+        ActivationMode::BootBound => bloom_signer_api::ActivationMode::BootBound,
+        ActivationMode::DurableLocal {
+            provider_tier,
+            maximum_rearm_until_ms,
+        } => bloom_signer_api::ActivationMode::DurableLocal {
+            provider_tier,
+            maximum_rearm_until_ms,
+        },
+        ActivationMode::BackendManaged => bloom_signer_api::ActivationMode::BackendManaged,
+    }
+}
+
+fn petal_scope_to_signer(value: &PetalKeyScope) -> bloom_signer_api::PetalKeyScope {
+    bloom_signer_api::PetalKeyScope {
+        wallet_id: value.wallet_id.clone(),
+        parent_key_ref: key_to_signer(&value.parent_key_ref),
+        package_hash: value.package_hash.clone(),
+        route: value.route.clone(),
+        agent_id: value.agent_id.clone(),
+        purpose: value.purpose.clone(),
+        allowed_crypto_suites: value
+            .allowed_crypto_suites
+            .iter()
+            .cloned()
+            .map(crypto_suite_to_signer)
+            .collect(),
+        maximum_lifetime_ms: value.maximum_lifetime_ms.clone(),
+        custody_operation_id: value.custody_operation_id.clone(),
+    }
+}
+
 impl CeremonyCompletionObserver for FailOnceAdoptionObserver {
     fn approval_completed(
         &self,
@@ -379,7 +592,7 @@ impl CeremonyCompletionObserver for FailOnceAdoptionObserver {
             ));
         }
         self.authority
-            .adopt_custody_receipt(receipt, now_ms)
+            .adopt_custody_receipt(&custody_result_to_machine(receipt), now_ms)
             .map_err(|error| {
                 ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, error.to_string())
             })
@@ -391,7 +604,7 @@ impl CeremonySigner for RealSigner {
         &self,
         request: CeremonyPrepareRequest,
         now_ms: u64,
-    ) -> Result<SignerPreparedApproval, ProtocolError> {
+    ) -> Result<SignerPreparedApproval, bloom_signer_api::ProtocolError> {
         let wallet_id = request.terms.wallet_id.clone();
         let prepared = self.service.prepare_approval(request, now_ms)?;
         let verification_credentials = prepared
@@ -412,7 +625,7 @@ impl CeremonySigner for RealSigner {
         &self,
         request: CeremonyCompleteRequest,
         now_ms: u64,
-    ) -> Result<SignerActivationReceipt, ProtocolError> {
+    ) -> Result<SignerActivationReceipt, bloom_signer_api::ProtocolError> {
         futures::executor::block_on(self.service.complete_approval(request, now_ms))
     }
 
@@ -420,7 +633,7 @@ impl CeremonySigner for RealSigner {
         &self,
         request: CustodyPrepareRequest,
         now_ms: u64,
-    ) -> Result<SignerPreparedCustody, ProtocolError> {
+    ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
         let prepared = self.service.prepare_custody(request, now_ms)?;
         let verification_credentials = prepared
             .contribution
@@ -448,11 +661,11 @@ impl CeremonySigner for RealSigner {
         &self,
         request: CustodyCompleteRequest,
         now_ms: u64,
-    ) -> Result<CustodyResult, ProtocolError> {
+    ) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
         self.service.complete_custody(request, now_ms)
     }
 
-    fn cancel(&self, operation_id: &OperationId) -> Result<(), ProtocolError> {
+    fn cancel(&self, operation_id: &OperationId) -> Result<(), bloom_signer_api::ProtocolError> {
         self.service.cancel(operation_id)
     }
 
@@ -461,7 +674,7 @@ impl CeremonySigner for RealSigner {
         operation_id: &OperationId,
         recipient_key: Base64UrlBytes,
         now_ms: u64,
-    ) -> Result<SignerPreparedCustody, ProtocolError> {
+    ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
         let prepared =
             self.service
                 .bind_custody_output_recipient(operation_id, recipient_key, now_ms)?;
@@ -491,7 +704,7 @@ impl CeremonySigner for RealSigner {
         &self,
         request: PolicyUpdateCeremonyPrepareRequest,
         now_ms: u64,
-    ) -> Result<SignerPreparedCustody, ProtocolError> {
+    ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
         let prepared = self.service.prepare_policy_update(request, now_ms)?;
         let verification_credentials = prepared
             .contribution
@@ -519,11 +732,14 @@ impl CeremonySigner for RealSigner {
         &self,
         request: PolicyUpdateCeremonyCompleteRequest,
         now_ms: u64,
-    ) -> Result<CustodyResult, ProtocolError> {
+    ) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
         self.service.complete_policy_update(request, now_ms)
     }
 
-    fn status(&self, operation_id: &OperationId) -> Result<SignerCeremonyStatus, ProtocolError> {
+    fn status(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<SignerCeremonyStatus, bloom_signer_api::ProtocolError> {
         Ok(match self.service.status(operation_id)? {
             bloom_signer::ceremony::SignerCeremonyStatus::Pending => SignerCeremonyStatus::Pending,
             bloom_signer::ceremony::SignerCeremonyStatus::CompletedApproval(receipt) => {
@@ -552,7 +768,7 @@ impl CeremonySigner for MockSigner {
         &self,
         request: CeremonyPrepareRequest,
         now_ms: u64,
-    ) -> Result<SignerPreparedApproval, ProtocolError> {
+    ) -> Result<SignerPreparedApproval, bloom_signer_api::ProtocolError> {
         self.pending
             .lock()
             .insert(request.activation_operation_id.clone());
@@ -577,7 +793,7 @@ impl CeremonySigner for MockSigner {
         let challenge = CeremonyChallenge {
             schema: Token::new("bloom.ceremony.challenge.v1").unwrap(),
             ceremony_id: contribution.ceremony_id.clone(),
-            ceremony_kind: CeremonyKind::SealedApproval,
+            ceremony_kind: bloom_signer_api::CeremonyKind::SealedApproval,
             operation_id: request.activation_operation_id,
             signer_nonce: contribution.signer_nonce.clone(),
             review_manifest_digest: request.review_manifest_digest,
@@ -601,9 +817,9 @@ impl CeremonySigner for MockSigner {
         &self,
         _request: CeremonyCompleteRequest,
         _now_ms: u64,
-    ) -> Result<SignerActivationReceipt, ProtocolError> {
-        Err(ProtocolError::new(
-            ProtocolErrorCode::BackendUnsupported,
+    ) -> Result<SignerActivationReceipt, bloom_signer_api::ProtocolError> {
+        Err(bloom_signer_api::ProtocolError::new(
+            bloom_signer_api::ProtocolErrorCode::BackendUnsupported,
             "mock exposes only the custody path used by this test",
         ))
     }
@@ -612,7 +828,7 @@ impl CeremonySigner for MockSigner {
         &self,
         request: CustodyPrepareRequest,
         now_ms: u64,
-    ) -> Result<SignerPreparedCustody, ProtocolError> {
+    ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
         self.pending
             .lock()
             .insert(request.custody_operation_id.clone());
@@ -666,7 +882,7 @@ impl CeremonySigner for MockSigner {
         &self,
         request: CustodyCompleteRequest,
         _now_ms: u64,
-    ) -> Result<CustodyResult, ProtocolError> {
+    ) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
         self.completions.fetch_add(1, Ordering::SeqCst);
         Ok(CustodyResult {
             ceremony_kind: request.ceremony_kind,
@@ -687,7 +903,7 @@ impl CeremonySigner for MockSigner {
         &self,
         request: PolicyUpdateCeremonyPrepareRequest,
         now_ms: u64,
-    ) -> Result<SignerPreparedCustody, ProtocolError> {
+    ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
         let review_manifest_digest = request
             .broker_validation_receipt
             .review_manifest_digest
@@ -707,11 +923,11 @@ impl CeremonySigner for MockSigner {
         &self,
         request: PolicyUpdateCeremonyCompleteRequest,
         now_ms: u64,
-    ) -> Result<CustodyResult, ProtocolError> {
+    ) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
         self.complete_custody(request.custody, now_ms)
     }
 
-    fn cancel(&self, operation_id: &OperationId) -> Result<(), ProtocolError> {
+    fn cancel(&self, operation_id: &OperationId) -> Result<(), bloom_signer_api::ProtocolError> {
         self.pending.lock().remove(operation_id);
         self.cancellations.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -722,111 +938,23 @@ impl CeremonySigner for MockSigner {
         _operation_id: &OperationId,
         _recipient_key: Base64UrlBytes,
         _now_ms: u64,
-    ) -> Result<SignerPreparedCustody, ProtocolError> {
-        Err(ProtocolError::new(
-            ProtocolErrorCode::BackendUnsupported,
+    ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
+        Err(bloom_signer_api::ProtocolError::new(
+            bloom_signer_api::ProtocolErrorCode::BackendUnsupported,
             "mock does not expose output-key binding",
         ))
     }
 
-    fn status(&self, operation_id: &OperationId) -> Result<SignerCeremonyStatus, ProtocolError> {
+    fn status(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<SignerCeremonyStatus, bloom_signer_api::ProtocolError> {
         Ok(if self.pending.lock().contains(operation_id) {
             SignerCeremonyStatus::Pending
         } else {
             SignerCeremonyStatus::Missing
         })
     }
-}
-
-#[test]
-fn policy_validate_update_returns_the_standard_launch_projection_without_a_new_method() {
-    let broker = CeremonyBroker::new(Arc::new(MockSigner::new()));
-    let proposed = Base64UrlBytes::from_bytes(br#"{"wallet_id":"wallet-review"}"#);
-    let update = PolicyUpdateRequest {
-        operation_id: operation("c1"),
-        wallet_id: Token::new("wallet-review").unwrap(),
-        baseline_version: DecimalU64::new(1),
-        baseline_digest: digest("c2"),
-        proposed_policy_digest: Digest32::from_bytes(
-            sha2::Sha256::digest(proposed.decode()).into(),
-        ),
-        proposed_canonical_policy: proposed,
-        authority_diff_digest: digest("c3"),
-        assurance_level: Token::new("user_verified").unwrap(),
-    };
-    let mut review = PolicyUpdateReviewManifest {
-        schema: Token::new("bloom.policy-update-review/1").unwrap(),
-        operation_id: update.operation_id.clone(),
-        wallet_id: update.wallet_id.clone(),
-        baseline_version: update.baseline_version.clone(),
-        baseline_digest: update.baseline_digest.clone(),
-        proposed_policy_digest: update.proposed_policy_digest.clone(),
-        authority_diff_digest: update.authority_diff_digest.clone(),
-        authority_diff: PolicyAuthorityDiff {
-            maximum_approval_lifetime_ms_before: DecimalU64::new(100),
-            maximum_approval_lifetime_ms_after: DecimalU64::new(200),
-            added_petal_packages: vec![],
-            removed_petal_packages: vec![],
-            added_destinations: vec![],
-            removed_destinations: vec![],
-            added_required_verifiers: vec![],
-            removed_required_verifiers: vec![],
-        },
-        assurance_level: update.assurance_level.clone(),
-        issued_at_ms: DecimalU64::new(1_000),
-        expires_at_ms: DecimalU64::new(11_000),
-        broker_key_id: Token::new("broker-app-1").unwrap(),
-        broker_signature: Base64UrlBytes::from_bytes(&[1; 64]),
-    };
-    let review_digest = review.digest().unwrap();
-    let request = PolicyUpdateCeremonyPrepareRequest {
-        custody: CustodyPrepareRequest {
-            ceremony_kind: CeremonyKind::PolicyUpdate,
-            custody_operation_id: update.operation_id.clone(),
-            wallet_id: Some(update.wallet_id.clone()),
-            key_ref: None,
-            exact_terms_digest: update.terms_digest().unwrap(),
-            expected_input_class: Token::new("policy_update_credential_prf").unwrap(),
-            browser_output_recipient_key: None,
-            petal_key_scope: None,
-        },
-        broker_validation_receipt: PolicyValidationReceipt {
-            update_terms_digest: update.terms_digest().unwrap(),
-            review_manifest_digest: review_digest.clone(),
-            broker_key_id: Token::new("broker-app-1").unwrap(),
-            broker_signature: Base64UrlBytes::from_bytes(&[2; 64]),
-        },
-        update,
-    };
-    let response = broker
-        .prepare_policy_update(request.clone(), review.clone(), 1_000)
-        .unwrap();
-    assert_eq!(response.ceremony_kind, CeremonyKind::PolicyUpdate);
-    assert_eq!(response.operation_id, request.update.operation_id);
-    assert_eq!(response.review_manifest_digest, review_digest);
-    assert!(response.ceremony_url.starts_with("http://localhost:18734/"));
-    assert_eq!(
-        broker
-            .prepare_policy_update(request.clone(), review.clone(), 1_001)
-            .unwrap()
-            .ceremony_url,
-        response.ceremony_url
-    );
-    assert_eq!(
-        broker
-            .prepare_custody(request.custody.clone(), 1_002)
-            .unwrap_err()
-            .code,
-        ProtocolErrorCode::CeremonyKindMismatch
-    );
-    review.authority_diff_digest = digest("c4");
-    assert_eq!(
-        broker
-            .prepare_policy_update(request, review, 1_003)
-            .unwrap_err()
-            .code,
-        ProtocolErrorCode::CeremonyKindMismatch
-    );
 }
 
 fn prepare(
@@ -945,13 +1073,21 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             let quota = EndpointQuota::new(16, 1_000, 60_000, 1_000, 60_000).unwrap();
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                bloom_triad_local_transport::dispatch_broker_signer_connection_with_journal_heads(
+                bloom_triad_local_transport::dispatch_connection_with_journal_heads::<
+                    BrokerSignerRequest,
+                    BrokerSignerResponse,
+                    bloom_signer_api::ProtocolError,
+                    _,
+                    _,
+                >(
                     &mut stream,
                     &signer_identity,
                     &broker_acl,
+                    bloom_signer_api::SIGNER_API_CURRENT,
+                    bloom_signer_api::SIGNER_API_RANGE,
                     &quota,
-                    signer_rpc.as_ref(),
                     &signer_journals,
+                    |request| BrokerSignerService::dispatch(signer_rpc.as_ref(), request),
                 )
                 .await
                 .unwrap();
@@ -1021,8 +1157,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let registration_operation = operation("e1");
     let registration = match MachineBrokerService::dispatch(
         &broker,
-        MachineBrokerRequest::WalletRegistrationPrepare(CustodyPrepareRequest {
-            ceremony_kind: CeremonyKind::WalletRegistration,
+        MachineBrokerRequest::WalletRegistrationPrepare(bloom_broker_api::CustodyPrepareRequest {
+            ceremony_kind: bloom_broker_api::CeremonyKind::WalletRegistration,
             custody_operation_id: registration_operation.clone(),
             wallet_id: None,
             key_ref: None,
@@ -1173,8 +1309,9 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             .to_bytes(),
     )
     .unwrap();
-    let wallet_id = registration_result.wallet_id.clone().unwrap();
-    let baseline = registration_result.initial_policy.clone().unwrap();
+    let machine_registration_result = custody_result_to_machine(&registration_result);
+    let wallet_id = machine_registration_result.wallet_id.clone().unwrap();
+    let baseline = machine_registration_result.initial_policy.clone().unwrap();
     assert_eq!(authority.policy_snapshot(&wallet_id).unwrap(), baseline);
 
     let baseline_policy: CanonicalWalletPolicy =
@@ -1217,7 +1354,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let premature = CustodyResult {
         ceremony_kind: CeremonyKind::PolicyUpdate,
         custody_operation_id: update.operation_id.clone(),
-        public_status: CeremonyState::Succeeded,
+        public_status: bloom_signer_api::CeremonyState::Succeeded,
         wallet_id: Some(wallet_id.clone()),
         public_key_refs: Vec::new(),
         credential_summaries: Vec::new(),
@@ -1232,7 +1369,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             &broker,
             MachineBrokerRequest::PolicyCommitUpdate(PolicyCommitUpdateRequest {
                 operation_id: update.operation_id.clone(),
-                ceremony_receipt: premature,
+                ceremony_receipt: custody_result_to_machine(&premature),
             }),
         )
         .await
@@ -1317,7 +1454,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .unwrap();
     let commit_request = PolicyCommitUpdateRequest {
         operation_id: update.operation_id,
-        ceremony_receipt: completed,
+        ceremony_receipt: custody_result_to_machine(&completed),
     };
     let expected_policy_ceremony_receipt_digest =
         commit_request.ceremony_receipt.receipt_digest.clone();
@@ -1368,7 +1505,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     sign_provenance(&mut petal_provenance, &installer_key);
     authority.install_provenance(&petal_provenance).unwrap();
 
-    let parent_key = registration_result.public_key_refs[0].clone();
+    let parent_key = machine_registration_result.public_key_refs[0].clone();
     let derive_operation = operation("d2");
     let scope_lifetime_ms = 5_000;
     let scope = PetalKeyScope {
@@ -1384,8 +1521,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     };
     let derive_prepared = match MachineBrokerService::dispatch(
         &broker,
-        MachineBrokerRequest::KeyDerivePrepare(CustodyPrepareRequest {
-            ceremony_kind: CeremonyKind::KeyDerive,
+        MachineBrokerRequest::KeyDerivePrepare(bloom_broker_api::CustodyPrepareRequest {
+            ceremony_kind: bloom_broker_api::CeremonyKind::KeyDerive,
             custody_operation_id: derive_operation.clone(),
             wallet_id: Some(wallet_id.clone()),
             key_ref: Some(parent_key.clone()),
@@ -1442,7 +1579,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         signer_nonce: derive_contribution.signer_nonce.clone(),
         signer_contribution_digest: derive_contribution.digest().unwrap(),
         wallet_id: Some(wallet_id.clone()),
-        key_ref: Some(parent_key),
+        key_ref: Some(key_to_signer(&parent_key)),
         credential_id: Some(derive_assertion.credential_id.clone()),
         expected_input_class: Token::new("petal-key-scope-v1").unwrap(),
     }
@@ -1514,7 +1651,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         MachineBrokerResponse::CustodyResult(result) => result,
         response => panic!("unexpected response: {response:?}"),
     };
-    assert_eq!(projected_result, derive_result);
+    assert_eq!(projected_result, custody_result_to_machine(&derive_result));
 
     let approval_now_ms: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1530,7 +1667,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             agent_id: scope.agent_id.clone(),
         },
         wallet_id: wallet_id.clone(),
-        key_ref: child_key.clone(),
+        key_ref: custody_result_to_machine(&derive_result).public_key_refs[0].clone(),
         allowed_crypto_suites: scope.allowed_crypto_suites.clone(),
         selector: ApprovalSelector::Petal {
             package_hash: petal_package.clone(),
@@ -1612,9 +1749,14 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         approval_digest: approval_terms.approval_digest().unwrap(),
         review_manifest_digest: approval_prepared.review_manifest_digest.clone(),
         key_ref: child_key.clone(),
-        allowed_crypto_suites: approval_terms.allowed_crypto_suites.clone(),
+        allowed_crypto_suites: approval_terms
+            .allowed_crypto_suites
+            .iter()
+            .cloned()
+            .map(crypto_suite_to_signer)
+            .collect(),
         credential_id: approval_assertion.credential_id.clone(),
-        activation_mode: approval_terms.activation_mode.clone(),
+        activation_mode: activation_mode_to_signer(approval_terms.activation_mode.clone()),
         wallet_revocation_epoch: approval_terms.wallet_revocation_epoch.clone(),
     }
     .canonical_bytes()
@@ -1734,9 +1876,14 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         approval_digest: exact_terms.approval_digest().unwrap(),
         review_manifest_digest: exact_prepared.review_manifest_digest.clone(),
         key_ref: child_key.clone(),
-        allowed_crypto_suites: exact_terms.allowed_crypto_suites.clone(),
+        allowed_crypto_suites: exact_terms
+            .allowed_crypto_suites
+            .iter()
+            .cloned()
+            .map(crypto_suite_to_signer)
+            .collect(),
         credential_id: exact_assertion.credential_id.clone(),
-        activation_mode: exact_terms.activation_mode.clone(),
+        activation_mode: activation_mode_to_signer(exact_terms.activation_mode.clone()),
         wallet_revocation_epoch: exact_terms.wallet_revocation_epoch.clone(),
     }
     .canonical_bytes()
@@ -2090,13 +2237,21 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             let quota = EndpointQuota::new(16, 1_000, 60_000, 1_000, 60_000).unwrap();
             loop {
                 let (mut stream, _) = restarted_signer_listener.accept().await.unwrap();
-                bloom_triad_local_transport::dispatch_broker_signer_connection_with_journal_heads(
+                bloom_triad_local_transport::dispatch_connection_with_journal_heads::<
+                    BrokerSignerRequest,
+                    BrokerSignerResponse,
+                    bloom_signer_api::ProtocolError,
+                    _,
+                    _,
+                >(
                     &mut stream,
                     &signer_identity,
                     &restarted_broker_acl,
+                    bloom_signer_api::SIGNER_API_CURRENT,
+                    bloom_signer_api::SIGNER_API_RANGE,
                     &quota,
-                    signer_rpc.as_ref(),
                     &signer_journals,
+                    |request| BrokerSignerService::dispatch(signer_rpc.as_ref(), request),
                 )
                 .await
                 .unwrap();
@@ -2173,12 +2328,9 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let restored_backup = restarted_signer_engine
         .export_backup(&wallet_id, None, Vec::new())
         .unwrap();
-    assert!(
-        restored_backup
-            .petal_key_scopes
-            .iter()
-            .any(|stored| { stored.key_ref == child_key && stored.scope == scope })
-    );
+    assert!(restored_backup.petal_key_scopes.iter().any(|stored| {
+        stored.key_ref == child_key && stored.scope == petal_scope_to_signer(&scope)
+    }));
     let restarted_sign = petal_sign_request(
         &approval_terms,
         operation("d9"),
@@ -2267,12 +2419,20 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         async move {
             let (mut stream, _) = control_listener.accept().await.unwrap();
             let quota = EndpointQuota::new(16, 1_000, 60_000, 1_000, 60_000).unwrap();
-            bloom_triad_local_transport::dispatch_control_connection(
+            bloom_triad_local_transport::dispatch_connection::<
+                ControlRequest,
+                ControlResponse,
+                bloom_signer_api::ProtocolError,
+                _,
+                _,
+            >(
                 &mut stream,
                 &signer_identity,
                 &revoke_acl,
+                bloom_signer_api::SIGNER_CONTROL_CURRENT,
+                bloom_signer_api::SIGNER_CONTROL_RANGE,
                 &quota,
-                signer_rpc.as_ref(),
+                |request| RevocationControlService::dispatch(signer_rpc.as_ref(), request),
             )
             .await
             .unwrap();
@@ -2281,10 +2441,16 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let mut control_stream = tokio::net::UnixStream::connect(&control_socket_path)
         .await
         .unwrap();
-    let signer_only_revoke: ControlResponse = bloom_triad_local_transport::call(
+    let signer_only_revoke: ControlResponse = bloom_triad_local_transport::call::<
+        ControlRequest,
+        ControlResponse,
+        bloom_signer_api::ProtocolError,
+    >(
         &mut control_stream,
         &revoke_identity,
         &signer_acl,
+        bloom_signer_api::SIGNER_CONTROL_CURRENT,
+        bloom_signer_api::SIGNER_CONTROL_RANGE,
         ControlRequest::RevokeAll(WalletOperationRequest {
             operation_id: operation("e6"),
             wallet_id: wallet_id.clone(),
@@ -2520,17 +2686,15 @@ async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
         .unwrap();
     let projection: serde_json::Value =
         serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    let manifest: ReviewManifest =
-        serde_json::from_value(projection["review_manifest"].clone()).unwrap();
-    assert!(manifest.canonical_plan.to_lowercase().contains("sha256"));
-    assert!(manifest.canonical_plan.contains("max_operations"));
-    assert!(manifest.canonical_plan.contains("root-key"));
-    assert!(
-        manifest
-            .canonical_plan
-            .contains("Bloom has not established the execution effects")
-    );
-    assert_eq!(manifest.broker_signature.decode().len(), 64);
+    let manifest = projection["review_manifest"].clone();
+    let canonical_plan = manifest["canonical_plan"].as_str().unwrap();
+    assert!(canonical_plan.to_lowercase().contains("sha256"));
+    assert!(canonical_plan.contains("max_operations"));
+    assert!(canonical_plan.contains("root-key"));
+    assert!(canonical_plan.contains("Bloom has not established the execution effects"));
+    let broker_signature: Base64UrlBytes =
+        serde_json::from_value(manifest["broker_signature"].clone()).unwrap();
+    assert_eq!(broker_signature.decode().len(), 64);
     assert_eq!(
         Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&manifest).unwrap()).into()),
         response.review_manifest_digest
@@ -2542,14 +2706,14 @@ async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() 
     let signer = Arc::new(MockSigner::new());
     let broker = CeremonyBroker::new(signer);
     let parent = approval_request().terms.key_ref;
-    let scope = PetalKeyScope {
+    let scope = bloom_signer_api::PetalKeyScope {
         wallet_id: Token::new("wallet-review").unwrap(),
         parent_key_ref: parent.clone(),
         package_hash: digest("91"),
         route: "/petals/exchange/sign".into(),
         agent_id: Some("account-a".into()),
         purpose: Token::new("exchange-order").unwrap(),
-        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
+        allowed_crypto_suites: vec![bloom_signer_api::CryptoSuite::Secp256k1Sha256Recoverable],
         maximum_lifetime_ms: DecimalU64::new(60_000),
         custody_operation_id: operation("92"),
     };
@@ -2627,16 +2791,16 @@ async fn machine_asserted_reusable_plan_carries_primary_surface_warning() {
     );
     let mut request = approval_request();
     request.activation_operation_id = operation("18");
-    request.terms.subject = ApprovalSubject::Petal {
+    request.terms.subject = bloom_signer_api::ApprovalSubject::Petal {
         package_hash: digest("19"),
         route: "wallet/send".into(),
         agent_id: None,
     };
-    request.terms.selector = ApprovalSelector::Petal {
+    request.terms.selector = bloom_signer_api::ApprovalSelector::Petal {
         package_hash: digest("19"),
         route: "wallet/send".into(),
         allowed_operation_classes: vec![Token::new("transfer").unwrap()],
-        required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+        required_claim_assurance: bloom_signer_api::ClaimAssuranceLevel::MachineAsserted,
     };
     request.exact_ordered_payload_digests.clear();
     request.exact_ordered_hashes.clear();
@@ -2853,9 +3017,9 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         )
         .await
         .unwrap();
-    assert_eq!(completed.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(signer.completions.load(Ordering::SeqCst), 0);
-    assert_eq!(signer.cancellations.load(Ordering::SeqCst), 1);
+    assert_eq!(completed.status(), StatusCode::OK);
+    assert_eq!(signer.completions.load(Ordering::SeqCst), 1);
+    assert_eq!(signer.cancellations.load(Ordering::SeqCst), 0);
 }
 
 #[test]

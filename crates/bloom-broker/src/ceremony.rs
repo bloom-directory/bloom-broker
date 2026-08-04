@@ -1,4 +1,11 @@
-use crate::journal::BrokerJournal;
+use crate::{
+    authority::PolicyAuthorityDiff,
+    journal::BrokerJournal,
+    translation::{
+        ceremony::{kind_to_machine, state_to_machine},
+        error::signer_error_to_machine,
+    },
+};
 use axum::{
     Json, Router,
     body::Body,
@@ -8,16 +15,21 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use bloom_triad_protocol::{
-    ApprovalPrepareState, Base64UrlBytes, CeremonyChallenge, CeremonyCompleteRequest, CeremonyKind,
+use bloom_broker_api::{
+    ApprovalPrepareState, CeremonyKind as BrokerCeremonyKind,
+    CeremonyPublicStatus as BrokerCeremonyPublicStatus, CeremonyState as BrokerCeremonyState,
+    ClaimAssurance, CustodyPrepareResponse, CustodyPrepareState, PetalUseClaim,
+    PolicyUpdatePrepareResponse, ProtocolError, ProtocolErrorCode, SealedApprovalPrepareResponse,
+};
+use bloom_signer_api::{
+    Base64UrlBytes, CeremonyChallenge, CeremonyCompleteRequest, CeremonyKind,
     CeremonyPrepareRequest, CeremonyState, CeremonyWebAuthnOptions, CustodyCompleteRequest,
-    CustodyPrepareRequest, CustodyPrepareResponse, CustodyPrepareState, CustodyResult,
-    CustodySignerContribution, Digest32, OperationId, PolicyUpdateCeremonyCompleteRequest,
-    PolicyUpdateCeremonyPrepareRequest, PolicyUpdatePrepareResponse, PolicyUpdateReviewManifest,
-    ProtocolError, ProtocolErrorCode, ReviewManifest, SealedApprovalPrepareResponse,
-    SignerActivationReceipt, SignerCeremonyContribution, SignerCeremonyStatus,
-    SignerPreparedApproval, SignerPreparedCustody, Token, WebAuthnCeremonyProof,
-    WebAuthnCredential, verify_webauthn_assertion, verify_webauthn_attestation,
+    CustodyPrepareRequest, CustodyResult, CustodySignerContribution, DecimalU64, Digest32,
+    HpkeEnvelope, OperationId, PolicyUpdateCeremonyCompleteRequest,
+    PolicyUpdateCeremonyPrepareRequest, ProtocolError as SignerProtocolError,
+    ProtocolErrorCode as SignerProtocolErrorCode, SignerActivationReceipt,
+    SignerCeremonyContribution, SignerCeremonyStatus, SignerPreparedApproval,
+    SignerPreparedCustody, Token, WebAuthnCeremonyProof, WebAuthnCredential,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use parking_lot::Mutex;
@@ -52,9 +64,122 @@ const APP_JS: &str = include_str!("ceremony_assets/app.js");
 
 #[derive(Clone, Debug, Default)]
 pub struct ReviewManifestContext {
-    pub petal_use_claim: Option<bloom_triad_protocol::PetalUseClaim>,
-    pub claim_assurance: Option<bloom_triad_protocol::ClaimAssurance>,
+    pub petal_use_claim: Option<PetalUseClaim>,
+    pub claim_assurance: Option<ClaimAssurance>,
     pub attributed_advisory_items: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReviewManifest {
+    pub schema: Token,
+    pub approval_id: Digest32,
+    pub approval_digest: Digest32,
+    pub canonical_plan: String,
+    pub canonical_plan_digest: Digest32,
+    pub exact_payload_digests: Vec<Digest32>,
+    pub exact_hashes: Vec<Digest32>,
+    pub petal_use_claim: Option<PetalUseClaim>,
+    pub claim_assurance: Option<ClaimAssurance>,
+    pub attributed_advisory_items: Vec<String>,
+    pub issued_at_ms: DecimalU64,
+    pub expires_at_ms: DecimalU64,
+    pub broker_key_id: Token,
+    pub broker_signature: Base64UrlBytes,
+}
+
+impl ReviewManifest {
+    fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            schema: &'a Token,
+            approval_id: &'a Digest32,
+            approval_digest: &'a Digest32,
+            canonical_plan: &'a str,
+            canonical_plan_digest: &'a Digest32,
+            exact_payload_digests: &'a [Digest32],
+            exact_hashes: &'a [Digest32],
+            petal_use_claim: &'a Option<PetalUseClaim>,
+            claim_assurance: &'a Option<ClaimAssurance>,
+            attributed_advisory_items: &'a [String],
+            issued_at_ms: &'a DecimalU64,
+            expires_at_ms: &'a DecimalU64,
+            broker_key_id: &'a Token,
+        }
+        serde_jcs::to_vec(&Unsigned {
+            schema: &self.schema,
+            approval_id: &self.approval_id,
+            approval_digest: &self.approval_digest,
+            canonical_plan: &self.canonical_plan,
+            canonical_plan_digest: &self.canonical_plan_digest,
+            exact_payload_digests: &self.exact_payload_digests,
+            exact_hashes: &self.exact_hashes,
+            petal_use_claim: &self.petal_use_claim,
+            claim_assurance: &self.claim_assurance,
+            attributed_advisory_items: &self.attributed_advisory_items,
+            issued_at_ms: &self.issued_at_ms,
+            expires_at_ms: &self.expires_at_ms,
+            broker_key_id: &self.broker_key_id,
+        })
+        .map_err(malformed)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PolicyUpdateReviewManifest {
+    pub schema: Token,
+    pub operation_id: OperationId,
+    pub wallet_id: Token,
+    pub baseline_version: DecimalU64,
+    pub baseline_digest: Digest32,
+    pub proposed_policy_digest: Digest32,
+    pub authority_diff_digest: Digest32,
+    pub authority_diff: PolicyAuthorityDiff,
+    pub assurance_level: Token,
+    pub issued_at_ms: DecimalU64,
+    pub expires_at_ms: DecimalU64,
+    pub broker_key_id: Token,
+    pub broker_signature: Base64UrlBytes,
+}
+
+impl PolicyUpdateReviewManifest {
+    pub(crate) fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            schema: &'a Token,
+            operation_id: &'a OperationId,
+            wallet_id: &'a Token,
+            baseline_version: &'a DecimalU64,
+            baseline_digest: &'a Digest32,
+            proposed_policy_digest: &'a Digest32,
+            authority_diff_digest: &'a Digest32,
+            authority_diff: &'a PolicyAuthorityDiff,
+            assurance_level: &'a Token,
+            issued_at_ms: &'a DecimalU64,
+            expires_at_ms: &'a DecimalU64,
+            broker_key_id: &'a Token,
+        }
+        serde_jcs::to_vec(&Unsigned {
+            schema: &self.schema,
+            operation_id: &self.operation_id,
+            wallet_id: &self.wallet_id,
+            baseline_version: &self.baseline_version,
+            baseline_digest: &self.baseline_digest,
+            proposed_policy_digest: &self.proposed_policy_digest,
+            authority_diff_digest: &self.authority_diff_digest,
+            authority_diff: &self.authority_diff,
+            assurance_level: &self.assurance_level,
+            issued_at_ms: &self.issued_at_ms,
+            expires_at_ms: &self.expires_at_ms,
+            broker_key_id: &self.broker_key_id,
+        })
+        .map_err(malformed)
+    }
+
+    pub(crate) fn digest(&self) -> Result<Digest32, ProtocolError> {
+        digest(self)
+    }
 }
 
 /// Typed Broker-to-Signer seam. Broker only forwards raw proof and opaque HPKE
@@ -64,34 +189,34 @@ pub trait CeremonySigner: Send + Sync {
         &self,
         request: CeremonyPrepareRequest,
         now_ms: u64,
-    ) -> Result<SignerPreparedApproval, ProtocolError>;
+    ) -> Result<SignerPreparedApproval, SignerProtocolError>;
 
     fn complete_approval(
         &self,
         request: CeremonyCompleteRequest,
         now_ms: u64,
-    ) -> Result<SignerActivationReceipt, ProtocolError>;
+    ) -> Result<SignerActivationReceipt, SignerProtocolError>;
 
     fn prepare_custody(
         &self,
         request: CustodyPrepareRequest,
         now_ms: u64,
-    ) -> Result<SignerPreparedCustody, ProtocolError>;
+    ) -> Result<SignerPreparedCustody, SignerProtocolError>;
 
     fn complete_custody(
         &self,
         request: CustodyCompleteRequest,
         now_ms: u64,
-    ) -> Result<CustodyResult, ProtocolError>;
+    ) -> Result<CustodyResult, SignerProtocolError>;
 
     fn prepare_policy_update(
         &self,
         request: PolicyUpdateCeremonyPrepareRequest,
         now_ms: u64,
-    ) -> Result<SignerPreparedCustody, ProtocolError> {
+    ) -> Result<SignerPreparedCustody, SignerProtocolError> {
         let _ = (request, now_ms);
-        Err(protocol(
-            ProtocolErrorCode::BackendUnsupported,
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::BackendUnsupported,
             "policy-update ceremony preparation is not implemented by this Signer seam",
         ))
     }
@@ -100,10 +225,10 @@ pub trait CeremonySigner: Send + Sync {
         &self,
         request: PolicyUpdateCeremonyCompleteRequest,
         now_ms: u64,
-    ) -> Result<CustodyResult, ProtocolError> {
+    ) -> Result<CustodyResult, SignerProtocolError> {
         let _ = (request, now_ms);
-        Err(protocol(
-            ProtocolErrorCode::BackendUnsupported,
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::BackendUnsupported,
             "policy-update ceremony completion is not implemented by this Signer seam",
         ))
     }
@@ -113,11 +238,14 @@ pub trait CeremonySigner: Send + Sync {
         operation_id: &OperationId,
         recipient_key: Base64UrlBytes,
         now_ms: u64,
-    ) -> Result<SignerPreparedCustody, ProtocolError>;
+    ) -> Result<SignerPreparedCustody, SignerProtocolError>;
 
-    fn cancel(&self, operation_id: &OperationId) -> Result<(), ProtocolError>;
+    fn cancel(&self, operation_id: &OperationId) -> Result<(), SignerProtocolError>;
 
-    fn status(&self, operation_id: &OperationId) -> Result<SignerCeremonyStatus, ProtocolError>;
+    fn status(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<SignerCeremonyStatus, SignerProtocolError>;
 }
 
 pub trait CeremonyCompletionObserver: Send + Sync {
@@ -218,7 +346,7 @@ struct BrowserChallenge {
 #[serde(deny_unknown_fields)]
 struct BrowserComplete {
     proof: WebAuthnCeremonyProof,
-    encrypted_input: Option<bloom_triad_protocol::HpkeEnvelope>,
+    encrypted_input: Option<HpkeEnvelope>,
     public_binding_digest: Digest32,
 }
 
@@ -357,7 +485,8 @@ impl CeremonyBroker {
         let prepared = self
             .inner
             .signer
-            .prepare_approval(request.clone(), now_ms)?;
+            .prepare_approval(request.clone(), now_ms)
+            .map_err(signer_error_to_machine)?;
         let ceremony_id = prepared.contribution.ceremony_id.clone();
         let expires_at_ms = prepared.contribution.expires_at_ms.get();
         let session = self.new_session(NewBrowserSession {
@@ -379,10 +508,13 @@ impl CeremonyBroker {
         let url = session_url(&token_for(&session));
         self.insert_session(ceremony_id.clone(), session)?;
         Ok(SealedApprovalPrepareResponse {
-            approval_id: request.terms.approval_id()?,
+            approval_id: request
+                .terms
+                .approval_id()
+                .map_err(signer_error_to_machine)?,
             state: ApprovalPrepareState::AwaitingCeremony,
             ceremony_url: url,
-            ceremony_expires_at_ms: bloom_triad_protocol::DecimalU64::new(expires_at_ms),
+            ceremony_expires_at_ms: DecimalU64::new(expires_at_ms),
             review_manifest_digest: request.review_manifest_digest,
         })
     }
@@ -393,7 +525,9 @@ impl CeremonyBroker {
         now_ms: u64,
     ) -> Result<CustodyPrepareResponse, ProtocolError> {
         self.expire_sessions(now_ms)?;
-        request.validate_petal_key_scope_binding()?;
+        request
+            .validate_petal_key_scope_binding()
+            .map_err(signer_error_to_machine)?;
         if matches!(
             request.ceremony_kind,
             CeremonyKind::SealedApproval | CeremonyKind::PolicyUpdate
@@ -409,12 +543,20 @@ impl CeremonyBroker {
         let anonymous_registration = request.ceremony_kind == CeremonyKind::WalletRegistration
             && request.wallet_id.is_none();
         self.enforce_creation_bounds(request.wallet_id.as_ref(), anonymous_registration, now_ms)?;
-        let prepared = self.inner.signer.prepare_custody(request.clone(), now_ms)?;
+        let prepared = self
+            .inner
+            .signer
+            .prepare_custody(request.clone(), now_ms)
+            .map_err(signer_error_to_machine)?;
         prepared
             .contribution
-            .validate_petal_key_scope_binding(&request)?;
+            .validate_petal_key_scope_binding(&request)
+            .map_err(signer_error_to_machine)?;
         let ceremony_id = prepared.contribution.ceremony_id.clone();
-        let contribution_digest = prepared.contribution.digest()?;
+        let contribution_digest = prepared
+            .contribution
+            .digest()
+            .map_err(signer_error_to_machine)?;
         let expires_at_ms = prepared.contribution.expires_at_ms.get();
         let session = self.new_session(NewBrowserSession {
             operation_id: request.custody_operation_id.clone(),
@@ -440,16 +582,16 @@ impl CeremonyBroker {
         let url = session_url(&token_for(&session));
         self.insert_session(ceremony_id, session)?;
         Ok(CustodyPrepareResponse {
-            ceremony_kind: request.ceremony_kind,
+            ceremony_kind: kind_to_machine(request.ceremony_kind),
             custody_operation_id: request.custody_operation_id,
             state: CustodyPrepareState::AwaitingUser,
             ceremony_url: url,
-            ceremony_expires_at_ms: bloom_triad_protocol::DecimalU64::new(expires_at_ms),
+            ceremony_expires_at_ms: DecimalU64::new(expires_at_ms),
             signer_contribution_digest: contribution_digest,
         })
     }
 
-    pub fn prepare_policy_update(
+    pub(crate) fn prepare_policy_update(
         &self,
         request: PolicyUpdateCeremonyPrepareRequest,
         review_manifest: PolicyUpdateReviewManifest,
@@ -460,7 +602,11 @@ impl CeremonyBroker {
             || request.custody.custody_operation_id != request.update.operation_id
             || request.custody.wallet_id.as_ref() != Some(&request.update.wallet_id)
             || request.custody.key_ref.is_some()
-            || request.custody.exact_terms_digest != request.update.terms_digest()?
+            || request.custody.exact_terms_digest
+                != request
+                    .update
+                    .terms_digest()
+                    .map_err(signer_error_to_machine)?
             || request.broker_validation_receipt.update_terms_digest
                 != request.custody.exact_terms_digest
             || request.broker_validation_receipt.review_manifest_digest
@@ -482,7 +628,8 @@ impl CeremonyBroker {
         let prepared = self
             .inner
             .signer
-            .prepare_policy_update(request.clone(), now_ms)?;
+            .prepare_policy_update(request.clone(), now_ms)
+            .map_err(signer_error_to_machine)?;
         let ceremony_id = prepared.contribution.ceremony_id.clone();
         let expires_at_ms = prepared.contribution.expires_at_ms.get();
         let session = self.new_session(NewBrowserSession {
@@ -503,28 +650,28 @@ impl CeremonyBroker {
         })?;
         let response = PolicyUpdatePrepareResponse {
             operation_id: request.update.operation_id,
-            ceremony_kind: CeremonyKind::PolicyUpdate,
+            ceremony_kind: BrokerCeremonyKind::PolicyUpdate,
             ceremony_url: session_url(&token_for(&session)),
-            ceremony_expires_at_ms: bloom_triad_protocol::DecimalU64::new(expires_at_ms),
+            ceremony_expires_at_ms: DecimalU64::new(expires_at_ms),
             review_manifest_digest: request.broker_validation_receipt.review_manifest_digest,
         };
         self.insert_session(ceremony_id, session)?;
         Ok(response)
     }
 
-    pub fn status(&self, operation_id: &OperationId) -> Option<CeremonyState> {
+    pub fn status(&self, operation_id: &OperationId) -> Option<BrokerCeremonyState> {
         let ceremony_id = self.inner.operations.lock().get(operation_id)?.clone();
         self.inner
             .sessions
             .lock()
             .get(&ceremony_id)
-            .map(|session| session.state)
+            .map(|session| state_to_machine(session.state))
     }
 
     pub fn public_status(
         &self,
         operation_id: &OperationId,
-    ) -> Result<bloom_triad_protocol::CeremonyPublicStatus, ProtocolError> {
+    ) -> Result<BrokerCeremonyPublicStatus, ProtocolError> {
         let ceremony_id = self
             .inner
             .operations
@@ -540,12 +687,12 @@ impl CeremonyBroker {
         } else {
             None
         };
-        Ok(bloom_triad_protocol::CeremonyPublicStatus {
+        Ok(BrokerCeremonyPublicStatus {
             ceremony_id: session.projection.ceremony_id.clone(),
-            ceremony_kind: session.ceremony_kind,
+            ceremony_kind: kind_to_machine(session.ceremony_kind),
             operation_id: operation_id.clone(),
-            state: session.state,
-            expires_at_ms: bloom_triad_protocol::DecimalU64::new(session.expires_at_ms),
+            state: state_to_machine(session.state),
+            expires_at_ms: DecimalU64::new(session.expires_at_ms),
             ceremony_url,
             receipt_digest,
         })
@@ -554,8 +701,8 @@ impl CeremonyBroker {
     pub fn completed_policy_update(
         &self,
         operation_id: &OperationId,
-        receipt: &CustodyResult,
-    ) -> Result<PolicyUpdateCeremonyPrepareRequest, ProtocolError> {
+        receipt: &bloom_broker_api::CustodyResult,
+    ) -> Result<(PolicyUpdateCeremonyPrepareRequest, CustodyResult), ProtocolError> {
         let ceremony_id = self
             .inner
             .operations
@@ -567,7 +714,7 @@ impl CeremonyBroker {
         let session = sessions.get(&ceremony_id).ok_or_else(not_found)?;
         if session.ceremony_kind != CeremonyKind::PolicyUpdate
             || session.state != CeremonyState::Succeeded
-            || receipt.ceremony_kind != CeremonyKind::PolicyUpdate
+            || receipt.ceremony_kind != BrokerCeremonyKind::PolicyUpdate
             || &receipt.custody_operation_id != operation_id
         {
             return Err(kind_mismatch());
@@ -575,13 +722,16 @@ impl CeremonyBroker {
         let stored: CustodyResult =
             serde_json::from_value(session.terminal_result.clone().ok_or_else(not_found)?)
                 .map_err(malformed)?;
-        if &stored != receipt {
+        if crate::translation::custody::result_to_machine(stored.clone()) != *receipt {
             return Err(protocol(
                 ProtocolErrorCode::OperationIdConflict,
                 "policy commit receipt differs from completed ceremony",
             ));
         }
-        session.policy_update.clone().ok_or_else(kind_mismatch)
+        Ok((
+            session.policy_update.clone().ok_or_else(kind_mismatch)?,
+            stored,
+        ))
     }
 
     pub fn cancel(&self, operation_id: &OperationId, now_ms: u64) -> Result<(), ProtocolError> {
@@ -608,7 +758,10 @@ impl CeremonyBroker {
             snapshot.token_hash = [0_u8; 32];
             (session.wallet_id.clone(), snapshot)
         };
-        self.inner.signer.cancel(operation_id)?;
+        self.inner
+            .signer
+            .cancel(operation_id)
+            .map_err(signer_error_to_machine)?;
         self.persist_session(&snapshot)?;
         self.inner.sessions.lock().insert(ceremony_id, snapshot);
         if let Some(wallet_id) = &wallet_id {
@@ -643,7 +796,10 @@ impl CeremonyBroker {
                 continue;
             }
             if state == CeremonyState::AwaitingUser {
-                self.inner.signer.cancel(&operation_id)?;
+                self.inner
+                    .signer
+                    .cancel(&operation_id)
+                    .map_err(signer_error_to_machine)?;
             }
             let snapshot = {
                 let sessions = self.inner.sessions.lock();
@@ -741,7 +897,11 @@ impl CeremonyBroker {
                     .insert(ceremony_id.clone(), snapshot);
                 continue;
             }
-            let signer_status = self.inner.signer.status(&operation_id)?;
+            let signer_status = self
+                .inner
+                .signer
+                .status(&operation_id)
+                .map_err(signer_error_to_machine)?;
             let (state, terminal_result) = match signer_status {
                 SignerCeremonyStatus::CompletedApproval(receipt) => (
                     CeremonyState::WalletCommitted,
@@ -752,7 +912,10 @@ impl CeremonyBroker {
                     Some(serde_json::to_value(result).map_err(malformed)?),
                 ),
                 SignerCeremonyStatus::Pending => {
-                    self.inner.signer.cancel(&operation_id)?;
+                    self.inner
+                        .signer
+                        .cancel(&operation_id)
+                        .map_err(signer_error_to_machine)?;
                     (CeremonyState::Expired, None)
                 }
                 SignerCeremonyStatus::Missing => (CeremonyState::Expired, None),
@@ -894,7 +1057,9 @@ impl CeremonyBroker {
                     .challenges
                     .into_iter()
                     .map(|binding| {
-                        let challenge = binding.webauthn_challenge()?;
+                        let challenge = binding
+                            .webauthn_challenge()
+                            .map_err(signer_error_to_machine)?;
                         Ok(BrowserChallenge { binding, challenge })
                     })
                     .collect::<Result<Vec<_>, ProtocolError>>()?,
@@ -1017,7 +1182,7 @@ impl CeremonyBroker {
             approval_id: manifest.approval_id.clone(),
             state: ApprovalPrepareState::AwaitingCeremony,
             ceremony_url: session_url(&token_for(session)),
-            ceremony_expires_at_ms: bloom_triad_protocol::DecimalU64::new(session.expires_at_ms),
+            ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             review_manifest_digest: digest(&manifest).ok()?,
         }))
     }
@@ -1039,11 +1204,11 @@ impl CeremonyBroker {
         let contribution: CustodySignerContribution =
             serde_json::from_value(session.projection.signer_contribution.clone()).ok()?;
         Some(Ok(CustodyPrepareResponse {
-            ceremony_kind: session.ceremony_kind,
+            ceremony_kind: kind_to_machine(session.ceremony_kind),
             custody_operation_id: operation_id.clone(),
             state: CustodyPrepareState::AwaitingUser,
             ceremony_url: session_url(&token_for(session)),
-            ceremony_expires_at_ms: bloom_triad_protocol::DecimalU64::new(session.expires_at_ms),
+            ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             signer_contribution_digest: contribution.digest().ok()?,
         }))
     }
@@ -1065,9 +1230,9 @@ impl CeremonyBroker {
         }
         Some(Ok(PolicyUpdatePrepareResponse {
             operation_id: operation_id.clone(),
-            ceremony_kind: CeremonyKind::PolicyUpdate,
+            ceremony_kind: BrokerCeremonyKind::PolicyUpdate,
             ceremony_url: session_url(&token_for(session)),
-            ceremony_expires_at_ms: bloom_triad_protocol::DecimalU64::new(session.expires_at_ms),
+            ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             review_manifest_digest: review_manifest_digest.clone(),
         }))
     }
@@ -1138,7 +1303,12 @@ impl CeremonyBroker {
                 && session.state != CeremonyState::WalletCommitted
                 && !is_terminal(session.state)
             {
-                match self.inner.signer.status(&session.operation_id)? {
+                match self
+                    .inner
+                    .signer
+                    .status(&session.operation_id)
+                    .map_err(signer_error_to_machine)?
+                {
                     SignerCeremonyStatus::CompletedApproval(receipt) => {
                         session.state = CeremonyState::WalletCommitted;
                         session.terminal_result =
@@ -1150,7 +1320,10 @@ impl CeremonyBroker {
                             Some(serde_json::to_value(result).map_err(malformed)?);
                     }
                     SignerCeremonyStatus::Pending => {
-                        self.inner.signer.cancel(&session.operation_id)?;
+                        self.inner
+                            .signer
+                            .cancel(&session.operation_id)
+                            .map_err(signer_error_to_machine)?;
                         session.state = CeremonyState::Expired;
                     }
                     SignerCeremonyStatus::Missing => {
@@ -1195,8 +1368,14 @@ impl CeremonyBroker {
         manifest: &ReviewManifest,
         now_ms: u64,
     ) -> Result<(), ProtocolError> {
-        let approval_id = request.terms.approval_id()?;
-        let approval_digest = request.terms.approval_digest()?;
+        let approval_id = request
+            .terms
+            .approval_id()
+            .map_err(signer_error_to_machine)?;
+        let approval_digest = request
+            .terms
+            .approval_digest()
+            .map_err(signer_error_to_machine)?;
         let disclosures = review_disclosures(
             request,
             manifest.claim_assurance.as_ref(),
@@ -1243,8 +1422,14 @@ impl CeremonyBroker {
         let canonical_plan = canonical_review_plan(request, &disclosures)?;
         let mut manifest = ReviewManifest {
             schema: Token::new("bloom.review-manifest.v1")?,
-            approval_id: request.terms.approval_id()?,
-            approval_digest: request.terms.approval_digest()?,
+            approval_id: request
+                .terms
+                .approval_id()
+                .map_err(signer_error_to_machine)?,
+            approval_digest: request
+                .terms
+                .approval_digest()
+                .map_err(signer_error_to_machine)?,
             canonical_plan_digest: Digest32::from_bytes(
                 Sha256::digest(canonical_plan.as_bytes()).into(),
             ),
@@ -1254,7 +1439,7 @@ impl CeremonyBroker {
             petal_use_claim: context.petal_use_claim,
             claim_assurance: context.claim_assurance,
             attributed_advisory_items: context.attributed_advisory_items,
-            issued_at_ms: bloom_triad_protocol::DecimalU64::new(now_ms),
+            issued_at_ms: DecimalU64::new(now_ms),
             expires_at_ms: request.terms.expires_at_ms.clone(),
             broker_key_id: broker_key_id.clone(),
             broker_signature: Base64UrlBytes::from_bytes(&[]),
@@ -1271,95 +1456,6 @@ impl CeremonyBroker {
                 .to_bytes(),
         );
         Ok(manifest)
-    }
-
-    fn verify_browser_proof(
-        &self,
-        wallet_id: Option<&Token>,
-        projection: &BrowserProjection,
-        verification_credentials: &[WebAuthnCredential],
-        proof: &WebAuthnCeremonyProof,
-    ) -> Result<(), ProtocolError> {
-        let challenge = |index: usize| {
-            projection
-                .challenges
-                .get(index)
-                .ok_or_else(kind_mismatch)?
-                .binding
-                .canonical_bytes()
-        };
-        let verify_assertion = |assertion: &bloom_triad_protocol::WebAuthnAssertion,
-                                index: usize|
-         -> Result<(), ProtocolError> {
-            wallet_id.ok_or_else(kind_mismatch)?;
-            let credential = verification_credentials
-                .iter()
-                .find(|credential| credential.credential_id == assertion.credential_id)
-                .ok_or_else(kind_mismatch)?;
-            if projection
-                .webauthn_options
-                .allowed_credentials
-                .iter()
-                .all(|allowed| allowed.credential_id != credential.credential_id)
-            {
-                return Err(kind_mismatch());
-            }
-            verify_webauthn_assertion(assertion, credential, &challenge(index)?, true)?;
-            Ok(())
-        };
-        let verify_attestation = |attestation: &bloom_triad_protocol::WebAuthnAttestation,
-                                  index: usize|
-         -> Result<WebAuthnCredential, ProtocolError> {
-            verify_webauthn_attestation(
-                attestation,
-                &challenge(index)?,
-                projection
-                    .webauthn_options
-                    .registration_user_handle
-                    .clone()
-                    .ok_or_else(kind_mismatch)?,
-                projection
-                    .webauthn_options
-                    .registration_prf_salt
-                    .clone()
-                    .ok_or_else(kind_mismatch)?,
-            )
-        };
-        match proof {
-            WebAuthnCeremonyProof::Assertion { assertion } => verify_assertion(assertion, 0),
-            WebAuthnCeremonyProof::Registration {
-                attestation,
-                prf_assertion,
-            } => {
-                let credential = verify_attestation(attestation, 0)?;
-                if let Some(assertion) = prf_assertion {
-                    verify_webauthn_assertion(assertion, &credential, &challenge(1)?, true)?;
-                }
-                Ok(())
-            }
-            WebAuthnCeremonyProof::AuthorityCredentialChange {
-                authority_assertion,
-                new_credential_attestation,
-                new_credential_prf_assertion,
-            } => {
-                verify_assertion(authority_assertion, 0)?;
-                let credential = verify_attestation(new_credential_attestation, 1)?;
-                if let Some(assertion) = new_credential_prf_assertion {
-                    verify_webauthn_assertion(assertion, &credential, &challenge(2)?, true)?;
-                }
-                Ok(())
-            }
-            WebAuthnCeremonyProof::RecoveryCredentialChange {
-                new_credential_attestation,
-                new_credential_prf_assertion,
-            } => {
-                let credential = verify_attestation(new_credential_attestation, 0)?;
-                if let Some(assertion) = new_credential_prf_assertion {
-                    verify_webauthn_assertion(assertion, &credential, &challenge(1)?, true)?;
-                }
-                Ok(())
-            }
-        }
     }
 
     fn persist_session(&self, session: &BrowserSession) -> Result<(), ProtocolError> {
@@ -1642,7 +1738,7 @@ async fn complete_session(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let (ceremony_kind, operation_id, wallet_id, projection, verifying_snapshot) = {
+    let (ceremony_kind, operation_id, projection, verifying_snapshot) = {
         let sessions = broker.inner.sessions.lock();
         let Some(session) = sessions.get(&ceremony_id) else {
             return StatusCode::NOT_FOUND.into_response();
@@ -1669,7 +1765,6 @@ async fn complete_session(
         (
             session.ceremony_kind,
             session.operation_id.clone(),
-            session.wallet_id.clone(),
             session.projection.clone(),
             verifying_snapshot,
         )
@@ -1682,33 +1777,6 @@ async fn complete_session(
         .sessions
         .lock()
         .insert(ceremony_id.clone(), verifying_snapshot.clone());
-    if let Err(error) = broker.verify_browser_proof(
-        wallet_id.as_ref(),
-        &projection,
-        &verifying_snapshot.verification_credentials,
-        &body.proof,
-    ) {
-        if broker.inner.signer.cancel(&operation_id).is_err() {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        let failed = {
-            let sessions = broker.inner.sessions.lock();
-            let Some(session) = sessions.get(&ceremony_id) else {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            };
-            let mut failed = session.clone();
-            failed.state = CeremonyState::Failed;
-            failed.terminal_at_ms = Some(unix_time_ms());
-            failed.token = None;
-            failed.token_hash = [0_u8; 32];
-            failed
-        };
-        if broker.persist_session(&failed).is_err() {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        broker.inner.sessions.lock().insert(ceremony_id, failed);
-        return (StatusCode::BAD_REQUEST, Json(error)).into_response();
-    }
     let result = if ceremony_kind == CeremonyKind::SealedApproval {
         let contribution: SignerCeremonyContribution =
             match serde_json::from_value(projection.signer_contribution.clone()) {
@@ -1727,6 +1795,7 @@ async fn complete_session(
                 },
                 unix_time_ms(),
             )
+            .map_err(signer_error_to_machine)
             .and_then(|receipt| serde_json::to_value(receipt).map_err(malformed))
     } else if ceremony_kind == CeremonyKind::PolicyUpdate {
         broker
@@ -1745,6 +1814,7 @@ async fn complete_session(
                 },
                 unix_time_ms(),
             )
+            .map_err(signer_error_to_machine)
             .and_then(|receipt| serde_json::to_value(receipt).map_err(malformed))
     } else {
         broker
@@ -1761,6 +1831,7 @@ async fn complete_session(
                 },
                 unix_time_ms(),
             )
+            .map_err(signer_error_to_machine)
             .and_then(|receipt| serde_json::to_value(receipt).map_err(malformed))
     };
     match result {
@@ -1797,6 +1868,11 @@ async fn complete_session(
             }
         }
         Err(error) => {
+            if error.code == ProtocolErrorCode::UnauthenticatedPeer
+                && broker.inner.signer.cancel(&operation_id).is_err()
+            {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
             let snapshot = {
                 let sessions = broker.inner.sessions.lock();
                 let Some(session) = sessions.get(&ceremony_id) else {
@@ -1846,7 +1922,13 @@ async fn bind_output_key(
         unix_time_ms(),
     ) {
         Ok(prepared) => prepared,
-        Err(error) => return (StatusCode::BAD_REQUEST, Json(error)).into_response(),
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(signer_error_to_machine(error)),
+            )
+                .into_response();
+        }
     };
     let snapshot = {
         let sessions = broker.inner.sessions.lock();
@@ -1866,7 +1948,9 @@ async fn bind_output_key(
             .challenges
             .into_iter()
             .map(|binding| {
-                let challenge = binding.webauthn_challenge()?;
+                let challenge = binding
+                    .webauthn_challenge()
+                    .map_err(signer_error_to_machine)?;
                 Ok(BrowserChallenge { binding, challenge })
             })
             .collect::<Result<Vec<_>, ProtocolError>>()
@@ -2128,7 +2212,7 @@ fn canonical_review_plan(
     #[derive(Serialize)]
     struct Plan<'a> {
         schema: &'static str,
-        terms: &'a bloom_triad_protocol::SealedApprovalTerms,
+        terms: &'a bloom_signer_api::SealedApprovalTerms,
         exact_ordered_payload_digests: &'a [Digest32],
         exact_ordered_hashes: &'a [Digest32],
         replacement_approval_id: &'a Option<Digest32>,
@@ -2147,8 +2231,8 @@ fn canonical_review_plan(
 
 fn review_disclosures(
     request: &CeremonyPrepareRequest,
-    assurance: Option<&bloom_triad_protocol::ClaimAssurance>,
-    claim: Option<&bloom_triad_protocol::PetalUseClaim>,
+    assurance: Option<&ClaimAssurance>,
+    claim: Option<&PetalUseClaim>,
 ) -> Vec<String> {
     let mut disclosures = Vec::new();
     if !request.exact_ordered_payload_digests.is_empty() || !request.exact_ordered_hashes.is_empty()
@@ -2158,18 +2242,13 @@ fn review_disclosures(
                 .to_owned(),
         );
     }
-    let machine_asserted = matches!(
-        assurance,
-        Some(bloom_triad_protocol::ClaimAssurance::MachineAsserted)
-    ) || claim.is_some_and(|claim| {
-        matches!(
-            claim.claim_assurance,
-            bloom_triad_protocol::ClaimAssurance::MachineAsserted
-        )
-    }) || matches!(
-        request.terms.selector,
-        bloom_triad_protocol::ApprovalSelector::Petal { .. }
-    ) && assurance.is_none();
+    let machine_asserted = matches!(assurance, Some(ClaimAssurance::MachineAsserted))
+        || claim
+            .is_some_and(|claim| matches!(claim.claim_assurance, ClaimAssurance::MachineAsserted))
+        || matches!(
+            request.terms.selector,
+            bloom_signer_api::ApprovalSelector::Petal { .. }
+        ) && assurance.is_none();
     if machine_asserted {
         disclosures.push(
             "The displayed limits are asserted by the named Petal. Bloom does not verify them against the payload, and a compromised Petal or Machine can consume the full remaining capacity."

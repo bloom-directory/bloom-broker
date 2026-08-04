@@ -2,19 +2,20 @@
 
 use std::sync::Arc;
 
-use bloom_triad_local_transport::NetworkContainmentGuard;
-use bloom_triad_protocol::{
+use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector, Base64UrlBytes, BootEpoch,
-    BrokerSignerRequest, BrokerSignerResponse, BrokerValidationReceipt, ControlRequest,
-    ControlResponse, DecimalU64, Digest32, Empty, MachineBrokerMethod, MachineBrokerRequest,
-    MachineBrokerResponse, MachineBrokerService, MachineSignRequest, OperationId,
-    OperationPublicStatus, OperationState, PolicyCompareAndSwapRequest,
-    PolicyUpdateCeremonyPrepareRequest, PolicyUpdateRequest, PolicyUpdateReviewManifest,
-    PolicyValidationReceipt, ProtocolError, ProtocolErrorCode, RPC_ENVELOPE_SCHEMA_V1, Readiness,
-    ReadinessState, RevocationControlService, SealedApprovalPrepareResponse, SelectorKind,
-    ServiceCapabilities, ServiceFuture, SignRequest, SigningPayloads, Token, UnsignedSignRequest,
-    VerifierPublicCapability, WalletPublic, WalletRequest,
+    DecimalU64, Digest32, MachineBrokerMethod, MachineBrokerRequest, MachineBrokerResponse,
+    MachineBrokerService, MachineSignRequest, OperationId, OperationPublicStatus, OperationState,
+    PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, RPC_ENVELOPE_SCHEMA_V1, Readiness,
+    ReadinessState, SealedApprovalPrepareResponse, ServiceCapabilities, ServiceFuture,
+    SigningPayloads, Token, VerifierPublicCapability, WalletPublic, WalletRequest,
 };
+use bloom_signer_api::{
+    BrokerSignerRequest, BrokerSignerResponse, BrokerValidationReceipt, ControlRequest,
+    ControlResponse, PolicyCompareAndSwapRequest, PolicyUpdateCeremonyPrepareRequest,
+    PolicyValidationReceipt, RevocationControlService, SignRequest, UnsignedSignRequest,
+};
+use bloom_triad_local_transport::NetworkContainmentGuard;
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _};
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
@@ -24,10 +25,18 @@ use crate::{
         AuthorityError, AuthorizationInput, BrokerAuthority, EpochReconciliation,
         PolicyInstallCorrelation,
     },
-    ceremony::{CeremonyBroker, CeremonyCompletionObserver, ReviewManifestContext},
+    ceremony::{
+        CeremonyBroker, CeremonyCompletionObserver, PolicyUpdateReviewManifest,
+        ReviewManifestContext,
+    },
     clock::BrokerClock,
     journal::{BrokerJournal, JournalError, ReservationState},
     signer_client::BrokerSignerClient,
+    translation::{
+        approval as translate_approval, custody as translate_custody, error as translate_error,
+        key as translate_key, policy as translate_policy, revocation as translate_revocation,
+        service as translate_service, signing as translate_signing,
+    },
 };
 
 const BROKER_SIGN_REQUEST_SCHEMA: &str = "bloom.sign-request/1";
@@ -149,7 +158,9 @@ impl BrokerRpcService {
                     .revoke_local_approval(&request.approval_id)
                     .map_err(authority_error)?;
                 self.signer
-                    .request_async(BrokerSignerRequest::SealedApprovalRevoke(request.clone()))
+                    .request_for_machine(BrokerSignerRequest::SealedApprovalRevoke(
+                        translate_revocation::revoke_request_to_signer(request.clone()),
+                    ))
                     .await?;
                 Ok(Response::SealedApprovalRevoke(
                     self.authority
@@ -176,11 +187,18 @@ impl BrokerRpcService {
                     .map_err(authority_error)?;
                 match self
                     .signer
-                    .request_async(BrokerSignerRequest::SealedApprovalRevokeAll(request))
+                    .request_for_machine(BrokerSignerRequest::SealedApprovalRevokeAll(
+                        bloom_signer_api::WalletOperationRequest {
+                            operation_id: request.operation_id,
+                            wallet_id: request.wallet_id,
+                        },
+                    ))
                     .await?
                 {
                     BrokerSignerResponse::SealedApprovalRevokeAll(state) => {
-                        Ok(Response::SealedApprovalRevokeAll(state))
+                        Ok(Response::SealedApprovalRevokeAll(
+                            translate_revocation::state_to_machine(state),
+                        ))
                     }
                     _ => Err(response_mismatch("sealed_approval.revoke_all")),
                 }
@@ -224,20 +242,23 @@ impl BrokerRpcService {
                 self.prepare_policy_update(request).await?,
             )),
             Request::PolicyCommitUpdate(request) => {
-                let staged = self
+                let (staged, ceremony_receipt) = self
                     .ceremony
                     .completed_policy_update(&request.operation_id, &request.ceremony_receipt)?;
                 let operation_id = request.operation_id.clone();
-                let ceremony_receipt_digest = request.ceremony_receipt.receipt_digest.clone();
-                let validation_receipt_digest = staged.broker_validation_receipt.digest()?;
+                let ceremony_receipt_digest = ceremony_receipt.receipt_digest.clone();
+                let validation_receipt_digest = staged
+                    .broker_validation_receipt
+                    .digest()
+                    .map_err(translate_error::signer_error_to_machine)?;
                 let compare = PolicyCompareAndSwapRequest {
-                    update: staged.update,
-                    ceremony_receipt: request.ceremony_receipt,
+                    update: staged.update.clone(),
+                    ceremony_receipt,
                     broker_validation_receipt: staged.broker_validation_receipt,
                 };
                 match self
                     .signer
-                    .request_async(BrokerSignerRequest::PolicyCompareAndSwap(compare))
+                    .request_for_machine(BrokerSignerRequest::PolicyCompareAndSwap(compare))
                     .await?
                 {
                     BrokerSignerResponse::PolicyCompareAndSwap(receipt) => {
@@ -250,22 +271,19 @@ impl BrokerRpcService {
                             })?)
                             .into(),
                         );
-                        let committed = match self
-                            .signer
-                            .request_async(BrokerSignerRequest::PolicyRead(WalletRequest {
-                                wallet_id: receipt.wallet_id.clone(),
-                            }))
-                            .await?
-                        {
-                            BrokerSignerResponse::PolicyRead(snapshot) => snapshot,
-                            _ => return Err(response_mismatch("policy.read")),
-                        };
-                        if committed != receipt.committed {
-                            return Err(ProtocolError::new(
-                                ProtocolErrorCode::OperationIdConflict,
-                                "Signer reread differs from policy commit receipt",
-                            ));
-                        }
+                        let committed = self.signer_policy_read(&staged.update.wallet_id).await?;
+                        let (policy_key_id, policy_key) = self
+                            .authority
+                            .policy_verification_key(&staged.update.wallet_id)
+                            .map_err(authority_error)?;
+                        verify_policy_commit_receipt(
+                            &receipt,
+                            &staged.update,
+                            &committed,
+                            &policy_key_id,
+                            &policy_key,
+                        )?;
+                        let committed = translate_policy::snapshot_to_machine(committed);
                         self.authority
                             .install_policy_with_correlation(
                                 &committed,
@@ -277,7 +295,9 @@ impl BrokerRpcService {
                                 },
                             )
                             .map_err(authority_error)?;
-                        Ok(Response::PolicyCommitUpdate(receipt))
+                        Ok(Response::PolicyCommitUpdate(
+                            translate_policy::commit_receipt_to_machine(receipt),
+                        ))
                     }
                     _ => Err(response_mismatch("policy.compare_and_swap")),
                 }
@@ -295,11 +315,13 @@ impl BrokerRpcService {
             Request::WalletRegistrationPrepare(request) => {
                 require_custody_kind(
                     request.ceremony_kind,
-                    bloom_triad_protocol::CeremonyKind::WalletRegistration,
+                    bloom_broker_api::CeremonyKind::WalletRegistration,
                 )?;
                 Ok(Response::WalletRegistrationPrepare(
-                    self.ceremony
-                        .prepare_custody(request, self.clock.now_ms(false)?)?,
+                    self.ceremony.prepare_custody(
+                        translate_custody::prepare_to_signer(request),
+                        self.clock.now_ms(false)?,
+                    )?,
                 ))
             }
             Request::WalletUnlockPrepare(_) => Err(ProtocolError::new(
@@ -309,37 +331,43 @@ impl BrokerRpcService {
             Request::WalletImportPrepare(request) => {
                 require_custody_kind(
                     request.ceremony_kind,
-                    bloom_triad_protocol::CeremonyKind::WalletImport,
+                    bloom_broker_api::CeremonyKind::WalletImport,
                 )?;
                 Ok(Response::WalletImportPrepare(
-                    self.ceremony
-                        .prepare_custody(request, self.clock.now_ms(false)?)?,
+                    self.ceremony.prepare_custody(
+                        translate_custody::prepare_to_signer(request),
+                        self.clock.now_ms(false)?,
+                    )?,
                 ))
             }
             Request::WalletExportPrepare(request) => {
                 require_custody_kind(
                     request.ceremony_kind,
-                    bloom_triad_protocol::CeremonyKind::WalletExport,
+                    bloom_broker_api::CeremonyKind::WalletExport,
                 )?;
                 Ok(Response::WalletExportPrepare(
-                    self.ceremony
-                        .prepare_custody(request, self.clock.now_ms(false)?)?,
+                    self.ceremony.prepare_custody(
+                        translate_custody::prepare_to_signer(request),
+                        self.clock.now_ms(false)?,
+                    )?,
                 ))
             }
             Request::WalletDeletePrepare(request) => {
                 require_custody_kind(
                     request.ceremony_kind,
-                    bloom_triad_protocol::CeremonyKind::WalletDelete,
+                    bloom_broker_api::CeremonyKind::WalletDelete,
                 )?;
                 Ok(Response::WalletDeletePrepare(
-                    self.ceremony
-                        .prepare_custody(request, self.clock.now_ms(false)?)?,
+                    self.ceremony.prepare_custody(
+                        translate_custody::prepare_to_signer(request),
+                        self.clock.now_ms(false)?,
+                    )?,
                 ))
             }
             Request::KeyDerivePrepare(request) => {
                 require_custody_kind(
                     request.ceremony_kind,
-                    bloom_triad_protocol::CeremonyKind::KeyDerive,
+                    bloom_broker_api::CeremonyKind::KeyDerive,
                 )?;
                 request.validate_petal_key_scope_binding()?;
                 if let Some(scope) = &request.petal_key_scope {
@@ -347,85 +375,103 @@ impl BrokerRpcService {
                         .prepare_petal_key_scope(scope)
                         .map_err(authority_error)?;
                 }
-                Ok(Response::KeyDerivePrepare(
-                    self.ceremony
-                        .prepare_custody(request, self.clock.now_ms(false)?)?,
-                ))
+                Ok(Response::KeyDerivePrepare(self.ceremony.prepare_custody(
+                    translate_custody::prepare_to_signer(request),
+                    self.clock.now_ms(false)?,
+                )?))
             }
             Request::KeyEnrollPrepare(request) => {
                 require_custody_kind(
                     request.ceremony_kind,
-                    bloom_triad_protocol::CeremonyKind::BackendEnrollment,
+                    bloom_broker_api::CeremonyKind::BackendEnrollment,
                 )?;
-                Ok(Response::KeyEnrollPrepare(
-                    self.ceremony
-                        .prepare_custody(request, self.clock.now_ms(false)?)?,
-                ))
+                Ok(Response::KeyEnrollPrepare(self.ceremony.prepare_custody(
+                    translate_custody::prepare_to_signer(request),
+                    self.clock.now_ms(false)?,
+                )?))
             }
             Request::CredentialAddPrepare(request) => {
                 require_custody_kind(
                     request.ceremony_kind,
-                    bloom_triad_protocol::CeremonyKind::CredentialAdd,
+                    bloom_broker_api::CeremonyKind::CredentialAdd,
                 )?;
                 Ok(Response::CredentialAddPrepare(
-                    self.ceremony
-                        .prepare_custody(request, self.clock.now_ms(false)?)?,
+                    self.ceremony.prepare_custody(
+                        translate_custody::prepare_to_signer(request),
+                        self.clock.now_ms(false)?,
+                    )?,
                 ))
             }
             Request::CredentialReplacePrepare(request) => {
                 require_custody_kind(
                     request.ceremony_kind,
-                    bloom_triad_protocol::CeremonyKind::CredentialReplace,
+                    bloom_broker_api::CeremonyKind::CredentialReplace,
                 )?;
                 Ok(Response::CredentialReplacePrepare(
-                    self.ceremony
-                        .prepare_custody(request, self.clock.now_ms(false)?)?,
+                    self.ceremony.prepare_custody(
+                        translate_custody::prepare_to_signer(request),
+                        self.clock.now_ms(false)?,
+                    )?,
                 ))
             }
             Request::CredentialRemovePrepare(request) => {
                 require_custody_kind(
                     request.ceremony_kind,
-                    bloom_triad_protocol::CeremonyKind::CredentialRemove,
+                    bloom_broker_api::CeremonyKind::CredentialRemove,
                 )?;
                 Ok(Response::CredentialRemovePrepare(
-                    self.ceremony
-                        .prepare_custody(request, self.clock.now_ms(false)?)?,
+                    self.ceremony.prepare_custody(
+                        translate_custody::prepare_to_signer(request),
+                        self.clock.now_ms(false)?,
+                    )?,
                 ))
             }
             Request::RecoveryPrepare(request) => {
                 require_custody_kind(
                     request.ceremony_kind,
-                    bloom_triad_protocol::CeremonyKind::WalletRecovery,
+                    bloom_broker_api::CeremonyKind::WalletRecovery,
                 )?;
-                Ok(Response::RecoveryPrepare(
-                    self.ceremony
-                        .prepare_custody(request, self.clock.now_ms(false)?)?,
-                ))
+                Ok(Response::RecoveryPrepare(self.ceremony.prepare_custody(
+                    translate_custody::prepare_to_signer(request),
+                    self.clock.now_ms(false)?,
+                )?))
             }
             Request::KeyListPublic(request) => {
                 match self
                     .signer
-                    .request_async(BrokerSignerRequest::KeyListPublic(request))
+                    .request_for_machine(BrokerSignerRequest::KeyListPublic(
+                        translate_service::wallet_request_to_signer(request),
+                    ))
                     .await?
                 {
-                    BrokerSignerResponse::KeyListPublic(keys) => Ok(Response::KeyListPublic(keys)),
+                    BrokerSignerResponse::KeyListPublic(keys) => Ok(Response::KeyListPublic(
+                        keys.into_iter()
+                            .map(translate_service::key_to_machine)
+                            .collect(),
+                    )),
                     _ => Err(response_mismatch("key.list_public")),
                 }
             }
             Request::KeyGetPublic(request) => {
                 match self
                     .signer
-                    .request_async(BrokerSignerRequest::KeyGetPublic(request))
+                    .request_for_machine(BrokerSignerRequest::KeyGetPublic(
+                        translate_service::key_request_to_signer(request),
+                    ))
                     .await?
                 {
-                    BrokerSignerResponse::KeyGetPublic(key) => Ok(Response::KeyGetPublic(key)),
+                    BrokerSignerResponse::KeyGetPublic(key) => Ok(Response::KeyGetPublic(
+                        translate_service::key_to_machine(key),
+                    )),
                     _ => Err(response_mismatch("key.get_public")),
                 }
             }
             Request::KeyDerivationCapabilities(request) => {
                 match self
                     .signer
-                    .request_async(BrokerSignerRequest::KeyDerivationCapabilities(request))
+                    .request_for_machine(BrokerSignerRequest::KeyDerivationCapabilities(
+                        translate_service::key_request_to_signer(request),
+                    ))
                     .await?
                 {
                     BrokerSignerResponse::KeyDerivationCapabilities(capabilities) => {
@@ -437,23 +483,34 @@ impl BrokerRpcService {
             Request::KeyListDerived(request) => {
                 match self
                     .signer
-                    .request_async(BrokerSignerRequest::KeyListDerived(request))
+                    .request_for_machine(BrokerSignerRequest::KeyListDerived(
+                        translate_service::key_request_to_signer(request),
+                    ))
                     .await?
                 {
-                    BrokerSignerResponse::KeyListDerived(keys) => {
-                        Ok(Response::KeyListDerived(keys))
-                    }
+                    BrokerSignerResponse::KeyListDerived(keys) => Ok(Response::KeyListDerived(
+                        keys.into_iter()
+                            .map(translate_service::key_to_machine)
+                            .collect(),
+                    )),
                     _ => Err(response_mismatch("key.list_derived")),
                 }
             }
             Request::CredentialListPublic(request) => {
                 match self
                     .signer
-                    .request_async(BrokerSignerRequest::CredentialListPublic(request))
+                    .request_for_machine(BrokerSignerRequest::CredentialListPublic(
+                        translate_service::wallet_request_to_signer(request),
+                    ))
                     .await?
                 {
                     BrokerSignerResponse::CredentialListPublic(credentials) => {
-                        Ok(Response::CredentialListPublic(credentials))
+                        Ok(Response::CredentialListPublic(
+                            credentials
+                                .into_iter()
+                                .map(translate_service::credential_to_machine)
+                                .collect(),
+                        ))
                     }
                     _ => Err(response_mismatch("credential.list_public")),
                 }
@@ -475,12 +532,16 @@ impl BrokerRpcService {
             Request::CustodyResult(request) => {
                 match self
                     .signer
-                    .request_async(BrokerSignerRequest::CustodyResult(request))
+                    .request_for_machine(BrokerSignerRequest::CustodyResult(
+                        bloom_signer_api::OperationRequest {
+                            operation_id: request.operation_id,
+                        },
+                    ))
                     .await?
                 {
-                    BrokerSignerResponse::CustodyResult(result) => {
-                        Ok(Response::CustodyResult(result))
-                    }
+                    BrokerSignerResponse::CustodyResult(result) => Ok(Response::CustodyResult(
+                        translate_custody::result_to_machine(result),
+                    )),
                     _ => Err(response_mismatch("custody.result")),
                 }
             }
@@ -499,9 +560,9 @@ impl BrokerRpcService {
             } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
             ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
         };
-        let ceremony_request = bloom_triad_protocol::CeremonyPrepareRequest {
+        let ceremony_request = bloom_signer_api::CeremonyPrepareRequest {
             activation_operation_id: request.operation_id.clone(),
-            terms: request.terms.clone(),
+            terms: translate_approval::validated_terms_to_signer(request.terms.clone()),
             review_manifest_digest: request.canonical_plan_facts_digest,
             exact_ordered_payload_digests,
             exact_ordered_hashes,
@@ -528,7 +589,7 @@ impl BrokerRpcService {
     async fn prepare_policy_update(
         &self,
         request: PolicyUpdateRequest,
-    ) -> Result<bloom_triad_protocol::PolicyUpdatePrepareResponse, ProtocolError> {
+    ) -> Result<bloom_broker_api::PolicyUpdatePrepareResponse, ProtocolError> {
         let authority_diff = self
             .authority
             .validate_policy_update(&request)
@@ -574,12 +635,14 @@ impl BrokerRpcService {
         };
         validation.broker_signature = self.sign_domain(
             POLICY_VALIDATION_DOMAIN,
-            &validation.unsigned_canonical_bytes()?,
+            &validation
+                .unsigned_canonical_bytes()
+                .map_err(translate_error::signer_error_to_machine)?,
         );
         self.ceremony.prepare_policy_update(
             PolicyUpdateCeremonyPrepareRequest {
-                custody: bloom_triad_protocol::CustodyPrepareRequest {
-                    ceremony_kind: bloom_triad_protocol::CeremonyKind::PolicyUpdate,
+                custody: bloom_signer_api::CustodyPrepareRequest {
+                    ceremony_kind: bloom_signer_api::CeremonyKind::PolicyUpdate,
                     custody_operation_id: request.operation_id.clone(),
                     wallet_id: Some(request.wallet_id.clone()),
                     key_ref: None,
@@ -588,7 +651,7 @@ impl BrokerRpcService {
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                 },
-                update: request,
+                update: translate_policy::update_to_signer(request),
                 broker_validation_receipt: validation,
             },
             review,
@@ -625,7 +688,7 @@ impl BrokerRpcService {
         &self,
         request: MachineSignRequest,
         is_batch: bool,
-    ) -> Result<bloom_triad_protocol::SigningResult, ProtocolError> {
+    ) -> Result<bloom_broker_api::SigningResult, ProtocolError> {
         let signature_count = match &request.payloads {
             SigningPayloads::Single { .. } => 1,
             SigningPayloads::Batch { children } => children.len(),
@@ -678,17 +741,26 @@ impl BrokerRpcService {
             claim_digest: claim_digest.clone(),
             assurance_digest: assurance_digest.clone(),
             reservation_ids: decision.reservation_ids.clone(),
-            effective_claim_assurance: decision.effective_assurance.clone(),
+            effective_claim_assurance: decision
+                .effective_assurance
+                .clone()
+                .map(translate_signing::assurance_to_signer),
             broker_key_id: self.signing_key_id.clone(),
             broker_signature: Base64UrlBytes::from_bytes(&[]),
         };
         validation_receipt.broker_signature = Base64UrlBytes::from_bytes(
             &self
                 .signing_key
-                .sign(&validation_receipt.signature_message()?)
+                .sign(
+                    &validation_receipt
+                        .signature_message()
+                        .map_err(translate_error::signer_error_to_machine)?,
+                )
                 .to_bytes(),
         );
-        let validation_receipt_digest = validation_receipt.digest()?;
+        let validation_receipt_digest = validation_receipt
+            .digest()
+            .map_err(translate_error::signer_error_to_machine)?;
         let mut unsigned = UnsignedSignRequest {
             schema: Token::new(BROKER_SIGN_REQUEST_SCHEMA)?,
             attempt_id: Digest32::from_bytes(attempt_bytes),
@@ -701,12 +773,9 @@ impl BrokerRpcService {
             broker_signing_key_id: self.signing_key_id.clone(),
             approval_id: request.approval_id.clone(),
             wallet_id: terms.wallet_id,
-            key_ref: request.key_ref,
-            crypto_suite: request.crypto_suite,
-            selector_kind: match terms.selector {
-                ApprovalSelector::Exact { .. } => SelectorKind::Exact,
-                ApprovalSelector::Petal { .. } => SelectorKind::Petal,
-            },
+            key_ref: translate_key::key_ref_to_signer(request.key_ref),
+            crypto_suite: translate_key::crypto_suite_to_signer(request.crypto_suite),
+            selector_kind: translate_signing::selector_to_signer(&terms.selector),
             ordered_payload_digests: decision.ordered_payload_digests,
             ordered_hashes: decision.ordered_hashes,
             signature_count: DecimalU64::new(signature_count as u64),
@@ -723,7 +792,9 @@ impl BrokerRpcService {
                     .min(terms.expires_at_ms.get()),
             ),
         };
-        unsigned.attempt_digest = unsigned.computed_attempt_digest()?;
+        unsigned.attempt_digest = unsigned
+            .computed_attempt_digest()
+            .map_err(translate_error::signer_error_to_machine)?;
         let snapshot = self
             .journal
             .begin_sign_attempt(&unsigned, is_batch, &validation_receipt)
@@ -784,19 +855,18 @@ impl BrokerRpcService {
         let approval_id = request.unsigned.approval_id.clone();
         let response = self
             .signer
-            .request_async(if is_batch {
+            .request_for_machine(if is_batch {
                 BrokerSignerRequest::SignerSignBatch(request)
             } else {
                 BrokerSignerRequest::SignerSign(request)
             })
             .await;
         match response {
-            Ok(BrokerSignerResponse::SignerSign(result))
-            | Ok(BrokerSignerResponse::SignerSignBatch(result)) => {
+            Ok(response) => {
+                let result = exact_signing_response(is_batch, response)?;
                 self.commit_signer_result(&approval_id, result.clone(), is_batch)?;
-                Ok(result)
+                Ok(translate_signing::result_to_machine(result))
             }
-            Ok(_) => Err(response_mismatch("signer.sign")),
             Err(error) if error.code == ProtocolErrorCode::AmbiguousProviderEffect => {
                 self.journal
                     .transition_operation(&operation_id, OperationState::Quarantined)
@@ -848,11 +918,11 @@ impl BrokerRpcService {
         operation_id: &OperationId,
         approval_id: &Digest32,
         is_batch: bool,
-    ) -> Result<bloom_triad_protocol::SigningResult, ProtocolError> {
+    ) -> Result<bloom_broker_api::SigningResult, ProtocolError> {
         let status = match self
             .signer
-            .request_async(BrokerSignerRequest::OperationStatus(
-                bloom_triad_protocol::OperationRequest {
+            .request_for_machine(BrokerSignerRequest::OperationStatus(
+                bloom_signer_api::OperationRequest {
                     operation_id: operation_id.clone(),
                 },
             ))
@@ -862,11 +932,11 @@ impl BrokerRpcService {
             _ => return Err(response_mismatch("operation.status")),
         };
         match (status.state, status.result) {
-            (OperationState::Succeeded, Some(result)) => {
+            (bloom_signer_api::OperationState::Succeeded, Some(result)) => {
                 self.commit_signer_result(approval_id, result.clone(), is_batch)?;
-                Ok(result)
+                Ok(translate_signing::result_to_machine(result))
             }
-            (OperationState::Quarantined, _) => {
+            (bloom_signer_api::OperationState::Quarantined, _) => {
                 self.transition_to_quarantined(operation_id)?;
                 self.journal
                     .finalize_reservation(approval_id, operation_id, ReservationState::Quarantined)
@@ -876,7 +946,12 @@ impl BrokerRpcService {
                     "Signer reports an ambiguous provider effect",
                 ))
             }
-            (OperationState::Denied | OperationState::Cancelled | OperationState::Failed, _) => {
+            (
+                bloom_signer_api::OperationState::Denied
+                | bloom_signer_api::OperationState::Cancelled
+                | bloom_signer_api::OperationState::Failed,
+                _,
+            ) => {
                 self.transition_to_failed(operation_id)?;
                 self.journal
                     .finalize_reservation(approval_id, operation_id, ReservationState::Released)
@@ -896,7 +971,7 @@ impl BrokerRpcService {
     fn commit_signer_result(
         &self,
         approval_id: &Digest32,
-        result: bloom_triad_protocol::SigningResult,
+        result: bloom_signer_api::SigningResult,
         is_batch: bool,
     ) -> Result<(), ProtocolError> {
         let validation_receipt = self
@@ -928,6 +1003,7 @@ impl BrokerRpcService {
                 )
             })?;
         validate_signer_result_shape(&snapshot, &result, is_batch, expected_signature_count)?;
+        let result = translate_signing::result_to_machine(result);
         match snapshot.state {
             OperationState::Dispatched => {
                 self.transition_operation(
@@ -954,7 +1030,7 @@ impl BrokerRpcService {
                 .iter()
                 .enumerate()
                 .map(|(ordinal, signature)| {
-                    Ok(bloom_triad_protocol::SigningResult {
+                    Ok(bloom_broker_api::SigningResult {
                         operation_id: crate::journal::derive_batch_child_operation_id(
                             &result.operation_id,
                             ordinal,
@@ -1007,7 +1083,12 @@ fn verify_broker_validation_receipt(
         )
     })?;
     verifying_key
-        .verify(&receipt.signature_message()?, &signature)
+        .verify(
+            &receipt
+                .signature_message()
+                .map_err(translate_error::signer_error_to_machine)?,
+            &signature,
+        )
         .map_err(|_| {
             ProtocolError::new(
                 ProtocolErrorCode::UnauthenticatedPeer,
@@ -1093,8 +1174,8 @@ impl BrokerRpcService {
                     OsRng.fill_bytes(&mut operation_bytes);
                     match self
                         .signer
-                        .request_async(BrokerSignerRequest::SealedApprovalRevokeAll(
-                            bloom_triad_protocol::WalletOperationRequest {
+                        .request_for_machine(BrokerSignerRequest::SealedApprovalRevokeAll(
+                            bloom_signer_api::WalletOperationRequest {
                                 operation_id: OperationId::from_bytes(operation_bytes),
                                 wallet_id: wallet_id.clone(),
                             },
@@ -1113,15 +1194,19 @@ impl BrokerRpcService {
     async fn revocation_snapshot(
         &self,
         wallet_id: &Token,
-    ) -> Result<bloom_triad_protocol::RevocationSnapshot, ProtocolError> {
+    ) -> Result<bloom_broker_api::RevocationSnapshot, ProtocolError> {
         match self
             .signer
-            .request_async(BrokerSignerRequest::RevocationState(WalletRequest {
-                wallet_id: wallet_id.clone(),
-            }))
+            .request_for_machine(BrokerSignerRequest::RevocationState(
+                bloom_signer_api::WalletRequest {
+                    wallet_id: wallet_id.clone(),
+                },
+            ))
             .await?
         {
-            BrokerSignerResponse::RevocationState(snapshot) => Ok(snapshot),
+            BrokerSignerResponse::RevocationState(snapshot) => {
+                Ok(translate_revocation::snapshot_to_machine(snapshot))
+            }
             _ => Err(response_mismatch("revocation.state")),
         }
     }
@@ -1129,18 +1214,29 @@ impl BrokerRpcService {
     async fn policy_read(
         &self,
         request: &WalletRequest,
-    ) -> Result<bloom_triad_protocol::SignedPolicySnapshot, ProtocolError> {
+    ) -> Result<bloom_broker_api::SignedPolicySnapshot, ProtocolError> {
+        let snapshot = self.signer_policy_read(&request.wallet_id).await?;
+        let snapshot = translate_policy::snapshot_to_machine(snapshot);
+        self.authority
+            .install_policy(&snapshot)
+            .map_err(authority_error)?;
+        Ok(snapshot)
+    }
+
+    async fn signer_policy_read(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<bloom_signer_api::SignedPolicySnapshot, ProtocolError> {
         match self
             .signer
-            .request_async(BrokerSignerRequest::PolicyRead(request.clone()))
+            .request_for_machine(BrokerSignerRequest::PolicyRead(
+                bloom_signer_api::WalletRequest {
+                    wallet_id: wallet_id.clone(),
+                },
+            ))
             .await?
         {
-            BrokerSignerResponse::PolicyRead(snapshot) => {
-                self.authority
-                    .install_policy(&snapshot)
-                    .map_err(authority_error)?;
-                Ok(snapshot)
-            }
+            BrokerSignerResponse::PolicyRead(snapshot) => Ok(snapshot),
             _ => Err(response_mismatch("policy.read")),
         }
     }
@@ -1153,9 +1249,11 @@ impl BrokerRpcService {
             .await?;
         let keys = match self
             .signer
-            .request_async(BrokerSignerRequest::KeyListPublic(WalletRequest {
-                wallet_id: wallet_id.clone(),
-            }))
+            .request_for_machine(BrokerSignerRequest::KeyListPublic(
+                bloom_signer_api::WalletRequest {
+                    wallet_id: wallet_id.clone(),
+                },
+            ))
             .await?
         {
             BrokerSignerResponse::KeyListPublic(keys) => keys,
@@ -1169,7 +1267,10 @@ impl BrokerRpcService {
             ),
             wallet_id,
             wallet_kind: Token::new("managed")?,
-            key_refs: keys.into_iter().map(|key| key.key_ref).collect(),
+            key_refs: keys
+                .into_iter()
+                .map(|key| translate_key::key_ref_to_machine(key.key_ref))
+                .collect(),
             policy_version: policy.version,
             policy_digest: policy.policy_digest,
         })
@@ -1234,7 +1335,9 @@ impl BrokerRpcService {
         }
         let signer = match self
             .signer
-            .request_async(BrokerSignerRequest::SignerReadiness(Empty {}))
+            .request_for_machine(BrokerSignerRequest::SignerReadiness(
+                bloom_signer_api::Empty {},
+            ))
             .await?
         {
             BrokerSignerResponse::SignerReadiness(readiness) => readiness,
@@ -1245,13 +1348,13 @@ impl BrokerRpcService {
                 ));
             }
         };
-        validate_signer_readiness(&broker, &signer)?;
+        validate_signer_readiness(&broker, &translate_service::readiness_to_machine(signer))?;
         Ok(broker)
     }
 
     fn require_network_containment(&self) -> Result<(), ProtocolError> {
         match &self.network_containment {
-            Some(guard) => guard.check(),
+            Some(guard) => Ok(guard.check()?),
             None => Ok(()),
         }
     }
@@ -1261,9 +1364,9 @@ impl BrokerRpcService {
             service_id: Token::new("bloom-broker")?,
             service_version: self.service_version.clone(),
             build_digest: self.build_digest.clone(),
-            protocol_major: bloom_triad_protocol::PROTOCOL_MAJOR,
-            protocol_minor_min: bloom_triad_protocol::PROTOCOL_MINOR_MIN,
-            protocol_minor_max: bloom_triad_protocol::PROTOCOL_MINOR_MAX,
+            protocol_major: bloom_broker_api::BROKER_API_MAJOR,
+            protocol_minor_min: bloom_broker_api::BROKER_API_MINOR_MIN,
+            protocol_minor_max: bloom_broker_api::BROKER_API_MINOR_MAX,
             methods: MachineBrokerMethod::ALL
                 .iter()
                 .map(|method| Token::new(method.as_str()))
@@ -1279,7 +1382,7 @@ impl BrokerRpcService {
                     verifier_digest: capability.artifact_digest,
                 })
                 .collect(),
-            frame_max_bytes: DecimalU64::new(bloom_triad_protocol::FRAME_MAX_BYTES as u64),
+            frame_max_bytes: DecimalU64::new(bloom_broker_api::FRAME_MAX_BYTES as u64),
         })
     }
 }
@@ -1316,7 +1419,7 @@ fn validate_signer_readiness(broker: &Readiness, signer: &Readiness) -> Result<(
     {
         return Err(ProtocolError::new(
             ProtocolErrorCode::ServiceUnavailable,
-            "Signer is not ready on the exact Broker build",
+            "Signer service is not ready",
         ));
     }
     Ok(())
@@ -1324,7 +1427,7 @@ fn validate_signer_readiness(broker: &Readiness, signer: &Readiness) -> Result<(
 
 fn validate_signer_result_shape(
     snapshot: &crate::journal::OperationSnapshot,
-    result: &bloom_triad_protocol::SigningResult,
+    result: &bloom_signer_api::SigningResult,
     is_batch: bool,
     expected_signature_count: u64,
 ) -> Result<(), ProtocolError> {
@@ -1347,6 +1450,89 @@ fn validate_signer_result_shape(
     Ok(())
 }
 
+fn exact_signing_response(
+    is_batch: bool,
+    response: BrokerSignerResponse,
+) -> Result<bloom_signer_api::SigningResult, ProtocolError> {
+    match (is_batch, response) {
+        (false, BrokerSignerResponse::SignerSign(result))
+        | (true, BrokerSignerResponse::SignerSignBatch(result)) => Ok(result),
+        (false, BrokerSignerResponse::SignerSignBatch(_))
+        | (true, BrokerSignerResponse::SignerSign(_)) => Err(response_mismatch(if is_batch {
+            "signer.sign_batch"
+        } else {
+            "signer.sign"
+        })),
+        (_, _) => Err(response_mismatch(if is_batch {
+            "signer.sign_batch"
+        } else {
+            "signer.sign"
+        })),
+    }
+}
+
+fn verify_policy_commit_receipt(
+    receipt: &bloom_signer_api::PolicyCommitReceipt,
+    update: &bloom_signer_api::PolicyUpdateRequest,
+    reread: &bloom_signer_api::SignedPolicySnapshot,
+    expected_key_id: &Token,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+) -> Result<(), ProtocolError> {
+    let expected_version = update
+        .baseline_version
+        .get()
+        .checked_add(1)
+        .ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::PolicyBaselineStale,
+                "policy commit baseline version overflowed",
+            )
+        })?;
+    if receipt.operation_id != update.operation_id
+        || receipt.wallet_id != update.wallet_id
+        || receipt.previous_version != update.baseline_version
+        || receipt.authority_diff_digest != update.authority_diff_digest
+        || receipt.committed != *reread
+        || receipt.committed.wallet_id != update.wallet_id
+        || receipt.committed.version.get() != expected_version
+        || receipt.committed.canonical_policy != update.proposed_canonical_policy
+        || receipt.committed.policy_digest != update.proposed_policy_digest
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::OperationIdConflict,
+            "Signer policy commit receipt differs from the staged update or exact reread",
+        ));
+    }
+    if &receipt.signer_key_id != expected_key_id
+        || &receipt.committed.policy_signing_key_id != expected_key_id
+        || receipt.committed.policy_verifying_key.decode() != verifying_key.to_bytes()
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            "policy commit receipt key differs from the pinned wallet policy key",
+        ));
+    }
+    let signature = Signature::from_slice(&receipt.signer_signature.decode()).map_err(|_| {
+        ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            "policy commit receipt signature is malformed",
+        )
+    })?;
+    verifying_key
+        .verify(
+            &receipt
+                .signature_message()
+                .map_err(translate_error::signer_error_to_machine)?,
+            &signature,
+        )
+        .map_err(|_| {
+            ProtocolError::new(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "policy commit receipt signature is invalid",
+            )
+        })
+}
+
 impl MachineBrokerService for BrokerRpcService {
     fn dispatch<'a>(
         &'a self,
@@ -1357,30 +1543,39 @@ impl MachineBrokerService for BrokerRpcService {
 }
 
 impl RevocationControlService for BrokerRpcService {
-    fn dispatch<'a>(&'a self, request: ControlRequest) -> ServiceFuture<'a, ControlResponse> {
+    fn dispatch<'a>(
+        &'a self,
+        request: ControlRequest,
+    ) -> bloom_signer_api::ServiceFuture<'a, ControlResponse> {
         Box::pin(async move {
             match request {
                 ControlRequest::Revoke(request) => {
                     self.authority
                         .revoke_local_approval(&request.approval_id)
-                        .map_err(authority_error)?;
+                        .map_err(authority_error)
+                        .map_err(translate_error::machine_error_to_signer)?;
                     self.signer
                         .request_async(BrokerSignerRequest::SealedApprovalRevoke(request.clone()))
                         .await?;
+                    let status = self
+                        .authority
+                        .approval_public_status(&request.approval_id)
+                        .map_err(authority_error)
+                        .map_err(translate_error::machine_error_to_signer)?;
                     Ok(ControlResponse::Revoke(
-                        self.authority
-                            .approval_public_status(&request.approval_id)
-                            .map_err(authority_error)?,
+                        translate_service::approval_status_to_signer(status),
                     ))
                 }
                 ControlRequest::RevokeAll(request) => {
                     let current = self
                         .authority
                         .wallet_epoch(&request.wallet_id)
-                        .map_err(authority_error)?;
+                        .map_err(authority_error)
+                        .map_err(translate_error::machine_error_to_signer)?;
                     self.authority
                         .advance_local_epoch(&request.wallet_id, current, current.saturating_add(1))
-                        .map_err(authority_error)?;
+                        .map_err(authority_error)
+                        .map_err(translate_error::machine_error_to_signer)?;
                     match self
                         .signer
                         .request_async(BrokerSignerRequest::SealedApprovalRevokeAll(request))
@@ -1389,7 +1584,9 @@ impl RevocationControlService for BrokerRpcService {
                         BrokerSignerResponse::SealedApprovalRevokeAll(state) => {
                             Ok(ControlResponse::RevokeAll(state))
                         }
-                        _ => Err(response_mismatch("sealed_approval.revoke_all")),
+                        _ => Err(translate_error::machine_error_to_signer(response_mismatch(
+                            "sealed_approval.revoke_all",
+                        ))),
                     }
                 }
                 ControlRequest::Status(request) => match self
@@ -1400,7 +1597,9 @@ impl RevocationControlService for BrokerRpcService {
                     BrokerSignerResponse::RevocationState(snapshot) => {
                         Ok(ControlResponse::Status(snapshot.state))
                     }
-                    _ => Err(response_mismatch("revocation.state")),
+                    _ => Err(translate_error::machine_error_to_signer(response_mismatch(
+                        "revocation.state",
+                    ))),
                 },
             }
         })
@@ -1414,7 +1613,7 @@ struct AuthorityCompletionObserver {
 impl CeremonyCompletionObserver for AuthorityCompletionObserver {
     fn approval_completed(
         &self,
-        receipt: &bloom_triad_protocol::SignerActivationReceipt,
+        receipt: &bloom_signer_api::SignerActivationReceipt,
         now_ms: u64,
     ) -> Result<(), ProtocolError> {
         self.authority
@@ -1424,18 +1623,21 @@ impl CeremonyCompletionObserver for AuthorityCompletionObserver {
 
     fn custody_completed(
         &self,
-        receipt: &bloom_triad_protocol::CustodyResult,
+        receipt: &bloom_signer_api::CustodyResult,
         now_ms: u64,
     ) -> Result<(), ProtocolError> {
         self.authority
-            .adopt_custody_receipt(receipt, now_ms)
+            .adopt_custody_receipt(
+                &translate_custody::result_to_machine(receipt.clone()),
+                now_ms,
+            )
             .map_err(authority_error)
     }
 }
 
 fn require_custody_kind(
-    actual: bloom_triad_protocol::CeremonyKind,
-    expected: bloom_triad_protocol::CeremonyKind,
+    actual: bloom_broker_api::CeremonyKind,
+    expected: bloom_broker_api::CeremonyKind,
 ) -> Result<(), ProtocolError> {
     if actual != expected {
         return Err(ProtocolError::new(
@@ -1503,7 +1705,8 @@ fn malformed(error: impl std::fmt::Display) -> ProtocolError {
 mod tests {
     use super::*;
     use crate::journal::OperationSnapshot;
-    use bloom_triad_protocol::{CryptoSuite, NormalizedSignature, OperationState, SigningResult};
+    use bloom_broker_api::OperationState;
+    use bloom_signer_api::{CryptoSuite, NormalizedSignature, SignerClaimAssurance, SigningResult};
 
     fn readiness(service_id: &str, build: u8, state: ReadinessState) -> Readiness {
         Readiness {
@@ -1526,7 +1729,7 @@ mod tests {
             claim_digest: Some(Digest32::from_bytes([0x15; 32])),
             assurance_digest: Some(Digest32::from_bytes([0x16; 32])),
             reservation_ids: vec![Digest32::from_bytes([0x17; 32])],
-            effective_claim_assurance: Some(bloom_triad_protocol::ClaimAssurance::MachineAsserted),
+            effective_claim_assurance: Some(SignerClaimAssurance::MachineAsserted),
             broker_key_id: Token::new("broker-validation-test").unwrap(),
             broker_signature: Base64UrlBytes::from_bytes(&[0; 64]),
         };
@@ -1615,21 +1818,53 @@ mod tests {
     }
 
     #[test]
-    fn broker_readiness_requires_a_ready_signer_on_the_exact_build() {
-        let broker = readiness("bloom-broker", 0x81, ReadinessState::Ready);
-        validate_signer_readiness(
-            &broker,
-            &readiness("bloom-signer", 0x81, ReadinessState::Ready),
-        )
-        .unwrap();
+    fn matched_previous_and_current_service_packages_are_compatible_on_the_frozen_wire() {
+        let mut previous_broker = readiness("bloom-broker", 0x81, ReadinessState::Ready);
+        previous_broker.service_version = "0.1.0".into();
+        let mut previous_signer = readiness("bloom-signer", 0x81, ReadinessState::Ready);
+        previous_signer.service_version = "0.1.0".into();
+
+        let mut current_broker = readiness("bloom-broker", 0x82, ReadinessState::Ready);
+        current_broker.service_version = previous_broker.service_version.clone();
+        let mut current_signer = readiness("bloom-signer", 0x82, ReadinessState::Ready);
+        current_signer.service_version = "0.1.1".into();
+
+        assert_eq!(
+            previous_broker.service_version,
+            current_broker.service_version
+        );
+        assert_ne!(
+            previous_signer.service_version,
+            current_signer.service_version
+        );
+        assert_eq!(previous_broker.build_digest, previous_signer.build_digest);
+        assert_eq!(current_broker.build_digest, current_signer.build_digest);
+        assert_ne!(previous_broker.build_digest, current_broker.build_digest);
+        assert_eq!(
+            bloom_signer_api::SIGNER_API_CURRENT,
+            bloom_broker_api::ProtocolVersion::new(1, 1)
+        );
+        validate_signer_readiness(&previous_broker, &previous_signer).unwrap();
+        validate_signer_readiness(&current_broker, &current_signer).unwrap();
+        assert_eq!(
+            validate_signer_readiness(&previous_broker, &current_signer)
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::ServiceUnavailable
+        );
+        assert_eq!(
+            validate_signer_readiness(&current_broker, &previous_signer)
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::ServiceUnavailable
+        );
 
         for signer in [
-            readiness("bloom-signer", 0x82, ReadinessState::Ready),
             readiness("bloom-signer", 0x81, ReadinessState::DegradedReadOnly),
             readiness("wrong-signer", 0x81, ReadinessState::Ready),
         ] {
             assert_eq!(
-                validate_signer_readiness(&broker, &signer)
+                validate_signer_readiness(&previous_broker, &signer)
                     .unwrap_err()
                     .code,
                 ProtocolErrorCode::ServiceUnavailable
@@ -1688,6 +1923,146 @@ mod tests {
                 .unwrap_err()
                 .code,
             ProtocolErrorCode::OperationIdConflict
+        );
+    }
+
+    #[test]
+    fn swapped_signer_response_variants_fail_even_with_compatible_result_counts() {
+        let (_, single) = result(1);
+        let (_, batch) = result(2);
+        assert_eq!(
+            exact_signing_response(false, BrokerSignerResponse::SignerSignBatch(single),)
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::MalformedFrame
+        );
+        assert_eq!(
+            exact_signing_response(true, BrokerSignerResponse::SignerSign(batch))
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::MalformedFrame
+        );
+    }
+
+    fn signed_policy_commit_fixture() -> (
+        SigningKey,
+        bloom_signer_api::PolicyUpdateRequest,
+        bloom_signer_api::SignedPolicySnapshot,
+        bloom_signer_api::PolicyCommitReceipt,
+    ) {
+        let key = SigningKey::from_bytes(&[0x71; 32]);
+        let wallet_id = Token::new("wallet-policy-test").unwrap();
+        let policy_key_id = Token::new("policy-key-test").unwrap();
+        let canonical_policy = Base64UrlBytes::from_bytes(br#"{"wallet_id":"wallet-policy-test"}"#);
+        let proposed_policy_digest = Digest32::from_bytes([0x72; 32]);
+        let update = bloom_signer_api::PolicyUpdateRequest {
+            operation_id: OperationId::from_bytes([0x73; 32]),
+            wallet_id: wallet_id.clone(),
+            baseline_version: DecimalU64::new(4),
+            baseline_digest: Digest32::from_bytes([0x74; 32]),
+            proposed_canonical_policy: canonical_policy.clone(),
+            proposed_policy_digest: proposed_policy_digest.clone(),
+            authority_diff_digest: Digest32::from_bytes([0x75; 32]),
+            assurance_level: Token::new("passkey").unwrap(),
+        };
+        let committed = bloom_signer_api::SignedPolicySnapshot {
+            wallet_id: wallet_id.clone(),
+            version: DecimalU64::new(5),
+            canonical_policy,
+            policy_digest: proposed_policy_digest,
+            policy_signing_key_id: policy_key_id.clone(),
+            policy_verifying_key: Base64UrlBytes::from_bytes(&key.verifying_key().to_bytes()),
+            signer_signature: Base64UrlBytes::from_bytes(&[0x76; 64]),
+        };
+        let mut receipt = bloom_signer_api::PolicyCommitReceipt {
+            operation_id: update.operation_id.clone(),
+            wallet_id,
+            previous_version: update.baseline_version.clone(),
+            committed: committed.clone(),
+            authority_diff_digest: update.authority_diff_digest.clone(),
+            signer_key_id: policy_key_id,
+            signer_signature: Base64UrlBytes::from_bytes(&[]),
+        };
+        receipt.signer_signature =
+            Base64UrlBytes::from_bytes(&key.sign(&receipt.signature_message().unwrap()).to_bytes());
+        (key, update, committed, receipt)
+    }
+
+    #[test]
+    fn policy_commit_receipt_rejects_every_reviewed_identity_or_signature_mutation() {
+        let (key, update, committed, receipt) = signed_policy_commit_fixture();
+        let expected_key_id = receipt.signer_key_id.clone();
+        let verifying_key = key.verifying_key();
+        let verify = |candidate: &bloom_signer_api::PolicyCommitReceipt| {
+            verify_policy_commit_receipt(
+                candidate,
+                &update,
+                &committed,
+                &expected_key_id,
+                &verifying_key,
+            )
+        };
+        verify(&receipt).unwrap();
+
+        let mut changed = receipt.clone();
+        changed.operation_id = OperationId::from_bytes([0x81; 32]);
+        assert_eq!(
+            verify(&changed).unwrap_err().code,
+            ProtocolErrorCode::OperationIdConflict
+        );
+        let mut changed = receipt.clone();
+        changed.wallet_id = Token::new("other-wallet").unwrap();
+        assert_eq!(
+            verify(&changed).unwrap_err().code,
+            ProtocolErrorCode::OperationIdConflict
+        );
+        let mut changed = receipt.clone();
+        changed.previous_version = DecimalU64::new(3);
+        assert_eq!(
+            verify(&changed).unwrap_err().code,
+            ProtocolErrorCode::OperationIdConflict
+        );
+        let mut changed = receipt.clone();
+        changed.authority_diff_digest = Digest32::from_bytes([0x82; 32]);
+        assert_eq!(
+            verify(&changed).unwrap_err().code,
+            ProtocolErrorCode::OperationIdConflict
+        );
+        let mut changed = receipt.clone();
+        changed.signer_key_id = Token::new("other-policy-key").unwrap();
+        assert_eq!(
+            verify(&changed).unwrap_err().code,
+            ProtocolErrorCode::UnauthenticatedPeer
+        );
+        let mut changed = receipt.clone();
+        changed.signer_signature = Base64UrlBytes::from_bytes(&[0x83; 64]);
+        assert_eq!(
+            verify(&changed).unwrap_err().code,
+            ProtocolErrorCode::UnauthenticatedPeer
+        );
+        assert_eq!(
+            verify_policy_commit_receipt(
+                &receipt,
+                &update,
+                &committed,
+                &Token::new("other-pinned-key").unwrap(),
+                &verifying_key,
+            )
+            .unwrap_err()
+            .code,
+            ProtocolErrorCode::UnauthenticatedPeer
+        );
+        assert_eq!(
+            verify_policy_commit_receipt(
+                &receipt,
+                &update,
+                &committed,
+                &expected_key_id,
+                &SigningKey::from_bytes(&[0x84; 32]).verifying_key(),
+            )
+            .unwrap_err()
+            .code,
+            ProtocolErrorCode::UnauthenticatedPeer
         );
     }
 }

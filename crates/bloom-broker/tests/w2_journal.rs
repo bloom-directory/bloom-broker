@@ -4,13 +4,16 @@ use bloom_broker::journal::{
     JournalError, ReservationRequest, ReservationState, SlidingBudgetLimit, SlidingValueLimit,
     TimeReading, derive_batch_child_operation_id,
 };
-use bloom_triad_local_transport::LocalIdentity;
-use bloom_triad_protocol::{
-    ApprovalLifecycleState, Base64UrlBytes, BootEpoch, BrokerValidationReceipt, CryptoSuite,
-    DecimalU64, DecimalU256, DerivationRef, Digest32, KeyRef, KeySpec, NormalizedSignature,
-    OperationId, OperationState, SelectorKind, SignOperationIdentity, SignatureEncoding,
-    SigningResult, Token, UnsignedSignRequest,
+use bloom_broker_api::{
+    ApprovalLifecycleState, Base64UrlBytes, BootEpoch, CryptoSuite, DecimalU64, DecimalU256,
+    Digest32, NormalizedSignature, OperationId, OperationState, ProtocolErrorCode,
+    SignatureEncoding, SignedJournalHead, SigningResult, Token,
 };
+use bloom_signer_api::{
+    BrokerValidationReceipt, CryptoSuite as SignerCryptoSuite, DerivationRef, KeyRef, KeySpec,
+    SelectorKind, SignOperationIdentity, UnsignedSignRequest,
+};
+use bloom_triad_local_transport::LocalIdentity;
 use ed25519_dalek::{Signer as _, SigningKey, Verifier as _};
 use rusqlite::{Connection, params};
 use std::{
@@ -27,12 +30,12 @@ use tempfile::TempDir;
 struct TestAuditSigner(SigningKey);
 
 #[derive(Default)]
-struct RecordingSelfCheckpoint(Mutex<Vec<bloom_triad_protocol::SignedJournalHead>>);
+struct RecordingSelfCheckpoint(Mutex<Vec<SignedJournalHead>>);
 
 impl CheckpointSink for RecordingSelfCheckpoint {
     fn append_peer_head(
         &self,
-        peer_head: &bloom_triad_protocol::SignedJournalHead,
+        peer_head: &SignedJournalHead,
     ) -> Result<AppendOutcome, CheckpointError> {
         self.0.lock().unwrap().push(peer_head.clone());
         Ok(AppendOutcome::Appended)
@@ -44,7 +47,7 @@ struct FailingSelfCheckpoint;
 impl CheckpointSink for FailingSelfCheckpoint {
     fn append_peer_head(
         &self,
-        _peer_head: &bloom_triad_protocol::SignedJournalHead,
+        _peer_head: &SignedJournalHead,
     ) -> Result<AppendOutcome, CheckpointError> {
         Err(CheckpointError::Io(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -62,7 +65,7 @@ struct ReorderingCheckpoint {
 impl CheckpointSink for ReorderingCheckpoint {
     fn append_peer_head(
         &self,
-        peer_head: &bloom_triad_protocol::SignedJournalHead,
+        peer_head: &SignedJournalHead,
     ) -> Result<AppendOutcome, CheckpointError> {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             // Without journal/checkpoint serialization this lets a later
@@ -167,7 +170,7 @@ fn request(value: u8) -> UnsignedSignRequest {
         operation_id: operation_id.clone(),
         approval_id: digest("22"),
         key_ref: key_ref.clone(),
-        crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+        crypto_suite: SignerCryptoSuite::Secp256k1Sha256Recoverable,
         ordered_payload_digests: vec![digest("33")],
         ordered_hashes: vec![digest("55")],
         petal_use_claim_digest: None,
@@ -228,7 +231,15 @@ fn result(request: &UnsignedSignRequest, receipt_byte: &str) -> SigningResult {
         operation_id: request.operation_id.clone(),
         operation_digest: request.operation_digest.clone(),
         signatures: vec![NormalizedSignature {
-            crypto_suite: request.crypto_suite,
+            crypto_suite: match request.crypto_suite {
+                SignerCryptoSuite::Secp256k1Keccak256Recoverable => {
+                    CryptoSuite::Secp256k1Keccak256Recoverable
+                }
+                SignerCryptoSuite::Secp256k1Sha256Recoverable => {
+                    CryptoSuite::Secp256k1Sha256Recoverable
+                }
+                SignerCryptoSuite::Ed25519Message => CryptoSuite::Ed25519Message,
+            },
             bytes: Base64UrlBytes::from_bytes(&[0; 65]),
         }],
         signer_receipt_digest: digest(receipt_byte),
@@ -273,7 +284,7 @@ fn ac10_sliding_windows_use_exact_continuous_boundaries() {
     }];
     assert_eq!(
         protocol_code(journal.reserve(&reservation(9), &bounded).unwrap_err()),
-        bloom_triad_protocol::ProtocolErrorCode::ClockUntrusted
+        ProtocolErrorCode::ClockUntrusted
     );
     journal
         .observe_time(
@@ -321,7 +332,7 @@ fn ac10_sliding_windows_use_exact_continuous_boundaries() {
     denied.reserved_at_ms = 1_999;
     assert_eq!(
         protocol_code(journal.reserve(&denied, &bounded).unwrap_err()),
-        bloom_triad_protocol::ProtocolErrorCode::LimitExceededRate
+        ProtocolErrorCode::LimitExceededRate
     );
     journal
         .observe_time(
@@ -344,7 +355,7 @@ fn reservation_fails_closed_without_canonical_active_approval() {
     let journal = memory_journal();
     assert_eq!(
         protocol_code(journal.reserve(&reservation(1), &limits(2)).unwrap_err()),
-        bloom_triad_protocol::ProtocolErrorCode::ApprovalRevoked
+        ProtocolErrorCode::ApprovalRevoked
     );
 }
 
@@ -389,13 +400,13 @@ fn ac10_clock_faults_freeze_or_advance_effective_time_fail_closed() {
                 )
                 .unwrap_err()
         ),
-        bloom_triad_protocol::ProtocolErrorCode::ClockRollback
+        ProtocolErrorCode::ClockRollback
     );
     let mut blocked = reservation(30);
     blocked.reserved_at_ms = 10_000;
     assert_eq!(
         protocol_code(journal.reserve(&blocked, &rate_limited).unwrap_err()),
-        bloom_triad_protocol::ProtocolErrorCode::ClockUntrusted
+        ProtocolErrorCode::ClockUntrusted
     );
     assert_eq!(
         protocol_code(
@@ -412,11 +423,11 @@ fn ac10_clock_faults_freeze_or_advance_effective_time_fail_closed() {
                 )
                 .unwrap_err()
         ),
-        bloom_triad_protocol::ProtocolErrorCode::ClockUntrusted
+        ProtocolErrorCode::ClockUntrusted
     );
     assert_eq!(
         protocol_code(journal.reserve(&blocked, &rate_limited).unwrap_err()),
-        bloom_triad_protocol::ProtocolErrorCode::ClockUntrusted
+        ProtocolErrorCode::ClockUntrusted
     );
     let forward = journal
         .observe_time(
@@ -518,7 +529,7 @@ fn ac10_rolling_asset_windows_are_atomic_and_release_aware() {
     third.reserved_at_ms = 1_999;
     assert_eq!(
         protocol_code(journal.reserve(&third, &bounded).unwrap_err()),
-        bloom_triad_protocol::ProtocolErrorCode::LimitExceededValue
+        ProtocolErrorCode::LimitExceededValue
     );
     journal
         .finalize_reservation(
@@ -585,7 +596,7 @@ fn reservation(value: u8) -> ReservationRequest {
     }
 }
 
-fn protocol_code(error: JournalError) -> bloom_triad_protocol::ProtocolErrorCode {
+fn protocol_code(error: JournalError) -> ProtocolErrorCode {
     match error {
         JournalError::Protocol(error) => error.code,
         other => panic!("expected protocol error, got {other}"),
@@ -649,7 +660,7 @@ fn ac06_same_operation_retry_is_stable_and_conflicts_fail_closed() {
                     .begin_sign_attempt(&changed, false, &validation_receipt(&changed))
                     .unwrap_err(),
             ),
-            bloom_triad_protocol::ProtocolErrorCode::OperationIdConflict,
+            ProtocolErrorCode::OperationIdConflict,
             "{field}"
         );
     }
@@ -667,7 +678,7 @@ fn ac06_same_operation_retry_is_stable_and_conflicts_fail_closed() {
                 )
                 .unwrap_err()
         ),
-        bloom_triad_protocol::ProtocolErrorCode::OperationIdConflict
+        ProtocolErrorCode::OperationIdConflict
     );
     assert_eq!(
         protocol_code(
@@ -675,7 +686,7 @@ fn ac06_same_operation_retry_is_stable_and_conflicts_fail_closed() {
                 .begin_sign_attempt(&retry, true, &validation_receipt(&retry))
                 .unwrap_err(),
         ),
-        bloom_triad_protocol::ProtocolErrorCode::OperationIdConflict
+        ProtocolErrorCode::OperationIdConflict
     );
 
     let mut conflict = first.clone();
@@ -689,7 +700,7 @@ fn ac06_same_operation_retry_is_stable_and_conflicts_fail_closed() {
                 .begin_sign_attempt(&conflict, false, &validation_receipt(&conflict))
                 .unwrap_err(),
         ),
-        bloom_triad_protocol::ProtocolErrorCode::OperationIdConflict
+        ProtocolErrorCode::OperationIdConflict
     );
 
     journal.reserve(&reservation(1), &limits(2)).unwrap();
@@ -705,7 +716,7 @@ fn ac06_same_operation_retry_is_stable_and_conflicts_fail_closed() {
                 .publish_result(&digest("22"), &different)
                 .unwrap_err()
         ),
-        bloom_triad_protocol::ProtocolErrorCode::OperationIdConflict
+        ProtocolErrorCode::OperationIdConflict
     );
 }
 
@@ -730,7 +741,7 @@ fn ac18_validation_receipt_is_exactly_bound_and_retained_tamper_degrades_audit()
                 .begin_sign_attempt(&request, false, &changed)
                 .unwrap_err()
         ),
-        bloom_triad_protocol::ProtocolErrorCode::OperationIdConflict
+        ProtocolErrorCode::OperationIdConflict
     );
     journal
         .begin_sign_attempt(&request, false, &receipt)
@@ -819,7 +830,7 @@ fn ac10_concurrent_reservations_cannot_overspend_and_release_is_full() {
     changed_retry.signature_count = 2;
     assert_eq!(
         protocol_code(journal.reserve(&changed_retry, &limits(5)).unwrap_err()),
-        bloom_triad_protocol::ProtocolErrorCode::OperationIdConflict
+        ProtocolErrorCode::OperationIdConflict
     );
 }
 
@@ -1625,7 +1636,7 @@ fn ac12_batch_parent_and_children_publish_in_one_transaction() {
                 )
                 .unwrap_err()
         ),
-        bloom_triad_protocol::ProtocolErrorCode::OperationIdConflict
+        ProtocolErrorCode::OperationIdConflict
     );
     assert_eq!(
         protocol_code(
@@ -1637,7 +1648,7 @@ fn ac12_batch_parent_and_children_publish_in_one_transaction() {
                 )
                 .unwrap_err()
         ),
-        bloom_triad_protocol::ProtocolErrorCode::BackendInvalidRequest
+        ProtocolErrorCode::BackendInvalidRequest
     );
 }
 

@@ -17,7 +17,7 @@ use std::{
 };
 
 use bip32::{DerivationPath, XPrv};
-use bloom_broker_api::{Base64UrlBytes, DerivationRef, KeyRef};
+use bloom_signer_api::{Base64UrlBytes, DerivationRef, KeyRef};
 use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
     aead::{Aead as _, KeyInit as _, Payload},

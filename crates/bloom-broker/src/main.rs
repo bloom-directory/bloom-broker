@@ -24,15 +24,21 @@ use bloom_broker::{
     service::BrokerRpcService,
     signer_client::BrokerSignerClient,
 };
+use bloom_broker_api::{
+    Base64UrlBytes, Digest32, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
+    ProtocolError, ProtocolErrorCode, ProvenanceCatalog, SignedJournalHead, Token,
+    is_read_only_method,
+};
+use bloom_signer_api::{
+    BrokerSignerRequest, BrokerSignerResponse, ControlRequest, ControlResponse,
+    Empty as SignerEmpty, ProtocolError as SignerProtocolError,
+    ProtocolErrorCode as SignerProtocolErrorCode, RevocationControlService,
+};
 #[cfg(feature = "triad-dev-harness")]
 use bloom_triad_local_transport::load_developer_identity_and_manifest;
 use bloom_triad_local_transport::{
-    EndpointQuota, LocalIdentity, MachineBrokerJournalExchange, NetworkContainmentGuard, PeerAcl,
-    is_read_only_method, load_identity_and_manifest,
-};
-use bloom_triad_protocol::{
-    Base64UrlBytes, BrokerSignerRequest, BrokerSignerResponse, Digest32, Empty, ProtocolError,
-    ProtocolErrorCode, ProvenanceCatalog, Token,
+    EndpointQuota, JournalExchange, LocalIdentity, NetworkContainmentGuard, PeerAcl,
+    load_identity_and_manifest,
 };
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -494,14 +500,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn require_signer_head_exchange(signer: &BrokerSignerClient) -> Result<(), ProtocolError> {
+async fn require_signer_head_exchange(
+    signer: &BrokerSignerClient,
+) -> Result<(), SignerProtocolError> {
     match signer
-        .request_async(BrokerSignerRequest::SignerReadiness(Empty {}))
+        .request_async(BrokerSignerRequest::SignerReadiness(SignerEmpty {}))
         .await?
     {
         BrokerSignerResponse::SignerReadiness(_) => Ok(()),
-        _ => Err(ProtocolError::new(
-            ProtocolErrorCode::ServiceUnavailable,
+        _ => Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
             "Signer returned the wrong journal-head readiness response",
         )),
     }
@@ -526,7 +534,7 @@ async fn run_periodic_signer_head_exchange<F, Fut>(
 ) -> std::io::Result<()>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<(), ProtocolError>>,
+    Fut: std::future::Future<Output = Result<(), SignerProtocolError>>,
 {
     let mut interval = tokio::time::interval(AUTHORITY_HEAD_EXCHANGE_CADENCE);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -607,7 +615,10 @@ fn canonical_listener_is_bloom_shaped(containment: Option<&NetworkContainmentGua
         return false;
     };
     for attempt in 0..4 {
-        if matches!(containment.ceremony_listener_bloom_shaped(), Ok(true)) {
+        if matches!(
+            containment.boolean_claim("ceremony_listener_bloom_shaped"),
+            Ok(Some(true))
+        ) {
             return true;
         }
         if attempt != 3 {
@@ -802,16 +813,23 @@ async fn serve_rpc(
         let journals = journals.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _ =
-                bloom_triad_local_transport::dispatch_machine_broker_connection_with_journal_heads(
-                    &mut stream,
-                    &identity,
-                    &machine_acl,
-                    &quota,
-                    service.as_ref(),
-                    journals.as_ref(),
-                )
-                .await;
+            let _ = bloom_triad_local_transport::dispatch_connection_with_journal_heads::<
+                MachineBrokerRequest,
+                MachineBrokerResponse,
+                ProtocolError,
+                _,
+                _,
+            >(
+                &mut stream,
+                &identity,
+                &machine_acl,
+                bloom_broker_api::BROKER_API_CURRENT,
+                bloom_broker_api::BROKER_API_RANGE,
+                &quota,
+                journals.as_ref(),
+                |request| MachineBrokerService::dispatch(service.as_ref(), request),
+            )
+            .await;
         });
     }
 }
@@ -822,11 +840,11 @@ struct BrokerMachineJournals {
     identity: LocalIdentity,
 }
 
-impl MachineBrokerJournalExchange for BrokerMachineJournals {
+impl JournalExchange<ProtocolError> for BrokerMachineJournals {
     fn checkpoint_request_head(
         &self,
         method: &Token,
-        peer_head: &bloom_triad_protocol::SignedJournalHead,
+        peer_head: &SignedJournalHead,
     ) -> Result<(), ProtocolError> {
         if let Err(error) = self.checkpoints.append_peer_head(peer_head) {
             self.journal.latch_audit_degradation();
@@ -842,7 +860,7 @@ impl MachineBrokerJournalExchange for BrokerMachineJournals {
         Ok(())
     }
 
-    fn local_journal_head(&self) -> Result<(u64, Digest32), ProtocolError> {
+    fn local_journal_head(&self, _method: &Token) -> Result<(u64, Digest32), ProtocolError> {
         self.journal.verified_audit_head().or_else(|_| {
             self.checkpoints
                 .latest_peer_head(&self.identity.service_id)
@@ -870,7 +888,7 @@ struct UnavailableCheckpointSink {
 impl CheckpointSink for UnavailableCheckpointSink {
     fn append_peer_head(
         &self,
-        _peer_head: &bloom_triad_protocol::SignedJournalHead,
+        _peer_head: &SignedJournalHead,
     ) -> Result<AppendOutcome, CheckpointError> {
         Err(CheckpointError::Malformed(self.reason.clone()))
     }
@@ -903,12 +921,20 @@ async fn serve_control(
         let service = service.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _ = bloom_triad_local_transport::dispatch_control_connection(
+            let _ = bloom_triad_local_transport::dispatch_connection::<
+                ControlRequest,
+                ControlResponse,
+                SignerProtocolError,
+                _,
+                _,
+            >(
                 &mut stream,
                 &identity,
                 &revoke_client_acl,
+                bloom_signer_api::SIGNER_CONTROL_CURRENT,
+                bloom_signer_api::SIGNER_CONTROL_RANGE,
                 &quota,
-                service.as_ref(),
+                |request| RevocationControlService::dispatch(service.as_ref(), request),
             )
             .await;
         });
@@ -927,6 +953,8 @@ async fn connect_authenticated_session(
                     &mut stream,
                     identity,
                     session_acl,
+                    bloom_service_activation::SESSION_PROTOCOL_CURRENT,
+                    bloom_service_activation::SESSION_PROTOCOL_RANGE,
                 )
                 .await?;
                 return Ok(stream);
@@ -1240,6 +1268,7 @@ fn verifying_key(encoded: &str) -> Result<VerifyingKey, ProtocolError> {
 #[cfg(test)]
 mod startup_failure_tests {
     use super::*;
+    use bloom_broker_api::{ApprovalLifecycleState, BootEpoch, ReadinessState};
 
     #[tokio::test]
     async fn initial_signer_absence_does_not_latch_local_audit_degradation() {
@@ -1256,7 +1285,7 @@ mod startup_failure_tests {
         );
         let identity = LocalIdentity {
             service_id: Token::new("bloom-broker").unwrap(),
-            boot_epoch: bloom_triad_protocol::BootEpoch::from_bytes([62; 16]),
+            boot_epoch: BootEpoch::from_bytes([62; 16]),
             application_key_id: Token::new("broker-app-1").unwrap(),
             signing_key: Arc::new(SigningKey::from_bytes(&[63; 32])),
         };
@@ -1284,7 +1313,7 @@ mod startup_failure_tests {
         let signer_acl = PeerAcl {
             effective_uid: fs::metadata(temporary.path()).unwrap().uid(),
             service_id: Token::new("bloom-signer").unwrap(),
-            boot_epoch: bloom_triad_protocol::BootEpoch::from_bytes([65; 16]),
+            boot_epoch: BootEpoch::from_bytes([65; 16]),
             application_key_id: Token::new("signer-app-1").unwrap(),
             application_public_key: signer_key.verifying_key().to_bytes(),
         };
@@ -1321,13 +1350,13 @@ mod startup_failure_tests {
 
         let machine = LocalIdentity {
             service_id: Token::new("bloom-machine").unwrap(),
-            boot_epoch: bloom_triad_protocol::BootEpoch::new("11".repeat(16)).unwrap(),
+            boot_epoch: BootEpoch::new("11".repeat(16)).unwrap(),
             application_key_id: Token::new("machine-app-1").unwrap(),
             signing_key: Arc::new(SigningKey::from_bytes(&[72; 32])),
         };
         let broker = LocalIdentity {
             service_id: Token::new("bloom-broker").unwrap(),
-            boot_epoch: bloom_triad_protocol::BootEpoch::new("22".repeat(16)).unwrap(),
+            boot_epoch: BootEpoch::new("22".repeat(16)).unwrap(),
             application_key_id: Token::new("broker-app-1").unwrap(),
             signing_key: Arc::new(SigningKey::from_bytes(&[73; 32])),
         };
@@ -1407,7 +1436,7 @@ mod startup_failure_tests {
         journal
             .create_approval(
                 &Digest32::from_bytes([1; 32]),
-                bloom_triad_protocol::ApprovalLifecycleState::Prepared,
+                ApprovalLifecycleState::Prepared,
             )
             .unwrap();
         drop(journal);
@@ -1427,7 +1456,7 @@ mod startup_failure_tests {
         rotated
             .create_approval(
                 &Digest32::from_bytes([2; 32]),
-                bloom_triad_protocol::ApprovalLifecycleState::Prepared,
+                ApprovalLifecycleState::Prepared,
             )
             .unwrap();
         assert_eq!(
@@ -1459,7 +1488,7 @@ mod startup_failure_tests {
         journal
             .create_approval(
                 &Digest32::from_bytes([3; 32]),
-                bloom_triad_protocol::ApprovalLifecycleState::Prepared,
+                ApprovalLifecycleState::Prepared,
             )
             .unwrap();
         drop(journal);
@@ -1470,27 +1499,24 @@ mod startup_failure_tests {
             degraded
                 .approval_state(&Digest32::from_bytes([3; 32]))
                 .unwrap(),
-            Some(bloom_triad_protocol::ApprovalLifecycleState::Prepared)
+            Some(ApprovalLifecycleState::Prepared)
         );
         assert!(
             degraded
                 .transition_approval(
                     &Digest32::from_bytes([3; 32]),
-                    bloom_triad_protocol::ApprovalLifecycleState::AwaitingCeremony,
+                    ApprovalLifecycleState::AwaitingCeremony,
                 )
                 .is_err()
         );
         let clock = BrokerClock::new(
             Arc::new(degraded),
             test_time_source(),
-            bloom_triad_protocol::BootEpoch::new("01".repeat(16)).unwrap(),
+            BootEpoch::new("01".repeat(16)).unwrap(),
         )
         .expect("degraded production clock construction must not mutate");
         let readiness = clock.readiness().unwrap();
-        assert_eq!(
-            readiness.0,
-            bloom_triad_protocol::ReadinessState::DegradedReadOnly
-        );
+        assert_eq!(readiness.0, ReadinessState::DegradedReadOnly);
         assert_eq!(
             readiness.1,
             vec![Token::new("audit_journal_degraded").unwrap()]
@@ -1513,10 +1539,7 @@ mod startup_failure_tests {
             open_operational_audit_journal(&path, key_id.clone(), signing_key.clone(), &[], None)
                 .unwrap();
         journal
-            .create_approval(
-                &approval_id,
-                bloom_triad_protocol::ApprovalLifecycleState::Prepared,
-            )
+            .create_approval(&approval_id, ApprovalLifecycleState::Prepared)
             .unwrap();
         drop(journal);
         rusqlite::Connection::open(&path)
@@ -1532,14 +1555,11 @@ mod startup_failure_tests {
         assert!(degraded.audit_degraded());
         assert_eq!(
             degraded.approval_state(&approval_id).unwrap(),
-            Some(bloom_triad_protocol::ApprovalLifecycleState::Prepared)
+            Some(ApprovalLifecycleState::Prepared)
         );
         assert!(
             degraded
-                .transition_approval(
-                    &approval_id,
-                    bloom_triad_protocol::ApprovalLifecycleState::AwaitingCeremony,
-                )
+                .transition_approval(&approval_id, ApprovalLifecycleState::AwaitingCeremony,)
                 .is_err()
         );
     }

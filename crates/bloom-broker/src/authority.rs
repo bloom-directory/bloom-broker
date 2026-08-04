@@ -2,19 +2,20 @@ use crate::journal::{
     BrokerJournal, BudgetLimits, JournalError, ReservationRequest, SlidingBudgetLimit,
     SlidingValueLimit,
 };
-use bloom_triad_protocol::{
+use bloom_broker_api::{
     ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
     ApprovalTombstone, Base64UrlBytes, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite,
     CustodyResult, DeclaredFee, Digest32, KeyRef, MachineSignRequest, OperationId,
-    PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope, PetalUseClaim, PolicyAuthorityDiff,
-    PolicyUpdateRequest, ProtocolErrorCode, RevocationState, SealedApprovalTerms,
-    SignOperationIdentity, SignedPolicySnapshot, SignerActivationReceipt, SigningPayloads, Token,
+    PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope, PetalUseClaim, PolicyUpdateRequest,
+    ProtocolErrorCode, RevocationState, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
+    Token,
 };
-pub use bloom_triad_protocol::{CanonicalWalletPolicy, PolicyDestination, RequiredVerifier};
-pub use bloom_triad_protocol::{
+pub use bloom_broker_api::{CanonicalWalletPolicy, PolicyDestination, RequiredVerifier};
+pub use bloom_broker_api::{
     ProvenanceCatalog, ProvenanceFeeAsset as PolicyAsset, ProvenanceOperationClass,
-    ProvenanceRecord, ProvenanceSubject, canonical_policy_authority_diff,
+    ProvenanceRecord, ProvenanceSubject,
 };
+use bloom_signer_api::SignerActivationReceipt;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use num_bigint::BigUint;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -33,6 +34,141 @@ const SIGNER_CEREMONY_RECEIPT_DOMAIN: &[u8] = b"bloom-signer-ceremony-receipt/v1
 const REVOCATION_STATE_DOMAIN: &[u8] = b"bloom-revocation-state/v1";
 const APPROVAL_TOMBSTONE_DOMAIN: &[u8] = b"bloom-approval-tombstone/v1";
 const WALLET_TOMBSTONE_DOMAIN: &[u8] = b"bloom-wallet-tombstone/v1";
+const POLICY_AUTHORITY_DIFF_DOMAIN: &[u8] = b"bloom-policy-authority-diff/v1";
+const SIGN_OPERATION_DOMAIN: &[u8] = b"bloom-sign-operation/v1";
+
+#[derive(Serialize)]
+struct MachineSignOperationIdentity {
+    operation_id: OperationId,
+    approval_id: Digest32,
+    key_ref: KeyRef,
+    crypto_suite: CryptoSuite,
+    ordered_payload_digests: Vec<Digest32>,
+    ordered_hashes: Vec<Digest32>,
+    petal_use_claim_digest: Option<Digest32>,
+    claim_assurance_digest: Option<Digest32>,
+    policy_version: bloom_broker_api::DecimalU64,
+    policy_digest: Digest32,
+}
+
+impl MachineSignOperationIdentity {
+    fn digest(&self) -> Result<Digest32, AuthorityError> {
+        let mut hasher = Sha256::new();
+        hasher.update(SIGN_OPERATION_DOMAIN);
+        hasher.update(serde_jcs::to_vec(self).map_err(storage)?);
+        Ok(Digest32::from_bytes(hasher.finalize().into()))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyAuthorityDiff {
+    pub maximum_approval_lifetime_ms_before: bloom_broker_api::DecimalU64,
+    pub maximum_approval_lifetime_ms_after: bloom_broker_api::DecimalU64,
+    pub added_petal_packages: Vec<Digest32>,
+    pub removed_petal_packages: Vec<Digest32>,
+    pub added_destinations: Vec<PolicyAuthorityDestination>,
+    pub removed_destinations: Vec<PolicyAuthorityDestination>,
+    pub added_required_verifiers: Vec<PolicyAuthorityVerifier>,
+    pub removed_required_verifiers: Vec<PolicyAuthorityVerifier>,
+}
+
+impl PolicyAuthorityDiff {
+    pub fn digest(&self) -> Result<Digest32, bloom_broker_api::ProtocolError> {
+        let mut hasher = Sha256::new();
+        hasher.update(POLICY_AUTHORITY_DIFF_DOMAIN);
+        hasher.update(serde_jcs::to_vec(self).map_err(|error| {
+            bloom_broker_api::ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                format!("policy canonicalization failed: {error}"),
+            )
+        })?);
+        Ok(Digest32::from_bytes(hasher.finalize().into()))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyAuthorityDestination {
+    pub chain: Token,
+    pub destination: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyAuthorityVerifier {
+    pub verifier_id: Token,
+    pub verifier_digest: Digest32,
+}
+
+pub fn canonical_policy_authority_diff(
+    current: &CanonicalWalletPolicy,
+    proposed: &CanonicalWalletPolicy,
+) -> PolicyAuthorityDiff {
+    fn set_diff<T: Ord + Clone>(
+        before: impl IntoIterator<Item = T>,
+        after: impl IntoIterator<Item = T>,
+    ) -> (Vec<T>, Vec<T>) {
+        let before = before.into_iter().collect::<BTreeSet<_>>();
+        let after = after.into_iter().collect::<BTreeSet<_>>();
+        (
+            after.difference(&before).cloned().collect(),
+            before.difference(&after).cloned().collect(),
+        )
+    }
+
+    let (added_petal_packages, removed_petal_packages) = set_diff(
+        current.allowed_petal_packages.iter().cloned(),
+        proposed.allowed_petal_packages.iter().cloned(),
+    );
+    let (added_destinations, removed_destinations) = set_diff(
+        current
+            .allowed_destinations
+            .iter()
+            .map(|value| PolicyAuthorityDestination {
+                chain: value.chain.clone(),
+                destination: value.destination.clone(),
+            }),
+        proposed
+            .allowed_destinations
+            .iter()
+            .map(|value| PolicyAuthorityDestination {
+                chain: value.chain.clone(),
+                destination: value.destination.clone(),
+            }),
+    );
+    let (added_required_verifiers, removed_required_verifiers) = set_diff(
+        current
+            .required_verifiers
+            .iter()
+            .map(|value| PolicyAuthorityVerifier {
+                verifier_id: value.verifier_id.clone(),
+                verifier_digest: value.verifier_digest.clone(),
+            }),
+        proposed
+            .required_verifiers
+            .iter()
+            .map(|value| PolicyAuthorityVerifier {
+                verifier_id: value.verifier_id.clone(),
+                verifier_digest: value.verifier_digest.clone(),
+            }),
+    );
+
+    PolicyAuthorityDiff {
+        maximum_approval_lifetime_ms_before: bloom_broker_api::DecimalU64::new(
+            current.maximum_approval_lifetime_ms,
+        ),
+        maximum_approval_lifetime_ms_after: bloom_broker_api::DecimalU64::new(
+            proposed.maximum_approval_lifetime_ms,
+        ),
+        added_petal_packages,
+        removed_petal_packages,
+        added_destinations,
+        removed_destinations,
+        added_required_verifiers,
+        removed_required_verifiers,
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthorityError {
@@ -71,7 +207,7 @@ pub struct AuthorizationInput {
     pub reserved_at_ms: u64,
     pub observed_utc_ms: Option<u64>,
     pub monotonic_anchor_ns: u64,
-    pub clock_boot_epoch: bloom_triad_protocol::BootEpoch,
+    pub clock_boot_epoch: bloom_broker_api::BootEpoch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,7 +215,7 @@ pub struct AuthorizationDecision {
     pub approval_id: Digest32,
     pub ordered_payload_digests: Vec<Digest32>,
     pub ordered_hashes: Vec<Digest32>,
-    pub reserved_values: BTreeMap<String, bloom_triad_protocol::DecimalU256>,
+    pub reserved_values: BTreeMap<String, bloom_broker_api::DecimalU256>,
     pub effective_assurance: Option<ClaimAssurance>,
     pub reservation_ids: Vec<Digest32>,
 }
@@ -377,6 +513,18 @@ impl BrokerAuthority {
         self.assurance.capabilities()
     }
 
+    pub(crate) fn policy_verification_key(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<(Token, VerifyingKey), AuthorityError> {
+        self.policy_keys
+            .lock()
+            .map_err(|_| storage("policy key registry lock poisoned"))?
+            .get(wallet_id.as_str())
+            .cloned()
+            .ok_or_else(|| denied("POLICY_KEY_UNKNOWN", "wallet policy key is not pinned"))
+    }
+
     pub fn install_policy(&self, snapshot: &SignedPolicySnapshot) -> Result<(), AuthorityError> {
         let _barrier = self.lock_authorization_barrier()?;
         self.install_policy_locked(snapshot, &PolicyInstallCorrelation::default())
@@ -586,7 +734,7 @@ impl BrokerAuthority {
                 )
             })?;
 
-        if receipt.ceremony_kind == bloom_triad_protocol::CeremonyKind::WalletDelete {
+        if receipt.ceremony_kind == bloom_broker_api::CeremonyKind::WalletDelete {
             let wallet_id = receipt.wallet_id.as_ref().ok_or_else(|| {
                 denied(
                     "CUSTODY_RECEIPT_INVALID",
@@ -629,8 +777,8 @@ impl BrokerAuthority {
 
         if !matches!(
             receipt.ceremony_kind,
-            bloom_triad_protocol::CeremonyKind::WalletRegistration
-                | bloom_triad_protocol::CeremonyKind::WalletImport
+            bloom_broker_api::CeremonyKind::WalletRegistration
+                | bloom_broker_api::CeremonyKind::WalletImport
         ) {
             if receipt.initial_policy.is_some() {
                 return Err(denied(
@@ -638,7 +786,7 @@ impl BrokerAuthority {
                     "only wallet registration or import may carry an initial policy",
                 ));
             }
-            if receipt.ceremony_kind == bloom_triad_protocol::CeremonyKind::KeyDerive {
+            if receipt.ceremony_kind == bloom_broker_api::CeremonyKind::KeyDerive {
                 self.adopt_petal_key_scope(receipt, now_ms)?;
             }
             return Ok(());
@@ -1255,6 +1403,7 @@ impl BrokerAuthority {
         }
         let terms: SealedApprovalTerms =
             serde_json::from_str(&record.terms_jcs).map_err(storage)?;
+        let signer_terms = crate::translation::approval::validated_terms_to_signer(terms.clone());
         let review_digest = Digest32::new(record.review_manifest_digest)
             .map_err(|error| denied("STORAGE_CORRUPTION", error.to_string()))?;
         let (current_epoch, reconciled) = self.epoch_state(&terms.wallet_id)?;
@@ -1270,12 +1419,12 @@ impl BrokerAuthority {
                     .approval_id()
                     .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?
             || receipt.review_manifest_digest != review_digest
-            || receipt.replaced_approval_id != terms.renewal_of
-            || receipt.wallet_revocation_epoch != terms.wallet_revocation_epoch
-            || receipt.key_ref != terms.key_ref
-            || receipt.allowed_crypto_suites != terms.allowed_crypto_suites
-            || receipt.activation_mode != terms.activation_mode
-            || receipt.expires_at_ms != terms.expires_at_ms
+            || receipt.replaced_approval_id != signer_terms.renewal_of
+            || receipt.wallet_revocation_epoch != signer_terms.wallet_revocation_epoch
+            || receipt.key_ref != signer_terms.key_ref
+            || receipt.allowed_crypto_suites != signer_terms.allowed_crypto_suites
+            || receipt.activation_mode != signer_terms.activation_mode
+            || receipt.expires_at_ms != signer_terms.expires_at_ms
         {
             return Err(denied(
                 "CEREMONY_GRANT_MISMATCH",
@@ -1582,7 +1731,7 @@ impl BrokerAuthority {
             .as_ref()
             .map(|claim| jcs_digest(&claim.claim_assurance))
             .transpose()?;
-        let operation_digest = SignOperationIdentity {
+        let operation_digest = MachineSignOperationIdentity {
             operation_id: input.request.operation_id.clone(),
             approval_id: input.request.approval_id.clone(),
             key_ref: input.request.key_ref.clone(),
@@ -2559,7 +2708,7 @@ fn account_claim_values(
     terms: &SealedApprovalTerms,
     claim: &PetalUseClaim,
     provenance: &ProvenanceRecord,
-) -> Result<BTreeMap<String, bloom_triad_protocol::DecimalU256>, AuthorityError> {
+) -> Result<BTreeMap<String, bloom_broker_api::DecimalU256>, AuthorityError> {
     let class = provenance
         .operation_classes
         .iter()
@@ -2623,7 +2772,7 @@ fn account_claim_values(
     values
         .into_iter()
         .map(|(asset, value)| {
-            let decimal = bloom_triad_protocol::DecimalU256::parse(value.to_string())
+            let decimal = bloom_broker_api::DecimalU256::parse(value.to_string())
                 .map_err(|error| denied("VALUE_OVERFLOW", error.to_string()))?;
             Ok((asset, decimal))
         })

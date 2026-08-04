@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bloom_triad_protocol::{BootEpoch, ProtocolError, ProtocolErrorCode, ReadinessState, Token};
+use bloom_broker_api::{BootEpoch, ProtocolError, ProtocolErrorCode, ReadinessState, Token};
 use bloom_trusted_time::{MAX_FORWARD_STEP_MS, PlatformTimeSampler};
 use parking_lot::Mutex;
 

@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 bloom-broker-api = { path = "../bloom-broker-api" }
+bloom-signer-api.workspace = true
 bip32.workspace = true
 ciborium.workspace = true
 chacha20poly1305.workspace = true

@@ -1,10 +1,11 @@
 use bloom_audit_checkpoint::CheckpointSink;
-use bloom_triad_local_transport::{LocalIdentity, sign_journal_head};
-use bloom_triad_protocol::{
-    ApprovalLifecycleState, ApprovalLimitState, Base64UrlBytes, BootEpoch, BrokerValidationReceipt,
-    DecimalU64, DecimalU256, Digest32, OperationId, OperationState, ProtocolError,
-    ProtocolErrorCode, SealedApprovalTerms, SigningResult, Token, UnsignedSignRequest,
+use bloom_broker_api::{
+    ApprovalLifecycleState, ApprovalLimitState, Base64UrlBytes, BootEpoch, DecimalU64, DecimalU256,
+    Digest32, OperationId, OperationState, ProtocolError, ProtocolErrorCode, SealedApprovalTerms,
+    SigningResult, Token,
 };
+use bloom_signer_api::{BrokerValidationReceipt, UnsignedSignRequest};
+use bloom_triad_local_transport::{LocalIdentity, sign_journal_head};
 use num_bigint::BigUint;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -117,6 +118,12 @@ pub enum JournalError {
     },
     #[error("journal storage failure: {0}")]
     Storage(String),
+}
+
+impl From<bloom_triad_local_transport::TransportError> for JournalError {
+    fn from(error: bloom_triad_local_transport::TransportError) -> Self {
+        Self::Protocol(error.into())
+    }
 }
 
 impl From<rusqlite::Error> for JournalError {
@@ -638,7 +645,7 @@ impl BrokerJournal {
         for row in rows {
             let (approval_id, record) = row?;
             records.push((
-                Digest32::new(approval_id).map_err(JournalError::Protocol)?,
+                Digest32::new(approval_id).map_err(|error| JournalError::Protocol(error.into()))?,
                 record,
             ));
         }
@@ -871,9 +878,15 @@ impl BrokerJournal {
         is_batch: bool,
         validation_receipt: &BrokerValidationReceipt,
     ) -> Result<OperationSnapshot, JournalError> {
-        if request.operation_digest != request.operation_identity().digest()?
-            || request.attempt_digest != request.computed_attempt_digest()?
-            || request.validation_receipt_digest != validation_receipt.digest()?
+        if request.operation_digest
+            != request
+                .operation_identity()
+                .digest()
+                .map_err(signer_protocol)?
+            || request.attempt_digest
+                != request.computed_attempt_digest().map_err(signer_protocol)?
+            || request.validation_receipt_digest
+                != validation_receipt.digest().map_err(signer_protocol)?
             || validation_receipt.approval_id != request.approval_id
             || validation_receipt.operation_digest != request.operation_digest
             || validation_receipt.policy_version != request.policy_version
@@ -1373,7 +1386,7 @@ impl BrokerJournal {
                 "result_digest": Digest32::from_bytes(Sha256::digest(result_jcs.as_bytes()).into()),
                 "signer_receipt_digest": result.signer_receipt_digest,
                 "broker_receipt_digest": result.broker_receipt_digest,
-                "validation_receipt_digest": validation_receipt.digest()?,
+                "validation_receipt_digest": validation_receipt.digest().map_err(signer_protocol)?,
                 "reservation_state": "COMMITTED"
                 ,"correlation_schema": "v1"
             }),
@@ -1516,7 +1529,7 @@ impl BrokerJournal {
                 "parent_result_digest": Digest32::from_bytes(Sha256::digest(parent_jcs.as_bytes()).into()),
                 "parent_signer_receipt_digest": parent_result.signer_receipt_digest,
                 "parent_broker_receipt_digest": parent_result.broker_receipt_digest,
-                "validation_receipt_digest": validation_receipt.digest()?,
+                "validation_receipt_digest": validation_receipt.digest().map_err(signer_protocol)?,
                 "children": child_results.iter().enumerate().map(|(ordinal, child)| {
                     let canonical = jcs_string(child).expect("validated SigningResult serializes");
                     serde_json::json!({
@@ -2052,6 +2065,10 @@ fn storage(error: impl std::fmt::Display) -> JournalError {
     JournalError::Storage(error.to_string())
 }
 
+fn signer_protocol(error: bloom_signer_api::ProtocolError) -> JournalError {
+    JournalError::Protocol(crate::translation::error::signer_error_to_machine(error))
+}
+
 fn jcs_string(value: &impl Serialize) -> Result<String, JournalError> {
     String::from_utf8(serde_jcs::to_vec(value).map_err(storage)?).map_err(storage)
 }
@@ -2261,7 +2278,9 @@ fn verify_audit_correlation(
             payload.get("operation_digest")
                 == Some(&serde_json::json!(validation_receipt.operation_digest))
                 && payload.get("validation_receipt_digest")
-                    == Some(&serde_json::json!(validation_receipt.digest()?))
+                    == Some(&serde_json::json!(
+                        validation_receipt.digest().map_err(signer_protocol)?
+                    ))
         }
         "operation.published" => {
             let operation_id = payload
@@ -2291,7 +2310,9 @@ fn verify_audit_correlation(
                 && payload.get("broker_receipt_digest")
                     == Some(&serde_json::json!(result.broker_receipt_digest))
                 && payload.get("validation_receipt_digest")
-                    == Some(&serde_json::json!(validation_receipt.digest()?))
+                    == Some(&serde_json::json!(
+                        validation_receipt.digest().map_err(signer_protocol)?
+                    ))
         }
         "batch.published" => {
             let parent_id = payload
@@ -2347,7 +2368,9 @@ fn verify_audit_correlation(
                 && payload.get("parent_broker_receipt_digest")
                     == Some(&serde_json::json!(parent.broker_receipt_digest))
                 && payload.get("validation_receipt_digest")
-                    == Some(&serde_json::json!(validation_receipt.digest()?))
+                    == Some(&serde_json::json!(
+                        validation_receipt.digest().map_err(signer_protocol)?
+                    ))
                 && payload.get("children") == Some(&serde_json::Value::Array(children))
         }
         "approval.transition"

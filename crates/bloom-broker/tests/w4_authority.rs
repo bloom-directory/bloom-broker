@@ -7,14 +7,14 @@ use bloom_broker::{
     },
     journal::{AuditSigner, BrokerJournal},
 };
-use bloom_triad_protocol::{
+use bloom_broker_api::{
     ActivationMode, ApprovalLimits, ApprovalSelector, ApprovalSubject, ApprovalTombstone, AssetId,
     Base64UrlBytes, BootEpoch, CeremonyKind, CeremonyState, ClaimAssurance, ClaimAssuranceLevel,
     CryptoSuite, CustodyResult, DecimalU64, DecimalU256, DeclaredDebit, DeclaredDestination,
     DeclaredFee, Digest32, KeyRef, KeySpec, MachineSignRequest, OperationId,
     PROVENANCE_CATALOG_SCHEMA, PetalKeyScope, PetalUseClaim, PolicyUpdateRequest,
-    ProvenanceCatalog, RequestNonce, RevocationState, SealedApprovalTerms, SignOperationIdentity,
-    SignedPolicySnapshot, SigningPayloads, Token, ValueLimit,
+    ProvenanceCatalog, RequestNonce, RevocationState, SealedApprovalTerms, SignedPolicySnapshot,
+    SigningPayloads, Token, ValueLimit,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
@@ -34,6 +34,30 @@ const CEREMONY_DOMAIN: &[u8] = b"bloom-broker-ceremony-grant/v1";
 const REVOCATION_DOMAIN: &[u8] = b"bloom-revocation-state/v1";
 const APPROVAL_TOMBSTONE_DOMAIN: &[u8] = b"bloom-approval-tombstone/v1";
 const SIGNER_RECEIPT_DOMAIN: &[u8] = b"bloom-signer-ceremony-receipt/v1";
+const SIGN_OPERATION_DOMAIN: &[u8] = b"bloom-sign-operation/v1";
+
+#[derive(serde::Serialize)]
+struct TestSignOperationIdentity {
+    operation_id: OperationId,
+    approval_id: Digest32,
+    key_ref: KeyRef,
+    crypto_suite: CryptoSuite,
+    ordered_payload_digests: Vec<Digest32>,
+    ordered_hashes: Vec<Digest32>,
+    petal_use_claim_digest: Option<Digest32>,
+    claim_assurance_digest: Option<Digest32>,
+    policy_version: DecimalU64,
+    policy_digest: Digest32,
+}
+
+impl TestSignOperationIdentity {
+    fn digest(&self) -> Digest32 {
+        let mut hasher = Sha256::new();
+        hasher.update(SIGN_OPERATION_DOMAIN);
+        hasher.update(serde_jcs::to_vec(self).unwrap());
+        Digest32::from_bytes(hasher.finalize().into())
+    }
+}
 
 #[derive(Clone)]
 struct TestAuditSigner;
@@ -670,7 +694,7 @@ fn active_approval_survives_broker_authority_and_journal_restart() {
                 .approval_public_status(&approval_id)
                 .unwrap()
                 .state,
-            bloom_triad_protocol::ApprovalLifecycleState::Active
+            bloom_broker_api::ApprovalLifecycleState::Active
         );
     }
 
@@ -681,7 +705,7 @@ fn active_approval_survives_broker_authority_and_journal_restart() {
             .approval_public_status(&approval_id)
             .unwrap()
             .state,
-        bloom_triad_protocol::ApprovalLifecycleState::Active
+        bloom_broker_api::ApprovalLifecycleState::Active
     );
 }
 
@@ -1901,7 +1925,7 @@ fn bind_operation_digest(input: &mut AuthorizationInput, terms: &SealedApprovalT
             Sha256::digest(serde_jcs::to_vec(&claim.claim_assurance).unwrap()).into(),
         )
     });
-    input.request.operation_digest = SignOperationIdentity {
+    input.request.operation_digest = TestSignOperationIdentity {
         operation_id: input.request.operation_id.clone(),
         approval_id: input.request.approval_id.clone(),
         key_ref: input.request.key_ref.clone(),
@@ -1913,8 +1937,7 @@ fn bind_operation_digest(input: &mut AuthorizationInput, terms: &SealedApprovalT
         policy_version: terms.policy_version.clone(),
         policy_digest: terms.policy_digest.clone(),
     }
-    .digest()
-    .unwrap();
+    .digest();
 }
 
 fn signed_revocation(harness: &Harness, epoch: u64) -> RevocationState {

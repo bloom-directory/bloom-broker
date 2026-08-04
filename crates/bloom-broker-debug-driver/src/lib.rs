@@ -4,7 +4,7 @@
 //! produces genuine ES256 WebAuthn bytes and RFC 9180 HPKE envelopes so tests
 //! exercise the same public contracts as a browser.
 
-use bloom_broker_api::{
+use bloom_signer_api::{
     Base64UrlBytes, DecimalU64, HpkeEnvelope, ProtocolError, ProtocolErrorCode, Token,
     WebAuthnAssertion, WebAuthnAttestation, WebAuthnCredential,
 };
