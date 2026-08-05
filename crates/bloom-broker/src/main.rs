@@ -29,6 +29,7 @@ use bloom_broker_api::{
     ProtocolError, ProtocolErrorCode, ProvenanceCatalog, SignedJournalHead, Token,
     is_read_only_method,
 };
+use bloom_platform_containment::NetworkContainmentGuard;
 use bloom_signer_api::{
     BrokerSignerRequest, BrokerSignerResponse, ControlRequest, ControlResponse,
     Empty as SignerEmpty, ProtocolError as SignerProtocolError,
@@ -37,8 +38,7 @@ use bloom_signer_api::{
 #[cfg(feature = "triad-dev-harness")]
 use bloom_triad_local_transport::load_developer_identity_and_manifest;
 use bloom_triad_local_transport::{
-    EndpointQuota, JournalExchange, LocalIdentity, NetworkContainmentGuard, PeerAcl,
-    load_identity_and_manifest,
+    EndpointQuota, JournalExchange, LocalIdentity, PeerAcl, load_identity_and_manifest,
 };
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use serde::{Deserialize, Serialize};

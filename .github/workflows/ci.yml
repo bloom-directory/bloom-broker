@@ -14,13 +14,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/checkout@v6
-        with:
-          repository: bloom-directory/bloom
-          path: bloom
-      - name: Arrange sibling checkout
-        run: |
-          mv bloom ../bloom
       - name: Install Rust toolchain
         run: rustup show
       - name: Check formatting
@@ -35,13 +28,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/checkout@v6
-        with:
-          repository: bloom-directory/bloom
-          path: bloom
-      - name: Arrange sibling checkout
-        run: |
-          mv bloom ../bloom
       - name: Install Rust toolchain
         run: rustup show
       - name: Build cross-UID canonical-listener test

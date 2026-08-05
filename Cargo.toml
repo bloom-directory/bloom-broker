@@ -13,12 +13,13 @@ rust-version = "1.85"
 license = "MIT"
 
 [workspace.dependencies]
-bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom.git", rev = "c05ac0e917b36585fe3051d715a274e1fbc261cc" }
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "da3b76d44ba9c7e16421530d5643027c7064d5f9" }
-bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom.git", rev = "c05ac0e917b36585fe3051d715a274e1fbc261cc" }
-bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom.git", rev = "c05ac0e917b36585fe3051d715a274e1fbc261cc" }
-bloom-service-activation = { git = "https://github.com/bloom-directory/bloom.git", rev = "c05ac0e917b36585fe3051d715a274e1fbc261cc" }
-bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom.git", rev = "c05ac0e917b36585fe3051d715a274e1fbc261cc" }
+bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2ebfdfd607bdeba0e9675def7cf9a0d3727d4410" }
+bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "748fde8a1032f5eda832157e95adf3549816e570" }
+bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2ebfdfd607bdeba0e9675def7cf9a0d3727d4410" }
+bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2ebfdfd607bdeba0e9675def7cf9a0d3727d4410" }
+bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2ebfdfd607bdeba0e9675def7cf9a0d3727d4410" }
+bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2ebfdfd607bdeba0e9675def7cf9a0d3727d4410" }
+bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2ebfdfd607bdeba0e9675def7cf9a0d3727d4410" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -10,12 +10,12 @@ use bloom_broker_api::{
     ReadinessState, SealedApprovalPrepareResponse, ServiceCapabilities, ServiceFuture,
     SigningPayloads, Token, VerifierPublicCapability, WalletPublic, WalletRequest,
 };
+use bloom_platform_containment::NetworkContainmentGuard;
 use bloom_signer_api::{
     BrokerSignerRequest, BrokerSignerResponse, BrokerValidationReceipt, ControlRequest,
     ControlResponse, PolicyCompareAndSwapRequest, PolicyUpdateCeremonyPrepareRequest,
     PolicyValidationReceipt, RevocationControlService, SignRequest, UnsignedSignRequest,
 };
-use bloom_triad_local_transport::NetworkContainmentGuard;
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _};
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
