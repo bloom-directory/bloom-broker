@@ -317,6 +317,7 @@ fn wallet_public() -> WalletPublic {
     WalletPublic {
         wallet_id: token("wallet"),
         wallet_kind: token("local"),
+        root_key_ref: key_ref(),
         key_refs: vec![key_ref()],
         policy_version: DecimalU64::new(1),
         policy_digest: digest(16),
@@ -327,6 +328,7 @@ fn wallet_public() -> WalletPublic {
 fn key_public() -> KeyPublic {
     KeyPublic {
         key_ref: key_ref(),
+        role: KeyRole::WalletRoot,
         canonical_public_key: Base64UrlBytes::from_bytes(&[63; 33]),
         addresses: vec!["0x1".into()],
         supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
@@ -446,12 +448,12 @@ fn every_machine_broker_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "b41bd34d6a4cc82490f312ab4ec0968d122d38627a6f36488cd853cad9a9ebb3",
+        "f33d6c30916faff32f1c0f2e6b639bbe03e68e86793c62f2f248bb332cc3b3aa",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "51a72388549cd74ea523b4ce392014e78e752f5327e9dca83177d64ba7c21c60",
+        "be7eea576147d5cd7a8793265d9e3eb7df3ea42e11331c17192747d6a0c43ab7",
     );
 }
 

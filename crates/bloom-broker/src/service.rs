@@ -1259,6 +1259,7 @@ impl BrokerRpcService {
             BrokerSignerResponse::KeyListPublic(keys) => keys,
             _ => return Err(response_mismatch("key.list_public")),
         };
+        let root_key_ref = unique_wallet_root(&keys)?;
         Ok(WalletPublic {
             wallet_revocation_epoch: DecimalU64::new(
                 self.authority
@@ -1267,6 +1268,7 @@ impl BrokerRpcService {
             ),
             wallet_id,
             wallet_kind: Token::new("managed")?,
+            root_key_ref,
             key_refs: keys
                 .into_iter()
                 .map(|key| translate_key::key_ref_to_machine(key.key_ref))
@@ -1385,6 +1387,30 @@ impl BrokerRpcService {
             frame_max_bytes: DecimalU64::new(bloom_broker_api::FRAME_MAX_BYTES as u64),
         })
     }
+}
+
+fn unique_wallet_root(
+    keys: &[bloom_signer_api::KeyPublic],
+) -> Result<bloom_broker_api::KeyRef, ProtocolError> {
+    let mut root_keys = keys
+        .iter()
+        .filter(|key| key.role == bloom_signer_api::KeyRole::WalletRoot);
+    let root_key_ref = root_keys
+        .next()
+        .map(|key| translate_key::key_ref_to_machine(key.key_ref.clone()))
+        .ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "Signer returned no wallet root key",
+            )
+        })?;
+    if root_keys.next().is_some() {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::KeyrefMismatch,
+            "Signer returned multiple wallet root keys",
+        ));
+    }
+    Ok(root_key_ref)
 }
 
 fn machine_request_requires_containment(request: &MachineBrokerRequest) -> bool {
@@ -1719,6 +1745,51 @@ mod tests {
         }
     }
 
+    fn signer_key(role: bloom_signer_api::KeyRole, fingerprint: u8) -> bloom_signer_api::KeyPublic {
+        bloom_signer_api::KeyPublic {
+            key_ref: bloom_signer_api::KeyRef {
+                backend: Token::new("local").unwrap(),
+                backend_instance: Token::new("wallet-root-test").unwrap(),
+                locator: format!("key-{fingerprint}"),
+                key_spec: bloom_signer_api::KeySpec::Secp256k1,
+                public_key_fingerprint: Digest32::from_bytes([fingerprint; 32]),
+                derivation: (role == bloom_signer_api::KeyRole::Derived).then(|| {
+                    bloom_signer_api::DerivationRef::Bip32Secp256k1 {
+                        root_key_id: Token::new("root").unwrap(),
+                        path: "m/44'/60'/0'/0/1".into(),
+                    }
+                }),
+            },
+            role,
+            canonical_public_key: Base64UrlBytes::from_bytes(&[fingerprint; 33]),
+            addresses: Vec::new(),
+            supported_crypto_suites: vec![
+                bloom_signer_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+            ],
+        }
+    }
+
+    #[test]
+    fn wallet_root_projection_is_exact_and_fails_closed_on_ambiguity() {
+        let root = signer_key(bloom_signer_api::KeyRole::WalletRoot, 1);
+        let derived = signer_key(bloom_signer_api::KeyRole::Derived, 2);
+        assert_eq!(
+            unique_wallet_root(&[derived.clone(), root.clone()]).unwrap(),
+            translate_key::key_ref_to_machine(root.key_ref.clone())
+        );
+
+        assert_eq!(
+            unique_wallet_root(&[derived]).unwrap_err().code,
+            ProtocolErrorCode::KeyrefMismatch
+        );
+        assert_eq!(
+            unique_wallet_root(&[root, signer_key(bloom_signer_api::KeyRole::WalletRoot, 3),])
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::KeyrefMismatch
+        );
+    }
+
     fn signed_validation_receipt(key: &SigningKey) -> BrokerValidationReceipt {
         let mut receipt = BrokerValidationReceipt {
             approval_id: Digest32::from_bytes([0x11; 32]),
@@ -1842,7 +1913,7 @@ mod tests {
         assert_ne!(previous_broker.build_digest, current_broker.build_digest);
         assert_eq!(
             bloom_signer_api::SIGNER_API_CURRENT,
-            bloom_broker_api::ProtocolVersion::new(1, 1)
+            bloom_broker_api::ProtocolVersion::new(1, 2)
         );
         validate_signer_readiness(&previous_broker, &previous_signer).unwrap();
         validate_signer_readiness(&current_broker, &current_signer).unwrap();

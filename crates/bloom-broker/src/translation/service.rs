@@ -20,6 +20,10 @@ pub(crate) fn key_request_to_signer(value: north::KeyRequest) -> south::KeyReque
 pub(crate) fn key_to_machine(value: south::KeyPublic) -> north::KeyPublic {
     north::KeyPublic {
         key_ref: key::key_ref_to_machine(value.key_ref),
+        role: match value.role {
+            south::KeyRole::WalletRoot => north::KeyRole::WalletRoot,
+            south::KeyRole::Derived => north::KeyRole::Derived,
+        },
         canonical_public_key: value.canonical_public_key,
         addresses: value.addresses,
         supported_crypto_suites: value
@@ -113,6 +117,7 @@ mod tests {
                 public_key_fingerprint: digest(4),
                 derivation: None,
             },
+            role: south::KeyRole::WalletRoot,
             canonical_public_key: south::Base64UrlBytes::from_bytes(&[5]),
             addresses: vec!["address-6".into()],
             supported_crypto_suites: vec![south::CryptoSuite::Secp256k1Sha256Recoverable],
@@ -121,6 +126,7 @@ mod tests {
         assert_eq!(key.key_ref.backend_instance.as_str(), "instance-2");
         assert_eq!(key.key_ref.locator, "locator-3");
         assert_eq!(key.key_ref.public_key_fingerprint, digest(4));
+        assert_eq!(key.role, north::KeyRole::WalletRoot);
         assert_eq!(key.canonical_public_key.decode(), vec![5]);
         assert_eq!(key.addresses, ["address-6"]);
         assert_eq!(

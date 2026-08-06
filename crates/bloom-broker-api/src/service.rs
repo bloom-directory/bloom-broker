@@ -206,16 +206,28 @@ pub struct OperationPublicStatus {
 pub struct WalletPublic {
     pub wallet_id: Token,
     pub wallet_kind: Token,
+    /// Signer-identified wallet root for exact owner-authority operations.
+    /// Machine must not derive this identity from list order or backend data.
+    pub root_key_ref: KeyRef,
     pub key_refs: Vec<KeyRef>,
     pub policy_version: DecimalU64,
     pub policy_digest: Digest32,
     pub wallet_revocation_epoch: DecimalU64,
 }
 
+/// Signer-owned classification projected unchanged through Broker.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyRole {
+    WalletRoot,
+    Derived,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyPublic {
     pub key_ref: KeyRef,
+    pub role: KeyRole,
     pub canonical_public_key: Base64UrlBytes,
     pub addresses: Vec<String>,
     pub supported_crypto_suites: Vec<crate::CryptoSuite>,

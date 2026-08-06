@@ -37,8 +37,8 @@ pub use bloom_rpc_wire::{
 };
 
 pub const BROKER_API_MAJOR: u16 = 1;
-pub const BROKER_API_MINOR_MIN: u16 = 1;
-pub const BROKER_API_MINOR_MAX: u16 = 1;
+pub const BROKER_API_MINOR_MIN: u16 = 2;
+pub const BROKER_API_MINOR_MAX: u16 = 2;
 pub const BROKER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(BROKER_API_MAJOR, BROKER_API_MINOR_MAX);
 pub const BROKER_API_RANGE: ProtocolVersionRange =
@@ -49,7 +49,7 @@ mod version_tests {
     use super::*;
 
     #[test]
-    fn broker_api_range_accepts_only_the_current_frozen_v1_1() {
+    fn broker_api_range_accepts_only_the_current_v1_2() {
         assert!(BROKER_API_RANGE.contains(BROKER_API_CURRENT));
     }
 

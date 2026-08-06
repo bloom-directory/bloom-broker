@@ -2554,10 +2554,18 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     )
     .await
     .unwrap();
-    assert!(matches!(
-        read_wallet,
-        MachineBrokerResponse::WalletGetPublic(_)
-    ));
+    let MachineBrokerResponse::WalletGetPublic(read_wallet) = read_wallet else {
+        panic!("wrong wallet projection response");
+    };
+    assert!(read_wallet.root_key_ref.derivation.is_none());
+    assert!(read_wallet.key_refs.contains(&read_wallet.root_key_ref));
+    assert!(
+        read_wallet
+            .key_refs
+            .iter()
+            .any(|key_ref| key_ref.derivation.is_some()),
+        "derived keys must not displace or alias the explicit wallet root"
+    );
     restarted_signer_server.abort();
     signer_server.abort();
 }
