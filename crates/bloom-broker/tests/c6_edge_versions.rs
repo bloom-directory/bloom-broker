@@ -94,9 +94,9 @@ fn acl(effective_uid: u32, identity: &LocalIdentity) -> PeerAcl {
 }
 
 fn downgrade_client_range() -> ProtocolVersionRange {
-    // It accepts the server's 1.2 hello but advertises 1.0 as its current
+    // It accepts the server's 1.3 hello but advertises 1.0 as its current
     // request version, allowing the server-side authority range to reject it.
-    ProtocolVersionRange::new(1, 0, 2)
+    ProtocolVersionRange::new(1, 0, 3)
 }
 
 #[tokio::test]

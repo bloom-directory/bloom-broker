@@ -39,10 +39,11 @@ use bloom_signer_api::{
     CeremonyCompleteRequest, CeremonyKind, CeremonyPhase, CeremonyPrepareRequest,
     CeremonyWebAuthnOptions, ControlRequest, ControlResponse, CustodyCompleteRequest,
     CustodyHpkeAad, CustodyOutputHpkeAad, CustodyPrepareRequest, CustodyResult,
-    CustodySignerContribution, LocalPrfHpkeAad, PolicyUpdateCeremonyCompleteRequest,
-    PolicyUpdateCeremonyPrepareRequest, RevocationControlService, SignerActivationReceipt,
-    SignerCeremonyContribution, SignerCeremonyStatus, SignerPreparedApproval,
-    SignerPreparedCustody, WalletOperationRequest, WebAuthnCeremonyProof,
+    CustodySignerContribution, LegacyPasskeyMigrationPublic, LocalPrfHpkeAad,
+    PolicyUpdateCeremonyCompleteRequest, PolicyUpdateCeremonyPrepareRequest,
+    RevocationControlService, SignerActivationReceipt, SignerCeremonyContribution,
+    SignerCeremonyStatus, SignerPreparedApproval, SignerPreparedCustody, WalletOperationRequest,
+    WebAuthnCeremonyProof,
 };
 use bloom_triad_local_transport::{EndpointQuota, JournalExchange, LocalIdentity, PeerAcl};
 use ed25519_dalek::{Signer as _, SigningKey, Verifier as _, VerifyingKey};
@@ -195,6 +196,16 @@ fn scoped_petal_key_browser_flow_never_collects_a_namespace_grant() {
     assert!(asset.contains("&& !scopedPetalKey"));
     assert!(asset.contains("Boolean(scopedPetalKey)"));
     assert!(asset.contains("if (!scopedPetalKey && !genericFields.hidden)"));
+}
+
+#[test]
+fn legacy_passkey_browser_flow_uses_assertion_prf_and_hides_raw_key_input() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    assert!(asset.contains("legacy_passkey_v1_prf"));
+    assert!(asset.contains("const assertion = await getCredential(session, 0)"));
+    assert!(asset.contains("credential_prf: encodeUrl(credentialPrf)"));
+    assert!(asset.contains("Boolean(scopedPetalKey) || legacyPasskeyImport"));
+    assert!(asset.contains("wallet_import\" && !legacyPasskeyImport"));
 }
 
 fn digest(byte: &str) -> Digest32 {
@@ -974,6 +985,7 @@ fn prepare(
                 expected_input_class: Token::new("policy-document").unwrap(),
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
+                legacy_passkey_migration: None,
             },
             now_ms,
         )
@@ -1166,6 +1178,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             expected_input_class: Token::new("passkey-prf").unwrap(),
             browser_output_recipient_key: None,
             petal_key_scope: None,
+            legacy_passkey_migration: None,
         }),
     )
     .await
@@ -1530,6 +1543,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             expected_input_class: Token::new("petal-key-scope-v1").unwrap(),
             browser_output_recipient_key: None,
             petal_key_scope: Some(scope.clone()),
+            legacy_passkey_migration: None,
         }),
     )
     .await
@@ -2598,6 +2612,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                 expected_input_class: Token::new("policy-document").unwrap(),
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
+                legacy_passkey_migration: None,
             },
             1_001,
         )
@@ -2615,6 +2630,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                     expected_input_class: Token::new("policy-document").unwrap(),
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
+                    legacy_passkey_migration: None,
                 },
                 1_001,
             )
@@ -2643,12 +2659,81 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                     expected_input_class: Token::new("policy-document").unwrap(),
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
+                    legacy_passkey_migration: None,
                 },
                 1_101,
             )
             .unwrap_err()
             .code,
         ProtocolErrorCode::CeremonyRateLimited
+    );
+}
+
+#[tokio::test]
+async fn legacy_passkey_prepare_renders_only_digest_bound_public_migration_terms() {
+    let signer = Arc::new(MockSigner::new());
+    let broker = CeremonyBroker::new(signer);
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let operation_id = operation("81");
+    let migration = LegacyPasskeyMigrationPublic {
+        schema: Token::new("bloom.legacy_passkey_migration_receipt.v1").unwrap(),
+        wallet_name: Token::new("wallet").unwrap(),
+        address: "0x1111111111111111111111111111111111111111".into(),
+        public_key_fingerprint: digest("82"),
+        credential_id_fingerprint: digest("83"),
+        legacy_format_version: 1,
+        bundle_digest: digest("84"),
+        policy_mode: Token::new("restrictive_current_policy").unwrap(),
+    };
+    let exact_terms_digest = migration.terms_digest(&operation_id).unwrap();
+    let response = broker
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::WalletImport,
+                custody_operation_id: operation_id,
+                wallet_id: None,
+                key_ref: None,
+                exact_terms_digest,
+                expected_input_class: Token::new("legacy_passkey_v1_prf").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: Some(migration),
+            },
+            now_ms,
+        )
+        .unwrap();
+    let session = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let projection: serde_json::Value =
+        serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        projection["review_manifest"]["schema"],
+        "bloom.legacy_passkey_migration_review.v1"
+    );
+    assert_eq!(projection["review_manifest"]["wallet_name"], "wallet");
+    assert_eq!(
+        projection["review_manifest"]["creates_current_wkek_custody"],
+        true
+    );
+    assert!(
+        projection["review_manifest"]
+            .get("raw_private_key")
+            .is_none()
     );
 }
 
@@ -2734,6 +2819,7 @@ async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() 
         expected_input_class: Token::new("petal-key-scope-v1").unwrap(),
         browser_output_recipient_key: None,
         petal_key_scope: Some(scope.clone()),
+        legacy_passkey_migration: None,
     };
     let now_ms: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3104,6 +3190,7 @@ fn ac18_forced_ceremony_audit_write_failure_rolls_back_session() {
         expected_input_class: Token::new("policy-document").unwrap(),
         browser_output_recipient_key: None,
         petal_key_scope: None,
+        legacy_passkey_migration: None,
     };
 
     fail.store(true, Ordering::SeqCst);
@@ -3155,6 +3242,7 @@ fn ac18_populated_ceremony_migration_is_atomic_idempotent_and_retains_source() {
                 expected_input_class: Token::new("policy-document").unwrap(),
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
+                legacy_passkey_migration: None,
             },
             50_000,
         )
@@ -3356,6 +3444,7 @@ fn ac18_ceremony_status_survives_latched_audit_tamper_while_new_sessions_fail() 
                     expected_input_class: Token::new("policy-document").unwrap(),
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
+                    legacy_passkey_migration: None,
                 },
                 41_001,
             )
@@ -3404,6 +3493,7 @@ fn restart_expires_nonterminal_session_and_persists_only_token_hash() {
                 expected_input_class: Token::new("policy-document").unwrap(),
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
+                legacy_passkey_migration: None,
             },
             50_001,
         )
@@ -3433,6 +3523,7 @@ fn rolling_creation_limits_survive_terminal_sessions_and_bound_anonymous_registr
                 expected_input_class: Token::new("policy-document").unwrap(),
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
+                legacy_passkey_migration: None,
             },
             355_000,
         )
@@ -3452,6 +3543,7 @@ fn rolling_creation_limits_survive_terminal_sessions_and_bound_anonymous_registr
                     expected_input_class: Token::new("passkey-prf").unwrap(),
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
+                    legacy_passkey_migration: None,
                 },
                 500_000 + u64::from(index),
             )
@@ -3472,6 +3564,7 @@ fn rolling_creation_limits_survive_terminal_sessions_and_bound_anonymous_registr
                     expected_input_class: Token::new("passkey-prf").unwrap(),
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
+                    legacy_passkey_migration: None,
                 },
                 500_010,
             )
@@ -3518,6 +3611,7 @@ fn real_signer_generated_wallet_ids_still_count_as_anonymous_registration_attemp
                     expected_input_class: Token::new("passkey-prf").unwrap(),
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
+                    legacy_passkey_migration: None,
                 },
                 100_000 + u64::from(index),
             )
@@ -3538,6 +3632,7 @@ fn real_signer_generated_wallet_ids_still_count_as_anonymous_registration_attemp
                     expected_input_class: Token::new("passkey-prf").unwrap(),
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
+                    legacy_passkey_migration: None,
                 },
                 100_010,
             )
@@ -3589,6 +3684,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
                 expected_input_class: Token::new("passkey-prf").unwrap(),
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
+                legacy_passkey_migration: None,
             },
             now_ms,
         )
@@ -3696,6 +3792,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
                 expected_input_class: Token::new("generic-custody-v1").unwrap(),
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
+                legacy_passkey_migration: None,
             },
             now_ms + 1_000,
         )

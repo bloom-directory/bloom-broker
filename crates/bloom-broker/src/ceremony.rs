@@ -526,6 +526,9 @@ impl CeremonyBroker {
     ) -> Result<CustodyPrepareResponse, ProtocolError> {
         self.expire_sessions(now_ms)?;
         request
+            .validate_legacy_passkey_migration_binding()
+            .map_err(signer_error_to_machine)?;
+        request
             .validate_petal_key_scope_binding()
             .map_err(signer_error_to_machine)?;
         if matches!(
@@ -565,12 +568,29 @@ impl CeremonyBroker {
             anonymous_registration,
             ceremony_kind: request.ceremony_kind,
             ceremony_id: ceremony_id.clone(),
-            review_manifest: request
-                .petal_key_scope
-                .as_ref()
-                .map(serde_json::to_value)
-                .transpose()
-                .map_err(malformed)?,
+            review_manifest: if let Some(migration) = &request.legacy_passkey_migration {
+                Some(serde_json::json!({
+                    "schema": "bloom.legacy_passkey_migration_review.v1",
+                    "title": "Import existing passkey wallet into Triad custody",
+                    "wallet_name": migration.wallet_name,
+                    "address": migration.address,
+                    "public_key_fingerprint": migration.public_key_fingerprint,
+                    "credential_id_fingerprint": migration.credential_id_fingerprint,
+                    "legacy_format_version": migration.legacy_format_version,
+                    "bundle_digest": migration.bundle_digest,
+                    "policy_mode": migration.policy_mode,
+                    "existing_passkey_remains_authority": true,
+                    "creates_current_wkek_custody": true,
+                    "legacy_policy_is_not_imported": true
+                }))
+            } else {
+                request
+                    .petal_key_scope
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(malformed)?
+            },
             challenges: prepared.challenges,
             signer_contribution: serde_json::to_value(prepared.contribution).map_err(malformed)?,
             webauthn_options: prepared.webauthn_options,

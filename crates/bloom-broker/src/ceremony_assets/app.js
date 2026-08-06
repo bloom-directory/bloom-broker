@@ -127,6 +127,8 @@ async function load() {
   if (!response.ok) throw new Error("Ceremony is unavailable");
   let session = await response.json();
   ceremonyId = session.ceremony_id;
+  const legacyPasskeyImport = session.ceremony_kind === "wallet_import" &&
+    session.signer_contribution?.expected_input_class === "legacy_passkey_v1_prf";
   if (!/^[0-9a-f]{64}$/.test(ceremonyId)) {
     throw new Error("Ceremony returned an invalid identity");
   }
@@ -164,8 +166,8 @@ async function load() {
     "wallet_import", "key_derive"
   ]);
   genericFields.hidden = !typedInputKinds.has(session.ceremony_kind) ||
-    Boolean(scopedPetalKey);
-  if (session.ceremony_kind === "wallet_import") {
+    Boolean(scopedPetalKey) || legacyPasskeyImport;
+  if (session.ceremony_kind === "wallet_import" && !legacyPasskeyImport) {
     genericInput.placeholder = '{"raw_private_key":"base64url-encoded-key"}';
   } else if (session.ceremony_kind === "key_derive") {
     genericInput.placeholder =
@@ -221,11 +223,13 @@ async function run(session) {
   approve.disabled = true;
   statusNode.textContent = "Waiting for passkey verification…";
   const kind = session.ceremony_kind;
+  const legacyPasskeyImport = kind === "wallet_import" &&
+    session.signer_contribution?.expected_input_class === "legacy_passkey_v1_prf";
   let proof;
   let secret = null;
   let credentialId = null;
 
-  if (kind === "wallet_registration" || kind === "wallet_import") {
+  if (kind === "wallet_registration" || (kind === "wallet_import" && !legacyPasskeyImport)) {
     const created = await createCredential(session, 0);
     const prf = await ensureNewCredentialPrf(session, created, 1);
     credentialId = encodeUrl(created.rawId);
@@ -244,6 +248,15 @@ async function run(session) {
     }
     proof = {kind: "registration", attestation: attestationJson(created),
       prf_assertion: prf.assertion};
+  } else if (legacyPasskeyImport) {
+    const assertion = await getCredential(session, 0);
+    credentialId = encodeUrl(assertion.rawId);
+    const credentialPrf = prfResult(assertion);
+    if (!credentialPrf) throw new Error("This passkey did not return required PRF output");
+    secret = te.encode(canonicalJson({
+      credential_prf: encodeUrl(credentialPrf)
+    }));
+    proof = {kind: "assertion", assertion: assertionJson(assertion)};
   } else if (kind === "wallet_recovery") {
     const created = await createCredential(session, 0);
     const newPrf = await ensureNewCredentialPrf(session, created, 1);

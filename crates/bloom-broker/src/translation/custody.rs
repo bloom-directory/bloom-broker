@@ -23,6 +23,21 @@ fn petal_scope_to_signer(value: north::PetalKeyScope) -> south::PetalKeyScope {
     }
 }
 
+fn legacy_migration_to_signer(
+    value: north::LegacyPasskeyMigrationPublic,
+) -> south::LegacyPasskeyMigrationPublic {
+    south::LegacyPasskeyMigrationPublic {
+        schema: value.schema,
+        wallet_name: value.wallet_name,
+        address: value.address,
+        public_key_fingerprint: value.public_key_fingerprint,
+        credential_id_fingerprint: value.credential_id_fingerprint,
+        legacy_format_version: value.legacy_format_version,
+        bundle_digest: value.bundle_digest,
+        policy_mode: value.policy_mode,
+    }
+}
+
 pub(crate) fn prepare_to_signer(
     value: north::CustodyPrepareRequest,
 ) -> south::CustodyPrepareRequest {
@@ -35,6 +50,9 @@ pub(crate) fn prepare_to_signer(
         expected_input_class: value.expected_input_class,
         browser_output_recipient_key: value.browser_output_recipient_key,
         petal_key_scope: value.petal_key_scope.map(petal_scope_to_signer),
+        legacy_passkey_migration: value
+            .legacy_passkey_migration
+            .map(legacy_migration_to_signer),
     }
 }
 
@@ -116,6 +134,7 @@ mod tests {
             expected_input_class: north::Token::new("scope-10").unwrap(),
             browser_output_recipient_key: None,
             petal_key_scope: Some(scope),
+            legacy_passkey_migration: None,
         };
         request.validate_petal_key_scope_binding().unwrap();
         let mut inconsistent = request.clone();
@@ -158,6 +177,48 @@ mod tests {
         let mut substituted = mapped_scope;
         substituted.custody_operation_id = operation(11);
         assert_ne!(substituted.digest().unwrap(), mapped.exact_terms_digest);
+    }
+
+    #[test]
+    fn legacy_migration_request_preserves_every_public_binding() {
+        let operation_id = operation(41);
+        let migration = north::LegacyPasskeyMigrationPublic {
+            schema: north::Token::new("bloom.legacy_passkey_migration_receipt.v1").unwrap(),
+            wallet_name: north::Token::new("legacy-wallet").unwrap(),
+            address: "0x1111111111111111111111111111111111111111".into(),
+            public_key_fingerprint: digest(42),
+            credential_id_fingerprint: digest(43),
+            legacy_format_version: 1,
+            bundle_digest: digest(44),
+            policy_mode: north::Token::new("restrictive_current_policy").unwrap(),
+        };
+        let request = north::CustodyPrepareRequest {
+            ceremony_kind: north::CeremonyKind::WalletImport,
+            custody_operation_id: operation_id.clone(),
+            wallet_id: None,
+            key_ref: None,
+            exact_terms_digest: migration.terms_digest(&operation_id).unwrap(),
+            expected_input_class: north::Token::new("legacy_passkey_v1_prf").unwrap(),
+            browser_output_recipient_key: None,
+            petal_key_scope: None,
+            legacy_passkey_migration: Some(migration.clone()),
+        };
+        request.validate_legacy_passkey_migration_binding().unwrap();
+        let mapped = prepare_to_signer(request);
+        mapped.validate_legacy_passkey_migration_binding().unwrap();
+        let mapped_migration = mapped.legacy_passkey_migration.unwrap();
+        assert_eq!(mapped_migration.wallet_name, migration.wallet_name);
+        assert_eq!(mapped_migration.address, migration.address);
+        assert_eq!(
+            mapped_migration.public_key_fingerprint,
+            migration.public_key_fingerprint
+        );
+        assert_eq!(
+            mapped_migration.credential_id_fingerprint,
+            migration.credential_id_fingerprint
+        );
+        assert_eq!(mapped_migration.bundle_digest, migration.bundle_digest);
+        assert_eq!(mapped_migration.policy_mode, migration.policy_mode);
     }
 
     #[test]
