@@ -1830,13 +1830,19 @@ fn petal_input(
         _ => panic!("expected Petal provenance"),
     };
     let payload = b"transfer";
-    let payload_digest = Digest32::from_bytes(Sha256::digest(payload).into());
+    let mut claim_digest = Sha256::new();
+    claim_digest.update(b"bloom.petal.payload-batch.v1\0");
+    claim_digest.update(1u64.to_be_bytes());
+    claim_digest.update((payload.len() as u64).to_be_bytes());
+    claim_digest.update(payload);
+    let payload_digest = Digest32::from_bytes(claim_digest.finalize().into());
+    let payload_hash = Digest32::from_bytes(Sha256::digest(payload).into());
     let ordered_hash = match suite {
         CryptoSuite::Secp256k1Keccak256Recoverable => {
             use sha3::Keccak256;
             Digest32::from_bytes(Keccak256::digest(payload).into())
         }
-        _ => payload_digest.clone(),
+        _ => payload_hash,
     };
     let claim_nonce = nonce(operation_id.to_bytes()[31]);
     let mut input = AuthorizationInput {

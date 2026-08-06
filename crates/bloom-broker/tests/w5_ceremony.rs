@@ -196,6 +196,20 @@ fn scoped_petal_key_browser_flow_never_collects_a_namespace_grant() {
     assert!(asset.contains("&& !scopedPetalKey"));
     assert!(asset.contains("Boolean(scopedPetalKey)"));
     assert!(asset.contains("if (!scopedPetalKey && !genericFields.hidden)"));
+    let run = asset
+        .split_once("async function run(session)")
+        .expect("asset must define the ceremony runner")
+        .1;
+    let definition = run
+        .find("const scopedPetalKey")
+        .expect("the runner must derive its own scoped-petal-key state");
+    let use_site = run
+        .find("if (!scopedPetalKey && !genericFields.hidden)")
+        .expect("the runner must guard generic input");
+    assert!(
+        definition < use_site,
+        "runner state must be defined before use"
+    );
 }
 
 #[test]
@@ -261,12 +275,17 @@ fn petal_sign_request(
     payload: &[u8],
 ) -> MachineSignRequest {
     let payload_digest = Digest32::from_bytes(sha2::Sha256::digest(payload).into());
+    let mut claim_payload_digest = sha2::Sha256::new();
+    claim_payload_digest.update(b"bloom.petal.payload-batch.v1\0");
+    claim_payload_digest.update(1u64.to_be_bytes());
+    claim_payload_digest.update((payload.len() as u64).to_be_bytes());
+    claim_payload_digest.update(payload);
     let claim = PetalUseClaim {
         package_hash: package_hash.clone(),
         route: route.into(),
         operation_class: Token::new("exchange-order").unwrap(),
         crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
-        payload_digest: payload_digest.clone(),
+        payload_digest: Digest32::from_bytes(claim_payload_digest.finalize().into()),
         ordered_hashes: vec![payload_digest.clone()],
         declared_debits: Vec::new(),
         declared_destinations: Vec::new(),
@@ -1364,6 +1383,34 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         MachineBrokerResponse::PolicyValidateUpdate(prepared) => prepared,
         response => panic!("unexpected response: {response:?}"),
     };
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let retried = match MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::PolicyValidateUpdate(update.clone()),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::PolicyValidateUpdate(prepared) => prepared,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    assert_eq!(
+        retried, prepared,
+        "exact retries must recover the durable prepare response"
+    );
+
+    let mut conflicting_update = update.clone();
+    conflicting_update.proposed_policy_digest = digest("ef");
+    assert_eq!(
+        MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::PolicyValidateUpdate(conflicting_update),
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ProtocolErrorCode::OperationIdConflict
+    );
     let premature = CustodyResult {
         ceremony_kind: CeremonyKind::PolicyUpdate,
         custody_operation_id: update.operation_id.clone(),

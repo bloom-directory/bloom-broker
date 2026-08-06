@@ -225,6 +225,8 @@ async function run(session) {
   const kind = session.ceremony_kind;
   const legacyPasskeyImport = kind === "wallet_import" &&
     session.signer_contribution?.expected_input_class === "legacy_passkey_v1_prf";
+  const scopedPetalKey = kind === "key_derive" &&
+    session.signer_contribution?.petal_key_scope;
   let proof;
   let secret = null;
   let credentialId = null;

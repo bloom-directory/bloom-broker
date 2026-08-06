@@ -139,15 +139,18 @@ impl BrokerRpcService {
                 self.renew_approval(request).await?,
             )),
             Request::SealedApprovalStatus(request) => Ok(Response::SealedApprovalStatus(
-                self.authority
-                    .approval_public_status(&request.id)
-                    .map_err(authority_error)?,
+                self.approval_public_status(&request.id)?,
             )),
-            Request::SealedApprovalList(request) => Ok(Response::SealedApprovalList(
-                self.authority
+            Request::SealedApprovalList(request) => {
+                let mut statuses = self
+                    .authority
                     .approval_public_list(&request.wallet_id)
-                    .map_err(authority_error)?,
-            )),
+                    .map_err(authority_error)?;
+                for status in &mut statuses {
+                    self.attach_pending_approval_ceremony(status);
+                }
+                Ok(Response::SealedApprovalList(statuses))
+            }
             Request::SealedApprovalLimitState(request) => Ok(Response::SealedApprovalLimitState(
                 self.journal
                     .approval_limit_state(&request.id)
@@ -163,9 +166,7 @@ impl BrokerRpcService {
                     ))
                     .await?;
                 Ok(Response::SealedApprovalRevoke(
-                    self.authority
-                        .approval_public_status(&request.approval_id)
-                        .map_err(authority_error)?,
+                    self.approval_public_status(&request.approval_id)?,
                 ))
             }
             Request::SealedApprovalRevokeAll(request) => {
@@ -586,10 +587,38 @@ impl BrokerRpcService {
         Ok(response)
     }
 
+    fn approval_public_status(
+        &self,
+        approval_id: &Digest32,
+    ) -> Result<bloom_broker_api::ApprovalPublicStatus, ProtocolError> {
+        let mut status = self
+            .authority
+            .approval_public_status(approval_id)
+            .map_err(authority_error)?;
+        self.attach_pending_approval_ceremony(&mut status);
+        Ok(status)
+    }
+
+    fn attach_pending_approval_ceremony(
+        &self,
+        status: &mut bloom_broker_api::ApprovalPublicStatus,
+    ) {
+        if let Some((url, expires_at_ms)) =
+            self.ceremony.pending_approval_ceremony(&status.approval_id)
+        {
+            status.ceremony_url = Some(url);
+            status.ceremony_expires_at_ms = Some(expires_at_ms);
+        }
+    }
+
     async fn prepare_policy_update(
         &self,
         request: PolicyUpdateRequest,
     ) -> Result<bloom_broker_api::PolicyUpdatePrepareResponse, ProtocolError> {
+        let signer_update = translate_policy::update_to_signer(request.clone());
+        if let Some(response) = self.ceremony.recover_policy_update_prepare(&signer_update) {
+            return response;
+        }
         let authority_diff = self
             .authority
             .validate_policy_update(&request)
@@ -652,7 +681,7 @@ impl BrokerRpcService {
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
                 },
-                update: translate_policy::update_to_signer(request),
+                update: signer_update,
                 broker_validation_receipt: validation,
             },
             review,
@@ -862,6 +891,14 @@ impl BrokerRpcService {
                 BrokerSignerRequest::SignerSign(request)
             })
             .await;
+        if let Err(error) = &response {
+            eprintln!(
+                "Signer rejected operation {}: {}: {}",
+                operation_id,
+                error.code.as_str(),
+                error.message
+            );
+        }
         match response {
             Ok(response) => {
                 let result = exact_signing_response(is_batch, response)?;
@@ -1682,6 +1719,7 @@ fn jcs_digest(value: &impl serde::Serialize) -> Result<Digest32, ProtocolError> 
 }
 
 fn authority_error(error: AuthorityError) -> ProtocolError {
+    eprintln!("Broker authority rejection: {error}");
     match error {
         AuthorityError::Journal(error) => journal_error(error),
         AuthorityError::Storage(message) => {

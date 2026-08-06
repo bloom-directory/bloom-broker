@@ -679,6 +679,43 @@ impl CeremonyBroker {
         Ok(response)
     }
 
+    /// Recover the stable prepare response for an exact policy-update retry.
+    ///
+    /// The review manifest contains Broker-issued timestamps, so rebuilding it
+    /// after a lost response would change the request digest. Compare the
+    /// immutable update terms first and return the already-durable response.
+    pub(crate) fn recover_policy_update_prepare(
+        &self,
+        update: &bloom_signer_api::PolicyUpdateRequest,
+    ) -> Option<Result<PolicyUpdatePrepareResponse, ProtocolError>> {
+        let id = self
+            .inner
+            .operations
+            .lock()
+            .get(&update.operation_id)?
+            .clone();
+        let sessions = self.inner.sessions.lock();
+        let session = sessions.get(&id)?;
+        let Some(stored) = session.policy_update.as_ref() else {
+            return Some(Err(operation_conflict()));
+        };
+        if &stored.update != update {
+            return Some(Err(operation_conflict()));
+        }
+        if is_terminal(session.state) {
+            return Some(Err(replay()));
+        }
+        let manifest: PolicyUpdateReviewManifest =
+            serde_json::from_value(session.projection.review_manifest.clone()?).ok()?;
+        Some(Ok(PolicyUpdatePrepareResponse {
+            operation_id: update.operation_id.clone(),
+            ceremony_kind: BrokerCeremonyKind::PolicyUpdate,
+            ceremony_url: session_url(&token_for(session)),
+            ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
+            review_manifest_digest: manifest.digest().ok()?,
+        }))
+    }
+
     pub fn status(&self, operation_id: &OperationId) -> Option<BrokerCeremonyState> {
         let ceremony_id = self.inner.operations.lock().get(operation_id)?.clone();
         self.inner
@@ -715,6 +752,36 @@ impl CeremonyBroker {
             expires_at_ms: DecimalU64::new(session.expires_at_ms),
             ceremony_url,
             receipt_digest,
+        })
+    }
+
+    /// Return the owner-visible URL for an approval ceremony while it is
+    /// awaiting the user. Approval status is keyed by the approval digest,
+    /// whereas the ceremony store is keyed by activation operation ID, so the
+    /// association is recovered from the signed review manifest.
+    pub fn pending_approval_ceremony(
+        &self,
+        approval_id: &Digest32,
+    ) -> Option<(String, DecimalU64)> {
+        self.inner.sessions.lock().values().find_map(|session| {
+            if session.ceremony_kind != CeremonyKind::SealedApproval
+                || session.state != CeremonyState::AwaitingUser
+            {
+                return None;
+            }
+            let manifest_approval_id = session
+                .projection
+                .review_manifest
+                .as_ref()?
+                .get("approval_id")?
+                .as_str()?;
+            if manifest_approval_id != approval_id.as_str() {
+                return None;
+            }
+            session
+                .token
+                .as_ref()
+                .map(|token| (session_url(token), DecimalU64::new(session.expires_at_ms)))
         })
     }
 

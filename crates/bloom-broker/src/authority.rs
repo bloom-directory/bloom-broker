@@ -1140,33 +1140,32 @@ impl BrokerAuthority {
                 "provenance subject differs from the approval subject",
             ));
         }
-        if let (
-            ApprovalSubject::Petal { package_hash, .. },
-            ApprovalSelector::Petal {
-                allowed_operation_classes,
-                ..
-            },
-        ) = (&terms.subject, &terms.selector)
-        {
+        if let ApprovalSubject::Petal { package_hash, .. } = &terms.subject {
             if !policy.allowed_petal_packages.contains(package_hash) {
                 return Err(denied(
                     "PROVENANCE_MISMATCH",
                     "wallet policy does not permit this Petal package",
                 ));
             }
-            let declared: BTreeSet<_> = record
-                .operation_classes
-                .iter()
-                .map(|entry| entry.operation_class.as_str())
-                .collect();
-            if allowed_operation_classes
-                .iter()
-                .any(|class| !declared.contains(class.as_str()))
+            if let ApprovalSelector::Petal {
+                allowed_operation_classes,
+                ..
+            } = &terms.selector
             {
-                return Err(denied(
-                    "PROVENANCE_CLASS_MISMATCH",
-                    "approval class is absent from installer-signed provenance",
-                ));
+                let declared: BTreeSet<_> = record
+                    .operation_classes
+                    .iter()
+                    .map(|entry| entry.operation_class.as_str())
+                    .collect();
+                if allowed_operation_classes
+                    .iter()
+                    .any(|class| !declared.contains(class.as_str()))
+                {
+                    return Err(denied(
+                        "PROVENANCE_CLASS_MISMATCH",
+                        "approval class is absent from installer-signed provenance",
+                    ));
+                }
             }
         }
         let provenance_jcs = serde_jcs::to_string(&record).map_err(storage)?;
@@ -1674,7 +1673,7 @@ impl BrokerAuthority {
                     ordered_payload_digests,
                     ordered_hashes: approved_hashes,
                 },
-                None,
+                claim,
             ) => {
                 if ordered_payload_digests != &payload_digests || approved_hashes != &ordered_hashes
                 {
@@ -1683,7 +1682,50 @@ impl BrokerAuthority {
                         "payload bytes, digest, hash, order, count, or algorithm changed",
                     ));
                 }
-                (BTreeMap::new(), None, None)
+                match claim {
+                    None => (BTreeMap::new(), None, None),
+                    Some(claim) => {
+                        let ApprovalSubject::Petal {
+                            package_hash,
+                            route,
+                            ..
+                        } = &terms.subject
+                        else {
+                            return Err(denied(
+                                "SELECTOR_MISMATCH",
+                                "only an exact Petal approval may carry a Petal claim",
+                            ));
+                        };
+                        if !policy.allowed_petal_packages.contains(package_hash) {
+                            return Err(denied(
+                                "PROVENANCE_MISMATCH",
+                                "wallet policy does not permit this Petal package",
+                            ));
+                        }
+                        let declared_classes: Vec<_> = current_provenance
+                            .operation_classes
+                            .iter()
+                            .map(|entry| entry.operation_class.clone())
+                            .collect();
+                        self.validate_petal_claim(
+                            &terms,
+                            &policy,
+                            input,
+                            claim,
+                            package_hash,
+                            route,
+                            &declared_classes,
+                            ClaimAssuranceLevel::MachineAsserted,
+                            &payloads,
+                            &ordered_hashes,
+                        )?;
+                        (
+                            account_claim_values(&terms, claim, &current_provenance)?,
+                            Some(claim.claim_assurance.clone()),
+                            declared_fee_asset(claim),
+                        )
+                    }
+                }
             }
             (
                 ApprovalSelector::Petal {
@@ -1703,7 +1745,7 @@ impl BrokerAuthority {
                     route,
                     allowed_operation_classes,
                     *required_claim_assurance,
-                    &payload_digests,
+                    &payloads,
                     &ordered_hashes,
                 )?;
                 (
@@ -1715,7 +1757,7 @@ impl BrokerAuthority {
             _ => {
                 return Err(denied(
                     "SELECTOR_MISMATCH",
-                    "exact requests must omit claims and Petal requests must include one",
+                    "Petal selectors require a Petal claim",
                 ));
             }
         };
@@ -1810,7 +1852,7 @@ impl BrokerAuthority {
         route: &str,
         allowed_operation_classes: &[Token],
         required_assurance: ClaimAssuranceLevel,
-        payload_digests: &[Digest32],
+        payloads: &[Vec<u8>],
         ordered_hashes: &[Digest32],
     ) -> Result<(), AuthorityError> {
         if &claim.package_hash != package_hash
@@ -1818,7 +1860,7 @@ impl BrokerAuthority {
             || !allowed_operation_classes.contains(&claim.operation_class)
             || claim.crypto_suite != input.request.crypto_suite
             || !terms.allowed_crypto_suites.contains(&claim.crypto_suite)
-            || claim.payload_digest != combined_payload_digest(payload_digests)
+            || claim.payload_digest != petal_payload_batch_digest(payloads)
             || claim.ordered_hashes != ordered_hashes
         {
             return Err(denied(
@@ -2340,6 +2382,17 @@ impl BrokerAuthority {
     }
 }
 
+fn petal_payload_batch_digest(payloads: &[Vec<u8>]) -> Digest32 {
+    let mut digest = Sha256::new();
+    digest.update(b"bloom.petal.payload-batch.v1\0");
+    digest.update((payloads.len() as u64).to_be_bytes());
+    for payload in payloads {
+        digest.update((payload.len() as u64).to_be_bytes());
+        digest.update(payload);
+    }
+    Digest32::from_bytes(digest.finalize().into())
+}
+
 // AC-18 requires Broker authority effects and the Broker audit record to share
 // one SQLite commit. Older packages stored authority tables in a second file.
 // On first open, copy that file into the journal database and record the source
@@ -2644,18 +2697,6 @@ fn suite_hash(suite: CryptoSuite, payload: &[u8]) -> Digest32 {
             Digest32::from_bytes(Sha256::digest(payload).into())
         }
     }
-}
-
-fn combined_payload_digest(payload_digests: &[Digest32]) -> Digest32 {
-    if payload_digests.len() == 1 {
-        return payload_digests[0].clone();
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(b"bloom-batch-payload-digests/v1");
-    for digest in payload_digests {
-        hasher.update(digest.as_str().as_bytes());
-    }
-    Digest32::from_bytes(hasher.finalize().into())
 }
 
 fn assurance_rank(level: ClaimAssuranceLevel) -> u8 {
