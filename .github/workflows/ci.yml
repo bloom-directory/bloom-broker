@@ -47,6 +47,8 @@ jobs:
           )"
           test -n "$executable"
           test -x "$executable"
-          echo "executable=$executable" >> "$GITHUB_OUTPUT"
+          installed_executable="/tmp/bloom-w0-listener-ownership-test"
+          install -m 0755 "$executable" "$installed_executable"
+          echo "executable=$installed_executable" >> "$GITHUB_OUTPUT"
       - name: Run cross-UID canonical-listener test
         run: sudo "${{ steps.w0-test.outputs.executable }}" --nocapture
