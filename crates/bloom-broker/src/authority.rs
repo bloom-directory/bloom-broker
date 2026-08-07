@@ -1581,6 +1581,14 @@ impl BrokerAuthority {
         &self,
         input: &AuthorizationInput,
     ) -> Result<AuthorizationDecision, AuthorityError> {
+        self.authorize_for_clock_profile(input, true)
+    }
+
+    pub fn authorize_for_clock_profile(
+        &self,
+        input: &AuthorizationInput,
+        durable_clock_guard: bool,
+    ) -> Result<AuthorizationDecision, AuthorityError> {
         let _barrier = self.lock_authorization_barrier()?;
         let terms = self
             .approval_terms(&input.request.approval_id)?
@@ -1793,7 +1801,7 @@ impl BrokerAuthority {
                 "operation digest does not match the authorized payload and claim identity",
             ));
         }
-        let reservation = self.journal.reserve(
+        let reservation = self.journal.reserve_for_clock_profile(
             &ReservationRequest {
                 approval_id: input.request.approval_id.clone(),
                 operation_id: input.request.operation_id.clone(),
@@ -1806,6 +1814,7 @@ impl BrokerAuthority {
                 values: values.clone(),
             },
             &budget_limits(&terms),
+            durable_clock_guard,
         );
         if let Err(JournalError::Protocol(error)) = &reservation
             && error.code == ProtocolErrorCode::LimitExceededValue

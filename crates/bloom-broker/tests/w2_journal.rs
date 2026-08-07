@@ -351,6 +351,37 @@ fn ac10_sliding_windows_use_exact_continuous_boundaries() {
 }
 
 #[test]
+fn macos_clock_profile_does_not_compare_reservations_with_legacy_clock_state() {
+    let journal = memory_journal();
+    install_reservation_approval(&journal);
+    let mut bounded = limits(10);
+    bounded.rate_limits = vec![SlidingBudgetLimit {
+        max_operations: 2,
+        max_signatures: 2,
+        duration_ms: 1_000,
+    }];
+    journal
+        .observe_time(
+            TimeReading {
+                utc_ms: Some(1_000),
+                monotonic_elapsed_ms: 0,
+                monotonic_anchor_ns: 1_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
+            },
+            3_600_000,
+            true,
+        )
+        .unwrap();
+
+    let mut request = reservation(1);
+    request.reserved_at_ms = 40_000_000;
+    request.observed_utc_ms = Some(40_000_000);
+    journal
+        .reserve_for_clock_profile(&request, &bounded, false)
+        .unwrap();
+}
+
+#[test]
 fn reservation_fails_closed_without_canonical_active_approval() {
     let journal = memory_journal();
     assert_eq!(

@@ -1072,6 +1072,15 @@ impl BrokerJournal {
         request: &ReservationRequest,
         limits: &BudgetLimits,
     ) -> Result<(), JournalError> {
+        self.reserve_for_clock_profile(request, limits, true)
+    }
+
+    pub fn reserve_for_clock_profile(
+        &self,
+        request: &ReservationRequest,
+        limits: &BudgetLimits,
+        durable_clock_guard: bool,
+    ) -> Result<(), JournalError> {
         if request.signature_count == 0 {
             return Err(protocol(
                 ProtocolErrorCode::BackendInvalidRequest,
@@ -1097,11 +1106,13 @@ impl BrokerJournal {
             )
             .into());
         }
-        validate_reservation_clock(
-            &transaction,
-            request.reserved_at_ms,
-            !limits.rate_limits.is_empty() || !limits.rolling_value_limits.is_empty(),
-        )?;
+        if durable_clock_guard {
+            validate_reservation_clock(
+                &transaction,
+                request.reserved_at_ms,
+                !limits.rate_limits.is_empty() || !limits.rolling_value_limits.is_empty(),
+            )?;
+        }
         if let Some(existing) = reservation_state(&transaction, request)? {
             if existing == ReservationState::Reserved {
                 if reservation_matches(&transaction, request)? {

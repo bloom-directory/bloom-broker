@@ -742,13 +742,16 @@ impl BrokerRpcService {
         self.reconcile_wallet(&terms.wallet_id).await?;
         let decision = self
             .authority
-            .authorize(&AuthorizationInput {
-                request: request.clone(),
-                reserved_at_ms,
-                observed_utc_ms: clock.observed_utc_ms,
-                monotonic_anchor_ns: clock.monotonic_anchor_ns,
-                clock_boot_epoch: clock.boot_epoch,
-            })
+            .authorize_for_clock_profile(
+                &AuthorizationInput {
+                    request: request.clone(),
+                    reserved_at_ms,
+                    observed_utc_ms: clock.observed_utc_ms,
+                    monotonic_anchor_ns: clock.monotonic_anchor_ns,
+                    clock_boot_epoch: clock.boot_epoch,
+                },
+                self.clock.uses_durable_clock_guard(),
+            )
             .map_err(authority_error)?;
         let mut attempt_bytes = [0_u8; 32];
         OsRng.fill_bytes(&mut attempt_bytes);
