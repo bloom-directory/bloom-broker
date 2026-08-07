@@ -61,6 +61,7 @@ const OUTPUT_ACK_TTL_MS: u64 = 5 * 60 * 1_000;
 
 const SHELL_HTML: &str = include_str!("ceremony_assets/index.html");
 const APP_JS: &str = include_str!("ceremony_assets/app.js");
+const STYLE_CSS: &str = include_str!("ceremony_assets/style.css");
 
 #[derive(Clone, Debug, Default)]
 pub struct ReviewManifestContext {
@@ -923,6 +924,7 @@ impl CeremonyBroker {
             .route("/", get(shell))
             .route("/ceremony/{token}", get(ceremony_shell))
             .route("/assets/app.js", get(app_js))
+            .route("/assets/style.css", get(style_css))
             .route("/api/session", get(read_session_by_token))
             .route("/api/session/{ceremony_id}", get(read_session))
             .route("/api/session/{ceremony_id}/result", get(read_result))
@@ -1709,6 +1711,17 @@ async fn app_js(headers: HeaderMap) -> Response {
             "application/javascript; charset=utf-8",
         )],
         APP_JS,
+    )
+        .into_response()
+}
+
+async fn style_css(headers: HeaderMap) -> Response {
+    if validate_host(&headers).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        STYLE_CSS,
     )
         .into_response()
 }

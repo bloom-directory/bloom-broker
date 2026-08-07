@@ -193,7 +193,7 @@ cryptoSelfTest().then(
 fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
     let shell = include_str!("../src/ceremony_assets/index.html");
     for required in [
-        "--paper:#f4efe6",
+        "href=\"/assets/style.css\"",
         "Signed local review",
         "Review before continuing",
         "id=\"status\"",
@@ -206,6 +206,18 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
         assert!(
             shell.contains(required),
             "ceremony shell omitted {required}"
+        );
+    }
+
+    let stylesheet = include_str!("../src/ceremony_assets/style.css");
+    for required in [
+        "--paper:#f4efe6",
+        ".layout{display:grid",
+        "@media(max-width:560px)",
+    ] {
+        assert!(
+            stylesheet.contains(required),
+            "ceremony stylesheet omitted {required}"
         );
     }
 }
@@ -3054,6 +3066,24 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
             .headers()
             .contains_key(header::CONTENT_SECURITY_POLICY)
     );
+    let stylesheet = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/assets/style.css")
+                .header(header::HOST, "localhost:18734")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stylesheet.status(), StatusCode::OK);
+    assert_eq!(
+        stylesheet.headers()[header::CONTENT_TYPE],
+        "text/css; charset=utf-8"
+    );
+    let stylesheet_body = stylesheet.into_body().collect().await.unwrap().to_bytes();
+    assert!(stylesheet_body.starts_with(b":root{"));
     let unknown_token = Base64UrlBytes::from_bytes(&[99; 32]);
     let unknown = app
         .clone()
