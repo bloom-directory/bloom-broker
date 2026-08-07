@@ -3679,6 +3679,45 @@ fn rolling_creation_limits_survive_terminal_sessions_and_bound_anonymous_registr
 }
 
 #[test]
+fn cancellation_backoff_reports_remaining_cooldown_and_resets_after_expiry() {
+    let signer = Arc::new(MockSigner::new());
+    let broker = CeremonyBroker::new(signer);
+    let wallet = Token::new("wallet-cancellation-backoff").unwrap();
+    let first_operation = operation("c1");
+    prepare(
+        &broker,
+        first_operation.clone(),
+        Some(wallet.clone()),
+        10_000,
+    );
+    broker.cancel(&first_operation, 10_000).unwrap();
+
+    let error = broker
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::WalletDelete,
+                custody_operation_id: operation("c2"),
+                wallet_id: Some(wallet.clone()),
+                key_ref: None,
+                exact_terms_digest: digest("35"),
+                expected_input_class: Token::new("policy-document").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+            },
+            10_001,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::CeremonyRateLimited);
+    assert_eq!(
+        error.message,
+        "wallet ceremony is in cancellation backoff; retry after 1999 ms"
+    );
+
+    prepare(&broker, operation("c3"), Some(wallet), 12_000);
+}
+
+#[test]
 fn requested_wallet_ids_still_count_as_new_registration_attempts() {
     let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
     let engine = Arc::new(

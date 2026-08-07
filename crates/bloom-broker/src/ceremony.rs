@@ -1242,16 +1242,27 @@ impl CeremonyBroker {
                     "wallet already has a live ceremony",
                 ));
             }
-            if self
-                .inner
-                .cancellation_backoff
-                .lock()
+            let mut backoffs = self.inner.cancellation_backoff.lock();
+            if backoffs
                 .get(wallet_id)
-                .is_some_and(|(_, until)| *until > now_ms)
+                .is_some_and(|(_, until)| *until <= now_ms)
             {
+                // Backoff is a cooldown, not durable strike history.  Leaving
+                // the old count here made every later cancellation escalate
+                // forever until the Broker process restarted.
+                backoffs.remove(wallet_id);
+            }
+            if let Some((_, until)) = backoffs
+                .get(wallet_id)
+                .copied()
+                .filter(|(_, until)| *until > now_ms)
+            {
+                let remaining_ms = until.saturating_sub(now_ms);
                 return Err(protocol(
                     ProtocolErrorCode::CeremonyRateLimited,
-                    "wallet ceremony is in cancellation backoff",
+                    format!(
+                        "wallet ceremony is in cancellation backoff; retry after {remaining_ms} ms"
+                    ),
                 ));
             }
         }
