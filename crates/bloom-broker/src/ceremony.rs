@@ -544,14 +544,35 @@ impl CeremonyBroker {
         {
             return response;
         }
-        let anonymous_registration = request.ceremony_kind == CeremonyKind::WalletRegistration
-            && request.wallet_id.is_none();
+        // This quota class means a brand-new wallet registration. The caller
+        // now supplies its authoritative ID, but it is still unauthenticated
+        // by an existing wallet credential and must retain the global bound.
+        let anonymous_registration = request.ceremony_kind == CeremonyKind::WalletRegistration;
         self.enforce_creation_bounds(request.wallet_id.as_ref(), anonymous_registration, now_ms)?;
         let prepared = self
             .inner
             .signer
             .prepare_custody(request.clone(), now_ms)
             .map_err(signer_error_to_machine)?;
+        if matches!(
+            request.ceremony_kind,
+            CeremonyKind::WalletRegistration | CeremonyKind::WalletImport
+        ) {
+            let expected_wallet_id = request.wallet_id.as_ref().or_else(|| {
+                request
+                    .legacy_passkey_migration
+                    .as_ref()
+                    .map(|migration| &migration.wallet_name)
+            });
+            if expected_wallet_id.is_some()
+                && prepared.contribution.wallet_id.as_ref() != expected_wallet_id
+            {
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "Signer contribution changed the requested wallet ID",
+                ));
+            }
+        }
         prepared
             .contribution
             .validate_petal_key_scope_binding(&request)
@@ -1233,7 +1254,8 @@ impl CeremonyBroker {
                     "wallet ceremony is in cancellation backoff",
                 ));
             }
-        } else if anonymous_registration {
+        }
+        if anonymous_registration {
             let recent = sessions
                 .values()
                 .filter(|session| {

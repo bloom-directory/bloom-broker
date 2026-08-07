@@ -154,6 +154,9 @@ impl LegacyPasskeyMigrationPublic {
 pub struct CustodyPrepareRequest {
     pub ceremony_kind: CeremonyKind,
     pub custody_operation_id: OperationId,
+    /// The authoritative wallet ID. New registrations and ordinary imports
+    /// require the caller-selected ID; legacy migration derives it from the
+    /// authenticated migration receipt instead.
     pub wallet_id: Option<Token>,
     pub key_ref: Option<KeyRef>,
     pub exact_terms_digest: Digest32,
@@ -166,6 +169,36 @@ pub struct CustodyPrepareRequest {
 }
 
 impl CustodyPrepareRequest {
+    pub fn validate_wallet_creation_binding(&self) -> Result<(), ProtocolError> {
+        if !matches!(
+            self.ceremony_kind,
+            CeremonyKind::WalletRegistration | CeremonyKind::WalletImport
+        ) {
+            return Ok(());
+        }
+        if self.key_ref.is_some() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "wallet creation derives its root KeyRef inside Signer",
+            ));
+        }
+        let legacy_import = self.ceremony_kind == CeremonyKind::WalletImport
+            && self.legacy_passkey_migration.is_some();
+        if self.wallet_id.is_none() && !legacy_import {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "wallet registration and ordinary import require an authoritative wallet ID",
+            ));
+        }
+        if self.wallet_id.is_some() && legacy_import {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::OperationIdConflict,
+                "legacy migration wallet ID must come from its authenticated receipt",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn validate_legacy_passkey_migration_binding(&self) -> Result<(), ProtocolError> {
         let Some(migration) = &self.legacy_passkey_migration else {
             if self.expected_input_class.as_str() == "legacy_passkey_v1_prf" {
@@ -313,4 +346,39 @@ impl CustodyResult {
 
 fn canonical_error(error: impl std::fmt::Display) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registration_prepare(wallet_id: Option<Token>) -> CustodyPrepareRequest {
+        CustodyPrepareRequest {
+            ceremony_kind: CeremonyKind::WalletRegistration,
+            custody_operation_id: OperationId::from_bytes([1; 32]),
+            wallet_id,
+            key_ref: None,
+            exact_terms_digest: Digest32::from_bytes([2; 32]),
+            expected_input_class: Token::new("passkey-prf").unwrap(),
+            browser_output_recipient_key: None,
+            petal_key_scope: None,
+            legacy_passkey_migration: None,
+        }
+    }
+
+    #[test]
+    fn new_wallet_creation_requires_its_authoritative_id() {
+        assert!(
+            registration_prepare(Some(Token::new("quiet-lilac").unwrap()))
+                .validate_wallet_creation_binding()
+                .is_ok()
+        );
+        assert_eq!(
+            registration_prepare(None)
+                .validate_wallet_creation_binding()
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::MalformedFrame
+        );
+    }
 }

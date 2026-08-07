@@ -318,6 +318,7 @@ impl BrokerRpcService {
                     request.ceremony_kind,
                     bloom_broker_api::CeremonyKind::WalletRegistration,
                 )?;
+                request.validate_wallet_creation_binding()?;
                 Ok(Response::WalletRegistrationPrepare(
                     self.ceremony.prepare_custody(
                         translate_custody::prepare_to_signer(request),
@@ -334,6 +335,7 @@ impl BrokerRpcService {
                     request.ceremony_kind,
                     bloom_broker_api::CeremonyKind::WalletImport,
                 )?;
+                request.validate_wallet_creation_binding()?;
                 Ok(Response::WalletImportPrepare(
                     self.ceremony.prepare_custody(
                         translate_custody::prepare_to_signer(request),

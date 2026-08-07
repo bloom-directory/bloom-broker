@@ -892,6 +892,12 @@ impl CeremonySigner for MockSigner {
         request: CustodyPrepareRequest,
         now_ms: u64,
     ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
+        let effective_wallet_id = request.wallet_id.clone().or_else(|| {
+            request
+                .legacy_passkey_migration
+                .as_ref()
+                .map(|migration| migration.wallet_name.clone())
+        });
         self.pending
             .lock()
             .insert(request.custody_operation_id.clone());
@@ -904,7 +910,7 @@ impl CeremonySigner for MockSigner {
             custody_operation_id: request.custody_operation_id.clone(),
             signer_nonce: digest("22"),
             review_manifest_digest: request.exact_terms_digest.clone(),
-            wallet_id: request.wallet_id.clone(),
+            wallet_id: effective_wallet_id,
             key_ref: request.key_ref,
             expected_input_class: request.expected_input_class,
             required_user_verification: true,
@@ -1224,7 +1230,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         MachineBrokerRequest::WalletRegistrationPrepare(bloom_broker_api::CustodyPrepareRequest {
             ceremony_kind: bloom_broker_api::CeremonyKind::WalletRegistration,
             custody_operation_id: registration_operation.clone(),
-            wallet_id: None,
+            wallet_id: Some(Token::new("quiet-lilac").unwrap()),
             key_ref: None,
             exact_terms_digest: digest("a1"),
             expected_input_class: Token::new("passkey-prf").unwrap(),
@@ -3635,7 +3641,7 @@ fn rolling_creation_limits_survive_terminal_sessions_and_bound_anonymous_registr
                 CustodyPrepareRequest {
                     ceremony_kind: CeremonyKind::WalletRegistration,
                     custody_operation_id: operation_id.clone(),
-                    wallet_id: None,
+                    wallet_id: Some(Token::new(format!("wallet-a{index}")).unwrap()),
                     key_ref: None,
                     exact_terms_digest: digest("34"),
                     expected_input_class: Token::new("passkey-prf").unwrap(),
@@ -3656,7 +3662,7 @@ fn rolling_creation_limits_survive_terminal_sessions_and_bound_anonymous_registr
                 CustodyPrepareRequest {
                     ceremony_kind: CeremonyKind::WalletRegistration,
                     custody_operation_id: operation("af"),
-                    wallet_id: None,
+                    wallet_id: Some(Token::new("wallet-af").unwrap()),
                     key_ref: None,
                     exact_terms_digest: digest("34"),
                     expected_input_class: Token::new("passkey-prf").unwrap(),
@@ -3673,7 +3679,7 @@ fn rolling_creation_limits_survive_terminal_sessions_and_bound_anonymous_registr
 }
 
 #[test]
-fn real_signer_generated_wallet_ids_still_count_as_anonymous_registration_attempts() {
+fn requested_wallet_ids_still_count_as_new_registration_attempts() {
     let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
     let engine = Arc::new(
         SignerEngine::open_in_memory(
@@ -3703,7 +3709,7 @@ fn real_signer_generated_wallet_ids_still_count_as_anonymous_registration_attemp
                 CustodyPrepareRequest {
                     ceremony_kind: CeremonyKind::WalletRegistration,
                     custody_operation_id: operation_id.clone(),
-                    wallet_id: None,
+                    wallet_id: Some(Token::new(format!("wallet-d{index}")).unwrap()),
                     key_ref: None,
                     exact_terms_digest: digest("d8"),
                     expected_input_class: Token::new("passkey-prf").unwrap(),
@@ -3724,7 +3730,7 @@ fn real_signer_generated_wallet_ids_still_count_as_anonymous_registration_attemp
                 CustodyPrepareRequest {
                     ceremony_kind: CeremonyKind::WalletRegistration,
                     custody_operation_id: operation("df"),
-                    wallet_id: None,
+                    wallet_id: Some(Token::new("wallet-df").unwrap()),
                     key_ref: None,
                     exact_terms_digest: digest("d8"),
                     expected_input_class: Token::new("passkey-prf").unwrap(),
@@ -3776,7 +3782,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
             CustodyPrepareRequest {
                 ceremony_kind: CeremonyKind::WalletRegistration,
                 custody_operation_id: operation_id.clone(),
-                wallet_id: None,
+                wallet_id: Some(Token::new("quiet-lilac").unwrap()),
                 key_ref: None,
                 exact_terms_digest: digest("51"),
                 expected_input_class: Token::new("passkey-prf").unwrap(),
