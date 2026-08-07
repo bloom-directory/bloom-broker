@@ -190,6 +190,27 @@ cryptoSelfTest().then(
 }
 
 #[test]
+fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
+    let shell = include_str!("../src/ceremony_assets/index.html");
+    for required in [
+        "--paper:#f4efe6",
+        "Signed local review",
+        "Review before continuing",
+        "id=\"status\"",
+        "id=\"review\"",
+        "id=\"approve\"",
+        "id=\"cancel\"",
+        "id=\"recovery-fields\"",
+        "id=\"generic-fields\"",
+    ] {
+        assert!(
+            shell.contains(required),
+            "ceremony shell omitted {required}"
+        );
+    }
+}
+
+#[test]
 fn scoped_petal_key_browser_flow_never_collects_a_namespace_grant() {
     let asset = include_str!("../src/ceremony_assets/app.js");
     assert!(asset.contains("session.signer_contribution?.petal_key_scope"));
