@@ -1290,7 +1290,7 @@ impl BrokerRpcService {
                 wallet_id: wallet_id.clone(),
             })
             .await?;
-        let keys = match self
+        let mut keys = match self
             .signer
             .request_for_machine(BrokerSignerRequest::KeyListPublic(
                 bloom_signer_api::WalletRequest {
@@ -1303,6 +1303,28 @@ impl BrokerRpcService {
             _ => return Err(response_mismatch("key.list_public")),
         };
         let root_key_ref = unique_wallet_root(&keys)?;
+        let derived = match self
+            .signer
+            .request_for_machine(BrokerSignerRequest::KeyListDerived(
+                translate_service::key_request_to_signer(bloom_broker_api::KeyRequest {
+                    key_ref: root_key_ref.clone(),
+                }),
+            ))
+            .await?
+        {
+            BrokerSignerResponse::KeyListDerived(keys) => keys,
+            _ => return Err(response_mismatch("key.list_derived")),
+        };
+        if derived
+            .iter()
+            .any(|key| key.role != bloom_signer_api::KeyRole::Derived)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "Signer returned a non-derived key from key.list_derived",
+            ));
+        }
+        keys.extend(derived);
         Ok(WalletPublic {
             wallet_revocation_epoch: DecimalU64::new(
                 self.authority
