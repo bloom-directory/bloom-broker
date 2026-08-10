@@ -62,6 +62,7 @@ const OUTPUT_ACK_TTL_MS: u64 = 5 * 60 * 1_000;
 const SHELL_HTML: &str = include_str!("ceremony_assets/index.html");
 const APP_JS: &str = include_str!("ceremony_assets/app.js");
 const STYLE_CSS: &str = include_str!("ceremony_assets/style.css");
+const BLOOM_PRIMARY_SVG: &str = include_str!("ceremony_assets/bloom-primary.svg");
 
 #[derive(Clone, Debug, Default)]
 pub struct ReviewManifestContext {
@@ -946,6 +947,7 @@ impl CeremonyBroker {
             .route("/ceremony/{token}", get(ceremony_shell))
             .route("/assets/app.js", get(app_js))
             .route("/assets/style.css", get(style_css))
+            .route("/assets/bloom-primary.svg", get(bloom_primary_svg))
             .route("/api/session", get(read_session_by_token))
             .route("/api/session/{ceremony_id}", get(read_session))
             .route("/api/session/{ceremony_id}/result", get(read_result))
@@ -1755,6 +1757,17 @@ async fn style_css(headers: HeaderMap) -> Response {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         STYLE_CSS,
+    )
+        .into_response()
+}
+
+async fn bloom_primary_svg(headers: HeaderMap) -> Response {
+    if validate_host(&headers).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+        BLOOM_PRIMARY_SVG,
     )
         .into_response()
 }

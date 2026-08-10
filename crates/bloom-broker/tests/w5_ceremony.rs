@@ -265,6 +265,8 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
     let shell = include_str!("../src/ceremony_assets/index.html");
     for required in [
         "href=\"/assets/style.css\"",
+        "href=\"/assets/bloom-primary.svg\"",
+        "src=\"/assets/bloom-primary.svg\"",
         "Signed local review",
         "Review before continuing",
         "id=\"status\"",
@@ -291,6 +293,11 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
             "ceremony stylesheet omitted {required}"
         );
     }
+
+    let logo = include_str!("../src/ceremony_assets/bloom-primary.svg");
+    assert_eq!(logo.matches("<path ").count(), 7);
+    assert!(logo.contains("fill=\"#9d2d3f\""));
+    assert!(logo.contains("stroke=\"#7a2230\""));
 }
 
 #[test]
@@ -3161,6 +3168,27 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
     );
     let stylesheet_body = stylesheet.into_body().collect().await.unwrap().to_bytes();
     assert!(stylesheet_body.starts_with(b":root{"));
+    let logo = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/assets/bloom-primary.svg")
+                .header(header::HOST, "localhost:18734")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logo.status(), StatusCode::OK);
+    assert_eq!(
+        logo.headers()[header::CONTENT_TYPE],
+        "image/svg+xml; charset=utf-8"
+    );
+    let logo_body = logo.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        logo_body.as_ref(),
+        include_bytes!("../src/ceremony_assets/bloom-primary.svg")
+    );
     let unknown_token = Base64UrlBytes::from_bytes(&[99; 32]);
     let unknown = app
         .clone()
