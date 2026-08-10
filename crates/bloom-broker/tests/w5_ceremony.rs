@@ -190,6 +190,77 @@ cryptoSelfTest().then(
 }
 
 #[test]
+fn browser_ceremony_state_survives_reload_and_reuses_one_output_key() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    for required in [
+        "tokenFromPath || readSessionToken()",
+        "writeSessionToken(tokenFromPath)",
+        "bloom-ceremony-browser-state-v1",
+        "database.transaction(browserStateStore, \"readwrite\")",
+        "store.get(session.ceremony_id)",
+        "{name: \"X25519\"}, false, [\"deriveBits\"]",
+        "await purgeExpiredBrowserState()",
+        "await clearBrowserState(ceremonyId)",
+    ] {
+        assert!(
+            asset.contains(required),
+            "browser state flow omitted {required}"
+        );
+    }
+    let persisted_key_flow = asset
+        .split_once("async function outputRecipientFor(session)")
+        .expect("asset must define persisted browser output-key state")
+        .1
+        .split_once("async function clearBrowserState(id)")
+        .expect("asset must bound persisted browser output-key state")
+        .0;
+    assert!(
+        !persisted_key_flow.contains("{name: \"X25519\"}, true, [\"deriveBits\"]"),
+        "the persisted browser private key must be non-extractable"
+    );
+}
+
+#[test]
+fn browser_reload_recovers_the_ceremony_token_from_tab_storage() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let encoded_token = serde_json::to_value(Base64UrlBytes::from_bytes(&[31; 32])).unwrap();
+    let token = encoded_token.as_str().unwrap();
+    let script = format!(
+        r#"
+globalThis.crypto = require("node:crypto").webcrypto;
+globalThis.document = {{getElementById: () => ({{}})}};
+globalThis.location = {{pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+const stored = new Map([["bloom.ceremony.token.v1", {token:?}]]);
+globalThis.sessionStorage = {{
+  getItem: key => stored.get(key) || null,
+  setItem: (key, value) => stored.set(key, value),
+  removeItem: key => stored.delete(key)
+}};
+{executable}
+if (token !== {token:?} || authHeaders["x-bloom-ceremony-token"] !== {token:?}) {{
+  throw new Error("reload did not recover the ceremony token");
+}}
+process.stdout.write("browser-reload-ok");
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate ceremony reload state");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "browser-reload-ok");
+}
+
+#[test]
 fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
     let shell = include_str!("../src/ceremony_assets/index.html");
     for required in [

@@ -6,13 +6,142 @@ const cancel = document.getElementById("cancel");
 const recoveryFields = document.getElementById("recovery-fields");
 const genericFields = document.getElementById("generic-fields");
 const genericInput = document.getElementById("generic-input");
-const token = location.pathname.startsWith("/ceremony/")
+const tokenFromPath = location.pathname.startsWith("/ceremony/")
   ? location.pathname.slice("/ceremony/".length) : "";
+const sessionTokenKey = "bloom.ceremony.token.v1";
+const token = tokenFromPath || readSessionToken();
 let ceremonyId = null;
-history.replaceState(null, "", "/");
+if (tokenFromPath) writeSessionToken(tokenFromPath);
+if (token) history.replaceState(null, "", "/");
 const authHeaders = {"x-bloom-ceremony-token": token};
 const te = new TextEncoder();
 let outputRecipient = null;
+
+function browserSessionStorage() {
+  try { return globalThis.sessionStorage || null; } catch (_) { return null; }
+}
+function readSessionToken() {
+  try { return browserSessionStorage()?.getItem(sessionTokenKey) || ""; }
+  catch (_) { return ""; }
+}
+function writeSessionToken(value) {
+  try { browserSessionStorage()?.setItem(sessionTokenKey, value); }
+  catch (_) {}
+}
+function clearSessionToken() {
+  try { browserSessionStorage()?.removeItem(sessionTokenKey); }
+  catch (_) {}
+}
+
+const browserStateDatabase = "bloom-ceremony-browser-state-v1";
+const browserStateStore = "output-recipients";
+
+function requestResult(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("Browser storage request failed"));
+  });
+}
+function transactionDone(transaction) {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(
+      transaction.error || new Error("Browser storage transaction failed")
+    );
+    transaction.onabort = transaction.onerror;
+  });
+}
+async function openBrowserState() {
+  if (!globalThis.indexedDB) {
+    throw new Error("Browser storage is unavailable; keep this ceremony in one tab");
+  }
+  const request = indexedDB.open(browserStateDatabase, 1);
+  request.onupgradeneeded = () => {
+    if (!request.result.objectStoreNames.contains(browserStateStore)) {
+      request.result.createObjectStore(browserStateStore, {keyPath: "ceremonyId"});
+    }
+  };
+  return requestResult(request);
+}
+async function purgeExpiredBrowserState() {
+  if (!globalThis.indexedDB) return;
+  let database;
+  try {
+    database = await openBrowserState();
+    const transaction = database.transaction(browserStateStore, "readwrite");
+    const done = transactionDone(transaction);
+    const request = transaction.objectStore(browserStateStore).openCursor();
+    await new Promise((resolve, reject) => {
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return resolve();
+        if (!Number.isFinite(cursor.value.expiresAtMs) ||
+            cursor.value.expiresAtMs <= Date.now()) {
+          cursor.delete();
+        }
+        cursor.continue();
+      };
+      request.onerror = () => reject(
+        request.error || new Error("Browser storage cleanup failed")
+      );
+    });
+    await done;
+  } catch (_) {
+    // Expiry cleanup must not make an otherwise valid ceremony unavailable.
+  } finally {
+    database?.close();
+  }
+}
+async function outputRecipientFor(session) {
+  const keyPair = await crypto.subtle.generateKey(
+    {name: "X25519"}, false, ["deriveBits"]
+  );
+  const publicKey = new Uint8Array(
+    await crypto.subtle.exportKey("raw", keyPair.publicKey)
+  );
+  const candidate = {
+    ceremonyId: session.ceremony_id,
+    expiresAtMs: Number(session.expires_at_ms),
+    privateKey: keyPair.privateKey,
+    publicKey: publicKey.buffer
+  };
+  const database = await openBrowserState();
+  try {
+    const transaction = database.transaction(browserStateStore, "readwrite");
+    const done = transactionDone(transaction);
+    const store = transaction.objectStore(browserStateStore);
+    let stored = await requestResult(store.get(session.ceremony_id));
+    if (!stored || !Number.isFinite(stored.expiresAtMs) ||
+        stored.expiresAtMs <= Date.now()) {
+      await requestResult(store.put(candidate));
+      stored = candidate;
+    }
+    await done;
+    const storedPublicKey = new Uint8Array(stored.publicKey);
+    if (!stored.privateKey || storedPublicKey.length !== 32) {
+      throw new Error("Stored ceremony browser key is invalid");
+    }
+    return {privateKey: stored.privateKey, publicKey: storedPublicKey};
+  } finally {
+    database.close();
+  }
+}
+async function clearBrowserState(id) {
+  clearSessionToken();
+  if (!id || !globalThis.indexedDB) return;
+  let database;
+  try {
+    database = await openBrowserState();
+    const transaction = database.transaction(browserStateStore, "readwrite");
+    const done = transactionDone(transaction);
+    transaction.objectStore(browserStateStore).delete(id);
+    await done;
+  } catch (_) {
+    // The ceremony is already terminal; storage cleanup is best effort.
+  } finally {
+    database?.close();
+  }
+}
 
 function concat(...parts) {
   const size = parts.reduce((n, part) => n + part.length, 0);
@@ -120,6 +249,7 @@ async function ensureNewCredentialPrf(session, credential, confirmPhase) {
 
 async function load() {
   await cryptoSelfTest();
+  await purgeExpiredBrowserState();
   if (token.length !== 43) {
     throw new Error("Invalid ceremony URL");
   }
@@ -140,16 +270,10 @@ async function load() {
   ].includes(
     session.ceremony_kind
   ) && !scopedPetalKey) {
-    const keyPair = await crypto.subtle.generateKey(
-      {name: "X25519"}, true, ["deriveBits"]
-    );
-    const publicKey = new Uint8Array(
-      await crypto.subtle.exportKey("raw", keyPair.publicKey)
-    );
+    outputRecipient = await outputRecipientFor(session);
     session = await mutate(`/api/session/${ceremonyId}/output-key`, {
-      recipient_key: encodeUrl(publicKey)
+      recipient_key: encodeUrl(outputRecipient.publicKey)
     });
-    outputRecipient = {privateKey: keyPair.privateKey, publicKey};
   }
   statusNode.textContent = "Review every item before continuing.";
   const pre = document.createElement("pre");
@@ -175,7 +299,18 @@ async function load() {
   }
   approve.disabled = false;
   approve.onclick = () => run(session);
-  cancel.onclick = () => mutate(`/api/session/${ceremonyId}/cancel`, {});
+  cancel.onclick = async () => {
+    cancel.disabled = true;
+    try {
+      await mutate(`/api/session/${ceremonyId}/cancel`, {});
+      await clearBrowserState(ceremonyId);
+      statusNode.textContent = "Cancelled. You may close this tab.";
+      approve.disabled = true;
+    } catch (error) {
+      cancel.disabled = false;
+      statusNode.textContent = error instanceof Error ? error.message : "Cancellation failed";
+    }
+  };
 }
 
 function fromHex(value) {
@@ -365,6 +500,7 @@ async function run(session) {
   } else {
     reviewNode.textContent = result.receipt_digest || result.approval_id || "";
   }
+  await clearBrowserState(ceremonyId);
 }
 
 function canonicalJson(value) {
@@ -409,7 +545,14 @@ async function mutate(url, body) {
     headers: {...authHeaders, "content-type": "application/json"},
     body: JSON.stringify(body)
   });
-  if (!response.ok) throw new Error("Ceremony request failed");
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const failure = await response.json();
+      detail = typeof failure?.message === "string" ? failure.message : "";
+    } catch (_) {}
+    throw new Error(detail || `Ceremony request failed (${response.status})`);
+  }
   return response.status === 204 ? null : response.json();
 }
 
