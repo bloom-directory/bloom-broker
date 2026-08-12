@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::{Base64UrlBytes, Digest32, ProtocolError, ProtocolErrorCode, Token};
+use crate::{
+    Base64UrlBytes, DecimalU64, Digest32, ProtocolError, ProtocolErrorCode, Token,
+    validate_lineage_id,
+};
 
 pub const PROVENANCE_RECORD_SIGNATURE_DOMAIN: &[u8] = b"bloom-provenance-record/v1";
 pub const PROVENANCE_CATALOG_SCHEMA: &str = "bloom.provenance-catalog.1";
@@ -36,9 +39,24 @@ pub enum ProvenanceSubject {
 pub struct ProvenanceRecord {
     pub subject: ProvenanceSubject,
     pub publisher: Token,
+    /// Installer-verified publisher/controller assertion that this package is
+    /// the currently active member of a stable Petal lineage.
+    #[serde(default)]
+    pub petal_lineage: Option<PetalLineageMembership>,
     pub operation_classes: Vec<ProvenanceOperationClass>,
     pub installer_key_id: Token,
     pub installer_signature: Base64UrlBytes,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PetalLineageMembership {
+    pub lineage_id: String,
+    pub release_sequence: DecimalU64,
+    pub predecessor_package_hashes: Vec<Digest32>,
+    pub controller_key_id: Token,
+    pub controller_signature: Base64UrlBytes,
+    pub active: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -110,6 +128,45 @@ impl ProvenanceCatalog {
                     "provenance catalog contains a duplicate subject or empty operation class",
                 ));
             }
+            match (&record.subject, &record.petal_lineage) {
+                (ProvenanceSubject::Petal { .. }, Some(membership)) => {
+                    validate_lineage_id(&membership.lineage_id)?;
+                    if membership.release_sequence.get() == 0
+                        || membership.controller_signature.decode().is_empty()
+                    {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::ProvenanceMismatch,
+                            "Petal lineage membership requires a positive release sequence and controller signature",
+                        ));
+                    }
+                }
+                (ProvenanceSubject::Petal { .. }, None) => {}
+                (_, Some(_)) => {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ProvenanceMismatch,
+                        "only Petal provenance may carry lineage membership",
+                    ));
+                }
+                (_, None) => {}
+            }
+        }
+        let mut active_lineages = std::collections::HashMap::new();
+        for record in &self.records {
+            let (ProvenanceSubject::Petal { package_hash, .. }, Some(membership)) =
+                (&record.subject, &record.petal_lineage)
+            else {
+                continue;
+            };
+            if membership.active {
+                if let Some(existing) = active_lineages.insert(&membership.lineage_id, package_hash)
+                    && existing != package_hash
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ProvenanceMismatch,
+                        "a Petal lineage has multiple active packages",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -129,6 +186,7 @@ mod tests {
         ProvenanceRecord {
             subject,
             publisher: Token::new("bloom-installer").unwrap(),
+            petal_lineage: None,
             operation_classes: vec![ProvenanceOperationClass {
                 operation_class: Token::new("transaction.confirm").unwrap(),
                 fee_asset: None,

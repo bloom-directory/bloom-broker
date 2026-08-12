@@ -11,8 +11,10 @@ fn petal_scope_to_signer(value: north::PetalKeyScope) -> south::PetalKeyScope {
         parent_key_ref: key::key_ref_to_signer(value.parent_key_ref),
         package_hash: value.package_hash,
         route: value.route,
-        agent_id: value.agent_id,
-        purpose: value.purpose,
+        lineage_id: value.lineage_id,
+        key_slot: value.key_slot,
+        allowed_routes: value.allowed_routes,
+        allowed_operation_classes: value.allowed_operation_classes,
         allowed_crypto_suites: value
             .allowed_crypto_suites
             .into_iter()
@@ -119,8 +121,10 @@ mod tests {
             parent_key_ref: north_key("parent-2", 3),
             package_hash: digest(4),
             route: "/route-5".into(),
-            agent_id: Some("agent-6".into()),
-            purpose: north::Token::new("purpose-7").unwrap(),
+            lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            key_slot: north::Token::new("agent-6").unwrap(),
+            allowed_routes: vec!["/route-5".into(), "/route-6".into()],
+            allowed_operation_classes: vec![north::Token::new("purpose-7").unwrap()],
             allowed_crypto_suites: vec![north::CryptoSuite::Secp256k1Sha256Recoverable],
             maximum_lifetime_ms: north::DecimalU64::new(8),
             custody_operation_id: operation(9),
@@ -130,7 +134,7 @@ mod tests {
             custody_operation_id: operation(9),
             wallet_id: Some(north::Token::new("wallet-1").unwrap()),
             key_ref: Some(north_key("parent-2", 3)),
-            exact_terms_digest: scope.digest().unwrap(),
+            exact_terms_digest: scope.request_digest().unwrap(),
             expected_input_class: north::Token::new("scope-10").unwrap(),
             browser_output_recipient_key: None,
             petal_key_scope: Some(scope),
@@ -157,7 +161,10 @@ mod tests {
         assert_eq!(mapped.custody_operation_id, operation(9));
         assert_eq!(mapped.wallet_id.unwrap().as_str(), "wallet-1");
         assert_eq!(mapped.key_ref.unwrap().locator, "parent-2");
-        assert_eq!(mapped.exact_terms_digest, mapped_scope.digest().unwrap());
+        assert_eq!(
+            mapped.exact_terms_digest,
+            mapped_scope.request_digest().unwrap()
+        );
         assert_eq!(mapped.expected_input_class.as_str(), "scope-10");
         assert_eq!(mapped_scope.package_hash, digest(4));
         assert_eq!(
@@ -165,8 +172,12 @@ mod tests {
             digest(3)
         );
         assert_eq!(mapped_scope.route, "/route-5");
-        assert_eq!(mapped_scope.agent_id.as_deref(), Some("agent-6"));
-        assert_eq!(mapped_scope.purpose.as_str(), "purpose-7");
+        assert_eq!(mapped_scope.key_slot.as_str(), "agent-6");
+        assert_eq!(mapped_scope.allowed_routes, ["/route-5", "/route-6"]);
+        assert_eq!(
+            mapped_scope.allowed_operation_classes[0].as_str(),
+            "purpose-7"
+        );
         assert_eq!(mapped_scope.maximum_lifetime_ms.get(), 8);
         assert_eq!(
             mapped_scope.allowed_crypto_suites,

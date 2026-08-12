@@ -256,7 +256,7 @@ impl CustodyPrepareRequest {
                 "Petal key scope parent KeyRef does not match the custody request",
             ));
         }
-        if self.exact_terms_digest != scope.digest()? {
+        if self.exact_terms_digest != scope.request_digest()? {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::OperationIdConflict,
                 "key-derive exact terms digest does not match the Petal key scope",

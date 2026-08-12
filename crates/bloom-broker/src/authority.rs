@@ -822,12 +822,6 @@ impl BrokerAuthority {
             .validate()
             .map_err(|error| denied("PETAL_KEY_SCOPE_INVALID", error.to_string()))?;
         let (_snapshot, policy) = self.current_policy(&scope.wallet_id)?;
-        if !policy.allowed_petal_packages.contains(&scope.package_hash) {
-            return Err(denied(
-                "PROVENANCE_MISMATCH",
-                "wallet policy does not permit this Petal package",
-            ));
-        }
         if scope.maximum_lifetime_ms.get() > policy.maximum_approval_lifetime_ms {
             return Err(denied(
                 "POLICY_LIFETIME_EXCEEDED",
@@ -847,14 +841,43 @@ impl BrokerAuthority {
             &self.installer_key,
             &record_digest,
         )?;
-        if !record
-            .operation_classes
-            .iter()
-            .any(|declared| declared.operation_class == scope.purpose)
+        let lineage = record.petal_lineage.as_ref().ok_or_else(|| {
+            denied(
+                "PROVENANCE_LINEAGE_MISSING",
+                "Petal package has no installer-verified lineage membership",
+            )
+        })?;
+        if !lineage.active || lineage.lineage_id != scope.lineage_id {
+            return Err(denied(
+                "PROVENANCE_LINEAGE_MISMATCH",
+                "Petal package is not the active member of the requested lineage",
+            ));
+        }
+        if !policy.allowed_petal_packages.contains(&scope.package_hash)
+            && !lineage
+                .predecessor_package_hashes
+                .iter()
+                .any(|predecessor| policy.allowed_petal_packages.contains(predecessor))
+        {
+            return Err(denied(
+                "PROVENANCE_MISMATCH",
+                "wallet policy permits neither this Petal package nor a signed predecessor",
+            ));
+        }
+        if !scope.allowed_routes.contains(&scope.route)
+            || scope
+                .allowed_operation_classes
+                .iter()
+                .any(|operation_class| {
+                    !record
+                        .operation_classes
+                        .iter()
+                        .any(|declared| &declared.operation_class == operation_class)
+                })
         {
             return Err(denied(
                 "PROVENANCE_CLASS_MISMATCH",
-                "Petal key purpose is absent from installer-signed provenance",
+                "Petal key routes or operation classes exceed installer-signed provenance",
             ));
         }
 
@@ -1030,9 +1053,8 @@ impl BrokerAuthority {
         let identity_matches = matches!(
             &terms.subject,
             ApprovalSubject::Petal { package_hash, route, agent_id }
-                if package_hash == &scope.package_hash
-                    && route == &scope.route
-                    && agent_id == &scope.agent_id
+                if scope.allowed_routes.contains(route)
+                    && agent_id.as_deref().is_none_or(|agent| agent == scope.key_slot.as_str())
         );
         if !identity_matches
             || terms.wallet_id != scope.wallet_id
@@ -1044,7 +1066,9 @@ impl BrokerAuthority {
             || matches!(
                 &terms.selector,
                 ApprovalSelector::Petal { allowed_operation_classes, .. }
-                    if allowed_operation_classes.iter().any(|class| class != &scope.purpose)
+                    if allowed_operation_classes.iter().any(|class| {
+                        !scope.allowed_operation_classes.contains(class)
+                    })
             )
         {
             return Err(denied(
@@ -1052,18 +1076,35 @@ impl BrokerAuthority {
                 "approval exceeds or changes the derived Petal key scope",
             ));
         }
+        let (package_hash, route) = match &terms.subject {
+            ApprovalSubject::Petal {
+                package_hash,
+                route,
+                ..
+            } => (package_hash, route),
+            _ => unreachable!("identity_matches requires a Petal subject"),
+        };
         let provenance = self.catalog_provenance(&ProvenanceSubject::Petal {
-            package_hash: scope.package_hash,
-            route: scope.route,
+            package_hash: package_hash.clone(),
+            route: route.clone(),
         })?;
-        if !provenance
-            .operation_classes
-            .iter()
-            .any(|declared| declared.operation_class == scope.purpose)
+        let active_lineage = provenance.petal_lineage.as_ref().is_some_and(|membership| {
+            membership.active && membership.lineage_id == scope.lineage_id
+        });
+        if !active_lineage
+            || scope
+                .allowed_operation_classes
+                .iter()
+                .any(|operation_class| {
+                    !provenance
+                        .operation_classes
+                        .iter()
+                        .any(|declared| &declared.operation_class == operation_class)
+                })
         {
             return Err(denied(
-                "PROVENANCE_CLASS_MISMATCH",
-                "current installer provenance no longer declares the Petal key purpose",
+                "PROVENANCE_LINEAGE_MISMATCH",
+                "current package is not an active authorized member of the key lineage",
             ));
         }
         Ok(())
