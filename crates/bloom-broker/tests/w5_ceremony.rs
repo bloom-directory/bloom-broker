@@ -20,10 +20,11 @@ use bloom_broker_api::{
     ClaimAssuranceLevel, CryptoSuite, CustodyPrepareResponse, DecimalU64, DeclaredFee, Digest32,
     KeyRef, KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
     MachineSignRequest, OperationId, OperationRequest, PROVENANCE_RECORD_SIGNATURE_DOMAIN,
-    PetalKeyScope, PetalUseClaim, PolicyCommitUpdateRequest, PolicyDestination,
-    PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceOperationClass,
-    ProvenanceRecord, ProvenanceSubject, RequestNonce, RevokeRequest, SealedApprovalTerms,
-    SignedJournalHead, SignedPolicySnapshot, SigningPayloads, Token, WalletRequest,
+    PetalKeyScope, PetalLineageMembership, PetalUseClaim, PolicyCommitUpdateRequest,
+    PolicyDestination, PolicyUpdateRequest, ProtocolError, ProtocolErrorCode,
+    ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject, RequestNonce, RevokeRequest,
+    SealedApprovalTerms, SignedJournalHead, SignedPolicySnapshot, SigningPayloads, Token,
+    WalletRequest,
 };
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer::{
@@ -699,8 +700,10 @@ fn petal_scope_to_signer(value: &PetalKeyScope) -> bloom_signer_api::PetalKeySco
         parent_key_ref: key_to_signer(&value.parent_key_ref),
         package_hash: value.package_hash.clone(),
         route: value.route.clone(),
-        agent_id: value.agent_id.clone(),
-        purpose: value.purpose.clone(),
+        lineage_id: value.lineage_id.clone(),
+        key_slot: value.key_slot.clone(),
+        allowed_routes: value.allowed_routes.clone(),
+        allowed_operation_classes: value.allowed_operation_classes.clone(),
         allowed_crypto_suites: value
             .allowed_crypto_suites
             .iter()
@@ -1672,6 +1675,14 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             route: petal_route.into(),
         },
         publisher: Token::new("fixture-publisher").unwrap(),
+        petal_lineage: Some(PetalLineageMembership {
+            lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            release_sequence: DecimalU64::new(1),
+            predecessor_package_hashes: vec![],
+            controller_key_id: Token::new("controller-key").unwrap(),
+            controller_signature: Base64UrlBytes::from_bytes(&[1]),
+            active: true,
+        }),
         operation_classes: vec![ProvenanceOperationClass {
             operation_class: Token::new("exchange-order").unwrap(),
             fee_asset: None,
@@ -1684,14 +1695,17 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
 
     let parent_key = machine_registration_result.public_key_refs[0].clone();
     let derive_operation = operation("d2");
-    let scope_lifetime_ms = 5_000;
+    let scope_lifetime_ms = 60_000;
+    let approval_lifetime_ms = 30_000;
     let scope = PetalKeyScope {
         wallet_id: wallet_id.clone(),
         parent_key_ref: parent_key.clone(),
         package_hash: petal_package.clone(),
         route: petal_route.into(),
-        agent_id: Some("fixture-instance".into()),
-        purpose: Token::new("exchange-order").unwrap(),
+        lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        key_slot: Token::new("fixture-instance").unwrap(),
+        allowed_routes: vec![petal_route.into()],
+        allowed_operation_classes: vec![Token::new("exchange-order").unwrap()],
         allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
         maximum_lifetime_ms: DecimalU64::new(scope_lifetime_ms),
         custody_operation_id: derive_operation.clone(),
@@ -1703,7 +1717,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             custody_operation_id: derive_operation.clone(),
             wallet_id: Some(wallet_id.clone()),
             key_ref: Some(parent_key.clone()),
-            exact_terms_digest: scope.digest().unwrap(),
+            exact_terms_digest: scope.request_digest().unwrap(),
             expected_input_class: Token::new("petal-key-scope-v1").unwrap(),
             browser_output_recipient_key: None,
             petal_key_scope: Some(scope.clone()),
@@ -1795,7 +1809,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                     serde_json::to_vec(&serde_json::json!({
                         "proof": {"kind": "assertion", "assertion": derive_assertion},
                         "encrypted_input": derive_encrypted,
-                        "public_binding_digest": scope.digest().unwrap()
+                        "public_binding_digest": scope.request_digest().unwrap()
                     }))
                     .unwrap(),
                 ))
@@ -1837,12 +1851,12 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .as_millis()
         .try_into()
         .unwrap();
-    let approval_expires_at_ms = scope_started_ms + scope_lifetime_ms;
+    let approval_expires_at_ms = scope_started_ms + approval_lifetime_ms;
     let approval_terms = SealedApprovalTerms {
         subject: ApprovalSubject::Petal {
             package_hash: petal_package.clone(),
             route: petal_route.into(),
-            agent_id: scope.agent_id.clone(),
+            agent_id: Some(scope.key_slot.as_str().into()),
         },
         wallet_id: wallet_id.clone(),
         key_ref: custody_result_to_machine(&derive_result).public_key_refs[0].clone(),
@@ -1850,7 +1864,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         selector: ApprovalSelector::Petal {
             package_hash: petal_package.clone(),
             route: petal_route.into(),
-            allowed_operation_classes: vec![scope.purpose.clone()],
+            allowed_operation_classes: scope.allowed_operation_classes.clone(),
             required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
         },
         limits: ApprovalLimits {
@@ -1992,6 +2006,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let exact_payload = b"fixture-exact-petal-action";
     let exact_payload_digest = Digest32::from_bytes(sha2::Sha256::digest(exact_payload).into());
     let mut exact_terms = approval_terms.clone();
+    exact_terms.expires_at_ms = DecimalU64::new(scope_started_ms + scope_lifetime_ms);
     exact_terms.selector = ApprovalSelector::Exact {
         ordered_payload_digests: vec![exact_payload_digest.clone()],
         ordered_hashes: vec![exact_payload_digest],
@@ -2098,16 +2113,21 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         )
         .await
         .unwrap();
-    assert_eq!(exact_complete_response.status(), StatusCode::OK);
-    let exact_receipt: SignerActivationReceipt = serde_json::from_slice(
-        &exact_complete_response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .unwrap();
+    let exact_complete_status = exact_complete_response.status();
+    let exact_complete_body = exact_complete_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(
+        exact_complete_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&exact_complete_body)
+    );
+    let exact_receipt: SignerActivationReceipt =
+        serde_json::from_slice(&exact_complete_body).unwrap();
     assert_eq!(
         exact_receipt.approval_id,
         exact_terms.approval_id().unwrap()
@@ -2159,7 +2179,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             terms.subject = ApprovalSubject::Petal {
                 package_hash: digest("c1"),
                 route: petal_route.into(),
-                agent_id: scope.agent_id.clone(),
+                agent_id: Some(scope.key_slot.as_str().into()),
             };
             if let ApprovalSelector::Petal { package_hash, .. } = &mut terms.selector {
                 *package_hash = digest("c1");
@@ -2172,7 +2192,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             terms.subject = ApprovalSubject::Petal {
                 package_hash: petal_package.clone(),
                 route: route.into(),
-                agent_id: scope.agent_id.clone(),
+                agent_id: Some(scope.key_slot.as_str().into()),
             };
             if let ApprovalSelector::Petal {
                 route: selector_route,
@@ -2968,8 +2988,10 @@ async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() 
         parent_key_ref: parent.clone(),
         package_hash: digest("91"),
         route: "/petals/exchange/sign".into(),
-        agent_id: Some("account-a".into()),
-        purpose: Token::new("exchange-order").unwrap(),
+        lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        key_slot: Token::new("account-a").unwrap(),
+        allowed_routes: vec!["/petals/exchange/sign".into()],
+        allowed_operation_classes: vec![Token::new("exchange-order").unwrap()],
         allowed_crypto_suites: vec![bloom_signer_api::CryptoSuite::Secp256k1Sha256Recoverable],
         maximum_lifetime_ms: DecimalU64::new(60_000),
         custody_operation_id: operation("92"),
@@ -2979,7 +3001,7 @@ async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() 
         custody_operation_id: scope.custody_operation_id.clone(),
         wallet_id: Some(scope.wallet_id.clone()),
         key_ref: Some(parent),
-        exact_terms_digest: scope.digest().unwrap(),
+        exact_terms_digest: scope.request_digest().unwrap(),
         expected_input_class: Token::new("petal-key-scope-v1").unwrap(),
         browser_output_recipient_key: None,
         petal_key_scope: Some(scope.clone()),
