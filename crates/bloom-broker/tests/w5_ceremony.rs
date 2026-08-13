@@ -261,6 +261,65 @@ process.stdout.write("browser-reload-ok");
 }
 
 #[test]
+fn browser_approval_failure_is_logged_displayed_and_retryable() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+globalThis.crypto = require("node:crypto").webcrypto;
+const elements = new Map();
+globalThis.document = {{getElementById: id => {{
+  if (!elements.has(id)) elements.set(id, {{disabled: true}});
+  return elements.get(id);
+}}}};
+globalThis.location = {{pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+const logged = [];
+globalThis.console = {{error: (...args) => logged.push(args)}};
+{executable}
+const failure = new Error("Signer rejected completion");
+reportApprovalFailure(failure);
+if (statusNode.textContent !== "Passkey verification failed. Please try again.") {{
+  throw new Error(`failure was not displayed: ${{statusNode.textContent}}`);
+}}
+if (approve.disabled) throw new Error("approval retry was not enabled");
+if (logged.length !== 1 || logged[0][0] !== "Bloom ceremony failed" ||
+    logged[0][1] !== failure) {{
+  throw new Error("full ceremony failure was not logged");
+}}
+const cancellationFailure = new Error("internal cancellation detail");
+reportCeremonyError(cancellationFailure, "Cancellation failed. Please try again.");
+if (statusNode.textContent !== "Cancellation failed. Please try again.") {{
+  throw new Error("safe cancellation failure was not displayed");
+}}
+if (logged.length !== 2 || logged[1][1] !== cancellationFailure) {{
+  throw new Error("full cancellation failure was not logged");
+}}
+process.stdout.write("browser-error-feedback-ok");
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate ceremony error feedback");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "browser-error-feedback-ok"
+    );
+    assert!(asset.contains("approve.onclick = () => run(session).catch(reportApprovalFailure)"));
+    assert!(asset.contains("Cancellation failed. Please try again."));
+    assert!(asset.contains("Ceremony failed to load. Please refresh and try again."));
+}
+
+#[test]
 fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
     let shell = include_str!("../src/ceremony_assets/index.html");
     for required in [
