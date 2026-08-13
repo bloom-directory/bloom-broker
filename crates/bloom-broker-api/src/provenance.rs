@@ -157,15 +157,14 @@ impl ProvenanceCatalog {
             else {
                 continue;
             };
-            if membership.active {
-                if let Some(existing) = active_lineages.insert(&membership.lineage_id, package_hash)
-                    && existing != package_hash
-                {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::ProvenanceMismatch,
-                        "a Petal lineage has multiple active packages",
-                    ));
-                }
+            if membership.active
+                && let Some(existing) = active_lineages.insert(&membership.lineage_id, package_hash)
+                && existing != package_hash
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::ProvenanceMismatch,
+                    "a Petal lineage has multiple active packages",
+                ));
             }
         }
         Ok(())

@@ -12,9 +12,9 @@ use bloom_broker_api::{
     Base64UrlBytes, BootEpoch, CeremonyKind, CeremonyState, ClaimAssurance, ClaimAssuranceLevel,
     CryptoSuite, CustodyResult, DecimalU64, DecimalU256, DeclaredDebit, DeclaredDestination,
     DeclaredFee, Digest32, KeyRef, KeySpec, MachineSignRequest, OperationId,
-    PROVENANCE_CATALOG_SCHEMA, PetalKeyScope, PetalUseClaim, PolicyUpdateRequest,
-    ProvenanceCatalog, RequestNonce, RevocationState, SealedApprovalTerms, SignedPolicySnapshot,
-    SigningPayloads, Token, ValueLimit,
+    PROVENANCE_CATALOG_SCHEMA, PetalKeyScope, PetalLineageMembership, PetalUseClaim,
+    PolicyUpdateRequest, ProvenanceCatalog, RequestNonce, RevocationState, SealedApprovalTerms,
+    SignedPolicySnapshot, SigningPayloads, Token, ValueLimit,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
@@ -279,6 +279,14 @@ impl Harness {
                 route: "/sign".into(),
             },
             publisher: token("publisher"),
+            petal_lineage: Some(PetalLineageMembership {
+                lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                release_sequence: DecimalU64::new(1),
+                predecessor_package_hashes: vec![],
+                controller_key_id: token("controller-key"),
+                controller_signature: Base64UrlBytes::from_bytes(&[1]),
+                active: true,
+            }),
             operation_classes: vec![
                 ProvenanceOperationClass {
                     operation_class: token("transfer"),
@@ -311,6 +319,7 @@ impl Harness {
                 operation_class: token("sign"),
             },
             publisher: token("publisher"),
+            petal_lineage: None,
             operation_classes: vec![ProvenanceOperationClass {
                 operation_class: token("sign"),
                 fee_asset: None,
@@ -813,8 +822,10 @@ fn petal_scoped_key_is_frozen_to_installer_provenance_and_petal_approvals() {
         parent_key_ref: key_ref(),
         package_hash: digest(9),
         route: "/sign".into(),
-        agent_id: Some("advisory".into()),
-        purpose: token("transfer"),
+        lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        key_slot: token("advisory"),
+        allowed_routes: vec!["/sign".into()],
+        allowed_operation_classes: vec![token("transfer")],
         allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
         maximum_lifetime_ms: DecimalU64::new(10_000),
         custody_operation_id: operation(94),
@@ -837,7 +848,7 @@ fn petal_scoped_key_is_frozen_to_installer_provenance_and_petal_approvals() {
         .contains("PROVENANCE")
     );
     let mut undeclared = scope.clone();
-    undeclared.purpose = token("undeclared-purpose");
+    undeclared.allowed_operation_classes = vec![token("undeclared-purpose")];
     assert!(
         error_code(
             harness
