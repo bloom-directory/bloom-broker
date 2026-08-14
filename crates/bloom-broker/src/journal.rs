@@ -1902,7 +1902,7 @@ impl BrokerJournal {
             .map_err(|_| JournalError::Storage("journal mutex poisoned".into()))
     }
 
-    fn lock_for_mutation(&self) -> Result<MutexGuard<'_, Connection>, JournalError> {
+    pub(crate) fn lock_for_mutation(&self) -> Result<MutexGuard<'_, Connection>, JournalError> {
         if self.audit_degraded.load(Ordering::SeqCst) {
             return Err(audit_degraded());
         }
@@ -1918,17 +1918,17 @@ impl BrokerJournal {
         self.connection.clone()
     }
 
-    /// Verify the Broker audit journal before a caller mutates a separately
-    /// locked authority or ceremony database.
-    ///
-    /// The caller's connection must never be used for this verification: the
-    /// signed `audit_chain` lives in this journal's dedicated database.
-    pub(crate) fn verify_before_external_mutation(&self) -> Result<(), JournalError> {
+    /// Verify the already-locked journal target used during legacy migration.
+    /// Runtime mutations must obtain a verified guard through
+    /// `lock_for_mutation` instead.
+    pub(crate) fn verify_migration_target(
+        &self,
+        connection: &Connection,
+    ) -> Result<(), JournalError> {
         if self.audit_degraded.load(Ordering::SeqCst) {
             return Err(audit_degraded());
         }
-        let connection = self.lock()?;
-        if let Err(error) = verify_audit_chain_connection(&connection, self.audit_signer.as_ref()) {
+        if let Err(error) = verify_audit_chain_connection(connection, self.audit_signer.as_ref()) {
             self.audit_degraded.store(true, Ordering::SeqCst);
             return Err(error);
         }
