@@ -1592,9 +1592,7 @@ impl CeremonyBroker {
             .lock()
             .map_err(|_| storage("ceremony database mutex poisoned"))?;
         if let Some(journal) = &self.inner.journal {
-            journal
-                .verify_before_external_mutation(&database)
-                .map_err(storage)?;
+            journal.verify_before_external_mutation().map_err(storage)?;
         }
         let transaction = database.transaction().map_err(storage)?;
         transaction
@@ -2541,9 +2539,7 @@ fn migrate_legacy_ceremonies(
     target
         .execute("ATTACH DATABASE ?1 AS ceremony_legacy", [&legacy_path])
         .map_err(storage)?;
-    journal
-        .verify_before_external_mutation(target)
-        .map_err(storage)?;
+    journal.verify_before_external_mutation().map_err(storage)?;
     let migration = (|| -> Result<(), ProtocolError> {
         let transaction = target.transaction().map_err(storage)?;
         transaction

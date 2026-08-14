@@ -626,7 +626,7 @@ impl BrokerAuthority {
         }) {
             return Ok(());
         }
-        self.journal.verify_before_external_mutation(&connection)?;
+        self.journal.verify_before_external_mutation()?;
         let transaction = connection.transaction()?;
         let existing: Option<(u64, String)> = transaction
             .query_row(
@@ -751,7 +751,7 @@ impl BrokerAuthority {
                 ));
             }
             let mut connection = self.lock()?;
-            self.journal.verify_before_external_mutation(&connection)?;
+            self.journal.verify_before_external_mutation()?;
             let transaction = connection.transaction()?;
             let removed = transaction.execute(
                 "DELETE FROM policies WHERE wallet_id = ?1",
@@ -884,7 +884,7 @@ impl BrokerAuthority {
         let scope_digest = scope.digest().map_err(storage)?;
         let scope_jcs = serde_jcs::to_string(scope).map_err(storage)?;
         let mut connection = self.lock()?;
-        self.journal.verify_before_external_mutation(&connection)?;
+        self.journal.verify_before_external_mutation()?;
         let transaction = connection.transaction()?;
         let existing = transaction
             .query_row(
@@ -933,7 +933,7 @@ impl BrokerAuthority {
         now_ms: u64,
     ) -> Result<(), AuthorityError> {
         let mut connection = self.lock()?;
-        self.journal.verify_before_external_mutation(&connection)?;
+        self.journal.verify_before_external_mutation()?;
         let transaction = connection.transaction()?;
         let pending = transaction
             .query_row(
@@ -1250,7 +1250,7 @@ impl BrokerAuthority {
         let subject_jcs = serde_jcs::to_string(&record.subject).map_err(storage)?;
         let record_jcs = serde_jcs::to_string(record).map_err(storage)?;
         let mut connection = self.lock()?;
-        self.journal.verify_before_external_mutation(&connection)?;
+        self.journal.verify_before_external_mutation()?;
         let transaction = connection.transaction()?;
         transaction.execute(
             "INSERT INTO provenance_catalog(subject_jcs, record_digest, record_jcs)
@@ -1297,7 +1297,7 @@ impl BrokerAuthority {
         }
 
         let mut connection = self.lock()?;
-        self.journal.verify_before_external_mutation(&connection)?;
+        self.journal.verify_before_external_mutation()?;
         let transaction = connection.transaction()?;
         transaction.execute("DELETE FROM provenance_catalog", [])?;
         for (subject_jcs, record_digest, record_jcs) in verified {
@@ -1979,7 +1979,7 @@ impl BrokerAuthority {
             return Err(denied("QUOTA_INVALID", "quota bounds must be positive"));
         }
         let mut connection = self.lock()?;
-        self.journal.verify_before_external_mutation(&connection)?;
+        self.journal.verify_before_external_mutation()?;
         let transaction = connection.transaction()?;
         let current: Option<(u64, u64)> = transaction
             .query_row(
@@ -2129,7 +2129,7 @@ impl BrokerAuthority {
         outcome: &str,
     ) -> Result<(), AuthorityError> {
         let mut connection = self.lock()?;
-        self.journal.verify_before_external_mutation(&connection)?;
+        self.journal.verify_before_external_mutation()?;
         let transaction = connection.transaction()?;
         transaction.execute(
             "INSERT INTO wallet_epochs(wallet_id, epoch, reconciled) VALUES (?1, ?2, ?3)
@@ -2163,7 +2163,7 @@ impl BrokerAuthority {
         tombstones: &[ApprovalTombstone],
     ) -> Result<(), AuthorityError> {
         let mut connection = self.lock()?;
-        self.journal.verify_before_external_mutation(&connection)?;
+        self.journal.verify_before_external_mutation()?;
         let transaction = connection.transaction()?;
         let mut statement = transaction.prepare(
             "SELECT approval_id, tombstone_jcs FROM signer_approval_tombstones
@@ -2254,7 +2254,7 @@ impl BrokerAuthority {
             ));
         }
         let mut connection = self.lock()?;
-        self.journal.verify_before_external_mutation(&connection)?;
+        self.journal.verify_before_external_mutation()?;
         let transaction = connection.transaction()?;
         let current: u64 = transaction
             .query_row(
@@ -2494,7 +2494,7 @@ fn migrate_legacy_authority(
         return Ok(());
     }
     target.execute("ATTACH DATABASE ?1 AS authority_legacy", [&legacy_path])?;
-    journal.verify_before_external_mutation(target)?;
+    journal.verify_before_external_mutation()?;
     let migration = (|| -> Result<(), AuthorityError> {
         let transaction = target.transaction()?;
         transaction.execute_batch(

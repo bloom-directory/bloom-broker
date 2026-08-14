@@ -1918,14 +1918,17 @@ impl BrokerJournal {
         self.connection.clone()
     }
 
-    pub(crate) fn verify_before_external_mutation(
-        &self,
-        connection: &Connection,
-    ) -> Result<(), JournalError> {
+    /// Verify the Broker audit journal before a caller mutates a separately
+    /// locked authority or ceremony database.
+    ///
+    /// The caller's connection must never be used for this verification: the
+    /// signed `audit_chain` lives in this journal's dedicated database.
+    pub(crate) fn verify_before_external_mutation(&self) -> Result<(), JournalError> {
         if self.audit_degraded.load(Ordering::SeqCst) {
             return Err(audit_degraded());
         }
-        if let Err(error) = verify_audit_chain_connection(connection, self.audit_signer.as_ref()) {
+        let connection = self.lock()?;
+        if let Err(error) = verify_audit_chain_connection(&connection, self.audit_signer.as_ref()) {
             self.audit_degraded.store(true, Ordering::SeqCst);
             return Err(error);
         }
