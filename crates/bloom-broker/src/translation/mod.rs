@@ -9,3 +9,8 @@ pub(crate) mod policy;
 pub(crate) mod revocation;
 pub(crate) mod service;
 pub(crate) mod signing;
+// Wallet-account translation pairs are consumed by the child-allocation
+// ceremony and Machine projection integration that lands after this
+// contract commit; suppress dead-code until those call sites exist.
+#[allow(dead_code)]
+pub(crate) mod wallet_account;
