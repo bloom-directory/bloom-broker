@@ -109,7 +109,7 @@ pub(crate) fn public_key_encoding_to_machine(
 }
 
 /// Strictly parse canonical uncompressed secp256k1 SPKI DER (88 bytes).
-fn secp256k1_uncompressed_point(spki: &[u8]) -> Result<[u8; 65], north::ProtocolError> {
+pub(crate) fn secp256k1_uncompressed_point(spki: &[u8]) -> Result<[u8; 65], north::ProtocolError> {
     if spki.len() != 88 || spki[..SECP256K1_SPKI_PREFIX.len()] != SECP256K1_SPKI_PREFIX {
         return Err(invalid("public key is not canonical secp256k1 SPKI DER"));
     }
@@ -122,7 +122,7 @@ fn secp256k1_uncompressed_point(spki: &[u8]) -> Result<[u8; 65], north::Protocol
 }
 
 /// Strictly parse canonical Ed25519 SPKI DER (44 bytes).
-fn ed25519_raw_key(spki: &[u8]) -> Result<[u8; 32], north::ProtocolError> {
+pub(crate) fn ed25519_raw_key(spki: &[u8]) -> Result<[u8; 32], north::ProtocolError> {
     if spki.len() != 44 || spki[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX {
         return Err(invalid("public key is not canonical Ed25519 SPKI DER"));
     }
@@ -147,7 +147,7 @@ fn derive_solana_address(spki: &[u8]) -> Result<String, north::ProtocolError> {
     Ok(base58_encode(&key))
 }
 
-fn base58_encode(input: &[u8]) -> String {
+pub(crate) fn base58_encode(input: &[u8]) -> String {
     let mut digits: Vec<u8> = Vec::with_capacity(input.len() * 2);
     for &byte in input {
         let mut carry = u32::from(byte);
@@ -561,5 +561,45 @@ mod tests {
         assert_eq!(base58_encode(&[1]), "2");
         assert_eq!(base58_encode(&[255]), "5Q");
         assert_eq!(base58_encode(b"hello world"), "StV1DL6CwTryKyV");
+    }
+
+    /// Differential gate: the hand-rolled encoder must agree with the
+    /// independent `bs58` crate across edge shapes — empty input, every
+    /// leading-zero pattern up to a full all-zero Ed25519 key, and random
+    /// payloads of random lengths. Self-consistent vectors are not
+    /// sufficient evidence for a hand-rolled encoder.
+    #[test]
+    fn base58_differentials_against_independent_bs58() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let mut cases: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![0],
+            vec![0, 0],
+            vec![0, 0, 0],
+            vec![1],
+            vec![255],
+            b"hello world".to_vec(),
+            vec![0, 1, 2, 3, 250, 251, 252],
+            vec![7, 0, 1, 2],
+            [0u8; 32].to_vec(),
+            [[0u8; 31].as_slice(), &[7u8]].concat(),
+        ];
+        for _ in 0..512 {
+            let len = rng.gen_range(0..64);
+            cases.push((0..len).map(|_| rng.r#gen::<u8>()).collect());
+        }
+        for _ in 0..128 {
+            let zeros = rng.gen_range(0..12);
+            let tail: Vec<u8> = (0..rng.gen_range(0..40)).map(|_| rng.r#gen::<u8>()).collect();
+            cases.push([vec![0u8; zeros], tail].concat());
+        }
+        for case in &cases {
+            assert_eq!(
+                base58_encode(case),
+                bs58::encode(case).into_string(),
+                "encoder disagreement for input {case:?}"
+            );
+        }
     }
 }
