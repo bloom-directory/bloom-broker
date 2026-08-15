@@ -13,6 +13,7 @@ mod provenance;
 mod revocation;
 mod service;
 mod signing;
+mod wallet_account;
 
 pub use approval::*;
 pub use ceremony::*;
@@ -27,6 +28,7 @@ pub use provenance::*;
 pub use revocation::*;
 pub use service::*;
 pub use signing::*;
+pub use wallet_account::*;
 
 pub use bloom_rpc_wire::{
     AuthenticatedPeer, Base64UrlBytes, BootEpoch, DecimalU64, DecimalU256, Digest32, EnvelopeKind,
