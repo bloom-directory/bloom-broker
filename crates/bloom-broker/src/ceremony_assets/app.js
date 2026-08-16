@@ -33,6 +33,16 @@ function clearSessionToken() {
   catch (_) {}
 }
 
+function reportCeremonyError(error, fallback = "Ceremony failed") {
+  console.error("Bloom ceremony failed", error);
+  statusNode.textContent = fallback;
+}
+
+function reportApprovalFailure(error) {
+  reportCeremonyError(error, "Passkey verification failed. Please try again.");
+  approve.disabled = false;
+}
+
 const browserStateDatabase = "bloom-ceremony-browser-state-v1";
 const browserStateStore = "output-recipients";
 
@@ -298,7 +308,7 @@ async function load() {
       '{"namespace_id":"...","grant":{...},"authority_signature":"..."}';
   }
   approve.disabled = false;
-  approve.onclick = () => run(session);
+  approve.onclick = () => run(session).catch(reportApprovalFailure);
   cancel.onclick = async () => {
     cancel.disabled = true;
     try {
@@ -308,7 +318,7 @@ async function load() {
       approve.disabled = true;
     } catch (error) {
       cancel.disabled = false;
-      statusNode.textContent = error instanceof Error ? error.message : "Cancellation failed";
+      reportCeremonyError(error, "Cancellation failed. Please try again.");
     }
   };
 }
@@ -739,6 +749,6 @@ function chacha20Poly1305Open(key, nonce, aad, sealed) {
   return chachaXor(key, nonce, ciphertext);
 }
 
-load().catch(error => {
-  statusNode.textContent = error instanceof Error ? error.message : "Ceremony failed";
-});
+load().catch(error => reportCeremonyError(
+  error, "Ceremony failed to load. Please refresh and try again."
+));
