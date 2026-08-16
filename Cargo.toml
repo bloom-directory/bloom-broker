@@ -13,13 +13,13 @@ rust-version = "1.85"
 license = "MIT"
 
 [workspace.dependencies]
-bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "1a1d52376919fff4cb295207e67c54dff60c745d" }
-bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
-bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
-bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
-bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
-bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
+bloom-rpc-wire = { git = "https://github.com/violet-agent/bloom-service-runtime.git", rev = "18e9c5a8c2faed853a5d8c72e2b3a30500aea2d8" }
+bloom-signer-api = { git = "https://github.com/violet-agent/bloom-signer.git", rev = "fb2c33ee7bfaef0cd7d6ba1599fd2a6c4bd91e06" }
+bloom-triad-local-transport = { git = "https://github.com/violet-agent/bloom-service-runtime.git", rev = "18e9c5a8c2faed853a5d8c72e2b3a30500aea2d8" }
+bloom-audit-checkpoint = { git = "https://github.com/violet-agent/bloom-service-runtime.git", rev = "18e9c5a8c2faed853a5d8c72e2b3a30500aea2d8" }
+bloom-service-activation = { git = "https://github.com/violet-agent/bloom-service-runtime.git", rev = "18e9c5a8c2faed853a5d8c72e2b3a30500aea2d8" }
+bloom-trusted-time = { git = "https://github.com/violet-agent/bloom-service-runtime.git", rev = "18e9c5a8c2faed853a5d8c72e2b3a30500aea2d8" }
+bloom-platform-containment = { git = "https://github.com/violet-agent/bloom-service-runtime.git", rev = "18e9c5a8c2faed853a5d8c72e2b3a30500aea2d8" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
