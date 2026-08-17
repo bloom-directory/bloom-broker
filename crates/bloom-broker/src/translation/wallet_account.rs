@@ -400,7 +400,7 @@ mod tests {
 
     const EVM_MAINNET_CAIP2: &str = "eip155:1";
     const SOLANA_MAINNET_CAIP2: &str = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
-    const EVM_MAINNET_ADDRESS: &str = "0x9c3dbd6b89c0d331956e2036b6a49176250bc297";
+    const EVM_MAINNET_ADDRESS: &str = "0xf278cf59f82edcf871d630f28ecc8056f25c1cdb";
     const SOLANA_MAINNET_ADDRESS: &str = "3Cy3YNTFywCmxoxt8n7UH6hg6dLo5uACowX3CFceaSnx";
 
     fn evm_target() -> ChainProjectionTarget<'static> {
