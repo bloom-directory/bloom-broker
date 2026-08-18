@@ -3,6 +3,7 @@ members = [
   "crates/bloom-broker-api",
   "crates/bloom-broker",
   "crates/bloom-broker-debug-driver",
+  "crates/bloom-solana",
 ]
 resolver = "2"
 
@@ -16,7 +17,7 @@ license = "MIT"
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "19d0465d53b279e6e1c98bac533510a1e7eb8f44" }
 bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "8186e97ae7d98534ee768ef70ce088829473fe46" }
 bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "8186e97ae7d98534ee768ef70ce088829473fe46" }
-bloom-solana = { git = "https://github.com/bloom-directory/bloom.git", rev = "e7893983013d08d1b96667e6bfd2425c482cce19" }
+bloom-solana = { path = "crates/bloom-solana" }
 bs58 = "0.5"
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "19d0465d53b279e6e1c98bac533510a1e7eb8f44" }
 bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "19d0465d53b279e6e1c98bac533510a1e7eb8f44" }
