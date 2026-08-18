@@ -71,7 +71,16 @@ pub enum SignatureEncoding {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "scheme", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum DerivationRef {
-    Bip32Secp256k1 { root_key_id: Token, path: String },
+    Bip32Secp256k1 {
+        root_key_id: Token,
+        path: String,
+    },
+    /// A BIP-39 multi-curve derived child.
+    Bip39Multicurve {
+        wallet_seed_ref: Token,
+        profile: crate::DerivationProfile,
+        path: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

@@ -25,8 +25,8 @@ use sha3::Keccak256;
 /// Canonical SPKI DER prefix for an uncompressed secp256k1 public key
 /// (`id-ecPublicKey` / `secp256k1`, 65-byte `0x04 || x || y` point).
 const SECP256K1_SPKI_PREFIX: [u8; 23] = [
-    0x30, 0x56, 0x30, 0x10, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x05,
-    0x2b, 0x81, 0x04, 0x00, 0x0a, 0x03, 0x42, 0x00,
+    0x30, 0x56, 0x30, 0x10, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x05, 0x2b,
+    0x81, 0x04, 0x00, 0x0a, 0x03, 0x42, 0x00,
 ];
 
 /// Canonical SPKI DER prefix for a raw Ed25519 public key (RFC 8410
@@ -116,7 +116,9 @@ pub(crate) fn secp256k1_uncompressed_point(spki: &[u8]) -> Result<[u8; 65], nort
     let mut point = [0u8; 65];
     point.copy_from_slice(&spki[23..88]);
     if point[0] != 0x04 {
-        return Err(invalid("secp256k1 point must be uncompressed 0x04 || x || y"));
+        return Err(invalid(
+            "secp256k1 point must be uncompressed 0x04 || x || y",
+        ));
     }
     Ok(point)
 }
@@ -223,13 +225,19 @@ pub(crate) fn verify_chain_projection(
 ) -> Result<(), north::ProtocolError> {
     let (address, encoding) = recompute_address(profile, canonical_public_key)?;
     if projection.address != address {
-        return Err(invalid("chain projection address does not match the public key"));
+        return Err(invalid(
+            "chain projection address does not match the public key",
+        ));
     }
     if projection.address_encoding != encoding {
-        return Err(invalid("chain projection address encoding is wrong for the profile"));
+        return Err(invalid(
+            "chain projection address encoding is wrong for the profile",
+        ));
     }
     if projection.caip10 != format!("{}:{}", projection.caip2, address) {
-        return Err(invalid("caip10 must embed the exact caip2 and encoded address"));
+        return Err(invalid(
+            "caip10 must embed the exact caip2 and encoded address",
+        ));
     }
     projection.validate()
 }
@@ -368,6 +376,7 @@ mod tests {
                 vectors::BIP32_EVM_TERMINAL_PUBLIC_KEY_FINGERPRINT_HEX,
             ),
             supported_crypto_suites: vec![south::CryptoSuite::Secp256k1Keccak256Recoverable],
+            lifecycle: south::AccountLifecycleState::Active,
         }
     }
 
@@ -395,6 +404,7 @@ mod tests {
                 vectors::SLIP10_SOLANA_TERMINAL_PUBLIC_KEY_FINGERPRINT_HEX,
             ),
             supported_crypto_suites: vec![south::CryptoSuite::Ed25519Message],
+            lifecycle: south::AccountLifecycleState::Active,
         }
     }
 
@@ -496,39 +506,43 @@ mod tests {
             EVM_MAINNET_CAIP2,
         )
         .unwrap();
-        assert!(verify_chain_projection(
-            &good,
-            south::DerivationProfile::Bip44EvmSecp256k1V1,
-            &key
-        )
-        .is_ok());
+        assert!(
+            verify_chain_projection(&good, south::DerivationProfile::Bip44EvmSecp256k1V1, &key)
+                .is_ok()
+        );
 
         let mut tampered_address = good.clone();
         tampered_address.address = "0x0000000000000000000000000000000000000000".into();
-        assert!(verify_chain_projection(
-            &tampered_address,
-            south::DerivationProfile::Bip44EvmSecp256k1V1,
-            &key
-        )
-        .is_err());
+        assert!(
+            verify_chain_projection(
+                &tampered_address,
+                south::DerivationProfile::Bip44EvmSecp256k1V1,
+                &key
+            )
+            .is_err()
+        );
 
         let mut tampered_caip10 = good.clone();
         tampered_caip10.caip10 = format!("eip155:137:{}", tampered_caip10.address);
-        assert!(verify_chain_projection(
-            &tampered_caip10,
-            south::DerivationProfile::Bip44EvmSecp256k1V1,
-            &key
-        )
-        .is_err());
+        assert!(
+            verify_chain_projection(
+                &tampered_caip10,
+                south::DerivationProfile::Bip44EvmSecp256k1V1,
+                &key
+            )
+            .is_err()
+        );
 
         let mut wrong_encoding = good.clone();
         wrong_encoding.address_encoding = north::AddressEncoding::Base58;
-        assert!(verify_chain_projection(
-            &wrong_encoding,
-            south::DerivationProfile::Bip44EvmSecp256k1V1,
-            &key
-        )
-        .is_err());
+        assert!(
+            verify_chain_projection(
+                &wrong_encoding,
+                south::DerivationProfile::Bip44EvmSecp256k1V1,
+                &key
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -591,7 +605,9 @@ mod tests {
         }
         for _ in 0..128 {
             let zeros = rng.gen_range(0..12);
-            let tail: Vec<u8> = (0..rng.gen_range(0..40)).map(|_| rng.r#gen::<u8>()).collect();
+            let tail: Vec<u8> = (0..rng.gen_range(0..40))
+                .map(|_| rng.r#gen::<u8>())
+                .collect();
             cases.push([vec![0u8; zeros], tail].concat());
         }
         for case in &cases {

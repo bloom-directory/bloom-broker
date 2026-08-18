@@ -55,6 +55,22 @@ pub(crate) fn prepare_to_signer(
         legacy_passkey_migration: value
             .legacy_passkey_migration
             .map(legacy_migration_to_signer),
+        wallet_seed_profile: value.wallet_seed_profile.map(seed_profile_to_signer),
+        derivation_request: value.derivation_request.map(derived_request_to_signer),
+    }
+}
+
+fn seed_profile_to_signer(value: north::WalletSeedProfile) -> south::WalletSeedProfile {
+    match value {
+        north::WalletSeedProfile::Bip39MulticurveV1 => south::WalletSeedProfile::Bip39MulticurveV1,
+    }
+}
+
+fn derived_request_to_signer(value: north::DerivedAccountRequest) -> south::DerivedAccountRequest {
+    south::DerivedAccountRequest {
+        derivation_profile: key::derivation_profile_to_signer(value.derivation_profile),
+        requested_role: value.requested_role,
+        account: value.account,
     }
 }
 
@@ -139,6 +155,8 @@ mod tests {
             browser_output_recipient_key: None,
             petal_key_scope: Some(scope),
             legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: None,
         };
         request.validate_petal_key_scope_binding().unwrap();
         let mut inconsistent = request.clone();
@@ -213,6 +231,8 @@ mod tests {
             browser_output_recipient_key: None,
             petal_key_scope: None,
             legacy_passkey_migration: Some(migration.clone()),
+            wallet_seed_profile: None,
+            derivation_request: None,
         };
         request.validate_legacy_passkey_migration_binding().unwrap();
         let mapped = prepare_to_signer(request);

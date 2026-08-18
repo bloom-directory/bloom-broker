@@ -19,6 +19,16 @@ pub enum WalletSeedProfile {
     Bip39MulticurveV1,
 }
 
+/// A requested derived-account allocation (AccountAllocate custody only).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivedAccountRequest {
+    pub derivation_profile: DerivationProfile,
+    pub requested_role: Token,
+    #[serde(default)]
+    pub account: Option<u32>,
+}
+
 /// Derivation profile mirrored for Machine presentation. The path template is
 /// frozen per profile and never changes silently.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -198,7 +208,9 @@ impl DerivedAccountPublic {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.key_ref.validate()?;
         if self.key_ref.key_spec != self.derivation_profile.key_spec() {
-            return Err(invalid("derivation profile curve does not match the KeyRef"));
+            return Err(invalid(
+                "derivation profile curve does not match the KeyRef",
+            ));
         }
         if self.public_key_encoding.key_spec() != self.key_ref.key_spec {
             return Err(invalid("public-key encoding does not match the KeyRef"));
@@ -352,7 +364,12 @@ mod tests {
         }
     }
 
-    fn projection(chain_family: &str, caip2: &str, caip10: &str, address: &str) -> ChainAccountProjection {
+    fn projection(
+        chain_family: &str,
+        caip2: &str,
+        caip10: &str,
+        address: &str,
+    ) -> ChainAccountProjection {
         ChainAccountProjection {
             chain_family: token(chain_family),
             caip2: caip2.into(),

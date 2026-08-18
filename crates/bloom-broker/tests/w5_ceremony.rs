@@ -615,6 +615,8 @@ fn custody_result_to_machine(value: &CustodyResult) -> bloom_broker_api::Custody
             CeremonyKind::CredentialRemove => bloom_broker_api::CeremonyKind::CredentialRemove,
             CeremonyKind::BackendEnrollment => bloom_broker_api::CeremonyKind::BackendEnrollment,
             CeremonyKind::KeyDerive => bloom_broker_api::CeremonyKind::KeyDerive,
+            CeremonyKind::AccountAllocate => bloom_broker_api::CeremonyKind::AccountAllocate,
+            CeremonyKind::AccountRetire => bloom_broker_api::CeremonyKind::AccountRetire,
             CeremonyKind::PolicyUpdate => bloom_broker_api::CeremonyKind::PolicyUpdate,
         }
     }
@@ -661,6 +663,22 @@ fn custody_result_to_machine(value: &CustodyResult) -> bloom_broker_api::Custody
                             path: path.clone(),
                         }
                     }
+                    bloom_signer_api::DerivationRef::Bip39Multicurve {
+                        wallet_seed_ref,
+                        profile,
+                        path,
+                    } => bloom_broker_api::DerivationRef::Bip39Multicurve {
+                        wallet_seed_ref: wallet_seed_ref.clone(),
+                        profile: match profile {
+                            bloom_signer_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
+                                bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1
+                            }
+                            bloom_signer_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+                                bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1
+                            }
+                        },
+                        path: path.clone(),
+                    },
                 }),
         }
     }
@@ -723,6 +741,22 @@ fn key_to_signer(value: &KeyRef) -> bloom_signer_api::KeyRef {
                         path: path.clone(),
                     }
                 }
+                bloom_broker_api::DerivationRef::Bip39Multicurve {
+                    wallet_seed_ref,
+                    profile,
+                    path,
+                } => bloom_signer_api::DerivationRef::Bip39Multicurve {
+                    wallet_seed_ref: wallet_seed_ref.clone(),
+                    profile: match profile {
+                        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
+                            bloom_signer_api::DerivationProfile::Bip44EvmSecp256k1V1
+                        }
+                        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+                            bloom_signer_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1
+                        }
+                    },
+                    path: path.clone(),
+                },
             }),
     }
 }
@@ -1184,6 +1218,8 @@ fn prepare(
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
             },
             now_ms,
         )
@@ -1377,6 +1413,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             browser_output_recipient_key: None,
             petal_key_scope: None,
             legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: None,
         }),
     )
     .await
@@ -1781,6 +1819,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             browser_output_recipient_key: None,
             petal_key_scope: Some(scope.clone()),
             legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: None,
         }),
     )
     .await
@@ -2856,6 +2896,8 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
             },
             1_001,
         )
@@ -2874,6 +2916,8 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_request: None,
                 },
                 1_001,
             )
@@ -2903,6 +2947,8 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_request: None,
                 },
                 1_101,
             )
@@ -2946,6 +2992,8 @@ async fn legacy_passkey_prepare_renders_only_digest_bound_public_migration_terms
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: Some(migration),
+                wallet_seed_profile: None,
+                derivation_request: None,
             },
             now_ms,
         )
@@ -3065,6 +3113,8 @@ async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() 
         browser_output_recipient_key: None,
         petal_key_scope: Some(scope.clone()),
         legacy_passkey_migration: None,
+        wallet_seed_profile: None,
+        derivation_request: None,
     };
     let now_ms: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3475,6 +3525,8 @@ fn ac18_forced_ceremony_audit_write_failure_rolls_back_session() {
         browser_output_recipient_key: None,
         petal_key_scope: None,
         legacy_passkey_migration: None,
+        wallet_seed_profile: None,
+        derivation_request: None,
     };
 
     fail.store(true, Ordering::SeqCst);
@@ -3527,6 +3579,8 @@ fn ac18_populated_ceremony_migration_is_atomic_idempotent_and_retains_source() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
             },
             50_000,
         )
@@ -3729,6 +3783,8 @@ fn ac18_ceremony_status_survives_latched_audit_tamper_while_new_sessions_fail() 
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_request: None,
                 },
                 41_001,
             )
@@ -3778,6 +3834,8 @@ fn restart_expires_nonterminal_session_and_persists_only_token_hash() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
             },
             50_001,
         )
@@ -3808,6 +3866,8 @@ fn rolling_creation_limits_survive_terminal_sessions_and_bound_anonymous_registr
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
             },
             355_000,
         )
@@ -3828,6 +3888,8 @@ fn rolling_creation_limits_survive_terminal_sessions_and_bound_anonymous_registr
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_request: None,
                 },
                 500_000 + u64::from(index),
             )
@@ -3849,6 +3911,8 @@ fn rolling_creation_limits_survive_terminal_sessions_and_bound_anonymous_registr
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_request: None,
                 },
                 500_010,
             )
@@ -3884,6 +3948,8 @@ fn cancellation_backoff_reports_remaining_cooldown_and_resets_after_expiry() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
             },
             10_001,
         )
@@ -3935,6 +4001,8 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_request: None,
                 },
                 100_000 + u64::from(index),
             )
@@ -3956,6 +4024,8 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_request: None,
                 },
                 100_010,
             )
@@ -4008,6 +4078,8 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
             },
             now_ms,
         )
@@ -4116,6 +4188,8 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
             },
             now_ms + 1_000,
         )
