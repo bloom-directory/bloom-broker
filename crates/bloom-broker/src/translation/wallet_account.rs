@@ -367,6 +367,7 @@ mod tests {
             wallet_seed_ref: south::WalletSeedRef {
                 wallet_id: south::Token::new("primary").unwrap(),
                 profile: south::WalletSeedProfile::Bip39MulticurveV1,
+                entropy_bits: 256,
             },
             derivation_profile: south::DerivationProfile::Bip44EvmSecp256k1V1,
             path: vectors::BIP32_EVM_PATH.into(),
@@ -395,6 +396,7 @@ mod tests {
             wallet_seed_ref: south::WalletSeedRef {
                 wallet_id: south::Token::new("primary").unwrap(),
                 profile: south::WalletSeedProfile::Bip39MulticurveV1,
+                entropy_bits: 256,
             },
             derivation_profile: south::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
             path: vectors::SLIP10_SOLANA_PATH.into(),
