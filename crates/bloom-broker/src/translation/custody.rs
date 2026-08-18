@@ -55,14 +55,38 @@ pub(crate) fn prepare_to_signer(
         legacy_passkey_migration: value
             .legacy_passkey_migration
             .map(legacy_migration_to_signer),
-        wallet_seed_profile: value.wallet_seed_profile.map(seed_profile_to_signer),
+        wallet_seed_profile: value
+            .wallet_seed_profile
+            .as_ref()
+            .map(seed_profile_to_signer),
         derivation_request: value.derivation_request.map(derived_request_to_signer),
     }
 }
 
-fn seed_profile_to_signer(value: north::WalletSeedProfile) -> south::WalletSeedProfile {
+/// Registration seed-profile selection: a brand-new wallet is always the
+/// interoperable BIP-39 multi-curve root when Machine omits the profile. Import
+/// is explicit — its two permanent profiles (mnemonic vs. raw key) are distinct
+/// and never defaulted. Other ceremonies never select a seed profile and pass
+/// through untouched.
+pub(crate) fn apply_seed_profile_selection(
+    value: &north::CustodyPrepareRequest,
+) -> north::CustodyPrepareRequest {
+    if value.ceremony_kind != north::CeremonyKind::WalletRegistration {
+        return value.clone();
+    }
+    let mut selected = value.clone();
+    if selected.wallet_seed_profile.is_none() {
+        selected.wallet_seed_profile = Some(north::WalletSeedProfile::Bip39MulticurveV1);
+    }
+    selected
+}
+
+fn seed_profile_to_signer(value: &north::WalletSeedProfile) -> south::WalletSeedProfile {
     match value {
         north::WalletSeedProfile::Bip39MulticurveV1 => south::WalletSeedProfile::Bip39MulticurveV1,
+        north::WalletSeedProfile::ImportedSecp256k1Scalar => {
+            south::WalletSeedProfile::ImportedSecp256k1Scalar
+        }
     }
 }
 
@@ -111,6 +135,73 @@ pub(crate) fn result_to_machine(value: south::CustodyResult) -> north::CustodyRe
 mod tests {
     use super::*;
 
+    #[test]
+    fn registration_seed_profile_defaults_to_bip39_and_import_stays_explicit() {
+        let mut registration = registration_request();
+        let defaulted = apply_seed_profile_selection(&registration);
+        assert_eq!(
+            defaulted.wallet_seed_profile,
+            Some(north::WalletSeedProfile::Bip39MulticurveV1)
+        );
+        // An explicit imported-scalar profile is never invented by the
+        // defaulting path, and it maps one-to-one to Signer.
+        registration.wallet_seed_profile = Some(north::WalletSeedProfile::ImportedSecp256k1Scalar);
+        let imported = apply_seed_profile_selection(&registration);
+        assert_eq!(
+            imported.wallet_seed_profile,
+            Some(north::WalletSeedProfile::ImportedSecp256k1Scalar)
+        );
+        assert_eq!(
+            prepare_to_signer(imported).wallet_seed_profile,
+            Some(south::WalletSeedProfile::ImportedSecp256k1Scalar)
+        );
+        registration.wallet_seed_profile = Some(north::WalletSeedProfile::Bip39MulticurveV1);
+        let explicit = apply_seed_profile_selection(&registration);
+        assert_eq!(
+            prepare_to_signer(explicit).wallet_seed_profile,
+            Some(south::WalletSeedProfile::Bip39MulticurveV1)
+        );
+    }
+
+    #[test]
+    fn import_is_never_defaulted_to_a_profile() {
+        let mut import = registration_request();
+        import.ceremony_kind = north::CeremonyKind::WalletImport;
+        import.wallet_seed_profile = None;
+        assert_eq!(
+            apply_seed_profile_selection(&import).wallet_seed_profile,
+            None
+        );
+    }
+
+    #[test]
+    fn non_creation_ceremonies_never_receive_a_seed_profile_default() {
+        let mut export = registration_request();
+        export.ceremony_kind = north::CeremonyKind::WalletExport;
+        export.wallet_seed_profile = None;
+        assert_eq!(
+            apply_seed_profile_selection(&export).wallet_seed_profile,
+            None
+        );
+    }
+
+    fn registration_request() -> north::CustodyPrepareRequest {
+        north::CustodyPrepareRequest {
+            ceremony_kind: north::CeremonyKind::WalletRegistration,
+            custody_operation_id: north::OperationId::from_bytes([1; 32]),
+            wallet_id: Some(north::Token::new("quiet-lilac").unwrap()),
+            key_ref: None,
+            exact_terms_digest: north::Digest32::from_bytes([2; 32]),
+            expected_input_class: north::Token::new("passkey-prf").unwrap(),
+            browser_output_recipient_key: None,
+            petal_key_scope: None,
+            legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: None,
+            account_terms: None,
+        }
+    }
+
     fn digest(byte: u8) -> north::Digest32 {
         north::Digest32::from_bytes([byte; 32])
     }
@@ -157,6 +248,7 @@ mod tests {
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
             derivation_request: None,
+            account_terms: None,
         };
         request.validate_petal_key_scope_binding().unwrap();
         let mut inconsistent = request.clone();
@@ -233,6 +325,7 @@ mod tests {
             legacy_passkey_migration: Some(migration.clone()),
             wallet_seed_profile: None,
             derivation_request: None,
+            account_terms: None,
         };
         request.validate_legacy_passkey_migration_binding().unwrap();
         let mapped = prepare_to_signer(request);

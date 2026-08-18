@@ -13,10 +13,16 @@ use crate::{
 };
 
 /// Root seed profile mirrored for Machine presentation.
+///
+/// `imported-secp256k1-scalar` names the permanent raw-key-import wallet: a
+/// single secp256k1 private key with no derivable seed. It is selectable only
+/// as an explicit import choice; such a wallet exposes no derived accounts and
+/// every allocation against it fails closed.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WalletSeedProfile {
     Bip39MulticurveV1,
+    ImportedSecp256k1Scalar,
 }
 
 /// A requested derived-account allocation (AccountAllocate custody only).
@@ -52,6 +58,19 @@ impl DerivationProfile {
         match self {
             Self::Bip44EvmSecp256k1V1 => crate::KeySpec::Secp256k1,
             Self::Bip44SolanaSlip10Ed25519V1 => crate::KeySpec::Ed25519,
+        }
+    }
+
+    /// The frozen suite set an allocated child of this profile supports.
+    /// Exact-terms bind this set verbatim; a descriptor or ceremony outcome
+    /// that disagrees fails closed.
+    pub const fn frozen_crypto_suites(self) -> &'static [crate::CryptoSuite] {
+        match self {
+            Self::Bip44EvmSecp256k1V1 => &[
+                crate::CryptoSuite::Secp256k1Keccak256Recoverable,
+                crate::CryptoSuite::Secp256k1Sha256Recoverable,
+            ],
+            Self::Bip44SolanaSlip10Ed25519V1 => &[crate::CryptoSuite::Ed25519Message],
         }
     }
 }

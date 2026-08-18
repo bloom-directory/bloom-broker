@@ -48,22 +48,23 @@ pub(crate) struct ChainProjectionTarget<'a> {
     pub accepted_profile: south::DerivationProfile,
 }
 
-pub(crate) fn wallet_seed_profile_to_signer(
-    value: north::WalletSeedProfile,
-) -> south::WalletSeedProfile {
-    match value {
-        north::WalletSeedProfile::Bip39MulticurveV1 => south::WalletSeedProfile::Bip39MulticurveV1,
-    }
-}
-
 pub(crate) fn wallet_seed_profile_to_machine(
     value: south::WalletSeedProfile,
 ) -> north::WalletSeedProfile {
     match value {
         south::WalletSeedProfile::Bip39MulticurveV1 => north::WalletSeedProfile::Bip39MulticurveV1,
+        south::WalletSeedProfile::ImportedSecp256k1Scalar => {
+            north::WalletSeedProfile::ImportedSecp256k1Scalar
+        }
     }
 }
 
+// The three north→south helpers below complete the translation surface but
+// have no production caller in Broker yet: Machine never sends descriptors
+// or address projections south. They are exercised by the round-trip and
+// tamper tests and become live with the deferred import/recovery Broker
+// ceremonies.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn derivation_profile_to_signer(
     value: north::DerivationProfile,
 ) -> south::DerivationProfile {
@@ -90,6 +91,7 @@ pub(crate) fn derivation_profile_to_machine(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn public_key_encoding_to_signer(
     value: north::PublicKeyEncoding,
 ) -> south::PublicKeyEncoding {
@@ -218,6 +220,7 @@ pub(crate) fn chain_projection_from_key_bytes(
 /// Verify a supplied projection against the canonical public-key bytes:
 /// recompute the address, require the exact encoding, and require that
 /// CAIP-10 embeds the exact CAIP-2 and encoded address.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn verify_chain_projection(
     projection: &north::ChainAccountProjection,
     profile: south::DerivationProfile,
@@ -325,6 +328,24 @@ pub(crate) fn wallet_accounts_to_machine(
     };
     collection.validate()?;
     Ok(collection)
+}
+
+/// The production chain projection targets. EVM mainnet and Solana mainnet
+/// are the only configured families for `bip39-multicurve-v1`; a descriptor
+/// of any other profile fails closed at projection time.
+pub(crate) fn production_chain_targets() -> [ChainProjectionTarget<'static>; 2] {
+    [
+        ChainProjectionTarget {
+            chain_family: north::Token::new("evm").expect("static token"),
+            caip2: "eip155:1",
+            accepted_profile: south::DerivationProfile::Bip44EvmSecp256k1V1,
+        },
+        ChainProjectionTarget {
+            chain_family: north::Token::new("solana").expect("static token"),
+            caip2: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+            accepted_profile: south::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+        },
+    ]
 }
 
 fn invalid(message: impl Into<String>) -> north::ProtocolError {
@@ -439,10 +460,12 @@ mod tests {
                 profile
             );
         }
-        let seed = north::WalletSeedProfile::Bip39MulticurveV1;
+        // The south edge carries exactly one seed profile; the legacy root
+        // exists only on the north edge and maps to a `None` south selection
+        // (asserted in the custody translation tests).
         assert_eq!(
-            wallet_seed_profile_to_machine(wallet_seed_profile_to_signer(seed)),
-            seed
+            wallet_seed_profile_to_machine(south::WalletSeedProfile::Bip39MulticurveV1),
+            north::WalletSeedProfile::Bip39MulticurveV1
         );
         for encoding in [
             north::PublicKeyEncoding::Secp256k1SpkiDer,

@@ -468,6 +468,18 @@ impl BrokerAuthority {
                 scope_digest TEXT NOT NULL,
                 scope_jcs TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS committed_account_terms (
+                custody_operation_id TEXT PRIMARY KEY,
+                terms_digest TEXT NOT NULL,
+                terms_jcs TEXT NOT NULL,
+                state TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS adopted_account_terms (
+                custody_operation_id TEXT PRIMARY KEY,
+                terms_digest TEXT NOT NULL,
+                receipt_digest TEXT NOT NULL,
+                adopted_at_ms TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS petal_key_scopes (
                 key_ref_jcs TEXT PRIMARY KEY,
                 scope_digest TEXT NOT NULL,
@@ -789,6 +801,12 @@ impl BrokerAuthority {
             if receipt.ceremony_kind == bloom_broker_api::CeremonyKind::KeyDerive {
                 self.adopt_petal_key_scope(receipt, now_ms)?;
             }
+            if receipt.ceremony_kind == bloom_broker_api::CeremonyKind::AccountAllocate {
+                self.adopt_account_allocation(receipt, now_ms)?;
+            }
+            if receipt.ceremony_kind == bloom_broker_api::CeremonyKind::AccountRetire {
+                self.adopt_account_retirement(receipt, now_ms)?;
+            }
             return Ok(());
         }
         let snapshot = receipt.initial_policy.as_ref().ok_or_else(|| {
@@ -811,12 +829,244 @@ impl BrokerAuthority {
                 validation_receipt_digest: None,
                 commit_receipt_digest: None,
             },
-        )
+        )?;
+        Ok(())
     }
 
     /// Validate and durably freeze a Petal-scoped derivation before Broker
     /// originates its exact custody ceremony. Exact retries are idempotent;
     /// an operation identity can never be rebound to another Petal.
+    /// Record the exact terms an account ceremony commits to. Replaying the
+    /// identical prepare is idempotent; binding one custody operation to
+    /// different terms is a hard conflict.
+    pub fn record_account_terms(
+        &self,
+        terms: &bloom_broker_api::AccountTerms,
+        now_ms: u64,
+    ) -> Result<(), AuthorityError> {
+        terms
+            .validate()
+            .map_err(|error| denied("ACCOUNT_TERMS_INVALID", error.to_string()))?;
+        let terms_digest = terms
+            .request_digest()
+            .map_err(|error| denied("ACCOUNT_TERMS_INVALID", error.to_string()))?;
+        let terms_jcs = serde_jcs::to_string(terms).map_err(storage)?;
+        let mut connection = self.lock()?;
+        self.journal.verify_before_external_mutation(&connection)?;
+        let transaction = connection.transaction()?;
+        let existing: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT terms_digest, terms_jcs FROM committed_account_terms
+                 WHERE custody_operation_id = ?1",
+                [terms.replay_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((existing_digest, existing_jcs)) = existing {
+            if existing_digest == terms_digest.as_str() && existing_jcs == terms_jcs {
+                return Ok(());
+            }
+            return Err(denied(
+                "OPERATION_ID_CONFLICT",
+                "custody operation is already bound to different account terms",
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO committed_account_terms(
+                custody_operation_id, terms_digest, terms_jcs, state
+             ) VALUES (?1, ?2, ?3, 'COMMITTED')",
+            params![terms.replay_id.as_str(), terms_digest.as_str(), terms_jcs],
+        )?;
+        self.journal.append_external_audit(
+            &transaction,
+            "account.terms_committed",
+            &serde_json::json!({
+                "custody_operation_id": terms.replay_id,
+                "wallet_id": terms.wallet_id,
+                "terms_digest": terms_digest,
+                "observed_at_ms": now_ms.to_string()
+            }),
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.journal.checkpoint_committed_head()?;
+        Ok(())
+    }
+
+    /// Fail-closed adoption of an allocation receipt: the returned child
+    /// must be exactly the child the committed terms asked for — same
+    /// wallet, same derivation profile, same committed account index, and a
+    /// path shape matching the profile's frozen template.
+    fn adopt_account_allocation(
+        &self,
+        receipt: &CustodyResult,
+        now_ms: u64,
+    ) -> Result<(), AuthorityError> {
+        let (terms, state) = self.committed_account_terms(&receipt.custody_operation_id)?;
+        if state == "ADOPTED" {
+            return Ok(());
+        }
+        let derivation = terms.derivation.clone().ok_or_else(|| {
+            denied(
+                "CUSTODY_RECEIPT_INVALID",
+                "committed allocation terms carry no derivation request",
+            )
+        })?;
+        if receipt.wallet_id.as_ref() != Some(&terms.wallet_id)
+            || receipt.public_key_refs.len() != 1
+        {
+            return Err(denied(
+                "CUSTODY_RECEIPT_INVALID",
+                "allocation receipt wallet or child count contradicts the committed terms",
+            ));
+        }
+        let child = &receipt.public_key_refs[0];
+        let Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+            wallet_seed_ref,
+            profile,
+            path,
+        }) = child.derivation.clone()
+        else {
+            return Err(denied(
+                "CUSTODY_RECEIPT_INVALID",
+                "allocated child is not a bip39 derived account",
+            ));
+        };
+        if wallet_seed_ref != terms.wallet_id
+            || profile != derivation.derivation_profile
+            || child.key_spec != derivation.derivation_profile.key_spec()
+            || !path_matches_committed_account(profile, &path, derivation.account)
+        {
+            return Err(denied(
+                "CUSTODY_RECEIPT_INVALID",
+                "allocated child does not match the committed derivation request",
+            ));
+        }
+        let mut connection = self.lock()?;
+        self.journal.verify_before_external_mutation(&connection)?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE committed_account_terms SET state = 'ADOPTED'
+             WHERE custody_operation_id = ?1",
+            [receipt.custody_operation_id.as_str()],
+        )?;
+        transaction.execute(
+            "INSERT INTO adopted_account_terms(
+                custody_operation_id, terms_digest, receipt_digest, adopted_at_ms
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                receipt.custody_operation_id.as_str(),
+                terms.request_digest().map_err(storage)?.as_str(),
+                receipt.receipt_digest.as_str(),
+                now_ms.to_string()
+            ],
+        )?;
+        self.journal.append_external_audit(
+            &transaction,
+            "account.allocation_adopted",
+            &serde_json::json!({
+                "custody_operation_id": receipt.custody_operation_id,
+                "wallet_id": terms.wallet_id,
+                "child_fingerprint": child.public_key_fingerprint,
+                "derivation_profile": derivation.derivation_profile,
+                "observed_at_ms": now_ms.to_string()
+            }),
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.journal.checkpoint_committed_head()?;
+        Ok(())
+    }
+
+    /// Fail-closed adoption of a retirement receipt: the terms Broker
+    /// committed to must exist, and the receipt must agree with them. The
+    /// retired child's live shape was verified against Signer's registry at
+    /// prepare time; the receipt itself carries no key material.
+    fn adopt_account_retirement(
+        &self,
+        receipt: &CustodyResult,
+        now_ms: u64,
+    ) -> Result<(), AuthorityError> {
+        let (terms, state) = self.committed_account_terms(&receipt.custody_operation_id)?;
+        if state == "ADOPTED" {
+            return Ok(());
+        }
+        if receipt.wallet_id.as_ref() != Some(&terms.wallet_id)
+            || !receipt.public_key_refs.is_empty()
+            || terms.retire_key_fingerprint.is_none()
+        {
+            return Err(denied(
+                "CUSTODY_RECEIPT_INVALID",
+                "retirement receipt contradicts the committed terms",
+            ));
+        }
+        let mut connection = self.lock()?;
+        self.journal.verify_before_external_mutation(&connection)?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE committed_account_terms SET state = 'ADOPTED'
+             WHERE custody_operation_id = ?1",
+            [receipt.custody_operation_id.as_str()],
+        )?;
+        transaction.execute(
+            "INSERT INTO adopted_account_terms(
+                custody_operation_id, terms_digest, receipt_digest, adopted_at_ms
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                receipt.custody_operation_id.as_str(),
+                terms.request_digest().map_err(storage)?.as_str(),
+                receipt.receipt_digest.as_str(),
+                now_ms.to_string()
+            ],
+        )?;
+        let retired_fingerprint = terms
+            .retire_key_fingerprint
+            .clone()
+            .expect("validated retirement terms");
+        self.journal.append_external_audit(
+            &transaction,
+            "account.retirement_adopted",
+            &serde_json::json!({
+                "custody_operation_id": receipt.custody_operation_id,
+                "wallet_id": terms.wallet_id,
+                "retired_fingerprint": retired_fingerprint,
+                "observed_at_ms": now_ms.to_string()
+            }),
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.journal.checkpoint_committed_head()?;
+        Ok(())
+    }
+
+    fn committed_account_terms(
+        &self,
+        operation_id: &bloom_broker_api::OperationId,
+    ) -> Result<(bloom_broker_api::AccountTerms, String), AuthorityError> {
+        let connection = self.lock()?;
+        let row = connection
+            .query_row(
+                "SELECT terms_jcs, state FROM committed_account_terms
+                 WHERE custody_operation_id = ?1",
+                [operation_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        drop(connection);
+        let Some((terms_jcs, state)) = row else {
+            return Err(denied(
+                "CUSTODY_RECEIPT_INVALID",
+                "account custody completed without Broker-committed terms",
+            ));
+        };
+        let terms: bloom_broker_api::AccountTerms =
+            serde_json::from_str(&terms_jcs).map_err(storage)?;
+        terms
+            .validate()
+            .map_err(|error| denied("ACCOUNT_TERMS_INVALID", error.to_string()))?;
+        Ok((terms, state))
+    }
+
     pub fn prepare_petal_key_scope(&self, scope: &PetalKeyScope) -> Result<(), AuthorityError> {
         scope
             .validate()
@@ -2521,6 +2771,43 @@ fn migrate_legacy_authority(
     migration?;
     detach?;
     Ok(())
+}
+
+/// The allocated path must be the profile's frozen template instantiated at
+/// exactly the committed account index. The terminal index is reserved by
+/// Signer and therefore free, but the account is human-approved and pinned.
+fn path_matches_committed_account(
+    profile: bloom_broker_api::DerivationProfile,
+    path: &str,
+    committed_account: Option<u32>,
+) -> bool {
+    let committed_account = committed_account.unwrap_or(0);
+    let segments: Vec<&str> = path.split('/').collect();
+    let (prefix, tail_len) = match profile {
+        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => (["m", "44'", "60'"], 3_u8),
+        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+            (["m", "44'", "501'"], 2)
+        }
+    };
+    if segments.len() != 3 + usize::from(tail_len) {
+        return false;
+    }
+    if segments[0..3] != prefix {
+        return false;
+    }
+    let account = format!("{committed_account}'");
+    if segments[3] != account {
+        return false;
+    }
+    let tail = &segments[4..];
+    match profile {
+        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
+            tail.len() == 2 && tail[0] == "0" && tail[1].parse::<u32>().is_ok()
+        }
+        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+            tail.len() == 1 && tail[0] == "0'"
+        }
+    }
 }
 
 fn verify_policy_snapshot(

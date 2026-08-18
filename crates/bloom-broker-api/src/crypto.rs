@@ -136,6 +136,11 @@ impl KeyRef {
             (KeySpec::Secp256k1, Some(DerivationRef::Bip32Secp256k1 { path, .. })) => {
                 validate_bip32_path(path)
             }
+            (_, Some(DerivationRef::Bip39Multicurve { profile, path, .. }))
+                if profile.key_spec() == self.key_spec =>
+            {
+                validate_bip32_path(path)
+            }
             (_, None) => Ok(()),
             _ => Err(ProtocolError::new(
                 ProtocolErrorCode::KeyrefMismatch,
