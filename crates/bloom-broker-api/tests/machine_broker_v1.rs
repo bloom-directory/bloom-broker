@@ -530,7 +530,7 @@ fn every_machine_broker_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "f71c0eebb4e0d7af85ff823438b5a41a7471f8557d8293c040a3b2ac4eef5586",
+        "e4b26f00a6e71211bdde751e05719a1351a7951f740c2ce3dbb4ff4d15fc0cb7",
     );
     assert_wire_digest(
         "machine responses",

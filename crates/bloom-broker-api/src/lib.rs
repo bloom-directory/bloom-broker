@@ -13,6 +13,7 @@ mod provenance;
 mod revocation;
 mod service;
 mod signing;
+mod validation;
 mod wallet_account;
 
 pub use approval::*;

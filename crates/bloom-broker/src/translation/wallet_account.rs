@@ -35,8 +35,6 @@ const ED25519_SPKI_PREFIX: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
 
-const BASE58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
 /// One configured chain projection target. `caip2` and the accepted
 /// derivation profile come from Broker's configured network profile, never
 /// from Machine input. A descriptor whose profile differs from the target
@@ -148,35 +146,7 @@ fn derive_evm_address(spki: &[u8]) -> Result<String, north::ProtocolError> {
 /// Solana address: base58 (Bitcoin alphabet) of the raw 32-byte Ed25519 key.
 fn derive_solana_address(spki: &[u8]) -> Result<String, north::ProtocolError> {
     let key = ed25519_raw_key(spki)?;
-    Ok(base58_encode(&key))
-}
-
-pub(crate) fn base58_encode(input: &[u8]) -> String {
-    let mut digits: Vec<u8> = Vec::with_capacity(input.len() * 2);
-    for &byte in input {
-        let mut carry = u32::from(byte);
-        for digit in &mut digits {
-            carry += u32::from(*digit) << 8;
-            *digit = (carry % 58) as u8;
-            carry /= 58;
-        }
-        while carry > 0 {
-            digits.push((carry % 58) as u8);
-            carry /= 58;
-        }
-    }
-    let mut encoded = String::with_capacity(digits.len() + input.len());
-    for &byte in input {
-        if byte == 0 {
-            encoded.push('1');
-        } else {
-            break;
-        }
-    }
-    for &digit in digits.iter().rev() {
-        encoded.push(BASE58_ALPHABET[usize::from(digit)] as char);
-    }
-    encoded
+    Ok(bs58::encode(key).into_string())
 }
 
 /// Recompute an address and encoding for a derivation profile from the
@@ -595,52 +565,10 @@ mod tests {
 
     #[test]
     fn base58_matches_reference_vectors() {
-        assert_eq!(base58_encode(&[0]), "1");
-        assert_eq!(base58_encode(&[0, 0]), "11");
-        assert_eq!(base58_encode(&[1]), "2");
-        assert_eq!(base58_encode(&[255]), "5Q");
-        assert_eq!(base58_encode(b"hello world"), "StV1DL6CwTryKyV");
-    }
-
-    /// Differential gate: the hand-rolled encoder must agree with the
-    /// independent `bs58` crate across edge shapes — empty input, every
-    /// leading-zero pattern up to a full all-zero Ed25519 key, and random
-    /// payloads of random lengths. Self-consistent vectors are not
-    /// sufficient evidence for a hand-rolled encoder.
-    #[test]
-    fn base58_differentials_against_independent_bs58() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let mut cases: Vec<Vec<u8>> = vec![
-            Vec::new(),
-            vec![0],
-            vec![0, 0],
-            vec![0, 0, 0],
-            vec![1],
-            vec![255],
-            b"hello world".to_vec(),
-            vec![0, 1, 2, 3, 250, 251, 252],
-            vec![7, 0, 1, 2],
-            [0u8; 32].to_vec(),
-            [[0u8; 31].as_slice(), &[7u8]].concat(),
-        ];
-        for _ in 0..512 {
-            let len = rng.gen_range(0..64);
-            cases.push((0..len).map(|_| rng.r#gen::<u8>()).collect());
-        }
-        for _ in 0..128 {
-            let zeros = rng.gen_range(0..12);
-            let tail: Vec<u8> = (0..rng.gen_range(0..40))
-                .map(|_| rng.r#gen::<u8>())
-                .collect();
-            cases.push([vec![0u8; zeros], tail].concat());
-        }
-        for case in &cases {
-            assert_eq!(
-                base58_encode(case),
-                bs58::encode(case).into_string(),
-                "encoder disagreement for input {case:?}"
-            );
-        }
+        assert_eq!(bs58::encode([0]).into_string(), "1");
+        assert_eq!(bs58::encode([0, 0]).into_string(), "11");
+        assert_eq!(bs58::encode([1]).into_string(), "2");
+        assert_eq!(bs58::encode([255]).into_string(), "5Q");
+        assert_eq!(bs58::encode(b"hello world").into_string(), "StV1DL6CwTryKyV");
     }
 }

@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::HashSet;
 
 use crate::{
     CryptoSuite, DecimalU64, DecimalU256, Digest32, KeyRef, ProtocolError, ProtocolErrorCode,
     RequestNonce, Token,
 };
+use crate::validation::all_unique;
 
 const APPROVAL_DOMAIN: &[u8] = b"bloom-sealed-approval-terms/v1";
 
@@ -152,7 +152,7 @@ impl SealedApprovalTerms {
             ) if package_hash == selector_hash
                 && route == selector_route
                 && !allowed_operation_classes.is_empty()
-                && unique(allowed_operation_classes) => {}
+                && all_unique(allowed_operation_classes) => {}
             (
                 _,
                 ApprovalSelector::Exact {
@@ -199,7 +199,7 @@ impl SealedApprovalTerms {
 fn validate_suites(suites: &[CryptoSuite], key_spec: crate::KeySpec) -> Result<(), ProtocolError> {
     if suites.is_empty()
         || suites.len() > 4
-        || !unique(suites)
+        || !all_unique(suites)
         || suites.iter().any(|suite| suite.key_spec() != key_spec)
     {
         return Err(ProtocolError::new(
@@ -236,11 +236,6 @@ fn validate_limits(limits: &ApprovalLimits) -> Result<(), ProtocolError> {
         ));
     }
     Ok(())
-}
-
-fn unique<T: Eq + std::hash::Hash>(values: &[T]) -> bool {
-    let mut seen = HashSet::with_capacity(values.len());
-    values.iter().all(|value| seen.insert(value))
 }
 
 #[cfg(test)]

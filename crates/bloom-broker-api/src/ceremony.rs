@@ -8,6 +8,7 @@ use crate::{
 };
 
 const ENCRYPTED_BROWSER_RESULT_MAX_BYTES: usize = 4 * 1024;
+const ACCOUNT_TERMS_REQUEST_DOMAIN: &[u8] = b"bloom-account-terms-request/v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -568,27 +569,27 @@ impl AccountTerms {
     }
 
     pub fn request_digest(&self) -> Result<Digest32, ProtocolError> {
-        Ok(Digest32::from_bytes(
-            Sha256::digest(
-                serde_jcs::to_vec(&TermsDigestSource {
-                    schema: &self.schema,
-                    wallet_id: &self.wallet_id,
-                    seed_profile: self.seed_profile,
-                    derivation: &self.derivation,
-                    retire_key_fingerprint: &self.retire_key_fingerprint,
-                    path_template: &self.path_template,
-                    key_spec: self.key_spec,
-                    allowed_crypto_suites: &self.allowed_crypto_suites,
-                    policy_version: &self.policy_version,
-                    revocation_epoch: &self.revocation_epoch,
-                    replay_id: &self.replay_id,
-                    expires_at_ms: &self.expires_at_ms,
-                    audit_purpose: &self.audit_purpose,
-                })
-                .map_err(canonical_error)?,
-            )
-            .into(),
-        ))
+        let mut hasher = Sha256::new();
+        hasher.update(ACCOUNT_TERMS_REQUEST_DOMAIN);
+        hasher.update(
+            serde_jcs::to_vec(&TermsDigestSource {
+                schema: &self.schema,
+                wallet_id: &self.wallet_id,
+                seed_profile: self.seed_profile,
+                derivation: &self.derivation,
+                retire_key_fingerprint: &self.retire_key_fingerprint,
+                path_template: &self.path_template,
+                key_spec: self.key_spec,
+                allowed_crypto_suites: &self.allowed_crypto_suites,
+                policy_version: &self.policy_version,
+                revocation_epoch: &self.revocation_epoch,
+                replay_id: &self.replay_id,
+                expires_at_ms: &self.expires_at_ms,
+                audit_purpose: &self.audit_purpose,
+            })
+            .map_err(canonical_error)?,
+        );
+        Ok(Digest32::from_bytes(hasher.finalize().into()))
     }
 }
 

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Base64UrlBytes, CryptoSuite, Digest32, KeyRef, ProtocolError, ProtocolErrorCode, Token,
 };
+use crate::validation::{all_unique, validate_display_identity};
 
 /// Root seed profile mirrored for Machine presentation.
 ///
@@ -161,8 +162,8 @@ impl<'de> Deserialize<'de> for ChainAccountProjection {
 impl ChainAccountProjection {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         validate_caip2(&self.caip2)?;
-        validate_bounded("caip10", &self.caip10, CAIP10_MAX_BYTES)?;
-        validate_bounded("address", &self.address, ADDRESS_MAX_BYTES)?;
+        validate_display_identity("caip10", &self.caip10, CAIP10_MAX_BYTES)?;
+        validate_display_identity("address", &self.address, ADDRESS_MAX_BYTES)?;
         Ok(())
     }
 }
@@ -237,11 +238,9 @@ impl DerivedAccountPublic {
         if self.canonical_public_key.decode().is_empty() {
             return Err(invalid("canonical public key must not be empty"));
         }
-        let unique_suites: std::collections::HashSet<_> =
-            self.supported_crypto_suites.iter().copied().collect();
         if self.supported_crypto_suites.is_empty()
             || self.supported_crypto_suites.len() > CryptoSuite::ALL.len()
-            || unique_suites.len() != self.supported_crypto_suites.len()
+            || !all_unique(&self.supported_crypto_suites)
             || self
                 .supported_crypto_suites
                 .iter()
@@ -322,7 +321,7 @@ impl WalletAccountsPublic {
 }
 
 fn validate_caip2(value: &str) -> Result<(), ProtocolError> {
-    validate_bounded("caip2", value, CAIP2_MAX_BYTES)?;
+    validate_display_identity("caip2", value, CAIP2_MAX_BYTES)?;
     let (namespace, reference) = value
         .split_once(':')
         .ok_or_else(|| invalid("caip2 must be namespace:reference"))?;
@@ -333,18 +332,6 @@ fn validate_caip2(value: &str) -> Result<(), ProtocolError> {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
     {
         return Err(invalid("caip2 namespace must be lowercase ascii"));
-    }
-    Ok(())
-}
-
-fn validate_bounded(field: &str, value: &str, maximum: usize) -> Result<(), ProtocolError> {
-    if value.is_empty()
-        || value.len() > maximum
-        || value.chars().any(|character| character.is_control())
-    {
-        return Err(invalid(format!(
-            "{field} must contain 1-{maximum} UTF-8 bytes without control characters"
-        )));
     }
     Ok(())
 }

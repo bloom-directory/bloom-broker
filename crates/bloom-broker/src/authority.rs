@@ -2781,33 +2781,25 @@ fn path_matches_committed_account(
     path: &str,
     committed_account: Option<u32>,
 ) -> bool {
-    let committed_account = committed_account.unwrap_or(0);
+    let committed = committed_account.unwrap_or(0);
+    let template = profile
+        .path_template()
+        .replace("<account>'", &format!("{committed}'"));
+    let expected: Vec<&str> = template.split('/').collect();
     let segments: Vec<&str> = path.split('/').collect();
-    let (prefix, tail_len) = match profile {
-        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => (["m", "44'", "60'"], 3_u8),
-        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
-            (["m", "44'", "501'"], 2)
-        }
-    };
-    if segments.len() != 3 + usize::from(tail_len) {
+    if segments.len() != expected.len() {
         return false;
     }
-    if segments[0..3] != prefix {
-        return false;
-    }
-    let account = format!("{committed_account}'");
-    if segments[3] != account {
-        return false;
-    }
-    let tail = &segments[4..];
-    match profile {
-        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
-            tail.len() == 2 && tail[0] == "0" && tail[1].parse::<u32>().is_ok()
-        }
-        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
-            tail.len() == 1 && tail[0] == "0'"
+    for (actual, expected) in segments.iter().zip(expected.iter()) {
+        if *expected == "<index>" {
+            if actual.parse::<u32>().is_err() {
+                return false;
+            }
+        } else if actual != expected {
+            return false;
         }
     }
+    true
 }
 
 fn verify_policy_snapshot(
