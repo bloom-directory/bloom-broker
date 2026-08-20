@@ -569,6 +569,9 @@ mod tests {
         assert_eq!(bs58::encode([0, 0]).into_string(), "11");
         assert_eq!(bs58::encode([1]).into_string(), "2");
         assert_eq!(bs58::encode([255]).into_string(), "5Q");
-        assert_eq!(bs58::encode(b"hello world").into_string(), "StV1DL6CwTryKyV");
+        assert_eq!(
+            bs58::encode(b"hello world").into_string(),
+            "StV1DL6CwTryKyV"
+        );
     }
 }

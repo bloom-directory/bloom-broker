@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::validation::all_unique;
 use crate::{
     CryptoSuite, DecimalU64, DecimalU256, Digest32, KeyRef, ProtocolError, ProtocolErrorCode,
     RequestNonce, Token,
 };
-use crate::validation::all_unique;
 
 const APPROVAL_DOMAIN: &[u8] = b"bloom-sealed-approval-terms/v1";
 

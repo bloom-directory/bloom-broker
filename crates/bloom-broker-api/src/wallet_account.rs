@@ -8,10 +8,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::validation::{all_unique, validate_display_identity};
 use crate::{
     Base64UrlBytes, CryptoSuite, Digest32, KeyRef, ProtocolError, ProtocolErrorCode, Token,
 };
-use crate::validation::{all_unique, validate_display_identity};
 
 /// Root seed profile mirrored for Machine presentation.
 ///

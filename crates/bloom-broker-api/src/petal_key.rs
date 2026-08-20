@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::validation::{all_unique, validate_display_identity};
 use crate::{
     CryptoSuite, DecimalU64, Digest32, KeyRef, OperationId, ProtocolError, ProtocolErrorCode, Token,
 };
-use crate::validation::{all_unique, validate_display_identity};
 
 const PETAL_KEY_SCOPE_DOMAIN: &[u8] = b"bloom-petal-key-scope/v2";
 const PETAL_KEY_REQUEST_DOMAIN: &[u8] = b"bloom-petal-key-request/v2";
@@ -85,7 +85,8 @@ impl PetalKeyScope {
             || !all_unique(&self.allowed_routes)
             || self.allowed_operation_classes.is_empty()
             || !all_unique(&self.allowed_operation_classes)
-        {            return Err(ProtocolError::new(
+        {
+            return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
                 "Petal key scope requires unique non-empty route and operation-class sets",
             ));
