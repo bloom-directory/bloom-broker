@@ -219,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(path) = startup_status_path.as_deref() {
                 write_listener_conflict(path, broker_effective_uid, containment.as_ref())?;
             }
-            return Err(error.into());
+            return Err(error);
         }
     };
     let broker_signing_key = take_signing_key(&mut config.broker_signing_seed_hex)?;
