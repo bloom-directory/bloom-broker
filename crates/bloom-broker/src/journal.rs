@@ -1667,22 +1667,34 @@ impl BrokerJournal {
             monotonic_anchor_ns: reading.monotonic_anchor_ns,
             boot_epoch: reading.boot_epoch.clone(),
         };
-        let stored: Option<(String, String, String)> = transaction
+        let stored: Option<(String, String, String, String)> = transaction
             .query_row(
-                "SELECT last_effective_ms, condition, monotonic_anchor_ns
+                "SELECT last_effective_ms, condition, monotonic_anchor_ns, boot_epoch
                  FROM clock_state WHERE singleton = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
         let initializing = stored.is_none();
-        let stored_condition = stored.as_ref().map(|(_, condition, _)| condition.as_str());
+        let stored_condition = stored
+            .as_ref()
+            .map(|(_, condition, _, _)| condition.as_str());
         let previous = stored
             .as_ref()
-            .map(|(value, _, anchor)| {
+            .map(|(value, _, anchor, persisted_epoch)| {
                 Ok::<_, JournalError>(PersistedClockState {
                     last_effective_ms: value.parse().map_err(storage)?,
                     monotonic_anchor_ns: anchor.parse().map_err(storage)?,
+                    // The absolute anchor is only comparable within the boot it
+                    // was sampled in, and the epoch was already persisted here.
+                    boot_epoch: comparable_boot_epoch(
+                        &BootEpoch::new(persisted_epoch.clone()).map_err(|_| {
+                            protocol(
+                                ProtocolErrorCode::ClockUntrusted,
+                                "persisted clock state has a malformed boot epoch",
+                            )
+                        })?,
+                    ),
                 })
             })
             .transpose()?;
@@ -1691,8 +1703,13 @@ impl BrokerJournal {
             monotonic_anchor_ns: reading.monotonic_anchor_ns,
             monotonic_elapsed_ms: reading.monotonic_elapsed_ms,
         };
-        let shared = evaluate_durable_clock(previous, &platform_reading, max_forward_step_ms)
-            .map_err(|cause| protocol(ProtocolErrorCode::ClockUntrusted, cause.to_string()))?;
+        let shared = evaluate_durable_clock(
+            previous,
+            &platform_reading,
+            comparable_boot_epoch(&reading.boot_epoch),
+            max_forward_step_ms,
+        )
+        .map_err(|cause| protocol(ProtocolErrorCode::ClockUntrusted, cause.to_string()))?;
         let condition = broker_clock_condition(shared.condition);
         let effective_now_ms = shared.effective_now_ms;
 
@@ -2438,6 +2455,14 @@ fn broker_clock_condition(condition: DurableClockCondition) -> ClockCondition {
         DurableClockCondition::RollbackFrozen => ClockCondition::RollbackFrozen,
         DurableClockCondition::ForwardJumpRejected => ClockCondition::ForwardJumpRejected,
     }
+}
+
+/// A boot epoch usable for comparing monotonic domains, or `None` when the
+/// domain is unknown. The all-zero sentinel means "not recorded" and must not
+/// compare equal to itself, or two unknown boots would look like one.
+fn comparable_boot_epoch(epoch: &BootEpoch) -> Option<[u8; 16]> {
+    let bytes = epoch.to_bytes();
+    (bytes != [0; 16]).then_some(bytes)
 }
 
 fn write_clock_state(
