@@ -304,6 +304,8 @@ pub struct CeremonyPublicStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+// Boxing the large request would change this frozen wire protocol's public shape.
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "method", content = "body", deny_unknown_fields)]
 pub enum MachineBrokerRequest {
     #[serde(rename = "system.hello")]

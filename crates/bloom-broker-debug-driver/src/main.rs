@@ -267,23 +267,6 @@ fn custody_effect_kind(kind: CeremonyKind) -> Result<serde_json::Value, serde_js
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn account_custody_effects_match_the_signer_contract() {
-        assert_eq!(
-            custody_effect_kind(CeremonyKind::AccountAllocate).unwrap(),
-            serde_json::json!("account_allocate")
-        );
-        assert_eq!(
-            custody_effect_kind(CeremonyKind::AccountRetire).unwrap(),
-            serde_json::json!("account_retire")
-        );
-    }
-}
-
 fn assert_machine_secret_confinement_command(
     mut args: impl Iterator<Item = String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -376,7 +359,7 @@ fn request(
 
 #[cfg(test)]
 mod tests {
-    use super::read_protected_seed_file;
+    use super::{custody_effect_kind, read_protected_seed_file, CeremonyKind};
     use std::{fs, path::PathBuf};
 
     fn temp_path(name: &str) -> PathBuf {
@@ -410,5 +393,17 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(read_protected_seed_file(&path).unwrap(), "secret");
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn account_custody_effects_match_the_signer_contract() {
+        assert_eq!(
+            custody_effect_kind(CeremonyKind::AccountAllocate).unwrap(),
+            serde_json::json!("account_allocate")
+        );
+        assert_eq!(
+            custody_effect_kind(CeremonyKind::AccountRetire).unwrap(),
+            serde_json::json!("account_retire")
+        );
     }
 }
