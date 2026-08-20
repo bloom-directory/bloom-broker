@@ -1650,6 +1650,8 @@ async fn approve_and_sign(
             operation_id: approval_operation.clone(),
             terms: terms.clone(),
             canonical_plan_facts_digest: terms.approval_digest().unwrap(),
+            petal_use_claim: None,
+            system_use_claim: None,
         }),
     )
     .await
@@ -1767,6 +1769,7 @@ async fn approve_and_sign(
             payload: Base64UrlBytes::from_bytes(payload),
         },
         petal_use_claim: None,
+        system_use_claim: None,
         claim_assurance_evidence: None,
         provenance: ProvenanceSubject::System {
             component_id: Token::new("cli").unwrap(),

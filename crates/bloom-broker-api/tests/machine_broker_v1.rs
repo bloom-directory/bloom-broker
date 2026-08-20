@@ -204,6 +204,7 @@ fn machine_sign() -> MachineSignRequest {
             payload: Base64UrlBytes::from_bytes(&[36]),
         },
         petal_use_claim: None,
+        system_use_claim: None,
         claim_assurance_evidence: None,
         provenance: ProvenanceSubject::Cli {
             client_id: token("cli"),
@@ -264,6 +265,8 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
             operation_id: operation(54),
             terms: approval_terms(),
             canonical_plan_facts_digest: digest(59),
+            petal_use_claim: None,
+            system_use_claim: None,
         }),
         MachineBrokerRequest::SealedApprovalStatus(id.clone()),
         MachineBrokerRequest::SealedApprovalList(wallet.clone()),
@@ -530,12 +533,12 @@ fn every_machine_broker_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "e4b26f00a6e71211bdde751e05719a1351a7951f740c2ce3dbb4ff4d15fc0cb7",
+        "bcb648dce4e11c5f38bc8555fd325299a2bdeb0f256345696ecb76b6c9d15030",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "d280f948205106784e559624be55a3545acdd435dadd7c0d6403851ac73ab44c",
+        "a5a33cc4fca269d9e7e7b1cadb7d681d0837afdbecad34f46ffcecd870e088c9",
     );
 }
 

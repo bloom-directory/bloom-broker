@@ -7,7 +7,11 @@
 //! exact message bytes and establishes destination and lamports, so a bug in
 //! Solana's own construction code cannot redefine what is being signed.
 
-use bloom_broker_api::{ClaimAssuranceLevel, CryptoSuite, Digest32, PetalUseClaim, Token};
+use bloom_broker_api::{
+    ClaimAssuranceLevel, CryptoSuite, Digest32, PetalUseClaim,
+    SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES, SOLANA_SYSTEM_TRANSFER_VERIFIER_ID,
+    SystemUseClaim, Token,
+};
 use bloom_solana::Pubkey;
 use std::str::FromStr;
 
@@ -18,11 +22,6 @@ use crate::authority::{AssuranceVerifier, VerifierCapability};
 /// compiled-verifier artifact digest that pins this exact implementation to
 /// its source, so a changed verifier is a changed digest and therefore a
 /// changed `ProofVerified` identity.
-const SOLANA_VERIFIER_ARTIFACT_DIGEST: [u8; 32] = [
-    0xeb, 0x3d, 0x9a, 0x08, 0x4d, 0x60, 0xcd, 0x73, 0xd2, 0xb2, 0x31, 0xb4, 0x27, 0x5f, 0x28, 0x4d,
-    0x8a, 0x33, 0x52, 0x68, 0x29, 0x57, 0xba, 0x85, 0xc4, 0x49, 0x2f, 0x6f, 0xe1, 0x6c, 0x63, 0x3a,
-];
-
 /// The `solana-system-transfer-v1` semantic verifier.
 pub struct SolanaSystemTransferVerifier;
 
@@ -35,8 +34,8 @@ impl SolanaSystemTransferVerifier {
 impl AssuranceVerifier for SolanaSystemTransferVerifier {
     fn capability(&self) -> VerifierCapability {
         VerifierCapability {
-            verifier_id: Token::new("solana-system-transfer-v1").expect("valid token"),
-            artifact_digest: Digest32::from_bytes(SOLANA_VERIFIER_ARTIFACT_DIGEST),
+            verifier_id: Token::new(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID).expect("valid token"),
+            artifact_digest: Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES),
             assurance: ClaimAssuranceLevel::ProofVerified,
             // The fields this verifier independently establishes from the
             // message evidence. Provenance/identity fields (package_hash,
@@ -47,6 +46,7 @@ impl AssuranceVerifier for SolanaSystemTransferVerifier {
                 Token::new("declared_destinations").expect("valid token"),
                 Token::new("declared_debits").expect("valid token"),
                 Token::new("payload_digest").expect("valid token"),
+                Token::new("recent_blockhash").expect("valid token"),
             ],
         }
     }
@@ -77,6 +77,42 @@ impl AssuranceVerifier for SolanaSystemTransferVerifier {
             .map(|_| ())
             .map_err(|reason| format!("{reason:?}"))
     }
+
+    fn verify_system(&self, claim: &SystemUseClaim, evidence: Option<&[u8]>) -> Result<(), String> {
+        let message = evidence.ok_or("solana transfer requires message evidence")?;
+        if claim.component_id.as_str() != "bloom-machine"
+            || claim.action_class.as_str() != "solana.transfer.confirm"
+            || claim.operation_class.as_str() != "solana.native-transfer"
+            || claim.crypto_suite != CryptoSuite::Ed25519Message
+            || claim.chain_context.chain_family.as_str() != "solana"
+        {
+            return Err("system claim identity, class, suite, or chain is invalid".to_owned());
+        }
+        let [destination] = claim.declared_destinations.as_slice() else {
+            return Err("expected exactly one declared destination".to_owned());
+        };
+        let [debit] = claim.declared_debits.as_slice() else {
+            return Err("expected exactly one declared debit".to_owned());
+        };
+        let destination_key = Pubkey::from_str(&destination.destination)
+            .map_err(|error| format!("declared destination is not base58: {error}"))?;
+        let lamports: u64 = debit
+            .amount
+            .as_str()
+            .parse()
+            .map_err(|_| "declared lamports do not fit u64".to_owned())?;
+        let verified = bloom_solana::verify_transfer(
+            message,
+            destination_key,
+            lamports,
+            Some(claim.payload_digest.to_bytes()),
+        )
+        .map_err(|reason| format!("{reason:?}"))?;
+        if verified.recent_blockhash != claim.chain_context.recent_blockhash {
+            return Err("signed message blockhash differs from system claim".to_owned());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -84,7 +120,8 @@ mod tests {
     use super::*;
     use bloom_broker_api::CryptoSuite;
     use bloom_broker_api::{
-        AssetId, ClaimAssurance, DeclaredDebit, DeclaredDestination, DeclaredFee,
+        AssetId, ClaimAssurance, DecimalU64, DeclaredDebit, DeclaredDestination, DeclaredFee,
+        SystemChainContext,
     };
     use bloom_solana::system_transfer::transfer_message;
 
@@ -110,8 +147,8 @@ mod tests {
             declared_fee: DeclaredFee::None,
             nonce: bloom_broker_api::RequestNonce::new("00".repeat(16)).unwrap(),
             claim_assurance: ClaimAssurance::ProofVerified {
-                verifier_id: Token::new("solana-system-transfer-v1").unwrap(),
-                verifier_digest: Digest32::from_bytes(SOLANA_VERIFIER_ARTIFACT_DIGEST),
+                verifier_id: Token::new(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID).unwrap(),
+                verifier_digest: Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES),
                 proof_digest: Digest32::from_bytes([0x22; 32]),
             },
         }
@@ -129,6 +166,45 @@ mod tests {
         let verifier = SolanaSystemTransferVerifier;
         let claim = solana_claim(&dest.to_string(), lamports, digest);
         verifier.verify(&claim, Some(&bytes)).unwrap();
+    }
+
+    #[test]
+    fn verifies_native_system_claim_and_binds_recent_blockhash() {
+        let payer = Pubkey::from_bytes([1u8; 32]);
+        let dest = Pubkey::from_bytes([2u8; 32]);
+        let blockhash = [7u8; 32];
+        let message = transfer_message(payer, dest, 42, blockhash).unwrap();
+        let bytes = message.serialize();
+        let petal = solana_claim(&dest.to_string(), 42, bloom_solana::message_digest(&bytes));
+        let mut claim = SystemUseClaim {
+            component_id: Token::new("bloom-machine").unwrap(),
+            action_class: Token::new("solana.transfer.confirm").unwrap(),
+            operation_class: petal.operation_class,
+            crypto_suite: petal.crypto_suite,
+            payload_digest: petal.payload_digest,
+            ordered_hashes: petal.ordered_hashes,
+            declared_debits: petal.declared_debits,
+            declared_destinations: petal.declared_destinations,
+            declared_fee: petal.declared_fee,
+            nonce: petal.nonce,
+            chain_context: SystemChainContext {
+                chain_family: Token::new("solana").unwrap(),
+                genesis_hash: "devnet-genesis".into(),
+                recent_blockhash: bs58::encode(blockhash).into_string(),
+                last_valid_block_height: DecimalU64::new(123),
+            },
+            claim_assurance: petal.claim_assurance,
+        };
+        SolanaSystemTransferVerifier
+            .verify_system(&claim, Some(&bytes))
+            .unwrap();
+        claim.chain_context.recent_blockhash = bs58::encode([8u8; 32]).into_string();
+        assert!(
+            SolanaSystemTransferVerifier
+                .verify_system(&claim, Some(&bytes))
+                .unwrap_err()
+                .contains("blockhash")
+        );
     }
 
     #[test]

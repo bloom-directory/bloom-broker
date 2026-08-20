@@ -269,6 +269,8 @@ async function load() {
   ceremonyId = session.ceremony_id;
   const legacyPasskeyImport = session.ceremony_kind === "wallet_import" &&
     session.signer_contribution?.expected_input_class === "legacy_passkey_v1_prf";
+  const bip39Import = session.ceremony_kind === "wallet_import" &&
+    session.signer_contribution?.wallet_seed_profile === "bip39-multicurve-v1";
   if (!/^[0-9a-f]{64}$/.test(ceremonyId)) {
     throw new Error("Ceremony returned an invalid identity");
   }
@@ -297,12 +299,16 @@ async function load() {
   reviewNode.replaceChildren(pre);
   recoveryFields.hidden = session.ceremony_kind !== "wallet_recovery";
   const typedInputKinds = new Set([
-    "wallet_import", "key_derive"
+    "wallet_import", "wallet_export", "key_derive"
   ]);
   genericFields.hidden = !typedInputKinds.has(session.ceremony_kind) ||
     Boolean(scopedPetalKey) || legacyPasskeyImport;
   if (session.ceremony_kind === "wallet_import" && !legacyPasskeyImport) {
-    genericInput.placeholder = '{"raw_private_key":"base64url-encoded-key"}';
+    genericInput.placeholder = bip39Import
+      ? '{"mnemonic":"twenty four BIP-39 words…","passphrase":""}'
+      : '{"raw_private_key":"base64url-encoded-key"}';
+  } else if (session.ceremony_kind === "wallet_export") {
+    genericInput.placeholder = '{"format":"bip39_mnemonic24"}';
   } else if (session.ceremony_kind === "key_derive") {
     genericInput.placeholder =
       '{"namespace_id":"...","grant":{...},"authority_signature":"..."}';
@@ -370,6 +376,8 @@ async function run(session) {
   const kind = session.ceremony_kind;
   const legacyPasskeyImport = kind === "wallet_import" &&
     session.signer_contribution?.expected_input_class === "legacy_passkey_v1_prf";
+  const bip39Import = kind === "wallet_import" &&
+    session.signer_contribution?.wallet_seed_profile === "bip39-multicurve-v1";
   const scopedPetalKey = kind === "key_derive" &&
     session.signer_contribution?.petal_key_scope;
   let proof;
@@ -382,14 +390,27 @@ async function run(session) {
     credentialId = encodeUrl(created.rawId);
     if (kind === "wallet_import") {
       const supplied = JSON.parse(genericInput.value);
-      if (!supplied || Array.isArray(supplied) ||
-          typeof supplied.raw_private_key !== "string") {
-        throw new Error("Raw private key input is required");
+      if (!supplied || Array.isArray(supplied)) {
+        throw new Error("Wallet import input is required");
       }
-      secret = te.encode(canonicalJson({
-        credential_prf: encodeUrl(prf.prf),
-        raw_private_key: supplied.raw_private_key
-      }));
+      if (bip39Import) {
+        if (typeof supplied.mnemonic !== "string") {
+          throw new Error("BIP-39 mnemonic input is required");
+        }
+        secret = te.encode(canonicalJson({
+          credential_prf: encodeUrl(prf.prf),
+          mnemonic: supplied.mnemonic,
+          passphrase: supplied.passphrase || ""
+        }));
+      } else {
+        if (typeof supplied.raw_private_key !== "string") {
+          throw new Error("Raw private key input is required");
+        }
+        secret = te.encode(canonicalJson({
+          credential_prf: encodeUrl(prf.prf),
+          raw_private_key: supplied.raw_private_key
+        }));
+      }
     } else {
       secret = prf.prf;
     }

@@ -92,6 +92,8 @@ pub struct VerifiedTransfer {
     /// SHA-256 of the serialized message — Bloom's payload commitment, not the
     /// Ed25519 signing input.
     pub message_digest: [u8; 32],
+    /// Base58 recent blockhash extracted from the canonical message.
+    pub recent_blockhash: String,
 }
 
 /// Verify that `message_bytes` is a canonical legacy, single-signer native
@@ -252,6 +254,7 @@ fn verify_transfer_inner(
         program: SYSTEM_PROGRAM_ID.to_string(),
         signer_count: 1,
         message_digest: digest,
+        recent_blockhash: bs58::encode(message.recent_blockhash).into_string(),
     })
 }
 
