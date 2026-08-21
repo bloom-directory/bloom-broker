@@ -359,7 +359,7 @@ fn request(
 
 #[cfg(test)]
 mod tests {
-    use super::{custody_effect_kind, read_protected_seed_file, CeremonyKind};
+    use super::{CeremonyKind, custody_effect_kind, read_protected_seed_file};
     use std::{fs, path::PathBuf};
 
     fn temp_path(name: &str) -> PathBuf {
