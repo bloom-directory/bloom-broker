@@ -6,6 +6,7 @@ use bloom_broker_api::{
 };
 use bloom_signer_api::{BrokerValidationReceipt, UnsignedSignRequest};
 use bloom_triad_local_transport::{LocalIdentity, sign_journal_head};
+use bloom_trusted_time::{DurableClockCondition, PersistedClockState, evaluate_durable_clock};
 use num_bigint::BigUint;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -1666,26 +1667,54 @@ impl BrokerJournal {
             monotonic_anchor_ns: reading.monotonic_anchor_ns,
             boot_epoch: reading.boot_epoch.clone(),
         };
-        let stored: Option<(String, String)> = transaction
+        let stored: Option<(String, String, String, String)> = transaction
             .query_row(
-                "SELECT last_effective_ms, condition FROM clock_state WHERE singleton = 1",
+                "SELECT last_effective_ms, condition, monotonic_anchor_ns, boot_epoch
+                 FROM clock_state WHERE singleton = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        let stored_condition = stored.as_ref().map(|(_, condition)| condition.as_str());
-        let Some(utc_ms) = reading.utc_ms else {
-            let effective_now_ms = stored
-                .as_ref()
-                .map(|(value, _)| value.parse().map_err(storage))
-                .transpose()?
-                .unwrap_or(0);
-            write_clock_state(
-                &transaction,
-                effective_now_ms,
-                ClockCondition::Untrusted,
-                &reading,
-            )?;
+        let initializing = stored.is_none();
+        let stored_condition = stored
+            .as_ref()
+            .map(|(_, condition, _, _)| condition.as_str());
+        let previous = stored
+            .as_ref()
+            .map(|(value, _, anchor, persisted_epoch)| {
+                Ok::<_, JournalError>(PersistedClockState {
+                    last_effective_ms: value.parse().map_err(storage)?,
+                    monotonic_anchor_ns: anchor.parse().map_err(storage)?,
+                    // The absolute anchor is only comparable within the boot it
+                    // was sampled in, and the epoch was already persisted here.
+                    boot_epoch: comparable_boot_epoch(
+                        &BootEpoch::new(persisted_epoch.clone()).map_err(|_| {
+                            protocol(
+                                ProtocolErrorCode::ClockUntrusted,
+                                "persisted clock state has a malformed boot epoch",
+                            )
+                        })?,
+                    ),
+                })
+            })
+            .transpose()?;
+        let platform_reading = bloom_trusted_time::PlatformTimeReading {
+            utc_ms: reading.utc_ms,
+            monotonic_anchor_ns: reading.monotonic_anchor_ns,
+            monotonic_elapsed_ms: reading.monotonic_elapsed_ms,
+        };
+        let shared = evaluate_durable_clock(
+            previous,
+            &platform_reading,
+            comparable_boot_epoch(&reading.boot_epoch),
+            max_forward_step_ms,
+        )
+        .map_err(|cause| protocol(ProtocolErrorCode::ClockUntrusted, cause.to_string()))?;
+        let condition = broker_clock_condition(shared.condition);
+        let effective_now_ms = shared.effective_now_ms;
+
+        if shared.condition == DurableClockCondition::Untrusted {
+            write_clock_state(&transaction, effective_now_ms, condition, &reading)?;
             if stored_condition != Some("UNTRUSTED") {
                 self.append_audit_transaction(
                     &transaction,
@@ -1709,107 +1738,85 @@ impl BrokerJournal {
                 )
                 .into());
             }
-            return Ok(decision(effective_now_ms, ClockCondition::Untrusted));
-        };
-        let Some(last_effective_ms) = stored
-            .as_ref()
-            .map(|(value, _)| value.parse::<u64>().map_err(storage))
-            .transpose()?
-        else {
-            write_clock_state(&transaction, utc_ms, ClockCondition::Healthy, &reading)?;
-            self.append_audit_transaction(
-                &transaction,
-                "clock.initialized",
-                &serde_json::json!({
-                    "effective_now_ms": utc_ms.to_string(),
-                    "observed_utc_ms": utc_ms.to_string(),
-                    "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
-                    "boot_epoch": reading.boot_epoch
-                }),
-                self.audit_signer.as_ref(),
-            )?;
-            transaction.commit()?;
-            drop(connection);
-            self.checkpoint_committed_head()?;
-            return Ok(decision(utc_ms, ClockCondition::Healthy));
-        };
-        let monotonic_now = last_effective_ms
-            .checked_add(reading.monotonic_elapsed_ms)
-            .ok_or_else(|| {
-                protocol(
-                    ProtocolErrorCode::ClockUntrusted,
-                    "monotonic clock arithmetic overflow",
-                )
-            })?;
-        if utc_ms < last_effective_ms {
-            write_clock_state(
-                &transaction,
-                last_effective_ms,
-                ClockCondition::RollbackFrozen,
-                &reading,
-            )?;
-            if stored_condition != Some("ROLLBACK_FROZEN") {
-                self.append_audit_transaction(
-                    &transaction,
-                    "clock.rollback",
-                    &serde_json::json!({
-                        "observed_utc_ms": utc_ms.to_string(),
-                        "effective_now_ms": last_effective_ms.to_string(),
-                        "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
-                        "boot_epoch": reading.boot_epoch
-                    }),
-                    self.audit_signer.as_ref(),
-                )?;
-            }
-            transaction.commit()?;
-            drop(connection);
-            self.checkpoint_committed_head()?;
-            if rate_limited_mutation {
-                return Err(protocol(
-                    ProtocolErrorCode::ClockRollback,
-                    "UTC rollback detected; effective time is frozen",
-                )
-                .into());
-            }
-            return Ok(decision(last_effective_ms, ClockCondition::RollbackFrozen));
+            return Ok(decision(effective_now_ms, condition));
         }
-        let maximum_automatic = monotonic_now.saturating_add(max_forward_step_ms);
-        if utc_ms > maximum_automatic {
-            write_clock_state(
-                &transaction,
-                monotonic_now,
-                ClockCondition::ForwardJumpRejected,
-                &reading,
-            )?;
-            if stored_condition != Some("FORWARD_JUMP_REJECTED") {
-                self.append_audit_transaction(
-                    &transaction,
-                    "clock.forward_jump",
-                    &serde_json::json!({
-                        "observed_utc_ms": utc_ms.to_string(),
-                        "effective_now_ms": monotonic_now.to_string(),
-                        "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
-                        "boot_epoch": reading.boot_epoch
-                    }),
-                    self.audit_signer.as_ref(),
-                )?;
+
+        let utc_ms = reading.utc_ms.ok_or_else(|| {
+            protocol(
+                ProtocolErrorCode::ClockUntrusted,
+                "durable clock returned a trusted decision without UTC",
+            )
+        })?;
+        match shared.condition {
+            DurableClockCondition::Healthy => {
+                write_clock_state(&transaction, effective_now_ms, condition, &reading)?;
+                if initializing {
+                    self.append_audit_transaction(
+                        &transaction,
+                        "clock.initialized",
+                        &serde_json::json!({
+                            "effective_now_ms": effective_now_ms.to_string(),
+                            "observed_utc_ms": utc_ms.to_string(),
+                            "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                            "boot_epoch": reading.boot_epoch
+                        }),
+                        self.audit_signer.as_ref(),
+                    )?;
+                }
+                transaction.commit()?;
+                drop(connection);
+                self.checkpoint_committed_head()?;
+                Ok(decision(effective_now_ms, condition))
             }
-            transaction.commit()?;
-            drop(connection);
-            self.checkpoint_committed_head()?;
-            return Ok(decision(monotonic_now, ClockCondition::ForwardJumpRejected));
+            DurableClockCondition::RollbackFrozen => {
+                write_clock_state(&transaction, effective_now_ms, condition, &reading)?;
+                if stored_condition != Some("ROLLBACK_FROZEN") {
+                    self.append_audit_transaction(
+                        &transaction,
+                        "clock.rollback",
+                        &serde_json::json!({
+                            "observed_utc_ms": utc_ms.to_string(),
+                            "effective_now_ms": effective_now_ms.to_string(),
+                            "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                            "boot_epoch": reading.boot_epoch
+                        }),
+                        self.audit_signer.as_ref(),
+                    )?;
+                }
+                transaction.commit()?;
+                drop(connection);
+                self.checkpoint_committed_head()?;
+                if rate_limited_mutation {
+                    return Err(protocol(
+                        ProtocolErrorCode::ClockRollback,
+                        "UTC rollback detected; effective time is frozen",
+                    )
+                    .into());
+                }
+                Ok(decision(effective_now_ms, condition))
+            }
+            DurableClockCondition::ForwardJumpRejected => {
+                write_clock_state(&transaction, effective_now_ms, condition, &reading)?;
+                if stored_condition != Some("FORWARD_JUMP_REJECTED") {
+                    self.append_audit_transaction(
+                        &transaction,
+                        "clock.forward_jump",
+                        &serde_json::json!({
+                            "observed_utc_ms": utc_ms.to_string(),
+                            "effective_now_ms": effective_now_ms.to_string(),
+                            "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                            "boot_epoch": reading.boot_epoch
+                        }),
+                        self.audit_signer.as_ref(),
+                    )?;
+                }
+                transaction.commit()?;
+                drop(connection);
+                self.checkpoint_committed_head()?;
+                Ok(decision(effective_now_ms, condition))
+            }
+            DurableClockCondition::Untrusted => unreachable!("handled above"),
         }
-        let effective_now_ms = utc_ms.max(monotonic_now);
-        write_clock_state(
-            &transaction,
-            effective_now_ms,
-            ClockCondition::Healthy,
-            &reading,
-        )?;
-        transaction.commit()?;
-        drop(connection);
-        self.checkpoint_committed_head()?;
-        Ok(decision(effective_now_ms, ClockCondition::Healthy))
     }
 
     pub fn repair_clock(&self, accepted_utc_ms: u64) -> Result<ClockDecision, JournalError> {
@@ -1902,7 +1909,7 @@ impl BrokerJournal {
             .map_err(|_| JournalError::Storage("journal mutex poisoned".into()))
     }
 
-    fn lock_for_mutation(&self) -> Result<MutexGuard<'_, Connection>, JournalError> {
+    pub(crate) fn lock_for_mutation(&self) -> Result<MutexGuard<'_, Connection>, JournalError> {
         if self.audit_degraded.load(Ordering::SeqCst) {
             return Err(audit_degraded());
         }
@@ -1918,7 +1925,10 @@ impl BrokerJournal {
         self.connection.clone()
     }
 
-    pub(crate) fn verify_before_external_mutation(
+    /// Verify the already-locked journal target used during legacy migration.
+    /// Runtime mutations must obtain a verified guard through
+    /// `lock_for_mutation` instead.
+    pub(crate) fn verify_migration_target(
         &self,
         connection: &Connection,
     ) -> Result<(), JournalError> {
@@ -2436,6 +2446,23 @@ fn audit_rotation_message(
         prior_head.as_str().as_bytes(),
     ]
     .concat()
+}
+
+fn broker_clock_condition(condition: DurableClockCondition) -> ClockCondition {
+    match condition {
+        DurableClockCondition::Healthy => ClockCondition::Healthy,
+        DurableClockCondition::Untrusted => ClockCondition::Untrusted,
+        DurableClockCondition::RollbackFrozen => ClockCondition::RollbackFrozen,
+        DurableClockCondition::ForwardJumpRejected => ClockCondition::ForwardJumpRejected,
+    }
+}
+
+/// A boot epoch usable for comparing monotonic domains, or `None` when the
+/// domain is unknown. The all-zero sentinel means "not recorded" and must not
+/// compare equal to itself, or two unknown boots would look like one.
+fn comparable_boot_epoch(epoch: &BootEpoch) -> Option<[u8; 16]> {
+    let bytes = epoch.to_bytes();
+    (bytes != [0; 16]).then_some(bytes)
 }
 
 fn write_clock_state(

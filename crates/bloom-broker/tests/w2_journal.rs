@@ -391,6 +391,168 @@ fn reservation_fails_closed_without_canonical_active_approval() {
 }
 
 #[test]
+fn broker_clock_rejects_downtime_credited_across_a_boot_change() {
+    // The kernel's suspend-aware clock restarts at zero on boot, so a current
+    // anchor can exceed a persisted one while belonging to a different boot.
+    // Crediting that delta would advance effective time by downtime that never
+    // elapsed and let a large forward UTC step pass the guard.
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("clock-reboot.sqlite");
+    let journal = open_journal(&path);
+    journal
+        .observe_time(
+            TimeReading {
+                utc_ms: Some(1_000),
+                monotonic_elapsed_ms: 0,
+                // One minute into the prior boot.
+                monotonic_anchor_ns: 60 * 1_000_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
+            },
+            1_000,
+            false,
+        )
+        .unwrap();
+    drop(journal);
+
+    let rebooted = open_journal(&path);
+    let decision = rebooted
+        .observe_time(
+            TimeReading {
+                utc_ms: Some(1_000 + 2 * 60 * 60 * 1_000),
+                monotonic_elapsed_ms: 0,
+                // Two hours into the new boot: numerically larger, so the
+                // rollback check cannot catch it.
+                monotonic_anchor_ns: 2 * 60 * 60 * 1_000_000_000,
+                boot_epoch: BootEpoch::from_bytes([2; 16]),
+            },
+            1_000,
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(decision.condition, ClockCondition::ForwardJumpRejected);
+    assert_eq!(decision.effective_now_ms, 1_000);
+}
+
+#[test]
+fn broker_clock_restart_credits_downtime_via_absolute_monotonic_anchor() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("clock-restart.sqlite");
+    let journal = open_journal(&path);
+    journal
+        .observe_time(
+            TimeReading {
+                utc_ms: Some(1_000),
+                monotonic_elapsed_ms: 0,
+                monotonic_anchor_ns: 1_000_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
+            },
+            1_000,
+            false,
+        )
+        .unwrap();
+    drop(journal);
+
+    let restarted = open_journal(&path);
+    let decision = restarted
+        .observe_time(
+            TimeReading {
+                utc_ms: Some(6_000),
+                // A fresh process sampler reports zero on its first sample.
+                monotonic_elapsed_ms: 0,
+                monotonic_anchor_ns: 6_000_000_000,
+                // Same boot: a Broker *process* restart, which the anchor
+                // delta may credit. A reboot is covered by the test below.
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
+            },
+            1_000,
+            false,
+        )
+        .unwrap();
+    assert_eq!(decision.effective_now_ms, 6_000);
+    assert_eq!(decision.condition, ClockCondition::Healthy);
+}
+
+#[test]
+fn broker_clock_restart_keeps_monotonic_domain_reset_fail_closed() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("clock-reset.sqlite");
+    let journal = open_journal(&path);
+    journal
+        .observe_time(
+            TimeReading {
+                utc_ms: Some(1_000),
+                monotonic_elapsed_ms: 0,
+                monotonic_anchor_ns: 2_000_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
+            },
+            1_000,
+            false,
+        )
+        .unwrap();
+    drop(journal);
+
+    let restarted = open_journal(&path);
+    let decision = restarted
+        .observe_time(
+            TimeReading {
+                utc_ms: Some(6_000),
+                monotonic_elapsed_ms: 0,
+                monotonic_anchor_ns: 1_000_000_000,
+                boot_epoch: BootEpoch::from_bytes([2; 16]),
+            },
+            1_000,
+            false,
+        )
+        .unwrap();
+    assert_eq!(decision.effective_now_ms, 1_000);
+    assert_eq!(decision.condition, ClockCondition::ForwardJumpRejected);
+}
+
+#[test]
+fn broker_clock_legacy_zero_anchor_does_not_grant_restart_credit() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("clock-legacy.sqlite");
+    let journal = open_journal(&path);
+    journal
+        .observe_time(
+            TimeReading {
+                utc_ms: Some(1_000),
+                monotonic_elapsed_ms: 0,
+                monotonic_anchor_ns: 1_000_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
+            },
+            1_000,
+            false,
+        )
+        .unwrap();
+    drop(journal);
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE clock_state SET monotonic_anchor_ns = '0' WHERE singleton = 1",
+            [],
+        )
+        .unwrap();
+
+    let restarted = open_journal(&path);
+    let decision = restarted
+        .observe_time(
+            TimeReading {
+                utc_ms: Some(6_000),
+                monotonic_elapsed_ms: 0,
+                monotonic_anchor_ns: 6_000_000_000,
+                boot_epoch: BootEpoch::from_bytes([2; 16]),
+            },
+            1_000,
+            false,
+        )
+        .unwrap();
+    assert_eq!(decision.effective_now_ms, 1_000);
+    assert_eq!(decision.condition, ClockCondition::ForwardJumpRejected);
+}
+
+#[test]
 fn ac10_clock_faults_freeze_or_advance_effective_time_fail_closed() {
     let journal = memory_journal();
     install_reservation_approval(&journal);

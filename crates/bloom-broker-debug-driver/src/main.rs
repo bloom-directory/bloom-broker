@@ -1,5 +1,5 @@
 use std::{
-    env,
+    env, fs,
     io::{Read as _, Write as _},
     net::TcpStream,
     path::PathBuf,
@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let command = args
         .next()
-        .ok_or("usage: bloom-broker-debug-driver complete URL SEED [options] | assert-machine-secret-confinement --signer-db PATH --authenticator-seed SEED --artifact PATH [...]")?;
+        .ok_or("usage: bloom-broker-debug-driver complete URL (--authenticator-seed-file PATH | SEED) [options] | assert-machine-secret-confinement --signer-db PATH --authenticator-seed SEED --artifact PATH [...]")?;
     if command == "assert-machine-secret-confinement" {
         return assert_machine_secret_confinement_command(args);
     }
@@ -25,9 +25,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("unsupported debug-driver command: {command}").into());
     }
     let url = args.next().ok_or("complete requires a ceremony URL")?;
-    let seed = args
+    let seed_arg = args
         .next()
         .ok_or("complete requires an authenticator seed")?;
+    let seed = if seed_arg == "--authenticator-seed-file" {
+        let path = PathBuf::from(
+            args.next()
+                .ok_or("--authenticator-seed-file requires a path")?,
+        );
+        read_protected_seed_file(&path)?
+    } else {
+        seed_arg
+    };
     let mut new_seed = None;
     let mut raw_private_key = None;
     let mut sign_count = 1_u32;
@@ -219,6 +228,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn read_protected_seed_file(path: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err("authenticator seed path must be a regular file".into());
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err("authenticator seed file must not be accessible by group or other".into());
+    }
+    read_nonempty_seed(path)
+}
+
+#[cfg(not(unix))]
+fn read_protected_seed_file(path: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+    read_nonempty_seed(path)
+}
+
+fn read_nonempty_seed(path: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+    let seed = fs::read_to_string(path)?;
+    let seed = seed.trim_end_matches(['\r', '\n']).to_owned();
+    if seed.is_empty() {
+        return Err("authenticator seed file is empty".into());
+    }
+    Ok(seed)
+}
+
 fn assert_machine_secret_confinement_command(
     mut args: impl Iterator<Item = String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -307,4 +344,43 @@ fn request(
         .into());
     }
     Ok(serde_json::from_slice(response_body)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_protected_seed_file;
+    use std::{fs, path::PathBuf};
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bloom-debug-driver-{name}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_seed_file_rejects_group_readable_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = temp_path("permissions");
+        fs::write(&path, "secret\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let error = read_protected_seed_file(&path).unwrap_err();
+        fs::remove_file(&path).unwrap();
+        assert!(error.to_string().contains("group or other"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_seed_file_reads_mode_0600_and_trims_newline() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = temp_path("success");
+        fs::write(&path, "secret\r\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_protected_seed_file(&path).unwrap(), "secret");
+        fs::remove_file(&path).unwrap();
+    }
 }
