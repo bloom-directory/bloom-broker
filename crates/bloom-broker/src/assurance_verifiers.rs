@@ -154,6 +154,34 @@ mod tests {
         }
     }
 
+    fn system_claim(
+        destination: &Pubkey,
+        lamports: u64,
+        digest: [u8; 32],
+        blockhash: [u8; 32],
+    ) -> SystemUseClaim {
+        let petal = solana_claim(&destination.to_string(), lamports, digest);
+        SystemUseClaim {
+            component_id: Token::new("bloom-machine").unwrap(),
+            action_class: Token::new("solana.transfer.confirm").unwrap(),
+            operation_class: petal.operation_class,
+            crypto_suite: petal.crypto_suite,
+            payload_digest: petal.payload_digest,
+            ordered_hashes: petal.ordered_hashes,
+            declared_debits: petal.declared_debits,
+            declared_destinations: petal.declared_destinations,
+            declared_fee: petal.declared_fee,
+            nonce: petal.nonce,
+            chain_context: SystemChainContext {
+                chain_family: Token::new("solana").unwrap(),
+                genesis_hash: "local-validator-genesis".into(),
+                recent_blockhash: bs58::encode(blockhash).into_string(),
+                last_valid_block_height: DecimalU64::new(123),
+            },
+            claim_assurance: petal.claim_assurance,
+        }
+    }
+
     #[test]
     fn verifies_golden_shaped_transfer() {
         let payer = Pubkey::from_bytes([1u8; 32]);
@@ -205,6 +233,65 @@ mod tests {
                 .unwrap_err()
                 .contains("blockhash")
         );
+    }
+
+    #[test]
+    fn generated_transfers_and_adversarial_claim_mutations_fail_closed() {
+        for case in 0u8..64 {
+            let payer = Pubkey::from_bytes([case.wrapping_add(1); 32]);
+            let destination = Pubkey::from_bytes([case.wrapping_add(2); 32]);
+            let lamports = 1_000 + u64::from(case);
+            let blockhash = [case.wrapping_add(7); 32];
+            let message = transfer_message(payer, destination, lamports, blockhash)
+                .unwrap()
+                .serialize();
+            let digest = bloom_solana::message_digest(&message);
+            let verifier = SolanaSystemTransferVerifier;
+            let claim = system_claim(&destination, lamports, digest, blockhash);
+            verifier.verify_system(&claim, Some(&message)).unwrap();
+
+            let mut wrong_destination = claim.clone();
+            wrong_destination.declared_destinations[0].destination =
+                Pubkey::from_bytes([0xee; 32]).to_string();
+            assert!(
+                verifier
+                    .verify_system(&wrong_destination, Some(&message))
+                    .is_err()
+            );
+
+            let mut wrong_amount = claim.clone();
+            wrong_amount.declared_debits[0].amount =
+                bloom_broker_api::DecimalU256::parse((lamports + 1).to_string()).unwrap();
+            assert!(
+                verifier
+                    .verify_system(&wrong_amount, Some(&message))
+                    .is_err()
+            );
+
+            let mut wrong_blockhash = claim.clone();
+            wrong_blockhash.chain_context.recent_blockhash = bs58::encode([0xdd; 32]).into_string();
+            assert!(
+                verifier
+                    .verify_system(&wrong_blockhash, Some(&message))
+                    .is_err()
+            );
+
+            let mut wrong_digest = claim.clone();
+            wrong_digest.payload_digest = Digest32::from_bytes([0xcc; 32]);
+            assert!(
+                verifier
+                    .verify_system(&wrong_digest, Some(&message))
+                    .is_err()
+            );
+
+            let mut wrong_suite = claim;
+            wrong_suite.crypto_suite = CryptoSuite::Secp256k1Keccak256Recoverable;
+            assert!(
+                verifier
+                    .verify_system(&wrong_suite, Some(&message))
+                    .is_err()
+            );
+        }
     }
 
     #[test]
