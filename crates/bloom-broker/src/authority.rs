@@ -851,8 +851,7 @@ impl BrokerAuthority {
             .request_digest()
             .map_err(|error| denied("ACCOUNT_TERMS_INVALID", error.to_string()))?;
         let terms_jcs = serde_jcs::to_string(terms).map_err(storage)?;
-        let mut connection = self.lock()?;
-        self.journal.verify_before_external_mutation(&connection)?;
+        let mut connection = self.journal.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         let existing: Option<(String, String)> = transaction
             .query_row(
@@ -942,8 +941,7 @@ impl BrokerAuthority {
                 "allocated child does not match the committed derivation request",
             ));
         }
-        let mut connection = self.lock()?;
-        self.journal.verify_before_external_mutation(&connection)?;
+        let mut connection = self.journal.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         transaction.execute(
             "UPDATE committed_account_terms SET state = 'ADOPTED'
@@ -1000,8 +998,7 @@ impl BrokerAuthority {
                 "retirement receipt contradicts the committed terms",
             ));
         }
-        let mut connection = self.lock()?;
-        self.journal.verify_before_external_mutation(&connection)?;
+        let mut connection = self.journal.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         transaction.execute(
             "UPDATE committed_account_terms SET state = 'ADOPTED'
