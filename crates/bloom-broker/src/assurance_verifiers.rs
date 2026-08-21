@@ -242,9 +242,16 @@ mod tests {
             let destination = Pubkey::from_bytes([case.wrapping_add(2); 32]);
             let lamports = 1_000 + u64::from(case);
             let blockhash = [case.wrapping_add(7); 32];
-            let message = transfer_message(payer, destination, lamports, blockhash)
-                .unwrap()
-                .serialize();
+            // Construct with the production Machine-side constructor from
+            // the pinned Bloom revision; verification below remains in this
+            // repository's independent Broker parser.
+            let message = bloom_solana_tx::build_transfer_message(
+                &payer.to_bytes(),
+                &destination.to_bytes(),
+                lamports,
+                &blockhash,
+            )
+            .unwrap();
             let digest = bloom_solana::message_digest(&message);
             let verifier = SolanaSystemTransferVerifier;
             let claim = system_claim(&destination, lamports, digest, blockhash);
