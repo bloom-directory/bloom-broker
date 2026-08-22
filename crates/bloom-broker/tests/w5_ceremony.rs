@@ -262,6 +262,65 @@ process.stdout.write("browser-reload-ok");
 }
 
 #[test]
+fn browser_approval_failure_is_logged_displayed_and_retryable() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+globalThis.crypto = require("node:crypto").webcrypto;
+const elements = new Map();
+globalThis.document = {{getElementById: id => {{
+  if (!elements.has(id)) elements.set(id, {{disabled: true}});
+  return elements.get(id);
+}}}};
+globalThis.location = {{pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+const logged = [];
+globalThis.console = {{error: (...args) => logged.push(args)}};
+{executable}
+const failure = new Error("Signer rejected completion");
+reportApprovalFailure(failure);
+if (statusNode.textContent !== "Passkey verification failed. Please try again.") {{
+  throw new Error(`failure was not displayed: ${{statusNode.textContent}}`);
+}}
+if (approve.disabled) throw new Error("approval retry was not enabled");
+if (logged.length !== 1 || logged[0][0] !== "Bloom ceremony failed" ||
+    logged[0][1] !== failure) {{
+  throw new Error("full ceremony failure was not logged");
+}}
+const cancellationFailure = new Error("internal cancellation detail");
+reportCeremonyError(cancellationFailure, "Cancellation failed. Please try again.");
+if (statusNode.textContent !== "Cancellation failed. Please try again.") {{
+  throw new Error("safe cancellation failure was not displayed");
+}}
+if (logged.length !== 2 || logged[1][1] !== cancellationFailure) {{
+  throw new Error("full cancellation failure was not logged");
+}}
+process.stdout.write("browser-error-feedback-ok");
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate ceremony error feedback");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "browser-error-feedback-ok"
+    );
+    assert!(asset.contains("approve.onclick = () => run(session).catch(reportApprovalFailure)"));
+    assert!(asset.contains("Cancellation failed. Please try again."));
+    assert!(asset.contains("Ceremony failed to load. Please refresh and try again."));
+}
+
+#[test]
 fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
     let shell = include_str!("../src/ceremony_assets/index.html");
     for required in [
@@ -1695,10 +1754,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
 
     let parent_key = machine_registration_result.public_key_refs[0].clone();
     let derive_operation = operation("d2");
-    // This end-to-end ceremony performs several authenticated RPC round trips
-    // before exercising the derived key. Keep the scope comfortably alive on
-    // clean CI runners; the test still waits for and verifies expiry below.
-    let scope_lifetime_ms = 30_000;
+    let scope_lifetime_ms = 60_000;
+    let approval_lifetime_ms = 30_000;
     let scope = PetalKeyScope {
         wallet_id: wallet_id.clone(),
         parent_key_ref: parent_key.clone(),
@@ -1853,7 +1910,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .as_millis()
         .try_into()
         .unwrap();
-    let approval_expires_at_ms = scope_started_ms + scope_lifetime_ms;
+    let approval_expires_at_ms = scope_started_ms + approval_lifetime_ms;
     let approval_terms = SealedApprovalTerms {
         subject: ApprovalSubject::Petal {
             package_hash: petal_package.clone(),
@@ -2008,6 +2065,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let exact_payload = b"fixture-exact-petal-action";
     let exact_payload_digest = Digest32::from_bytes(sha2::Sha256::digest(exact_payload).into());
     let mut exact_terms = approval_terms.clone();
+    exact_terms.expires_at_ms = DecimalU64::new(scope_started_ms + scope_lifetime_ms);
     exact_terms.selector = ApprovalSelector::Exact {
         ordered_payload_digests: vec![exact_payload_digest.clone()],
         ordered_hashes: vec![exact_payload_digest],
@@ -2114,16 +2172,21 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         )
         .await
         .unwrap();
-    assert_eq!(exact_complete_response.status(), StatusCode::OK);
-    let exact_receipt: SignerActivationReceipt = serde_json::from_slice(
-        &exact_complete_response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .unwrap();
+    let exact_complete_status = exact_complete_response.status();
+    let exact_complete_body = exact_complete_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(
+        exact_complete_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&exact_complete_body)
+    );
+    let exact_receipt: SignerActivationReceipt =
+        serde_json::from_slice(&exact_complete_body).unwrap();
     assert_eq!(
         exact_receipt.approval_id,
         exact_terms.approval_id().unwrap()

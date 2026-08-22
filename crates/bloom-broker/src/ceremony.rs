@@ -1588,14 +1588,13 @@ impl CeremonyBroker {
         };
         let encoded =
             String::from_utf8(serde_jcs::to_vec(session).map_err(malformed)?).map_err(malformed)?;
-        let mut database = database
-            .lock()
-            .map_err(|_| storage("ceremony database mutex poisoned"))?;
-        if let Some(journal) = &self.inner.journal {
-            journal
-                .verify_before_external_mutation(&database)
-                .map_err(storage)?;
-        }
+        let mut database = if let Some(journal) = &self.inner.journal {
+            journal.lock_for_mutation().map_err(storage)?
+        } else {
+            database
+                .lock()
+                .map_err(|_| storage("ceremony database mutex poisoned"))?
+        };
         let transaction = database.transaction().map_err(storage)?;
         transaction
             .execute(
@@ -2541,9 +2540,7 @@ fn migrate_legacy_ceremonies(
     target
         .execute("ATTACH DATABASE ?1 AS ceremony_legacy", [&legacy_path])
         .map_err(storage)?;
-    journal
-        .verify_before_external_mutation(target)
-        .map_err(storage)?;
+    journal.verify_migration_target(target).map_err(storage)?;
     let migration = (|| -> Result<(), ProtocolError> {
         let transaction = target.transaction().map_err(storage)?;
         transaction
