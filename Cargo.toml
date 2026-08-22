@@ -14,7 +14,7 @@ license = "MIT"
 
 [workspace.dependencies]
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "19d0465d53b279e6e1c98bac533510a1e7eb8f44" }
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "dc24d20f084ea595b1fa8d0c06bd52dd2aabe4d4" }
+bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "59c12e15438e436979eb30a27b2e9534a3f97615" }
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "19d0465d53b279e6e1c98bac533510a1e7eb8f44" }
 bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "19d0465d53b279e6e1c98bac533510a1e7eb8f44" }
 bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "19d0465d53b279e6e1c98bac533510a1e7eb8f44" }
