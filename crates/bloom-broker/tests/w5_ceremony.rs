@@ -1924,6 +1924,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             package_hash: petal_package.clone(),
             route: petal_route.into(),
             allowed_operation_classes: scope.allowed_operation_classes.clone(),
+            route_grants: Vec::new(),
             required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
         },
         limits: ApprovalLimits {
@@ -3139,6 +3140,7 @@ async fn machine_asserted_reusable_plan_carries_primary_surface_warning() {
         package_hash: digest("19"),
         route: "wallet/send".into(),
         allowed_operation_classes: vec![Token::new("transfer").unwrap()],
+        route_grants: Vec::new(),
         required_claim_assurance: bloom_signer_api::ClaimAssuranceLevel::MachineAsserted,
     };
     request.exact_ordered_payload_digests.clear();

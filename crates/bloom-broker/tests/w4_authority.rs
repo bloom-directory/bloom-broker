@@ -1739,6 +1739,7 @@ fn petal_terms(harness: &Harness, provenance: &ProvenanceRecord) -> SealedApprov
             package_hash,
             route,
             allowed_operation_classes: vec![token("transfer"), token("authenticate")],
+            route_grants: Vec::new(),
             required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
         },
         limits: ApprovalLimits {
