@@ -1216,12 +1216,11 @@ impl BrokerAuthority {
                         package_hash: package_hash.clone(),
                         route: grant.route.clone(),
                     })?;
-                    let granted_digest = granted.digest().map_err(storage)?;
                     verify_provenance(
                         &granted,
                         &self.installer_key_id,
                         &self.installer_key,
-                        &granted_digest,
+                        &grant.provenance_digest,
                     )?;
                     let granted_classes: BTreeSet<_> = granted
                         .operation_classes
@@ -1729,7 +1728,20 @@ impl BrokerAuthority {
             ApprovalSelector::Petal { route_grants, .. } if !route_grants.is_empty()
         );
         let expected_provenance_digest = if multi_route {
-            current_provenance.digest().map_err(storage)?
+            let ProvenanceSubject::Petal { route, .. } = &input.request.provenance else {
+                return Err(denied(
+                    "PROVENANCE_MISMATCH",
+                    "multi-route approval requires Petal provenance",
+                ));
+            };
+            let ApprovalSelector::Petal { route_grants, .. } = &terms.selector else {
+                unreachable!("multi_route requires a Petal selector")
+            };
+            route_grants
+                .iter()
+                .find(|grant| &grant.route == route)
+                .map(|grant| grant.provenance_digest.clone())
+                .ok_or_else(|| denied("PROVENANCE_MISMATCH", "executing route is not granted"))?
         } else {
             terms.provenance_digest.clone()
         };

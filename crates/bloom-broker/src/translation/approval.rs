@@ -67,6 +67,7 @@ fn selector_to_signer(value: north::ApprovalSelector) -> south::ApprovalSelector
                 .map(|grant| south::PetalRouteGrant {
                     route: grant.route,
                     allowed_operation_classes: grant.allowed_operation_classes,
+                    provenance_digest: grant.provenance_digest,
                 })
                 .collect(),
             required_claim_assurance: assurance_to_signer(required_claim_assurance),
