@@ -12,9 +12,9 @@ use bloom_broker_api::{
     Base64UrlBytes, BootEpoch, CeremonyKind, CeremonyState, ClaimAssurance, ClaimAssuranceLevel,
     CryptoSuite, CustodyResult, DecimalU64, DecimalU256, DeclaredDebit, DeclaredDestination,
     DeclaredFee, Digest32, KeyRef, KeySpec, MachineSignRequest, OperationId,
-    PROVENANCE_CATALOG_SCHEMA, PetalKeyScope, PetalLineageMembership, PetalUseClaim,
-    PolicyUpdateRequest, ProvenanceCatalog, RequestNonce, RevocationState, SealedApprovalTerms,
-    SignedPolicySnapshot, SigningPayloads, Token, ValueLimit,
+    PROVENANCE_CATALOG_SCHEMA, PetalKeyScope, PetalLineageMembership, PetalRouteGrant,
+    PetalUseClaim, PolicyUpdateRequest, ProvenanceCatalog, RequestNonce, RevocationState,
+    SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads, Token, ValueLimit,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
@@ -824,7 +824,7 @@ fn petal_scoped_key_is_frozen_to_installer_provenance_and_petal_approvals() {
         route: "/sign".into(),
         lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
         key_slot: token("advisory"),
-        allowed_routes: vec!["/sign".into()],
+        allowed_routes: vec!["/other".into(), "/sign".into()],
         allowed_operation_classes: vec![token("transfer")],
         allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
         maximum_lifetime_ms: DecimalU64::new(10_000),
@@ -894,7 +894,7 @@ fn petal_scoped_key_is_frozen_to_installer_provenance_and_petal_approvals() {
     );
 
     let mut terms = petal_terms(&harness, &provenance);
-    terms.key_ref = child;
+    terms.key_ref = child.clone();
     terms.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Sha256Recoverable];
     if let ApprovalSelector::Petal {
         allowed_operation_classes,
@@ -903,6 +903,53 @@ fn petal_scoped_key_is_frozen_to_installer_provenance_and_petal_approvals() {
     {
         *allowed_operation_classes = vec![token("transfer")];
     }
+
+    let mut secondary = provenance.clone();
+    secondary.subject = ProvenanceSubject::Petal {
+        package_hash: digest(9),
+        route: "/other".into(),
+    };
+    secondary.operation_classes = vec![ProvenanceOperationClass {
+        operation_class: token("transfer"),
+        fee_asset: None,
+    }];
+    secondary.petal_lineage.as_mut().unwrap().active = false;
+    sign_zeroed(
+        &mut secondary,
+        |value| &mut value.installer_signature,
+        PROVENANCE_DOMAIN,
+        &harness.installer_key,
+    );
+    harness.authority.install_provenance(&secondary).unwrap();
+
+    let mut multi_route = terms.clone();
+    let secondary_digest =
+        Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(&secondary).unwrap()).into());
+    if let ApprovalSelector::Petal { route_grants, .. } = &mut multi_route.selector {
+        *route_grants = vec![
+            PetalRouteGrant {
+                route: "/other".into(),
+                allowed_operation_classes: vec![token("transfer")],
+                provenance_digest: secondary_digest,
+            },
+            PetalRouteGrant {
+                route: "/sign".into(),
+                allowed_operation_classes: vec![token("transfer")],
+                provenance_digest: multi_route.provenance_digest.clone(),
+            },
+        ];
+    }
+    assert!(
+        error_code(
+            harness
+                .authority
+                .prepare_approval(&multi_route, &digest(7))
+                .unwrap_err()
+        )
+        .contains("PROVENANCE_LINEAGE_MISMATCH"),
+        "an inactive secondary grant must not inherit the origin route's lineage"
+    );
+
     harness.activate(&terms, Some(&provenance));
     harness
         .authority
@@ -1738,7 +1785,7 @@ fn petal_terms(harness: &Harness, provenance: &ProvenanceRecord) -> SealedApprov
         selector: ApprovalSelector::Petal {
             package_hash,
             route,
-            allowed_operation_classes: vec![token("transfer"), token("authenticate")],
+            allowed_operation_classes: vec![token("authenticate"), token("transfer")],
             route_grants: Vec::new(),
             required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
         },

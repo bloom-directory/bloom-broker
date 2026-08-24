@@ -1087,27 +1087,56 @@ impl BrokerAuthority {
             } => (package_hash, route),
             _ => unreachable!("identity_matches requires a Petal subject"),
         };
+        let ApprovalSelector::Petal {
+            allowed_operation_classes,
+            route_grants,
+            ..
+        } = &terms.selector
+        else {
+            return Err(denied(
+                "PETAL_KEY_SCOPE_MISMATCH",
+                "derived Petal keys require a Petal approval selector",
+            ));
+        };
+        self.validate_scoped_route_lineage(&scope, package_hash, route, allowed_operation_classes)?;
+        for grant in route_grants {
+            self.validate_scoped_route_lineage(
+                &scope,
+                package_hash,
+                &grant.route,
+                &grant.allowed_operation_classes,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_scoped_route_lineage(
+        &self,
+        scope: &PetalKeyScope,
+        package_hash: &Digest32,
+        route: &str,
+        allowed_operation_classes: &[Token],
+    ) -> Result<(), AuthorityError> {
         let provenance = self.catalog_provenance(&ProvenanceSubject::Petal {
             package_hash: package_hash.clone(),
-            route: route.clone(),
+            route: route.to_owned(),
         })?;
         let active_lineage = provenance.petal_lineage.as_ref().is_some_and(|membership| {
             membership.active && membership.lineage_id == scope.lineage_id
         });
+        let declared_classes: BTreeSet<_> = provenance
+            .operation_classes
+            .iter()
+            .map(|declared| &declared.operation_class)
+            .collect();
         if !active_lineage
-            || scope
-                .allowed_operation_classes
+            || allowed_operation_classes
                 .iter()
-                .any(|operation_class| {
-                    !provenance
-                        .operation_classes
-                        .iter()
-                        .any(|declared| &declared.operation_class == operation_class)
-                })
+                .any(|operation_class| !declared_classes.contains(operation_class))
         {
             return Err(denied(
                 "PROVENANCE_LINEAGE_MISMATCH",
-                "current package is not an active authorized member of the key lineage",
+                "every granted route must remain an active member of the derived-key lineage",
             ));
         }
         Ok(())
