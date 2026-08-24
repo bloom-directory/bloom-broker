@@ -3859,6 +3859,54 @@ fn rolling_creation_limits_survive_terminal_sessions_and_bound_anonymous_registr
 }
 
 #[test]
+fn zero_effective_time_fails_closed_before_anonymous_creation_quota() {
+    let signer = Arc::new(MockSigner::new());
+    let broker = CeremonyBroker::new(signer);
+    for index in 0..4_u8 {
+        let operation_id = operation(&format!("b{index}"));
+        broker
+            .prepare_custody(
+                CustodyPrepareRequest {
+                    ceremony_kind: CeremonyKind::WalletRegistration,
+                    custody_operation_id: operation_id.clone(),
+                    wallet_id: Some(Token::new(format!("wallet-b{index}")).unwrap()),
+                    key_ref: None,
+                    exact_terms_digest: digest("34"),
+                    expected_input_class: Token::new("passkey-prf").unwrap(),
+                    browser_output_recipient_key: None,
+                    petal_key_scope: None,
+                    legacy_passkey_migration: None,
+                },
+                1 + u64::from(index),
+            )
+            .unwrap();
+        broker.cancel(&operation_id, 1 + u64::from(index)).unwrap();
+    }
+
+    let error = broker
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::WalletRegistration,
+                custody_operation_id: operation("bf"),
+                wallet_id: Some(Token::new("wallet-bf").unwrap()),
+                key_ref: None,
+                exact_terms_digest: digest("34"),
+                expected_input_class: Token::new("passkey-prf").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+            },
+            0,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::ClockUntrusted);
+    assert_eq!(
+        error.message,
+        "trusted platform time is required to create a ceremony"
+    );
+}
+
+#[test]
 fn cancellation_backoff_reports_remaining_cooldown_and_resets_after_expiry() {
     let signer = Arc::new(MockSigner::new());
     let broker = CeremonyBroker::new(signer);
