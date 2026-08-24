@@ -1087,25 +1087,30 @@ impl BrokerAuthority {
             } => (package_hash, route),
             _ => unreachable!("identity_matches requires a Petal subject"),
         };
-        let ApprovalSelector::Petal {
-            allowed_operation_classes,
-            route_grants,
-            ..
-        } = &terms.selector
-        else {
-            return Err(denied(
-                "PETAL_KEY_SCOPE_MISMATCH",
-                "derived Petal keys require a Petal approval selector",
-            ));
-        };
-        self.validate_scoped_route_lineage(&scope, package_hash, route, allowed_operation_classes)?;
-        for grant in route_grants {
-            self.validate_scoped_route_lineage(
-                &scope,
-                package_hash,
-                &grant.route,
-                &grant.allowed_operation_classes,
-            )?;
+        match &terms.selector {
+            ApprovalSelector::Exact { .. } => {
+                self.validate_scoped_route_lineage(&scope, package_hash, route, &[])?;
+            }
+            ApprovalSelector::Petal {
+                allowed_operation_classes,
+                route_grants,
+                ..
+            } => {
+                self.validate_scoped_route_lineage(
+                    &scope,
+                    package_hash,
+                    route,
+                    allowed_operation_classes,
+                )?;
+                for grant in route_grants {
+                    self.validate_scoped_route_lineage(
+                        &scope,
+                        package_hash,
+                        &grant.route,
+                        &grant.allowed_operation_classes,
+                    )?;
+                }
+            }
         }
         Ok(())
     }
