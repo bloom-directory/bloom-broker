@@ -208,7 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Own the canonical origin before opening or mutating any durable Broker
     // authority state. A losing AC-31 contender must die without racing the
     // owning Broker's journal or checkpoint store.
-    let ceremony_listener = match CeremonyBroker::bind_canonical() {
+    let ceremony_listener = match acquire_ceremony_listener() {
         Ok(listener) => {
             if let Some(path) = startup_status_path.as_deref() {
                 clear_startup_failure(path, broker_effective_uid)?;
@@ -219,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(path) = startup_status_path.as_deref() {
                 write_listener_conflict(path, broker_effective_uid, containment.as_ref())?;
             }
-            return Err(error.into());
+            return Err(error);
         }
     };
     let broker_signing_key = take_signing_key(&mut config.broker_signing_seed_hex)?;
@@ -740,15 +740,28 @@ fn acquire_unix_listener(
     Ok(bloom_service_activation::bind_owned_unix_listener(&path)?)
 }
 
+#[cfg(target_os = "macos")]
+fn acquire_ceremony_listener() -> Result<std::net::TcpListener, Box<dyn std::error::Error>> {
+    Ok(CeremonyBroker::bind_canonical()?)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn acquire_ceremony_listener() -> Result<std::net::TcpListener, Box<dyn std::error::Error>> {
+    let name = std::env::var("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME")
+        .unwrap_or_else(|_| "broker-ceremony".to_string());
+    Ok(bloom_service_activation::take_tcp_listener(&name)?)
+}
+
 #[cfg(not(target_os = "macos"))]
 fn acquire_unix_listener(
-    _path_variable: &str,
-    activation_variable: &str,
-    default_activation_name: &str,
+    path_variable: &str,
+    _activation_variable: &str,
+    _default_activation_name: &str,
 ) -> Result<std::os::unix::net::UnixListener, Box<dyn std::error::Error>> {
-    let name =
-        std::env::var(activation_variable).unwrap_or_else(|_| default_activation_name.to_string());
-    Ok(bloom_service_activation::take_unix_listener(&name)?)
+    let path = std::env::var_os(path_variable)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{path_variable} is required by the Linux service profile"))?;
+    Ok(bloom_service_activation::bind_owned_unix_listener(&path)?)
 }
 
 fn require_clock_repair_confirmation(

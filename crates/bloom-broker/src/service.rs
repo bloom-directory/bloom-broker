@@ -328,7 +328,7 @@ impl BrokerRpcService {
                 Ok(Response::WalletRegistrationPrepare(
                     self.ceremony.prepare_custody(
                         translate_custody::prepare_to_signer(request),
-                        self.clock.now_ms(false)?,
+                        self.clock.now_ms(true)?,
                     )?,
                 ))
             }
@@ -346,7 +346,7 @@ impl BrokerRpcService {
                 Ok(Response::WalletImportPrepare(
                     self.ceremony.prepare_custody(
                         translate_custody::prepare_to_signer(request),
-                        self.clock.now_ms(false)?,
+                        self.clock.now_ms(true)?,
                     )?,
                 ))
             }
@@ -358,7 +358,7 @@ impl BrokerRpcService {
                 Ok(Response::WalletExportPrepare(
                     self.ceremony.prepare_custody(
                         translate_custody::prepare_to_signer(request),
-                        self.clock.now_ms(false)?,
+                        self.clock.now_ms(true)?,
                     )?,
                 ))
             }
@@ -370,7 +370,7 @@ impl BrokerRpcService {
                 Ok(Response::WalletDeletePrepare(
                     self.ceremony.prepare_custody(
                         translate_custody::prepare_to_signer(request),
-                        self.clock.now_ms(false)?,
+                        self.clock.now_ms(true)?,
                     )?,
                 ))
             }
@@ -387,7 +387,7 @@ impl BrokerRpcService {
                 }
                 Ok(Response::KeyDerivePrepare(self.ceremony.prepare_custody(
                     translate_custody::prepare_to_signer(request),
-                    self.clock.now_ms(false)?,
+                    self.clock.now_ms(true)?,
                 )?))
             }
             Request::KeyEnrollPrepare(request) => {
@@ -397,7 +397,7 @@ impl BrokerRpcService {
                 )?;
                 Ok(Response::KeyEnrollPrepare(self.ceremony.prepare_custody(
                     translate_custody::prepare_to_signer(request),
-                    self.clock.now_ms(false)?,
+                    self.clock.now_ms(true)?,
                 )?))
             }
             Request::AccountAllocatePrepare(request) => {
@@ -450,7 +450,7 @@ impl BrokerRpcService {
                 Ok(Response::CredentialAddPrepare(
                     self.ceremony.prepare_custody(
                         translate_custody::prepare_to_signer(request),
-                        self.clock.now_ms(false)?,
+                        self.clock.now_ms(true)?,
                     )?,
                 ))
             }
@@ -462,7 +462,7 @@ impl BrokerRpcService {
                 Ok(Response::CredentialReplacePrepare(
                     self.ceremony.prepare_custody(
                         translate_custody::prepare_to_signer(request),
-                        self.clock.now_ms(false)?,
+                        self.clock.now_ms(true)?,
                     )?,
                 ))
             }
@@ -474,7 +474,7 @@ impl BrokerRpcService {
                 Ok(Response::CredentialRemovePrepare(
                     self.ceremony.prepare_custody(
                         translate_custody::prepare_to_signer(request),
-                        self.clock.now_ms(false)?,
+                        self.clock.now_ms(true)?,
                     )?,
                 ))
             }
@@ -485,7 +485,7 @@ impl BrokerRpcService {
                 )?;
                 Ok(Response::RecoveryPrepare(self.ceremony.prepare_custody(
                     translate_custody::prepare_to_signer(request),
-                    self.clock.now_ms(false)?,
+                    self.clock.now_ms(true)?,
                 )?))
             }
             Request::KeyListPublic(request) => {
@@ -654,7 +654,7 @@ impl BrokerRpcService {
                 claim_assurance,
                 attributed_advisory_items: Vec::new(),
             },
-            self.clock.now_ms(false)?,
+            self.clock.now_ms(true)?,
         )?;
         if let Err(error) = self
             .authority
@@ -722,7 +722,7 @@ impl BrokerRpcService {
                 "Signer-authenticated policy baseline is stale",
             ));
         }
-        let now = self.clock.now_ms(false)?;
+        let now = self.clock.now_ms(true)?;
         let mut review = PolicyUpdateReviewManifest {
             schema: Token::new("bloom.policy-update-review/1")?,
             operation_id: request.operation_id.clone(),

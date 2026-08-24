@@ -1214,6 +1214,12 @@ impl CeremonyBroker {
         anonymous_registration: bool,
         now_ms: u64,
     ) -> Result<(), ProtocolError> {
+        if now_ms == 0 {
+            return Err(protocol(
+                ProtocolErrorCode::ClockUntrusted,
+                "trusted platform time is required to create a ceremony",
+            ));
+        }
         let sessions = self.inner.sessions.lock();
         let live = sessions
             .values()
