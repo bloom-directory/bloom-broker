@@ -38,7 +38,6 @@ zeroize.workspace = true
 bloom-broker-debug-driver = { path = "../bloom-broker-debug-driver" }
 bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "35d2832a39b69dbc69d5c91d8781d2bf816e74e6" }
 bloom-signer-vectors.workspace = true
-bloom-solana-tx = { git = "https://github.com/bloom-directory/bloom.git", rev = "d0757adf156c504b4a0e9e9dd3a4ded1013d17c2" }
 futures = "0.3"
 http-body-util = "0.1"
 k256.workspace = true
