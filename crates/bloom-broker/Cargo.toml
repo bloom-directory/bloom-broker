@@ -34,7 +34,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 bloom-broker-debug-driver = { path = "../bloom-broker-debug-driver" }
-bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "c6ccb4afb9eded99c5e6d4c92d18001cdde0cd25" }
+bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "aed142b99b1a5118fa073b28cae83cbef927eb23" }
 futures = "0.3"
 http-body-util = "0.1"
 tempfile = "3"

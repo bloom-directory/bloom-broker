@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bloom_broker_api::{BootEpoch, ProtocolError, ProtocolErrorCode, ReadinessState, Token};
-use bloom_trusted_time::{MAX_FORWARD_STEP_MS, PlatformTimeSampler, TrustedTimeSource};
+use bloom_trusted_time::{MAX_FORWARD_STEP_MS, PlatformTimeSampler};
 use parking_lot::Mutex;
 
 use crate::journal::{BrokerJournal, ClockCondition, ClockDecision, JournalError, TimeReading};
@@ -23,10 +23,7 @@ impl BrokerClock {
         let sampler = PlatformTimeSampler::new(trusted_time_source).map_err(|error| {
             ProtocolError::new(ProtocolErrorCode::ClockUntrusted, error.to_string())
         })?;
-        let durable_clock_guard = match sampler.source() {
-            TrustedTimeSource::LinuxChronyNts => true,
-            TrustedTimeSource::MacosManagedTimed => false,
-        };
+        let durable_clock_guard = sampler.source().requires_durable_clock_guard();
         let clock = Self {
             journal,
             sampler,
