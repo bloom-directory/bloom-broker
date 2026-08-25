@@ -249,9 +249,18 @@ pub struct AuditEntry {
 pub struct BrokerJournal {
     connection: Arc<Mutex<Connection>>,
     audit_signer: Arc<ActiveAuditSigner>,
+    verified_audit_tail: Arc<Mutex<Option<VerifiedAuditTail>>>,
     audit_degraded: Arc<AtomicBool>,
     fault_hook: Option<Arc<dyn FaultHook>>,
     self_checkpoint: Arc<Mutex<Option<SelfCheckpoint>>>,
+}
+
+#[derive(Clone)]
+struct VerifiedAuditTail {
+    sequence: u64,
+    head_hash: Digest32,
+    data_version: i64,
+    total_changes: u64,
 }
 
 #[derive(Clone)]
@@ -388,6 +397,7 @@ impl BrokerJournal {
         let journal = Self {
             connection: Arc::new(Mutex::new(connection)),
             audit_signer: Arc::new(ActiveAuditSigner::new(audit_signer)),
+            verified_audit_tail: Arc::new(Mutex::new(None)),
             audit_degraded: Arc::new(AtomicBool::new(false)),
             fault_hook: None,
             self_checkpoint: Arc::new(Mutex::new(None)),
@@ -426,41 +436,19 @@ impl BrokerJournal {
         self.audit_degraded.load(Ordering::SeqCst)
     }
 
-    /// Return the current head only after fully verifying the local chain.
+    /// Return the startup-verified, incrementally maintained local audit head.
     /// `(0, 00..00)` is the explicit empty-chain convention. The externally
     /// reported sequence is the entry count, so DB sequence `N` is exposed as
     /// `N + 1` and the first mutation advances the checkpoint from 0 to 1.
     pub fn verified_audit_head(&self) -> Result<(u64, Digest32), JournalError> {
         let connection = self.lock()?;
-        if let Err(error) = verify_audit_chain_connection(&connection, self.audit_signer.as_ref()) {
-            self.audit_degraded.store(true, Ordering::SeqCst);
-            return Err(error);
+        match self.cached_audit_head(&connection) {
+            Ok(head) => Ok(head),
+            Err(error) => {
+                self.audit_degraded.store(true, Ordering::SeqCst);
+                Err(error)
+            }
         }
-        connection
-            .query_row(
-                "SELECT sequence, entry_hash FROM audit_chain ORDER BY sequence DESC LIMIT 1",
-                [],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?
-            .map(|(sequence, hash)| -> Result<_, JournalError> {
-                Ok((
-                    u64::try_from(sequence)
-                        .map_err(storage)?
-                        .checked_add(1)
-                        .ok_or_else(|| JournalError::Storage("audit head overflow".into()))?,
-                    Digest32::new(hash)?,
-                ))
-            })
-            .transpose()
-            .map(|head| {
-                head.unwrap_or_else(|| {
-                    (
-                        0,
-                        Digest32::new("00".repeat(32)).expect("fixed zero digest is valid"),
-                    )
-                })
-            })
     }
 
     /// Latch local security mutations after a required peer/OS checkpoint
@@ -1648,6 +1636,8 @@ impl BrokerJournal {
         let result = verify_audit_chain_connection(&connection, self.audit_signer.as_ref());
         if result.is_err() {
             self.audit_degraded.store(true, Ordering::SeqCst);
+        } else {
+            self.refresh_verified_audit_tail(&connection)?;
         }
         result
     }
@@ -1914,7 +1904,7 @@ impl BrokerJournal {
             return Err(audit_degraded());
         }
         let connection = self.lock()?;
-        if let Err(error) = verify_audit_chain_connection(&connection, self.audit_signer.as_ref()) {
+        if let Err(error) = self.cached_audit_head(&connection) {
             self.audit_degraded.store(true, Ordering::SeqCst);
             return Err(error);
         }
@@ -1972,35 +1962,18 @@ impl BrokerJournal {
         // commit and checkpoint N+1, and then A can publish stale head N. The
         // checkpoint store correctly rejects that ordering as a rollback.
         let connection = self.lock()?;
-        if let Err(error) = verify_audit_chain_connection(&connection, self.audit_signer.as_ref()) {
-            self.audit_degraded.store(true, Ordering::SeqCst);
-            return Err(error);
-        }
-        let (sequence, head_hash) = connection
-            .query_row(
-                "SELECT sequence, entry_hash FROM audit_chain ORDER BY sequence DESC LIMIT 1",
-                [],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?
-            .map(
-                |(sequence, hash)| -> Result<(u64, Digest32), JournalError> {
-                    Ok((
-                        u64::try_from(sequence)
-                            .map_err(storage)?
-                            .checked_add(1)
-                            .ok_or_else(|| JournalError::Storage("audit head overflow".into()))?,
-                        Digest32::new(hash)?,
-                    ))
-                },
-            )
-            .transpose()?
-            .unwrap_or_else(|| {
-                (
-                    0,
-                    Digest32::new("00".repeat(32)).expect("fixed zero digest is valid"),
-                )
-            });
+        let data_version = audit_data_version(&connection)?;
+        let cache_matches_database_owner = self
+            .verified_audit_tail
+            .lock()
+            .map_err(|_| storage("Broker verified audit tail mutex poisoned"))?
+            .as_ref()
+            .is_some_and(|tail| tail.data_version == data_version);
+        let (sequence, head_hash) = if cache_matches_database_owner {
+            self.refresh_verified_audit_tail(&connection)?
+        } else {
+            self.cached_audit_head(&connection)?
+        };
         let installed = self
             .self_checkpoint
             .lock()
@@ -2037,6 +2010,41 @@ impl BrokerJournal {
         Ok(())
     }
 
+    fn cached_audit_head(&self, connection: &Connection) -> Result<(u64, Digest32), JournalError> {
+        let data_version = audit_data_version(connection)?;
+        let total_changes = connection.total_changes();
+        if let Some(tail) = self
+            .verified_audit_tail
+            .lock()
+            .map_err(|_| storage("Broker verified audit tail mutex poisoned"))?
+            .as_ref()
+            .filter(|tail| tail.data_version == data_version && tail.total_changes == total_changes)
+            .cloned()
+        {
+            return Ok((tail.sequence, tail.head_hash));
+        }
+        verify_audit_chain_connection(connection, self.audit_signer.as_ref())?;
+        self.refresh_verified_audit_tail(connection)
+    }
+
+    fn refresh_verified_audit_tail(
+        &self,
+        connection: &Connection,
+    ) -> Result<(u64, Digest32), JournalError> {
+        let (sequence, head_hash) = audit_head(connection)?;
+        *self
+            .verified_audit_tail
+            .lock()
+            .map_err(|_| storage("Broker verified audit tail mutex poisoned"))? =
+            Some(VerifiedAuditTail {
+                sequence,
+                head_hash: head_hash.clone(),
+                data_version: audit_data_version(connection)?,
+                total_changes: connection.total_changes(),
+            });
+        Ok((sequence, head_hash))
+    }
+
     fn after_durable(&self, point: DurablePoint) -> Result<(), JournalError> {
         if let Some(hook) = &self.fault_hook {
             hook.after_durable(point)
@@ -2064,6 +2072,40 @@ fn ensure_column(
         )?;
     }
     Ok(())
+}
+
+fn audit_data_version(connection: &Connection) -> Result<i64, JournalError> {
+    connection
+        .query_row("PRAGMA data_version", [], |row| row.get(0))
+        .map_err(Into::into)
+}
+
+fn audit_head(connection: &Connection) -> Result<(u64, Digest32), JournalError> {
+    connection
+        .query_row(
+            "SELECT sequence, entry_hash FROM audit_chain ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .map(|(sequence, hash)| -> Result<_, JournalError> {
+            Ok((
+                u64::try_from(sequence)
+                    .map_err(storage)?
+                    .checked_add(1)
+                    .ok_or_else(|| JournalError::Storage("audit head overflow".into()))?,
+                Digest32::new(hash)?,
+            ))
+        })
+        .transpose()
+        .map(|head| {
+            head.unwrap_or_else(|| {
+                (
+                    0,
+                    Digest32::new("00".repeat(32)).expect("fixed zero digest is valid"),
+                )
+            })
+        })
 }
 
 pub fn derive_batch_child_operation_id(

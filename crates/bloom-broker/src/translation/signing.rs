@@ -65,6 +65,7 @@ mod tests {
             package_hash: north::Digest32::from_bytes([1; 32]),
             route: "/route".into(),
             allowed_operation_classes: vec![],
+            route_grants: Vec::new(),
             required_claim_assurance: north::ClaimAssuranceLevel::MachineAsserted,
         };
         assert_eq!(selector_to_signer(&exact), south::SelectorKind::Exact);
