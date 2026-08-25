@@ -1,4 +1,5 @@
 use bloom_broker::{
+    assurance_verifiers::SolanaSystemTransferVerifier,
     authority::{
         AssuranceRegistry, AssuranceVerifier, AuthorizationInput, BrokerAuthority,
         CanonicalWalletPolicy, CeremonyApprovalGrant, EpochReconciliation, PolicyAsset,
@@ -14,7 +15,9 @@ use bloom_broker_api::{
     DeclaredFee, Digest32, KeyRef, KeySpec, MachineSignRequest, OperationId,
     PROVENANCE_CATALOG_SCHEMA, PetalKeyScope, PetalLineageMembership, PetalRouteGrant,
     PetalUseClaim, PolicyUpdateRequest, ProvenanceCatalog, RequestNonce, RevocationState,
-    SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads, Token, ValueLimit,
+    SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES, SOLANA_SYSTEM_TRANSFER_VERIFIER_ID,
+    SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads, SystemChainContext, SystemUseClaim,
+    Token, ValueLimit,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
@@ -245,10 +248,16 @@ impl Harness {
             wallet_id: self.wallet.clone(),
             maximum_approval_lifetime_ms: 100_000,
             allowed_petal_packages: vec![digest(9)],
-            allowed_destinations: vec![PolicyDestination {
-                chain: token("ethereum"),
-                destination: "0xrecipient".into(),
-            }],
+            allowed_destinations: vec![
+                PolicyDestination {
+                    chain: token("ethereum"),
+                    destination: "0xrecipient".into(),
+                },
+                PolicyDestination {
+                    chain: token("solana"),
+                    destination: solana_destination(),
+                },
+            ],
             required_verifiers: vec![],
         };
         let canonical = serde_jcs::to_vec(&policy).unwrap();
@@ -336,6 +345,33 @@ impl Harness {
         record
     }
 
+    fn solana_provenance(&self) -> ProvenanceRecord {
+        let mut record = ProvenanceRecord {
+            subject: ProvenanceSubject::System {
+                component_id: token("bloom-machine"),
+                operation_class: token("solana.transfer.confirm"),
+            },
+            publisher: token("bloom-installer"),
+            petal_lineage: None,
+            operation_classes: vec![ProvenanceOperationClass {
+                operation_class: token("solana.native-transfer"),
+                fee_asset: Some(PolicyAsset {
+                    chain: token("solana"),
+                    asset: "native".into(),
+                }),
+            }],
+            installer_key_id: token("installer-key"),
+            installer_signature: Base64UrlBytes::from_bytes(&[]),
+        };
+        sign_zeroed(
+            &mut record,
+            |value| &mut value.installer_signature,
+            PROVENANCE_DOMAIN,
+            &self.installer_key,
+        );
+        record
+    }
+
     fn activate(&self, terms: &SealedApprovalTerms, provenance: Option<&ProvenanceRecord>) {
         let review = digest(7);
         self.authority
@@ -344,6 +380,24 @@ impl Harness {
         let approval_id = self.authority.prepare_approval(terms, &review).unwrap();
         let grant = self.signed_grant(terms, approval_id, operation(3));
         self.authority.activate_approval(&grant, 1_500).unwrap();
+        self.authority.activate_approval(&grant, 1_500).unwrap();
+    }
+
+    fn activate_with_system_claim(
+        &self,
+        terms: &SealedApprovalTerms,
+        provenance: &ProvenanceRecord,
+        claim: &SystemUseClaim,
+    ) {
+        let review = digest(7);
+        self.authority.install_provenance(provenance).unwrap();
+        let claim_digest =
+            Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(claim).unwrap()).into());
+        let approval_id = self
+            .authority
+            .prepare_approval_with_claim(terms, &review, Some(&claim_digest))
+            .unwrap();
+        let grant = self.signed_grant(terms, approval_id, operation(3));
         self.authority.activate_approval(&grant, 1_500).unwrap();
     }
 
@@ -1384,6 +1438,124 @@ fn assurance_contract_fields_and_proof_evidence_are_enforced() {
 }
 
 #[test]
+fn native_solana_system_claim_reaches_the_compiled_verifier() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (message, claim) = solana_message_and_claim(ClaimAssurance::ProofVerified {
+        verifier_id: token(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID),
+        verifier_digest: Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES),
+        proof_digest: digest(0),
+    });
+    let claim = with_evidence_digest(claim, &message);
+    let terms = solana_terms(&harness, &provenance, &message, 81);
+    harness.activate_with_system_claim(&terms, &provenance, &claim);
+
+    let input = solana_input(
+        &terms,
+        &provenance,
+        operation(81),
+        &message,
+        claim.clone(),
+        &message,
+    );
+    let decision = harness.authority.authorize(&input).unwrap();
+    assert_eq!(decision.effective_assurance, Some(claim.claim_assurance));
+    assert_eq!(
+        decision.reserved_values["solana:native"].as_str(),
+        "1005000"
+    );
+}
+
+#[test]
+fn native_solana_machine_asserted_claim_is_denied() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (message, claim) = solana_message_and_claim(ClaimAssurance::MachineAsserted);
+    let terms = solana_terms(&harness, &provenance, &message, 82);
+    harness.activate_with_system_claim(&terms, &provenance, &claim);
+    let input = solana_input(
+        &terms,
+        &provenance,
+        operation(82),
+        &message,
+        claim,
+        &message,
+    );
+
+    assert!(
+        error_code(harness.authority.authorize(&input).unwrap_err()).contains("ASSURANCE_TOO_WEAK")
+    );
+}
+
+#[test]
+fn native_solana_mismatched_assurance_evidence_is_denied() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (message, claim) = solana_message_and_claim(ClaimAssurance::ProofVerified {
+        verifier_id: token(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID),
+        verifier_digest: Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES),
+        proof_digest: digest(0),
+    });
+    let claim = with_evidence_digest(claim, &message);
+    let terms = solana_terms(&harness, &provenance, &message, 83);
+    harness.activate_with_system_claim(&terms, &provenance, &claim);
+    let input = solana_input(
+        &terms,
+        &provenance,
+        operation(83),
+        &message,
+        claim,
+        b"different-message-evidence",
+    );
+
+    assert!(
+        error_code(harness.authority.authorize(&input).unwrap_err())
+            .contains("ASSURANCE_EVIDENCE_MISMATCH")
+    );
+}
+
+#[test]
+fn native_solana_destination_outside_policy_is_denied() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let destination = bloom_solana::Pubkey::from_bytes([0x44; 32]);
+    let blockhash = [0x07; 32];
+    let message = bloom_solana::system_transfer::transfer_message(
+        bloom_solana::Pubkey::from_bytes([0x01; 32]),
+        destination,
+        1_000_000,
+        blockhash,
+    )
+    .unwrap()
+    .serialize();
+    let claim = solana_claim_for(
+        &message,
+        &destination.to_string(),
+        blockhash,
+        ClaimAssurance::ProofVerified {
+            verifier_id: token(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID),
+            verifier_digest: Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES),
+            proof_digest: Digest32::from_bytes(Sha256::digest(&message).into()),
+        },
+    );
+    let terms = solana_terms(&harness, &provenance, &message, 84);
+    harness.activate_with_system_claim(&terms, &provenance, &claim);
+    let input = solana_input(
+        &terms,
+        &provenance,
+        operation(84),
+        &message,
+        claim,
+        &message,
+    );
+
+    assert!(
+        error_code(harness.authority.authorize(&input).unwrap_err())
+            .contains("DESTINATION_NOT_ALLOWED")
+    );
+}
+
+#[test]
 fn concurrent_renewal_has_one_atomic_winner_and_never_reactivates_predecessor() {
     let harness = Harness::new();
     let provenance = harness.system_provenance();
@@ -1761,6 +1933,150 @@ fn exact_terms(harness: &Harness, payload: &[u8]) -> SealedApprovalTerms {
     }
 }
 
+fn solana_destination() -> String {
+    bloom_solana::Pubkey::from_bytes([0x02; 32]).to_string()
+}
+
+fn solana_message_and_claim(assurance: ClaimAssurance) -> (Vec<u8>, SystemUseClaim) {
+    let blockhash = [0x07; 32];
+    let destination = bloom_solana::Pubkey::from_bytes([0x02; 32]);
+    let message = bloom_solana::system_transfer::transfer_message(
+        bloom_solana::Pubkey::from_bytes([0x01; 32]),
+        destination,
+        1_000_000,
+        blockhash,
+    )
+    .unwrap()
+    .serialize();
+    let claim = solana_claim_for(&message, &destination.to_string(), blockhash, assurance);
+    (message, claim)
+}
+
+fn solana_claim_for(
+    message: &[u8],
+    destination: &str,
+    blockhash: [u8; 32],
+    claim_assurance: ClaimAssurance,
+) -> SystemUseClaim {
+    let payload_digest = Digest32::from_bytes(Sha256::digest(message).into());
+    SystemUseClaim {
+        component_id: token("bloom-machine"),
+        action_class: token("solana.transfer.confirm"),
+        operation_class: token("solana.native-transfer"),
+        crypto_suite: CryptoSuite::Ed25519Message,
+        payload_digest: payload_digest.clone(),
+        ordered_hashes: vec![payload_digest],
+        declared_debits: vec![DeclaredDebit {
+            asset: AssetId {
+                chain: token("solana"),
+                asset: "native".into(),
+            },
+            amount: DecimalU256::parse("1000000").unwrap(),
+        }],
+        declared_destinations: vec![DeclaredDestination {
+            chain: token("solana"),
+            destination: destination.into(),
+        }],
+        declared_fee: DeclaredFee::Fee {
+            chain: token("solana"),
+            asset: "native".into(),
+            amount: DecimalU256::parse("5000").unwrap(),
+        },
+        nonce: nonce(81),
+        chain_context: SystemChainContext {
+            chain_family: token("solana"),
+            genesis_hash: "local-validator-genesis".into(),
+            recent_blockhash: bs58::encode(blockhash).into_string(),
+            last_valid_block_height: DecimalU64::new(123),
+        },
+        claim_assurance,
+    }
+}
+
+fn with_evidence_digest(mut claim: SystemUseClaim, evidence: &[u8]) -> SystemUseClaim {
+    let ClaimAssurance::ProofVerified { proof_digest, .. } = &mut claim.claim_assurance else {
+        panic!("test claim must be proof verified");
+    };
+    *proof_digest = Digest32::from_bytes(Sha256::digest(evidence).into());
+    claim
+}
+
+fn solana_terms(
+    harness: &Harness,
+    provenance: &ProvenanceRecord,
+    message: &[u8],
+    nonce_byte: u8,
+) -> SealedApprovalTerms {
+    let payload_digest = Digest32::from_bytes(Sha256::digest(message).into());
+    let mut derived_key = key_ref();
+    derived_key.key_spec = KeySpec::Ed25519;
+    derived_key.locator = "wallet/derived/solana-0".into();
+    SealedApprovalTerms {
+        subject: ApprovalSubject::System {
+            component_id: token("bloom-machine"),
+            operation_class: token("solana.transfer.confirm"),
+        },
+        wallet_id: harness.wallet.clone(),
+        key_ref: derived_key,
+        allowed_crypto_suites: vec![CryptoSuite::Ed25519Message],
+        selector: ApprovalSelector::Exact {
+            ordered_payload_digests: vec![payload_digest.clone()],
+            ordered_hashes: vec![payload_digest],
+        },
+        limits: ApprovalLimits {
+            max_operations: DecimalU64::new(1),
+            max_signatures: DecimalU64::new(1),
+            operation_rate_limits: vec![],
+            signature_rate_limits: vec![],
+            value_limits: vec![value_limit("solana", "native", "2000000")],
+        },
+        activation_mode: ActivationMode::BootBound,
+        wallet_revocation_epoch: DecimalU64::new(0),
+        policy_version: DecimalU64::new(1),
+        policy_digest: harness.policy_snapshot(1).policy_digest,
+        provenance_digest: Digest32::from_bytes(
+            Sha256::digest(serde_jcs::to_vec(provenance).unwrap()).into(),
+        ),
+        request_nonce: nonce(nonce_byte),
+        issued_at_ms: DecimalU64::new(900),
+        not_before_ms: DecimalU64::new(1_000),
+        expires_at_ms: DecimalU64::new(2_000),
+        renewal_of: None,
+    }
+}
+
+fn solana_input(
+    terms: &SealedApprovalTerms,
+    provenance: &ProvenanceRecord,
+    operation_id: OperationId,
+    message: &[u8],
+    claim: SystemUseClaim,
+    evidence: &[u8],
+) -> AuthorizationInput {
+    let mut input = AuthorizationInput {
+        request: MachineSignRequest {
+            operation_id,
+            operation_digest: digest(5),
+            approval_id: terms.approval_id().unwrap(),
+            key_ref: terms.key_ref.clone(),
+            crypto_suite: CryptoSuite::Ed25519Message,
+            payloads: SigningPayloads::Single {
+                payload: Base64UrlBytes::from_bytes(message),
+            },
+            petal_use_claim: None,
+            system_use_claim: Some(claim),
+            claim_assurance_evidence: Some(Base64UrlBytes::from_bytes(evidence)),
+            provenance: provenance.subject.clone(),
+        },
+        reserved_at_ms: 1_500,
+        observed_utc_ms: Some(1_500),
+        monotonic_anchor_ns: 1_000_000,
+        clock_boot_epoch: BootEpoch::from_bytes([1; 16]),
+    };
+    bind_operation_digest(&mut input, terms);
+    input
+}
+
 fn petal_terms(harness: &Harness, provenance: &ProvenanceRecord) -> SealedApprovalTerms {
     harness.authority.install_provenance(provenance).unwrap();
     let (package_hash, route) = match &provenance.subject {
@@ -1985,14 +2301,31 @@ fn bind_operation_digest(input: &mut AuthorizationInput, terms: &SealedApprovalT
             _ => Digest32::from_bytes(Sha256::digest(payload).into()),
         })
         .collect();
-    let claim_digest = input.request.petal_use_claim.as_ref().map(|claim| {
-        Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(claim).unwrap()).into())
-    });
-    let assurance_digest = input.request.petal_use_claim.as_ref().map(|claim| {
-        Digest32::from_bytes(
-            Sha256::digest(serde_jcs::to_vec(&claim.claim_assurance).unwrap()).into(),
-        )
-    });
+    let claim_digest = input
+        .request
+        .petal_use_claim
+        .as_ref()
+        .map(|claim| Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(claim).unwrap()).into()))
+        .or_else(|| {
+            input.request.system_use_claim.as_ref().map(|claim| {
+                Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(claim).unwrap()).into())
+            })
+        });
+    let assurance_digest = input
+        .request
+        .petal_use_claim
+        .as_ref()
+        .map(|claim| &claim.claim_assurance)
+        .or_else(|| {
+            input
+                .request
+                .system_use_claim
+                .as_ref()
+                .map(|claim| &claim.claim_assurance)
+        })
+        .map(|assurance| {
+            Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(assurance).unwrap()).into())
+        });
     input.request.operation_digest = TestSignOperationIdentity {
         operation_id: input.request.operation_id.clone(),
         approval_id: input.request.approval_id.clone(),
