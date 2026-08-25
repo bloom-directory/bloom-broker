@@ -56,11 +56,20 @@ fn selector_to_signer(value: north::ApprovalSelector) -> south::ApprovalSelector
             package_hash,
             route,
             allowed_operation_classes,
+            route_grants,
             required_claim_assurance,
         } => south::ApprovalSelector::Petal {
             package_hash,
             route,
             allowed_operation_classes,
+            route_grants: route_grants
+                .into_iter()
+                .map(|grant| south::PetalRouteGrant {
+                    route: grant.route,
+                    allowed_operation_classes: grant.allowed_operation_classes,
+                    provenance_digest: grant.provenance_digest,
+                })
+                .collect(),
             required_claim_assurance: assurance_to_signer(required_claim_assurance),
         },
     }
