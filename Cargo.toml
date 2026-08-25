@@ -13,13 +13,13 @@ rust-version = "1.85"
 license = "MIT"
 
 [workspace.dependencies]
-bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "46bd0d0dc6c1cddc4dbdccd52693072d216e6284" }
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "afb8947e8858480954267b4e9743f7e213a8c20d" }
-bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "46bd0d0dc6c1cddc4dbdccd52693072d216e6284" }
-bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "46bd0d0dc6c1cddc4dbdccd52693072d216e6284" }
-bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "46bd0d0dc6c1cddc4dbdccd52693072d216e6284" }
-bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "46bd0d0dc6c1cddc4dbdccd52693072d216e6284" }
-bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "46bd0d0dc6c1cddc4dbdccd52693072d216e6284" }
+bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "b709a07d9807bdaade50c04f2178085915ef6101" }
+bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "53a0f8500f04234076972b13a54f9d90a73c2e46" }
+bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "b709a07d9807bdaade50c04f2178085915ef6101" }
+bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "b709a07d9807bdaade50c04f2178085915ef6101" }
+bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "b709a07d9807bdaade50c04f2178085915ef6101" }
+bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "b709a07d9807bdaade50c04f2178085915ef6101" }
+bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "b709a07d9807bdaade50c04f2178085915ef6101" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
