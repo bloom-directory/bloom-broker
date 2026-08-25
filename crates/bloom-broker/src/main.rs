@@ -22,7 +22,7 @@ use bloom_broker::{
     clock::BrokerClock,
     journal::{AuditSigner, BrokerJournal},
     service::BrokerRpcService,
-    signer_client::BrokerSignerClient,
+    signer_client::{BrokerSignerClient, checkpoint_append_fatal},
 };
 use bloom_broker_api::{
     Base64UrlBytes, Digest32, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
@@ -866,7 +866,10 @@ impl JournalExchange<ProtocolError> for BrokerMachineJournals {
         method: &Token,
         peer_head: &SignedJournalHead,
     ) -> Result<(), ProtocolError> {
-        if let Err(error) = self.checkpoints.append_peer_head(peer_head) {
+        if let Some(error) = checkpoint_append_fatal(self.checkpoints.append_peer_head(peer_head)) {
+            eprintln!(
+                "Broker audit degradation latched: Machine checkpoint append failed during {method}: {error}"
+            );
             self.journal.latch_audit_degradation();
             if !is_read_only_method(method) {
                 return Err(ProtocolError::new(

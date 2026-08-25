@@ -8,7 +8,7 @@ use std::{
     thread,
 };
 
-use bloom_audit_checkpoint::CheckpointSink;
+use bloom_audit_checkpoint::{AppendOutcome, CheckpointError, CheckpointSink};
 use bloom_signer_api::{
     Base64UrlBytes, BrokerSignerRequest, BrokerSignerResponse, CeremonyCompleteRequest,
     CeremonyKind, CustodyBindOutputRecipientRequest, CustodyCompleteRequest, CustodyPrepareRequest,
@@ -156,16 +156,24 @@ fn worker(
             Ok((sequence, head_hash)) => {
                 let head =
                     bloom_triad_local_transport::sign_journal_head(&identity, sequence, head_hash);
-                if let Err(error) = checkpoints.append_peer_head(&head) {
-                    journal.latch_audit_degradation();
-                    if !is_read_only_method(&method) {
-                        let _ = reply.send(Err(unavailable(format!(
-                            "persist Broker audit head before dispatch: {error}"
-                        ))));
-                        continue;
+                match checkpoint_append_fatal(checkpoints.append_peer_head(&head)) {
+                    Some(error) => {
+                        eprintln!(
+                            "Broker audit degradation latched: own head append failed before {method}: {error}"
+                        );
+                        journal.latch_audit_degradation();
+                        if !is_read_only_method(&method) {
+                            let _ = reply.send(Err(unavailable(format!(
+                                "persist Broker audit head before dispatch: {error}"
+                            ))));
+                            continue;
+                        }
                     }
-                } else {
-                    last_verified_head = Some(head.clone());
+                    // Success, already-present, or a benign rollback: `head` is
+                    // still our genuine current verified head, so cache it.
+                    None => {
+                        last_verified_head = Some(head.clone());
+                    }
                 }
                 head
             }
@@ -213,13 +221,38 @@ fn worker(
     }
 }
 
+/// Classify a checkpoint `append_peer_head` result.
+///
+/// A [`CheckpointError::SequenceRollback`] means the peer presented a
+/// validly-signed head OLDER than one we already durably hold — the crate's
+/// `verify_live_head` has already rejected any bad signature or forked
+/// (same-sequence, different-content) head as `SequenceConflict`. So a rollback
+/// only tells us the required "we retain >= this head" invariant is already
+/// satisfied by a newer record; it is benign and must NOT latch audit
+/// degradation. (Latching on it bricked every subsequent mutation whenever a
+/// peer replayed an older head during the non-mutating `readiness` handshake.)
+///
+/// Returns `Some(error)` only for genuine persistence or integrity failures
+/// that must latch; `None` for success, `AlreadyPresent`, or a benign rollback.
+pub fn checkpoint_append_fatal(
+    result: Result<AppendOutcome, CheckpointError>,
+) -> Option<CheckpointError> {
+    match result {
+        Ok(_) | Err(CheckpointError::SequenceRollback) => None,
+        Err(error) => Some(error),
+    }
+}
+
 fn persist_response_checkpoint(
     journal: &BrokerJournal,
     checkpoints: &dyn CheckpointSink,
     method: &Token,
     peer_head: &bloom_signer_api::SignedJournalHead,
 ) -> Result<(), ProtocolError> {
-    if let Err(error) = checkpoints.append_peer_head(peer_head) {
+    if let Some(error) = checkpoint_append_fatal(checkpoints.append_peer_head(peer_head)) {
+        eprintln!(
+            "Broker audit degradation latched: Signer checkpoint append failed during {method}: {error}"
+        );
         journal.latch_audit_degradation();
         if !is_read_only_method(method) {
             return Err(unavailable(format!(
@@ -420,6 +453,30 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
+
+    #[test]
+    fn benign_rollback_and_success_do_not_latch_but_real_failures_do() {
+        // Success and idempotent no-ops are never fatal.
+        assert!(checkpoint_append_fatal(Ok(AppendOutcome::Appended)).is_none());
+        assert!(checkpoint_append_fatal(Ok(AppendOutcome::AlreadyPresent)).is_none());
+        // A validly-signed older head (the crate rejects bad signatures and
+        // forks before this point) is benign: we already retain a newer record.
+        assert!(checkpoint_append_fatal(Err(CheckpointError::SequenceRollback)).is_none());
+        // Genuine integrity/persistence failures must still latch.
+        for fatal in [
+            CheckpointError::SequenceConflict,
+            CheckpointError::InvalidSignature,
+            CheckpointError::UnpinnedPeer,
+            CheckpointError::InvalidRoot,
+            CheckpointError::InsecurePermissions,
+            CheckpointError::Malformed("bad".into()),
+        ] {
+            assert!(
+                checkpoint_append_fatal(Err(fatal)).is_some(),
+                "this error must latch audit degradation"
+            );
+        }
+    }
 
     struct TestAuditSigner;
 
