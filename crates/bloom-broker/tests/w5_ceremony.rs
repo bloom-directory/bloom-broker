@@ -953,6 +953,9 @@ impl CeremonySigner for RealSigner {
             bloom_signer::ceremony::SignerCeremonyStatus::CompletedCustody(result) => {
                 SignerCeremonyStatus::CompletedCustody(result)
             }
+            bloom_signer::ceremony::SignerCeremonyStatus::Terminal(state) => {
+                SignerCeremonyStatus::Terminal(state)
+            }
             bloom_signer::ceremony::SignerCeremonyStatus::Missing => SignerCeremonyStatus::Missing,
         })
     }

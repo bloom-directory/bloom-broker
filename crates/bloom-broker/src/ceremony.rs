@@ -1030,6 +1030,7 @@ impl CeremonyBroker {
                         .map_err(signer_error_to_machine)?;
                     (CeremonyState::Expired, None)
                 }
+                SignerCeremonyStatus::Terminal(state) => (state, None),
                 SignerCeremonyStatus::Missing => (CeremonyState::Expired, None),
             };
             let snapshot = {
@@ -1455,6 +1456,9 @@ impl CeremonyBroker {
                             .cancel(&session.operation_id)
                             .map_err(signer_error_to_machine)?;
                         session.state = CeremonyState::Expired;
+                    }
+                    SignerCeremonyStatus::Terminal(state) => {
+                        session.state = state;
                     }
                     SignerCeremonyStatus::Missing => {
                         session.state = CeremonyState::Expired;
