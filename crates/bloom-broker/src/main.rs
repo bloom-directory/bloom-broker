@@ -740,12 +740,12 @@ fn acquire_unix_listener(
     Ok(bloom_service_activation::bind_owned_unix_listener(&path)?)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", feature = "triad-dev-harness"))]
 fn acquire_ceremony_listener() -> Result<std::net::TcpListener, Box<dyn std::error::Error>> {
     Ok(CeremonyBroker::bind_canonical()?)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(feature = "triad-dev-harness")))]
 fn acquire_ceremony_listener() -> Result<std::net::TcpListener, Box<dyn std::error::Error>> {
     let name = std::env::var("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME")
         .unwrap_or_else(|_| "broker-ceremony".to_string());

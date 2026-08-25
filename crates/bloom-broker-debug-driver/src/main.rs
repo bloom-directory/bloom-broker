@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let command = args
         .next()
-        .ok_or("usage: bloom-broker-debug-driver complete URL (--authenticator-seed-file PATH | SEED) [options] | assert-machine-secret-confinement --signer-db PATH --authenticator-seed SEED --artifact PATH [...]")?;
+        .ok_or("usage: bloom-broker-debug-driver complete URL (--authenticator-seed-file PATH | SEED) [--raw-private-key HEX | --mnemonic WORDS] [options] | assert-machine-secret-confinement --signer-db PATH --authenticator-seed SEED --artifact PATH [...]")?;
     if command == "assert-machine-secret-confinement" {
         return assert_machine_secret_confinement_command(args);
     }
@@ -39,6 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut new_seed = None;
     let mut raw_private_key = None;
+    let mut mnemonic = None;
     let mut sign_count = 1_u32;
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -50,6 +51,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--raw-private-key" => {
                 raw_private_key = Some(args.next().ok_or("--raw-private-key requires a value")?);
+            }
+            "--mnemonic" => {
+                mnemonic = Some(args.next().ok_or("--mnemonic requires a value")?);
             }
             "--sign-count" => {
                 sign_count = args
@@ -128,12 +132,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let assertion = authenticator.assertion(&challenges[1].canonical_bytes()?, sign_count);
             let credential_id = attestation.credential_id.clone();
             let plaintext = if kind == CeremonyKind::WalletImport {
-                let raw_private_key =
-                    raw_private_key.ok_or("wallet_import requires --raw-private-key")?;
-                serde_jcs::to_vec(&serde_json::json!({
-                    "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
-                    "raw_private_key": raw_private_key,
-                }))?
+                match (raw_private_key.take(), mnemonic.take()) {
+                    (Some(raw_private_key), None) => serde_jcs::to_vec(&serde_json::json!({
+                        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+                        "raw_private_key": raw_private_key,
+                    }))?,
+                    (None, Some(mnemonic)) => serde_jcs::to_vec(&serde_json::json!({
+                        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+                        "mnemonic": mnemonic,
+                        "passphrase": "",
+                    }))?,
+                    (None, None) => {
+                        return Err("wallet_import requires --raw-private-key or --mnemonic".into());
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(
+                            "wallet_import accepts only one of --raw-private-key or --mnemonic"
+                                .into(),
+                        );
+                    }
+                }
             } else {
                 authenticator.deterministic_prf().to_vec()
             };
