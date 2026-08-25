@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Base64UrlBytes, BootEpoch, CeremonyKind, CustodyPrepareRequest, CustodyPrepareResponse,
     CustodyResult, DecimalU64, Digest32, HelloChallenge, KeyRef, MachineSignRequest, OperationId,
-    PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
+    PetalUseClaim, PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
     PolicyUpdateRequest, ProtocolError, RevocationState, SealedApprovalPrepareResponse,
-    SealedApprovalTerms, ServiceFuture, SignedPolicySnapshot, SigningResult, Token,
+    SealedApprovalTerms, ServiceFuture, SignedPolicySnapshot, SigningResult, SystemUseClaim, Token,
     WalletAccountsPublic,
 };
 
@@ -96,6 +96,10 @@ pub struct ApprovalPrepareRequest {
     pub operation_id: OperationId,
     pub terms: SealedApprovalTerms,
     pub canonical_plan_facts_digest: Digest32,
+    #[serde(default)]
+    pub petal_use_claim: Option<PetalUseClaim>,
+    #[serde(default)]
+    pub system_use_claim: Option<SystemUseClaim>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

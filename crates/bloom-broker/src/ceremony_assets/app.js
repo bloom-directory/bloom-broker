@@ -299,7 +299,7 @@ async function load() {
   reviewNode.replaceChildren(pre);
   recoveryFields.hidden = session.ceremony_kind !== "wallet_recovery";
   const typedInputKinds = new Set([
-    "wallet_import", "key_derive"
+    "wallet_import", "wallet_export", "key_derive"
   ]);
   genericFields.hidden = !typedInputKinds.has(session.ceremony_kind) ||
     Boolean(scopedPetalKey) || legacyPasskeyImport;
@@ -307,6 +307,8 @@ async function load() {
     genericInput.placeholder = bip39Import
       ? '{"mnemonic":"twenty four BIP-39 words…"}'
       : '{"raw_private_key":"base64url-encoded-key"}';
+  } else if (session.ceremony_kind === "wallet_export") {
+    genericInput.placeholder = '{"format":"bip39_mnemonic24"}';
   } else if (session.ceremony_kind === "key_derive") {
     genericInput.placeholder =
       '{"namespace_id":"...","grant":{...},"authority_signature":"..."}';
