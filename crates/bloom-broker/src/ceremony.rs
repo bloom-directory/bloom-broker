@@ -460,7 +460,7 @@ impl CeremonyBroker {
             })
             .collect::<Vec<_>>();
         for (ceremony_id, completed_at_ms) in sessions {
-            self.finalize_committed_session(&ceremony_id, completed_at_ms)?;
+            self.sweep_committed_session(&ceremony_id, completed_at_ms)?;
         }
         Ok(())
     }
@@ -907,7 +907,7 @@ impl CeremonyBroker {
             .collect::<Vec<_>>();
         for (ceremony_id, operation_id, state, wallet_id) in live {
             if state == CeremonyState::WalletCommitted {
-                self.finalize_committed_session(&ceremony_id, now_ms)?;
+                self.sweep_committed_session(&ceremony_id, now_ms)?;
                 continue;
             }
             if state == CeremonyState::AwaitingUser {
@@ -988,7 +988,7 @@ impl CeremonyBroker {
                 .get(&ceremony_id)
                 .is_some_and(|session| session.state == CeremonyState::WalletCommitted)
             {
-                self.finalize_committed_session(&ceremony_id, now_ms)?;
+                self.sweep_committed_session(&ceremony_id, now_ms)?;
                 continue;
             }
             if self
@@ -1068,7 +1068,7 @@ impl CeremonyBroker {
                 .lock()
                 .insert(ceremony_id.clone(), snapshot);
             if state == CeremonyState::WalletCommitted {
-                self.finalize_committed_session(&ceremony_id, now_ms)?;
+                self.sweep_committed_session(&ceremony_id, now_ms)?;
             }
         }
         Ok(())
@@ -1671,6 +1671,17 @@ impl CeremonyBroker {
         }
     }
 
+    /// Sweep-side adoption: a permanently rejected session has already been
+    /// terminalized by `finalize_committed_session`, so the sweep continues;
+    /// transient failures still surface so the caller retries later.
+    fn sweep_committed_session(&self, ceremony_id: &str, now_ms: u64) -> Result<(), ProtocolError> {
+        match self.finalize_committed_session(ceremony_id, now_ms) {
+            Ok(_) => Ok(()),
+            Err(error) if error.retry == bloom_broker_api::RetryClass::Never => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     fn finalize_committed_session(
         &self,
         ceremony_id: &str,
@@ -1695,9 +1706,30 @@ impl CeremonyBroker {
         })?;
 
         // Adoption is deliberately after the signed receipt is durable. Every
-        // observer operation is idempotent, so a failure leaves WALLET_COMMITTED
-        // retryable across the same request and process restart.
-        self.notify_completion(committed.ceremony_kind, &receipt, now_ms)?;
+        // observer operation is idempotent, so a transient failure leaves
+        // WALLET_COMMITTED retryable across the same request and process
+        // restart. A permanent rejection (`retry: never`, e.g. an activation
+        // receipt whose validity interval already closed) can never succeed
+        // on retry; leaving it WALLET_COMMITTED would re-fire on every sweep
+        // and every restart, so it is terminalized as FAILED instead.
+        if let Err(error) = self.notify_completion(committed.ceremony_kind, &receipt, now_ms) {
+            if error.retry == bloom_broker_api::RetryClass::Never {
+                eprintln!(
+                    "Broker ceremony {ceremony_id} adoption permanently rejected; marking FAILED: {error}"
+                );
+                let mut failed = committed;
+                failed.state = CeremonyState::Failed;
+                failed.terminal_at_ms = Some(now_ms);
+                failed.token = None;
+                failed.token_hash = [0_u8; 32];
+                self.persist_session(&failed)?;
+                self.inner
+                    .sessions
+                    .lock()
+                    .insert(ceremony_id.to_owned(), failed);
+            }
+            return Err(error);
+        }
 
         let has_sensitive_output = receipt
             .get("encrypted_browser_result")
@@ -2027,10 +2059,22 @@ async fn complete_session(
             }
         }
         Err(error) => {
+            // Best-effort Signer-side cleanup for an unauthenticated completion
+            // (e.g. a rejected WebAuthn proof or a non-advancing signature
+            // counter). A failed cancel must NOT abort terminalization: the
+            // proof is rejected before any custody operation durably begins, so
+            // there is nothing to orphan, and leaving the session non-terminal
+            // would keep it "live" and block every retry of the same wallet
+            // operation until it expires (QUOTA_EXCEEDED: wallet already has a
+            // live ceremony). Terminalize as Failed regardless so the wallet is
+            // immediately free for a clean retry.
             if error.code == ProtocolErrorCode::UnauthenticatedPeer
                 && broker.inner.signer.cancel(&operation_id).is_err()
             {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                eprintln!(
+                    "Broker ceremony {ceremony_id}: Signer cancel after an unauthenticated \
+                     completion failed; terminalizing the session as Failed anyway so retry is not blocked"
+                );
             }
             let snapshot = {
                 let sessions = broker.inner.sessions.lock();
