@@ -1030,6 +1030,7 @@ impl CeremonyBroker {
                         .map_err(signer_error_to_machine)?;
                     (CeremonyState::Expired, None)
                 }
+                SignerCeremonyStatus::Terminal(state) => (state, None),
                 SignerCeremonyStatus::Missing => (CeremonyState::Expired, None),
             };
             let snapshot = {
@@ -1455,6 +1456,9 @@ impl CeremonyBroker {
                             .cancel(&session.operation_id)
                             .map_err(signer_error_to_machine)?;
                         session.state = CeremonyState::Expired;
+                    }
+                    SignerCeremonyStatus::Terminal(state) => {
+                        session.state = state;
                     }
                     SignerCeremonyStatus::Missing => {
                         session.state = CeremonyState::Expired;
@@ -2019,27 +2023,37 @@ async fn complete_session(
             }
         }
         Err(error) => {
-            if error.code == ProtocolErrorCode::UnauthenticatedPeer
-                && broker.inner.signer.cancel(&operation_id).is_err()
-            {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-            let snapshot = {
-                let sessions = broker.inner.sessions.lock();
-                let Some(session) = sessions.get(&ceremony_id) else {
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            // A stale WebAuthn signature counter reports `UnauthenticatedPeer`
+            // while the Signer leaves the operation pending, so the Signer-side
+            // operation has to be released or it holds the wallet's concurrency
+            // quota forever. Every other rejection already terminalises the
+            // Signer operation, so there is nothing to cancel.
+            let released = error.code != ProtocolErrorCode::UnauthenticatedPeer
+                || broker.inner.signer.cancel(&operation_id).is_ok();
+            // The Broker session is only terminalised once the Signer side is
+            // known to be released. If cancellation failed the session stays
+            // `Verifying` so the expiry sweep retries the cancel; terminalising
+            // here would strand the Signer operation permanently.
+            if released {
+                let snapshot = {
+                    let sessions = broker.inner.sessions.lock();
+                    let Some(session) = sessions.get(&ceremony_id) else {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    };
+                    let mut snapshot = session.clone();
+                    snapshot.state = CeremonyState::Failed;
+                    snapshot.terminal_at_ms = Some(unix_time_ms());
+                    snapshot.token = None;
+                    snapshot.token_hash = [0_u8; 32];
+                    snapshot
                 };
-                let mut snapshot = session.clone();
-                snapshot.state = CeremonyState::Failed;
-                snapshot.terminal_at_ms = Some(unix_time_ms());
-                snapshot.token = None;
-                snapshot.token_hash = [0_u8; 32];
-                snapshot
-            };
-            if broker.persist_session(&snapshot).is_err() {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                if broker.persist_session(&snapshot).is_err() {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+                broker.inner.sessions.lock().insert(ceremony_id, snapshot);
             }
-            broker.inner.sessions.lock().insert(ceremony_id, snapshot);
+            // The browser needs the structured rejection either way: a failed
+            // best-effort cancel must never replace it with an empty 500.
             (StatusCode::BAD_REQUEST, Json(error)).into_response()
         }
     }

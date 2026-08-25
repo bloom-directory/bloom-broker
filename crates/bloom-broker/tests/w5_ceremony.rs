@@ -590,6 +590,8 @@ struct MockSigner {
     completions: AtomicUsize,
     cancellations: AtomicUsize,
     pending: parking_lot::Mutex<HashSet<OperationId>>,
+    reject_completion: bool,
+    cancellation_fails: bool,
 }
 
 struct RealSigner {
@@ -951,6 +953,9 @@ impl CeremonySigner for RealSigner {
             bloom_signer::ceremony::SignerCeremonyStatus::CompletedCustody(result) => {
                 SignerCeremonyStatus::CompletedCustody(result)
             }
+            bloom_signer::ceremony::SignerCeremonyStatus::Terminal(state) => {
+                SignerCeremonyStatus::Terminal(state)
+            }
             bloom_signer::ceremony::SignerCeremonyStatus::Missing => SignerCeremonyStatus::Missing,
         })
     }
@@ -962,6 +967,18 @@ impl MockSigner {
             completions: AtomicUsize::new(0),
             cancellations: AtomicUsize::new(0),
             pending: parking_lot::Mutex::new(HashSet::new()),
+            reject_completion: false,
+            cancellation_fails: false,
+        }
+    }
+
+    /// A Signer that refuses the browser proof with `UnauthenticatedPeer`, the
+    /// stale-signature-counter rejection that leaves its operation pending.
+    fn rejecting_proof(cancellation_fails: bool) -> Self {
+        Self {
+            reject_completion: true,
+            cancellation_fails,
+            ..Self::new()
         }
     }
 }
@@ -1092,6 +1109,12 @@ impl CeremonySigner for MockSigner {
         request: CustodyCompleteRequest,
         _now_ms: u64,
     ) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
+        if self.reject_completion {
+            return Err(bloom_signer_api::ProtocolError::new(
+                bloom_signer_api::ProtocolErrorCode::UnauthenticatedPeer,
+                "stale webauthn signature counter",
+            ));
+        }
         self.completions.fetch_add(1, Ordering::SeqCst);
         Ok(CustodyResult {
             ceremony_kind: request.ceremony_kind,
@@ -1137,8 +1160,16 @@ impl CeremonySigner for MockSigner {
     }
 
     fn cancel(&self, operation_id: &OperationId) -> Result<(), bloom_signer_api::ProtocolError> {
-        self.pending.lock().remove(operation_id);
         self.cancellations.fetch_add(1, Ordering::SeqCst);
+        if self.cancellation_fails {
+            // The operation stays pending: the Signer still holds the wallet's
+            // concurrency quota until a later cancel succeeds.
+            return Err(bloom_signer_api::ProtocolError::new(
+                bloom_signer_api::ProtocolErrorCode::ServiceUnavailable,
+                "mock cancellation is unavailable",
+            ));
+        }
+        self.pending.lock().remove(operation_id);
         Ok(())
     }
 
