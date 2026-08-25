@@ -604,12 +604,6 @@ impl BrokerRpcService {
         &self,
         request: ApprovalPrepareRequest,
     ) -> Result<SealedApprovalPrepareResponse, ProtocolError> {
-        if request.petal_use_claim.is_some() && request.system_use_claim.is_some() {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::MalformedFrame,
-                "an approval cannot bind both Petal and system claims",
-            ));
-        }
         self.reconcile_wallet(&request.terms.wallet_id).await?;
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
             ApprovalSelector::Exact {
@@ -626,43 +620,14 @@ impl BrokerRpcService {
             exact_ordered_hashes,
             replacement_approval_id: request.terms.renewal_of.clone(),
         };
-        let claim_assurance = request
-            .petal_use_claim
-            .as_ref()
-            .map(|claim| claim.claim_assurance.clone())
-            .or_else(|| {
-                request
-                    .system_use_claim
-                    .as_ref()
-                    .map(|claim| claim.claim_assurance.clone())
-            });
-        let approved_claim_digest = request
-            .petal_use_claim
-            .as_ref()
-            .map(jcs_digest)
-            .transpose()?
-            .or(request
-                .system_use_claim
-                .as_ref()
-                .map(jcs_digest)
-                .transpose()?);
         let response = self.ceremony.prepare_approval(
             ceremony_request,
-            ReviewManifestContext {
-                petal_use_claim: request.petal_use_claim,
-                system_use_claim: request.system_use_claim,
-                claim_assurance,
-                attributed_advisory_items: Vec::new(),
-            },
+            ReviewManifestContext::default(),
             self.clock.now_ms(true)?,
         )?;
         if let Err(error) = self
             .authority
-            .prepare_approval_with_claim(
-                &request.terms,
-                &response.review_manifest_digest,
-                approved_claim_digest.as_ref(),
-            )
+            .prepare_approval(&request.terms, &response.review_manifest_digest)
             .map_err(authority_error)
         {
             let _ = self
@@ -798,8 +763,6 @@ impl BrokerRpcService {
             operation_id: request.operation_id,
             canonical_plan_facts_digest: request.replacement_terms.approval_digest()?,
             terms: request.replacement_terms,
-            petal_use_claim: None,
-            system_use_claim: None,
         })
         .await
     }
@@ -849,22 +812,12 @@ impl BrokerRpcService {
             .petal_use_claim
             .as_ref()
             .map(jcs_digest)
-            .transpose()?
-            .or(request
-                .system_use_claim
-                .as_ref()
-                .map(jcs_digest)
-                .transpose()?);
+            .transpose()?;
         let assurance_digest = request
             .petal_use_claim
             .as_ref()
             .map(|claim| jcs_digest(&claim.claim_assurance))
-            .transpose()?
-            .or(request
-                .system_use_claim
-                .as_ref()
-                .map(|claim| jcs_digest(&claim.claim_assurance))
-                .transpose()?);
+            .transpose()?;
         let mut validation_receipt = BrokerValidationReceipt {
             approval_id: request.approval_id.clone(),
             approval_digest: terms.approval_digest()?,

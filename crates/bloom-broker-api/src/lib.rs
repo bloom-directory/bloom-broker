@@ -41,7 +41,7 @@ pub use bloom_rpc_wire::{
 
 pub const BROKER_API_MAJOR: u16 = 1;
 pub const BROKER_API_MINOR_MIN: u16 = 3;
-pub const BROKER_API_MINOR_MAX: u16 = 6;
+pub const BROKER_API_MINOR_MAX: u16 = 5;
 pub const BROKER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(BROKER_API_MAJOR, BROKER_API_MINOR_MAX);
 pub const BROKER_API_RANGE: ProtocolVersionRange =

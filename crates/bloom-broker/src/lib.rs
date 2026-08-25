@@ -1,6 +1,5 @@
 //! Broker service implementation.
 
-pub mod assurance_verifiers;
 pub mod authority;
 pub mod ceremony;
 pub mod clock;

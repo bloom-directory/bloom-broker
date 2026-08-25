@@ -20,7 +20,6 @@ use bloom_broker_api::{
     CeremonyPublicStatus as BrokerCeremonyPublicStatus, CeremonyState as BrokerCeremonyState,
     ClaimAssurance, CustodyPrepareResponse, CustodyPrepareState, PetalUseClaim,
     PolicyUpdatePrepareResponse, ProtocolError, ProtocolErrorCode, SealedApprovalPrepareResponse,
-    SystemUseClaim,
 };
 use bloom_signer_api::{
     Base64UrlBytes, CeremonyChallenge, CeremonyCompleteRequest, CeremonyKind,
@@ -68,7 +67,6 @@ const BLOOM_PRIMARY_SVG: &str = include_str!("ceremony_assets/bloom-primary.svg"
 #[derive(Clone, Debug, Default)]
 pub struct ReviewManifestContext {
     pub petal_use_claim: Option<PetalUseClaim>,
-    pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance: Option<ClaimAssurance>,
     pub attributed_advisory_items: Vec<String>,
 }
@@ -84,7 +82,6 @@ pub(crate) struct ReviewManifest {
     pub exact_payload_digests: Vec<Digest32>,
     pub exact_hashes: Vec<Digest32>,
     pub petal_use_claim: Option<PetalUseClaim>,
-    pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance: Option<ClaimAssurance>,
     pub attributed_advisory_items: Vec<String>,
     pub issued_at_ms: DecimalU64,
@@ -105,7 +102,6 @@ impl ReviewManifest {
             exact_payload_digests: &'a [Digest32],
             exact_hashes: &'a [Digest32],
             petal_use_claim: &'a Option<PetalUseClaim>,
-            system_use_claim: &'a Option<SystemUseClaim>,
             claim_assurance: &'a Option<ClaimAssurance>,
             attributed_advisory_items: &'a [String],
             issued_at_ms: &'a DecimalU64,
@@ -121,7 +117,6 @@ impl ReviewManifest {
             exact_payload_digests: &self.exact_payload_digests,
             exact_hashes: &self.exact_hashes,
             petal_use_claim: &self.petal_use_claim,
-            system_use_claim: &self.system_use_claim,
             claim_assurance: &self.claim_assurance,
             attributed_advisory_items: &self.attributed_advisory_items,
             issued_at_ms: &self.issued_at_ms,
@@ -1515,7 +1510,6 @@ impl CeremonyBroker {
             request,
             manifest.claim_assurance.as_ref(),
             manifest.petal_use_claim.as_ref(),
-            manifest.system_use_claim.as_ref(),
         );
         let canonical_plan = canonical_review_plan(request, &disclosures)?;
         if manifest.approval_id != approval_id
@@ -1554,7 +1548,6 @@ impl CeremonyBroker {
             request,
             context.claim_assurance.as_ref(),
             context.petal_use_claim.as_ref(),
-            context.system_use_claim.as_ref(),
         );
         let canonical_plan = canonical_review_plan(request, &disclosures)?;
         let mut manifest = ReviewManifest {
@@ -1574,7 +1567,6 @@ impl CeremonyBroker {
             exact_payload_digests: request.exact_ordered_payload_digests.clone(),
             exact_hashes: request.exact_ordered_hashes.clone(),
             petal_use_claim: context.petal_use_claim,
-            system_use_claim: context.system_use_claim,
             claim_assurance: context.claim_assurance,
             attributed_advisory_items: context.attributed_advisory_items,
             issued_at_ms: DecimalU64::new(now_ms),
@@ -2392,7 +2384,6 @@ fn review_disclosures(
     request: &CeremonyPrepareRequest,
     assurance: Option<&ClaimAssurance>,
     claim: Option<&PetalUseClaim>,
-    system_claim: Option<&SystemUseClaim>,
 ) -> Vec<String> {
     let mut disclosures = Vec::new();
     if !request.exact_ordered_payload_digests.is_empty() || !request.exact_ordered_hashes.is_empty()
@@ -2404,8 +2395,6 @@ fn review_disclosures(
     }
     let machine_asserted = matches!(assurance, Some(ClaimAssurance::MachineAsserted))
         || claim
-            .is_some_and(|claim| matches!(claim.claim_assurance, ClaimAssurance::MachineAsserted))
-        || system_claim
             .is_some_and(|claim| matches!(claim.claim_assurance, ClaimAssurance::MachineAsserted))
         || matches!(
             request.terms.selector,

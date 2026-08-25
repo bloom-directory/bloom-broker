@@ -12,7 +12,6 @@ triad-dev-harness = ["bloom-triad-local-transport/triad-dev-harness"]
 axum.workspace = true
 bloom-broker-api = { path = "../bloom-broker-api" }
 bloom-signer-api.workspace = true
-bloom-solana.workspace = true
 bloom-platform-containment.workspace = true
 bloom-triad-local-transport.workspace = true
 bloom-audit-checkpoint.workspace = true

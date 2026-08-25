@@ -356,9 +356,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         verifying_key(&config.signer_ceremony_public_key_hex)?,
         Token::new(config.signer_revocation_key_id.clone())?,
         verifying_key(&config.signer_revocation_public_key_hex)?,
-        AssuranceRegistry::compiled(vec![
-            bloom_broker::assurance_verifiers::SolanaSystemTransferVerifier::compiled(),
-        ])?,
+        AssuranceRegistry::compiled(Vec::new())?,
     )?);
     #[cfg(feature = "triad-dev-harness")]
     let provenance_catalog = match std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT") {
