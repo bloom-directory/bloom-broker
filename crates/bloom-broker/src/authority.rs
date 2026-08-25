@@ -1310,9 +1310,14 @@ impl BrokerAuthority {
                 .any(|suite| !scope.allowed_crypto_suites.contains(suite))
             || matches!(
                 &terms.selector,
-                ApprovalSelector::Petal { allowed_operation_classes, .. }
+                ApprovalSelector::Petal { allowed_operation_classes, route_grants, .. }
                     if allowed_operation_classes.iter().any(|class| {
                         !scope.allowed_operation_classes.contains(class)
+                    }) || route_grants.iter().any(|grant| {
+                        !scope.allowed_routes.contains(&grant.route)
+                            || grant.allowed_operation_classes.iter().any(|class| {
+                                !scope.allowed_operation_classes.contains(class)
+                            })
                     })
             )
         {
@@ -1329,27 +1334,61 @@ impl BrokerAuthority {
             } => (package_hash, route),
             _ => unreachable!("identity_matches requires a Petal subject"),
         };
+        match &terms.selector {
+            ApprovalSelector::Exact { .. } => {
+                self.validate_scoped_route_lineage(&scope, package_hash, route, &[])?;
+            }
+            ApprovalSelector::Petal {
+                allowed_operation_classes,
+                route_grants,
+                ..
+            } => {
+                self.validate_scoped_route_lineage(
+                    &scope,
+                    package_hash,
+                    route,
+                    allowed_operation_classes,
+                )?;
+                for grant in route_grants {
+                    self.validate_scoped_route_lineage(
+                        &scope,
+                        package_hash,
+                        &grant.route,
+                        &grant.allowed_operation_classes,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_scoped_route_lineage(
+        &self,
+        scope: &PetalKeyScope,
+        package_hash: &Digest32,
+        route: &str,
+        allowed_operation_classes: &[Token],
+    ) -> Result<(), AuthorityError> {
         let provenance = self.catalog_provenance(&ProvenanceSubject::Petal {
             package_hash: package_hash.clone(),
-            route: route.clone(),
+            route: route.to_owned(),
         })?;
         let active_lineage = provenance.petal_lineage.as_ref().is_some_and(|membership| {
             membership.active && membership.lineage_id == scope.lineage_id
         });
+        let declared_classes: BTreeSet<_> = provenance
+            .operation_classes
+            .iter()
+            .map(|declared| &declared.operation_class)
+            .collect();
         if !active_lineage
-            || scope
-                .allowed_operation_classes
+            || allowed_operation_classes
                 .iter()
-                .any(|operation_class| {
-                    !provenance
-                        .operation_classes
-                        .iter()
-                        .any(|declared| &declared.operation_class == operation_class)
-                })
+                .any(|operation_class| !declared_classes.contains(operation_class))
         {
             return Err(denied(
                 "PROVENANCE_LINEAGE_MISMATCH",
-                "current package is not an active authorized member of the key lineage",
+                "every granted route must remain an active member of the derived-key lineage",
             ));
         }
         Ok(())
@@ -1435,6 +1474,7 @@ impl BrokerAuthority {
             }
             if let ApprovalSelector::Petal {
                 allowed_operation_classes,
+                route_grants,
                 ..
             } = &terms.selector
             {
@@ -1451,6 +1491,33 @@ impl BrokerAuthority {
                         "PROVENANCE_CLASS_MISMATCH",
                         "approval class is absent from installer-signed provenance",
                     ));
+                }
+                for grant in route_grants {
+                    let granted = self.catalog_provenance(&ProvenanceSubject::Petal {
+                        package_hash: package_hash.clone(),
+                        route: grant.route.clone(),
+                    })?;
+                    verify_provenance(
+                        &granted,
+                        &self.installer_key_id,
+                        &self.installer_key,
+                        &grant.provenance_digest,
+                    )?;
+                    let granted_classes: BTreeSet<_> = granted
+                        .operation_classes
+                        .iter()
+                        .map(|entry| entry.operation_class.as_str())
+                        .collect();
+                    if grant
+                        .allowed_operation_classes
+                        .iter()
+                        .any(|class| !granted_classes.contains(class.as_str()))
+                    {
+                        return Err(denied(
+                            "PROVENANCE_CLASS_MISMATCH",
+                            "route grant class is absent from installer-signed provenance",
+                        ));
+                    }
                 }
             }
         }
@@ -1937,22 +2004,52 @@ impl BrokerAuthority {
             .map(|payload| suite_hash(input.request.crypto_suite, payload))
             .collect();
         let current_provenance = self.catalog_provenance(&input.request.provenance)?;
-        let frozen_provenance = self.frozen_provenance_for(&terms)?;
+        let multi_route = matches!(
+            &terms.selector,
+            ApprovalSelector::Petal { route_grants, .. } if !route_grants.is_empty()
+        );
+        let expected_provenance_digest = if multi_route {
+            let ProvenanceSubject::Petal { route, .. } = &input.request.provenance else {
+                return Err(denied(
+                    "PROVENANCE_MISMATCH",
+                    "multi-route approval requires Petal provenance",
+                ));
+            };
+            let ApprovalSelector::Petal { route_grants, .. } = &terms.selector else {
+                unreachable!("multi_route requires a Petal selector")
+            };
+            route_grants
+                .iter()
+                .find(|grant| &grant.route == route)
+                .map(|grant| grant.provenance_digest.clone())
+                .ok_or_else(|| denied("PROVENANCE_MISMATCH", "executing route is not granted"))?
+        } else {
+            terms.provenance_digest.clone()
+        };
         verify_provenance(
             &current_provenance,
             &self.installer_key_id,
             &self.installer_key,
-            &terms.provenance_digest,
+            &expected_provenance_digest,
         )?;
-        if current_provenance != frozen_provenance {
+        if !multi_route && current_provenance != self.frozen_provenance_for(&terms)? {
             return Err(denied(
                 "PROVENANCE_MISMATCH",
                 "current installer catalog record differs from the approval-frozen record",
             ));
         }
-        if current_provenance.subject != input.request.provenance
-            || !provenance_subject_matches(&terms.subject, &current_provenance.subject)
-        {
+        let subject_matches = if multi_route {
+            matches!(
+                (&terms.subject, &current_provenance.subject),
+                (
+                    ApprovalSubject::Petal { package_hash, .. },
+                    ProvenanceSubject::Petal { package_hash: current_hash, .. }
+                ) if package_hash == current_hash
+            )
+        } else {
+            provenance_subject_matches(&terms.subject, &current_provenance.subject)
+        };
+        if current_provenance.subject != input.request.provenance || !subject_matches {
             return Err(denied(
                 "PROVENANCE_MISMATCH",
                 "current provenance differs from the frozen approval record",
@@ -2024,18 +2121,33 @@ impl BrokerAuthority {
                     package_hash,
                     route,
                     allowed_operation_classes,
+                    route_grants,
                     required_claim_assurance,
                 },
                 Some(claim),
             ) => {
+                let (approved_route, approved_classes) = if route_grants.is_empty() {
+                    (route.as_str(), allowed_operation_classes.as_slice())
+                } else {
+                    let grant = route_grants
+                        .iter()
+                        .find(|grant| grant.route == claim.route)
+                        .ok_or_else(|| {
+                            denied("PETAL_CLAIM_MISMATCH", "claim route is not granted")
+                        })?;
+                    (
+                        grant.route.as_str(),
+                        grant.allowed_operation_classes.as_slice(),
+                    )
+                };
                 self.validate_petal_claim(
                     &terms,
                     &policy,
                     input,
                     claim,
                     package_hash,
-                    route,
-                    allowed_operation_classes,
+                    approved_route,
+                    approved_classes,
                     *required_claim_assurance,
                     &payloads,
                     &ordered_hashes,
