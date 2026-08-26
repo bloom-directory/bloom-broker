@@ -974,6 +974,10 @@ impl MockSigner {
 
     /// A Signer that refuses the browser proof with `UnauthenticatedPeer`, the
     /// stale-signature-counter rejection that leaves its operation pending.
+    #[expect(
+        dead_code,
+        reason = "the fixture is exercised by the post-Signer-merge cross-repository regression"
+    )]
     fn rejecting_proof(cancellation_fails: bool) -> Self {
         Self {
             reject_completion: true,
