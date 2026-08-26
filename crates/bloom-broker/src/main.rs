@@ -716,12 +716,17 @@ fn verified_status_parent(
     let parent = path
         .parent()
         .ok_or("Broker startup diagnostic has no parent directory")?;
+    // Deliberately no link-count check. Requiring `nlink >= 2` treated the
+    // traditional `.`-plus-parent-entry count as evidence of a real directory,
+    // but btrfs reports `nlink == 1` for every directory, so this refused a
+    // perfectly safe status directory there while proving nothing extra
+    // elsewhere. `is_dir()` establishes the type and `symlink_metadata`
+    // establishes that the name resolves.
     let metadata = fs::symlink_metadata(parent)?;
     if !metadata.file_type().is_dir()
         || metadata.file_type().is_symlink()
         || metadata.uid() != broker_uid
         || metadata.mode() & 0o7777 != 0o750
-        || metadata.nlink() < 2
     {
         return Err("Broker startup status directory has unsafe metadata".into());
     }

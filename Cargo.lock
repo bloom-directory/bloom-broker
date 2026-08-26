@@ -258,6 +258,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "k256",
+ "libc",
  "num-bigint",
  "parking_lot",
  "rand 0.8.7",
