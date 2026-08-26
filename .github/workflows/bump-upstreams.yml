@@ -1,0 +1,176 @@
+name: Bump Upstreams
+
+# This workflow advances the pinned git revisions of upstream triad
+# repositories (bloom-service-runtime, bloom-signer) to their default-branch
+# heads and opens a reviewed pull request. It never writes to the default
+# branch directly. Registry (crates.io) updates are handled separately by
+# Dependabot; cargo ignores git dependencies, so pinned revs need this job.
+#
+# RELEASE_PR_TOKEN must be a repository secret containing a fine-grained PAT
+# with Contents: read/write and Pull requests: read/write, mirroring the
+# convention used by the bloom repository's Propose Release workflow. A
+# separate token lets the generated PR receive normal pull_request CI.
+
+on:
+  schedule:
+    - cron: "0 7 * * 4"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: bump-upstreams
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bump:
+    name: Open reviewed upstream bump PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
+      BASE: ${{ github.event.repository.default_branch }}
+      BRANCH: chore/bump-upstreams
+    steps:
+      - name: Require release PR token
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::configure the RELEASE_PR_TOKEN repository secret before running this workflow"
+            exit 1
+          fi
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PR_TOKEN }}
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Resolve and rewrite pinned upstream revisions
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          # Upstream triad repositories and every workspace package resolved
+          # from each. Keep in sync with the git pins in Cargo.toml files.
+          declare -A UPSTREAM_PKGS=(
+            [bloom-service-runtime]="bloom-rpc-wire bloom-triad-local-transport bloom-audit-checkpoint bloom-service-activation bloom-trusted-time bloom-platform-containment"
+            [bloom-signer]="bloom-signer-api bloom-signer-vectors bloom-signer"
+          )
+
+          SUMMARY="$(mktemp)"
+          CHANGED=0
+
+          for repo in bloom-service-runtime bloom-signer; do
+            url="https://github.com/bloom-directory/${repo}.git"
+            new="$(git ls-remote "$url" HEAD | cut -f1)"
+            if [[ ! "$new" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::could not resolve HEAD of $url"
+              exit 1
+            fi
+
+            pins="$(
+              grep -rhoE "git = \"https://github\.com/bloom-directory/${repo}\.git\", rev = \"[0-9a-f]{40}\"" \
+                --include=Cargo.toml . |
+                sed -E 's/.*rev = "([0-9a-f]{40})".*/\1/' | sort -u
+            )"
+            if [[ -z "$pins" ]]; then
+              echo "::error::no git pin found for $repo"
+              exit 1
+            fi
+            if [[ "$(wc -l <<<"$pins")" -ne 1 ]]; then
+              echo "::error::$repo is pinned at multiple divergent revisions; reconcile manually:"
+              printf '%s\n' "$pins"
+              exit 1
+            fi
+            old="$pins"
+
+            if [[ "$old" == "$new" ]]; then
+              echo "$repo: up to date at $new" >> "$SUMMARY"
+              continue
+            fi
+
+            for file in $(git grep -l "$old" -- '*.toml'); do
+              sed -i "s/$old/$new/g" "$file"
+            done
+
+            pkgs="${UPSTREAM_PKGS[$repo]}"
+            # shellcheck disable=SC2086
+            cargo update -p $(printf -- '-p %s ' $pkgs)
+
+            echo "- $repo: \`$old\` -> \`$new\`" >> "$SUMMARY"
+            CHANGED=1
+          done
+
+          cat "$SUMMARY"
+          if [[ "$CHANGED" -eq 0 ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            cp "$SUMMARY" "$RUNNER_TEMP/summary.md"
+          fi
+
+      - name: Check formatting
+        if: steps.resolve.outputs.changed == 'true'
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        if: steps.resolve.outputs.changed == 'true'
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        if: steps.resolve.outputs.changed == 'true'
+        run: cargo test --workspace --all-features --locked
+
+      - name: Enforce change scope
+        if: steps.resolve.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          CHANGED_FILES="$(git diff --name-only)"
+          if [[ "$(printf '%s\n' "$CHANGED_FILES" | grep -Ev '(^|/)Cargo\.(toml|lock)$' || true)" != "" ]]; then
+            echo "::error::bump changed files outside Cargo.toml and Cargo.lock"
+            printf '%s\n' "$CHANGED_FILES"
+            exit 1
+          fi
+          git diff --check
+
+      - name: Open or update bump PR
+        if: steps.resolve.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: bump upstream triad pins"
+          git push --force origin "HEAD:refs/heads/$BRANCH"
+
+          NOTES="$(mktemp)"
+          {
+            echo "## Upstream pin bumps"
+            echo
+            cat "$RUNNER_TEMP/summary.md"
+            echo
+            echo "Resolved from the default-branch heads of the upstream repositories."
+            echo "Please review the upstream commits between the old and new revisions"
+            echo "before merging; normal CI checks apply."
+          } > "$NOTES"
+
+          EXISTING_PR="$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url')"
+          if [[ -n "$EXISTING_PR" ]]; then
+            gh pr edit "$EXISTING_PR" --body-file "$NOTES"
+            echo "updated $EXISTING_PR"
+          else
+            gh pr create \
+              --base "$BASE" \
+              --head "$BRANCH" \
+              --title "chore: bump upstream triad pins" \
+              --body-file "$NOTES"
+          fi
