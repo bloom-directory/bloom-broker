@@ -938,16 +938,15 @@ fn acquire_unix_listener(
     Ok(bloom_service_activation::bind_owned_unix_listener(&path)?)
 }
 
-#[cfg(any(target_os = "macos", feature = "triad-dev-harness"))]
-fn acquire_ceremony_listener() -> Result<std::net::TcpListener, Box<dyn std::error::Error>> {
-    Ok(CeremonyBroker::bind_canonical()?)
-}
-
-#[cfg(all(not(target_os = "macos"), not(feature = "triad-dev-harness")))]
+/// Acquire the canonical ceremony listener.
+///
+/// The platform logic lives in `CeremonyBroker::acquire_canonical_listener`
+/// so that the Linux inherited-listener path is covered by a regression rather
+/// than only by running the service.
 fn acquire_ceremony_listener() -> Result<std::net::TcpListener, Box<dyn std::error::Error>> {
     let name = std::env::var("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME")
         .unwrap_or_else(|_| "broker-ceremony".to_string());
-    Ok(bloom_service_activation::take_tcp_listener(&name)?)
+    Ok(CeremonyBroker::acquire_canonical_listener(&name)?)
 }
 
 #[cfg(not(target_os = "macos"))]
