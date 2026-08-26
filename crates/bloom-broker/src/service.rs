@@ -864,6 +864,10 @@ impl BrokerRpcService {
             selector_kind: translate_signing::selector_to_signer(&terms.selector),
             ordered_payload_digests: decision.ordered_payload_digests,
             ordered_hashes: decision.ordered_hashes,
+            // Raw preimages are carried only by the message-signing suites,
+            // which arrive with the native Solana authorization path. Every
+            // suite reachable here is digest-signing, so this stays empty.
+            ordered_messages: Vec::new(),
             signature_count: DecimalU64::new(signature_count as u64),
             petal_use_claim_digest: claim_digest,
             claim_assurance_digest: assurance_digest,

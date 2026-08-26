@@ -94,9 +94,19 @@ fn acl(effective_uid: u32, identity: &LocalIdentity) -> PeerAcl {
 }
 
 fn downgrade_client_range() -> ProtocolVersionRange {
-    // It accepts the server's 1.5 hello but advertises 1.0 as its current
-    // request version, allowing the server-side authority range to reject it.
-    ProtocolVersionRange::new(1, 0, 5)
+    // It accepts the machine/Broker server's hello at the current Broker
+    // maximum but advertises 1.0 as its current request version, allowing the
+    // server-side range to reject it.
+    ProtocolVersionRange::new(1, 0, bloom_broker_api::BROKER_API_MINOR_MAX)
+}
+
+fn signer_downgrade_client_range() -> ProtocolVersionRange {
+    // It accepts the Signer's hello at the current Signer maximum but
+    // advertises 1.0 as its current request version, allowing the server-side
+    // authority range to reject it. The maximum moved from 1.4 to 1.5 when the
+    // bip39 surface landed above the terminal ceremony-status contract, so it
+    // is read from the constant rather than pinned.
+    ProtocolVersionRange::new(1, 0, bloom_signer_api::SIGNER_API_MINOR_MAX)
 }
 
 #[tokio::test]
@@ -124,7 +134,7 @@ async fn broker_signer_downgrade_fails_before_durable_broker_work() {
         bloom_signer_api::SIGNER_API_CURRENT,
         bloom_signer_api::SIGNER_API_RANGE,
         ProtocolVersion::new(1, 0),
-        downgrade_client_range(),
+        signer_downgrade_client_range(),
         0x20,
     )
     .await;
