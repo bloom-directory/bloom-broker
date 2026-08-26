@@ -1069,6 +1069,74 @@ impl CeremonyBroker {
         Ok(())
     }
 
+    /// Acquire the canonical ceremony listener for this platform.
+    ///
+    /// macOS binds it directly. Linux always consumes the listener its launch
+    /// manager inherited, including under `triad-dev-harness`: that feature
+    /// selects which identity and manifest are loaded, not how a Linux service
+    /// acquires its socket. This lives in the library rather than the binary
+    /// so the inherited-listener path is directly testable.
+    #[cfg(target_os = "macos")]
+    pub fn acquire_canonical_listener(
+        _activation_name: &str,
+    ) -> Result<StdTcpListener, ProtocolError> {
+        Self::bind_canonical()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn acquire_canonical_listener(
+        activation_name: &str,
+    ) -> Result<StdTcpListener, ProtocolError> {
+        let listener =
+            bloom_service_activation::take_tcp_listener(activation_name).map_err(|error| {
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!(
+                        "no inherited ceremony listener named {activation_name:?}; this service \
+                         is socket-activated and will not bind a listener itself: {error}"
+                    ),
+                )
+            })?;
+        Self::require_canonical_listener(listener)
+    }
+
+    /// Verify that an already-acquired listener is the canonical ceremony
+    /// socket.
+    ///
+    /// An inherited listener is supplied by the launch manager rather than
+    /// chosen by this process, so its address is an input to be checked, not
+    /// an invariant to be assumed. A descriptor bound to any other address is
+    /// refused outright: the ceremony origin, the `Host` header check, and the
+    /// browser's same-origin expectations are all pinned to
+    /// [`CEREMONY_ADDR`], so serving on a different address would silently
+    /// break them rather than fail closed.
+    pub fn require_canonical_listener(
+        listener: StdTcpListener,
+    ) -> Result<StdTcpListener, ProtocolError> {
+        let observed = listener.local_addr().map_err(|error| {
+            protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                format!("inherited ceremony listener has no readable address: {error}"),
+            )
+        })?;
+        if observed != CEREMONY_ADDR {
+            return Err(protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                format!(
+                    "inherited ceremony listener is bound to {observed}, not the canonical \
+                     {CEREMONY_ADDR}; no other address will be served"
+                ),
+            ));
+        }
+        listener.set_nonblocking(true).map_err(|error| {
+            protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                format!("canonical ceremony listener setup failed: {error}"),
+            )
+        })?;
+        Ok(listener)
+    }
+
     /// Exclusively acquire the canonical socket. There is deliberately no
     /// fallback address or port.
     pub fn bind_canonical() -> Result<StdTcpListener, ProtocolError> {
