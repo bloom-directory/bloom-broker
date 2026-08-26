@@ -912,6 +912,12 @@ fn verified_status_parent(
     let parent = path
         .parent()
         .ok_or("Broker startup diagnostic has no parent directory")?;
+    // Deliberately no link-count check. Requiring `nlink >= 2` treated the
+    // traditional `.`-plus-parent-entry count as evidence of a real directory,
+    // but btrfs reports `nlink == 1` for every directory, so this refused a
+    // perfectly safe status directory there while proving nothing extra
+    // elsewhere. `is_dir()` establishes the type and `symlink_metadata`
+    // establishes that the name resolves.
     let metadata = fs::symlink_metadata(parent)?;
     // Directory hard links are forbidden by POSIX, so `is_dir` already rules
     // out substitutes; a link-count floor is not portable (btrfs reports
