@@ -11,7 +11,7 @@ use bloom_broker::{
 };
 use bloom_broker_api::{
     Base64UrlBytes, CeremonyState, ClaimAssurance, CustodyPrepareResponse, DecimalU64, Digest32,
-    OperationId, ProtocolErrorCode, RequestNonce, Token,
+    OperationId, ProtocolError, ProtocolErrorCode, RequestNonce, Token,
 };
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer::{
@@ -402,6 +402,8 @@ struct MockSigner {
     completions: AtomicUsize,
     cancellations: AtomicUsize,
     pending: parking_lot::Mutex<HashSet<OperationId>>,
+    reject_completion: bool,
+    cancellation_fails: AtomicBool,
 }
 
 struct RealSigner {
@@ -557,6 +559,9 @@ impl CeremonySigner for RealSigner {
             bloom_signer::ceremony::SignerCeremonyStatus::CompletedCustody(result) => {
                 SignerCeremonyStatus::CompletedCustody(result)
             }
+            bloom_signer::ceremony::SignerCeremonyStatus::Terminal(state) => {
+                SignerCeremonyStatus::Terminal(state)
+            }
             bloom_signer::ceremony::SignerCeremonyStatus::Missing => SignerCeremonyStatus::Missing,
         })
     }
@@ -568,7 +573,25 @@ impl MockSigner {
             completions: AtomicUsize::new(0),
             cancellations: AtomicUsize::new(0),
             pending: parking_lot::Mutex::new(HashSet::new()),
+            reject_completion: false,
+            cancellation_fails: AtomicBool::new(false),
         }
+    }
+
+    /// A Signer that refuses the browser proof with `UnauthenticatedPeer`, the
+    /// stale-signature-counter rejection that leaves its operation pending.
+    fn rejecting_proof(cancellation_fails: bool) -> Self {
+        Self {
+            reject_completion: true,
+            cancellation_fails: AtomicBool::new(cancellation_fails),
+            ..Self::new()
+        }
+    }
+
+    /// End a transient cancellation outage so the next reconciliation attempt
+    /// releases the still-pending Signer operation.
+    fn restore_cancellation(&self) {
+        self.cancellation_fails.store(false, Ordering::SeqCst);
     }
 }
 
@@ -698,6 +721,12 @@ impl CeremonySigner for MockSigner {
         request: CustodyCompleteRequest,
         _now_ms: u64,
     ) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
+        if self.reject_completion {
+            return Err(bloom_signer_api::ProtocolError::new(
+                bloom_signer_api::ProtocolErrorCode::UnauthenticatedPeer,
+                "stale webauthn signature counter",
+            ));
+        }
         self.completions.fetch_add(1, Ordering::SeqCst);
         Ok(CustodyResult {
             ceremony_kind: request.ceremony_kind,
@@ -743,8 +772,16 @@ impl CeremonySigner for MockSigner {
     }
 
     fn cancel(&self, operation_id: &OperationId) -> Result<(), bloom_signer_api::ProtocolError> {
-        self.pending.lock().remove(operation_id);
         self.cancellations.fetch_add(1, Ordering::SeqCst);
+        if self.cancellation_fails.load(Ordering::SeqCst) {
+            // The operation stays pending: the Signer still holds the wallet's
+            // concurrency quota until a later cancel succeeds.
+            return Err(bloom_signer_api::ProtocolError::new(
+                bloom_signer_api::ProtocolErrorCode::ServiceUnavailable,
+                "mock cancellation is unavailable",
+            ));
+        }
+        self.pending.lock().remove(operation_id);
         Ok(())
     }
 
@@ -1779,6 +1816,169 @@ fn restart_expires_nonterminal_session_and_persists_only_token_hash() {
         )
         .unwrap_err();
     assert_eq!(error.code, ProtocolErrorCode::CeremonyReplay);
+}
+
+/// A stale WebAuthn signature counter is rejected as `UnauthenticatedPeer`
+/// while the Signer keeps its operation pending, so Broker must cancel that
+/// operation before the session may become terminal. When the cancel itself
+/// fails the browser still gets the structured rejection, the session stays
+/// nonterminal so a later sweep or restart retries the cancel, and only the
+/// successful retry burns the launch token and frees the wallet.
+#[tokio::test]
+async fn rejected_proof_stays_verifying_until_a_retried_cancel_releases_the_signer() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("ceremonies.sqlite");
+    let signer = Arc::new(MockSigner::rejecting_proof(true));
+    let journal = Arc::new(BrokerJournal::open(&path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let broker = CeremonyBroker::open(&path, signer.clone(), journal.clone()).unwrap();
+    let wallet = Token::new("wallet-stale-counter").unwrap();
+    // The browser completion path stamps itself from the real clock, so the
+    // session has to be staged against it to still be live when it posts.
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let prepared = prepare(&broker, operation("41"), Some(wallet.clone()), now_ms);
+    let ceremony_id = broker
+        .public_status(&operation("41"))
+        .unwrap()
+        .ceremony_id
+        .to_string();
+    let token = url_token(&prepared.ceremony_url);
+    let app = broker.router();
+    let body = serde_json::json!({
+        "proof": {
+            "kind": "assertion",
+            "assertion": {
+                "credential_id": "Y3JlZGVudGlhbA",
+                "authenticator_data": "YXV0aA",
+                "client_data_json": "e30",
+                "signature": "c2ln",
+                "user_handle": null
+            }
+        },
+        "encrypted_input": {
+            "kem_output": "a2Vt",
+            "ciphertext": "Y2lwaGVydGV4dA"
+        },
+        "public_binding_digest": digest("33")
+    });
+
+    let rejected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/session/{ceremony_id}/complete"))
+                .header(header::HOST, "localhost:18734")
+                .header(header::ORIGIN, "http://localhost:18734")
+                .header("x-bloom-ceremony-token", &token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    // Deserialising through `ProtocolError` also proves the rejection kept its
+    // real retry and durable-effect contract rather than an empty failure.
+    let error: ProtocolError =
+        serde_json::from_slice(&rejected.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(error.code, ProtocolErrorCode::UnauthenticatedPeer);
+    assert_eq!(error.message, "stale webauthn signature counter");
+    assert_eq!(signer.completions.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        signer.cancellations.load(Ordering::SeqCst),
+        1,
+        "the rejected proof has to release the still-pending Signer operation"
+    );
+    assert_eq!(
+        broker.status(&operation("41")),
+        Some(CeremonyState::Verifying),
+        "a failed cancel must leave the session nonterminal so the cancel is retried"
+    );
+    let live = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", &token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        live.status(),
+        StatusCode::OK,
+        "a nonterminal session keeps its launch token usable"
+    );
+
+    let sweep = broker.expire_sessions(now_ms + 10_001).unwrap_err();
+    assert_eq!(sweep.code, ProtocolErrorCode::ServiceUnavailable);
+    assert_eq!(signer.cancellations.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        broker.status(&operation("41")),
+        Some(CeremonyState::Verifying),
+        "an expiry sweep that cannot reach the Signer must not strand the operation"
+    );
+
+    signer.restore_cancellation();
+    drop(app);
+    drop(broker);
+    let restarted = CeremonyBroker::open(&path, signer.clone(), journal).unwrap();
+    assert_eq!(
+        signer.cancellations.load(Ordering::SeqCst),
+        3,
+        "restart reconciliation retries the cancel the browser path could not complete"
+    );
+    assert_eq!(
+        restarted.status(&operation("41")),
+        Some(CeremonyState::Expired)
+    );
+    let public = restarted.public_status(&operation("41")).unwrap();
+    assert_eq!(public.state, CeremonyState::Expired);
+    assert!(
+        public.ceremony_url.is_none(),
+        "a terminal session must not hand out a ceremony URL"
+    );
+    let burned = restarted
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", &token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        burned.status(),
+        StatusCode::FORBIDDEN,
+        "terminalising burns the token hash, so the launch token stops authorising"
+    );
+    assert!(
+        !std::fs::read(&path)
+            .unwrap()
+            .windows(token.len())
+            .any(|window| window == token.as_bytes()),
+        "launch token plaintext must not be durable"
+    );
+
+    // The released Signer operation no longer holds the wallet, so the owner
+    // can stage a fresh ceremony with a token unrelated to the burned one.
+    let fresh = prepare(&restarted, operation("42"), Some(wallet), now_ms + 13_000);
+    assert_eq!(
+        restarted.status(&operation("42")),
+        Some(CeremonyState::AwaitingUser)
+    );
+    assert_ne!(url_token(&fresh.ceremony_url), token);
 }
 
 #[test]

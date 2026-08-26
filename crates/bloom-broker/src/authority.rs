@@ -955,8 +955,10 @@ impl BrokerAuthority {
 
     /// Fail-closed adoption of an allocation receipt: the returned child
     /// must be exactly the child the committed terms asked for — same
-    /// wallet, same derivation profile, same committed account index, and a
-    /// path shape matching the profile's frozen template.
+    /// wallet, same derivation profile, and a path shape matching the
+    /// profile's frozen template. An explicit account is pinned exactly;
+    /// `None` on the Solana profile commits to Signer's atomic automatic
+    /// account selection rather than incorrectly meaning account zero.
     fn adopt_account_allocation(
         &self,
         receipt: &CustodyResult,
@@ -3115,13 +3117,30 @@ fn migrate_legacy_authority(
 }
 
 /// The allocated path must be the profile's frozen template instantiated at
-/// exactly the committed account index. The terminal index is reserved by
-/// Signer and therefore free, but the account is human-approved and pinned.
+/// exactly the committed account index. For Solana only, `None` means the
+/// Signer atomically selects the next never-used BIP-44 account; Broker still
+/// verifies the complete frozen path shape and hardened account range. The
+/// terminal EVM index is reserved by Signer and therefore free.
 fn path_matches_committed_account(
     profile: bloom_broker_api::DerivationProfile,
     path: &str,
     committed_account: Option<u32>,
 ) -> bool {
+    if profile == bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1
+        && committed_account.is_none()
+    {
+        let segments: Vec<&str> = path.split('/').collect();
+        let ["m", "44'", "501'", account, "0'"] = segments.as_slice() else {
+            return false;
+        };
+        let Some(value) = account.strip_suffix('\'') else {
+            return false;
+        };
+        let Ok(account) = value.parse::<u32>() else {
+            return false;
+        };
+        return account < (1_u32 << 31) && account.to_string() == value;
+    }
     let committed = committed_account.unwrap_or(0);
     let template = profile
         .path_template()
@@ -3640,4 +3659,74 @@ fn denied(code: &'static str, message: impl Into<String>) -> AuthorityError {
 
 fn storage(error: impl ToString) -> AuthorityError {
     AuthorityError::Storage(error.to_string())
+}
+
+#[cfg(test)]
+mod account_path_tests {
+    use super::path_matches_committed_account;
+    use bloom_broker_api::DerivationProfile;
+
+    #[test]
+    fn automatic_solana_account_accepts_only_the_frozen_hardened_path_shape() {
+        let profile = DerivationProfile::Bip44SolanaSlip10Ed25519V1;
+        assert!(path_matches_committed_account(
+            profile,
+            "m/44'/501'/0'/0'",
+            None
+        ));
+        assert!(path_matches_committed_account(
+            profile,
+            "m/44'/501'/2'/0'",
+            None
+        ));
+        assert!(!path_matches_committed_account(
+            profile,
+            "m/44'/501'/2/0'",
+            None
+        ));
+        assert!(!path_matches_committed_account(
+            profile,
+            "m/44'/501'/2147483648'/0'",
+            None
+        ));
+        assert!(!path_matches_committed_account(
+            profile,
+            "m/44'/501'/02'/0'",
+            None
+        ));
+        assert!(!path_matches_committed_account(
+            profile,
+            "m/44'/501'/+2'/0'",
+            None
+        ));
+        assert!(!path_matches_committed_account(
+            profile,
+            "m/44'/501'/2'/0'/0'",
+            None
+        ));
+    }
+
+    #[test]
+    fn explicit_accounts_and_evm_defaults_remain_exact() {
+        assert!(path_matches_committed_account(
+            DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            "m/44'/501'/2'/0'",
+            Some(2)
+        ));
+        assert!(!path_matches_committed_account(
+            DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            "m/44'/501'/3'/0'",
+            Some(2)
+        ));
+        assert!(path_matches_committed_account(
+            DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/7",
+            None
+        ));
+        assert!(!path_matches_committed_account(
+            DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/1'/0/7",
+            None
+        ));
+    }
 }
