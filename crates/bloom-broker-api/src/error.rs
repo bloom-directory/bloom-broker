@@ -212,6 +212,48 @@ impl<'de> Deserialize<'de> for ProtocolErrorCode {
     }
 }
 
+/// Structured rolling-quota metadata attached to `CEREMONY_RATE_LIMITED`.
+///
+/// Callers wait `retry_after_ms` and retry the *same* operation identity; they
+/// must never parse the human-readable message or invent a replacement
+/// operation. The values describe the quota class that rejected the request,
+/// never the wallet that hit it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitDetails {
+    /// Milliseconds until the rejected creation can succeed, derived from the
+    /// oldest session that currently holds the quota at capacity.
+    pub retry_after_ms: u64,
+    /// Effective number of creations allowed inside one rolling window.
+    pub limit: u64,
+    /// Length of the rolling window in milliseconds.
+    pub window_ms: u64,
+}
+
+impl RateLimitDetails {
+    /// Build details, returning `None` when the values cannot describe a real
+    /// rolling quota. Callers fall back to an error without details rather
+    /// than publishing a retry hint a caller could not act on.
+    pub fn new(retry_after_ms: u64, limit: u64, window_ms: u64) -> Option<Self> {
+        let details = Self {
+            retry_after_ms,
+            limit,
+            window_ms,
+        };
+        details.is_well_formed().then_some(details)
+    }
+
+    /// A retry hint is only actionable when it is positive and lands inside
+    /// the window it was derived from; anything else is a forged or corrupt
+    /// projection and is refused at the boundary.
+    pub fn is_well_formed(&self) -> bool {
+        self.limit > 0
+            && self.window_ms > 0
+            && self.retry_after_ms > 0
+            && self.retry_after_ms <= self.window_ms
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorContract {
@@ -235,6 +277,11 @@ pub struct ProtocolError {
     pub retry: RetryClass,
     pub durable_effect: DurableEffect,
     pub message: String,
+    /// Present only on rolling-quota rejections. Older peers omit the field
+    /// entirely, and it is never serialized when absent, so both directions
+    /// stay compatible with encoders and decoders that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimitDetails>,
 }
 
 impl<'de> Deserialize<'de> for ProtocolError {
@@ -249,6 +296,8 @@ impl<'de> Deserialize<'de> for ProtocolError {
             retry: RetryClass,
             durable_effect: DurableEffect,
             message: String,
+            #[serde(default)]
+            rate_limit: Option<RateLimitDetails>,
         }
 
         let wire = WireError::deserialize(deserializer)?;
@@ -259,11 +308,20 @@ impl<'de> Deserialize<'de> for ProtocolError {
                 wire.code.as_str()
             )));
         }
+        if let Some(details) = wire.rate_limit
+            && (wire.code != ProtocolErrorCode::CeremonyRateLimited || !details.is_well_formed())
+        {
+            return Err(serde::de::Error::custom(format!(
+                "{} carries unusable rate-limit details",
+                wire.code.as_str()
+            )));
+        }
         Ok(Self {
             code: wire.code,
             retry: wire.retry,
             durable_effect: wire.durable_effect,
             message: wire.message,
+            rate_limit: wire.rate_limit,
         })
     }
 }
@@ -276,11 +334,21 @@ impl ProtocolError {
             retry: contract.retry,
             durable_effect: contract.durable_effect,
             message: message.into(),
+            rate_limit: None,
         }
     }
 
     pub fn fatal(code: ProtocolErrorCode, message: impl Into<String>) -> Self {
         Self::new(code, message)
+    }
+
+    /// A rolling-quota rejection carrying the retry contract callers act on.
+    pub fn rate_limited(message: impl Into<String>, details: RateLimitDetails) -> Self {
+        let mut error = Self::new(ProtocolErrorCode::CeremonyRateLimited, message);
+        if details.is_well_formed() {
+            error.rate_limit = Some(details);
+        }
+        error
     }
 
     pub fn has_valid_contract(&self) -> bool {
@@ -289,6 +357,9 @@ impl ProtocolError {
                 retry: self.retry,
                 durable_effect: self.durable_effect,
             }
+            && self.rate_limit.is_none_or(|details| {
+                self.code == ProtocolErrorCode::CeremonyRateLimited && details.is_well_formed()
+            })
     }
 }
 
@@ -357,5 +428,67 @@ mod tests {
             "message":"forged"
         }"#;
         assert!(serde_json::from_str::<ProtocolError>(wire).is_err());
+    }
+
+    #[test]
+    fn rate_limit_details_survive_a_wire_round_trip() {
+        let details = RateLimitDetails::new(84_231, 12, 300_000).unwrap();
+        let error = ProtocolError::rate_limited("wallet quota is exhausted", details);
+        assert!(error.has_valid_contract());
+
+        let encoded = serde_json::to_value(&error).unwrap();
+        assert_eq!(encoded["rate_limit"]["retry_after_ms"], 84_231);
+        assert_eq!(encoded["rate_limit"]["limit"], 12);
+        assert_eq!(encoded["rate_limit"]["window_ms"], 300_000);
+
+        let decoded: ProtocolError = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, error);
+        assert_eq!(decoded.rate_limit, Some(details));
+    }
+
+    #[test]
+    fn errors_without_rate_limit_details_still_decode_and_omit_the_field() {
+        let plain = ProtocolError::new(ProtocolErrorCode::CeremonyRateLimited, "no hint");
+        let encoded = serde_json::to_value(&plain).unwrap();
+        assert!(encoded.get("rate_limit").is_none());
+
+        let legacy = r#"{
+            "code":"CEREMONY_RATE_LIMITED",
+            "retry":"after_backoff",
+            "durable_effect":"none",
+            "message":"no hint"
+        }"#;
+        let decoded: ProtocolError = serde_json::from_str(legacy).unwrap();
+        assert_eq!(decoded, plain);
+        assert!(decoded.rate_limit.is_none());
+    }
+
+    #[test]
+    fn unusable_or_misplaced_rate_limit_details_are_refused() {
+        assert!(RateLimitDetails::new(0, 12, 300_000).is_none());
+        assert!(RateLimitDetails::new(300_001, 12, 300_000).is_none());
+        assert!(RateLimitDetails::new(1, 0, 300_000).is_none());
+        assert!(RateLimitDetails::new(1, 12, 0).is_none());
+
+        // A retry hint longer than its own window, and a hint bolted onto an
+        // unrelated code, are both rejected instead of trusted.
+        for wire in [
+            r#"{
+                "code":"CEREMONY_RATE_LIMITED",
+                "retry":"after_backoff",
+                "durable_effect":"none",
+                "message":"forged",
+                "rate_limit":{"retry_after_ms":300001,"limit":12,"window_ms":300000}
+            }"#,
+            r#"{
+                "code":"QUOTA_EXCEEDED",
+                "retry":"after_backoff",
+                "durable_effect":"none",
+                "message":"concurrency",
+                "rate_limit":{"retry_after_ms":10,"limit":12,"window_ms":300000}
+            }"#,
+        ] {
+            assert!(serde_json::from_str::<ProtocolError>(wire).is_err());
+        }
     }
 }
