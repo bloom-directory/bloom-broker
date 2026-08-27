@@ -439,9 +439,16 @@ async function run(session) {
     credentialId = encodeUrl(assertion.rawId);
     const credentialPrf = prfResult(assertion);
     if (!credentialPrf) throw new Error("This passkey did not return required PRF output");
+    // Every custody kind whose input is just the PRF plus a typed effect.
+    // The account kinds belong here: the Broker builds their exact terms from
+    // the prepare request, so the browser supplies no operator input for them
+    // and `genericFields` stays hidden. Omitting them left
+    // `bloom wallet account-allocate` and `account-retire` unusable — the page
+    // sent no custody input at all and the Broker rejected the completion.
     const genericKinds = new Set([
       "wallet_export", "wallet_delete",
-      "backend_enrollment", "key_derive", "policy_update"
+      "backend_enrollment", "key_derive", "policy_update",
+      "account_allocate", "account_retire"
     ]);
     if (genericKinds.has(kind)) {
       let effect = {kind};
