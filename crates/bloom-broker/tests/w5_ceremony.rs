@@ -98,6 +98,52 @@ impl AuditSigner for SwitchableAuditSigner {
     }
 }
 
+/// Every custody ceremony the Broker can prepare must be completable in the
+/// shipped page.
+///
+/// `account_allocate` and `account_retire` were missing from the page's kind
+/// handling while the Broker, Signer, and Machine CLI all supported them, so
+/// `bloom wallet account-allocate` produced a ceremony URL that could never be
+/// completed: the page sent no custody input and the Broker rejected the
+/// completion while parsing it. Nothing caught that, because every test
+/// completed these ceremonies through the API rather than the page.
+#[test]
+fn the_shipped_page_handles_every_custody_ceremony_kind() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+
+    // Kinds whose completion is PRF plus a typed effect, with no operator
+    // input. The page must list them, or it sends nothing at all.
+    for kind in [
+        "wallet_export",
+        "wallet_delete",
+        "backend_enrollment",
+        "key_derive",
+        "policy_update",
+        "account_allocate",
+        "account_retire",
+    ] {
+        assert!(
+            asset.contains(&format!("\"{kind}\"")),
+            "the ceremony page does not handle the {kind} ceremony, so it cannot be completed"
+        );
+    }
+
+    // Kinds the page handles through their own branches.
+    for kind in [
+        "sealed_approval",
+        "wallet_registration",
+        "wallet_import",
+        "wallet_recovery",
+        "credential_add",
+        "credential_replace",
+    ] {
+        assert!(
+            asset.contains(&format!("\"{kind}\"")),
+            "the ceremony page does not mention the {kind} ceremony"
+        );
+    }
+}
+
 #[test]
 fn browser_crypto_self_test_executes_the_shipped_asset() {
     let asset = include_str!("../src/ceremony_assets/app.js");
