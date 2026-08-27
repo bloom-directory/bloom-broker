@@ -198,7 +198,7 @@ dependencies = [
 [[package]]
 name = "bloom-audit-checkpoint"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=06104c74d63275473dea1a554b2afebb32338a9c#06104c74d63275473dea1a554b2afebb32338a9c"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=8e0aa7645c484b02ea9d994c3ce5f6f37abd9360#8e0aa7645c484b02ea9d994c3ce5f6f37abd9360"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek",
@@ -289,7 +289,7 @@ dependencies = [
 [[package]]
 name = "bloom-platform-containment"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=06104c74d63275473dea1a554b2afebb32338a9c#06104c74d63275473dea1a554b2afebb32338a9c"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=8e0aa7645c484b02ea9d994c3ce5f6f37abd9360#8e0aa7645c484b02ea9d994c3ce5f6f37abd9360"
 dependencies = [
  "bloom-rpc-wire",
  "serde",
@@ -299,7 +299,7 @@ dependencies = [
 [[package]]
 name = "bloom-rpc-wire"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=06104c74d63275473dea1a554b2afebb32338a9c#06104c74d63275473dea1a554b2afebb32338a9c"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=8e0aa7645c484b02ea9d994c3ce5f6f37abd9360#8e0aa7645c484b02ea9d994c3ce5f6f37abd9360"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -314,7 +314,7 @@ dependencies = [
 [[package]]
 name = "bloom-service-activation"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=06104c74d63275473dea1a554b2afebb32338a9c#06104c74d63275473dea1a554b2afebb32338a9c"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=8e0aa7645c484b02ea9d994c3ce5f6f37abd9360#8e0aa7645c484b02ea9d994c3ce5f6f37abd9360"
 dependencies = [
  "bloom-rpc-wire",
  "libc",
@@ -324,7 +324,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a4c6925b53b7d59a6f4f3419135cbcaa15a3454a#a4c6925b53b7d59a6f4f3419135cbcaa15a3454a"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=6f902ba455256793c14d7855c115d39ff7a30327#6f902ba455256793c14d7855c115d39ff7a30327"
 dependencies = [
  "blake3",
  "bloom-audit-checkpoint",
@@ -364,7 +364,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a4c6925b53b7d59a6f4f3419135cbcaa15a3454a#a4c6925b53b7d59a6f4f3419135cbcaa15a3454a"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=6f902ba455256793c14d7855c115d39ff7a30327#6f902ba455256793c14d7855c115d39ff7a30327"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek",
@@ -379,7 +379,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-backend-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a4c6925b53b7d59a6f4f3419135cbcaa15a3454a#a4c6925b53b7d59a6f4f3419135cbcaa15a3454a"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=6f902ba455256793c14d7855c115d39ff7a30327#6f902ba455256793c14d7855c115d39ff7a30327"
 dependencies = [
  "bloom-signer-api",
  "serde",
@@ -390,7 +390,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-backend-local"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a4c6925b53b7d59a6f4f3419135cbcaa15a3454a#a4c6925b53b7d59a6f4f3419135cbcaa15a3454a"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=6f902ba455256793c14d7855c115d39ff7a30327#6f902ba455256793c14d7855c115d39ff7a30327"
 dependencies = [
  "bip32",
  "bloom-signer-api",
@@ -413,7 +413,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a4c6925b53b7d59a6f4f3419135cbcaa15a3454a#a4c6925b53b7d59a6f4f3419135cbcaa15a3454a"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=6f902ba455256793c14d7855c115d39ff7a30327#6f902ba455256793c14d7855c115d39ff7a30327"
 dependencies = [
  "bip39",
  "ed25519-dalek",
@@ -430,7 +430,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-process-hardening"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a4c6925b53b7d59a6f4f3419135cbcaa15a3454a#a4c6925b53b7d59a6f4f3419135cbcaa15a3454a"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=6f902ba455256793c14d7855c115d39ff7a30327#6f902ba455256793c14d7855c115d39ff7a30327"
 dependencies = [
  "libc",
 ]
@@ -438,12 +438,12 @@ dependencies = [
 [[package]]
 name = "bloom-signer-vectors"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a4c6925b53b7d59a6f4f3419135cbcaa15a3454a#a4c6925b53b7d59a6f4f3419135cbcaa15a3454a"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=6f902ba455256793c14d7855c115d39ff7a30327#6f902ba455256793c14d7855c115d39ff7a30327"
 
 [[package]]
 name = "bloom-triad-local-transport"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=06104c74d63275473dea1a554b2afebb32338a9c#06104c74d63275473dea1a554b2afebb32338a9c"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=8e0aa7645c484b02ea9d994c3ce5f6f37abd9360#8e0aa7645c484b02ea9d994c3ce5f6f37abd9360"
 dependencies = [
  "bloom-rpc-wire",
  "bloom-trusted-time",
@@ -461,7 +461,7 @@ dependencies = [
 [[package]]
 name = "bloom-trusted-time"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=06104c74d63275473dea1a554b2afebb32338a9c#06104c74d63275473dea1a554b2afebb32338a9c"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=8e0aa7645c484b02ea9d994c3ce5f6f37abd9360#8e0aa7645c484b02ea9d994c3ce5f6f37abd9360"
 dependencies = [
  "libc",
  "thiserror",
