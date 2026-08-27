@@ -555,6 +555,49 @@ fn broker_clock_legacy_zero_anchor_does_not_grant_restart_credit() {
 }
 
 #[test]
+fn broker_clock_unknown_legacy_boot_epoch_does_not_impersonate_a_reboot() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("clock-legacy-epoch.sqlite");
+    let journal = open_journal(&path);
+    journal
+        .observe_time(
+            TimeReading {
+                utc_ms: Some(1_000),
+                monotonic_elapsed_ms: 0,
+                monotonic_anchor_ns: 1_000_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
+            },
+            1_000,
+            false,
+        )
+        .unwrap();
+    drop(journal);
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE clock_state SET boot_epoch = ?1 WHERE singleton = 1",
+            [BootEpoch::from_bytes([0; 16]).as_str()],
+        )
+        .unwrap();
+
+    let restarted = open_journal(&path);
+    let decision = restarted
+        .observe_time(
+            TimeReading {
+                utc_ms: Some(6_000),
+                monotonic_elapsed_ms: 0,
+                monotonic_anchor_ns: 6_000_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
+            },
+            1_000,
+            false,
+        )
+        .unwrap();
+    assert_eq!(decision.effective_now_ms, 1_000);
+    assert_eq!(decision.condition, ClockCondition::ForwardJumpRejected);
+}
+
+#[test]
 fn ac10_clock_faults_freeze_or_advance_effective_time_fail_closed() {
     let journal = memory_journal();
     install_reservation_approval(&journal);
