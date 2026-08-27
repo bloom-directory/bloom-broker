@@ -132,8 +132,16 @@ fn linux_ceremony_listener_is_inherited_and_never_rebound() {
 
     // Hold the canonical address for the whole test. Every child below runs
     // while it is held, so any attempt to bind it would fail.
-    let held = TcpListener::bind(CEREMONY_ADDR)
-        .expect("the test must own the canonical address before the children run");
+    // A developer running the triad harness locally already owns this address,
+    // and the failure would otherwise look like a product defect rather than a
+    // busy port.
+    let held = TcpListener::bind(CEREMONY_ADDR).unwrap_or_else(|error| {
+        panic!(
+            "this test needs the canonical ceremony address {CEREMONY_ADDR} to be free, but \
+             binding it failed: {error}. A running Broker or triad harness holds it; stop that \
+             first."
+        )
+    });
 
     // The verifier accepts a listener that really is on the canonical address.
     let checked = CeremonyBroker::require_canonical_listener(duplicate(held.as_raw_fd()).into())
