@@ -82,7 +82,7 @@ mod version_tests {
         // The gate is the range itself: nothing below the minor that
         // introduced `rate_limit` can ever be negotiated, so no accepted peer
         // can be handed a field its decoder would refuse.
-        assert!(BROKER_API_MINOR_MIN >= RATE_LIMIT_DETAILS_MINOR);
+        const { assert!(BROKER_API_MINOR_MIN >= RATE_LIMIT_DETAILS_MINOR) };
         assert!(!BROKER_API_RANGE.contains(ProtocolVersion::new(
             BROKER_API_MAJOR,
             RATE_LIMIT_DETAILS_MINOR - 1,
