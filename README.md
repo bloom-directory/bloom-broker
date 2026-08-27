@@ -60,12 +60,33 @@ rejected the request; `retry_after_ms` is the exact wait until the oldest
 creation holding that quota leaves the window, so waiting it out is sufficient
 and callers need no extra margin. Callers wait and retry the **same** operation
 identity — never parse the message, and never invent a replacement operation.
-The field is absent on older peers and is refused if it appears on any other
-code or carries values outside its own window.
+The field is refused if it appears on any other code or carries values outside
+its own window.
 
 Concurrency exhaustion is a different class: it returns `QUOTA_EXCEEDED` with
 **no** retry hint, because nothing ages out on a schedule — only when a live
 ceremony ends.
+
+### Why `rate_limit` needs protocol 1.4
+
+`rate_limit` is an optional field, but it could not be added under 1.3, because
+every decoder in this protocol is **strict**: an unknown field fails the whole
+frame rather than being ignored. A 1.3 peer handed a `CEREMONY_RATE_LIMITED`
+carrying `rate_limit` would reject the entire error instead of reading the retry
+hint inside it — turning a routine, retryable rejection into an unreadable one.
+
+There is no way to make that safe by omitting the field selectively, so the
+negotiated range moves as a unit instead. Broker accepts **1.4 only**
+(`BROKER_API_MINOR_MIN == BROKER_API_MINOR_MAX == 4`), which means:
+
+- A **1.3 peer is rejected during the hello**, with `UNSUPPORTED_VERSION`,
+  before any request is served and before any durable work is done. It never
+  reaches a point where a response could carry `rate_limit`.
+- Consequently no *accepted* peer can be handed a field its decoder would
+  refuse — the version gate, not per-response suppression, is what upholds this.
+
+Upgrading a 1.3 Machine is therefore required, not optional; a 1.3 peer does not
+degrade to a subset of functionality, it fails to connect at all.
 
 ## Recovering a fail-closed clock after a restart
 

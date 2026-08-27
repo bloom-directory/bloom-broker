@@ -42,24 +42,24 @@ fn merge_ceremony_limits(
     let mut builder = Config::builder()
         .set_default(
             "ceremony_limits.maximum_concurrent_sessions",
-            defaults.maximum_concurrent_sessions as u64,
+            defaults.maximum_concurrent_sessions() as u64,
         )
         .and_then(|builder| {
             builder.set_default(
                 "ceremony_limits.creation_window_ms",
-                defaults.creation_window_ms,
+                defaults.creation_window_ms(),
             )
         })
         .and_then(|builder| {
             builder.set_default(
                 "ceremony_limits.maximum_creations_per_wallet",
-                defaults.maximum_creations_per_wallet as u64,
+                defaults.maximum_creations_per_wallet() as u64,
             )
         })
         .and_then(|builder| {
             builder.set_default(
                 "ceremony_limits.maximum_anonymous_registrations",
-                defaults.maximum_anonymous_registrations as u64,
+                defaults.maximum_anonymous_registrations() as u64,
             )
         })
         .map_err(invalid)?;
@@ -78,13 +78,14 @@ fn merge_ceremony_limits(
     if let Some(environment) = environment {
         overrides = overrides.source(Some(environment.into_iter().collect()));
     }
+    // `CeremonyLimits` validates as it decodes, so the merged policy is in
+    // range by the time it exists at all.
     builder
         .add_source(overrides)
         .build()
         .map_err(invalid)?
         .get::<CeremonyLimits>(CEREMONY_LIMITS_KEY)
-        .map_err(invalid)?
-        .validated()
+        .map_err(invalid)
 }
 
 fn invalid(error: config::ConfigError) -> ProtocolError {
@@ -116,25 +117,61 @@ mod tests {
 
     #[test]
     fn compiled_defaults_apply_when_nothing_is_configured() {
-        let limits = ceremony_limits(None).unwrap();
+        // Both layers are explicitly empty rather than left to the process
+        // environment, so an operator's exported BLOOM_BROKER_CEREMONY_LIMITS__*
+        // cannot change what this test observes.
+        let limits = merge_ceremony_limits(None, Some(environment(&[]))).unwrap();
         assert_eq!(limits, CeremonyLimits::default());
         assert_eq!(
-            limits.maximum_concurrent_sessions,
+            limits.maximum_concurrent_sessions(),
             DEFAULT_MAXIMUM_CONCURRENT_SESSIONS
         );
-        assert_eq!(limits.maximum_concurrent_sessions, 16);
-        assert_eq!(limits.creation_window_ms, DEFAULT_CREATION_WINDOW_MS);
-        assert_eq!(limits.creation_window_ms, 300_000);
+        assert_eq!(limits.maximum_concurrent_sessions(), 16);
+        assert_eq!(limits.creation_window_ms(), DEFAULT_CREATION_WINDOW_MS);
+        assert_eq!(limits.creation_window_ms(), 300_000);
         assert_eq!(
-            limits.maximum_creations_per_wallet,
+            limits.maximum_creations_per_wallet(),
             DEFAULT_MAXIMUM_CREATIONS_PER_WALLET
         );
-        assert_eq!(limits.maximum_creations_per_wallet, 12);
+        assert_eq!(limits.maximum_creations_per_wallet(), 12);
         assert_eq!(
-            limits.maximum_anonymous_registrations,
+            limits.maximum_anonymous_registrations(),
             DEFAULT_MAXIMUM_ANONYMOUS_REGISTRATIONS
         );
-        assert_eq!(limits.maximum_anonymous_registrations, 4);
+        assert_eq!(limits.maximum_anonymous_registrations(), 4);
+    }
+
+    #[test]
+    fn the_compiled_defaults_satisfy_the_validation_they_are_defaults_for() {
+        // `Default` is the one constructor that does not run the bounds
+        // checks, so the compiled values are pinned to them here instead.
+        let defaults = CeremonyLimits::default();
+        assert_eq!(
+            CeremonyLimits::new(
+                defaults.maximum_concurrent_sessions(),
+                defaults.creation_window_ms(),
+                defaults.maximum_creations_per_wallet(),
+                defaults.maximum_anonymous_registrations(),
+            )
+            .unwrap(),
+            defaults
+        );
+    }
+
+    #[test]
+    fn direct_construction_refuses_the_values_that_would_break_admission() {
+        // A zero window would make the retry arithmetic meaningless and a zero
+        // quota would close the Broker; neither can be built at all.
+        assert!(CeremonyLimits::new(0, 300_000, 12, 4).is_err());
+        assert!(CeremonyLimits::new(16, 0, 12, 4).is_err());
+        assert!(CeremonyLimits::new(16, 300_000, 0, 4).is_err());
+        assert!(CeremonyLimits::new(16, 300_000, 12, 0).is_err());
+        assert!(CeremonyLimits::new(1_025, 300_000, 12, 4).is_err());
+        assert!(CeremonyLimits::new(16, 86_400_001, 12, 4).is_err());
+        assert!(CeremonyLimits::new(16, 300_000, 1_025, 4).is_err());
+        assert!(CeremonyLimits::new(16, 300_000, 12, 1_025).is_err());
+        // The ceilings themselves are policy an operator may legitimately set.
+        assert!(CeremonyLimits::new(1_024, 86_400_000, 1_024, 1_024).is_ok());
     }
 
     #[test]
@@ -144,11 +181,11 @@ mod tests {
             "creation_window_ms": 60_000,
         });
         let limits = merge_ceremony_limits(Some(&document), Some(environment(&[]))).unwrap();
-        assert_eq!(limits.maximum_creations_per_wallet, 3);
-        assert_eq!(limits.creation_window_ms, 60_000);
+        assert_eq!(limits.maximum_creations_per_wallet(), 3);
+        assert_eq!(limits.creation_window_ms(), 60_000);
         // Unmentioned fields keep the compiled defaults.
-        assert_eq!(limits.maximum_concurrent_sessions, 16);
-        assert_eq!(limits.maximum_anonymous_registrations, 4);
+        assert_eq!(limits.maximum_concurrent_sessions(), 16);
+        assert_eq!(limits.maximum_anonymous_registrations(), 4);
     }
 
     #[test]
@@ -170,10 +207,10 @@ mod tests {
             ])),
         )
         .unwrap();
-        assert_eq!(limits.maximum_creations_per_wallet, 7);
-        assert_eq!(limits.creation_window_ms, 90_000);
-        assert_eq!(limits.maximum_anonymous_registrations, 2);
-        assert_eq!(limits.maximum_concurrent_sessions, 16);
+        assert_eq!(limits.maximum_creations_per_wallet(), 7);
+        assert_eq!(limits.creation_window_ms(), 90_000);
+        assert_eq!(limits.maximum_anonymous_registrations(), 2);
+        assert_eq!(limits.maximum_concurrent_sessions(), 16);
     }
 
     #[test]
@@ -185,6 +222,9 @@ mod tests {
             ("creation_window_ms", 0),
             ("maximum_concurrent_sessions", 1_025),
             ("creation_window_ms", 86_400_001),
+            // Both creation quotas have the same ceiling, and both enforce it.
+            ("maximum_creations_per_wallet", 1_025),
+            ("maximum_anonymous_registrations", 1_025),
         ] {
             let document = serde_json::json!({ field: value });
             let error = merge_ceremony_limits(Some(&document), Some(environment(&[])))

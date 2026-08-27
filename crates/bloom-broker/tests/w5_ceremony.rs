@@ -4090,12 +4090,7 @@ fn rolling_creation_limits_survive_terminal_sessions_and_bound_anonymous_registr
 
 #[test]
 fn configured_ceremony_limits_replace_the_defaults_for_every_admission_class() {
-    let limits = CeremonyLimits {
-        maximum_concurrent_sessions: 2,
-        creation_window_ms: 60_000,
-        maximum_creations_per_wallet: 3,
-        maximum_anonymous_registrations: 2,
-    };
+    let limits = CeremonyLimits::new(2, 60_000, 3, 2).unwrap();
     let broker = CeremonyBroker::new_with_limits(Arc::new(MockSigner::new()), limits);
     assert_eq!(broker.limits(), limits);
 
@@ -4167,16 +4162,20 @@ fn configured_ceremony_limits_replace_the_defaults_for_every_admission_class() {
 
 #[test]
 fn rolling_quota_retry_hint_names_the_blocking_creation_and_clears_at_the_boundary() {
-    let limits = CeremonyLimits {
-        creation_window_ms: 60_000,
-        maximum_creations_per_wallet: 3,
-        ..CeremonyLimits::default()
-    };
+    let defaults = CeremonyLimits::default();
+    let limits = CeremonyLimits::new(
+        defaults.maximum_concurrent_sessions(),
+        60_000,
+        3,
+        defaults.maximum_anonymous_registrations(),
+    )
+    .unwrap();
     let broker = CeremonyBroker::new_with_limits(Arc::new(MockSigner::new()), limits);
     let wallet = Token::new("wallet-boundary").unwrap();
     // Three creations at distinct, unevenly spaced timestamps: the hint must
-    // track the oldest one holding the quota at capacity, not the newest and
-    // not an average.
+    // track the creation whose expiry frees the next slot — here, with the
+    // quota exactly at capacity, the oldest — not the newest and not an
+    // average.
     for (index, now_ms) in [10_000_u64, 25_000, 41_000].into_iter().enumerate() {
         let operation_id = operation(&format!("{index:02x}"));
         prepare(&broker, operation_id.clone(), Some(wallet.clone()), now_ms);

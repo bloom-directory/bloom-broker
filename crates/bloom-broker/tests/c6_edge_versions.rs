@@ -94,9 +94,10 @@ fn acl(effective_uid: u32, identity: &LocalIdentity) -> PeerAcl {
 }
 
 fn downgrade_client_range() -> ProtocolVersionRange {
-    // It accepts the machine/Broker server's 1.3 hello but advertises 1.0 as
-    // its current request version, allowing the server-side range to reject it.
-    ProtocolVersionRange::new(1, 0, 3)
+    // It accepts the machine/Broker server's current hello but advertises 1.0
+    // as its current request version, allowing the server-side range to reject
+    // it.
+    ProtocolVersionRange::new(1, 0, BROKER_API_CURRENT.minor)
 }
 
 fn signer_downgrade_client_range() -> ProtocolVersionRange {
@@ -113,6 +114,36 @@ async fn machine_broker_downgrade_fails_before_durable_broker_work() {
         ProtocolVersion::new(1, 0),
         downgrade_client_range(),
         0x10,
+    )
+    .await;
+
+    assert_eq!(
+        result.server.unwrap_err().code,
+        WireErrorCode::UnsupportedVersion
+    );
+    assert!(result.client.is_err());
+    assert_eq!(result.durable_work, 0);
+}
+
+#[tokio::test]
+async fn machine_predating_the_rate_limit_minor_is_refused_at_the_hello() {
+    // A Machine built against the previous minor: it would decode
+    // CEREMONY_RATE_LIMITED, but its strict error decoder has no field for
+    // rate_limit. Negotiation must refuse it before any response exists.
+    let older = ProtocolVersion::new(
+        bloom_broker_api::BROKER_API_MAJOR,
+        bloom_broker_api::RATE_LIMIT_DETAILS_MINOR - 1,
+    );
+    assert!(!BROKER_API_RANGE.contains(older));
+
+    let result = authenticate_edge(
+        BROKER_API_CURRENT,
+        BROKER_API_RANGE,
+        older,
+        // It tolerates the Broker's current hello but still speaks the older
+        // minor itself, so the server-side range is what rejects it.
+        ProtocolVersionRange::new(older.major, older.minor, BROKER_API_CURRENT.minor),
+        0x50,
     )
     .await;
 

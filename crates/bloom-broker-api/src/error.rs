@@ -212,21 +212,29 @@ impl<'de> Deserialize<'de> for ProtocolErrorCode {
     }
 }
 
-/// Structured rolling-quota metadata attached to `CEREMONY_RATE_LIMITED`.
+/// Structured metadata attached to `CEREMONY_RATE_LIMITED`, introduced in
+/// protocol minor [`crate::RATE_LIMIT_DETAILS_MINOR`].
 ///
 /// Callers wait `retry_after_ms` and retry the *same* operation identity; they
 /// must never parse the human-readable message or invent a replacement
 /// operation. The values describe the quota class that rejected the request,
 /// never the wallet that hit it.
+///
+/// Both time-based classes of `CEREMONY_RATE_LIMITED` report through this
+/// shape: a rolling creation quota (`limit` creations per `window_ms`) and a
+/// per-wallet cancellation cooldown (`limit` of 1 creation once the current
+/// `window_ms` cooldown has elapsed).
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitDetails {
-    /// Milliseconds until the rejected creation can succeed, derived from the
-    /// oldest session that currently holds the quota at capacity.
+    /// Milliseconds until the rejected creation can succeed: for a rolling
+    /// quota, the wait until the counted creation whose expiry frees the next
+    /// slot leaves the window; for a cooldown, the wait remaining on it.
     pub retry_after_ms: u64,
-    /// Effective number of creations allowed inside one rolling window.
+    /// Effective number of creations the quota class allows inside one
+    /// `window_ms`.
     pub limit: u64,
-    /// Length of the rolling window in milliseconds.
+    /// Length of the window the limit is measured over, in milliseconds.
     pub window_ms: u64,
 }
 
@@ -277,9 +285,10 @@ pub struct ProtocolError {
     pub retry: RetryClass,
     pub durable_effect: DurableEffect,
     pub message: String,
-    /// Present only on rolling-quota rejections. Older peers omit the field
-    /// entirely, and it is never serialized when absent, so both directions
-    /// stay compatible with encoders and decoders that predate it.
+    /// Present only on time-based `CEREMONY_RATE_LIMITED` rejections, and
+    /// never serialized when absent. Decoders that predate
+    /// [`crate::RATE_LIMIT_DETAILS_MINOR`] refuse it as an unknown field, so
+    /// the Broker never negotiates a minor below that one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimitDetails>,
 }
@@ -342,7 +351,8 @@ impl ProtocolError {
         Self::new(code, message)
     }
 
-    /// A rolling-quota rejection carrying the retry contract callers act on.
+    /// A time-based rate-limit rejection carrying the retry contract callers
+    /// act on.
     pub fn rate_limited(message: impl Into<String>, details: RateLimitDetails) -> Self {
         let mut error = Self::new(ProtocolErrorCode::CeremonyRateLimited, message);
         if details.is_well_formed() {
@@ -461,6 +471,47 @@ mod tests {
         let decoded: ProtocolError = serde_json::from_str(legacy).unwrap();
         assert_eq!(decoded, plain);
         assert!(decoded.rate_limit.is_none());
+    }
+
+    /// `ProtocolError` exactly as a peer one minor older decodes it: strict,
+    /// with no field able to absorb `rate_limit`. This is the decoder the
+    /// negotiated range exists to keep away from a rate-limited error.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PreRateLimitProtocolError {
+        #[allow(dead_code)]
+        code: ProtocolErrorCode,
+        #[allow(dead_code)]
+        retry: RetryClass,
+        #[allow(dead_code)]
+        durable_effect: DurableEffect,
+        #[allow(dead_code)]
+        message: String,
+    }
+
+    #[test]
+    fn a_decoder_predating_the_rate_limit_minor_refuses_the_field() {
+        let details = RateLimitDetails::new(61_000, 12, 300_000).unwrap();
+        let encoded = serde_json::to_string(&ProtocolError::rate_limited(
+            "wallet ceremony rolling creation quota is exhausted",
+            details,
+        ))
+        .unwrap();
+        assert!(
+            serde_json::from_str::<PreRateLimitProtocolError>(&encoded).is_err(),
+            "an older strict decoder must fail on rate_limit, which is why the \
+             negotiated range excludes every minor below it"
+        );
+
+        // The same decoder still reads every error that omits the field, so
+        // the field is the whole of the incompatibility.
+        let plain = serde_json::to_string(&ProtocolError::new(
+            ProtocolErrorCode::QuotaExceeded,
+            "full",
+        ))
+        .unwrap();
+        assert!(serde_json::from_str::<PreRateLimitProtocolError>(&plain).is_ok());
+        assert_eq!(crate::BROKER_API_MINOR_MIN, crate::RATE_LIMIT_DETAILS_MINOR);
     }
 
     #[test]

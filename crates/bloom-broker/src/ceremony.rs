@@ -80,15 +80,20 @@ const CREATION_WINDOW_CEILING_MS: u64 = 24 * 60 * 60 * 1_000;
 /// The four global ceremony admission limits.
 ///
 /// One policy for the whole Broker: nothing here is selected per wallet or per
-/// ceremony kind, so no request can widen the quota that judges it. Values
-/// arrive from [`crate::config`] and are validated before any session exists.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+/// ceremony kind, so no request can widen the quota that judges it.
+///
+/// The fields are private and every way in validates, so a `CeremonyLimits`
+/// value is in range by construction: there is no zero window for the retry
+/// arithmetic to divide a caller out of, and no zero quota to silently close
+/// the Broker. [`Self::new`] is the only literal constructor,
+/// [`Self::default`] is the compiled policy, and the [`Deserialize`] impl —
+/// the path [`crate::config`] merges through — runs the same checks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct CeremonyLimits {
-    pub maximum_concurrent_sessions: usize,
-    pub creation_window_ms: u64,
-    pub maximum_creations_per_wallet: usize,
-    pub maximum_anonymous_registrations: usize,
+    maximum_concurrent_sessions: usize,
+    creation_window_ms: u64,
+    maximum_creations_per_wallet: usize,
+    maximum_anonymous_registrations: usize,
 }
 
 impl Default for CeremonyLimits {
@@ -102,32 +107,84 @@ impl Default for CeremonyLimits {
     }
 }
 
+impl<'de> Deserialize<'de> for CeremonyLimits {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Unchecked {
+            maximum_concurrent_sessions: usize,
+            creation_window_ms: u64,
+            maximum_creations_per_wallet: usize,
+            maximum_anonymous_registrations: usize,
+        }
+
+        let unchecked = Unchecked::deserialize(deserializer)?;
+        Self::new(
+            unchecked.maximum_concurrent_sessions,
+            unchecked.creation_window_ms,
+            unchecked.maximum_creations_per_wallet,
+            unchecked.maximum_anonymous_registrations,
+        )
+        .map_err(|error| serde::de::Error::custom(error.message))
+    }
+}
+
 impl CeremonyLimits {
-    /// Reject any value that would disable admission control or overflow the
-    /// window arithmetic, naming the field and its environment override so an
-    /// operator can fix the deployment rather than read Broker's source.
-    pub fn validated(self) -> Result<Self, ProtocolError> {
+    /// Build a policy, rejecting any value that would disable admission
+    /// control or overflow the window arithmetic. The error names the field
+    /// and its environment override so an operator can fix the deployment
+    /// rather than read Broker's source.
+    pub fn new(
+        maximum_concurrent_sessions: usize,
+        creation_window_ms: u64,
+        maximum_creations_per_wallet: usize,
+        maximum_anonymous_registrations: usize,
+    ) -> Result<Self, ProtocolError> {
         bounded(
             "maximum_concurrent_sessions",
-            self.maximum_concurrent_sessions as u64,
+            maximum_concurrent_sessions as u64,
             MAXIMUM_SESSIONS_CEILING as u64,
         )?;
         bounded(
             "creation_window_ms",
-            self.creation_window_ms,
+            creation_window_ms,
             CREATION_WINDOW_CEILING_MS,
         )?;
         bounded(
             "maximum_creations_per_wallet",
-            self.maximum_creations_per_wallet as u64,
+            maximum_creations_per_wallet as u64,
             MAXIMUM_CREATIONS_CEILING as u64,
         )?;
         bounded(
             "maximum_anonymous_registrations",
-            self.maximum_anonymous_registrations as u64,
+            maximum_anonymous_registrations as u64,
             MAXIMUM_CREATIONS_CEILING as u64,
         )?;
-        Ok(self)
+        Ok(Self {
+            maximum_concurrent_sessions,
+            creation_window_ms,
+            maximum_creations_per_wallet,
+            maximum_anonymous_registrations,
+        })
+    }
+
+    pub fn maximum_concurrent_sessions(&self) -> usize {
+        self.maximum_concurrent_sessions
+    }
+
+    pub fn creation_window_ms(&self) -> u64 {
+        self.creation_window_ms
+    }
+
+    pub fn maximum_creations_per_wallet(&self) -> usize {
+        self.maximum_creations_per_wallet
+    }
+
+    pub fn maximum_anonymous_registrations(&self) -> usize {
+        self.maximum_anonymous_registrations
     }
 
     /// The four effective values, and nothing else. Safe to log: none of them
@@ -1355,7 +1412,7 @@ impl CeremonyBroker {
             .values()
             .filter(|session| !is_terminal(session.state) && session.expires_at_ms > now_ms)
             .count();
-        if live >= limits.maximum_concurrent_sessions {
+        if live >= limits.maximum_concurrent_sessions() {
             // Concurrency exhaustion is a different class from rolling rate
             // limiting: it carries no retry hint because nothing ages out on a
             // schedule, only when a live ceremony ends.
@@ -1369,16 +1426,16 @@ impl CeremonyBroker {
                 sessions
                     .values()
                     .filter(|session| session.wallet_id.as_ref() == Some(wallet_id)),
-                limits.creation_window_ms,
+                limits.creation_window_ms(),
                 now_ms,
             );
-            if recent.len() >= limits.maximum_creations_per_wallet {
+            if recent.len() >= limits.maximum_creations_per_wallet() {
                 return Err(rolling_quota_exhausted(
                     "wallet",
                     "wallet ceremony rolling creation quota is exhausted",
                     recent,
-                    limits.maximum_creations_per_wallet,
-                    limits.creation_window_ms,
+                    limits.maximum_creations_per_wallet(),
+                    limits.creation_window_ms(),
                     now_ms,
                 ));
             }
@@ -1402,18 +1459,25 @@ impl CeremonyBroker {
                 // forever until the Broker process restarted.
                 backoffs.remove(wallet_id);
             }
-            if let Some((_, until)) = backoffs
+            if let Some((strikes, until)) = backoffs
                 .get(wallet_id)
                 .copied()
                 .filter(|(_, until)| *until > now_ms)
             {
+                // Same code, same structured contract as the rolling quotas: a
+                // caller acts on the metadata, never on the message. The
+                // cooldown admits one creation once it elapses, so its limit
+                // is 1 over a window of the current backoff.
                 let remaining_ms = until.saturating_sub(now_ms);
-                return Err(protocol(
-                    ProtocolErrorCode::CeremonyRateLimited,
-                    format!(
-                        "wallet ceremony is in cancellation backoff; retry after {remaining_ms} ms"
-                    ),
-                ));
+                let message = format!(
+                    "wallet ceremony is in cancellation backoff; retry after {remaining_ms} ms"
+                );
+                return Err(
+                    match RateLimitDetails::new(remaining_ms, 1, backoff_window_ms(strikes)) {
+                        Some(details) => ProtocolError::rate_limited(message, details),
+                        None => protocol(ProtocolErrorCode::CeremonyRateLimited, message),
+                    },
+                );
             }
         }
         if anonymous_registration {
@@ -1421,16 +1485,16 @@ impl CeremonyBroker {
                 sessions
                     .values()
                     .filter(|session| session.anonymous_registration),
-                limits.creation_window_ms,
+                limits.creation_window_ms(),
                 now_ms,
             );
-            if recent.len() >= limits.maximum_anonymous_registrations {
+            if recent.len() >= limits.maximum_anonymous_registrations() {
                 return Err(rolling_quota_exhausted(
                     "anonymous-registration",
                     "anonymous registration rolling creation quota is exhausted",
                     recent,
-                    limits.maximum_anonymous_registrations,
-                    limits.creation_window_ms,
+                    limits.maximum_anonymous_registrations(),
+                    limits.creation_window_ms(),
                     now_ms,
                 ));
             }
@@ -1517,14 +1581,11 @@ impl CeremonyBroker {
         let mut backoffs = self.inner.cancellation_backoff.lock();
         let (count, _) = backoffs.get(wallet_id).copied().unwrap_or((0, 0));
         let next_count = count.saturating_add(1);
-        let multiplier = 1_u64
-            .checked_shl(next_count.saturating_sub(1).min(5))
-            .unwrap_or(32);
         backoffs.insert(
             wallet_id.clone(),
             (
                 next_count,
-                now_ms.saturating_add(CANCELLATION_BACKOFF_MS.saturating_mul(multiplier)),
+                now_ms.saturating_add(backoff_window_ms(next_count)),
             ),
         );
     }
@@ -2757,14 +2818,25 @@ fn creations_in_window<'a>(
         .collect()
 }
 
+/// The cancellation cooldown a wallet is held for after `strikes` consecutive
+/// cancellations, doubling up to a ceiling. This is the window the rejection's
+/// retry hint is measured against, so both sides read one definition.
+fn backoff_window_ms(strikes: u32) -> u64 {
+    let multiplier = 1_u64
+        .checked_shl(strikes.saturating_sub(1).min(5))
+        .unwrap_or(32);
+    CANCELLATION_BACKOFF_MS.saturating_mul(multiplier)
+}
+
 /// Reject a creation whose rolling quota is at capacity, carrying the retry
 /// contract callers act on.
 ///
 /// The hint is the wait until enough of the counted creations have left the
-/// window to free one slot: with the quota exactly at capacity that is the
-/// oldest creation, and with a quota lowered under an existing population it
-/// is the last one that must age out. The quota class is logged; the wallet
-/// that hit it is not, since the class is what an operator tunes.
+/// window to free one slot — the creation whose expiry frees that slot, which
+/// is the oldest only when the quota sits exactly at capacity. Under a quota
+/// lowered beneath an existing population it is a later creation: the last one
+/// that must age out. The quota class is logged; the wallet that hit it is
+/// not, since the class is what an operator tunes.
 fn rolling_quota_exhausted(
     quota: &str,
     message: &str,
