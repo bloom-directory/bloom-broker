@@ -863,9 +863,7 @@ impl CeremonyBroker {
             }
             let mut snapshot = session.clone();
             snapshot.state = CeremonyState::Cancelled;
-            snapshot.terminal_at_ms = Some(now_ms);
-            snapshot.token = None;
-            snapshot.token_hash = [0_u8; 32];
+            latch_terminal(&mut snapshot, now_ms);
             (session.wallet_id.clone(), snapshot)
         };
         self.inner
@@ -925,9 +923,7 @@ impl CeremonyBroker {
                 } else {
                     CeremonyState::Failed
                 };
-                snapshot.terminal_at_ms = Some(now_ms);
-                snapshot.token = None;
-                snapshot.token_hash = [0_u8; 32];
+                latch_terminal(&mut snapshot, now_ms);
                 snapshot
             };
             self.persist_session(&snapshot)?;
@@ -997,9 +993,7 @@ impl CeremonyBroker {
                     let sessions = self.inner.sessions.lock();
                     let mut snapshot = sessions.get(&ceremony_id).cloned().ok_or_else(not_found)?;
                     snapshot.state = CeremonyState::Failed;
-                    snapshot.terminal_at_ms = Some(now_ms);
-                    snapshot.token = None;
-                    snapshot.token_hash = [0_u8; 32];
+                    latch_terminal(&mut snapshot, now_ms);
                     snapshot
                 };
                 self.persist_session(&snapshot)?;
@@ -1030,6 +1024,7 @@ impl CeremonyBroker {
                         .map_err(signer_error_to_machine)?;
                     (CeremonyState::Expired, None)
                 }
+                SignerCeremonyStatus::Terminal(state) => (state, None),
                 SignerCeremonyStatus::Missing => (CeremonyState::Expired, None),
             };
             let snapshot = {
@@ -1038,10 +1033,10 @@ impl CeremonyBroker {
                 let mut snapshot = session.clone();
                 snapshot.state = state;
                 snapshot.terminal_result = terminal_result;
-                if state == CeremonyState::Expired {
-                    snapshot.terminal_at_ms = Some(now_ms);
-                    snapshot.token = None;
-                    snapshot.token_hash = [0_u8; 32];
+                // A Signer-reported terminal state is as final as an expiry:
+                // `Cancelled` and `Failed` have to burn the token too.
+                if is_terminal(state) {
+                    latch_terminal(&mut snapshot, now_ms);
                 }
                 snapshot
             };
@@ -1425,9 +1420,7 @@ impl CeremonyBroker {
                 // available while every security mutation remains latched.
             } else if session.state == CeremonyState::AwaitingRecoveryAck && !preserve_awaiting {
                 session.state = CeremonyState::Failed;
-                session.terminal_at_ms = Some(unix_time_ms());
-                session.token = None;
-                session.token_hash = [0_u8; 32];
+                latch_terminal(&mut session, unix_time_ms());
                 self.persist_session(&session)?;
             } else if !preserve_awaiting
                 && session.state != CeremonyState::WalletCommitted
@@ -1456,14 +1449,15 @@ impl CeremonyBroker {
                             .map_err(signer_error_to_machine)?;
                         session.state = CeremonyState::Expired;
                     }
+                    SignerCeremonyStatus::Terminal(state) => {
+                        session.state = state;
+                    }
                     SignerCeremonyStatus::Missing => {
                         session.state = CeremonyState::Expired;
                     }
                 }
-                if session.state == CeremonyState::Expired {
-                    session.terminal_at_ms = Some(unix_time_ms());
-                    session.token = None;
-                    session.token_hash = [0_u8; 32];
+                if is_terminal(session.state) {
+                    latch_terminal(&mut session, unix_time_ms());
                 } else if session.state == CeremonyState::WalletCommitted {
                     validate_completion_identity(
                         session.ceremony_kind,
@@ -1703,9 +1697,7 @@ impl CeremonyBroker {
                 .ceremony_kind
                 .successful_terminal_state()
                 .unwrap_or(CeremonyState::Completed);
-            finalized.terminal_at_ms = Some(now_ms);
-            finalized.token = None;
-            finalized.token_hash = [0_u8; 32];
+            latch_terminal(&mut finalized, now_ms);
         }
         self.persist_session(&finalized)?;
         self.inner
@@ -1865,9 +1857,7 @@ async fn acknowledge_result(
             .ceremony_kind
             .successful_terminal_state()
             .unwrap_or(CeremonyState::Completed);
-        snapshot.terminal_at_ms = Some(unix_time_ms());
-        snapshot.token = None;
-        snapshot.token_hash = [0_u8; 32];
+        latch_terminal(&mut snapshot, unix_time_ms());
         snapshot
     };
     if broker.persist_session(&snapshot).is_err() {
@@ -2019,27 +2009,35 @@ async fn complete_session(
             }
         }
         Err(error) => {
-            if error.code == ProtocolErrorCode::UnauthenticatedPeer
-                && broker.inner.signer.cancel(&operation_id).is_err()
-            {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-            let snapshot = {
-                let sessions = broker.inner.sessions.lock();
-                let Some(session) = sessions.get(&ceremony_id) else {
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            // A stale WebAuthn signature counter reports `UnauthenticatedPeer`
+            // while the Signer leaves the operation pending, so the Signer-side
+            // operation has to be released or it holds the wallet's concurrency
+            // quota forever. Every other rejection already terminalises the
+            // Signer operation, so there is nothing to cancel.
+            let released = error.code != ProtocolErrorCode::UnauthenticatedPeer
+                || broker.inner.signer.cancel(&operation_id).is_ok();
+            // The Broker session is only terminalised once the Signer side is
+            // known to be released. If cancellation failed the session stays
+            // `Verifying` so the expiry sweep retries the cancel; terminalising
+            // here would strand the Signer operation permanently.
+            if released {
+                let snapshot = {
+                    let sessions = broker.inner.sessions.lock();
+                    let Some(session) = sessions.get(&ceremony_id) else {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    };
+                    let mut snapshot = session.clone();
+                    snapshot.state = CeremonyState::Failed;
+                    latch_terminal(&mut snapshot, unix_time_ms());
+                    snapshot
                 };
-                let mut snapshot = session.clone();
-                snapshot.state = CeremonyState::Failed;
-                snapshot.terminal_at_ms = Some(unix_time_ms());
-                snapshot.token = None;
-                snapshot.token_hash = [0_u8; 32];
-                snapshot
-            };
-            if broker.persist_session(&snapshot).is_err() {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                if broker.persist_session(&snapshot).is_err() {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+                broker.inner.sessions.lock().insert(ceremony_id, snapshot);
             }
-            broker.inner.sessions.lock().insert(ceremony_id, snapshot);
+            // The browser needs the structured rejection either way: a failed
+            // best-effort cancel must never replace it with an empty 500.
             (StatusCode::BAD_REQUEST, Json(error)).into_response()
         }
     }
@@ -2302,6 +2300,15 @@ fn token_for(session: &BrowserSession) -> Base64UrlBytes {
         .token
         .clone()
         .unwrap_or_else(|| Base64UrlBytes::from_bytes(&[]))
+}
+
+/// Stamp when a session reached its terminal state and destroy the launch
+/// token material. Every terminal state latches identically: no terminal
+/// session may keep a usable bearer token, whichever state ended it.
+fn latch_terminal(session: &mut BrowserSession, now_ms: u64) {
+    session.terminal_at_ms = Some(now_ms);
+    session.token = None;
+    session.token_hash = [0_u8; 32];
 }
 
 fn is_terminal(state: CeremonyState) -> bool {

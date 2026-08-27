@@ -299,7 +299,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=11ac5fb05c8e61b97d9e174302880a9b2425efe5#11ac5fb05c8e61b97d9e174302880a9b2425efe5"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a13de61514ea92a0553e05d139bb72a919be8c5a#a13de61514ea92a0553e05d139bb72a919be8c5a"
 dependencies = [
  "blake3",
  "bloom-audit-checkpoint",
@@ -335,7 +335,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=11ac5fb05c8e61b97d9e174302880a9b2425efe5#11ac5fb05c8e61b97d9e174302880a9b2425efe5"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a13de61514ea92a0553e05d139bb72a919be8c5a#a13de61514ea92a0553e05d139bb72a919be8c5a"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek",
@@ -350,7 +350,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-backend-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=11ac5fb05c8e61b97d9e174302880a9b2425efe5#11ac5fb05c8e61b97d9e174302880a9b2425efe5"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a13de61514ea92a0553e05d139bb72a919be8c5a#a13de61514ea92a0553e05d139bb72a919be8c5a"
 dependencies = [
  "bloom-signer-api",
  "serde",
@@ -361,7 +361,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-backend-local"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=11ac5fb05c8e61b97d9e174302880a9b2425efe5#11ac5fb05c8e61b97d9e174302880a9b2425efe5"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a13de61514ea92a0553e05d139bb72a919be8c5a#a13de61514ea92a0553e05d139bb72a919be8c5a"
 dependencies = [
  "bip32",
  "bloom-signer-api",
