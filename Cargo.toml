@@ -14,16 +14,16 @@ rust-version = "1.85"
 license = "MIT"
 
 [workspace.dependencies]
-bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "8e0aa7645c484b02ea9d994c3ce5f6f37abd9360" }
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "6f902ba455256793c14d7855c115d39ff7a30327" }
-bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "6f902ba455256793c14d7855c115d39ff7a30327" }
+bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d4150dd2d383836a50edb6188029210bae02c4b6" }
+bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "2ef153a7394d4ae36dac1166b69de4b3e618de3d" }
+bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "2ef153a7394d4ae36dac1166b69de4b3e618de3d" }
 bloom-solana = { path = "crates/bloom-solana" }
 bs58 = "0.5"
-bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "8e0aa7645c484b02ea9d994c3ce5f6f37abd9360" }
-bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "8e0aa7645c484b02ea9d994c3ce5f6f37abd9360" }
-bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "8e0aa7645c484b02ea9d994c3ce5f6f37abd9360" }
-bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "8e0aa7645c484b02ea9d994c3ce5f6f37abd9360" }
-bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "8e0aa7645c484b02ea9d994c3ce5f6f37abd9360" }
+bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d4150dd2d383836a50edb6188029210bae02c4b6" }
+bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d4150dd2d383836a50edb6188029210bae02c4b6" }
+bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d4150dd2d383836a50edb6188029210bae02c4b6" }
+bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d4150dd2d383836a50edb6188029210bae02c4b6" }
+bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d4150dd2d383836a50edb6188029210bae02c4b6" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
