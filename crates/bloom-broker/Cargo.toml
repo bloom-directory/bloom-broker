@@ -17,6 +17,7 @@ bloom-triad-local-transport.workspace = true
 bloom-audit-checkpoint.workspace = true
 bloom-service-activation.workspace = true
 bloom-trusted-time.workspace = true
+config.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
 num-bigint.workspace = true

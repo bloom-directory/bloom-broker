@@ -449,12 +449,12 @@ fn every_machine_broker_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "daf51490e24e5fba6a118e570b3877f102ad7d1200630cd2302173718682e83d",
+        "bb59de7ed5b9ca2d968fbd678795365002bc526d09cc77e429bcb68c7ff939b7",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "a26cbea559ba7b62bceaccd1d102f27e4fe0ab77da4cb743a202d457fc7d0bf0",
+        "5163c785f7f6579ccace3dd93d233b96e61e2bd20658fb094b3a3a38f5e728cb",
     );
 }
 

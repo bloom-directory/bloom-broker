@@ -7,7 +7,7 @@ use bloom_broker::{
     authority::{AssuranceRegistry, BrokerAuthority, canonical_policy_authority_diff},
     ceremony::{
         CEREMONY_ADDR, CEREMONY_OWNER_HEADER, CEREMONY_OWNER_VALUE, CeremonyBroker,
-        CeremonyCompletionObserver, CeremonySigner, ReviewManifestContext,
+        CeremonyCompletionObserver, CeremonyLimits, CeremonySigner, ReviewManifestContext,
     },
     clock::BrokerClock,
     journal::{AuditSigner, BrokerJournal},
@@ -22,9 +22,9 @@ use bloom_broker_api::{
     MachineSignRequest, OperationId, OperationRequest, PROVENANCE_RECORD_SIGNATURE_DOMAIN,
     PetalKeyScope, PetalLineageMembership, PetalUseClaim, PolicyCommitUpdateRequest,
     PolicyDestination, PolicyUpdateRequest, ProtocolError, ProtocolErrorCode,
-    ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject, RequestNonce, RevokeRequest,
-    SealedApprovalTerms, SignedJournalHead, SignedPolicySnapshot, SigningPayloads, Token,
-    WalletRequest,
+    ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject, RateLimitDetails, RequestNonce,
+    RevokeRequest, SealedApprovalTerms, SignedJournalHead, SignedPolicySnapshot, SigningPayloads,
+    Token, WalletRequest,
 };
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer::{
@@ -1203,28 +1203,76 @@ impl CeremonySigner for MockSigner {
     }
 }
 
+fn try_prepare(
+    broker: &CeremonyBroker,
+    operation_id: OperationId,
+    wallet_id: Option<Token>,
+    now_ms: u64,
+) -> Result<CustodyPrepareResponse, ProtocolError> {
+    broker.prepare_custody(
+        CustodyPrepareRequest {
+            ceremony_kind: CeremonyKind::WalletDelete,
+            custody_operation_id: operation_id,
+            wallet_id,
+            key_ref: None,
+            exact_terms_digest: digest("33"),
+            expected_input_class: Token::new("policy-document").unwrap(),
+            browser_output_recipient_key: None,
+            petal_key_scope: None,
+            legacy_passkey_migration: None,
+        },
+        now_ms,
+    )
+}
+
 fn prepare(
     broker: &CeremonyBroker,
     operation_id: OperationId,
     wallet_id: Option<Token>,
     now_ms: u64,
 ) -> CustodyPrepareResponse {
-    broker
-        .prepare_custody(
-            CustodyPrepareRequest {
-                ceremony_kind: CeremonyKind::WalletDelete,
-                custody_operation_id: operation_id,
-                wallet_id,
-                key_ref: None,
-                exact_terms_digest: digest("33"),
-                expected_input_class: Token::new("policy-document").unwrap(),
-                browser_output_recipient_key: None,
-                petal_key_scope: None,
-                legacy_passkey_migration: None,
-            },
-            now_ms,
-        )
-        .unwrap()
+    try_prepare(broker, operation_id, wallet_id, now_ms).unwrap()
+}
+
+/// An anonymous registration: the quota class that is unauthenticated by any
+/// existing wallet credential, so it is counted separately from the wallet
+/// rolling quota that also judges it.
+fn try_register(
+    broker: &CeremonyBroker,
+    operation_id: OperationId,
+    wallet_id: Token,
+    now_ms: u64,
+) -> Result<CustodyPrepareResponse, ProtocolError> {
+    broker.prepare_custody(
+        CustodyPrepareRequest {
+            ceremony_kind: CeremonyKind::WalletRegistration,
+            custody_operation_id: operation_id,
+            wallet_id: Some(wallet_id),
+            key_ref: None,
+            exact_terms_digest: digest("34"),
+            expected_input_class: Token::new("passkey-prf").unwrap(),
+            browser_output_recipient_key: None,
+            petal_key_scope: None,
+            legacy_passkey_migration: None,
+        },
+        now_ms,
+    )
+}
+
+/// Assert the structured retry contract on a rolling-quota rejection: callers
+/// act on these values, never on the human-readable message.
+fn assert_retry_contract(error: &ProtocolError, retry_after_ms: u64, limit: u64, window_ms: u64) {
+    assert_eq!(error.code, ProtocolErrorCode::CeremonyRateLimited);
+    assert!(error.has_valid_contract());
+    let details = error
+        .rate_limit
+        .expect("a rolling-quota rejection must carry structured retry metadata");
+    assert_eq!(
+        details,
+        RateLimitDetails::new(retry_after_ms, limit, window_ms).unwrap(),
+        "unexpected retry contract in {}",
+        error.message
+    );
 }
 
 fn url_token(url: &str) -> String {
@@ -3501,6 +3549,7 @@ fn ac18_forced_ceremony_audit_write_failure_rolls_back_session() {
         Token::new("broker-review-key").unwrap(),
         SigningKey::from_bytes(&[7; 32]),
         journal.clone(),
+        CeremonyLimits::default(),
     )
     .unwrap();
     let operation_id = operation("30");
@@ -3552,6 +3601,7 @@ fn ac18_populated_ceremony_migration_is_atomic_idempotent_and_retains_source() {
         Token::new("broker-review-key").unwrap(),
         SigningKey::from_bytes(&[7; 32]),
         legacy_journal,
+        CeremonyLimits::default(),
     )
     .unwrap();
     legacy_broker
@@ -3722,6 +3772,7 @@ fn ac18_ceremony_status_survives_latched_audit_tamper_while_new_sessions_fail() 
         Token::new("broker-review-key").unwrap(),
         SigningKey::from_bytes(&[7; 32]),
         journal,
+        CeremonyLimits::default(),
     )
     .unwrap();
     let existing_operation = operation("39");
@@ -3749,6 +3800,7 @@ fn ac18_ceremony_status_survives_latched_audit_tamper_while_new_sessions_fail() 
         Token::new("broker-review-key").unwrap(),
         SigningKey::from_bytes(&[7; 32]),
         degraded_journal,
+        CeremonyLimits::default(),
     )
     .unwrap();
     assert_eq!(
@@ -3992,72 +4044,160 @@ fn rolling_creation_limits_survive_terminal_sessions_and_bound_anonymous_registr
     let signer = Arc::new(MockSigner::new());
     let broker = CeremonyBroker::new(signer);
     let wallet = Token::new("wallet-rate-bound").unwrap();
-    for index in 0..6_u8 {
-        let now_ms = 1_000 + u64::from(index) * 70_000;
+    // Twelve creations spread across the compiled five-minute window, each
+    // cancelled at once: a terminal session keeps occupying the slot it
+    // consumed, so cancelling cannot be used to mint extra creations.
+    for index in 0..12_u8 {
+        let now_ms = 1_000 + u64::from(index) * 20_000;
         let operation_id = operation(&format!("{index:02x}"));
         prepare(&broker, operation_id.clone(), Some(wallet.clone()), now_ms);
         broker.cancel(&operation_id, now_ms).unwrap();
     }
-    let error = broker
-        .prepare_custody(
-            CustodyPrepareRequest {
-                ceremony_kind: CeremonyKind::WalletDelete,
-                custody_operation_id: operation("f1"),
-                wallet_id: Some(wallet),
-                key_ref: None,
-                exact_terms_digest: digest("33"),
-                expected_input_class: Token::new("policy-document").unwrap(),
-                browser_output_recipient_key: None,
-                petal_key_scope: None,
-                legacy_passkey_migration: None,
-            },
-            355_000,
-        )
-        .unwrap_err();
-    assert_eq!(error.code, ProtocolErrorCode::CeremonyRateLimited);
+    let error = try_prepare(&broker, operation("f1"), Some(wallet.clone()), 240_000).unwrap_err();
+    // The oldest counted creation is at 1_000, so a wallet slot frees at
+    // 301_000: 61_000 ms after the rejected attempt.
+    assert_retry_contract(&error, 61_000, 12, 300_000);
 
     for index in 0..4_u8 {
         let operation_id = operation(&format!("a{index}"));
-        broker
-            .prepare_custody(
-                CustodyPrepareRequest {
-                    ceremony_kind: CeremonyKind::WalletRegistration,
-                    custody_operation_id: operation_id.clone(),
-                    wallet_id: Some(Token::new(format!("wallet-a{index}")).unwrap()),
-                    key_ref: None,
-                    exact_terms_digest: digest("34"),
-                    expected_input_class: Token::new("passkey-prf").unwrap(),
-                    browser_output_recipient_key: None,
-                    petal_key_scope: None,
-                    legacy_passkey_migration: None,
-                },
-                500_000 + u64::from(index),
-            )
-            .unwrap();
+        try_register(
+            &broker,
+            operation_id.clone(),
+            Token::new(format!("wallet-a{index}")).unwrap(),
+            500_000 + u64::from(index),
+        )
+        .unwrap();
         broker
             .cancel(&operation_id, 500_000 + u64::from(index))
             .unwrap();
     }
-    assert_eq!(
-        broker
-            .prepare_custody(
-                CustodyPrepareRequest {
-                    ceremony_kind: CeremonyKind::WalletRegistration,
-                    custody_operation_id: operation("af"),
-                    wallet_id: Some(Token::new("wallet-af").unwrap()),
-                    key_ref: None,
-                    exact_terms_digest: digest("34"),
-                    expected_input_class: Token::new("passkey-prf").unwrap(),
-                    browser_output_recipient_key: None,
-                    petal_key_scope: None,
-                    legacy_passkey_migration: None,
-                },
-                500_010,
-            )
-            .unwrap_err()
-            .code,
-        ProtocolErrorCode::CeremonyRateLimited
+    let error = try_register(
+        &broker,
+        operation("af"),
+        Token::new("wallet-af").unwrap(),
+        500_010,
+    )
+    .unwrap_err();
+    // The anonymous class has its own tighter quota and its own hint, taken
+    // from the oldest of the four registrations rather than from the wallet
+    // creations that preceded them.
+    assert_retry_contract(&error, 299_990, 4, 300_000);
+
+    // The wallet quota is unchanged by the anonymous traffic: once the window
+    // has rolled past all twelve creations, the same wallet is admitted again.
+    prepare(&broker, operation("f2"), Some(wallet), 522_000);
+}
+
+#[test]
+fn configured_ceremony_limits_replace_the_defaults_for_every_admission_class() {
+    let limits = CeremonyLimits::new(2, 60_000, 3, 2).unwrap();
+    let broker = CeremonyBroker::new_with_limits(Arc::new(MockSigner::new()), limits);
+    assert_eq!(broker.limits(), limits);
+
+    // Concurrency is the configured 2, not the compiled 16, and it carries no
+    // retry hint: nothing ages out on a schedule, only when a ceremony ends.
+    prepare(
+        &broker,
+        operation("e0"),
+        Some(Token::new("wallet-live-0").unwrap()),
+        1_000,
     );
+    prepare(
+        &broker,
+        operation("e1"),
+        Some(Token::new("wallet-live-1").unwrap()),
+        2_000,
+    );
+    let error = try_prepare(
+        &broker,
+        operation("e2"),
+        Some(Token::new("wallet-live-2").unwrap()),
+        3_000,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::QuotaExceeded);
+    assert_eq!(
+        error.message,
+        "Broker ceremony concurrency quota is exhausted"
+    );
+    assert!(error.rate_limit.is_none());
+    broker.cancel(&operation("e0"), 3_000).unwrap();
+    broker.cancel(&operation("e1"), 3_000).unwrap();
+
+    // The configured per-wallet quota of 3 in a 60-second window binds well
+    // before the compiled default of 12 in five minutes would.
+    let wallet = Token::new("wallet-configured").unwrap();
+    for (index, now_ms) in [10_000_u64, 25_000, 41_000].into_iter().enumerate() {
+        let operation_id = operation(&format!("f{index}"));
+        prepare(&broker, operation_id.clone(), Some(wallet.clone()), now_ms);
+        broker.cancel(&operation_id, now_ms).unwrap();
+    }
+    let error = try_prepare(&broker, operation("fa"), Some(wallet.clone()), 50_000).unwrap_err();
+    assert_retry_contract(&error, 20_000, 3, 60_000);
+
+    // The configured anonymous quota of 2 is tighter still, and reports its
+    // own limit and window rather than the wallet quota's.
+    for index in 0..2_u8 {
+        let operation_id = operation(&format!("c{index}"));
+        try_register(
+            &broker,
+            operation_id.clone(),
+            Token::new(format!("wallet-anon-{index}")).unwrap(),
+            51_000 + u64::from(index) * 1_000,
+        )
+        .unwrap();
+        broker
+            .cancel(&operation_id, 51_000 + u64::from(index) * 1_000)
+            .unwrap();
+    }
+    let error = try_register(
+        &broker,
+        operation("cf"),
+        Token::new("wallet-anon-f").unwrap(),
+        53_000,
+    )
+    .unwrap_err();
+    assert_retry_contract(&error, 58_000, 2, 60_000);
+}
+
+#[test]
+fn rolling_quota_retry_hint_names_the_blocking_creation_and_clears_at_the_boundary() {
+    let defaults = CeremonyLimits::default();
+    let limits = CeremonyLimits::new(
+        defaults.maximum_concurrent_sessions(),
+        60_000,
+        3,
+        defaults.maximum_anonymous_registrations(),
+    )
+    .unwrap();
+    let broker = CeremonyBroker::new_with_limits(Arc::new(MockSigner::new()), limits);
+    let wallet = Token::new("wallet-boundary").unwrap();
+    // Three creations at distinct, unevenly spaced timestamps: the hint must
+    // track the creation whose expiry frees the next slot — here, with the
+    // quota exactly at capacity, the oldest — not the newest and not an
+    // average.
+    for (index, now_ms) in [10_000_u64, 25_000, 41_000].into_iter().enumerate() {
+        let operation_id = operation(&format!("{index:02x}"));
+        prepare(&broker, operation_id.clone(), Some(wallet.clone()), now_ms);
+        broker.cancel(&operation_id, now_ms).unwrap();
+    }
+
+    // The blocking creation is the one at 10_000, so the slot frees at 70_000
+    // however late in the window the caller asks.
+    let error = try_prepare(&broker, operation("b1"), Some(wallet.clone()), 50_000).unwrap_err();
+    assert_retry_contract(&error, 20_000, 3, 60_000);
+    let error = try_prepare(&broker, operation("b2"), Some(wallet.clone()), 69_999).unwrap_err();
+    assert_retry_contract(&error, 1, 3, 60_000);
+
+    // Waiting exactly the advertised hint is enough: the contract is exact,
+    // so an honest caller never has to guess an extra margin.
+    prepare(&broker, operation("b3"), Some(wallet.clone()), 70_000);
+    broker.cancel(&operation("b3"), 70_000).unwrap();
+
+    // That admission consumed the freed slot, and the quota is now held by the
+    // creation at 25_000, which frees at 85_000.
+    let error = try_prepare(&broker, operation("b4"), Some(wallet), 71_000).unwrap_err();
+    assert_retry_contract(&error, 14_000, 3, 60_000);
 }
 
 #[test]
