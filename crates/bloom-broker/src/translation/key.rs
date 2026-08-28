@@ -41,46 +41,11 @@ pub(crate) fn crypto_suite_to_machine(value: south::CryptoSuite) -> north::Crypt
     }
 }
 
-pub(crate) fn derivation_profile_to_signer(
-    value: north::DerivationProfile,
-) -> south::DerivationProfile {
-    match value {
-        north::DerivationProfile::Bip44EvmSecp256k1V1 => {
-            south::DerivationProfile::Bip44EvmSecp256k1V1
-        }
-        north::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
-            south::DerivationProfile::Bip44SolanaSlip10Ed25519V1
-        }
-    }
-}
-
-pub(crate) fn derivation_profile_to_machine(
-    value: south::DerivationProfile,
-) -> north::DerivationProfile {
-    match value {
-        south::DerivationProfile::Bip44EvmSecp256k1V1 => {
-            north::DerivationProfile::Bip44EvmSecp256k1V1
-        }
-        south::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
-            north::DerivationProfile::Bip44SolanaSlip10Ed25519V1
-        }
-    }
-}
-
 fn derivation_to_signer(value: north::DerivationRef) -> south::DerivationRef {
     match value {
         north::DerivationRef::Bip32Secp256k1 { root_key_id, path } => {
             south::DerivationRef::Bip32Secp256k1 { root_key_id, path }
         }
-        north::DerivationRef::Bip39Multicurve {
-            wallet_seed_ref,
-            profile,
-            path,
-        } => south::DerivationRef::Bip39Multicurve {
-            wallet_seed_ref,
-            profile: derivation_profile_to_signer(profile),
-            path,
-        },
     }
 }
 
@@ -89,15 +54,6 @@ fn derivation_to_machine(value: south::DerivationRef) -> north::DerivationRef {
         south::DerivationRef::Bip32Secp256k1 { root_key_id, path } => {
             north::DerivationRef::Bip32Secp256k1 { root_key_id, path }
         }
-        south::DerivationRef::Bip39Multicurve {
-            wallet_seed_ref,
-            profile,
-            path,
-        } => north::DerivationRef::Bip39Multicurve {
-            wallet_seed_ref,
-            profile: derivation_profile_to_machine(profile),
-            path,
-        },
     }
 }
 

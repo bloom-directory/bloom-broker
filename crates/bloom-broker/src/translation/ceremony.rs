@@ -16,8 +16,6 @@ pub(crate) fn kind_to_signer(value: north::CeremonyKind) -> south::CeremonyKind 
         north::CeremonyKind::CredentialRemove => south::CeremonyKind::CredentialRemove,
         north::CeremonyKind::BackendEnrollment => south::CeremonyKind::BackendEnrollment,
         north::CeremonyKind::KeyDerive => south::CeremonyKind::KeyDerive,
-        north::CeremonyKind::AccountAllocate => south::CeremonyKind::AccountAllocate,
-        north::CeremonyKind::AccountRetire => south::CeremonyKind::AccountRetire,
         north::CeremonyKind::PolicyUpdate => south::CeremonyKind::PolicyUpdate,
     }
 }
@@ -35,8 +33,6 @@ pub(crate) fn kind_to_machine(value: south::CeremonyKind) -> north::CeremonyKind
         south::CeremonyKind::CredentialRemove => north::CeremonyKind::CredentialRemove,
         south::CeremonyKind::BackendEnrollment => north::CeremonyKind::BackendEnrollment,
         south::CeremonyKind::KeyDerive => north::CeremonyKind::KeyDerive,
-        south::CeremonyKind::AccountAllocate => north::CeremonyKind::AccountAllocate,
-        south::CeremonyKind::AccountRetire => north::CeremonyKind::AccountRetire,
         south::CeremonyKind::PolicyUpdate => north::CeremonyKind::PolicyUpdate,
     }
 }

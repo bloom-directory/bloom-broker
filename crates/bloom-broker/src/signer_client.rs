@@ -285,9 +285,6 @@ impl CeremonySigner for BrokerSignerClient {
             CeremonyKind::CredentialRemove => BrokerSignerRequest::CredentialRemovePrepare(request),
             CeremonyKind::BackendEnrollment => BrokerSignerRequest::KeyEnrollPrepare(request),
             CeremonyKind::KeyDerive => BrokerSignerRequest::KeyDerivePrepare(request),
-            CeremonyKind::AccountAllocate | CeremonyKind::AccountRetire => {
-                BrokerSignerRequest::KeyDerivePrepare(request)
-            }
             CeremonyKind::SealedApproval | CeremonyKind::PolicyUpdate => {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::CeremonyKindMismatch,

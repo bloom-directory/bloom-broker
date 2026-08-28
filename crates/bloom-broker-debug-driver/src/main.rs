@@ -175,17 +175,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         CeremonyKind::WalletDelete
         | CeremonyKind::KeyDerive
-        | CeremonyKind::AccountAllocate
-        | CeremonyKind::AccountRetire
         | CeremonyKind::PolicyUpdate
         | CeremonyKind::WalletExport
         | CeremonyKind::BackendEnrollment => {
             let assertion = authenticator.assertion(&challenges[0].canonical_bytes()?, sign_count);
             let credential_id = assertion.credential_id.clone();
-            let effect_kind = custody_effect_kind(kind)?;
             let plaintext = serde_jcs::to_vec(&serde_json::json!({
                 "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
-                "effect": {"kind": effect_kind},
+                "effect": {"kind": kind},
             }))?;
             (
                 WebAuthnCeremonyProof::Assertion { assertion },
@@ -257,14 +254,6 @@ fn read_nonempty_seed(path: &std::path::Path) -> Result<String, Box<dyn std::err
         return Err("authenticator seed file is empty".into());
     }
     Ok(seed)
-}
-
-fn custody_effect_kind(kind: CeremonyKind) -> Result<serde_json::Value, serde_json::Error> {
-    Ok(match kind {
-        CeremonyKind::AccountAllocate => serde_json::json!("account_allocate"),
-        CeremonyKind::AccountRetire => serde_json::json!("account_retire"),
-        _ => serde_json::to_value(kind)?,
-    })
 }
 
 fn assert_machine_secret_confinement_command(
@@ -359,7 +348,7 @@ fn request(
 
 #[cfg(test)]
 mod tests {
-    use super::{CeremonyKind, custody_effect_kind, read_protected_seed_file};
+    use super::read_protected_seed_file;
     use std::{fs, path::PathBuf};
 
     fn temp_path(name: &str) -> PathBuf {
@@ -393,17 +382,5 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(read_protected_seed_file(&path).unwrap(), "secret");
         fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn account_custody_effects_match_the_signer_contract() {
-        assert_eq!(
-            custody_effect_kind(CeremonyKind::AccountAllocate).unwrap(),
-            serde_json::json!("account_allocate")
-        );
-        assert_eq!(
-            custody_effect_kind(CeremonyKind::AccountRetire).unwrap(),
-            serde_json::json!("account_retire")
-        );
     }
 }

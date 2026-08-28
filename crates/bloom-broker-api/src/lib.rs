@@ -13,8 +13,6 @@ mod provenance;
 mod revocation;
 mod service;
 mod signing;
-mod validation;
-mod wallet_account;
 
 pub use approval::*;
 pub use ceremony::*;
@@ -29,7 +27,6 @@ pub use provenance::*;
 pub use revocation::*;
 pub use service::*;
 pub use signing::*;
-pub use wallet_account::*;
 
 pub use bloom_rpc_wire::{
     AuthenticatedPeer, Base64UrlBytes, BootEpoch, DecimalU64, DecimalU256, Digest32, EnvelopeKind,
@@ -48,10 +45,10 @@ pub const BROKER_API_MAJOR: u16 = 1;
 /// instead of reading the retry hint inside it.
 pub const RATE_LIMIT_DETAILS_MINOR: u16 = 4;
 /// The negotiated range moves as a unit, so there is no accepted minor that
-/// predates any field the Broker may emit. Older peers are refused at the
-/// hello before a response can carry a field their strict decoder rejects.
-pub const BROKER_API_MINOR_MIN: u16 = 5;
-pub const BROKER_API_MINOR_MAX: u16 = 5;
+/// predates a field the Broker may emit. A 1.3 peer is refused at the hello,
+/// before any response could carry `rate_limit`.
+pub const BROKER_API_MINOR_MIN: u16 = RATE_LIMIT_DETAILS_MINOR;
+pub const BROKER_API_MINOR_MAX: u16 = RATE_LIMIT_DETAILS_MINOR;
 pub const BROKER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(BROKER_API_MAJOR, BROKER_API_MINOR_MAX);
 pub const BROKER_API_RANGE: ProtocolVersionRange =
