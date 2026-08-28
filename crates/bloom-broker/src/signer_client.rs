@@ -60,17 +60,22 @@ impl BrokerSignerClient {
     ) -> Result<Self, ProtocolError> {
         let socket_path = socket_path.into();
         let (jobs, receiver) = mpsc::channel::<Job>();
+        let service_span = tracing::Span::current();
+        let tracing_dispatch = tracing::dispatcher::get_default(Clone::clone);
         let worker = thread::Builder::new()
             .name("bloom-broker-signer-rpc".into())
             .spawn(move || {
-                worker(
-                    receiver,
-                    socket_path,
-                    identity,
-                    signer,
-                    journal,
-                    checkpoints,
-                )
+                tracing::dispatcher::with_default(&tracing_dispatch, || {
+                    let _service_span = service_span.enter();
+                    worker(
+                        receiver,
+                        socket_path,
+                        identity,
+                        signer,
+                        journal,
+                        checkpoints,
+                    )
+                })
             })
             .map_err(|error| unavailable(format!("start Signer RPC worker: {error}")))?;
         Ok(Self {
@@ -551,6 +556,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
+    use tracing_subscriber::prelude::*;
 
     struct TestAuditSigner;
 
@@ -694,6 +700,60 @@ mod tests {
             .code,
             ProtocolErrorCode::ServiceUnavailable
         );
+    }
+
+    #[test]
+    fn signer_worker_preserves_trusted_service_span_and_dispatcher() {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(capture.clone()),
+        );
+        let dispatcher = tracing::Dispatch::new(subscriber);
+        tracing::dispatcher::with_default(&dispatcher, || {
+            let service_span = tracing::info_span!(
+                "trusted_service",
+                service_id = "bloom-broker",
+                login_uid = 501_u64,
+                build_digest = "test-build-digest"
+            );
+            let _service_span = service_span.enter();
+            let identity = LocalIdentity {
+                service_id: Token::new("bloom-broker").unwrap(),
+                boot_epoch: BootEpoch::from_bytes([0x21; 16]),
+                application_key_id: Token::new("broker-app").unwrap(),
+                signing_key: Arc::new(SigningKey::from_bytes(&[0x22; 32])),
+            };
+            let signer = PeerAcl {
+                effective_uid: 0,
+                service_id: Token::new("bloom-signer").unwrap(),
+                boot_epoch: BootEpoch::from_bytes([0x23; 16]),
+                application_key_id: Token::new("signer-app").unwrap(),
+                application_public_key: SigningKey::from_bytes(&[0x24; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            };
+            let client = BrokerSignerClient::connect_unix(
+                "/unused/signer.sock",
+                identity,
+                signer,
+                Arc::new(BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).unwrap()),
+                Arc::new(RetainingCheckpointSink::default()),
+            )
+            .unwrap();
+            drop(client);
+        });
+
+        let event = capture
+            .text()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["fields"]["event"] == "checkpoint.decision")
+            .expect("Signer worker checkpoint event");
+        assert_eq!(event["span"]["service_id"], "bloom-broker");
+        assert_eq!(event["span"]["login_uid"], 501);
+        assert_eq!(event["span"]["build_digest"], "test-build-digest");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

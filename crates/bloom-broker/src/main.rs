@@ -149,6 +149,9 @@ impl Drop for BrokerConfig {
     }
 }
 
+const OBSERVABILITY_INIT_FAILURE_MESSAGE: &str =
+    "Bloom Broker logging initialization failed; exiting safely";
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     if std::env::args_os().len() == 2
@@ -158,6 +161,7 @@ async fn main() {
         return;
     }
     if init_observability().is_err() {
+        eprintln!("{OBSERVABILITY_INIT_FAILURE_MESSAGE}");
         std::process::exit(1);
     }
     let result = run().await;
@@ -968,9 +972,11 @@ async fn serve_rpc(
         let quota = quota.clone();
         let service = service.clone();
         let journals = journals.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            let _ =
+        let service_span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                let _permit = permit;
+                let _ =
                 bloom_triad_local_transport::dispatch_connection_with_journal_heads_and_context::<
                     MachineBrokerRequest,
                     MachineBrokerResponse,
@@ -1002,7 +1008,9 @@ async fn serve_rpc(
                     },
                 )
                 .await;
-        });
+            }
+            .instrument(service_span),
+        );
     }
 }
 
@@ -1135,39 +1143,43 @@ async fn serve_control(
         let revoke_client_acl = revoke_client_acl.clone();
         let quota = quota.clone();
         let service = service.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            let _ = bloom_triad_local_transport::dispatch_connection_with_context::<
-                ControlRequest,
-                ControlResponse,
-                SignerProtocolError,
-                _,
-                _,
-            >(
-                &mut stream,
-                &identity,
-                &revoke_client_acl,
-                bloom_signer_api::SIGNER_CONTROL_CURRENT,
-                bloom_signer_api::SIGNER_CONTROL_RANGE,
-                &quota,
-                |request, context| async move {
-                    tracing::info!(
-                        event = "rpc.admitted",
-                        method = context.method.as_str(),
-                        operation_id = context.operation_id.as_str(),
-                        peer_service = context.caller_service_id.as_str(),
-                        peer_key_id = context.caller_application_key_id.as_str(),
-                        "Broker admitted authenticated control request"
-                    );
-                    let started = Instant::now();
-                    let result =
-                        RevocationControlService::dispatch(service.as_ref(), request).await;
-                    log_control_rpc_completion(&context, started, &result);
-                    result
-                },
-            )
-            .await;
-        });
+        let service_span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                let _permit = permit;
+                let _ = bloom_triad_local_transport::dispatch_connection_with_context::<
+                    ControlRequest,
+                    ControlResponse,
+                    SignerProtocolError,
+                    _,
+                    _,
+                >(
+                    &mut stream,
+                    &identity,
+                    &revoke_client_acl,
+                    bloom_signer_api::SIGNER_CONTROL_CURRENT,
+                    bloom_signer_api::SIGNER_CONTROL_RANGE,
+                    &quota,
+                    |request, context| async move {
+                        tracing::info!(
+                            event = "rpc.admitted",
+                            method = context.method.as_str(),
+                            operation_id = context.operation_id.as_str(),
+                            peer_service = context.caller_service_id.as_str(),
+                            peer_key_id = context.caller_application_key_id.as_str(),
+                            "Broker admitted authenticated control request"
+                        );
+                        let started = Instant::now();
+                        let result =
+                            RevocationControlService::dispatch(service.as_ref(), request).await;
+                        log_control_rpc_completion(&context, started, &result);
+                        result
+                    },
+                )
+                .await;
+            }
+            .instrument(service_span),
+        );
     }
 }
 
@@ -1585,6 +1597,14 @@ fn verifying_key(encoded: &str) -> Result<VerifyingKey, ProtocolError> {
 mod startup_failure_tests {
     use super::*;
     use bloom_broker_api::{ApprovalLifecycleState, BootEpoch, ReadinessState};
+
+    #[test]
+    fn observability_init_fallback_is_fixed_and_sanitized() {
+        assert_eq!(
+            OBSERVABILITY_INIT_FAILURE_MESSAGE,
+            "Bloom Broker logging initialization failed; exiting safely"
+        );
+    }
 
     #[tokio::test]
     async fn initial_signer_absence_does_not_latch_local_audit_degradation() {
