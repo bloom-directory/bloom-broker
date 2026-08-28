@@ -152,6 +152,21 @@ impl Drop for BrokerConfig {
 const OBSERVABILITY_INIT_FAILURE_MESSAGE: &str =
     "Bloom Broker logging initialization failed; exiting safely";
 
+#[derive(Debug)]
+struct TrustedTerminalError(Box<dyn std::error::Error>);
+
+impl std::fmt::Display for TrustedTerminalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Bloom Broker failed after trusted service metadata was loaded")
+    }
+}
+
+impl std::error::Error for TrustedTerminalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     if std::env::args_os().len() == 2
@@ -164,8 +179,20 @@ async fn main() {
         eprintln!("{OBSERVABILITY_INIT_FAILURE_MESSAGE}");
         std::process::exit(1);
     }
-    if run().await.is_err() {
+    if let Err(error) = run().await {
+        log_unreported_run_failure(error.as_ref());
         std::process::exit(1);
+    }
+}
+
+fn log_unreported_run_failure(error: &(dyn std::error::Error + 'static)) {
+    if error.downcast_ref::<TrustedTerminalError>().is_none() {
+        tracing::error!(
+            event = "service.fatal",
+            service = "broker",
+            error_kind = "bootstrap_failure",
+            "Bloom Broker exited before trusted service metadata was loaded"
+        );
     }
 }
 
@@ -216,12 +243,22 @@ fn required_env_u32(name: &str) -> Result<u32, Box<dyn std::error::Error>> {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let identity_path = env_path(
-        "BLOOM_BROKER_IDENTITY",
-        "/var/run/bloom/broker-identity.json",
-    );
-    let manifest_path = env_path("BLOOM_EDGE_MANIFEST", "/etc/bloom/edge-manifest.json");
-    let config_path = env_path("BLOOM_BROKER_CONFIG", "/etc/bloom/broker.json");
+    run_with_paths(
+        env_path(
+            "BLOOM_BROKER_IDENTITY",
+            "/var/run/bloom/broker-identity.json",
+        ),
+        env_path("BLOOM_EDGE_MANIFEST", "/etc/bloom/edge-manifest.json"),
+        env_path("BLOOM_BROKER_CONFIG", "/etc/bloom/broker.json"),
+    )
+    .await
+}
+
+async fn run_with_paths(
+    identity_path: PathBuf,
+    manifest_path: PathBuf,
+    config_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "triad-dev-harness")]
     let loaded_identity = match std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT") {
         Some(root) => load_developer_identity_and_manifest(
@@ -626,8 +663,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     .instrument(service_span)
     .await;
-    log_service_terminal(&terminal_span, result.is_ok());
-    result
+    complete_trusted_service_run(&terminal_span, result)
+}
+
+fn complete_trusted_service_run(
+    service_span: &tracing::Span,
+    result: Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    log_service_terminal(service_span, result.is_ok());
+    result.map_err(|error| Box::new(TrustedTerminalError(error)) as Box<dyn std::error::Error>)
 }
 
 async fn require_signer_head_exchange(
@@ -1636,26 +1680,90 @@ mod startup_failure_tests {
                 Some("test-build-digest"),
             );
             log_service_terminal(&span, true);
-            log_service_terminal(&span, false);
         });
 
         let events = capture
             .text()
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .filter(|event| {
-                matches!(
-                    event["fields"]["event"].as_str(),
-                    Some("service.shutdown" | "service.fatal")
-                )
-            })
+            .filter(|event| matches!(event["fields"]["event"].as_str(), Some("service.shutdown")))
             .collect::<Vec<_>>();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         for event in events {
             assert_eq!(event["span"]["service_id"], "bloom-broker");
             assert_eq!(event["span"]["enrolled_login_uid"], 501);
             assert_eq!(event["span"]["release_digest"], "test-build-digest");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_bootstrap_failure_emits_one_safe_root_fatal_event() {
+        let temporary = tempfile::tempdir().unwrap();
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(capture.clone()),
+        );
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let error = run_with_paths(
+            temporary.path().join("missing-identity.json"),
+            temporary.path().join("missing-manifest.json"),
+            temporary.path().join("missing-config.json"),
+        )
+        .await
+        .unwrap_err();
+        log_unreported_run_failure(error.as_ref());
+
+        let output = capture.text();
+        let events = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["fields"]["event"] == "service.fatal")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1, "{output}");
+        assert_eq!(events[0]["fields"]["error_kind"], "bootstrap_failure");
+        assert!(events[0].get("span").is_none(), "{output}");
+    }
+
+    #[test]
+    fn trusted_service_failure_is_logged_once_with_metadata() {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(capture.clone()),
+        );
+        let marker_secret = "MARKER_RUN_ERROR_MUST_NOT_BE_LOGGED";
+        tracing::subscriber::with_default(subscriber, || {
+            let span = bloom_service_observability::service_span(
+                "broker",
+                "test-version",
+                "bloom-broker",
+                Some(501),
+                Some("test-build-digest"),
+            );
+            let error = complete_trusted_service_run(
+                &span,
+                Err(std::io::Error::other(marker_secret).into()),
+            )
+            .unwrap_err();
+            log_unreported_run_failure(error.as_ref());
+        });
+
+        let output = capture.text();
+        let events = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["fields"]["event"] == "service.fatal")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1, "{output}");
+        assert_eq!(events[0]["span"]["service_id"], "bloom-broker");
+        assert_eq!(events[0]["span"]["enrolled_login_uid"], 501);
+        assert_eq!(events[0]["span"]["release_digest"], "test-build-digest");
+        assert!(!output.contains(marker_secret), "{output}");
     }
 
     #[tokio::test]
