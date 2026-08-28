@@ -266,10 +266,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // admission. The four values are non-secret, so the effective policy is
     // reported without the secret-bearing configuration around it.
     let ceremony_limits = bloom_broker::config::ceremony_limits(config.ceremony_limits.as_ref())?;
-    eprintln!(
-        "Bloom Broker ceremony admission limits: {}",
-        ceremony_limits.effective_summary()
-    );
     let build_digest = Digest32::new(config.build_digest.clone())?;
     let containment = config
         .network_containment
@@ -294,6 +290,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(config.build_digest.as_str()),
     );
     async move {
+        tracing::info!(
+            event = "broker.ceremony_limits_configured",
+            maximum_concurrent_sessions = ceremony_limits.maximum_concurrent_sessions(),
+            creation_window_ms = ceremony_limits.creation_window_ms(),
+            maximum_creations_per_wallet = ceremony_limits.maximum_creations_per_wallet(),
+            maximum_anonymous_registrations = ceremony_limits.maximum_anonymous_registrations(),
+            "Broker ceremony admission limits configured"
+        );
         // Own the canonical origin before opening or mutating any durable Broker
         // authority state. A losing AC-31 contender must die without racing the
         // owning Broker's journal or checkpoint store.
