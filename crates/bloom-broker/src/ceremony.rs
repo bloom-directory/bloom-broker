@@ -2564,6 +2564,8 @@ fn ceremony_kind_name(kind: CeremonyKind) -> &'static str {
         CeremonyKind::BackendEnrollment => "backend_enrollment",
         CeremonyKind::KeyDerive => "key_derive",
         CeremonyKind::PolicyUpdate => "policy_update",
+        CeremonyKind::AccountAllocate => "account_allocate",
+        CeremonyKind::AccountRetire => "account_retire",
     }
 }
 
@@ -2896,8 +2898,12 @@ fn rolling_quota_exhausted(
     window_ms: u64,
     now_ms: u64,
 ) -> ProtocolError {
-    eprintln!(
-        "Broker ceremony rolling creation quota exhausted: quota={quota} limit={limit} window_ms={window_ms}"
+    tracing::warn!(
+        event = "ceremony.quota_rejected",
+        quota,
+        limit,
+        window_ms,
+        "Broker ceremony rolling creation quota exhausted"
     );
     created_at_ms.sort_unstable();
     let blocking = created_at_ms
