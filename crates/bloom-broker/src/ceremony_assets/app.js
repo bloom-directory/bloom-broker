@@ -19,12 +19,12 @@ const panelKicker = document.getElementById("panel-kicker");
 const KINDS = {
   wallet_registration: {
     title: "Create a new wallet",
-    summary: "A new wallet will be created inside the Signer. You will register a <strong>new passkey</strong> for it now; that passkey is what approves anything this wallet does.",
+    summary: "A new wallet will be created on this computer. You will set up a <strong>new passkey</strong> for it now — that passkey is what approves anything this wallet does.",
     button: "Create wallet with passkey"
   },
   wallet_import: {
     title: "Import a wallet",
-    summary: "The wallet you enter below will be imported into the Signer and protected by a <strong>new passkey</strong> that you register now.",
+    summary: "The wallet you enter below will be imported and protected by a <strong>new passkey</strong> that you register now.",
     button: "Import with passkey"
   },
   wallet_export: {
@@ -35,7 +35,7 @@ const KINDS = {
   },
   wallet_delete: {
     title: "Delete wallet",
-    summary: "Remove wallet <strong>{wallet}</strong> from this Signer. Funds are not moved; if you have no backup, they become unreachable.",
+    summary: "Remove wallet <strong>{wallet}</strong> from this computer. Funds are not moved; if you have no backup, they become unreachable.",
     button: "Delete with passkey",
     warn: "This cannot be undone."
   },
@@ -141,9 +141,16 @@ function renderReview(session) {
   const meta = KINDS[kind] || {title: kind.replace(/_/g, " "), summary: "", button: "Continue with passkey"};
   const contribution = session.signer_contribution || {};
   const wallet = contribution.wallet_id || session.review_manifest?.wallet_id || "";
-  panelKicker.textContent = "Passkey confirmation";
-  panelTitle.textContent = meta.title;
+  panelKicker.textContent = "Step 1 of 2 · Check";
+  panelTitle.textContent = "What will happen";
   approve.textContent = meta.button;
+  const pageTitle = document.getElementById("page-title");
+  const pageLede = document.getElementById("page-lede");
+  if (pageTitle) pageTitle.textContent = meta.title;
+  if (pageLede) {
+    pageLede.textContent = meta.lede ||
+      "Read what will happen, then press the button. Your device will ask for your fingerprint, face, or PIN.";
+  }
 
   const facts = el("dl", {class: "facts"});
   const fact = (label, value, mono) => {
@@ -162,8 +169,7 @@ function renderReview(session) {
     fact("Scope", canonicalJson(contribution.petal_key_scope), true);
   }
   const expiry = el("span", {class: "expiry"});
-  facts.append(el("dt", {}, "Valid"), el("dd", {}, expiry));
-  fact("Ceremony", shortDigest(session.ceremony_id), true);
+  facts.append(el("dt", {}, "Expires"), el("dd", {}, expiry));
 
   const parts = [
     el("p", {class: "summary", html: meta.summary.replace("{wallet}", escapeHtml(wallet || "this wallet"))}),
@@ -179,10 +185,19 @@ function renderReview(session) {
     ceremony_kind: kind, signer_contribution: session.signer_contribution
   };
   parts.push(el("details", {class: "signed"},
-    el("summary", {}, "Signed details"),
+    el("summary", {}, "Technical details (what your passkey signs)"),
     el("pre", {}, canonicalJson(signed).replace(/,"/g, ',\n"'))));
   reviewNode.replaceChildren(...parts);
   startExpiry(session, expiry);
+}
+
+function markDone(title) {
+  panelKicker.textContent = "Done";
+  panelTitle.textContent = title;
+  const pageTitle = document.getElementById("page-title");
+  const pageLede = document.getElementById("page-lede");
+  if (pageTitle) pageTitle.textContent = "All done.";
+  if (pageLede) pageLede.textContent = "You can close this tab and go back to Bloom.";
 }
 
 function renderResult(session, plaintext) {
@@ -194,8 +209,8 @@ function renderResult(session, plaintext) {
   const isMnemonic = !parsed && (words.length === 12 || words.length === 24) &&
     words.every(w => /^[a-z]+$/.test(w));
   const parts = [];
+  markDone(isMnemonic ? "Your recovery phrase" : "Result");
   if (isMnemonic) {
-    parts.push(el("h3", {class: "result-title"}, "Your recovery phrase"));
     parts.push(el("p", {class: "summary"},
       `Write these ${words.length} words down, in order, and keep them offline. ` +
       "They restore this wallet on any device. Anyone who has them controls the funds."));
@@ -228,6 +243,7 @@ function renderResult(session, plaintext) {
 function renderDone(session, result) {
   const meta = KINDS[session.ceremony_kind] || {};
   const receipt = result?.receipt_digest || result?.approval_id || "";
+  markDone(`${meta.title || "Ceremony"} — done`);
   reviewNode.replaceChildren(
     el("h3", {class: "result-title ok"}, `${meta.title || "Ceremony"} — done`),
     el("p", {class: "summary"}, "Your passkey approved exactly the operation shown. You can close this tab."),
