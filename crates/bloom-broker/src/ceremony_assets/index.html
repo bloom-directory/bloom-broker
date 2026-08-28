@@ -25,7 +25,7 @@
     #status{margin:7px 0 0;color:var(--muted);font-size:13px}#review{padding:24px 30px;border-bottom:1px solid var(--rule)}
     #review pre{max-height:42vh;margin:0;padding:16px;overflow:auto;border:1px solid var(--rule);border-radius:9px;background:#fffdf9;color:var(--ink-2);font-family:var(--mono);font-size:11px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}
     fieldset{margin:0;padding:24px 30px;border:0;border-bottom:1px solid var(--rule)}legend{padding:0;color:var(--ink);font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase}label{display:grid;gap:5px;margin-top:13px;color:var(--ink-2);font-size:13px}input,textarea{width:100%;padding:11px 12px;border:1px solid var(--rule-2);border-radius:8px;background:#fffdf9;color:var(--ink);font:13px/1.45 var(--mono)}textarea{resize:vertical}input:focus,textarea:focus{border-color:var(--accent);outline:3px solid rgba(138,42,58,.1)}fieldset p{color:var(--muted);font-size:12px}
-    .actions{display:grid;grid-template-columns:1fr auto;gap:10px;padding:26px 30px 30px;background:rgba(236,228,214,.22)}button{min-height:49px;padding:12px 18px;border:0;border-radius:9px;background:var(--accent);color:var(--paper);font:500 12px var(--mono);cursor:pointer;box-shadow:0 8px 20px rgba(94,26,38,.17);transition:transform .16s,background .16s}button:hover:not(:disabled){transform:translateY(-1px);background:var(--accent-deep)}button:disabled{opacity:.48;cursor:wait;box-shadow:none}button.secondary{border:1px solid var(--rule-2);background:transparent;color:var(--ink-2);box-shadow:none}
+    .actions{display:grid;grid-template-columns:1fr auto;gap:10px;padding:26px 30px 30px;background:rgba(236,228,214,.22)}button{min-height:49px;padding:12px 18px;border:0;border-radius:9px;background:var(--accent);color:var(--paper);font:600 15px var(--sans);cursor:pointer;box-shadow:0 8px 20px rgba(94,26,38,.17);transition:transform .16s,background .16s}button:hover:not(:disabled){transform:translateY(-1px);background:var(--accent-deep)}button:disabled{opacity:.48;cursor:wait;box-shadow:none}button.secondary{border:1px solid var(--rule-2);background:transparent;color:var(--ink-2);box-shadow:none}
     @media(max-width:820px){.layout{grid-template-columns:1fr;gap:30px;margin-top:32px}.intro{position:static}.trust{grid-template-columns:repeat(2,minmax(0,1fr))}}
     @media(max-width:560px){.page{padding:19px 14px 28px}h1{font-size:46px}.panel{border-radius:14px}.panel-header,#review,fieldset,.actions{padding-left:20px;padding-right:20px}.actions{grid-template-columns:1fr}.trust{grid-template-columns:1fr}}
     @media(prefers-reduced-motion:reduce){*{transition:none!important}}
@@ -35,20 +35,20 @@
   <main class="page">
     <header class="brand" aria-label="Bloom walletFS">
       <img src="/assets/bloom-primary.svg" width="30" height="30" alt="">
-      <span><strong>/bloom</strong> walletFS</span>
+      <span><strong>Bloom</strong></span>
     </header>
     <div class="layout">
       <section class="intro" aria-labelledby="page-title">
         <p class="eyebrow">Signed local review</p>
-        <h1 id="page-title">Security ceremony.</h1>
-        <p class="lede">Review the exact operation Bloom will authorize, then confirm it with your passkey.</p>
+        <h1 id="page-title">One moment…</h1>
+        <p id="page-lede" class="lede">Bloom is preparing this request.</p>
         <div class="trust">
-          <div class="trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg><div><strong>Keys stay isolated</strong>Private key material never enters this page or Machine.</div></div>
-          <div class="trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3 20 7v5c0 4.6-3.1 7.5-8 9-4.9-1.5-8-4.4-8-9V7l8-4Z"/><path d="m8.5 12 2.2 2.2 4.8-5"/></svg><div><strong>Exact terms only</strong>Your passkey binds the signed review shown here.</div></div>
+          <div class="trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg><div><strong>Nothing leaves this computer</strong>Your keys and secrets stay on this device. This page never sees them.</div></div>
+          <div class="trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3 20 7v5c0 4.6-3.1 7.5-8 9-4.9-1.5-8-4.4-8-9V7l8-4Z"/><path d="m8.5 12 2.2 2.2 4.8-5"/></svg><div><strong>Your passkey approves only this</strong>It can't be reused for anything not shown on this page.</div></div>
         </div>
       </section>
       <section class="panel">
-        <header class="panel-header"><p id="panel-kicker" class="panel-kicker">Passkey confirmation</p><h2 id="panel-title" class="panel-title">Review before continuing</h2><p id="status" role="status">Loading signed review…</p></header>
+        <header class="panel-header"><p id="panel-kicker" class="panel-kicker">Step 1 of 2 · Check</p><h2 id="panel-title" class="panel-title">Review before continuing</h2><p id="status" role="status">Loading…</p></header>
         <section id="review" aria-live="polite"></section>
         <fieldset id="recovery-fields" hidden>
           <legend>Recovery factor</legend>

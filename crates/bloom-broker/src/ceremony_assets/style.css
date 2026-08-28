@@ -28,3 +28,6 @@ details.signed{margin-top:18px}details.signed summary{cursor:pointer;color:var(-
 .words{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin:14px 0 0;padding:0;list-style:none;counter-reset:w}.words li{display:flex;gap:8px;align-items:baseline;padding:9px 11px;border:1px solid var(--rule);border-radius:8px;background:#fffdf9;font-family:var(--mono);font-size:14px}.words li::before{counter-increment:w;content:counter(w);min-width:1.6em;color:var(--muted);font-size:11px}
 .result-title{margin:0 0 6px;font-family:var(--serif);font-size:24px;font-weight:400}.result-actions{display:flex;gap:10px;margin-top:16px}.result-actions button{min-height:40px;padding:8px 14px}
 .ok{color:var(--success)}
+button{font:600 15px/1.2 var(--sans);letter-spacing:0}button.secondary{font-weight:500}
+.lede{font-size:18px}.panel-title{font-size:26px}
+#review{padding:26px 30px}
