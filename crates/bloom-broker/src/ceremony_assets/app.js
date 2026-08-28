@@ -171,28 +171,42 @@ function describeTransfer(manifest) {
   const chain = debits[0]?.asset?.chain || dests[0]?.chain || ctx?.chain_family || "";
   const amounts = debits.map(d => fmtAmount(d.asset.chain, d.asset.asset, d.amount));
   const to = dests.map(d => d.destination);
+  const network = chainLabel(chain, ctx);
   let sentence;
   if (amounts.length && to.length) {
-    sentence = `Send <strong>${escapeHtml(amounts.join(" + "))}</strong> to <strong>${escapeHtml(to.join(", "))}</strong> on ${escapeHtml(chainLabel(chain, ctx))}.`;
+    sentence = `Send <strong>${escapeHtml(amounts.join(" + "))}</strong> on ${escapeHtml(network)} to the address below.`;
   } else if (amounts.length) {
-    sentence = `Spend up to <strong>${escapeHtml(amounts.join(" + "))}</strong> on ${escapeHtml(chainLabel(chain, ctx))}.`;
+    sentence = `Spend up to <strong>${escapeHtml(amounts.join(" + "))}</strong> on ${escapeHtml(network)}.`;
   } else {
-    sentence = `Sign one operation on ${escapeHtml(chainLabel(chain, ctx))}.`;
+    sentence = `Sign one operation on ${escapeHtml(network)}.`;
   }
   const facts = [];
-  if (amounts.length) facts.push(["Amount", amounts.join(" + ")]);
   if (to.length) facts.push(["To", to.join(", "), true]);
-  if (fee && fee.kind === "fee") facts.push(["Network fee", fmtAmount(fee.chain, fee.asset, fee.amount)]);
-  else if (fee && fee.amount) facts.push(["Network fee", fmtAmount(fee.chain, fee.asset, fee.amount)]);
-  facts.push(["Network", chainLabel(chain, ctx)]);
+  if (amounts.length) facts.push(["Amount", amounts.join(" + ")]);
+  if (fee && fee.amount) facts.push(["Network fee", fmtAmount(fee.chain, fee.asset, fee.amount)]);
+  facts.push(["Network", network]);
   if (claim.route) facts.push(["Requested by", `Petal ${claim.route}`]);
   const assurance = claim.claim_assurance?.kind || manifest?.claim_assurance?.kind;
+  const verified = assurance === "proof_verified";
   if (assurance) {
-    facts.push(["Checked by Bloom", assurance === "proof_verified"
-      ? "yes — the transaction bytes were decoded and match this summary"
-      : "no — these figures are claimed, not verified"]);
+    facts.push(["Checked by Bloom", verified
+      ? "Yes — Bloom decoded the transaction and it matches this summary"
+      : "No — these figures are claimed, not verified"]);
   }
-  return {sentence, facts};
+  return {sentence, facts, verified};
+}
+// Turn a Signer key reference into "Solana account 0 (m/44'/501'/0'/0')".
+function describeKey(ref) {
+  if (!ref || typeof ref !== "object") return {wallet: "", account: ""};
+  const wallet = ref.derivation?.wallet_seed_ref || ref.backend_instance || "";
+  const path = ref.derivation?.path || "";
+  let account = "";
+  let m;
+  if ((m = path.match(/^m\/44'\/501'\/(\d+)'/))) account = `Solana account ${m[1]} (${path})`;
+  else if ((m = path.match(/^m\/44'\/60'\/(\d+)'\/0\/(\d+)/))) account = `EVM account ${m[2]} (${path})`;
+  else if (path) account = path;
+  else if (ref.key_spec) account = `${ref.key_spec} key ${shortDigest(ref.public_key_fingerprint || ref.locator || "")}`;
+  return {wallet, account};
 }
 function planDisclosures(manifest) {
   try {
@@ -222,30 +236,39 @@ function renderReview(session) {
     if (value == null || value === "") return;
     facts.append(el("dt", {}, label), el("dd", {}, mono ? el("code", {}, value) : value));
   };
-  fact("Wallet", wallet);
-  if (session.signer_contribution?.wallet_seed_profile === "bip39-multicurve-v1") {
+  const ref = contribution.key_ref;
+  const keyInfo = describeKey(ref);
+  const walletName = wallet || keyInfo.wallet || "";
+  let summaryHtml = meta.summary.replace("{wallet}", escapeHtml(walletName || "this wallet"));
+  const warns = [];
+  let transfer = null;
+  if (kind === "sealed_approval") {
+    transfer = describeTransfer(session.review_manifest);
+    if (transfer) summaryHtml = transfer.sentence;
+  }
+  fact("Wallet", walletName);
+  if (kind !== "sealed_approval" &&
+      session.signer_contribution?.wallet_seed_profile === "bip39-multicurve-v1") {
     fact("Wallet type", "BIP-39 recovery phrase (multi-chain)");
   }
-  if (contribution.key_ref) {
-    const ref = contribution.key_ref;
-    fact("Key", typeof ref === "string" ? ref : (ref.fingerprint || ref.key_id || canonicalJson(ref)), true);
+  if (transfer) {
+    if (keyInfo.account) fact("From", keyInfo.account);
+    for (const [label, value, mono] of transfer.facts) fact(label, value, mono);
+  } else if (keyInfo.account) {
+    fact("Account", keyInfo.account);
   }
   if (contribution.petal_key_scope) {
     fact("Scope", canonicalJson(contribution.petal_key_scope), true);
   }
   const expiry = el("span", {class: "expiry"});
   facts.append(el("dt", {}, "Expires"), el("dd", {}, expiry));
-
-  let summaryHtml = meta.summary.replace("{wallet}", escapeHtml(wallet || "this wallet"));
-  const warns = [];
   if (kind === "sealed_approval") {
-    const transfer = describeTransfer(session.review_manifest);
-    if (transfer) {
-      summaryHtml = transfer.sentence;
-      for (const [label, value, mono] of transfer.facts) fact(label, value, mono);
-    }
     for (const item of session.review_manifest?.attributed_advisory_items || []) warns.push(item);
-    for (const item of planDisclosures(session.review_manifest)) warns.push(item);
+    // The plan's generic "opaque payload" disclosure is only meaningful when
+    // Bloom did not decode the payload itself; a verified claim supersedes it.
+    if (!transfer || !transfer.verified) {
+      for (const item of planDisclosures(session.review_manifest)) warns.push(item);
+    }
   }
   const parts = [
     el("p", {class: "summary", html: summaryHtml}),
