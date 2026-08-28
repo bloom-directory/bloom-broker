@@ -974,10 +974,16 @@ fn require_clock_repair_confirmation(
     let expected = Digest32::from_bytes(hasher.finalize().into());
     let supplied = std::env::var("BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST").ok();
     if supplied.as_deref() != Some(expected.as_str()) {
+        let affected_approval_ids = expiring
+            .iter()
+            .map(Digest32::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
         tracing::warn!(
             event = "broker.clock_repair_confirmation_required",
             accepted_utc_ms,
             expiring_approval_count = expiring.len(),
+            affected_approval_ids,
             confirmation_digest = expected.as_str(),
             "Broker clock repair requires operator confirmation"
         );
@@ -1660,6 +1666,44 @@ mod startup_failure_tests {
         assert_eq!(
             OBSERVABILITY_INIT_FAILURE_MESSAGE,
             "Bloom Broker logging initialization failed; exiting safely"
+        );
+    }
+
+    #[test]
+    fn clock_repair_warning_names_every_affected_approval() {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(capture.clone()),
+        );
+        let accepted_utc_ms = 1_725_000_000_123;
+        let approvals = [
+            Digest32::from_bytes([0x11; 32]),
+            Digest32::from_bytes([0x22; 32]),
+        ];
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(require_clock_repair_confirmation(accepted_utc_ms, &approvals).is_err());
+        });
+
+        let output = capture.text();
+        let event: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(
+            event["fields"]["event"],
+            "broker.clock_repair_confirmation_required"
+        );
+        assert_eq!(event["fields"]["accepted_utc_ms"], accepted_utc_ms);
+        assert_eq!(event["fields"]["expiring_approval_count"], 2);
+        assert_eq!(
+            event["fields"]["affected_approval_ids"],
+            format!("{},{}", approvals[0].as_str(), approvals[1].as_str())
+        );
+        let confirmation_digest = event["fields"]["confirmation_digest"].as_str().unwrap();
+        assert_eq!(confirmation_digest.len(), 64);
+        assert!(
+            confirmation_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
         );
     }
 
