@@ -137,6 +137,70 @@ function startExpiry(session, node) {
   expiryTimer = setInterval(tick, 1000);
 }
 
+// Amount formatting for the assets Bloom currently moves. Anything unknown is
+// shown as the raw integer plus its asset name rather than guessed.
+const NATIVE_UNITS = {
+  solana: ["SOL", 9], ethereum: ["ETH", 18], mainnet: ["ETH", 18], base: ["ETH", 18],
+  arbitrum: ["ETH", 18], optimism: ["ETH", 18], polygon: ["POL", 18], bsc: ["BNB", 18],
+  avalanche: ["AVAX", 18], gnosis: ["xDAI", 18], anvil: ["ETH", 18]
+};
+function fmtAmount(chain, asset, raw) {
+  const unit = asset === "native" ? NATIVE_UNITS[chain] : null;
+  if (!unit) return `${raw} ${asset === "native" ? chain : asset}`;
+  const [symbol, decimals] = unit;
+  const digits = String(raw).padStart(decimals + 1, "0");
+  const whole = digits.slice(0, -decimals);
+  const frac = digits.slice(-decimals).replace(/0+$/, "");
+  return `${whole}${frac ? "." + frac : ""} ${symbol}`;
+}
+function chainLabel(chain, ctx) {
+  if (chain === "solana") {
+    return ctx?.genesis_hash === "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+      ? "Solana mainnet" : "Solana";
+  }
+  return {ethereum: "Ethereum", mainnet: "Ethereum", base: "Base", arbitrum: "Arbitrum",
+    optimism: "Optimism", polygon: "Polygon", anvil: "local test chain"}[chain] || chain;
+}
+function describeTransfer(manifest) {
+  const claim = manifest?.system_use_claim || manifest?.petal_use_claim;
+  if (!claim) return null;
+  const debits = claim.declared_debits || [];
+  const dests = claim.declared_destinations || [];
+  const fee = claim.declared_fee;
+  const ctx = claim.chain_context;
+  const chain = debits[0]?.asset?.chain || dests[0]?.chain || ctx?.chain_family || "";
+  const amounts = debits.map(d => fmtAmount(d.asset.chain, d.asset.asset, d.amount));
+  const to = dests.map(d => d.destination);
+  let sentence;
+  if (amounts.length && to.length) {
+    sentence = `Send <strong>${escapeHtml(amounts.join(" + "))}</strong> to <strong>${escapeHtml(to.join(", "))}</strong> on ${escapeHtml(chainLabel(chain, ctx))}.`;
+  } else if (amounts.length) {
+    sentence = `Spend up to <strong>${escapeHtml(amounts.join(" + "))}</strong> on ${escapeHtml(chainLabel(chain, ctx))}.`;
+  } else {
+    sentence = `Sign one operation on ${escapeHtml(chainLabel(chain, ctx))}.`;
+  }
+  const facts = [];
+  if (amounts.length) facts.push(["Amount", amounts.join(" + ")]);
+  if (to.length) facts.push(["To", to.join(", "), true]);
+  if (fee && fee.kind === "fee") facts.push(["Network fee", fmtAmount(fee.chain, fee.asset, fee.amount)]);
+  else if (fee && fee.amount) facts.push(["Network fee", fmtAmount(fee.chain, fee.asset, fee.amount)]);
+  facts.push(["Network", chainLabel(chain, ctx)]);
+  if (claim.route) facts.push(["Requested by", `Petal ${claim.route}`]);
+  const assurance = claim.claim_assurance?.kind || manifest?.claim_assurance?.kind;
+  if (assurance) {
+    facts.push(["Checked by Bloom", assurance === "proof_verified"
+      ? "yes — the transaction bytes were decoded and match this summary"
+      : "no — these figures are claimed, not verified"]);
+  }
+  return {sentence, facts};
+}
+function planDisclosures(manifest) {
+  try {
+    const plan = JSON.parse(manifest?.canonical_plan || "{}");
+    return Array.isArray(plan.security_disclosures) ? plan.security_disclosures : [];
+  } catch (_) { return []; }
+}
+
 function renderReview(session) {
   const kind = session.ceremony_kind;
   const meta = KINDS[kind] || {title: kind.replace(/_/g, " "), summary: "", button: "Continue with passkey"};
@@ -172,15 +236,23 @@ function renderReview(session) {
   const expiry = el("span", {class: "expiry"});
   facts.append(el("dt", {}, "Expires"), el("dd", {}, expiry));
 
+  let summaryHtml = meta.summary.replace("{wallet}", escapeHtml(wallet || "this wallet"));
+  const warns = [];
+  if (kind === "sealed_approval") {
+    const transfer = describeTransfer(session.review_manifest);
+    if (transfer) {
+      summaryHtml = transfer.sentence;
+      for (const [label, value, mono] of transfer.facts) fact(label, value, mono);
+    }
+    for (const item of session.review_manifest?.attributed_advisory_items || []) warns.push(item);
+    for (const item of planDisclosures(session.review_manifest)) warns.push(item);
+  }
   const parts = [
-    el("p", {class: "summary", html: meta.summary.replace("{wallet}", escapeHtml(wallet || "this wallet"))}),
+    el("p", {class: "summary", html: summaryHtml}),
     facts
   ];
-  if (kind === "sealed_approval" && session.review_manifest?.canonical_plan) {
-    parts.push(el("div", {class: "plan"},
-      el("pre", {}, session.review_manifest.canonical_plan)));
-  }
-  if (meta.warn) parts.push(el("p", {class: "warn"}, meta.warn));
+  if (meta.warn) warns.unshift(meta.warn);
+  for (const w of warns) parts.push(el("p", {class: "warn"}, w));
 
   const signed = session.review_manifest || {
     ceremony_kind: kind, signer_contribution: session.signer_contribution
