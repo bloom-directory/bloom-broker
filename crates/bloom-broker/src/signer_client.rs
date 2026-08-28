@@ -558,6 +558,8 @@ mod tests {
     use std::sync::Mutex;
     use tracing_subscriber::prelude::*;
 
+    static CHECKPOINT_TRACING_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     struct TestAuditSigner;
 
     impl AuditSigner for TestAuditSigner {
@@ -675,6 +677,7 @@ mod tests {
 
     #[test]
     fn response_checkpoint_failure_latches_mutations_but_preserves_reads() {
+        let _tracing_test = CHECKPOINT_TRACING_TEST_LOCK.lock().unwrap();
         let journal = BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).unwrap();
         let sink = FailingCheckpointSink;
         assert!(
@@ -704,6 +707,7 @@ mod tests {
 
     #[test]
     fn signer_worker_preserves_trusted_service_span_and_dispatcher() {
+        let _tracing_test = CHECKPOINT_TRACING_TEST_LOCK.lock().unwrap();
         let capture = bloom_service_observability::CapturedWriter::default();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
@@ -742,22 +746,31 @@ mod tests {
                 Arc::new(RetainingCheckpointSink::default()),
             )
             .unwrap();
+            assert_eq!(
+                client
+                    .request(BrokerSignerRequest::SignerReadiness(Empty {}))
+                    .unwrap_err()
+                    .code,
+                ProtocolErrorCode::ServiceUnavailable
+            );
             drop(client);
         });
 
-        let event = capture
-            .text()
+        let captured = capture.text();
+        let event = captured
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .find(|event| event["fields"]["event"] == "checkpoint.decision")
-            .expect("Signer worker checkpoint event");
+            .unwrap_or_else(|| panic!("Signer worker checkpoint event; captured: {captured}"));
         assert_eq!(event["span"]["service_id"], "bloom-broker");
         assert_eq!(event["span"]["login_uid"], 501);
         assert_eq!(event["span"]["build_digest"], "test-build-digest");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // Test-only serialization of tracing callsite capture.
     async fn degraded_restart_uses_retained_nonzero_broker_head_for_real_rpc_read() {
+        let _tracing_test = CHECKPOINT_TRACING_TEST_LOCK.lock().unwrap();
         use std::os::unix::fs::MetadataExt as _;
 
         let directory = tempfile::tempdir().unwrap();

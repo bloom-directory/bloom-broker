@@ -164,22 +164,7 @@ async fn main() {
         eprintln!("{OBSERVABILITY_INIT_FAILURE_MESSAGE}");
         std::process::exit(1);
     }
-    let result = run().await;
-    match &result {
-        Ok(()) => tracing::info!(
-            event = "service.shutdown",
-            service = "broker",
-            outcome = "clean",
-            "Bloom Broker stopped"
-        ),
-        Err(_) => tracing::error!(
-            event = "service.fatal",
-            service = "broker",
-            error_kind = "startup_or_runtime",
-            "Bloom Broker exited with an error"
-        ),
-    }
-    if result.is_err() {
+    if run().await.is_err() {
         std::process::exit(1);
     }
 }
@@ -200,6 +185,26 @@ fn init_observability() -> Result<(), Box<dyn std::error::Error>> {
     let output = bloom_service_observability::LogOutput::JsonStderr;
     bloom_service_observability::init("broker", env!("CARGO_PKG_VERSION"), output)?;
     Ok(())
+}
+
+fn log_service_terminal(service_span: &tracing::Span, clean: bool) {
+    service_span.in_scope(|| {
+        if clean {
+            tracing::info!(
+                event = "service.shutdown",
+                service = "broker",
+                outcome = "clean",
+                "Bloom Broker stopped"
+            );
+        } else {
+            tracing::error!(
+                event = "service.fatal",
+                service = "broker",
+                error_kind = "startup_or_runtime",
+                "Bloom Broker exited with an error"
+            );
+        }
+    });
 }
 
 #[cfg(target_os = "macos")]
@@ -289,7 +294,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map(|containment| containment.login_uid),
         Some(config.build_digest.as_str()),
     );
-    async move {
+    let terminal_span = service_span.clone();
+    let result = async move {
         tracing::info!(
             event = "broker.ceremony_limits_configured",
             maximum_concurrent_sessions = ceremony_limits.maximum_concurrent_sessions(),
@@ -619,7 +625,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
     .instrument(service_span)
-    .await
+    .await;
+    log_service_terminal(&terminal_span, result.is_ok());
+    result
 }
 
 async fn require_signer_head_exchange(
@@ -1601,6 +1609,7 @@ fn verifying_key(encoded: &str) -> Result<VerifyingKey, ProtocolError> {
 mod startup_failure_tests {
     use super::*;
     use bloom_broker_api::{ApprovalLifecycleState, BootEpoch, ReadinessState};
+    use tracing_subscriber::prelude::*;
 
     #[test]
     fn observability_init_fallback_is_fixed_and_sanitized() {
@@ -1608,6 +1617,45 @@ mod startup_failure_tests {
             OBSERVABILITY_INIT_FAILURE_MESSAGE,
             "Bloom Broker logging initialization failed; exiting safely"
         );
+    }
+
+    #[test]
+    fn terminal_lifecycle_events_retain_trusted_service_metadata() {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(capture.clone()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let span = bloom_service_observability::service_span(
+                "broker",
+                "test-version",
+                "bloom-broker",
+                Some(501),
+                Some("test-build-digest"),
+            );
+            log_service_terminal(&span, true);
+            log_service_terminal(&span, false);
+        });
+
+        let events = capture
+            .text()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| {
+                matches!(
+                    event["fields"]["event"].as_str(),
+                    Some("service.shutdown" | "service.fatal")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        for event in events {
+            assert_eq!(event["span"]["service_id"], "bloom-broker");
+            assert_eq!(event["span"]["enrolled_login_uid"], 501);
+            assert_eq!(event["span"]["release_digest"], "test-build-digest");
+        }
     }
 
     #[tokio::test]
