@@ -230,7 +230,6 @@ dependencies = [
  "bloom-broker-debug-driver",
  "bloom-platform-containment",
  "bloom-service-activation",
- "bloom-service-observability",
  "bloom-signer",
  "bloom-signer-api",
  "bloom-signer-vectors",

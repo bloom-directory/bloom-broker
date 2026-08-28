@@ -952,11 +952,11 @@ impl BrokerRpcService {
             })
             .await;
         if let Err(error) = &response {
-            tracing::warn!(
-                event = "broker.signer_operation_rejected",
-                operation_id = operation_id.as_str(),
-                protocol_error_code = error.code.as_str(),
-                "Signer rejected Broker operation"
+            eprintln!(
+                "Signer rejected operation {}: {}: {}",
+                operation_id,
+                error.code.as_str(),
+                error.message
             );
         }
         match response {
@@ -1240,20 +1240,9 @@ impl BrokerRpcService {
     }
 
     pub async fn reconcile_all(&self) -> Result<(), ProtocolError> {
-        let wallet_ids = self.authority.wallet_ids().map_err(authority_error)?;
-        tracing::info!(
-            event = "reconciliation.started",
-            wallet_count = wallet_ids.len(),
-            "Broker revocation reconciliation started"
-        );
-        for wallet_id in wallet_ids {
+        for wallet_id in self.authority.wallet_ids().map_err(authority_error)? {
             self.reconcile_wallet(&wallet_id).await?;
         }
-        tracing::info!(
-            event = "reconciliation.completed",
-            outcome = "converged",
-            "Broker revocation reconciliation completed"
-        );
         Ok(())
     }
 
@@ -1265,22 +1254,7 @@ impl BrokerRpcService {
                 .reconcile_revocation(&snapshot.state, &snapshot.approval_tombstones)
                 .map_err(authority_error)?
             {
-                EpochReconciliation::Converged => {
-                    tracing::info!(
-                        event = "reconciliation.wallet_completed",
-                        wallet_id = wallet_id.as_str(),
-                        outcome = "converged",
-                        "Broker wallet revocation state reconciled"
-                    );
-                    return Ok(());
-                }
-                EpochReconciliation::AdoptedSignerEpoch => {
-                    tracing::info!(
-                        event = "reconciliation.wallet_completed",
-                        wallet_id = wallet_id.as_str(),
-                        outcome = "adopted_signer_epoch",
-                        "Broker adopted Signer revocation epoch"
-                    );
+                EpochReconciliation::Converged | EpochReconciliation::AdoptedSignerEpoch => {
                     return Ok(());
                 }
                 EpochReconciliation::PushLocalEpoch => {
@@ -1296,12 +1270,11 @@ impl BrokerRpcService {
                     }
                     let mut operation_bytes = [0_u8; 32];
                     OsRng.fill_bytes(&mut operation_bytes);
-                    let operation_id = OperationId::from_bytes(operation_bytes);
                     match self
                         .signer
                         .request_for_machine(BrokerSignerRequest::SealedApprovalRevokeAll(
                             bloom_signer_api::WalletOperationRequest {
-                                operation_id: operation_id.clone(),
+                                operation_id: OperationId::from_bytes(operation_bytes),
                                 wallet_id: wallet_id.clone(),
                             },
                         ))
@@ -1310,13 +1283,6 @@ impl BrokerRpcService {
                         BrokerSignerResponse::SealedApprovalRevokeAll(_) => {}
                         _ => return Err(response_mismatch("sealed_approval.revoke_all")),
                     }
-                    tracing::info!(
-                        event = "reconciliation.wallet_advanced",
-                        wallet_id = wallet_id.as_str(),
-                        operation_id = operation_id.as_str(),
-                        outcome = "pushed_local_epoch",
-                        "Broker pushed local revocation epoch to Signer"
-                    );
                     snapshot = self.revocation_snapshot(wallet_id).await?;
                 }
             }
@@ -2047,16 +2013,7 @@ fn jcs_digest(value: &impl serde::Serialize) -> Result<Digest32, ProtocolError> 
 }
 
 fn authority_error(error: AuthorityError) -> ProtocolError {
-    let error_kind = match &error {
-        AuthorityError::Journal(_) => "journal",
-        AuthorityError::Storage(_) => "storage",
-        AuthorityError::Denied { .. } => "denied",
-    };
-    tracing::warn!(
-        event = "broker.authority_rejected",
-        error_kind,
-        "Broker authority rejected an operation"
-    );
+    eprintln!("Broker authority rejection: {error}");
     match error {
         AuthorityError::Journal(error) => journal_error(error),
         AuthorityError::Storage(message) => {
