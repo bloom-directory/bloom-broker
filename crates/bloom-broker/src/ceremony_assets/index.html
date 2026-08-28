@@ -48,17 +48,30 @@
         </div>
       </section>
       <section class="panel">
-        <header class="panel-header"><p class="panel-kicker">Passkey confirmation</p><h2 class="panel-title">Review before continuing</h2><p id="status" role="status">Loading signed review…</p></header>
+        <header class="panel-header"><p id="panel-kicker" class="panel-kicker">Passkey confirmation</p><h2 id="panel-title" class="panel-title">Review before continuing</h2><p id="status" role="status">Loading signed review…</p></header>
         <section id="review" aria-live="polite"></section>
         <fieldset id="recovery-fields" hidden>
           <legend>Recovery factor</legend>
           <label>Recovery record ID<input id="recovery-id" autocomplete="off"></label>
           <label>Recovery secret<input id="recovery-secret" type="password" autocomplete="off"></label>
         </fieldset>
+        <fieldset id="export-fields" hidden>
+          <legend>What to export</legend>
+          <label class="choice"><input type="radio" name="export-format" value="bip39_mnemonic24" checked><span><strong>Recovery phrase</strong> — the 24 words that restore this wallet anywhere</span></label>
+          <label class="choice"><input type="radio" name="export-format" value="legacy_backup"><span><strong>Bloom backup file</strong> — encrypted backup for restoring into Bloom</span></label>
+          <p>The result is decrypted only in this tab. Nobody else, including Bloom, sees it.</p>
+        </fieldset>
+        <fieldset id="import-fields" hidden>
+          <legend>Wallet to import</legend>
+          <label id="mnemonic-label">Recovery phrase (12 or 24 words)<textarea id="mnemonic-input" rows="3" autocomplete="off" spellcheck="false" placeholder="word word word …"></textarea></label>
+          <label id="passphrase-label">Passphrase (leave empty unless you set one)<input id="passphrase-input" type="password" autocomplete="off"></label>
+          <label id="raw-key-label" hidden>Private key<input id="raw-key-input" type="password" autocomplete="off" spellcheck="false"></label>
+          <p>Encrypted directly to the Signer before it leaves this page.</p>
+        </fieldset>
         <fieldset id="generic-fields" hidden>
-          <legend>Custody workflow input</legend>
-          <p>Enter the exact JSON requested by this signed workflow. It is encrypted directly to Signer.</p>
-          <textarea id="generic-input" rows="10" autocomplete="off"></textarea>
+          <legend>Advanced input</legend>
+          <p>This workflow needs a JSON object. It is encrypted directly to Signer.</p>
+          <textarea id="generic-input" rows="6" autocomplete="off" spellcheck="false"></textarea>
         </fieldset>
         <div class="actions"><button id="approve" type="button" disabled>Continue with passkey</button><button id="cancel" class="secondary" type="button">Cancel</button></div>
       </section>
