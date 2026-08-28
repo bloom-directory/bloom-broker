@@ -6,6 +6,234 @@ const cancel = document.getElementById("cancel");
 const recoveryFields = document.getElementById("recovery-fields");
 const genericFields = document.getElementById("generic-fields");
 const genericInput = document.getElementById("generic-input");
+const exportFields = document.getElementById("export-fields");
+const importFields = document.getElementById("import-fields");
+const mnemonicInput = document.getElementById("mnemonic-input");
+const rawKeyInput = document.getElementById("raw-key-input");
+const panelTitle = document.getElementById("panel-title");
+const panelKicker = document.getElementById("panel-kicker");
+
+// Human-readable framing for every ceremony kind. Nothing here changes what
+// is signed or bound; the exact signed material stays available under
+// "Signed details" and is what the passkey attests to.
+const KINDS = {
+  wallet_registration: {
+    title: "Create a new wallet",
+    summary: "A new wallet will be created inside the Signer. You will register a <strong>new passkey</strong> for it now; that passkey is what approves anything this wallet does.",
+    button: "Create wallet with passkey"
+  },
+  wallet_import: {
+    title: "Import a wallet",
+    summary: "The wallet you enter below will be imported into the Signer and protected by a <strong>new passkey</strong> that you register now.",
+    button: "Import with passkey"
+  },
+  wallet_export: {
+    title: "Export recovery phrase",
+    summary: "Reveal the recovery material for wallet <strong>{wallet}</strong>. Anyone holding it controls the wallet's funds.",
+    button: "Reveal with passkey",
+    warn: "Only continue on a device and screen you trust. Write the words down; do not screenshot or paste them anywhere."
+  },
+  wallet_delete: {
+    title: "Delete wallet",
+    summary: "Remove wallet <strong>{wallet}</strong> from this Signer. Funds are not moved; if you have no backup, they become unreachable.",
+    button: "Delete with passkey",
+    warn: "This cannot be undone."
+  },
+  wallet_recovery: {
+    title: "Recover wallet access",
+    summary: "Replace the passkey for wallet <strong>{wallet}</strong> using your recovery record. You will register a new passkey now.",
+    button: "Recover with passkey"
+  },
+  credential_add: {
+    title: "Add a passkey",
+    summary: "Authorize an additional passkey for wallet <strong>{wallet}</strong>. Confirm with an existing passkey, then register the new one.",
+    button: "Add passkey"
+  },
+  credential_replace: {
+    title: "Replace a passkey",
+    summary: "Replace a passkey on wallet <strong>{wallet}</strong>. Confirm with an existing passkey, then register the replacement.",
+    button: "Replace passkey"
+  },
+  account_allocate: {
+    title: "Allocate a new account",
+    summary: "Derive the next account for wallet <strong>{wallet}</strong> from its recovery phrase. No funds move.",
+    button: "Allocate with passkey"
+  },
+  account_retire: {
+    title: "Retire an account",
+    summary: "Stop using an account of wallet <strong>{wallet}</strong> for new activity. Its address and any funds on it are unchanged.",
+    button: "Retire with passkey"
+  },
+  policy_update: {
+    title: "Change wallet rules",
+    summary: "Update the policy for wallet <strong>{wallet}</strong>. This does not move money; after approval Bloom uses the new rules to decide what is allowed.",
+    button: "Approve rules with passkey"
+  },
+  key_derive: {
+    title: "Derive a key",
+    summary: "Derive a scoped key from wallet <strong>{wallet}</strong>.",
+    button: "Derive with passkey"
+  },
+  backend_enrollment: {
+    title: "Enrol a signing backend",
+    summary: "Bind an external signing backend to wallet <strong>{wallet}</strong>.",
+    button: "Enrol with passkey"
+  },
+  sealed_approval: {
+    title: "Approve transaction",
+    summary: "Approve exactly the operation described below for wallet <strong>{wallet}</strong>. Nothing outside this plan is authorized.",
+    button: "Approve with passkey"
+  }
+};
+
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (key === "class") node.className = value;
+    else if (key === "html") node.innerHTML = value;
+    else node.setAttribute(key, value);
+  }
+  for (const child of children) {
+    if (child == null) continue;
+    node.append(typeof child === "string" ? document.createTextNode(child) : child);
+  }
+  return node;
+}
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
+  })[c]);
+}
+function shortDigest(value) {
+  return typeof value === "string" && value.length > 16
+    ? `${value.slice(0, 8)}…${value.slice(-6)}` : (value || "");
+}
+function fmtRemaining(ms) {
+  if (ms <= 0) return "expired";
+  const s = Math.ceil(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m}m ${s % 60}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+let expiryTimer = null;
+function startExpiry(session, node) {
+  const expiresAt = Number(session.expires_at_ms ||
+    session.signer_contribution?.expires_at_ms ||
+    session.review_manifest?.expires_at_ms);
+  if (!Number.isFinite(expiresAt) || !node) return;
+  const tick = () => {
+    const left = expiresAt - Date.now();
+    node.textContent = left <= 0 ? "Expired — ask Bloom to start this again"
+      : `Time left: ${fmtRemaining(left)}`;
+    node.className = left <= 0 ? "expired" : (left < 60000 ? "expiry soon" : "expiry");
+    if (left <= 0) {
+      approve.disabled = true;
+      statusNode.textContent = "This ceremony has expired. Nothing was changed.";
+      clearInterval(expiryTimer);
+    }
+  };
+  tick();
+  expiryTimer = setInterval(tick, 1000);
+}
+
+function renderReview(session) {
+  const kind = session.ceremony_kind;
+  const meta = KINDS[kind] || {title: kind.replace(/_/g, " "), summary: "", button: "Continue with passkey"};
+  const contribution = session.signer_contribution || {};
+  const wallet = contribution.wallet_id || session.review_manifest?.wallet_id || "";
+  panelKicker.textContent = "Passkey confirmation";
+  panelTitle.textContent = meta.title;
+  approve.textContent = meta.button;
+
+  const facts = el("dl", {class: "facts"});
+  const fact = (label, value, mono) => {
+    if (value == null || value === "") return;
+    facts.append(el("dt", {}, label), el("dd", {}, mono ? el("code", {}, value) : value));
+  };
+  fact("Wallet", wallet);
+  if (session.signer_contribution?.wallet_seed_profile === "bip39-multicurve-v1") {
+    fact("Wallet type", "BIP-39 recovery phrase (multi-chain)");
+  }
+  if (contribution.key_ref) {
+    const ref = contribution.key_ref;
+    fact("Key", typeof ref === "string" ? ref : (ref.fingerprint || ref.key_id || canonicalJson(ref)), true);
+  }
+  if (contribution.petal_key_scope) {
+    fact("Scope", canonicalJson(contribution.petal_key_scope), true);
+  }
+  const expiry = el("span", {class: "expiry"});
+  facts.append(el("dt", {}, "Valid"), el("dd", {}, expiry));
+  fact("Ceremony", shortDigest(session.ceremony_id), true);
+
+  const parts = [
+    el("p", {class: "summary", html: meta.summary.replace("{wallet}", escapeHtml(wallet || "this wallet"))}),
+    facts
+  ];
+  if (kind === "sealed_approval" && session.review_manifest?.canonical_plan) {
+    parts.push(el("div", {class: "plan"},
+      el("pre", {}, session.review_manifest.canonical_plan)));
+  }
+  if (meta.warn) parts.push(el("p", {class: "warn"}, meta.warn));
+
+  const signed = session.review_manifest || {
+    ceremony_kind: kind, signer_contribution: session.signer_contribution
+  };
+  parts.push(el("details", {class: "signed"},
+    el("summary", {}, "Signed details"),
+    el("pre", {}, canonicalJson(signed).replace(/,"/g, ',\n"'))));
+  reviewNode.replaceChildren(...parts);
+  startExpiry(session, expiry);
+}
+
+function renderResult(session, plaintext) {
+  const kind = session.ceremony_kind;
+  const text = new TextDecoder().decode(plaintext).trim();
+  let parsed = null;
+  try { parsed = JSON.parse(text); } catch (_) {}
+  const words = text.split(/\s+/);
+  const isMnemonic = !parsed && (words.length === 12 || words.length === 24) &&
+    words.every(w => /^[a-z]+$/.test(w));
+  const parts = [];
+  if (isMnemonic) {
+    parts.push(el("h3", {class: "result-title"}, "Your recovery phrase"));
+    parts.push(el("p", {class: "summary"},
+      `Write these ${words.length} words down, in order, and keep them offline. ` +
+      "They restore this wallet on any device. Anyone who has them controls the funds."));
+    parts.push(el("ol", {class: "words"}, ...words.map(w => el("li", {}, w))));
+    const copy = el("button", {type: "button", class: "secondary"}, "Copy to clipboard");
+    copy.onclick = async () => {
+      try { await navigator.clipboard.writeText(words.join(" ")); copy.textContent = "Copied"; }
+      catch (_) { copy.textContent = "Copy failed — select the words instead"; }
+    };
+    parts.push(el("p", {class: "warn"},
+      "Clipboard contents can be read by other apps. Prefer writing the words down."));
+    parts.push(el("div", {class: "result-actions"}, copy));
+  } else if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    parts.push(el("h3", {class: "result-title"}, kind === "key_derive" ? "Key derived" : "Result"));
+    const facts = el("dl", {class: "facts"});
+    for (const [key, value] of Object.entries(parsed)) {
+      const shown = typeof value === "string" ? value : canonicalJson(value);
+      facts.append(el("dt", {}, key.replace(/_/g, " ")), el("dd", {}, el("code", {}, shown)));
+    }
+    parts.push(facts);
+    parts.push(el("details", {class: "signed"},
+      el("summary", {}, "Raw output"), el("pre", {}, text)));
+  } else {
+    parts.push(el("h3", {class: "result-title"}, "Result"));
+    parts.push(el("pre", {}, text));
+  }
+  reviewNode.replaceChildren(...parts);
+}
+
+function renderDone(session, result) {
+  const meta = KINDS[session.ceremony_kind] || {};
+  const receipt = result?.receipt_digest || result?.approval_id || "";
+  reviewNode.replaceChildren(
+    el("h3", {class: "result-title ok"}, `${meta.title || "Ceremony"} — done`),
+    el("p", {class: "summary"}, "Your passkey approved exactly the operation shown. You can close this tab."),
+    receipt ? el("dl", {class: "facts"}, el("dt", {}, "Receipt"), el("dd", {}, el("code", {}, receipt))) : null
+  );
+}
 const tokenFromPath = location.pathname.startsWith("/ceremony/")
   ? location.pathname.slice("/ceremony/".length) : "";
 const sessionTokenKey = "bloom.ceremony.token.v1";
@@ -287,29 +515,18 @@ async function load() {
       recipient_key: encodeUrl(outputRecipient.publicKey)
     });
   }
-  statusNode.textContent = "Review every item before continuing.";
-  const pre = document.createElement("pre");
-  pre.textContent = session.review_manifest?.canonical_plan ||
-    (session.review_manifest
-      ? canonicalJson(session.review_manifest)
-      : canonicalJson({
-          ceremony_kind: session.ceremony_kind,
-          signer_contribution: session.signer_contribution
-        }));
-  reviewNode.replaceChildren(pre);
+  statusNode.textContent = "Check the details, then continue with your passkey.";
+  renderReview(session);
   recoveryFields.hidden = session.ceremony_kind !== "wallet_recovery";
-  const typedInputKinds = new Set([
-    "wallet_import", "wallet_export", "key_derive"
-  ]);
-  genericFields.hidden = !typedInputKinds.has(session.ceremony_kind) ||
-    Boolean(scopedPetalKey) || legacyPasskeyImport;
-  if (session.ceremony_kind === "wallet_import" && !legacyPasskeyImport) {
-    genericInput.placeholder = bip39Import
-      ? '{"mnemonic":"twenty four BIP-39 words…"}'
-      : '{"raw_private_key":"base64url-encoded-key"}';
-  } else if (session.ceremony_kind === "wallet_export") {
-    genericInput.placeholder = '{"format":"bip39_mnemonic24"}';
-  } else if (session.ceremony_kind === "key_derive") {
+  exportFields.hidden = session.ceremony_kind !== "wallet_export";
+  importFields.hidden = !(session.ceremony_kind === "wallet_import" && !legacyPasskeyImport);
+  if (!importFields.hidden) {
+    document.getElementById("mnemonic-label").hidden = !bip39Import;
+    document.getElementById("raw-key-label").hidden = bip39Import;
+  }
+  // Only key derivation still takes free-form JSON; it is an operator flow.
+  genericFields.hidden = session.ceremony_kind !== "key_derive" || Boolean(scopedPetalKey);
+  if (!genericFields.hidden) {
     genericInput.placeholder =
       '{"namespace_id":"...","grant":{...},"authority_signature":"..."}';
   }
@@ -389,28 +606,22 @@ async function run(session) {
     const prf = await ensureNewCredentialPrf(session, created, 1);
     credentialId = encodeUrl(created.rawId);
     if (kind === "wallet_import") {
-      const supplied = JSON.parse(genericInput.value);
-      if (!supplied || Array.isArray(supplied)) {
-        throw new Error("Wallet import input is required");
-      }
       if (bip39Import) {
-        if (typeof supplied.mnemonic !== "string") {
-          throw new Error("BIP-39 mnemonic input is required");
-        }
-        if (Object.hasOwn(supplied, "passphrase")) {
-          throw new Error("BIP-39 passphrases are not supported");
+        const mnemonic = mnemonicInput.value.trim().toLowerCase().split(/\s+/).join(" ");
+        const count = mnemonic ? mnemonic.split(" ").length : 0;
+        if (count !== 12 && count !== 24) {
+          throw new Error("Enter your 12 or 24 word recovery phrase");
         }
         secret = te.encode(canonicalJson({
           credential_prf: encodeUrl(prf.prf),
-          mnemonic: supplied.mnemonic
+          mnemonic
         }));
       } else {
-        if (typeof supplied.raw_private_key !== "string") {
-          throw new Error("Raw private key input is required");
-        }
+        const rawKey = rawKeyInput.value.trim();
+        if (!rawKey) throw new Error("Enter the private key to import");
         secret = te.encode(canonicalJson({
           credential_prf: encodeUrl(prf.prf),
-          raw_private_key: supplied.raw_private_key
+          raw_private_key: rawKey
         }));
       }
     } else {
@@ -475,10 +686,16 @@ async function run(session) {
     ]);
     if (genericKinds.has(kind)) {
       let effect = {kind};
-      if (!scopedPetalKey && !genericFields.hidden) {
-        const supplied = JSON.parse(genericInput.value);
+      if (kind === "wallet_export") {
+        const format = document.querySelector('input[name="export-format"]:checked')?.value;
+        if (!format) throw new Error("Choose what to export");
+        effect = {format, kind};
+      } else if (!scopedPetalKey && !genericFields.hidden) {
+        let supplied;
+        try { supplied = JSON.parse(genericInput.value); }
+        catch (_) { throw new Error("Advanced input must be valid JSON"); }
         if (!supplied || Array.isArray(supplied) || typeof supplied !== "object") {
-          throw new Error("Custody input must be a JSON object");
+          throw new Error("Advanced input must be a JSON object");
         }
         effect = {...supplied, kind};
       }
@@ -518,7 +735,11 @@ async function run(session) {
     if (!recovered.ok) throw error;
     result = await recovered.json();
   }
-  statusNode.textContent = "Completed. You may close this tab.";
+  statusNode.textContent = "Completed.";
+  clearInterval(expiryTimer);
+  for (const fields of [recoveryFields, exportFields, importFields, genericFields]) fields.hidden = true;
+  cancel.hidden = true;
+  approve.hidden = true;
   if (result.encrypted_browser_result) {
     if (!outputRecipient) throw new Error("Browser output key is unavailable");
     const outputAad = canonicalJson({
@@ -535,10 +756,10 @@ async function run(session) {
       te.encode(outputAad),
       result.encrypted_browser_result
     );
-    reviewNode.textContent = new TextDecoder().decode(plaintext);
+    renderResult(session, plaintext);
     await mutate(`/api/session/${ceremonyId}/ack`, {});
   } else {
-    reviewNode.textContent = result.receipt_digest || result.approval_id || "";
+    renderDone(session, result);
   }
   await clearBrowserState(ceremonyId);
 }

@@ -435,7 +435,9 @@ fn legacy_passkey_browser_flow_uses_assertion_prf_and_hides_raw_key_input() {
     assert!(asset.contains("legacy_passkey_v1_prf"));
     assert!(asset.contains("const assertion = await getCredential(session, 0)"));
     assert!(asset.contains("credential_prf: encodeUrl(credentialPrf)"));
-    assert!(asset.contains("Boolean(scopedPetalKey) || legacyPasskeyImport"));
+    assert!(asset.contains(
+        "importFields.hidden = !(session.ceremony_kind === \"wallet_import\" && !legacyPasskeyImport)"
+    ));
     assert!(asset.contains("wallet_import\" && !legacyPasskeyImport"));
 }
 
