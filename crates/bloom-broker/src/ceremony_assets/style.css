@@ -31,3 +31,4 @@ details.signed{margin-top:18px}details.signed summary{cursor:pointer;color:var(-
 button{font:600 15px/1.2 var(--sans);letter-spacing:0}button.secondary{font-weight:500}
 .lede{font-size:18px}.panel-title{font-size:26px}
 #review{padding:26px 30px}
+.facts dd code{font-size:13px;line-height:1.5}
