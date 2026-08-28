@@ -392,11 +392,11 @@ fn reservation_fails_closed_without_canonical_active_approval() {
 }
 
 #[test]
-fn broker_clock_rejects_downtime_credited_across_a_boot_change() {
-    // The kernel's suspend-aware clock restarts at zero on boot, so a current
-    // anchor can exceed a persisted one while belonging to a different boot.
-    // Crediting that delta would advance effective time by downtime that never
-    // elapsed and let a large forward UTC step pass the guard.
+fn broker_clock_accepts_non_decreasing_wall_time_across_a_boot_change() {
+    // The kernel's suspend-aware clock restarts at zero on boot. Bloom cannot
+    // measure powered-off time from the new domain, so the durable floor
+    // rejects rollback and a nondecreasing host wall clock restores current
+    // time without a separate synchronization daemon.
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("clock-reboot.sqlite");
     let journal = open_journal(&path);
@@ -431,8 +431,8 @@ fn broker_clock_rejects_downtime_credited_across_a_boot_change() {
         )
         .unwrap();
 
-    assert_eq!(decision.condition, ClockCondition::ForwardJumpRejected);
-    assert_eq!(decision.effective_now_ms, 1_000);
+    assert_eq!(decision.condition, ClockCondition::Healthy);
+    assert_eq!(decision.effective_now_ms, 1_000 + 2 * 60 * 60 * 1_000);
 }
 
 #[test]
@@ -475,7 +475,7 @@ fn broker_clock_restart_credits_downtime_via_absolute_monotonic_anchor() {
 }
 
 #[test]
-fn broker_clock_restart_keeps_monotonic_domain_reset_fail_closed() {
+fn broker_clock_restart_accepts_wall_time_after_monotonic_domain_reset() {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("clock-reset.sqlite");
     let journal = open_journal(&path);
@@ -506,8 +506,8 @@ fn broker_clock_restart_keeps_monotonic_domain_reset_fail_closed() {
             false,
         )
         .unwrap();
-    assert_eq!(decision.effective_now_ms, 1_000);
-    assert_eq!(decision.condition, ClockCondition::ForwardJumpRejected);
+    assert_eq!(decision.effective_now_ms, 6_000);
+    assert_eq!(decision.condition, ClockCondition::Healthy);
 }
 
 #[test]
@@ -543,7 +543,52 @@ fn broker_clock_legacy_zero_anchor_does_not_grant_restart_credit() {
                 utc_ms: Some(6_000),
                 monotonic_elapsed_ms: 0,
                 monotonic_anchor_ns: 6_000_000_000,
-                boot_epoch: BootEpoch::from_bytes([2; 16]),
+                // Same boot: a legacy zero anchor must not bypass the
+                // forward-step guard during a process restart.
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
+            },
+            1_000,
+            false,
+        )
+        .unwrap();
+    assert_eq!(decision.effective_now_ms, 1_000);
+    assert_eq!(decision.condition, ClockCondition::ForwardJumpRejected);
+}
+
+#[test]
+fn broker_clock_unknown_legacy_boot_epoch_does_not_impersonate_a_reboot() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("clock-legacy-epoch.sqlite");
+    let journal = open_journal(&path);
+    journal
+        .observe_time(
+            TimeReading {
+                utc_ms: Some(1_000),
+                monotonic_elapsed_ms: 0,
+                monotonic_anchor_ns: 1_000_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
+            },
+            1_000,
+            false,
+        )
+        .unwrap();
+    drop(journal);
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE clock_state SET boot_epoch = ?1 WHERE singleton = 1",
+            [BootEpoch::from_bytes([0; 16]).as_str()],
+        )
+        .unwrap();
+
+    let restarted = open_journal(&path);
+    let decision = restarted
+        .observe_time(
+            TimeReading {
+                utc_ms: Some(6_000),
+                monotonic_elapsed_ms: 0,
+                monotonic_anchor_ns: 6_000_000_000,
+                boot_epoch: BootEpoch::from_bytes([1; 16]),
             },
             1_000,
             false,

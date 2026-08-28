@@ -76,6 +76,11 @@ struct BrokerConfig {
     provenance_catalog_path: PathBuf,
     policy_keys: Vec<PolicyKeyConfig>,
     build_digest: String,
+    /// Non-secret global ceremony admission limits. Kept as a raw document so
+    /// the secret-bearing configuration never enters the layered merge; see
+    /// [`bloom_broker::config`].
+    #[serde(default)]
+    ceremony_limits: Option<serde_json::Value>,
     network_containment: Option<NetworkContainmentConfig>,
     maximum_connections: usize,
     maximum_in_flight_mutations: usize,
@@ -192,6 +197,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let startup_status_path = std::env::var_os("BLOOM_BROKER_STARTUP_STATUS").map(PathBuf::from);
     let mut config = load_config(&config_path)?;
+    // Merge and validate admission limits before any durable state is opened,
+    // so a mistyped quota fails startup instead of silently widening
+    // admission. The four values are non-secret, so the effective policy is
+    // reported without the secret-bearing configuration around it.
+    let ceremony_limits = bloom_broker::config::ceremony_limits(config.ceremony_limits.as_ref())?;
+    eprintln!(
+        "Bloom Broker ceremony admission limits: {}",
+        ceremony_limits.effective_summary()
+    );
     let build_digest = Digest32::new(config.build_digest.clone())?;
     let containment = config
         .network_containment
@@ -391,6 +405,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Token::new(config.review_manifest_key_id.clone())?,
         review_manifest_signing_key,
         journal.clone(),
+        ceremony_limits,
     )?;
     let machine_journal = journal.clone();
     let mut service = BrokerRpcService::new(
@@ -1582,7 +1597,7 @@ mod startup_failure_tests {
 
     fn test_time_source() -> &'static str {
         #[cfg(target_os = "linux")]
-        return "linux-chrony-nts";
+        return "linux-system-clock";
         #[cfg(target_os = "macos")]
         return "macos-managed-timed";
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]

@@ -535,7 +535,7 @@ fn every_machine_broker_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "d280f948205106784e559624be55a3545acdd435dadd7c0d6403851ac73ab44c",
+        "2386da024a2fdfcf6b8bf57d4e4e52f938ef04b1e26d3ec9b43328e6eede8cb1",
     );
 }
 
