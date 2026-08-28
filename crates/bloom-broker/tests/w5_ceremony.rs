@@ -589,6 +589,9 @@ fn approval_request() -> CeremonyPrepareRequest {
 struct MockSigner {
     completions: AtomicUsize,
     cancellations: AtomicUsize,
+    custody_preparations: AtomicUsize,
+    custody_prepare_events: Option<std::sync::mpsc::Sender<usize>>,
+    first_custody_release: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     pending: parking_lot::Mutex<HashSet<OperationId>>,
     reject_completion: bool,
     cancellation_fails: AtomicBool,
@@ -966,6 +969,9 @@ impl MockSigner {
         Self {
             completions: AtomicUsize::new(0),
             cancellations: AtomicUsize::new(0),
+            custody_preparations: AtomicUsize::new(0),
+            custody_prepare_events: None,
+            first_custody_release: parking_lot::Mutex::new(None),
             pending: parking_lot::Mutex::new(HashSet::new()),
             reject_completion: false,
             cancellation_fails: AtomicBool::new(false),
@@ -980,6 +986,19 @@ impl MockSigner {
             cancellation_fails: AtomicBool::new(cancellation_fails),
             ..Self::new()
         }
+    }
+
+    fn blocking_first_custody() -> (
+        Self,
+        std::sync::mpsc::Receiver<usize>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut signer = Self::new();
+        signer.custody_prepare_events = Some(events_tx);
+        *signer.first_custody_release.lock() = Some(release_rx);
+        (signer, events_rx, release_tx)
     }
 
     /// End a transient cancellation outage so the next reconciliation attempt
@@ -1055,6 +1074,15 @@ impl CeremonySigner for MockSigner {
         request: CustodyPrepareRequest,
         now_ms: u64,
     ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
+        let preparation = self.custody_preparations.fetch_add(1, Ordering::SeqCst);
+        if let Some(events) = &self.custody_prepare_events {
+            events.send(preparation).unwrap();
+        }
+        if preparation == 0
+            && let Some(release) = self.first_custody_release.lock().take()
+        {
+            release.recv().unwrap();
+        }
         let effective_wallet_id = request.wallet_id.clone().or_else(|| {
             request
                 .legacy_passkey_migration
@@ -4158,6 +4186,53 @@ fn configured_ceremony_limits_replace_the_defaults_for_every_admission_class() {
     )
     .unwrap_err();
     assert_retry_contract(&error, 58_000, 2, 60_000);
+}
+
+#[test]
+fn concurrent_prepares_cannot_oversubscribe_the_configured_session_limit() {
+    let (signer, events, release_first) = MockSigner::blocking_first_custody();
+    let signer = Arc::new(signer);
+    let limits = CeremonyLimits::new(1, 60_000, 12, 4).unwrap();
+    let broker = CeremonyBroker::new_with_limits(signer.clone(), limits);
+
+    let first_broker = broker.clone();
+    let first = std::thread::spawn(move || {
+        try_prepare(
+            &first_broker,
+            operation("d0"),
+            Some(Token::new("wallet-concurrent-0").unwrap()),
+            1_000,
+        )
+    });
+    assert_eq!(
+        events
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap(),
+        0
+    );
+
+    let second_broker = broker.clone();
+    let second = std::thread::spawn(move || {
+        try_prepare(
+            &second_broker,
+            operation("d1"),
+            Some(Token::new("wallet-concurrent-1").unwrap()),
+            1_000,
+        )
+    });
+
+    // While the first prepare is blocked inside Signer, the second must remain
+    // behind Broker's admission decision rather than reaching Signer too.
+    let second_reached_signer = events
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .is_ok();
+    release_first.send(()).unwrap();
+
+    assert!(first.join().unwrap().is_ok());
+    let second_error = second.join().unwrap().unwrap_err();
+    assert_eq!(second_error.code, ProtocolErrorCode::QuotaExceeded);
+    assert!(!second_reached_signer);
+    assert_eq!(signer.custody_preparations.load(Ordering::SeqCst), 1);
 }
 
 #[test]

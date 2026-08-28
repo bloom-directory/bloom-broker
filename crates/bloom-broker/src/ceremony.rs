@@ -434,6 +434,9 @@ pub struct CeremonyBroker {
 struct BrokerInner {
     signer: Arc<dyn CeremonySigner>,
     limits: CeremonyLimits,
+    /// Serializes the admission decision through durable session insertion so
+    /// concurrent prepares cannot all reserve the same remaining capacity.
+    creation_admission: Mutex<()>,
     sessions: Mutex<HashMap<String, BrowserSession>>,
     operations: Mutex<HashMap<OperationId, String>>,
     cancellation_backoff: Mutex<HashMap<Token, (u32, u64)>>,
@@ -619,6 +622,7 @@ impl CeremonyBroker {
             inner: Arc::new(BrokerInner {
                 signer,
                 limits,
+                creation_admission: Mutex::new(()),
                 sessions: Mutex::new(HashMap::new()),
                 operations: Mutex::new(HashMap::new()),
                 cancellation_backoff: Mutex::new(HashMap::new()),
@@ -674,6 +678,7 @@ impl CeremonyBroker {
         request.review_manifest_digest = digest(&manifest)?;
         self.validate_review_manifest(&request, &manifest, now_ms)?;
         let request_digest = digest(&(request.clone(), manifest.clone()))?;
+        let _admission_guard = self.inner.creation_admission.lock();
         if let Some(response) =
             self.stable_approval_response(&request.activation_operation_id, &request_digest)
         {
@@ -736,6 +741,7 @@ impl CeremonyBroker {
             return Err(kind_mismatch());
         }
         let request_digest = digest(&request)?;
+        let _admission_guard = self.inner.creation_admission.lock();
         if let Some(response) =
             self.stable_custody_response(&request.custody_operation_id, &request_digest)
         {
@@ -856,6 +862,7 @@ impl CeremonyBroker {
             return Err(kind_mismatch());
         }
         let request_digest = digest(&(request.clone(), review_manifest.clone()))?;
+        let _admission_guard = self.inner.creation_admission.lock();
         if let Some(response) = self.stable_policy_update_response(
             &request.update.operation_id,
             &request_digest,
