@@ -463,19 +463,20 @@ fn bip39_browser_import_uses_profile_to_control_serialization() {
         assert!(scope.contains("const bip39Import = "));
         assert!(scope.contains("wallet_seed_profile === \"bip39-multicurve-v1\""));
     }
-    assert!(load.contains("genericInput.placeholder = bip39Import"));
+    assert!(load.contains("document.getElementById(\"mnemonic-label\").hidden = !bip39Import"));
+    assert!(load.contains("document.getElementById(\"raw-key-label\").hidden = bip39Import"));
 
     // The serialization branch follows the profile; it never infers the
     // profile from whichever property the operator supplied.
     assert!(run.contains("if (bip39Import)"));
-    assert!(run.contains("BIP-39 mnemonic input is required"));
-    assert!(run.contains("mnemonic: supplied.mnemonic"));
-    assert!(run.contains("BIP-39 passphrases are not supported"));
+    assert!(run.contains("const mnemonic = mnemonicInput.value"));
+    assert!(run.contains("Enter your 12 or 24 word recovery phrase"));
     assert!(!run.contains("passphrase: \"\""));
+    assert!(!run.contains("passphraseInput"));
     assert!(!run.contains("supplied.passphrase"));
     assert!(!load.contains("passphrase"));
-    assert!(run.contains("Raw private key input is required"));
-    assert!(run.contains("raw_private_key: supplied.raw_private_key"));
+    assert!(run.contains("Enter the private key to import"));
+    assert!(run.contains("raw_private_key: rawKey"));
     assert!(!run.contains("if (supplied.mnemonic)"));
     assert!(!run.contains("if (supplied.raw_private_key)"));
 }
@@ -578,6 +579,7 @@ fn petal_sign_request(
             payload: Base64UrlBytes::from_bytes(payload),
         },
         petal_use_claim: Some(claim),
+        system_use_claim: None,
         claim_assurance_evidence: None,
         provenance: ProvenanceSubject::Petal {
             package_hash,
@@ -616,6 +618,7 @@ fn exact_petal_sign_request(
             payload: Base64UrlBytes::from_bytes(payload),
         },
         petal_use_claim: None,
+        system_use_claim: None,
         claim_assurance_evidence: None,
         provenance: ProvenanceSubject::Petal {
             package_hash,
@@ -2222,6 +2225,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             operation_id: approval_operation.clone(),
             terms: approval_terms.clone(),
             canonical_plan_facts_digest: digest("d4"),
+            petal_use_claim: None,
+            system_use_claim: None,
         }),
     )
     .await
@@ -2351,6 +2356,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             operation_id: exact_approval_operation.clone(),
             terms: exact_terms.clone(),
             canonical_plan_facts_digest: digest("e7"),
+            petal_use_claim: None,
+            system_use_claim: None,
         }),
     )
     .await
@@ -2578,6 +2585,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                     operation_id: operation(&format!("{:02x}", 0xc0 + index)),
                     terms: denied_terms,
                     canonical_plan_facts_digest: digest("c9"),
+                    petal_use_claim: None,
+                    system_use_claim: None,
                 }),
             )
             .await
@@ -2926,6 +2935,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                 operation_id: operation("dc"),
                 terms: expired_terms,
                 canonical_plan_facts_digest: digest("dd"),
+                petal_use_claim: None,
+                system_use_claim: None,
             }),
         )
         .await
