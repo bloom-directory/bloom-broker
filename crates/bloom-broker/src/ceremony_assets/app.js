@@ -208,6 +208,29 @@ function describeKey(ref) {
   else if (ref.key_spec) account = `${ref.key_spec} key ${shortDigest(ref.public_key_fingerprint || ref.locator || "")}`;
   return {wallet, account};
 }
+// Policy updates: say what changes, in the order a person cares about.
+function describePolicy(manifest) {
+  const diff = manifest?.authority_diff;
+  if (!diff) return null;
+  const lines = [];
+  const dest = d => `${d.destination || d.address || canonicalJson(d)} (${chainLabel(d.chain)})`;
+  for (const d of diff.added_destinations || []) lines.push(["Allow sending to", dest(d), true]);
+  for (const d of diff.removed_destinations || []) lines.push(["Stop allowing sending to", dest(d), true]);
+  for (const p of diff.added_petal_packages || []) lines.push(["Allow app (petal)", shortDigest(p), true]);
+  for (const p of diff.removed_petal_packages || []) lines.push(["Remove app (petal)", shortDigest(p), true]);
+  for (const v of diff.added_required_verifiers || []) lines.push(["Require verifier", v.verifier_id || canonicalJson(v), true]);
+  for (const v of diff.removed_required_verifiers || []) lines.push(["Drop verifier", v.verifier_id || canonicalJson(v), true]);
+  const before = Number(diff.maximum_approval_lifetime_ms_before);
+  const after = Number(diff.maximum_approval_lifetime_ms_after);
+  if (Number.isFinite(before) && Number.isFinite(after) && before !== after) {
+    lines.push(["Max approval lifetime", `${fmtRemaining(before)} → ${fmtRemaining(after)}`]);
+  }
+  const n = lines.length;
+  const sentence = n === 0
+    ? "No rule changes are proposed."
+    : `Change <strong>${n} rule${n === 1 ? "" : "s"}</strong> for this wallet. Nothing moves; after approval Bloom applies the new rules to future transactions.`;
+  return {sentence, facts: lines};
+}
 function planDisclosures(manifest) {
   try {
     const plan = JSON.parse(manifest?.canonical_plan || "{}");
@@ -244,6 +267,9 @@ function renderReview(session) {
   let transfer = null;
   if (kind === "sealed_approval") {
     transfer = describeTransfer(session.review_manifest);
+    if (transfer) summaryHtml = transfer.sentence;
+  } else if (kind === "policy_update") {
+    transfer = describePolicy(session.review_manifest);
     if (transfer) summaryHtml = transfer.sentence;
   }
   fact("Wallet", walletName);
