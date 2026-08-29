@@ -1,4 +1,4 @@
-use bloom_audit_checkpoint::CheckpointSink;
+use bloom_audit_checkpoint::{CheckpointDecision, CheckpointDecisionOutcome, CheckpointSink};
 use bloom_broker_api::{
     ApprovalLifecycleState, ApprovalLimitState, Base64UrlBytes, BootEpoch, DecimalU64, DecimalU256,
     Digest32, OperationId, OperationState, ProtocolError, ProtocolErrorCode, SealedApprovalTerms,
@@ -15,10 +15,7 @@ use std::{
     collections::BTreeMap,
     path::Path,
     str::FromStr,
-    sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
 const AUDIT_DOMAIN: &[u8] = b"bloom-broker-audit/v1";
@@ -250,9 +247,34 @@ pub struct BrokerJournal {
     connection: Arc<Mutex<Connection>>,
     audit_signer: Arc<ActiveAuditSigner>,
     verified_audit_tail: Arc<Mutex<Option<VerifiedAuditTail>>>,
-    audit_degraded: Arc<AtomicBool>,
+    degradation: Arc<OnceLock<DegradationCause>>,
     fault_hook: Option<Arc<dyn FaultHook>>,
     self_checkpoint: Arc<Mutex<Option<SelfCheckpoint>>>,
+}
+
+/// The first safe, operator-visible reason security mutations were disabled.
+///
+/// This is deliberately small and in-memory. It contains only allowlisted
+/// operational identifiers and never retains an error string or domain value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DegradationCause {
+    pub code: &'static str,
+    pub attempted_sequence: Option<u64>,
+    pub attempted_head: Option<Digest32>,
+    pub retained_sequence: Option<u64>,
+    pub retained_head: Option<Digest32>,
+}
+
+impl DegradationCause {
+    fn journal(code: &'static str) -> Self {
+        Self {
+            code,
+            attempted_sequence: None,
+            attempted_head: None,
+            retained_sequence: None,
+            retained_head: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -398,12 +420,12 @@ impl BrokerJournal {
             connection: Arc::new(Mutex::new(connection)),
             audit_signer: Arc::new(ActiveAuditSigner::new(audit_signer)),
             verified_audit_tail: Arc::new(Mutex::new(None)),
-            audit_degraded: Arc::new(AtomicBool::new(false)),
+            degradation: Arc::new(OnceLock::new()),
             fault_hook: None,
             self_checkpoint: Arc::new(Mutex::new(None)),
         };
         if journal.verify_audit_chain().is_err() {
-            journal.audit_degraded.store(true, Ordering::SeqCst);
+            journal.latch_degradation(DegradationCause::journal("journal_verification_failed"));
         }
         Ok(journal)
     }
@@ -433,7 +455,11 @@ impl BrokerJournal {
     }
 
     pub fn audit_degraded(&self) -> bool {
-        self.audit_degraded.load(Ordering::SeqCst)
+        self.degradation.get().is_some()
+    }
+
+    pub fn degradation_cause(&self) -> Option<DegradationCause> {
+        self.degradation.get().cloned()
     }
 
     /// Return the startup-verified, incrementally maintained local audit head.
@@ -445,7 +471,9 @@ impl BrokerJournal {
         match self.cached_audit_head(&connection) {
             Ok(head) => Ok(head),
             Err(error) => {
-                self.audit_degraded.store(true, Ordering::SeqCst);
+                self.latch_degradation(DegradationCause::journal(
+                    "journal_head_verification_failed",
+                ));
                 Err(error)
             }
         }
@@ -454,7 +482,37 @@ impl BrokerJournal {
     /// Latch local security mutations after a required peer/OS checkpoint
     /// cannot be persisted. Read and status methods intentionally remain live.
     pub fn latch_audit_degradation(&self) {
-        self.audit_degraded.store(true, Ordering::SeqCst);
+        self.latch_degradation(DegradationCause::journal("required_checkpoint_unavailable"));
+    }
+
+    pub fn latch_checkpoint_degradation(
+        &self,
+        code: &'static str,
+        attempted_sequence: u64,
+        attempted_head: Digest32,
+        retained: Option<(u64, Digest32)>,
+    ) {
+        self.latch_degradation(DegradationCause {
+            code,
+            attempted_sequence: Some(attempted_sequence),
+            attempted_head: Some(attempted_head),
+            retained_sequence: retained.as_ref().map(|(sequence, _)| *sequence),
+            retained_head: retained.map(|(_, head)| head),
+        });
+    }
+
+    fn latch_degradation(&self, cause: DegradationCause) {
+        let first = self.degradation.set(cause.clone()).is_ok();
+        tracing::error!(
+            event = "broker.mutations_disabled",
+            cause_code = cause.code,
+            attempted_sequence = cause.attempted_sequence,
+            attempted_head = cause.attempted_head.as_ref().map(Digest32::as_str),
+            retained_sequence = cause.retained_sequence,
+            retained_head = cause.retained_head.as_ref().map(Digest32::as_str),
+            first_cause = first,
+            "Broker security mutations disabled"
+        );
     }
 
     /// Append an old-key-signed transition containing proof of possession of
@@ -791,7 +849,15 @@ impl BrokerJournal {
         transaction.commit()?;
         drop(connection);
         self.checkpoint_committed_head()?;
-        self.after_durable(DurablePoint::ApprovalTransition)
+        self.after_durable(DurablePoint::ApprovalTransition)?;
+        tracing::info!(
+            event = "approval.transition_committed",
+            approval_id = approval_id.as_str(),
+            from = approval_state_text(current)?.as_str(),
+            to = approval_state_text(next)?.as_str(),
+            "Broker approval transition committed"
+        );
+        Ok(())
     }
 
     pub fn approval_state(
@@ -896,6 +962,7 @@ impl BrokerJournal {
         let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         let existing = read_operation(&transaction, &request.operation_id)?;
+        let is_retry = existing.is_some();
         let snapshot = if let Some(existing) = existing {
             if existing.operation_digest != request.operation_digest {
                 return Err(protocol(
@@ -997,6 +1064,15 @@ impl BrokerJournal {
         drop(connection);
         self.checkpoint_committed_head()?;
         self.after_durable(DurablePoint::OperationReceived)?;
+        tracing::info!(
+            event = "operation.received_committed",
+            operation_id = request.operation_id.as_str(),
+            attempt_id = request.attempt_id.as_str(),
+            retry = is_retry,
+            is_batch,
+            state = operation_state_text(snapshot.state)?.as_str(),
+            "Broker operation admission committed"
+        );
         Ok(snapshot)
     }
 
@@ -1053,7 +1129,22 @@ impl BrokerJournal {
         transaction.commit()?;
         drop(connection);
         self.checkpoint_committed_head()?;
-        self.after_durable(DurablePoint::OperationTransition)
+        self.after_durable(DurablePoint::OperationTransition)?;
+        tracing::info!(
+            event = "operation.transition_committed",
+            operation_id = operation_id.as_str(),
+            from = operation_state_text(current.state)?.as_str(),
+            to = operation_state_text(next)?.as_str(),
+            terminal = matches!(
+                next,
+                OperationState::Denied
+                    | OperationState::Cancelled
+                    | OperationState::Failed
+                    | OperationState::Succeeded
+            ),
+            "Broker operation transition committed"
+        );
+        Ok(())
     }
 
     pub fn reserve(
@@ -1635,7 +1726,7 @@ impl BrokerJournal {
         let connection = self.lock()?;
         let result = verify_audit_chain_connection(&connection, self.audit_signer.as_ref());
         if result.is_err() {
-            self.audit_degraded.store(true, Ordering::SeqCst);
+            self.latch_degradation(DegradationCause::journal("journal_verification_failed"));
         } else {
             self.refresh_verified_audit_tail(&connection)?;
         }
@@ -1900,12 +1991,14 @@ impl BrokerJournal {
     }
 
     pub(crate) fn lock_for_mutation(&self) -> Result<MutexGuard<'_, Connection>, JournalError> {
-        if self.audit_degraded.load(Ordering::SeqCst) {
+        if self.audit_degraded() {
             return Err(audit_degraded());
         }
         let connection = self.lock()?;
         if let Err(error) = self.cached_audit_head(&connection) {
-            self.audit_degraded.store(true, Ordering::SeqCst);
+            self.latch_degradation(DegradationCause::journal(
+                "journal_head_verification_failed",
+            ));
             return Err(error);
         }
         Ok(connection)
@@ -1922,11 +2015,11 @@ impl BrokerJournal {
         &self,
         connection: &Connection,
     ) -> Result<(), JournalError> {
-        if self.audit_degraded.load(Ordering::SeqCst) {
+        if self.audit_degraded() {
             return Err(audit_degraded());
         }
         if let Err(error) = verify_audit_chain_connection(connection, self.audit_signer.as_ref()) {
-            self.audit_degraded.store(true, Ordering::SeqCst);
+            self.latch_degradation(DegradationCause::journal("journal_verification_failed"));
             return Err(error);
         }
         Ok(())
@@ -1980,33 +2073,43 @@ impl BrokerJournal {
             .map_err(|_| storage("Broker self-checkpoint mutex poisoned"))?
             .clone();
         if let Some(installed) = installed {
-            let signed_head = sign_journal_head(&installed.identity, sequence, head_hash);
-            if let Err(error) = installed.checkpoints.append_peer_head(&signed_head) {
-                self.audit_degraded.store(true, Ordering::SeqCst);
-                let retained = installed
-                    .checkpoints
-                    .latest_peer_head(&signed_head.service_id)
-                    .ok()
-                    .flatten()
-                    .map(|head| {
-                        format!(
-                            "{}:{}:{}:{}",
-                            head.service_id,
-                            head.key_id,
-                            head.sequence.get(),
-                            head.head_hash
-                        )
-                    })
-                    .unwrap_or_else(|| "none".into());
-                return Err(storage(format!(
-                    "persist Broker self-checkpoint before publishing mutation success: {error}; attempted={}:{}:{}:{} retained={retained}",
-                    signed_head.service_id,
-                    signed_head.key_id,
-                    signed_head.sequence.get(),
-                    signed_head.head_hash
-                )));
+            let signed_head = sign_journal_head(&installed.identity, sequence, head_hash.clone());
+            match installed
+                .checkpoints
+                .append_peer_head_diagnosed(&signed_head)
+            {
+                Ok(decision) => log_self_checkpoint_decision(&decision, false),
+                Err(failure) => {
+                    let decision = &failure.decision;
+                    self.latch_degradation(DegradationCause {
+                        code: "self_checkpoint_rejected",
+                        attempted_sequence: Some(decision.attempted.sequence),
+                        attempted_head: Some(
+                            Digest32::new(decision.attempted.head_digest.clone())
+                                .map_err(storage)?,
+                        ),
+                        retained_sequence: decision.retained.as_ref().map(|head| head.sequence),
+                        retained_head: decision
+                            .retained
+                            .as_ref()
+                            .map(|head| Digest32::new(head.head_digest.clone()))
+                            .transpose()
+                            .map_err(storage)?,
+                    });
+                    log_self_checkpoint_decision(decision, true);
+                    return Err(storage(format!(
+                        "persist Broker self-checkpoint before publishing mutation success: {}",
+                        failure.source
+                    )));
+                }
             }
         }
+        tracing::info!(
+            event = "broker.mutation_committed",
+            journal_sequence = sequence,
+            journal_head = head_hash.as_str(),
+            "Broker durable mutation committed and checkpointed"
+        );
         Ok(())
     }
 
@@ -2206,45 +2309,75 @@ fn verify_audit_chain_connection(
                 signing_key_id, signature
          FROM audit_chain ORDER BY sequence",
     )?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-        ))
-    })?;
+    let mut rows = statement.query([])?;
     let mut expected_sequence = 0_u64;
     let mut expected_previous = Digest32::new("00".repeat(32))?;
     let mut expected_key_id: Option<Token> = None;
     let mut pending_rotation: Option<(Token, Token, Digest32)> = None;
-    for row in rows {
-        let (sequence, event_type, payload_jcs, previous_hash, entry_hash, key_id, signature) =
-            row?;
-        let sequence = u64::try_from(sequence).map_err(storage)?;
-        let previous_hash = Digest32::new(previous_hash)?;
-        let entry_hash = Digest32::new(entry_hash)?;
-        let key_id = Token::new(key_id)?;
-        let signature = Base64UrlBytes::parse(signature)?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|_| audit_verification_failure(expected_sequence, "row_extraction"))?
+    {
+        let stored_sequence = row
+            .get::<_, i64>(0)
+            .map_err(|_| audit_verification_failure(expected_sequence, "row_extraction"))?;
+        let sequence = u64::try_from(stored_sequence)
+            .map_err(|_| audit_verification_failure(expected_sequence, "sequence"))?;
+        let event_type = row
+            .get::<_, String>(1)
+            .map_err(|_| audit_verification_failure(sequence, "row_extraction"))?;
+        let payload_jcs = row
+            .get::<_, String>(2)
+            .map_err(|_| audit_verification_failure(sequence, "row_extraction"))?;
+        let previous_hash = row
+            .get::<_, String>(3)
+            .map_err(|_| audit_verification_failure(sequence, "row_extraction"))?;
+        let entry_hash = row
+            .get::<_, String>(4)
+            .map_err(|_| audit_verification_failure(sequence, "row_extraction"))?;
+        let key_id = row
+            .get::<_, String>(5)
+            .map_err(|_| audit_verification_failure(sequence, "row_extraction"))?;
+        let signature = row
+            .get::<_, String>(6)
+            .map_err(|_| audit_verification_failure(sequence, "row_extraction"))?;
+        let previous_hash = Digest32::new(previous_hash)
+            .map_err(|_| audit_verification_failure(sequence, "predecessor_link"))?;
+        let entry_hash = Digest32::new(entry_hash)
+            .map_err(|_| audit_verification_failure(sequence, "content_hash"))?;
+        let key_id =
+            Token::new(key_id).map_err(|_| audit_verification_failure(sequence, "signing_key"))?;
+        let signature = Base64UrlBytes::parse(signature)
+            .map_err(|_| audit_verification_failure(sequence, "signature"))?;
         if expected_key_id.is_none() {
             expected_key_id = Some(key_id.clone());
         }
-        if sequence != expected_sequence
-            || previous_hash != expected_previous
-            || compute_audit_hash(sequence, &event_type, &payload_jcs, &previous_hash) != entry_hash
-            || expected_key_id.as_ref() != Some(&key_id)
-            || audit_signer
-                .verify(&key_id, &audit_signature_message(&entry_hash), &signature)
-                .is_err()
-        {
-            return Err(audit_degraded());
+        if sequence != expected_sequence {
+            return Err(audit_verification_failure(sequence, "sequence"));
         }
-        verify_audit_correlation(connection, &event_type, &payload_jcs)?;
+        if previous_hash != expected_previous {
+            return Err(audit_verification_failure(sequence, "predecessor_link"));
+        }
+        if compute_audit_hash(sequence, &event_type, &payload_jcs, &previous_hash) != entry_hash {
+            return Err(audit_verification_failure(sequence, "content_hash"));
+        }
+        if expected_key_id.as_ref() != Some(&key_id) {
+            return Err(audit_verification_failure(sequence, "signing_key"));
+        }
+        if audit_signer
+            .verify(&key_id, &audit_signature_message(&entry_hash), &signature)
+            .is_err()
+        {
+            return Err(audit_verification_failure(sequence, "signature"));
+        }
+        if verify_audit_correlation(connection, &event_type, &payload_jcs).is_err() {
+            return Err(audit_verification_failure(
+                sequence,
+                "durable_state_correlation",
+            ));
+        }
         if pending_rotation.is_some() && event_type != "audit.key_rotation_completed" {
-            return Err(audit_degraded());
+            return Err(audit_verification_failure(sequence, "key_rotation"));
         }
         if event_type == "audit.key_rotated" {
             #[derive(Deserialize)]
@@ -2254,7 +2387,8 @@ fn verify_audit_chain_connection(
                 prior_head: Digest32,
                 new_key_confirmation: Base64UrlBytes,
             }
-            let rotation: Rotation = serde_json::from_str(&payload_jcs).map_err(storage)?;
+            let rotation: Rotation = serde_json::from_str(&payload_jcs)
+                .map_err(|_| audit_verification_failure(sequence, "key_rotation"))?;
             if rotation.old_key_id != key_id
                 || rotation.prior_head != previous_hash
                 || rotation.new_key_id == rotation.old_key_id
@@ -2270,7 +2404,7 @@ fn verify_audit_chain_connection(
                     )
                     .is_err()
             {
-                return Err(audit_degraded());
+                return Err(audit_verification_failure(sequence, "key_rotation"));
             }
             pending_rotation = Some((
                 rotation.old_key_id.clone(),
@@ -2285,10 +2419,10 @@ fn verify_audit_chain_connection(
                 new_key_id: Token,
                 final_old_head: Digest32,
             }
-            let completion: Completion =
-                serde_json::from_str(&payload_jcs).map_err(|_| audit_degraded())?;
+            let completion: Completion = serde_json::from_str(&payload_jcs)
+                .map_err(|_| audit_verification_failure(sequence, "key_rotation"))?;
             let Some((old_key_id, new_key_id, final_old_head)) = pending_rotation.take() else {
-                return Err(audit_degraded());
+                return Err(audit_verification_failure(sequence, "key_rotation"));
             };
             if completion.old_key_id != old_key_id
                 || completion.new_key_id != new_key_id
@@ -2297,7 +2431,7 @@ fn verify_audit_chain_connection(
                 || completion.final_old_head != final_old_head
                 || completion.final_old_head != previous_hash
             {
-                return Err(audit_degraded());
+                return Err(audit_verification_failure(sequence, "key_rotation"));
             }
         }
         expected_sequence = expected_sequence
@@ -2310,7 +2444,10 @@ fn verify_audit_chain_connection(
             .as_ref()
             .is_some_and(|expected| expected != &audit_signer.key_id())
     {
-        return Err(audit_degraded());
+        return Err(audit_verification_failure(
+            expected_sequence,
+            "key_rotation",
+        ));
     }
     Ok(())
 }
@@ -2470,6 +2607,52 @@ fn audit_degraded() -> JournalError {
         "Broker audit chain verification failed; security mutations are disabled",
     )
     .into()
+}
+
+fn audit_verification_failure(sequence: u64, invariant: &'static str) -> JournalError {
+    tracing::error!(
+        event = "journal.verification_failed",
+        service = "broker",
+        sequence,
+        invariant,
+        mutations_disabled = true,
+        "Broker audit journal verification failed"
+    );
+    audit_degraded()
+}
+
+fn log_self_checkpoint_decision(decision: &CheckpointDecision, mutations_disabled: bool) {
+    tracing::info!(
+        event = "checkpoint.decision",
+        edge = "broker_self",
+        recipient_service = decision.recipient_service_id.as_ref().map(Token::as_str),
+        peer_service = decision.attempted.service_id.as_str(),
+        peer_key_id = decision.attempted.key_id.as_str(),
+        attempted_sequence = decision.attempted.sequence,
+        attempted_head = decision.attempted.head_digest.as_str(),
+        retained_sequence = decision.retained.as_ref().map(|head| head.sequence),
+        retained_head = decision
+            .retained
+            .as_ref()
+            .map(|head| head.head_digest.as_str()),
+        outcome = checkpoint_outcome(decision.outcome),
+        mutations_disabled,
+        "Broker self-checkpoint decision"
+    );
+}
+
+fn checkpoint_outcome(outcome: CheckpointDecisionOutcome) -> &'static str {
+    match outcome {
+        CheckpointDecisionOutcome::Appended => "appended",
+        CheckpointDecisionOutcome::AlreadyPresent => "already_present",
+        CheckpointDecisionOutcome::SequenceRollback => "sequence_rollback",
+        CheckpointDecisionOutcome::SequenceConflict => "sequence_conflict",
+        CheckpointDecisionOutcome::InvalidSignature => "invalid_signature",
+        CheckpointDecisionOutcome::UnpinnedPeer => "unpinned_peer",
+        CheckpointDecisionOutcome::StorageOrConfigurationFailure => {
+            "storage_or_configuration_failure"
+        }
+    }
 }
 
 fn audit_signature_message(entry_hash: &Digest32) -> Vec<u8> {

@@ -16,6 +16,7 @@ bloom-platform-containment.workspace = true
 bloom-triad-local-transport.workspace = true
 bloom-audit-checkpoint.workspace = true
 bloom-service-activation.workspace = true
+bloom-service-observability.workspace = true
 bloom-trusted-time.workspace = true
 config.workspace = true
 ed25519-dalek.workspace = true
@@ -30,14 +31,16 @@ serde_json.workspace = true
 sha2.workspace = true
 sha3.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 bloom-broker-debug-driver = { path = "../bloom-broker-debug-driver" }
-bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "3915f8d6348f7690351a9ee4075e79c359687ffa" }
+bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "e4716eb87800a48159b2e32fe21278aa777fa508" }
 futures = "0.3"
 http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "json"] }

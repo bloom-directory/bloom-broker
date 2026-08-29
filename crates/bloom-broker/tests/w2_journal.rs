@@ -1,4 +1,7 @@
-use bloom_audit_checkpoint::{AppendOutcome, CheckpointError, CheckpointSink};
+use bloom_audit_checkpoint::{
+    AppendOutcome, CheckpointAppendError, CheckpointDecision, CheckpointDecisionOutcome,
+    CheckpointError, CheckpointHeadMetadata, CheckpointSink,
+};
 use bloom_broker::journal::{
     AuditSigner, BrokerJournal, BudgetLimits, ClockCondition, DurablePoint, FaultHook,
     JournalError, ReservationRequest, ReservationState, SlidingBudgetLimit, SlidingValueLimit,
@@ -26,6 +29,7 @@ use std::{
     time::Duration,
 };
 use tempfile::TempDir;
+use tracing_subscriber::prelude::*;
 
 struct TestAuditSigner(SigningKey);
 
@@ -53,6 +57,44 @@ impl CheckpointSink for FailingSelfCheckpoint {
             std::io::ErrorKind::PermissionDenied,
             "forced self-checkpoint failure",
         )))
+    }
+}
+
+struct DiagnosedConflictCheckpoint;
+
+impl CheckpointSink for DiagnosedConflictCheckpoint {
+    fn append_peer_head(
+        &self,
+        _peer_head: &SignedJournalHead,
+    ) -> Result<AppendOutcome, CheckpointError> {
+        panic!("post-commit self-checkpoint must use the diagnosed append")
+    }
+
+    fn append_peer_head_diagnosed(
+        &self,
+        peer_head: &SignedJournalHead,
+    ) -> Result<CheckpointDecision, CheckpointAppendError> {
+        Err(CheckpointAppendError {
+            source: CheckpointError::SequenceConflict,
+            decision: CheckpointDecision {
+                recipient_service_id: Some(Token::new("checkpoint-store").unwrap()),
+                attempted: CheckpointHeadMetadata::from(peer_head),
+                retained: Some(CheckpointHeadMetadata {
+                    service_id: peer_head.service_id.clone(),
+                    key_id: peer_head.key_id.clone(),
+                    sequence: 0,
+                    head_digest: "11".repeat(32),
+                }),
+                outcome: CheckpointDecisionOutcome::SequenceConflict,
+            },
+        })
+    }
+
+    fn latest_peer_head(
+        &self,
+        _service_id: &Token,
+    ) -> Result<Option<SignedJournalHead>, CheckpointError> {
+        panic!("diagnosed append already captured the retained head")
     }
 }
 
@@ -1393,6 +1435,14 @@ fn ac18_postcommit_self_checkpoint_failure_suppresses_success_but_is_reconcilabl
             .is_err()
     );
     assert!(journal.audit_degraded());
+    let first_cause = journal.degradation_cause().unwrap();
+    assert_eq!(first_cause.code, "self_checkpoint_rejected");
+    assert_eq!(first_cause.attempted_sequence, Some(1));
+    assert!(first_cause.attempted_head.is_some());
+    assert_eq!(first_cause.retained_sequence, None);
+    assert_eq!(first_cause.retained_head, None);
+    journal.latch_audit_degradation();
+    assert_eq!(journal.degradation_cause().unwrap(), first_cause);
     assert_eq!(
         journal.approval_state(&approval_id).unwrap(),
         Some(ApprovalLifecycleState::Prepared)
@@ -1423,6 +1473,106 @@ fn ac18_postcommit_self_checkpoint_failure_suppresses_success_but_is_reconcilabl
     let heads = checkpoint.0.lock().unwrap();
     assert_eq!(heads.len(), 1);
     assert_eq!(heads[0].sequence.get(), 2);
+}
+
+#[test]
+fn postcommit_self_checkpoint_uses_atomic_diagnostics_without_a_second_lookup() {
+    let journal = memory_journal();
+    journal
+        .install_self_checkpoint(broker_identity(), Arc::new(DiagnosedConflictCheckpoint))
+        .unwrap();
+
+    assert!(
+        journal
+            .create_approval(&digest("85"), ApprovalLifecycleState::Prepared)
+            .is_err()
+    );
+    let cause = journal.degradation_cause().unwrap();
+    assert_eq!(cause.code, "self_checkpoint_rejected");
+    assert_eq!(cause.attempted_sequence, Some(1));
+    assert_eq!(cause.retained_sequence, Some(0));
+    assert_eq!(cause.retained_head, Some(digest("11")));
+}
+
+#[test]
+fn degradation_event_is_semantic_and_does_not_log_checkpoint_error_text() {
+    const MARKER_SECRET: &str = "MARKER-SECRET-MUST-NOT-APPEAR";
+
+    struct MarkerFailure;
+
+    impl CheckpointSink for MarkerFailure {
+        fn append_peer_head(
+            &self,
+            _peer_head: &SignedJournalHead,
+        ) -> Result<AppendOutcome, CheckpointError> {
+            Err(CheckpointError::Malformed(MARKER_SECRET.into()))
+        }
+    }
+
+    let capture = bloom_service_observability::CapturedWriter::default();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(capture.clone()),
+    );
+    // One process-wide capture dispatcher avoids callsite-interest races with
+    // parallel tests that exercise the same event before this test runs. The
+    // shared writer keeps their lines atomic; assertions select this event.
+    tracing::subscriber::set_global_default(subscriber).expect("install test capture dispatcher");
+    let journal = memory_journal();
+    journal
+        .install_self_checkpoint(broker_identity(), Arc::new(MarkerFailure))
+        .unwrap();
+    assert!(
+        journal
+            .create_approval(&digest("84"), ApprovalLifecycleState::Prepared)
+            .is_err()
+    );
+
+    let output = capture.text();
+    assert!(!output.contains(MARKER_SECRET));
+    let event = output
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| {
+            event["fields"]["event"] == "broker.mutations_disabled"
+                && event["fields"]["cause_code"] == "self_checkpoint_rejected"
+                && event["fields"]["attempted_sequence"] == 1
+        })
+        .expect("mutations-disabled event");
+    assert_eq!(event["fields"]["cause_code"], "self_checkpoint_rejected");
+    assert_eq!(event["fields"]["attempted_sequence"], 1);
+    assert_eq!(event["fields"]["first_cause"], true);
+
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("malformed-audit-row.sqlite");
+    let stored = open_journal(&path);
+    stored
+        .create_approval(&digest("86"), ApprovalLifecycleState::Prepared)
+        .unwrap();
+    drop(stored);
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE audit_chain SET signature = ?1 WHERE sequence = 0",
+            [MARKER_SECRET],
+        )
+        .unwrap();
+    let reopened = open_journal(&path);
+    assert!(reopened.audit_degraded());
+
+    let output = capture.text();
+    assert!(!output.contains(MARKER_SECRET));
+    let verification = output
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| {
+            event["fields"]["event"] == "journal.verification_failed"
+                && event["fields"]["sequence"] == 0
+                && event["fields"]["invariant"] == "signature"
+        })
+        .expect("safe malformed-row verification event");
+    assert_eq!(verification["fields"]["mutations_disabled"], true);
 }
 
 #[test]
