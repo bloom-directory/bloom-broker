@@ -269,6 +269,8 @@ async function load() {
   ceremonyId = session.ceremony_id;
   const legacyPasskeyImport = session.ceremony_kind === "wallet_import" &&
     session.signer_contribution?.expected_input_class === "legacy_passkey_v1_prf";
+  const bip39Import = session.ceremony_kind === "wallet_import" &&
+    session.signer_contribution?.wallet_seed_profile === "bip39-multicurve-v1";
   if (!/^[0-9a-f]{64}$/.test(ceremonyId)) {
     throw new Error("Ceremony returned an invalid identity");
   }

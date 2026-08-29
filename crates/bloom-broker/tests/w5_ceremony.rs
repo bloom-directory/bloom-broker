@@ -442,22 +442,36 @@ fn legacy_passkey_browser_flow_uses_assertion_prf_and_hides_raw_key_input() {
 #[test]
 fn bip39_browser_import_uses_profile_to_control_serialization() {
     let asset = include_str!("../src/ceremony_assets/app.js");
-    // The profile should control import format decision, not user input detection
-    assert!(asset.contains("wallet_seed_profile === \"bip39-multicurve-v1\""));
-    assert!(asset.contains("const bip39Import = "));
-    // BIP-39 path should require mnemonic, not accept raw_private_key
-    assert!(asset.contains("if (bip39Import)"));
-    assert!(asset.contains("BIP-39 mnemonic input is required"));
-    // Placeholder should differ based on profile
-    assert!(asset.contains("bip39Import\n      ?"));
-    assert!(asset.contains("\"mnemonic\""));
-    assert!(asset.contains("\"raw_private_key\""));
-    // Both paths should work but NOT interchangeably
-    assert!(asset.contains("} else {"));
-    assert!(asset.contains("Raw private key input is required"));
-    // Serialization should encode mnemonic differently from raw key
-    assert!(asset.contains("mnemonic: supplied.mnemonic"));
-    assert!(asset.contains("raw_private_key: supplied.raw_private_key"));
+    let load = asset
+        .split_once("async function load() {")
+        .expect("browser asset must define load")
+        .1
+        .split_once("\nfunction fromHex")
+        .expect("load must end before the crypto helpers")
+        .0;
+    let run = asset
+        .split_once("async function run(session) {")
+        .expect("browser asset must define run")
+        .1;
+
+    // Both browser phases must make their decision from the signed Signer
+    // contribution. Keeping these assertions scoped catches a declaration in
+    // run() that leaves load() with an undefined variable.
+    for scope in [load, run] {
+        assert!(scope.contains("const bip39Import = "));
+        assert!(scope.contains("wallet_seed_profile === \"bip39-multicurve-v1\""));
+    }
+    assert!(load.contains("genericInput.placeholder = bip39Import"));
+
+    // The serialization branch follows the profile; it never infers the
+    // profile from whichever property the operator supplied.
+    assert!(run.contains("if (bip39Import)"));
+    assert!(run.contains("BIP-39 mnemonic input is required"));
+    assert!(run.contains("mnemonic: supplied.mnemonic"));
+    assert!(run.contains("Raw private key input is required"));
+    assert!(run.contains("raw_private_key: supplied.raw_private_key"));
+    assert!(!run.contains("if (supplied.mnemonic)"));
+    assert!(!run.contains("if (supplied.raw_private_key)"));
 }
 
 fn digest(byte: &str) -> Digest32 {
@@ -666,6 +680,31 @@ struct MockSigner {
 
 struct RealSigner {
     service: Arc<SignerCeremonyService>,
+}
+
+fn real_ceremony_signer() -> Arc<RealSigner> {
+    let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
+    let engine = Arc::new(
+        SignerEngine::open_in_memory(
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
+            SigningKey::from_bytes(&[6; 32]).verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            signer_audit_keys(),
+            registry,
+        )
+        .unwrap(),
+    );
+    let service = Arc::new(
+        SignerCeremonyService::new(
+            engine,
+            Token::new("signer-ceremony-key").unwrap(),
+            SigningKey::from_bytes(&[9; 32]),
+        )
+        .unwrap(),
+    );
+    Arc::new(RealSigner { service })
 }
 
 struct FailOnceAdoptionObserver {
@@ -1209,6 +1248,7 @@ impl CeremonySigner for MockSigner {
             hpke_recipient_key: Base64UrlBytes::from_bytes(&[7; 32]),
             browser_output_recipient_key: request.browser_output_recipient_key,
             petal_key_scope: request.petal_key_scope,
+            wallet_seed_profile: request.wallet_seed_profile,
             expires_at_ms: DecimalU64::new(now_ms + 10_000),
             signer_key_id: Token::new("mock-signer").unwrap(),
             signer_signature: Base64UrlBytes::from_bytes(&[]),
@@ -4579,29 +4619,70 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
 }
 
 #[tokio::test]
+async fn bip39_import_session_projects_the_authoritative_signer_profile() {
+    let broker = CeremonyBroker::new(real_ceremony_signer());
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let response = broker
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::WalletImport,
+                custody_operation_id: operation("40"),
+                wallet_id: Some(Token::new("imported-wallet").unwrap()),
+                key_ref: None,
+                exact_terms_digest: digest("50"),
+                expected_input_class: Token::new("passkey-prf").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1),
+                derivation_request: None,
+            },
+            now_ms,
+        )
+        .unwrap();
+    let session_response = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session_response.status(), StatusCode::OK);
+    let session: serde_json::Value = serde_json::from_slice(
+        &session_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        session["signer_contribution"]["wallet_seed_profile"],
+        "bip39-multicurve-v1"
+    );
+    let contribution: CustodySignerContribution =
+        serde_json::from_value(session["signer_contribution"].clone()).unwrap();
+    assert_eq!(
+        contribution.wallet_seed_profile,
+        Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1)
+    );
+}
+
+#[tokio::test]
 async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() {
-    let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
-    let engine = Arc::new(
-        SignerEngine::open_in_memory(
-            Token::new("broker-app-1").unwrap(),
-            SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            SigningKey::from_bytes(&[6; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            signer_audit_keys(),
-            registry,
-        )
-        .unwrap(),
-    );
-    let service = Arc::new(
-        SignerCeremonyService::new(
-            engine,
-            Token::new("signer-ceremony-key").unwrap(),
-            SigningKey::from_bytes(&[9; 32]),
-        )
-        .unwrap(),
-    );
-    let broker = CeremonyBroker::new(Arc::new(RealSigner { service }));
+    let broker = CeremonyBroker::new(real_ceremony_signer());
     let now_ms: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
