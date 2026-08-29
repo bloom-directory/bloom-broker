@@ -444,6 +444,8 @@ fn legacy_passkey_browser_flow_uses_assertion_prf_and_hides_raw_key_input() {
 #[test]
 fn bip39_browser_import_uses_profile_to_control_serialization() {
     let asset = include_str!("../src/ceremony_assets/app.js");
+    let html = include_str!("../src/ceremony_assets/index.html");
+    let css = include_str!("../src/ceremony_assets/style.css");
     let load = asset
         .split_once("async function load() {")
         .expect("browser asset must define load")
@@ -479,6 +481,14 @@ fn bip39_browser_import_uses_profile_to_control_serialization() {
     assert!(run.contains("raw_private_key: rawKey"));
     assert!(!run.contains("if (supplied.mnemonic)"));
     assert!(!run.contains("if (supplied.raw_private_key)"));
+
+    // v1 deliberately fixes the BIP-39 passphrase to empty. The ceremony
+    // must not ask the operator for an unsupported second secret, and fields
+    // for the other import profile must stay hidden despite label styling.
+    assert!(!html.contains("passphrase-input"));
+    assert!(!html.contains("passphrase-label"));
+    assert!(html.contains("[hidden]{display:none!important}"));
+    assert!(css.contains("[hidden]{display:none!important}"));
 }
 
 fn digest(byte: &str) -> Digest32 {
