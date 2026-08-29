@@ -439,6 +439,27 @@ fn legacy_passkey_browser_flow_uses_assertion_prf_and_hides_raw_key_input() {
     assert!(asset.contains("wallet_import\" && !legacyPasskeyImport"));
 }
 
+#[test]
+fn bip39_browser_import_uses_profile_to_control_serialization() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    // The profile should control import format decision, not user input detection
+    assert!(asset.contains("wallet_seed_profile === \"bip39-multicurve-v1\""));
+    assert!(asset.contains("const bip39Import = "));
+    // BIP-39 path should require mnemonic, not accept raw_private_key
+    assert!(asset.contains("if (bip39Import)"));
+    assert!(asset.contains("BIP-39 mnemonic input is required"));
+    // Placeholder should differ based on profile
+    assert!(asset.contains("bip39Import\n      ?"));
+    assert!(asset.contains("\"mnemonic\""));
+    assert!(asset.contains("\"raw_private_key\""));
+    // Both paths should work but NOT interchangeably
+    assert!(asset.contains("} else {"));
+    assert!(asset.contains("Raw private key input is required"));
+    // Serialization should encode mnemonic differently from raw key
+    assert!(asset.contains("mnemonic: supplied.mnemonic"));
+    assert!(asset.contains("raw_private_key: supplied.raw_private_key"));
+}
+
 fn digest(byte: &str) -> Digest32 {
     Digest32::new(byte.repeat(32)).unwrap()
 }
