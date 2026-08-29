@@ -1853,6 +1853,15 @@ impl CeremonyBroker {
         if let Some(journal) = &self.inner.journal {
             journal.checkpoint_committed_head().map_err(storage)?;
         }
+        tracing::info!(
+            event = "ceremony.state_persisted",
+            ceremony_id = session.projection.ceremony_id.as_str(),
+            operation_id = session.operation_id.as_str(),
+            ceremony_kind = ceremony_kind_name(session.ceremony_kind),
+            state = ceremony_state_name(session.state),
+            terminal = is_terminal(session.state),
+            "Broker ceremony state persisted"
+        );
         Ok(())
     }
 
@@ -2541,6 +2550,41 @@ fn is_terminal(state: CeremonyState) -> bool {
     )
 }
 
+fn ceremony_kind_name(kind: CeremonyKind) -> &'static str {
+    match kind {
+        CeremonyKind::SealedApproval => "sealed_approval",
+        CeremonyKind::WalletRegistration => "wallet_registration",
+        CeremonyKind::WalletImport => "wallet_import",
+        CeremonyKind::WalletExport => "wallet_export",
+        CeremonyKind::WalletDelete => "wallet_delete",
+        CeremonyKind::WalletRecovery => "wallet_recovery",
+        CeremonyKind::CredentialAdd => "credential_add",
+        CeremonyKind::CredentialReplace => "credential_replace",
+        CeremonyKind::CredentialRemove => "credential_remove",
+        CeremonyKind::BackendEnrollment => "backend_enrollment",
+        CeremonyKind::KeyDerive => "key_derive",
+        CeremonyKind::PolicyUpdate => "policy_update",
+    }
+}
+
+fn ceremony_state_name(state: CeremonyState) -> &'static str {
+    match state {
+        CeremonyState::Prepared => "prepared",
+        CeremonyState::AwaitingUser => "awaiting_user",
+        CeremonyState::Verifying => "verifying",
+        CeremonyState::WalletCommitted => "wallet_committed",
+        CeremonyState::AwaitingRecoveryAck => "awaiting_recovery_ack",
+        CeremonyState::Completed => "completed",
+        CeremonyState::ApprovingRootChange => "approving_root_change",
+        CeremonyState::CreatingCredential => "creating_credential",
+        CeremonyState::Committing => "committing",
+        CeremonyState::Succeeded => "succeeded",
+        CeremonyState::Cancelled => "cancelled",
+        CeremonyState::Expired => "expired",
+        CeremonyState::Failed => "failed",
+    }
+}
+
 fn validate_completion_identity(
     ceremony_kind: CeremonyKind,
     operation_id: &OperationId,
@@ -2852,8 +2896,12 @@ fn rolling_quota_exhausted(
     window_ms: u64,
     now_ms: u64,
 ) -> ProtocolError {
-    eprintln!(
-        "Broker ceremony rolling creation quota exhausted: quota={quota} limit={limit} window_ms={window_ms}"
+    tracing::warn!(
+        event = "ceremony.quota_rejected",
+        quota,
+        limit,
+        window_ms,
+        "Broker ceremony rolling creation quota exhausted"
     );
     created_at_ms.sort_unstable();
     let blocking = created_at_ms
