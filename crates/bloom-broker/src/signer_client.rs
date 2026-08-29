@@ -4,11 +4,11 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, mpsc},
     thread,
 };
 
-use bloom_audit_checkpoint::{CheckpointDecision, CheckpointDecisionOutcome, CheckpointSink};
+use bloom_audit_checkpoint::CheckpointSink;
 use bloom_signer_api::{
     Base64UrlBytes, BrokerSignerRequest, BrokerSignerResponse, CeremonyCompleteRequest,
     CeremonyKind, CustodyBindOutputRecipientRequest, CustodyCompleteRequest, CustodyPrepareRequest,
@@ -33,21 +33,7 @@ type Job = (
 /// handlers must not construct or nest a Tokio runtime on an Axum worker.
 #[derive(Clone)]
 pub struct BrokerSignerClient {
-    inner: Arc<ClientInner>,
-}
-
-struct ClientInner {
-    jobs: Mutex<Option<mpsc::Sender<Job>>>,
-    worker: Mutex<Option<thread::JoinHandle<()>>>,
-}
-
-impl Drop for ClientInner {
-    fn drop(&mut self) {
-        self.jobs.get_mut().ok().and_then(Option::take);
-        if let Some(worker) = self.worker.get_mut().ok().and_then(Option::take) {
-            let _ = worker.join();
-        }
-    }
+    jobs: mpsc::Sender<Job>,
 }
 
 impl BrokerSignerClient {
@@ -60,30 +46,20 @@ impl BrokerSignerClient {
     ) -> Result<Self, ProtocolError> {
         let socket_path = socket_path.into();
         let (jobs, receiver) = mpsc::channel::<Job>();
-        let service_span = tracing::Span::current();
-        let tracing_dispatch = tracing::dispatcher::get_default(Clone::clone);
-        let worker = thread::Builder::new()
+        thread::Builder::new()
             .name("bloom-broker-signer-rpc".into())
             .spawn(move || {
-                tracing::dispatcher::with_default(&tracing_dispatch, || {
-                    let _service_span = service_span.enter();
-                    worker(
-                        receiver,
-                        socket_path,
-                        identity,
-                        signer,
-                        journal,
-                        checkpoints,
-                    )
-                })
+                worker(
+                    receiver,
+                    socket_path,
+                    identity,
+                    signer,
+                    journal,
+                    checkpoints,
+                )
             })
             .map_err(|error| unavailable(format!("start Signer RPC worker: {error}")))?;
-        Ok(Self {
-            inner: Arc::new(ClientInner {
-                jobs: Mutex::new(Some(jobs)),
-                worker: Mutex::new(Some(worker)),
-            }),
-        })
+        Ok(Self { jobs })
     }
 
     pub fn connect_unix_from_files(
@@ -113,12 +89,7 @@ impl BrokerSignerClient {
         request: BrokerSignerRequest,
     ) -> Result<BrokerSignerResponse, ProtocolError> {
         let (reply, response) = mpsc::channel();
-        self.inner
-            .jobs
-            .lock()
-            .map_err(|_| unavailable("Signer RPC worker queue lock is poisoned"))?
-            .as_ref()
-            .ok_or_else(|| unavailable("Signer RPC worker stopped"))?
+        self.jobs
             .send((request, reply))
             .map_err(|_| unavailable("Signer RPC worker stopped"))?;
         response
@@ -165,20 +136,8 @@ fn worker(
         Ok((sequence, head_hash)) => {
             let head =
                 bloom_triad_local_transport::sign_journal_head(&identity, sequence, head_hash);
-            match persist_checkpoint_diagnosed(
-                journal.as_ref(),
-                checkpoints.as_ref(),
-                None,
-                None,
-                &head,
-                "broker_signer_initial",
-            ) {
-                Ok(()) => Some(head),
-                Err(_) => checkpoints
-                    .latest_peer_head(&identity.service_id)
-                    .ok()
-                    .flatten(),
-            }
+            let _ = checkpoints.append_peer_head(&head);
+            Some(head)
         }
         Err(_) => checkpoints
             .latest_peer_head(&identity.service_id)
@@ -193,25 +152,16 @@ fn worker(
                 continue;
             }
         };
-        let operation_id = request
-            .operation_id()
-            .ok()
-            .flatten()
-            .map(|operation_id| operation_id.as_str().to_owned());
         let sender_head = match journal.verified_audit_head() {
             Ok((sequence, head_hash)) => {
                 let head =
                     bloom_triad_local_transport::sign_journal_head(&identity, sequence, head_hash);
-                if let Err(error) = persist_checkpoint_diagnosed(
-                    journal.as_ref(),
-                    checkpoints.as_ref(),
-                    Some(&method),
-                    operation_id.as_deref(),
-                    &head,
-                    "broker_signer_pre_dispatch",
-                ) {
+                if let Err(error) = checkpoints.append_peer_head(&head) {
+                    journal.latch_audit_degradation();
                     if !is_read_only_method(&method) {
-                        let _ = reply.send(Err(error));
+                        let _ = reply.send(Err(unavailable(format!(
+                            "persist Broker audit head before dispatch: {error}"
+                        ))));
                         continue;
                     }
                 } else {
@@ -235,7 +185,6 @@ fn worker(
         };
         let journal_for_checkpoint = journal.clone();
         let checkpoints_for_response = checkpoints.clone();
-        let response_operation_id = operation_id.clone();
         let result = runtime.block_on(async {
             let mut stream = tokio::net::UnixStream::connect(&socket_path)
                 .await
@@ -254,7 +203,6 @@ fn worker(
                         journal_for_checkpoint.as_ref(),
                         checkpoints_for_response.as_ref(),
                         &method,
-                        response_operation_id.as_deref(),
                         peer_head,
                     )
                 },
@@ -269,104 +217,17 @@ fn persist_response_checkpoint(
     journal: &BrokerJournal,
     checkpoints: &dyn CheckpointSink,
     method: &Token,
-    operation_id: Option<&str>,
     peer_head: &bloom_signer_api::SignedJournalHead,
 ) -> Result<(), ProtocolError> {
-    if let Err(error) = persist_checkpoint_diagnosed(
-        journal,
-        checkpoints,
-        Some(method),
-        operation_id,
-        peer_head,
-        "broker_signer_response",
-    ) {
+    if let Err(error) = checkpoints.append_peer_head(peer_head) {
+        journal.latch_audit_degradation();
         if !is_read_only_method(method) {
-            return Err(error);
+            return Err(unavailable(format!(
+                "persist Signer audit checkpoint before publishing mutation result: {error}"
+            )));
         }
     }
     Ok(())
-}
-
-fn persist_checkpoint_diagnosed(
-    journal: &BrokerJournal,
-    checkpoints: &dyn CheckpointSink,
-    method: Option<&Token>,
-    operation_id: Option<&str>,
-    peer_head: &bloom_signer_api::SignedJournalHead,
-    edge: &'static str,
-) -> Result<(), ProtocolError> {
-    match checkpoints.append_peer_head_diagnosed(peer_head) {
-        Ok(decision) => {
-            log_checkpoint_decision(&decision, method, operation_id, edge, false);
-            Ok(())
-        }
-        Err(failure) => {
-            let decision = &failure.decision;
-            journal.latch_checkpoint_degradation(
-                checkpoint_outcome(decision.outcome),
-                decision.attempted.sequence,
-                Digest32::new(decision.attempted.head_digest.clone())
-                    .expect("checkpoint metadata preserves a validated digest"),
-                decision.retained.as_ref().map(|retained| {
-                    (
-                        retained.sequence,
-                        Digest32::new(retained.head_digest.clone())
-                            .expect("checkpoint metadata preserves a validated digest"),
-                    )
-                }),
-            );
-            log_checkpoint_decision(decision, method, operation_id, edge, true);
-            Err(unavailable(match edge {
-                "broker_signer_response" => {
-                    "persist Signer audit checkpoint before publishing mutation result"
-                }
-                "broker_signer_pre_dispatch" => "persist Broker audit head before dispatch",
-                _ => "persist initial Broker audit head",
-            }))
-        }
-    }
-}
-
-fn log_checkpoint_decision(
-    decision: &CheckpointDecision,
-    method: Option<&Token>,
-    operation_id: Option<&str>,
-    edge: &'static str,
-    mutations_disabled: bool,
-) {
-    tracing::info!(
-        event = "checkpoint.decision",
-        edge,
-        recipient_service = decision.recipient_service_id.as_ref().map(Token::as_str),
-        peer_service = decision.attempted.service_id.as_str(),
-        peer_key_id = decision.attempted.key_id.as_str(),
-        method = method.map(Token::as_str),
-        operation_id,
-        attempted_sequence = decision.attempted.sequence,
-        attempted_head = decision.attempted.head_digest.as_str(),
-        retained_sequence = decision.retained.as_ref().map(|head| head.sequence),
-        retained_head = decision
-            .retained
-            .as_ref()
-            .map(|head| head.head_digest.as_str()),
-        outcome = checkpoint_outcome(decision.outcome),
-        mutations_disabled,
-        "Broker-Signer checkpoint decision"
-    );
-}
-
-fn checkpoint_outcome(outcome: CheckpointDecisionOutcome) -> &'static str {
-    match outcome {
-        CheckpointDecisionOutcome::Appended => "appended",
-        CheckpointDecisionOutcome::AlreadyPresent => "already_present",
-        CheckpointDecisionOutcome::SequenceRollback => "sequence_rollback",
-        CheckpointDecisionOutcome::SequenceConflict => "sequence_conflict",
-        CheckpointDecisionOutcome::InvalidSignature => "invalid_signature",
-        CheckpointDecisionOutcome::UnpinnedPeer => "unpinned_peer",
-        CheckpointDecisionOutcome::StorageOrConfigurationFailure => {
-            "storage_or_configuration_failure"
-        }
-    }
 }
 
 fn journal_error(error: crate::journal::JournalError) -> ProtocolError {
@@ -424,9 +285,6 @@ impl CeremonySigner for BrokerSignerClient {
             CeremonyKind::CredentialRemove => BrokerSignerRequest::CredentialRemovePrepare(request),
             CeremonyKind::BackendEnrollment => BrokerSignerRequest::KeyEnrollPrepare(request),
             CeremonyKind::KeyDerive => BrokerSignerRequest::KeyDerivePrepare(request),
-            CeremonyKind::AccountAllocate | CeremonyKind::AccountRetire => {
-                BrokerSignerRequest::KeyDerivePrepare(request)
-            }
             CeremonyKind::SealedApproval | CeremonyKind::PolicyUpdate => {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::CeremonyKindMismatch,
@@ -559,9 +417,6 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
-    use tracing_subscriber::prelude::*;
-
-    static CHECKPOINT_TRACING_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct TestAuditSigner;
 
@@ -680,7 +535,6 @@ mod tests {
 
     #[test]
     fn response_checkpoint_failure_latches_mutations_but_preserves_reads() {
-        let _tracing_test = CHECKPOINT_TRACING_TEST_LOCK.lock().unwrap();
         let journal = BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).unwrap();
         let sink = FailingCheckpointSink;
         assert!(
@@ -688,7 +542,6 @@ mod tests {
                 &journal,
                 &sink,
                 &Token::new("signer.readiness").unwrap(),
-                None,
                 &peer_head(),
             )
             .is_ok()
@@ -699,7 +552,6 @@ mod tests {
                 &journal,
                 &sink,
                 &Token::new("signer.sign").unwrap(),
-                Some("11"),
                 &peer_head(),
             )
             .unwrap_err()
@@ -708,72 +560,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn signer_worker_preserves_trusted_service_span_and_dispatcher() {
-        let _tracing_test = CHECKPOINT_TRACING_TEST_LOCK.lock().unwrap();
-        let capture = bloom_service_observability::CapturedWriter::default();
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_subscriber::fmt::layer()
-                .json()
-                .with_writer(capture.clone()),
-        );
-        let dispatcher = tracing::Dispatch::new(subscriber);
-        tracing::dispatcher::with_default(&dispatcher, || {
-            let service_span = tracing::info_span!(
-                "trusted_service",
-                service_id = "bloom-broker",
-                login_uid = 501_u64,
-                build_digest = "test-build-digest"
-            );
-            let _service_span = service_span.enter();
-            let identity = LocalIdentity {
-                service_id: Token::new("bloom-broker").unwrap(),
-                boot_epoch: BootEpoch::from_bytes([0x21; 16]),
-                application_key_id: Token::new("broker-app").unwrap(),
-                signing_key: Arc::new(SigningKey::from_bytes(&[0x22; 32])),
-            };
-            let signer = PeerAcl {
-                effective_uid: 0,
-                service_id: Token::new("bloom-signer").unwrap(),
-                boot_epoch: BootEpoch::from_bytes([0x23; 16]),
-                application_key_id: Token::new("signer-app").unwrap(),
-                application_public_key: SigningKey::from_bytes(&[0x24; 32])
-                    .verifying_key()
-                    .to_bytes(),
-            };
-            let client = BrokerSignerClient::connect_unix(
-                "/unused/signer.sock",
-                identity,
-                signer,
-                Arc::new(BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).unwrap()),
-                Arc::new(RetainingCheckpointSink::default()),
-            )
-            .unwrap();
-            assert_eq!(
-                client
-                    .request(BrokerSignerRequest::SignerReadiness(Empty {}))
-                    .unwrap_err()
-                    .code,
-                ProtocolErrorCode::ServiceUnavailable
-            );
-            drop(client);
-        });
-
-        let captured = capture.text();
-        let event = captured
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .find(|event| event["fields"]["event"] == "checkpoint.decision")
-            .unwrap_or_else(|| panic!("Signer worker checkpoint event; captured: {captured}"));
-        assert_eq!(event["span"]["service_id"], "bloom-broker");
-        assert_eq!(event["span"]["login_uid"], 501);
-        assert_eq!(event["span"]["build_digest"], "test-build-digest");
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[allow(clippy::await_holding_lock)] // Test-only serialization of tracing callsite capture.
     async fn degraded_restart_uses_retained_nonzero_broker_head_for_real_rpc_read() {
-        let _tracing_test = CHECKPOINT_TRACING_TEST_LOCK.lock().unwrap();
         use std::os::unix::fs::MetadataExt as _;
 
         let directory = tempfile::tempdir().unwrap();

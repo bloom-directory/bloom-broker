@@ -511,9 +511,7 @@ mod tests {
         ))
         .unwrap();
         assert!(serde_json::from_str::<PreRateLimitProtocolError>(&plain).is_ok());
-        const {
-            assert!(crate::BROKER_API_MINOR_MIN >= crate::RATE_LIMIT_DETAILS_MINOR);
-        }
+        assert_eq!(crate::BROKER_API_MINOR_MIN, crate::RATE_LIMIT_DETAILS_MINOR);
     }
 
     #[test]

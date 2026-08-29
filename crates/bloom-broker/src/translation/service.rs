@@ -121,7 +121,6 @@ mod tests {
             canonical_public_key: south::Base64UrlBytes::from_bytes(&[5]),
             addresses: vec!["address-6".into()],
             supported_crypto_suites: vec![south::CryptoSuite::Secp256k1Sha256Recoverable],
-            derived_account: None,
         });
         assert_eq!(key.key_ref.backend.as_str(), "backend-1");
         assert_eq!(key.key_ref.backend_instance.as_str(), "instance-2");

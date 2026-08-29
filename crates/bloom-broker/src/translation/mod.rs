@@ -9,4 +9,3 @@ pub(crate) mod policy;
 pub(crate) mod revocation;
 pub(crate) mod service;
 pub(crate) mod signing;
-pub(crate) mod wallet_account;

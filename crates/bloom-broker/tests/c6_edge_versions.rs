@@ -101,12 +101,9 @@ fn downgrade_client_range() -> ProtocolVersionRange {
 }
 
 fn signer_downgrade_client_range() -> ProtocolVersionRange {
-    // It accepts the Signer's hello at the current Signer maximum but
-    // advertises 1.0 as its current request version, allowing the server-side
-    // authority range to reject it. The maximum moved from 1.4 to 1.5 when the
-    // bip39 surface landed above the terminal ceremony-status contract, so it
-    // is read from the constant rather than pinned.
-    ProtocolVersionRange::new(1, 0, bloom_signer_api::SIGNER_API_MINOR_MAX)
+    // It accepts the Signer's 1.4 hello but advertises 1.0 as its current
+    // request version, allowing the server-side authority range to reject it.
+    ProtocolVersionRange::new(1, 0, 4)
 }
 
 #[tokio::test]
