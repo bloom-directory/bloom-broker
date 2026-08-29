@@ -22,7 +22,7 @@ use bloom_broker::{
     clock::BrokerClock,
     journal::{AuditSigner, BrokerJournal},
     service::BrokerRpcService,
-    signer_client::BrokerSignerClient,
+    signer_client::{BrokerSignerClient, checkpoint_failure_requires_degradation},
 };
 use bloom_broker_api::{
     Base64UrlBytes, Digest32, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
@@ -1145,6 +1145,10 @@ impl BrokerMachineJournals {
             }
             Err(failure) => {
                 let decision = &failure.decision;
+                if !checkpoint_failure_requires_degradation(decision.outcome) {
+                    log_checkpoint_decision(decision, method, operation_id, false);
+                    return Ok(());
+                }
                 self.journal.latch_checkpoint_degradation(
                     checkpoint_outcome(decision.outcome),
                     decision.attempted.sequence,
@@ -1879,7 +1883,7 @@ mod startup_failure_tests {
     }
 
     #[test]
-    fn unchanged_machine_head_remains_admissible_without_degradation() {
+    fn unchanged_and_older_machine_heads_remain_admissible_without_degradation() {
         let temporary = tempfile::tempdir().unwrap();
         let journal = Arc::new(
             open_operational_audit_journal(
@@ -1936,6 +1940,15 @@ mod startup_failure_tests {
         for _ in 0..1_000 {
             exchange.checkpoint_request_head(&readiness, &head).unwrap();
         }
+        let newer = bloom_triad_local_transport::sign_journal_head(
+            &machine,
+            9,
+            Digest32::from_bytes([9; 32]),
+        );
+        exchange
+            .checkpoint_request_head(&readiness, &newer)
+            .unwrap();
+        exchange.checkpoint_request_head(&readiness, &head).unwrap();
         assert!(!exchange.journal.audit_degraded());
     }
 
