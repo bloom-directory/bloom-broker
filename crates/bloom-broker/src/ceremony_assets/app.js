@@ -305,7 +305,7 @@ async function load() {
     Boolean(scopedPetalKey) || legacyPasskeyImport;
   if (session.ceremony_kind === "wallet_import" && !legacyPasskeyImport) {
     genericInput.placeholder = bip39Import
-      ? '{"mnemonic":"twenty four BIP-39 words…","passphrase":""}'
+      ? '{"mnemonic":"twenty four BIP-39 words…"}'
       : '{"raw_private_key":"base64url-encoded-key"}';
   } else if (session.ceremony_kind === "key_derive") {
     genericInput.placeholder =
@@ -395,10 +395,13 @@ async function run(session) {
         if (typeof supplied.mnemonic !== "string") {
           throw new Error("BIP-39 mnemonic input is required");
         }
+        if (Object.hasOwn(supplied, "passphrase")) {
+          throw new Error("BIP-39 passphrases are not supported");
+        }
         secret = te.encode(canonicalJson({
           credential_prf: encodeUrl(prf.prf),
           mnemonic: supplied.mnemonic,
-          passphrase: supplied.passphrase || ""
+          passphrase: ""
         }));
       } else {
         if (typeof supplied.raw_private_key !== "string") {
