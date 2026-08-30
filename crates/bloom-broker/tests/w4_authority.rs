@@ -1523,10 +1523,10 @@ fn native_solana_mismatched_assurance_evidence_is_denied() {
 fn native_solana_destination_outside_policy_is_denied() {
     let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
     let provenance = harness.solana_provenance();
-    let destination = bloom_solana::Pubkey::from_bytes([0x44; 32]);
+    let destination = bloom_solana_verify::Pubkey::from_bytes([0x44; 32]);
     let blockhash = [0x07; 32];
-    let message = bloom_solana::system_transfer::transfer_message(
-        bloom_solana::Pubkey::from_bytes([0x01; 32]),
+    let message = bloom_solana_verify::system_transfer::transfer_message(
+        bloom_solana_verify::Pubkey::from_bytes([0x01; 32]),
         destination,
         1_000_000,
         blockhash,
@@ -1941,14 +1941,14 @@ fn exact_terms(harness: &Harness, payload: &[u8]) -> SealedApprovalTerms {
 }
 
 fn solana_destination() -> String {
-    bloom_solana::Pubkey::from_bytes([0x02; 32]).to_string()
+    bloom_solana_verify::Pubkey::from_bytes([0x02; 32]).to_string()
 }
 
 fn solana_message_and_claim(assurance: ClaimAssurance) -> (Vec<u8>, SystemUseClaim) {
     let blockhash = [0x07; 32];
-    let destination = bloom_solana::Pubkey::from_bytes([0x02; 32]);
-    let message = bloom_solana::system_transfer::transfer_message(
-        bloom_solana::Pubkey::from_bytes([0x01; 32]),
+    let destination = bloom_solana_verify::Pubkey::from_bytes([0x02; 32]);
+    let message = bloom_solana_verify::system_transfer::transfer_message(
+        bloom_solana_verify::Pubkey::from_bytes([0x01; 32]),
         destination,
         1_000_000,
         blockhash,

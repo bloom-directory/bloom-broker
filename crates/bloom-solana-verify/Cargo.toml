@@ -1,14 +1,15 @@
 [package]
-name = "bloom-solana"
+name = "bloom-solana-verify"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Canonical Solana legacy-message codec and the strict solana-system-transfer-v1 semantic verifier for Bloom verified chain Petals"
+description = "Independent Solana legacy-message parser and strict native-transfer verifier for Bloom"
 
 [features]
 default = []
 
 [dependencies]
+bloom-broker-api = { path = "../bloom-broker-api" }
 sha2.workspace = true
 serde.workspace = true
 bs58.workspace = true

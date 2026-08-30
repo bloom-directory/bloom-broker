@@ -1,4 +1,4 @@
-//! Compiled-verifier artifact digest.
+//! Verifier source digest.
 //!
 //! The `ProofVerified` identity a wallet pins names this verifier by digest.
 //! For that identity to mean anything, the digest has to be *derived* from
@@ -6,7 +6,7 @@
 //! constant can stay put while the code beneath it changes, which is the one
 //! thing the digest exists to prevent.
 //!
-//! [`compute`] recomputes it from the sources embedded at compile time, and
+//! [`compute`] recomputes it from the semantic sources embedded at compile time, and
 //! the test below asserts it equals the constant the Broker publishes. A
 //! change to any covered file fails that test until the constant is updated
 //! deliberately — which is the intended workflow, because a changed verifier
@@ -26,7 +26,7 @@ const COVERED_SOURCES: [(&str, &str); 6] = [
     ("system_transfer.rs", include_str!("system_transfer.rs")),
 ];
 
-/// SHA-256 over the covered sources.
+/// SHA-256 over the covered semantic sources.
 ///
 /// Each file contributes its name and byte length before its contents, so
 /// moving text between files changes the digest rather than cancelling out.

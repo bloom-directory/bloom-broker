@@ -6,10 +6,10 @@
 //! verification test constructs an actual Anza `Transaction` and confirms its
 //! signature — over the raw message bytes — verifies.
 
-use bloom_solana::golden;
-use bloom_solana::message_digest;
-use bloom_solana::system_transfer::transfer_message;
-use bloom_solana::{Pubkey, verify_native_transfer};
+use bloom_solana_verify::golden;
+use bloom_solana_verify::message_digest;
+use bloom_solana_verify::system_transfer::transfer_message;
+use bloom_solana_verify::{Pubkey, verify_native_transfer};
 
 #[test]
 fn golden_message_reproduced_by_our_codec() {
@@ -281,6 +281,6 @@ fn oversized_message_rejected_before_parse() {
     assert!(matches!(
         verify_native_transfer(&bytes, golden::fee_payer(), golden::destination(), 1, None)
             .unwrap_err(),
-        bloom_solana::RejectionReason::Oversized { message_len: 1200 }
+        bloom_solana_verify::RejectionReason::Oversized { message_len: 1200 }
     ));
 }

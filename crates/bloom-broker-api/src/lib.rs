@@ -13,6 +13,7 @@ mod provenance;
 mod revocation;
 mod service;
 mod signing;
+pub mod solana_vectors;
 mod validation;
 mod wallet_account;
 

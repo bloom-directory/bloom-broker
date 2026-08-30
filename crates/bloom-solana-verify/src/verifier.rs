@@ -3,7 +3,7 @@
 //! This verifier is network-free and deterministic. It accepts only a legacy,
 //! single-signer message containing exactly one System Program native
 //! transfer, and establishes the facts listed in the
-//! `Verified Chain Petals` architecture contract. Every other shape is
+//! native system-claim contract. Every other shape is
 //! rejected with a precise reason.
 //!
 //! Facts established: complete canonical legacy encoding (no trailing bytes),
@@ -18,13 +18,11 @@
 //! freshness, last-valid height, fee quote, balance, simulation result,
 //! broadcast acceptance, or finality. Those remain `machine_asserted`.
 
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
-
-use crate::message::{self, LegacyMessage, ParseError};
+use crate::message::{self, LegacyMessage};
 use crate::message_digest;
 use crate::pubkey::Pubkey;
 use crate::system_transfer::{SYSTEM_PROGRAM_ID, decode_transfer_data};
+use serde::{Deserialize, Serialize};
 
 /// Solana's maximum transaction packet size (bytes).
 pub const PACKET_DATA_SIZE: usize = 1232;
@@ -32,12 +30,6 @@ pub const PACKET_DATA_SIZE: usize = 1232;
 /// Maximum serialized message size once a single-signature (65-byte) signature
 /// area is accounted for.
 pub const MAX_MESSAGE_SIZE: usize = PACKET_DATA_SIZE - (1 + 64);
-
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum VerifierError {
-    #[error("message parse failed: {0}")]
-    Parse(#[from] ParseError),
-}
 
 /// Why a message was rejected by the verifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,41 +101,6 @@ pub fn verify_native_transfer(
     lamports: u64,
     claimed_digest: Option<[u8; 32]>,
 ) -> Result<VerifiedTransfer, RejectionReason> {
-    verify_transfer_inner(
-        message_bytes,
-        destination,
-        lamports,
-        claimed_digest,
-        Some(fee_payer),
-    )
-}
-
-/// Verify that `message_bytes` is a canonical legacy, single-signer native
-/// SOL transfer matching `destination` and `lamports`, without binding a
-/// *claimed* fee payer.
-///
-/// The fee payer is the message's single required signer (index 0); its
-/// identity is bound to the derived account by the Ed25519 signature over
-/// the raw message in the signing path, not by the claim. This is the entry
-/// point the Broker's `solana-system-transfer-v1` assurance verifier uses:
-/// the claim carries the economic facts (destination, lamports, digest), and
-/// the signature carries who paid/signed.
-pub fn verify_transfer(
-    message_bytes: &[u8],
-    destination: Pubkey,
-    lamports: u64,
-    claimed_digest: Option<[u8; 32]>,
-) -> Result<VerifiedTransfer, RejectionReason> {
-    verify_transfer_inner(message_bytes, destination, lamports, claimed_digest, None)
-}
-
-fn verify_transfer_inner(
-    message_bytes: &[u8],
-    destination: Pubkey,
-    lamports: u64,
-    claimed_digest: Option<[u8; 32]>,
-    expected_fee_payer: Option<Pubkey>,
-) -> Result<VerifiedTransfer, RejectionReason> {
     // Reject oversized input before parsing or allocating anything: the
     // signed transaction must fit the packet limit, so the message itself is
     // bounded regardless of what its short-vec length prefixes claim.
@@ -187,11 +144,9 @@ fn verify_transfer_inner(
     }
 
     let actual_payer = message.fee_payer();
-    if let Some(expected) = expected_fee_payer
-        && actual_payer != expected
-    {
+    if actual_payer != fee_payer {
         return Err(RejectionReason::FeePayerMismatch {
-            expected: expected.to_string(),
+            expected: fee_payer.to_string(),
             actual: actual_payer.to_string(),
         });
     }
@@ -241,7 +196,6 @@ fn verify_transfer_inner(
         });
     }
 
-    let actual_destination = message.account_keys[1];
     if actual_destination != destination {
         return Err(RejectionReason::DestinationMismatch {
             expected: destination.to_string(),

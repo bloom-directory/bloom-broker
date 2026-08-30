@@ -12,16 +12,16 @@ use bloom_broker_api::{
     SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES, SOLANA_SYSTEM_TRANSFER_VERIFIER_ID,
     SystemUseClaim, Token,
 };
-use bloom_solana::Pubkey;
+use bloom_solana_verify::Pubkey;
 use std::str::FromStr;
 
 use crate::authority::{AssuranceVerifier, VerifierCapability};
 
 /// The `solana-system-transfer-v1` semantic verifier.
 ///
-/// Its published artifact digest (`SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES`)
-/// is SHA-256 over the verifier crate's core sources, recomputed by
-/// `bloom_solana::artifact::compute` and asserted equal below. That is what
+/// Its published source digest (`SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES`)
+/// is SHA-256 over the verifier crate's semantic sources, recomputed by
+/// `bloom_solana_verify::artifact::compute` and asserted equal below. That is what
 /// makes "a changed verifier is a changed `ProofVerified` identity" true
 /// rather than aspirational: the digest cannot stay put while the code it
 /// names changes.
@@ -102,7 +102,7 @@ impl AssuranceVerifier for SolanaSystemTransferVerifier {
         // account has to be established here or that claim is not true.
         let expected_signer = expected_signer
             .ok_or("native Solana verification requires the approved account's public key")?;
-        let verified = bloom_solana::verify_native_transfer(
+        let verified = bloom_solana_verify::verify_native_transfer(
             message,
             Pubkey::from_bytes(*expected_signer),
             destination_key,
@@ -131,7 +131,7 @@ mod tests {
         AssetId, ClaimAssurance, DecimalU64, DeclaredDebit, DeclaredDestination, DeclaredFee,
         SystemChainContext,
     };
-    use bloom_solana::system_transfer::transfer_message;
+    use bloom_solana_verify::system_transfer::transfer_message;
 
     fn solana_claim(destination: &str, lamports: u64, digest: [u8; 32]) -> PetalUseClaim {
         PetalUseClaim {
@@ -234,7 +234,7 @@ mod tests {
             solana_claim(
                 &dest.to_string(),
                 lamports,
-                bloom_solana::message_digest(&bytes),
+                bloom_solana_verify::message_digest(&bytes),
             ),
             [7u8; 32],
         );
@@ -260,7 +260,11 @@ mod tests {
         let message = transfer_message(payer, dest, 42, [7u8; 32]).unwrap();
         let bytes = message.serialize();
         let claim = as_system_claim(
-            solana_claim(&dest.to_string(), 42, bloom_solana::message_digest(&bytes)),
+            solana_claim(
+                &dest.to_string(),
+                42,
+                bloom_solana_verify::message_digest(&bytes),
+            ),
             [7u8; 32],
         );
         let err = SolanaSystemTransferVerifier
@@ -276,7 +280,7 @@ mod tests {
         let lamports = 1_000_000_000u64;
         let message = transfer_message(payer, dest, lamports, [7u8; 32]).unwrap();
         let bytes = message.serialize();
-        let digest = bloom_solana::message_digest(&bytes);
+        let digest = bloom_solana_verify::message_digest(&bytes);
 
         let verifier = SolanaSystemTransferVerifier;
         let claim = solana_claim(&dest.to_string(), lamports, digest);
@@ -297,7 +301,11 @@ mod tests {
         let blockhash = [7u8; 32];
         let message = transfer_message(payer, dest, 42, blockhash).unwrap();
         let bytes = message.serialize();
-        let petal = solana_claim(&dest.to_string(), 42, bloom_solana::message_digest(&bytes));
+        let petal = solana_claim(
+            &dest.to_string(),
+            42,
+            bloom_solana_verify::message_digest(&bytes),
+        );
         let mut claim = SystemUseClaim {
             component_id: Token::new("bloom-machine").unwrap(),
             action_class: Token::new("solana.transfer.confirm").unwrap(),
@@ -339,7 +347,7 @@ mod tests {
             let message = transfer_message(payer, destination, lamports, blockhash)
                 .unwrap()
                 .serialize();
-            let digest = bloom_solana::message_digest(&message);
+            let digest = bloom_solana_verify::message_digest(&message);
             let verifier = SolanaSystemTransferVerifier;
             let claim = system_claim(&destination, lamports, digest, blockhash);
             verifier
@@ -397,7 +405,7 @@ mod tests {
         let lamports = 1_000_000_000u64;
         let message = transfer_message(payer, dest, lamports, [7u8; 32]).unwrap();
         let bytes = message.serialize();
-        let digest = bloom_solana::message_digest(&bytes);
+        let digest = bloom_solana_verify::message_digest(&bytes);
 
         let lying = Pubkey::from_bytes([9u8; 32]);
         let claim = as_system_claim(
@@ -417,7 +425,7 @@ mod tests {
         let lamports = 1_000_000_000u64;
         let message = transfer_message(payer, dest, lamports, [7u8; 32]).unwrap();
         let bytes = message.serialize();
-        let digest = bloom_solana::message_digest(&bytes);
+        let digest = bloom_solana_verify::message_digest(&bytes);
 
         let claim = as_system_claim(
             solana_claim(&dest.to_string(), lamports + 1, digest),
@@ -454,12 +462,12 @@ mod artifact_digest_tests {
     /// journal entries would all be unchanged.
     ///
     /// When this fails after a deliberate verifier change, recompute with
-    /// `cargo test -p bloom-solana artifact_digest_is_reproducible -- --nocapture`
+    /// `cargo test -p bloom-solana-verify artifact_digest_is_reproducible -- --nocapture`
     /// and update the constant as part of the same change.
     #[test]
     fn published_digest_matches_the_verifier_sources() {
         assert_eq!(
-            bloom_solana::artifact::compute(),
+            bloom_solana_verify::artifact::compute(),
             bloom_broker_api::SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES,
             "the published verifier artifact digest no longer matches its sources"
         );

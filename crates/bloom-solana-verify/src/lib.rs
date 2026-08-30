@@ -1,14 +1,14 @@
 //! Canonical Solana legacy-message codec and strict semantic verifier.
 //!
 //! This crate is the content-addressed, dependency-light foundation for
-//! Bloom's `solana-system-transfer-v1` verified chain Petal. It contains two
+//! Bloom's `solana-system-transfer-v1` native system claim. It contains two
 //! deliberately separate concerns:
 //!
 //! * [`message`] — a strict, canonical encoder/decoder for the Solana legacy
 //!   transaction message format, together with [`system_transfer`] for the
 //!   System Program native transfer instruction. This is the *verifier's*
 //!   implementation-independent parser: it must never share code with the
-//!   driver Petal's construction parser (which uses the Anza `solana-message`
+//!   Machine's construction parser (which uses the Anza `solana-message`
 //!   and `solana-system-interface` crates).
 //! * [`verifier`] — the `solana-system-transfer-v1` semantic verifier. Given
 //!   exact message bytes and the expected economic facts, it establishes the
@@ -36,9 +36,7 @@ pub use short_vec::{ShortVecError, read_short_vec, write_short_vec};
 pub use system_transfer::{
     SYSTEM_PROGRAM_ID, SystemTransferError, transfer_data, transfer_instruction,
 };
-pub use verifier::{
-    RejectionReason, VerifiedTransfer, VerifierError, verify_native_transfer, verify_transfer,
-};
+pub use verifier::{RejectionReason, VerifiedTransfer, verify_native_transfer};
 
 /// The `solana-system-transfer-v1` verifier identifier, as advertised by
 /// Broker capabilities and required by wallet policy.
