@@ -2792,10 +2792,14 @@ fn review_disclosures(
             bloom_signer_api::ApprovalSelector::Petal { .. }
         ) && assurance.is_none();
     if machine_asserted {
-        disclosures.push(
-            "The displayed limits are asserted by the named Petal. Bloom does not verify them against the payload, and a compromised Petal or Machine can consume the full remaining capacity."
-                .to_owned(),
-        );
+        let source = if system_claim.is_some() {
+            "the named system component"
+        } else {
+            "the named Petal"
+        };
+        disclosures.push(format!(
+            "The displayed limits are asserted by {source}. Bloom does not verify them against the payload, and a compromised Petal or Machine can consume the full remaining capacity."
+        ));
     }
     disclosures
 }

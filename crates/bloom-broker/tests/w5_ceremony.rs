@@ -367,6 +367,16 @@ process.stdout.write("browser-error-feedback-ok");
 }
 
 #[test]
+fn transfer_review_promises_later_verification_without_claiming_it_already_happened() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    assert!(asset.contains("Estimated network fee"));
+    assert!(asset.contains("Required before signing"));
+    assert!(asset.contains("Bloom will decode the transaction"));
+    assert!(!asset.contains("Bloom decoded the transaction and it matches this summary"));
+    assert!(!asset.contains("transfer.verified"));
+}
+
+#[test]
 fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
     let shell = include_str!("../src/ceremony_assets/index.html");
     for required in [

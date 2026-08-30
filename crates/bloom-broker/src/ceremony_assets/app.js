@@ -182,17 +182,17 @@ function describeTransfer(manifest) {
   const facts = [];
   if (to.length) facts.push(["To", to.join(", "), true]);
   if (amounts.length) facts.push(["Amount", amounts.join(" + ")]);
-  if (fee && fee.amount) facts.push(["Network fee", fmtAmount(fee.chain, fee.asset, fee.amount)]);
+  if (fee && fee.amount) facts.push(["Estimated network fee", fmtAmount(fee.chain, fee.asset, fee.amount)]);
   facts.push(["Network", network]);
   if (claim.route) facts.push(["Requested by", `Petal ${claim.route}`]);
   const assurance = claim.claim_assurance?.kind || manifest?.claim_assurance?.kind;
-  const verified = assurance === "proof_verified";
+  const willVerify = assurance === "proof_verified";
   if (assurance) {
-    facts.push(["Checked by Bloom", verified
-      ? "Yes — Bloom decoded the transaction and it matches this summary"
+    facts.push(["Bloom verification", willVerify
+      ? "Required before signing — Bloom will decode the transaction and require it to match this summary"
       : "No — these figures are claimed, not verified"]);
   }
-  return {sentence, facts, verified};
+  return {sentence, facts, willVerify};
 }
 // Turn a Signer key reference into "Solana account 0 (m/44'/501'/0'/0')".
 function describeKey(ref) {
@@ -289,11 +289,10 @@ function renderReview(session) {
   facts.append(el("dt", {}, "Expires"), el("dd", {}, expiry));
   if (kind === "sealed_approval") {
     for (const item of session.review_manifest?.attributed_advisory_items || []) warns.push(item);
-    // The plan's generic "opaque payload" disclosure is only meaningful when
-    // Bloom did not decode the payload itself; a verified claim supersedes it.
-    if (!transfer || !transfer.verified) {
-      for (const item of planDisclosures(session.review_manifest)) warns.push(item);
-    }
+    // Proof verification occurs during authorization, after this review.
+    // Never suppress the plan's present-tense disclosure merely because the
+    // Machine requested proof verification for the later signing step.
+    for (const item of planDisclosures(session.review_manifest)) warns.push(item);
   }
   const parts = [
     el("p", {class: "summary", html: summaryHtml}),
