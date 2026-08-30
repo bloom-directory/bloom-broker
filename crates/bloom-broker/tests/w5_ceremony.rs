@@ -381,6 +381,128 @@ fn legacy_passkey_browser_flow_uses_assertion_prf_and_hides_raw_key_input() {
     assert!(asset.contains("wallet_import\" && !legacyPasskeyImport"));
 }
 
+/// The policy-update review must state each rule change by its effect on
+/// what Bloom will allow. A bare rule count ("Change 2 rules") told the
+/// operator nothing about which permissions their passkey was granting.
+/// The summary may be reworded; what must hold is the meaning: the
+/// direction of each change, and that every changed address is listed
+/// verbatim rather than only counted.
+#[test]
+fn policy_update_review_names_each_rule_change_in_plain_language() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+globalThis.crypto = require("node:crypto").webcrypto;
+globalThis.document = {{getElementById: () => ({{}})}};
+globalThis.location = {{pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+{executable}
+const requires = (summary, phrases) => {{
+  for (const phrase of phrases) {{
+    if (!summary.includes(phrase)) {{
+      throw new Error(`summary omitted "${{phrase}}": ${{summary}}`);
+    }}
+  }}
+}};
+const loosened = describePolicy({{authority_diff: {{
+  maximum_approval_lifetime_ms_before: 60000,
+  maximum_approval_lifetime_ms_after: 60000,
+  added_petal_packages: [],
+  removed_petal_packages: [],
+  added_destinations: [
+    {{chain: "solana", destination: "FT23ewccKxfccjYoomz6CygaDqxPYjzx3xaEzMLJT92x"}},
+    {{chain: "solana", destination: "GWGW3TzM5dEDV38xK1F8chQJptJ6aywQkwksgfhKztEu"}}
+  ],
+  removed_destinations: [],
+  added_required_verifiers: [],
+  removed_required_verifiers: []
+}}}});
+requires(loosened.sentence, [
+  "send funds",
+  "2 new Solana addresses",
+  "refused today",
+  "Nothing moves now"
+]);
+const listed = loosened.facts
+  .filter(([label]) => label === "Allow sending to")
+  .map(([, value]) => value);
+if (listed.join("|") !== [
+  "FT23ewccKxfccjYoomz6CygaDqxPYjzx3xaEzMLJT92x (Solana)",
+  "GWGW3TzM5dEDV38xK1F8chQJptJ6aywQkwksgfhKztEu (Solana)"
+].join("|")) {{
+  throw new Error(`added destinations were not listed verbatim: ${{listed}}`);
+}}
+const tightened = describePolicy({{authority_diff: {{
+  maximum_approval_lifetime_ms_before: 60000,
+  maximum_approval_lifetime_ms_after: 300000,
+  added_petal_packages: [],
+  removed_petal_packages: [],
+  added_destinations: [],
+  removed_destinations: [
+    {{chain: "ethereum", destination: "0x000000000000000000000000000000000000dEaD"}}
+  ],
+  added_required_verifiers: [],
+  removed_required_verifiers: []
+}}}});
+requires(tightened.sentence, [
+  "refuse sends",
+  "one Ethereum address",
+  "allows today",
+  "up to <strong>5m 0s</strong> instead of 1m 0s"
+]);
+if (!tightened.facts.some(([label]) => label === "Stop allowing sends to")) {{
+  throw new Error("removed destinations were not listed");
+}}
+const singular = describePolicy({{authority_diff: {{
+  maximum_approval_lifetime_ms_before: 0,
+  maximum_approval_lifetime_ms_after: 0,
+  added_petal_packages: ["1111111111111111111111111111111111111111111111111111111111111111"],
+  removed_petal_packages: [],
+  added_destinations: [{{chain: "solana", destination: "FT23ewccKxfccjYoomz6CygaDqxPYjzx3xaEzMLJT92x"}}],
+  removed_destinations: [],
+  added_required_verifiers: [{{verifier_id: "ens", verifier_digest: "00"}}],
+  removed_required_verifiers: []
+}}}});
+requires(singular.sentence, [
+  "one new Solana address",
+  "a new app (petal)",
+  "one more verifier"
+]);
+const empty = describePolicy({{authority_diff: {{
+  maximum_approval_lifetime_ms_before: 0,
+  maximum_approval_lifetime_ms_after: 0,
+  added_petal_packages: [],
+  removed_petal_packages: [],
+  added_destinations: [],
+  removed_destinations: [],
+  added_required_verifiers: [],
+  removed_required_verifiers: []
+}}}});
+if (empty.sentence !== "No rule changes are proposed.") {{
+  throw new Error(`empty diff was not described: ${{empty.sentence}}`);
+}}
+process.stdout.write("policy-language-ok");
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the policy language");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "policy-language-ok"
+    );
+}
+
 fn digest(byte: &str) -> Digest32 {
     Digest32::new(byte.repeat(32)).unwrap()
 }

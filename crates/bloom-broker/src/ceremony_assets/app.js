@@ -67,7 +67,7 @@ const KINDS = {
   },
   policy_update: {
     title: "Change wallet rules",
-    summary: "Update the policy for wallet <strong>{wallet}</strong>. This does not move money; after approval Bloom uses the new rules to decide what is allowed.",
+    summary: "Change the rules for wallet <strong>{wallet}</strong>: where it may send funds, which apps may act, and how long approvals stay valid. This does not move money; after approval Bloom applies the new rules to future transactions.",
     button: "Approve rules with passkey"
   },
   key_derive: {
@@ -208,27 +208,67 @@ function describeKey(ref) {
   else if (ref.key_spec) account = `${ref.key_spec} key ${shortDigest(ref.public_key_fingerprint || ref.locator || "")}`;
   return {wallet, account};
 }
-// Policy updates: say what changes, in the order a person cares about.
+// Policy updates: name each rule change by its effect on what Bloom will
+// allow, in the order a person cares about — new freedoms first, then
+// restrictions, then mechanics. A bare rule count ("Change 2 rules") hid
+// which permissions the passkey was actually granting.
 function describePolicy(manifest) {
   const diff = manifest?.authority_diff;
   if (!diff) return null;
   const lines = [];
   const dest = d => `${d.destination || d.address || canonicalJson(d)} (${chainLabel(d.chain)})`;
-  for (const d of diff.added_destinations || []) lines.push(["Allow sending to", dest(d), true]);
-  for (const d of diff.removed_destinations || []) lines.push(["Stop allowing sending to", dest(d), true]);
-  for (const p of diff.added_petal_packages || []) lines.push(["Allow app (petal)", shortDigest(p), true]);
-  for (const p of diff.removed_petal_packages || []) lines.push(["Remove app (petal)", shortDigest(p), true]);
-  for (const v of diff.added_required_verifiers || []) lines.push(["Require verifier", v.verifier_id || canonicalJson(v), true]);
-  for (const v of diff.removed_required_verifiers || []) lines.push(["Drop verifier", v.verifier_id || canonicalJson(v), true]);
+  const addedDests = diff.added_destinations || [];
+  const removedDests = diff.removed_destinations || [];
+  const addedPetals = diff.added_petal_packages || [];
+  const removedPetals = diff.removed_petal_packages || [];
+  const addedVerifiers = diff.added_required_verifiers || [];
+  const removedVerifiers = diff.removed_required_verifiers || [];
+  for (const d of addedDests) lines.push(["Allow sending to", dest(d), true]);
+  for (const d of removedDests) lines.push(["Stop allowing sends to", dest(d), true]);
+  for (const p of addedPetals) lines.push(["Allow app (petal)", shortDigest(p), true]);
+  for (const p of removedPetals) lines.push(["Remove app (petal)", shortDigest(p), true]);
+  for (const v of addedVerifiers) lines.push(["Require verifier", v.verifier_id || canonicalJson(v), true]);
+  for (const v of removedVerifiers) lines.push(["Drop verifier", v.verifier_id || canonicalJson(v), true]);
   const before = Number(diff.maximum_approval_lifetime_ms_before);
   const after = Number(diff.maximum_approval_lifetime_ms_after);
-  if (Number.isFinite(before) && Number.isFinite(after) && before !== after) {
-    lines.push(["Max approval lifetime", `${fmtRemaining(before)} → ${fmtRemaining(after)}`]);
+  const lifetimeChanged = Number.isFinite(before) && Number.isFinite(after) && before !== after;
+  if (lifetimeChanged) {
+    lines.push(["Approval validity", `${fmtRemaining(before)} → ${fmtRemaining(after)}`]);
   }
-  const n = lines.length;
-  const sentence = n === 0
+  const addresses = (list, adjective) => {
+    const networks = [...new Set(list.map(d => chainLabel(d.chain)))];
+    return [
+      list.length === 1 ? "one" : `${list.length}`,
+      adjective,
+      networks.length === 1 ? escapeHtml(networks[0]) : "",
+      list.length === 1 ? "address" : "addresses"
+    ].filter(Boolean).join(" ");
+  };
+  const parts = [];
+  if (addedDests.length) {
+    parts.push(`Bloom will be allowed to <strong>send funds</strong> from this wallet to ${addresses(addedDests, "new")} (listed below); those sends are refused today`);
+  }
+  if (removedDests.length) {
+    parts.push(`Bloom will <strong>refuse sends</strong> to ${addresses(removedDests)} (listed below) that it allows today`);
+  }
+  if (addedPetals.length) {
+    parts.push(`Bloom will be allowed to run ${addedPetals.length === 1 ? "a new app (petal)" : `${addedPetals.length} new apps (petals)`} for this wallet`);
+  }
+  if (removedPetals.length) {
+    parts.push(`Bloom will stop running ${removedPetals.length === 1 ? "one app (petal)" : `${removedPetals.length} apps (petals)`} for this wallet`);
+  }
+  if (addedVerifiers.length) {
+    parts.push(`future approvals must also pass ${addedVerifiers.length === 1 ? "one more verifier" : `${addedVerifiers.length} more verifiers`}`);
+  }
+  if (removedVerifiers.length) {
+    parts.push(`future approvals will drop ${removedVerifiers.length === 1 ? "one required verifier" : `${removedVerifiers.length} required verifiers`}`);
+  }
+  if (lifetimeChanged) {
+    parts.push(`approvals can stay valid for up to <strong>${fmtRemaining(after)}</strong> instead of ${fmtRemaining(before)}`);
+  }
+  const sentence = parts.length === 0
     ? "No rule changes are proposed."
-    : `Change <strong>${n} rule${n === 1 ? "" : "s"}</strong> for this wallet. Nothing moves; after approval Bloom applies the new rules to future transactions.`;
+    : `${parts.join("; ")}. Nothing moves now; after approval these rules decide what Bloom allows.`;
   return {sentence, facts: lines};
 }
 function planDisclosures(manifest) {
