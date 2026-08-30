@@ -46,6 +46,21 @@ pub(crate) struct ChainProjectionTarget<'a> {
     pub accepted_profile: south::DerivationProfile,
 }
 
+/// Translate the Signer's account lifecycle explicitly.
+///
+/// The two enums serialize differently — `snake_case` on one edge and
+/// `ACTIVE`/`RETIRED` on the other — so this is a real translation and not a
+/// re-export, in keeping with this module's rule that every value crossing
+/// the boundary is converted by name.
+pub(crate) fn account_lifecycle_to_machine(
+    lifecycle: south::AccountLifecycleState,
+) -> north::AccountLifecycleState {
+    match lifecycle {
+        south::AccountLifecycleState::Active => north::AccountLifecycleState::Active,
+        south::AccountLifecycleState::Retired => north::AccountLifecycleState::Retired,
+    }
+}
+
 pub(crate) fn wallet_seed_profile_to_machine(
     value: south::WalletSeedProfile,
 ) -> north::WalletSeedProfile {
@@ -263,9 +278,11 @@ pub(crate) fn derived_account_to_machine(
             .map(|suite| super::key::crypto_suite_to_machine(*suite))
             .collect(),
         chain_projections,
-        // The descriptor carries no lifecycle yet; retire operations extend
-        // this mapping when they are implemented.
-        lifecycle: north::AccountLifecycleState::Active,
+        // Carried from the Signer, not assumed. Hardcoding `Active` made
+        // `verify_retire_target_matches_terms`'s lifecycle check unreachable
+        // by construction: a retired child still projected as active, so the
+        // guard could never fire.
+        lifecycle: account_lifecycle_to_machine(descriptor.lifecycle),
     };
     account.validate()?;
     Ok(account)
@@ -572,6 +589,46 @@ mod tests {
         assert_eq!(
             bs58::encode(b"hello world").into_string(),
             "StV1DL6CwTryKyV"
+        );
+    }
+
+    /// A retired child must project as retired. Hardcoding `Active` here made
+    /// the Broker's own retire guard unreachable: it rejects a target whose
+    /// lifecycle is not `Active`, so a retired child that always looked
+    /// active could never trip it.
+    #[test]
+    fn account_lifecycle_is_carried_not_assumed() {
+        let mut descriptor = evm_descriptor();
+        descriptor.lifecycle = south::AccountLifecycleState::Retired;
+        let account = derived_account_to_machine(&descriptor, &[evm_target()]).unwrap();
+        assert_eq!(
+            account.lifecycle,
+            north::AccountLifecycleState::Retired,
+            "a retired child must not project as active"
+        );
+
+        let active = derived_account_to_machine(&evm_descriptor(), &[evm_target()]).unwrap();
+        assert_eq!(active.lifecycle, north::AccountLifecycleState::Active);
+    }
+
+    /// The two lifecycle enums serialize differently — `snake_case` on the
+    /// Signer edge, `ACTIVE`/`RETIRED` on the Machine edge — so this is a
+    /// real translation. A re-export would have coupled two wire formats that
+    /// are deliberately independent.
+    #[test]
+    fn lifecycle_translation_is_total_and_distinct() {
+        assert_eq!(
+            account_lifecycle_to_machine(south::AccountLifecycleState::Active),
+            north::AccountLifecycleState::Active
+        );
+        assert_eq!(
+            account_lifecycle_to_machine(south::AccountLifecycleState::Retired),
+            north::AccountLifecycleState::Retired
+        );
+        assert_ne!(
+            serde_json::to_string(&south::AccountLifecycleState::Retired).unwrap(),
+            serde_json::to_string(&north::AccountLifecycleState::Retired).unwrap(),
+            "the two edges use different wire spellings, which is why they are translated"
         );
     }
 }

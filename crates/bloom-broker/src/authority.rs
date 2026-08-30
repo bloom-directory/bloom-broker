@@ -833,9 +833,6 @@ impl BrokerAuthority {
         Ok(())
     }
 
-    /// Validate and durably freeze a Petal-scoped derivation before Broker
-    /// originates its exact custody ceremony. Exact retries are idempotent;
-    /// an operation identity can never be rebound to another Petal.
     /// Record the exact terms an account ceremony commits to. Replaying the
     /// identical prepare is idempotent; binding one custody operation to
     /// different terms is a hard conflict.
@@ -1064,6 +1061,9 @@ impl BrokerAuthority {
         Ok((terms, state))
     }
 
+    /// Validate and durably freeze a Petal-scoped derivation before Broker
+    /// originates its exact custody ceremony. Exact retries are idempotent;
+    /// an operation identity can never be rebound to another Petal.
     pub fn prepare_petal_key_scope(&self, scope: &PetalKeyScope) -> Result<(), AuthorityError> {
         scope
             .validate()
@@ -2901,7 +2901,7 @@ fn path_matches_committed_account(
     }
     for (actual, expected) in segments.iter().zip(expected.iter()) {
         if *expected == "<index>" {
-            if actual.parse::<u32>().is_err() {
+            if !is_canonical_index(actual) {
                 return false;
             }
         } else if actual != expected {
@@ -2909,6 +2909,23 @@ fn path_matches_committed_account(
         }
     }
     true
+}
+
+/// A BIP-44 index segment in canonical form: plain ASCII digits, no sign, no
+/// leading zeros, and in range.
+///
+/// `u32::from_str` accepts `+0` and `007`, which parse to the same number as
+/// `0` but are different path strings. Accepting them would let one committed
+/// account be addressed by several distinct paths, so an approval pinned to
+/// one spelling could be satisfied by another.
+fn is_canonical_index(segment: &str) -> bool {
+    if segment.is_empty() || !segment.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if segment.len() > 1 && segment.starts_with('0') {
+        return false;
+    }
+    segment.parse::<u32>().is_ok()
 }
 
 fn verify_policy_snapshot(
@@ -3356,4 +3373,58 @@ fn denied(code: &'static str, message: impl Into<String>) -> AuthorityError {
 
 fn storage(error: impl ToString) -> AuthorityError {
     AuthorityError::Storage(error.to_string())
+}
+
+#[cfg(test)]
+mod path_index_tests {
+    use super::*;
+
+    /// A BIP-44 index segment must have exactly one spelling. `u32::from_str`
+    /// accepts `+0` and `007`, which parse to the same number as `0` but are
+    /// different path strings — so one committed account could be addressed
+    /// by several distinct paths, and an approval pinned to one spelling
+    /// satisfied by another.
+    #[test]
+    fn only_canonical_index_spellings_are_accepted() {
+        for ok in ["0", "1", "9", "42", "4294967295"] {
+            assert!(is_canonical_index(ok), "{ok} is canonical");
+        }
+        for bad in [
+            "+0",         // signed
+            "-1",         // negative
+            "007",        // leading zeros
+            "00",         //
+            "",           // empty
+            " 1",         // whitespace
+            "1 ",         //
+            "0x1",        // radix prefix
+            "1_000",      // separator
+            "४२",         // non-ASCII digits
+            "4294967296", // out of range
+        ] {
+            assert!(!is_canonical_index(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    /// The whole point of rejecting them: a non-canonical spelling must not
+    /// satisfy a path pinned to the canonical one.
+    #[test]
+    fn a_non_canonical_index_does_not_match_a_committed_account() {
+        let profile = bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1;
+        assert!(path_matches_committed_account(
+            profile,
+            "m/44'/60'/0'/0/0",
+            Some(0)
+        ));
+        for spelling in [
+            "m/44'/60'/0'/0/+0",
+            "m/44'/60'/0'/0/00",
+            "m/44'/60'/0'/0/007",
+        ] {
+            assert!(
+                !path_matches_committed_account(profile, spelling, Some(0)),
+                "{spelling} must not match the committed account"
+            );
+        }
+    }
 }

@@ -569,45 +569,17 @@ impl AccountTerms {
     }
 
     pub fn request_digest(&self) -> Result<Digest32, ProtocolError> {
+        // Hash the terms themselves. A hand-built mirror of this struct used
+        // to stand in for it, listing every field again in the same order; a
+        // field added here and forgotten there would have dropped silently
+        // out of the digest the owner's ceremony binds, with nothing to catch
+        // it. JCS canonicalises regardless of declaration order, so hashing
+        // `self` is both simpler and impossible to under-cover.
         let mut hasher = Sha256::new();
         hasher.update(ACCOUNT_TERMS_REQUEST_DOMAIN);
-        hasher.update(
-            serde_jcs::to_vec(&TermsDigestSource {
-                schema: &self.schema,
-                wallet_id: &self.wallet_id,
-                seed_profile: self.seed_profile,
-                derivation: &self.derivation,
-                retire_key_fingerprint: &self.retire_key_fingerprint,
-                path_template: &self.path_template,
-                key_spec: self.key_spec,
-                allowed_crypto_suites: &self.allowed_crypto_suites,
-                policy_version: &self.policy_version,
-                revocation_epoch: &self.revocation_epoch,
-                replay_id: &self.replay_id,
-                expires_at_ms: &self.expires_at_ms,
-                audit_purpose: &self.audit_purpose,
-            })
-            .map_err(canonical_error)?,
-        );
+        hasher.update(serde_jcs::to_vec(self).map_err(canonical_error)?);
         Ok(Digest32::from_bytes(hasher.finalize().into()))
     }
-}
-
-#[derive(Serialize)]
-struct TermsDigestSource<'a> {
-    schema: &'a Token,
-    wallet_id: &'a Token,
-    seed_profile: WalletSeedProfile,
-    derivation: &'a Option<DerivedAccountRequest>,
-    retire_key_fingerprint: &'a Option<Digest32>,
-    path_template: &'a str,
-    key_spec: KeySpec,
-    allowed_crypto_suites: &'a [CryptoSuite],
-    policy_version: &'a DecimalU64,
-    revocation_epoch: &'a DecimalU64,
-    replay_id: &'a OperationId,
-    expires_at_ms: &'a DecimalU64,
-    audit_purpose: &'a Token,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

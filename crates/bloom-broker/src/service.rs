@@ -59,6 +59,55 @@ pub struct BrokerRpcService {
     network_containment: Option<NetworkContainmentGuard>,
 }
 
+/// The wallet's seed profile, read from the key projection the Signer
+/// published rather than inferred from which fields happen to be populated.
+///
+/// A wallet with no live derived accounts is still describable: what it is
+/// shows in the derivation carried by its keys. Only genuinely
+/// unrepresentable shapes fail, and they fail by name instead of being
+/// rounded to whichever profile looks closest.
+fn seed_profile_from_key_projection(
+    public: &bloom_broker_api::WalletPublic,
+) -> Result<WalletSeedProfile, ProtocolError> {
+    let mut saw_bip32_child = false;
+    for key_ref in &public.key_refs {
+        match key_ref.derivation.as_ref() {
+            // A BIP-39 child proves the seed profile outright.
+            Some(bloom_broker_api::DerivationRef::Bip39Multicurve { .. }) => {
+                return Ok(WalletSeedProfile::Bip39MulticurveV1);
+            }
+            // A BIP-32 child means a legacy pre-BIP-39 wallet.
+            Some(bloom_broker_api::DerivationRef::Bip32Secp256k1 { .. }) => {
+                saw_bip32_child = true;
+            }
+            None => {}
+        }
+    }
+    if saw_bip32_child {
+        // Real custody, but not either Machine-facing profile. Naming it is
+        // the point: silently calling it an imported scalar would assert the
+        // wallet has no derivable seed, which is false and would mislead a
+        // migration decision.
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::BackendUnsupported,
+            "wallet uses legacy BIP-32 custody, which has no wallet.accounts projection; \
+             it must be migrated before derived accounts can be listed",
+        ));
+    }
+    match &public.root_key_ref {
+        // A root with no derived keys at all is a raw single-key import.
+        Some(_) => Ok(WalletSeedProfile::ImportedSecp256k1Scalar),
+        // No root and no derived keys: nothing to characterise. A BIP-39
+        // wallet whose children were all retired still projects its seed
+        // ref, so reaching here means the projection is incomplete.
+        None => Err(ProtocolError::new(
+            ProtocolErrorCode::BackendUnsupported,
+            "wallet projection carries neither a root key nor any derived key, \
+             so its seed profile cannot be established",
+        )),
+    }
+}
+
 impl BrokerRpcService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1478,15 +1527,14 @@ impl BrokerRpcService {
             _ => return Err(response_mismatch("wallet.derived_accounts")),
         };
         if descriptors.is_empty() {
-            // No derived accounts. Distinguish a real wallet (an imported
-            // scalar root, or a bip39 wallet whose children are all retired)
-            // from an unknown wallet via the root projection.
+            // No derived accounts, so the seed profile cannot come from a
+            // descriptor. It is still read from what the Signer projects
+            // rather than inferred from whether a root happens to exist:
+            // that inference reported a legacy BIP-32 wallet as
+            // `imported-secp256k1-scalar`, which is defined as having no
+            // derivable seed — a false statement about custody.
             let public = self.wallet_public(wallet_id.clone()).await?;
-            let seed_profile = if public.root_key_ref.is_some() {
-                WalletSeedProfile::ImportedSecp256k1Scalar
-            } else {
-                WalletSeedProfile::Bip39MulticurveV1
-            };
+            let seed_profile = seed_profile_from_key_projection(&public)?;
             return Ok(WalletAccountsPublic {
                 wallet_id,
                 seed_profile,
@@ -2510,5 +2558,95 @@ mod tests {
             .code,
             ProtocolErrorCode::UnauthenticatedPeer
         );
+    }
+
+    /// The seed profile is read from what the Signer projected, never guessed
+    /// from which fields happen to be populated. The guess this replaced
+    /// reported a legacy BIP-32 wallet as `imported-secp256k1-scalar`, which
+    /// is defined as having no derivable seed — a false custody claim, and
+    /// exactly the kind of statement a migration decision would rest on.
+    mod seed_profile_projection {
+        use super::*;
+
+        fn key_ref(
+            derivation: Option<bloom_broker_api::DerivationRef>,
+        ) -> bloom_broker_api::KeyRef {
+            bloom_broker_api::KeyRef {
+                backend: bloom_broker_api::Token::new("local").unwrap(),
+                backend_instance: bloom_broker_api::Token::new("primary").unwrap(),
+                locator: "wallet/primary/k".into(),
+                key_spec: bloom_broker_api::KeySpec::Secp256k1,
+                public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([7; 32]),
+                derivation,
+            }
+        }
+
+        fn public(
+            root: Option<bloom_broker_api::KeyRef>,
+            key_refs: Vec<bloom_broker_api::KeyRef>,
+        ) -> bloom_broker_api::WalletPublic {
+            bloom_broker_api::WalletPublic {
+                wallet_id: bloom_broker_api::Token::new("primary").unwrap(),
+                wallet_kind: bloom_broker_api::Token::new("managed").unwrap(),
+                root_key_ref: root,
+                key_refs,
+                policy_version: bloom_broker_api::DecimalU64::new(1),
+                policy_digest: bloom_broker_api::Digest32::from_bytes([1; 32]),
+                wallet_revocation_epoch: bloom_broker_api::DecimalU64::new(0),
+            }
+        }
+
+        #[test]
+        fn a_bip39_child_proves_the_profile() {
+            let child = key_ref(Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: bloom_broker_api::Token::new("seed").unwrap(),
+                profile: bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                path: "m/44'/60'/0'/0/0".into(),
+            }));
+            assert_eq!(
+                seed_profile_from_key_projection(&public(None, vec![child])).unwrap(),
+                WalletSeedProfile::Bip39MulticurveV1
+            );
+        }
+
+        #[test]
+        fn a_root_with_no_derived_keys_is_an_imported_scalar() {
+            let root = key_ref(None);
+            assert_eq!(
+                seed_profile_from_key_projection(&public(Some(root.clone()), vec![root])).unwrap(),
+                WalletSeedProfile::ImportedSecp256k1Scalar
+            );
+        }
+
+        /// The case the old inference got wrong. A legacy BIP-32 wallet has a
+        /// derivable root, so calling it an imported scalar asserts the
+        /// opposite of the truth. It is named instead.
+        #[test]
+        fn a_legacy_bip32_wallet_is_named_not_relabelled() {
+            let root = key_ref(None);
+            let child = key_ref(Some(bloom_broker_api::DerivationRef::Bip32Secp256k1 {
+                root_key_id: bloom_broker_api::Token::new("primary-root").unwrap(),
+                path: "m/44'/60'/0'/0/0".into(),
+            }));
+            let error =
+                seed_profile_from_key_projection(&public(Some(root), vec![child])).unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::BackendUnsupported);
+            assert!(
+                error.message.contains("legacy BIP-32"),
+                "the error must name the actual custody shape: {}",
+                error.message
+            );
+        }
+
+        #[test]
+        fn an_empty_projection_is_incomplete_not_bip39() {
+            let error = seed_profile_from_key_projection(&public(None, vec![])).unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::BackendUnsupported);
+            assert!(
+                error
+                    .message
+                    .contains("neither a root key nor any derived key")
+            );
+        }
     }
 }
