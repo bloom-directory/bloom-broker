@@ -896,11 +896,17 @@ impl BrokerRpcService {
         let clock = self.clock.observe(trusted_time_required)?;
         let reserved_at_ms = clock.effective_now_ms;
         self.reconcile_wallet(&terms.wallet_id).await?;
+        // Resolve the account the approval pinned to its canonical public
+        // key, so a native Solana claim can bind its fee payer to it. This is
+        // the only layer that can: authority is synchronous and journal-
+        // backed, while the account projection comes from the Signer.
+        let expected_signer_public_key = self.resolve_terms_signer_public_key(&terms).await?;
         let decision = self
             .authority
             .authorize_for_clock_profile(
                 &AuthorizationInput {
                     request: request.clone(),
+                    expected_signer_public_key,
                     reserved_at_ms,
                     observed_utc_ms: clock.observed_utc_ms,
                     monotonic_anchor_ns: clock.monotonic_anchor_ns,
@@ -1365,6 +1371,44 @@ impl BrokerRpcService {
             "Broker revocation reconciliation completed"
         );
         Ok(())
+    }
+
+    /// The canonical public key of the account named by `terms.key_ref`, when
+    /// that account is an Ed25519 child projected by the Signer.
+    ///
+    /// Returns `None` for terms whose key is not a projected Ed25519 account
+    /// — every non-Solana approval — so this stays a no-op for existing
+    /// flows. Native Solana verification refuses to proceed on `None` rather
+    /// than treating an unresolvable account as unconstrained.
+    async fn resolve_terms_signer_public_key(
+        &self,
+        terms: &bloom_broker_api::SealedApprovalTerms,
+    ) -> Result<Option<[u8; 32]>, ProtocolError> {
+        if terms.key_ref.key_spec != bloom_broker_api::KeySpec::Ed25519 {
+            return Ok(None);
+        }
+        let accounts = self.wallet_accounts(terms.wallet_id.clone()).await?;
+        let Some(account) = accounts
+            .accounts
+            .iter()
+            .find(|account| account.key_ref == terms.key_ref)
+        else {
+            return Ok(None);
+        };
+        if account.public_key_encoding != bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer {
+            return Ok(None);
+        }
+        // Canonical Ed25519 SPKI DER: a fixed 12-byte prefix then the raw key.
+        const ED25519_SPKI_PREFIX: [u8; 12] = [
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        let spki = account.canonical_public_key.decode();
+        if spki.len() != 44 || spki[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX {
+            return Ok(None);
+        }
+        let mut key = [0_u8; 32];
+        key.copy_from_slice(&spki[ED25519_SPKI_PREFIX.len()..]);
+        Ok(Some(key))
     }
 
     async fn reconcile_wallet(&self, wallet_id: &Token) -> Result<(), ProtocolError> {

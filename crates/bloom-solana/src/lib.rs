@@ -22,7 +22,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_debug_implementations)]
 
-pub mod adapter;
+pub mod artifact;
 pub mod golden;
 pub mod message;
 pub mod pubkey;

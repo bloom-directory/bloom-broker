@@ -183,7 +183,13 @@ pub fn parse_message(bytes: &[u8]) -> Result<LegacyMessage, ParseError> {
     offset += 32;
 
     let instruction_count = short_vec::read_short_vec(bytes, &mut offset)? as usize;
-    let mut instructions = Vec::with_capacity(instruction_count);
+    // `instruction_count` is attacker-controlled: a two-byte prefix can claim
+    // ~3.6 MB of instructions. The Broker's own path pre-checks message size,
+    // but `parse_message` is public and must not allocate on a claim it has
+    // not yet read. Reserve only what the remaining bytes could hold — each
+    // instruction costs at least three bytes on the wire.
+    let remaining = bytes.len().saturating_sub(offset);
+    let mut instructions = Vec::with_capacity(instruction_count.min(remaining / 3));
     for _ in 0..instruction_count {
         let program_id_index = *bytes.get(offset).ok_or(ParseError::Truncated)?;
         offset += 1;

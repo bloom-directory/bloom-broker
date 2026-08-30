@@ -1457,6 +1457,8 @@ fn native_solana_system_claim_reaches_the_compiled_verifier() {
         &message,
         claim.clone(),
         &message,
+        // The account the approval pins is the message\'s payer.
+        Some([0x01; 32]),
     );
     let decision = harness.authority.authorize(&input).unwrap();
     assert_eq!(decision.effective_assurance, Some(claim.claim_assurance));
@@ -1480,6 +1482,8 @@ fn native_solana_machine_asserted_claim_is_denied() {
         &message,
         claim,
         &message,
+        // The account the approval pins is the message\'s payer.
+        Some([0x01; 32]),
     );
 
     assert!(
@@ -1506,6 +1510,7 @@ fn native_solana_mismatched_assurance_evidence_is_denied() {
         &message,
         claim,
         b"different-message-evidence",
+        Some([0x01; 32]),
     );
 
     assert!(
@@ -1547,6 +1552,8 @@ fn native_solana_destination_outside_policy_is_denied() {
         &message,
         claim,
         &message,
+        // The account the approval pins is the message\'s payer.
+        Some([0x01; 32]),
     );
 
     assert!(
@@ -2052,8 +2059,10 @@ fn solana_input(
     message: &[u8],
     claim: SystemUseClaim,
     evidence: &[u8],
+    expected_signer_public_key: Option<[u8; 32]>,
 ) -> AuthorizationInput {
     let mut input = AuthorizationInput {
+        expected_signer_public_key,
         request: MachineSignRequest {
             operation_id,
             operation_digest: digest(5),
@@ -2137,6 +2146,7 @@ fn exact_input(
     payload: &[u8],
 ) -> AuthorizationInput {
     let mut input = AuthorizationInput {
+        expected_signer_public_key: None,
         request: MachineSignRequest {
             operation_id,
             operation_digest: digest(5),
@@ -2167,6 +2177,7 @@ fn exact_batch_input(
     payloads: &[&[u8]],
 ) -> AuthorizationInput {
     let mut input = AuthorizationInput {
+        expected_signer_public_key: None,
         request: MachineSignRequest {
             operation_id,
             operation_digest: digest(5),
@@ -2223,6 +2234,7 @@ fn petal_input(
     };
     let claim_nonce = nonce(operation_id.to_bytes()[31]);
     let mut input = AuthorizationInput {
+        expected_signer_public_key: None,
         request: MachineSignRequest {
             operation_id,
             operation_digest: digest(5),

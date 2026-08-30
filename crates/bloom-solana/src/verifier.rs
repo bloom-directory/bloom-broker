@@ -70,6 +70,8 @@ pub enum RejectionReason {
     NotNativeTransfer,
     /// The extracted destination does not match the claimed destination.
     DestinationMismatch { expected: String, actual: String },
+    /// The transfer moves no value.
+    ZeroLamports,
     /// The extracted lamports do not match the claimed debit.
     LamportsMismatch { expected: u64, actual: u64 },
     /// The computed message digest does not match the claimed digest.
@@ -225,6 +227,13 @@ fn verify_transfer_inner(
 
     let actual_lamports =
         decode_transfer_data(ix.data.as_slice()).ok_or(RejectionReason::NotNativeTransfer)?;
+    // A zero-lamport transfer moves nothing while still consuming an
+    // approval, a nonce and a signature over a real message. The constructor
+    // already refuses to build one, so accepting it here would mean the
+    // verifier admits a shape Bloom itself will not produce.
+    if actual_lamports == 0 {
+        return Err(RejectionReason::ZeroLamports);
+    }
     if actual_lamports != lamports {
         return Err(RejectionReason::LamportsMismatch {
             expected: lamports,
@@ -386,6 +395,27 @@ mod tests {
         assert!(matches!(
             verify_native_transfer(&bytes, payer, dest, 1, None).unwrap_err(),
             RejectionReason::AmbiguousAccountRole
+        ));
+    }
+
+    /// A zero-lamport transfer moves nothing while still consuming an
+    /// approval, a nonce, and a signature over a real message. The
+    /// constructor refuses to build one, so the verifier must not admit a
+    /// shape Bloom itself will not produce.
+    #[test]
+    fn zero_lamport_transfers_are_refused() {
+        // Built by hand precisely because `transfer_message` rejects zero.
+        let payer = Pubkey::from_bytes([1u8; 32]);
+        let dest = Pubkey::from_bytes([2u8; 32]);
+        let message = crate::system_transfer::transfer_message(payer, dest, 1, [7u8; 32]).unwrap();
+        let mut bytes = message.serialize();
+        // Overwrite the little-endian u64 amount in the instruction data with
+        // zero, leaving every other byte of a valid message intact.
+        let len = bytes.len();
+        bytes[len - 8..].copy_from_slice(&0u64.to_le_bytes());
+        assert!(matches!(
+            verify_native_transfer(&bytes, payer, dest, 0, None),
+            Err(RejectionReason::ZeroLamports)
         ));
     }
 }

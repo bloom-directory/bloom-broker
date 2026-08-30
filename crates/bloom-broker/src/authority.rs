@@ -204,6 +204,10 @@ pub struct CeremonyApprovalGrant {
 #[derive(Clone, Debug)]
 pub struct AuthorizationInput {
     pub request: MachineSignRequest,
+    /// Canonical public key of the account named by the approval terms,
+    /// resolved from the Signer projection before authorization. Native
+    /// Solana claims bind their fee payer to it.
+    pub expected_signer_public_key: Option<[u8; 32]>,
     pub reserved_at_ms: u64,
     pub observed_utc_ms: Option<u64>,
     pub monotonic_anchor_ns: u64,
@@ -240,10 +244,18 @@ pub struct VerifierCapability {
 pub trait AssuranceVerifier: Send + Sync {
     fn capability(&self) -> VerifierCapability;
     fn verify(&self, claim: &PetalUseClaim, evidence: Option<&[u8]>) -> Result<(), String>;
+    /// Verify a native system claim.
+    ///
+    /// `expected_signer` is the canonical public key of the account the
+    /// approval pinned, resolved from `SealedApprovalTerms::key_ref`. A
+    /// verifier that binds a payer must require it: without it the Broker
+    /// approves, reserves quota, and journals a `ProofVerified` transfer
+    /// whose debited account was never established.
     fn verify_system(
         &self,
         _claim: &SystemUseClaim,
         _evidence: Option<&[u8]>,
+        _expected_signer: Option<&[u8; 32]>,
     ) -> Result<(), String> {
         Err("verifier does not accept native system claims".to_owned())
     }
@@ -349,6 +361,7 @@ impl AssuranceRegistry {
         &self,
         claim: &SystemUseClaim,
         evidence: Option<&[u8]>,
+        expected_signer: Option<&[u8; 32]>,
     ) -> Result<Option<VerifierCapability>, AuthorityError> {
         match &claim.claim_assurance {
             ClaimAssurance::MachineAsserted => Ok(None),
@@ -388,7 +401,7 @@ impl AssuranceRegistry {
                     ));
                 }
                 verifier
-                    .verify_system(claim, Some(evidence))
+                    .verify_system(claim, Some(evidence), expected_signer)
                     .map_err(|message| denied("ASSURANCE_VERIFICATION_FAILED", message))?;
                 Ok(Some(verifier.capability()))
             }
@@ -2526,7 +2539,11 @@ impl BrokerAuthority {
             .map(Base64UrlBytes::decode);
         let capability = self
             .assurance
-            .verify_system(claim, evidence.as_deref())?
+            .verify_system(
+                claim,
+                evidence.as_deref(),
+                input.expected_signer_public_key.as_ref(),
+            )?
             .ok_or_else(|| {
                 denied(
                     "ASSURANCE_CONTRACT_INCOMPLETE",

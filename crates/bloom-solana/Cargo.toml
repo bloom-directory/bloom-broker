@@ -11,12 +11,12 @@ default = []
 [dependencies]
 sha2.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 bs58.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 ed25519-dalek.workspace = true
 solana-message = { version = "4.5.0", features = ["wincode"] }
 solana-system-interface = { version = "3.3.0", features = ["bincode"] }
