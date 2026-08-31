@@ -503,6 +503,19 @@ fn bip39_browser_import_uses_profile_to_control_serialization() {
     assert!(css.contains("[hidden]{display:none!important}"));
 }
 
+#[test]
+fn bip39_browser_export_uses_the_length_neutral_signer_format() {
+    let html = include_str!("../src/ceremony_assets/index.html");
+
+    // This value is encrypted into GenericCustodyEffect and parsed by Signer.
+    // Imported roots retain their original 12/15/18/21/24-word length, so the
+    // browser must use Signer's length-neutral token instead of the obsolete
+    // 24-word-only spelling.
+    assert!(html.contains("value=\"bip39_mnemonic\""));
+    assert!(!html.contains("bip39_mnemonic24"));
+    assert!(!html.contains("the 24 words that restore this wallet"));
+}
+
 fn digest(byte: &str) -> Digest32 {
     Digest32::new(byte.repeat(32)).unwrap()
 }
@@ -4911,9 +4924,17 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
     }
     .canonical_bytes()
     .unwrap();
+    let export_html = include_str!("../src/ceremony_assets/index.html");
+    let export_format = export_html
+        .split_once("name=\"export-format\" value=\"")
+        .expect("the shipped browser must offer an export format")
+        .1
+        .split_once('"')
+        .expect("the shipped export format must be quoted")
+        .0;
     let export_input = serde_jcs::to_vec(&serde_json::json!({
         "credential_prf": Base64UrlBytes::from_bytes(&prf),
-        "effect": {"kind": "wallet_export"}
+        "effect": {"kind": "wallet_export", "format": export_format}
     }))
     .unwrap();
     let export_envelope = seal_hpke(
@@ -4985,9 +5006,9 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
             &output_aad,
         )
         .unwrap();
-    let export_json: serde_json::Value =
-        serde_json::from_slice(plaintext.expose_to_backend()).unwrap();
-    assert_eq!(export_json["credentials"].as_array().unwrap().len(), 1);
+    let exported_mnemonic = std::str::from_utf8(plaintext.expose_to_backend()).unwrap();
+    assert_eq!(export_format, "bip39_mnemonic");
+    assert_eq!(exported_mnemonic.split_whitespace().count(), 24);
     let acknowledged = export_app
         .clone()
         .oneshot(
