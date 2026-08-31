@@ -176,6 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         CeremonyKind::WalletDelete
         | CeremonyKind::KeyDerive
         | CeremonyKind::PolicyUpdate
+        | CeremonyKind::PetalRegistration
         | CeremonyKind::WalletExport
         | CeremonyKind::BackendEnrollment => {
             let assertion = authenticator.assertion(&challenges[0].canonical_bytes()?, sign_count);
