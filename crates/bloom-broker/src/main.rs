@@ -17,6 +17,7 @@ use bloom_audit_checkpoint::{
     CheckpointError, CheckpointSink, CheckpointStore, PinnedAuditKey,
 };
 use bloom_broker::{
+    assurance_verifiers::SolanaSystemTransferVerifier,
     authority::{AssuranceRegistry, BrokerAuthority},
     ceremony::CeremonyBroker,
     clock::BrokerClock,
@@ -501,7 +502,7 @@ async fn run_with_paths(
             verifying_key(&config.signer_ceremony_public_key_hex)?,
             Token::new(config.signer_revocation_key_id.clone())?,
             verifying_key(&config.signer_revocation_public_key_hex)?,
-            AssuranceRegistry::compiled(Vec::new())?,
+            compiled_assurance_registry()?,
         )?);
         #[cfg(feature = "triad-dev-harness")]
         let provenance_catalog = match std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT") {
@@ -1666,11 +1667,30 @@ fn verifying_key(encoded: &str) -> Result<VerifyingKey, ProtocolError> {
     })
 }
 
+fn compiled_assurance_registry()
+-> Result<AssuranceRegistry, bloom_broker::authority::AuthorityError> {
+    AssuranceRegistry::compiled(vec![SolanaSystemTransferVerifier::compiled()])
+}
+
 #[cfg(test)]
 mod startup_failure_tests {
     use super::*;
     use bloom_broker_api::{ApprovalLifecycleState, BootEpoch, ReadinessState};
     use tracing_subscriber::prelude::*;
+
+    #[test]
+    fn production_registry_contains_the_digest_pinned_solana_verifier() {
+        let capabilities = compiled_assurance_registry().unwrap().capabilities();
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(
+            capabilities[0].verifier_id.as_str(),
+            bloom_broker_api::SOLANA_SYSTEM_TRANSFER_VERIFIER_ID
+        );
+        assert_eq!(
+            capabilities[0].artifact_digest.to_bytes(),
+            bloom_broker_api::SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES
+        );
+    }
 
     #[test]
     fn observability_init_fallback_is_fixed_and_sanitized() {
