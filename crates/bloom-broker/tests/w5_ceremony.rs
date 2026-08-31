@@ -362,25 +362,7 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
 
 #[test]
 fn scoped_petal_key_browser_flow_never_collects_a_namespace_grant() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
-    assert!(asset.contains("session.signer_contribution?.petal_key_scope"));
-    assert!(asset.contains("&& !scopedPetalKey"));
-    assert!(asset.contains("Boolean(scopedPetalKey)"));
-    assert!(asset.contains("if (!scopedPetalKey && !genericFields.hidden)"));
-    let run = asset
-        .split_once("async function run(session)")
-        .expect("asset must define the ceremony runner")
-        .1;
-    let definition = run
-        .find("const scopedPetalKey")
-        .expect("the runner must derive its own scoped-petal-key state");
-    let use_site = run
-        .find("if (!scopedPetalKey && !genericFields.hidden)")
-        .expect("the runner must guard generic input");
-    assert!(
-        definition < use_site,
-        "runner state must be defined before use"
-    );
+    assert_browser_closed_custody_effect("key_derive", true);
 }
 
 #[test]
@@ -1439,13 +1421,18 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             SigningKey::from_bytes(&[9; 32]).verifying_key(),
             Token::new("signer-revocation-key").unwrap(),
             SigningKey::from_bytes(&[4; 32]).verifying_key(),
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
             AssuranceRegistry::compiled(Vec::new()).unwrap(),
         )
         .unwrap(),
     );
     let ceremony = CeremonyBroker::open_with_manifest_signer(
         directory.path().join("ceremony.sqlite"),
-        Arc::new(signer_client.clone()),
+        Arc::new(LoseOneRegistrationPrepareResponse {
+            inner: signer_client.clone(),
+            lose_next_success: AtomicBool::new(true),
+        }),
         Token::new("broker-app-1").unwrap(),
         SigningKey::from_bytes(&[7; 32]),
         journal.clone(),
@@ -1485,14 +1472,14 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         "petal.registration_read",
     ] {
         assert!(
-            !capabilities
+            capabilities
                 .methods
                 .iter()
                 .any(|method| method.as_str() == name),
-            "unavailable registration method advertised: {name}"
+            "connected registration method missing: {name}"
         );
     }
-    let error = MachineBrokerService::dispatch(
+    let record = MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::PetalRegistrationRead(
             bloom_broker_api::PetalRegistrationReadRequest {
@@ -1501,8 +1488,11 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         ),
     )
     .await
-    .unwrap_err();
-    assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+    .unwrap();
+    assert!(matches!(
+        record,
+        MachineBrokerResponse::PetalRegistrationRead(None)
+    ));
 
     let adoption_observer = Arc::new(FailOnceAdoptionObserver {
         authority: authority.clone(),
@@ -2593,6 +2583,169 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         );
     }
 
+    // Registration goes through the real typed RPC and existing owner authenticator.
+    let wrong_owner =
+        registration_fixture::proposal(operation("89"), Token::new("missing-owner").unwrap());
+    let error = MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::PetalRegistrationPrepare(wrong_owner),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::ApprovalNotFound);
+    let cancelled_proposal = registration_fixture::proposal(operation("90"), wallet_id.clone());
+    let ambiguous = MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::PetalRegistrationPrepare(cancelled_proposal.clone()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(ambiguous.code, ProtocolErrorCode::ServiceUnavailable);
+
+    let MachineBrokerResponse::PetalRegistrationPrepare(
+        bloom_broker_api::PetalRegistrationPrepareResponse::AwaitingApproval {
+            terms: cancelled_terms,
+            ..
+        },
+    ) = MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::PetalRegistrationPrepare(cancelled_proposal),
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("wrong cancelled preparation")
+    };
+    let cancel_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    broker
+        .ceremony()
+        .cancel(&cancelled_terms.operation_id, cancel_now)
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2_010)).await;
+    let proposal = registration_fixture::proposal(operation("91"), wallet_id.clone());
+    let (petal_prepared, petal_receipt) = complete_registration_for_test(
+        &broker,
+        &authenticator,
+        &signer_client,
+        proposal.clone(),
+        6,
+        false,
+    )
+    .await;
+    assert_eq!(petal_prepared.terms.lineage_id, cancelled_terms.lineage_id);
+    assert_ne!(
+        petal_prepared.terms.operation_id,
+        cancelled_terms.operation_id
+    );
+    assert!(
+        authority
+            .petal_registration(&petal_prepared.terms.package_hash)
+            .unwrap()
+            .is_none()
+    );
+    let commit_registration = bloom_broker_api::PetalRegistrationCommitRequest {
+        operation_id: petal_prepared.terms.operation_id.clone(),
+        ceremony_receipt: petal_receipt,
+    };
+    let MachineBrokerResponse::PetalRegistrationCommit(registered) =
+        MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::PetalRegistrationCommit(commit_registration.clone()),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("wrong registration commit response")
+    };
+    assert_eq!(registered.approved_routes, proposal.requested_routes);
+    assert_eq!(registered.approved_routes.len(), 2);
+    let MachineBrokerResponse::PetalRegistrationCommit(replayed) = MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::PetalRegistrationCommit(commit_registration.clone()),
+    )
+    .await
+    .unwrap() else {
+        panic!("wrong registration replay response")
+    };
+    assert_eq!(
+        replayed, registered,
+        "response lost after commit must replay exactly"
+    );
+
+    let MachineBrokerResponse::PetalRegistrationPrepare(
+        bloom_broker_api::PetalRegistrationPrepareResponse::Registered {
+            registration: already_registered,
+        },
+    ) = MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::PetalRegistrationPrepare(proposal.clone()),
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("repeat install did not return committed registration")
+    };
+    assert_eq!(already_registered, registered);
+    let mut lost_proposal = registration_fixture::proposal(operation("92"), wallet_id.clone());
+    registration_fixture::change_artifact(&mut lost_proposal, 92);
+    let (lost_prepared, lost_receipt) = complete_registration_for_test(
+        &broker,
+        &authenticator,
+        &signer_client,
+        lost_proposal.clone(),
+        7,
+        true,
+    )
+    .await;
+    assert!(
+        authority
+            .petal_registration(&lost_prepared.terms.package_hash)
+            .unwrap()
+            .is_none()
+    );
+    let MachineBrokerResponse::PetalRegistrationPrepare(
+        bloom_broker_api::PetalRegistrationPrepareResponse::Registered {
+            registration: quota_retry,
+        },
+    ) = MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::PetalRegistrationPrepare(proposal.clone()),
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("quota must not block committed retry")
+    };
+    assert_eq!(quota_retry, registered);
+    let MachineBrokerResponse::PetalRegistrationRead(read_while_exhausted) =
+        MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::PetalRegistrationRead(
+                bloom_broker_api::PetalRegistrationReadRequest {
+                    package_hash: registered.terms.package_hash.clone(),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("registration read unavailable during quota exhaustion")
+    };
+    assert_eq!(read_while_exhausted, Some(registered.clone()));
+
+    assert_eq!(
+        journal
+            .audit_entries()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.event_type == "petal.registration_prepared")
+            .count(),
+        4
+    );
+
     // Reopen Signer from its durable database and use a fresh authenticated
     // transport and Broker service. The restored process retains the public
     // child and immutable scope, but correctly starts with private signing
@@ -2702,12 +2855,14 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             SigningKey::from_bytes(&[9; 32]).verifying_key(),
             Token::new("signer-revocation-key").unwrap(),
             SigningKey::from_bytes(&[4; 32]).verifying_key(),
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
             AssuranceRegistry::compiled(Vec::new()).unwrap(),
         )
         .unwrap(),
     );
     let restarted_scoped_broker = BrokerRpcService::new(
-        restarted_authority,
+        restarted_authority.clone(),
         restarted_journal.clone(),
         Arc::new(
             BrokerClock::new(
@@ -2873,6 +3028,62 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     };
     assert_eq!(signer_only_state.wallet_revocation_epoch.get(), 1);
     assert_eq!(authority.wallet_epoch(&wallet_id).unwrap(), 0);
+
+    assert_eq!(
+        restarted_authority
+            .petal_registration(&registered.terms.package_hash)
+            .unwrap(),
+        Some(registered.clone())
+    );
+    let MachineBrokerResponse::PetalRegistrationPrepare(
+        bloom_broker_api::PetalRegistrationPrepareResponse::Registered {
+            registration: recovered_prepare,
+        },
+    ) = MachineBrokerService::dispatch(
+        &restarted_scoped_broker,
+        MachineBrokerRequest::PetalRegistrationPrepare(lost_proposal),
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("completed Signer receipt must recover via repeated prepare after restart")
+    };
+    assert_eq!(recovered_prepare.terms, lost_prepared.terms);
+    let MachineBrokerResponse::PetalRegistrationCommit(recovered_registration) =
+        MachineBrokerService::dispatch(
+            &restarted_scoped_broker,
+            MachineBrokerRequest::PetalRegistrationCommit(
+                bloom_broker_api::PetalRegistrationCommitRequest {
+                    operation_id: lost_prepared.terms.operation_id,
+                    ceremony_receipt: lost_receipt,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("wrong recovered registration response")
+    };
+    assert_eq!(recovered_registration.approved_routes.len(), 2);
+    let mut native_record = petal_provenance.clone();
+    native_record.subject = ProvenanceSubject::System {
+        component_id: Token::new("fixture").unwrap(),
+        operation_class: Token::new("exchange-order").unwrap(),
+    };
+    native_record.petal_lineage = None;
+    sign_provenance(&mut native_record, &installer_key);
+    restarted_authority
+        .synchronize_provenance_catalog(&bloom_broker_api::ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![native_record],
+        })
+        .unwrap();
+    assert_eq!(
+        restarted_authority
+            .petal_registration(&registered.terms.package_hash)
+            .unwrap(),
+        Some(registered)
+    );
 
     let restarted_broker = BrokerRpcService::new(
         authority.clone(),
@@ -4782,4 +4993,332 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         .await
         .unwrap();
     assert_eq!(replay_after_ack.status(), StatusCode::FORBIDDEN);
+}
+
+#[path = "support/petal_registration.rs"]
+mod registration_fixture;
+
+async fn complete_registration_for_test(
+    broker: &BrokerRpcService,
+    authenticator: &VirtualAuthenticator,
+    signer: &BrokerSignerClient,
+    proposal: bloom_broker_api::PetalRegistrationPrepareRequest,
+    counter: u32,
+    lose_response: bool,
+) -> (PreparedRegistrationForTest, bloom_broker_api::CustodyResult) {
+    let MachineBrokerResponse::PetalRegistrationPrepare(prepared) = MachineBrokerService::dispatch(
+        broker,
+        MachineBrokerRequest::PetalRegistrationPrepare(proposal.clone()),
+    )
+    .await
+    .unwrap() else {
+        panic!("wrong registration prepare response")
+    };
+    let MachineBrokerResponse::PetalRegistrationPrepare(retry) = MachineBrokerService::dispatch(
+        broker,
+        MachineBrokerRequest::PetalRegistrationPrepare(proposal.clone()),
+    )
+    .await
+    .unwrap() else {
+        panic!("wrong retry response")
+    };
+    assert_eq!(retry, prepared);
+    let bloom_broker_api::PetalRegistrationPrepareResponse::AwaitingApproval { terms, ceremony } =
+        prepared
+    else {
+        panic!("registration unexpectedly completed")
+    };
+    let prepared = PreparedRegistrationForTest { terms, ceremony };
+    let app = broker.ceremony().router();
+    let token = url_token(&prepared.ceremony.ceremony_url);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", &token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let session: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let review = &session["review_manifest"];
+    assert_eq!(
+        review["terms"],
+        serde_json::to_value(&prepared.terms).unwrap()
+    );
+    assert_eq!(
+        review["requested_permissions"],
+        serde_json::to_value(&proposal.requested_routes).unwrap()
+    );
+    assert_eq!(
+        review["delegated_transaction_requests"]["r000001"],
+        serde_json::json!([
+            "transaction.confirm",
+            "transaction.replace",
+            "transaction.cancel"
+        ])
+    );
+    assert!(
+        review["delegated_transaction_requests"]
+            .get("r000002")
+            .is_none()
+    );
+    assert_eq!(
+        review["disclaimer"],
+        "This does not grant wallet access or approve transactions."
+    );
+    assert_eq!(review["source_verified"], false);
+    assert_eq!(
+        review["owner_wallet_role"],
+        "Authenticate this registration only"
+    );
+    if lose_response {
+        // Four reservations include the rejected owner and cancelled attempt.
+        // Failed preparations consume durable quota too; exact retries do not.
+        let mut blocked =
+            registration_fixture::proposal(operation("99"), Token::new("missing-owner").unwrap());
+        registration_fixture::change_artifact(&mut blocked, 102);
+        let error = MachineBrokerService::dispatch(
+            broker,
+            MachineBrokerRequest::PetalRegistrationPrepare(blocked),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::CeremonyRateLimited);
+        let MachineBrokerResponse::PetalRegistrationPrepare(
+            bloom_broker_api::PetalRegistrationPrepareResponse::AwaitingApproval {
+                terms,
+                ceremony,
+            },
+        ) = MachineBrokerService::dispatch(
+            broker,
+            MachineBrokerRequest::PetalRegistrationPrepare(proposal.clone()),
+        )
+        .await
+        .unwrap()
+        else {
+            panic!("quota must not block identical active retry")
+        };
+        assert_eq!(terms, prepared.terms);
+        assert_eq!(ceremony, prepared.ceremony);
+    }
+    let challenge: CeremonyChallenge =
+        serde_json::from_value(session["challenges"][0]["binding"].clone()).unwrap();
+    let contribution: CustodySignerContribution =
+        serde_json::from_value(session["signer_contribution"].clone()).unwrap();
+    let assertion = authenticator.assertion(&challenge.canonical_bytes().unwrap(), counter);
+    let aad = CustodyHpkeAad {
+        ceremony_id: contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::PetalRegistration,
+        custody_operation_id: prepared.terms.operation_id.clone(),
+        signer_nonce: contribution.signer_nonce.clone(),
+        signer_contribution_digest: contribution.digest().unwrap(),
+        wallet_id: contribution.wallet_id.clone(),
+        key_ref: None,
+        credential_id: Some(assertion.credential_id.clone()),
+        expected_input_class: Token::new("petal_registration").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+        "effect": {"kind":"petal_registration"},
+    }))
+    .unwrap();
+    let encrypted = seal_hpke(
+        &contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )
+    .unwrap();
+    let completion = CustodyCompleteRequest {
+        ceremony_kind: CeremonyKind::PetalRegistration,
+        custody_operation_id: prepared.terms.operation_id.clone(),
+        ceremony_id: contribution.ceremony_id.clone(),
+        proof: WebAuthnCeremonyProof::Assertion { assertion },
+        encrypted_input: Some(encrypted),
+        public_binding_digest: prepared.terms.digest().unwrap(),
+    };
+    let receipt: CustodyResult = if lose_response {
+        let BrokerSignerResponse::CeremonyComplete(
+            bloom_signer_api::SignerCeremonyCompleteResponse::PetalRegistration(receipt),
+        ) = signer
+            .request(BrokerSignerRequest::CeremonyComplete(
+                bloom_signer_api::SignerCeremonyCompleteRequest::PetalRegistration(Box::new(
+                    completion,
+                )),
+            ))
+            .unwrap()
+        else {
+            panic!("wrong Signer receipt")
+        };
+        *receipt
+    } else {
+        let response = app.oneshot(Request::builder().method("POST")
+            .uri(format!("/api/session/{}/complete", contribution.ceremony_id))
+            .header(header::HOST, "localhost:18734").header(header::ORIGIN, "http://localhost:18734")
+            .header("x-bloom-ceremony-token", &token).header(header::CONTENT_TYPE, "application/json").header("sec-fetch-site", "same-origin")
+            .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                "proof": completion.proof, "encrypted_input": completion.encrypted_input,
+                "public_binding_digest": completion.public_binding_digest,
+            })).unwrap())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    };
+    assert_eq!(receipt.public_key_refs.len(), 0);
+    assert!(receipt.initial_policy.is_none());
+    assert!(receipt.encrypted_browser_result.is_none());
+    let receipt = custody_result_to_machine(&receipt);
+    receipt
+        .validate_petal_registration_binding(&prepared.terms)
+        .unwrap();
+    (prepared, receipt)
+}
+
+struct PreparedRegistrationForTest {
+    terms: bloom_broker_api::PetalRegistrationTerms,
+    ceremony: bloom_broker_api::CustodyPrepareResponse,
+}
+
+#[test]
+fn browser_petal_registration_seals_only_the_closed_effect_and_renders_every_route() {
+    assert_browser_closed_custody_effect("petal_registration", false);
+}
+
+fn assert_browser_closed_custody_effect(kind: &str, scoped: bool) {
+    let executable = include_str!("../src/ceremony_assets/app.js")
+        .split_once("\nload().catch")
+        .unwrap()
+        .0;
+    let script = format!(
+        r#"
+globalThis.crypto = require("node:crypto").webcrypto;
+class Element {{ constructor() {{this.children=[]; this.hidden=true; this._text="";}} set textContent(value) {{this._text=String(value); this.children=[];}} get textContent() {{return this._text+this.children.map(child=>child.textContent).join("\n");}} append(...children) {{this.children.push(...children);}} replaceChildren(...children) {{this._text="";this.children=children;}} }}
+const elements = new Map();
+globalThis.document = {{getElementById: id => {{if (!elements.has(id)) elements.set(id,new Element()); return elements.get(id);}},createElement:()=>new Element()}};
+globalThis.location = {{hash:"",search:"",pathname:"/"}};
+globalThis.history = {{replaceState:()=>{{}}}};
+{executable}
+const review = {{title:"Requested permissions",disclaimer:"This does not grant wallet access or approve transactions.",terms:{{package_hash:"ab".repeat(32),owner_wallet_id:"owner-wallet"}},owner_wallet_role:"Authenticate this registration only", source:{{repository:"<script>untrusted</script>"}},source_disclosure:"Source information is unverified.",manifest_bounds:{{name:"fixture"}},delegated_transaction_requests:{{r000001:["transaction.confirm","transaction.replace","transaction.cancel"]}}, requested_permissions:Array.from({{length:256}},(_,index)=>({{route_id:`r${{String(index+1).padStart(6,"0")}}`,source_path:`petal/fixture/${{index}}.wasm`,capabilities:["bloom:tx.outbox"],signing_operations:[],key_derive_operations:[]}}))}};
+renderPetalRegistrationReview(review);
+for (const expected of ["Requested permissions","owner-wallet","Authenticate this registration only","r000001","r000256","transaction.replace","unverified",review.disclaimer]) {{if (!reviewNode.textContent.includes(expected)) throw new Error("review omitted "+expected);}}
+getCredential = async()=>({{rawId:new Uint8Array([1]),getClientExtensionResults:()=>({{prf:{{results:{{first:new Uint8Array(32).fill(7)}}}}}})}});
+assertionJson = ()=>({{credential_id:"AQ"}});
+clearBrowserState = async()=>{{}};
+let sealed;
+hpkeSeal = async(_key,_info,_aad,plaintext)=>{{sealed=JSON.parse(new TextDecoder().decode(plaintext));return {{opaque:true}};}};
+mutate = async(_path,body)=>{{if (!body.encrypted_input.opaque) throw new Error("missing encrypted input");return {{receipt_digest:"done"}};}};
+genericFields.hidden = false;
+genericInput.value = '{{"namespace_id":"must-not-be-collected","authority_signature":"untrusted"}}';
+run({{ceremony_kind:"{kind}", signer_contribution:{{hpke_recipient_key:encodeUrl(new Uint8Array(32)),expected_input_class:"{kind}",petal_key_scope: {scoped} ? {{}} : null}},challenges:[{{binding:{{exact_terms_digest:"11".repeat(32)}}}}]}}).then(()=>{{
+ if (canonicalJson(sealed)!==canonicalJson({{credential_prf:encodeUrl(new Uint8Array(32).fill(7)),effect:{{kind:"{kind}"}}}})) throw new Error("closed custody effect accepted generic authority input");
+ process.stdout.write("registration-browser-ok");
+}},error=>{{console.error(error);process.exit(1);}});
+"#
+    );
+    let output = Command::new("node").args(["-e", &script]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "registration-browser-ok"
+    );
+}
+
+/// Simulate loss after an actual authenticated Signer prepare, not an allow-all verifier.
+struct LoseOneRegistrationPrepareResponse {
+    inner: BrokerSignerClient,
+    lose_next_success: AtomicBool,
+}
+impl CeremonySigner for LoseOneRegistrationPrepareResponse {
+    fn prepare_petal_registration(
+        &self,
+        request: bloom_signer_api::PetalRegistrationCeremonyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
+        let prepared = self.inner.prepare_petal_registration(request, now_ms)?;
+        if self.lose_next_success.swap(false, Ordering::SeqCst) {
+            return Err(bloom_signer_api::ProtocolError::new(
+                bloom_signer_api::ProtocolErrorCode::ServiceUnavailable,
+                "injected response loss after actual Signer preparation",
+            ));
+        }
+        Ok(prepared)
+    }
+    fn complete_petal_registration(
+        &self,
+        request: CustodyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
+        self.inner.complete_petal_registration(request, now_ms)
+    }
+    fn prepare_approval(
+        &self,
+        request: CeremonyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<SignerPreparedApproval, bloom_signer_api::ProtocolError> {
+        self.inner.prepare_approval(request, now_ms)
+    }
+    fn complete_approval(
+        &self,
+        request: CeremonyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<SignerActivationReceipt, bloom_signer_api::ProtocolError> {
+        self.inner.complete_approval(request, now_ms)
+    }
+    fn prepare_custody(
+        &self,
+        request: CustodyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
+        self.inner.prepare_custody(request, now_ms)
+    }
+    fn complete_custody(
+        &self,
+        request: CustodyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
+        self.inner.complete_custody(request, now_ms)
+    }
+    fn prepare_policy_update(
+        &self,
+        request: PolicyUpdateCeremonyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
+        self.inner.prepare_policy_update(request, now_ms)
+    }
+    fn complete_policy_update(
+        &self,
+        request: PolicyUpdateCeremonyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
+        self.inner.complete_policy_update(request, now_ms)
+    }
+    fn bind_custody_output_recipient(
+        &self,
+        operation_id: &OperationId,
+        recipient_key: Base64UrlBytes,
+        now_ms: u64,
+    ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
+        self.inner
+            .bind_custody_output_recipient(operation_id, recipient_key, now_ms)
+    }
+    fn cancel(&self, operation_id: &OperationId) -> Result<(), bloom_signer_api::ProtocolError> {
+        self.inner.cancel(operation_id)
+    }
+    fn status(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<SignerCeremonyStatus, bloom_signer_api::ProtocolError> {
+        self.inner.status(operation_id)
+    }
 }

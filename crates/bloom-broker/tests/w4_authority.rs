@@ -221,6 +221,8 @@ impl Harness {
             ceremony_key.verifying_key(),
             token("revocation-key"),
             revocation_key.verifying_key(),
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
             AssuranceRegistry::compiled(verifiers).unwrap(),
         )
         .unwrap();
@@ -427,6 +429,8 @@ fn ac18_forced_authority_audit_write_failure_rolls_back_quota_effect() {
         SigningKey::from_bytes(&[3; 32]).verifying_key(),
         token("revocation-key"),
         SigningKey::from_bytes(&[4; 32]).verifying_key(),
+        Token::new("broker-app-1").unwrap(),
+        SigningKey::from_bytes(&[7; 32]).verifying_key(),
         AssuranceRegistry::compiled(vec![]).unwrap(),
     )
     .unwrap();
@@ -470,6 +474,8 @@ fn ac18_authority_reads_survive_latched_audit_tamper_while_mutations_fail() {
             SigningKey::from_bytes(&[3; 32]).verifying_key(),
             token("revocation-key"),
             SigningKey::from_bytes(&[4; 32]).verifying_key(),
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
             AssuranceRegistry::compiled(vec![]).unwrap(),
         )
         .unwrap();
@@ -546,6 +552,8 @@ fn ac18_populated_authority_migration_is_atomic_idempotent_and_retains_source() 
             SigningKey::from_bytes(&[3; 32]).verifying_key(),
             token("revocation-key"),
             SigningKey::from_bytes(&[4; 32]).verifying_key(),
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
             AssuranceRegistry::compiled(vec![]).unwrap(),
         )
         .is_err()
@@ -584,6 +592,8 @@ fn ac18_populated_authority_migration_is_atomic_idempotent_and_retains_source() 
             SigningKey::from_bytes(&[3; 32]).verifying_key(),
             token("revocation-key"),
             SigningKey::from_bytes(&[4; 32]).verifying_key(),
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
             AssuranceRegistry::compiled(vec![]).unwrap(),
         )
         .unwrap();
@@ -638,6 +648,8 @@ fn ac18_populated_authority_migration_is_atomic_idempotent_and_retains_source() 
             SigningKey::from_bytes(&[3; 32]).verifying_key(),
             token("revocation-key"),
             SigningKey::from_bytes(&[4; 32]).verifying_key(),
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
             AssuranceRegistry::compiled(vec![]).unwrap(),
         )
         .is_err()
@@ -683,6 +695,8 @@ fn active_approval_survives_broker_authority_and_journal_restart() {
             fixture.ceremony_key.verifying_key(),
             token("revocation-key"),
             fixture.revocation_key.verifying_key(),
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
             AssuranceRegistry::compiled(vec![]).unwrap(),
         )
         .expect("authority")
@@ -2152,4 +2166,357 @@ fn nonce(byte: u8) -> RequestNonce {
 
 fn error_code(error: impl ToString) -> String {
     error.to_string()
+}
+
+#[path = "support/petal_registration.rs"]
+mod registration_fixture;
+
+fn registration_receipt(
+    h: &Harness,
+    terms: &bloom_broker_api::PetalRegistrationTerms,
+) -> CustodyResult {
+    let mut receipt: CustodyResult = serde_json::from_value(serde_json::json!({
+        "ceremony_kind": "petal_registration", "custody_operation_id": terms.operation_id,
+        "public_status": "SUCCEEDED", "wallet_id": terms.owner_wallet_id,
+        "public_key_refs": [], "credential_summaries": [], "initial_policy": null,
+        "receipt_digest": "66".repeat(32), "petal_registration_terms_digest": terms.digest().unwrap(),
+        "encrypted_browser_result": null, "signer_key_id": "ceremony-key", "signer_signature": ""
+    })).unwrap();
+    receipt.signer_signature = Base64UrlBytes::from_bytes(
+        &h.ceremony_key
+            .sign(
+                &[
+                    SIGNER_RECEIPT_DOMAIN,
+                    &receipt.unsigned_canonical_bytes().unwrap(),
+                ]
+                .concat(),
+            )
+            .to_bytes(),
+    );
+    receipt
+}
+
+#[test]
+fn petal_registration_commits_complete_exact_routes_only_after_a_valid_receipt() {
+    let h = Harness::new();
+    let request =
+        registration_fixture::proposal(OperationId::from_bytes([81; 32]), h.wallet.clone());
+    let terms = h.authority.prepare_petal_registration(&request).unwrap();
+    assert!(
+        h.authority
+            .petal_registration(&terms.package_hash)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        h.authority.prepare_petal_registration(&request).unwrap(),
+        terms
+    );
+    let mut equivalent = request.clone();
+    equivalent.requested_routes.reverse();
+    equivalent.requested_routes[0]
+        .capabilities
+        .push("bloom:sign".into());
+    equivalent.evidence.file_pages[0].reverse();
+    assert_eq!(
+        h.authority.prepare_petal_registration(&equivalent).unwrap(),
+        terms,
+        "equivalent sets must be canonicalized before consent"
+    );
+    let mut same_package = request.clone();
+    same_package.operation_id = OperationId::from_bytes([82; 32]);
+    assert_eq!(
+        h.authority
+            .prepare_petal_registration(&same_package)
+            .unwrap(),
+        terms
+    );
+    let receipt = registration_receipt(&h, &terms);
+    for mutated in 0..5 {
+        let mut forged = receipt.clone();
+        match mutated {
+            0 => forged.signer_signature = Base64UrlBytes::from_bytes(&[0; 64]),
+            1 => forged.custody_operation_id = OperationId::from_bytes([83; 32]),
+            2 => {
+                forged.ceremony_kind = CeremonyKind::PolicyUpdate;
+                forged.petal_registration_terms_digest = None;
+            }
+            3 => forged.petal_registration_terms_digest = Some(digest(1)),
+            _ => forged.wallet_id = Some(token("different-owner")),
+        }
+        if mutated != 0 {
+            // These are valid Signer signatures for different terms/kinds. Only
+            // exact registration binding, rather than signature alone, rejects them.
+            forged.signer_signature = Base64UrlBytes::from_bytes(
+                &h.ceremony_key
+                    .sign(
+                        &[
+                            SIGNER_RECEIPT_DOMAIN,
+                            &forged.unsigned_canonical_bytes().unwrap(),
+                        ]
+                        .concat(),
+                    )
+                    .to_bytes(),
+            );
+        }
+        assert!(
+            h.authority
+                .commit_petal_registration(&bloom_broker_api::PetalRegistrationCommitRequest {
+                    operation_id: terms.operation_id.clone(),
+                    ceremony_receipt: forged
+                })
+                .is_err()
+        );
+        assert!(
+            h.authority
+                .petal_registration(&terms.package_hash)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let commit = bloom_broker_api::PetalRegistrationCommitRequest {
+        operation_id: terms.operation_id.clone(),
+        ceremony_receipt: receipt,
+    };
+    let record = h.authority.commit_petal_registration(&commit).unwrap();
+    assert_eq!(record.approved_routes, request.requested_routes);
+    assert_eq!(record.approved_routes.len(), 2);
+    assert_eq!(
+        h.authority.commit_petal_registration(&commit).unwrap(),
+        record
+    );
+    assert_eq!(
+        h.authority.petal_registration(&terms.package_hash).unwrap(),
+        Some(record.clone())
+    );
+    same_package.requested_routes[0].capabilities.clear();
+    assert!(
+        h.authority
+            .prepare_petal_registration(&same_package)
+            .is_err()
+    );
+    h.authority
+        .synchronize_provenance_catalog(&ProvenanceCatalog {
+            schema: PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![h.system_provenance()],
+        })
+        .unwrap();
+    assert_eq!(
+        h.authority.petal_registration(&terms.package_hash).unwrap(),
+        Some(record)
+    );
+    assert_eq!(
+        h.authority.policy_snapshot(&h.wallet).unwrap(),
+        h.policy_snapshot(1)
+    );
+}
+
+#[test]
+fn petal_registration_rejects_static_scope_and_incomplete_routes_before_reserving_identity() {
+    let h = Harness::new();
+    let request =
+        registration_fixture::proposal(OperationId::from_bytes([84; 32]), h.wallet.clone());
+    let mut invalid = request.clone();
+    invalid.requested_routes.pop();
+    assert!(h.authority.prepare_petal_registration(&invalid).is_err());
+    invalid = request.clone();
+    invalid.requested_routes[0]
+        .signing_operations
+        .push("transaction.confirm".into());
+    assert!(h.authority.prepare_petal_registration(&invalid).is_err());
+    invalid = request.clone();
+    invalid.evidence.package_hash = digest(1).to_string();
+    assert!(h.authority.prepare_petal_registration(&invalid).is_err());
+    assert!(h.authority.prepare_petal_registration(&request).is_ok());
+}
+
+#[test]
+fn petal_registration_concurrent_prepares_reserve_one_lineage_and_operation() {
+    let h = Harness::new();
+    let mut request =
+        registration_fixture::proposal(OperationId::from_bytes([85; 32]), h.wallet.clone());
+    let authority = Arc::new(h.authority);
+    let barrier = Arc::new(Barrier::new(3));
+    let mut handles = vec![];
+    for tag in [85, 86] {
+        request.operation_id = OperationId::from_bytes([tag; 32]);
+        let request = request.clone();
+        let authority = authority.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            authority.prepare_petal_registration(&request).unwrap()
+        }));
+    }
+    barrier.wait();
+    let first = handles.remove(0).join().unwrap();
+    let second = handles.remove(0).join().unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        h.journal
+            .audit_entries()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.event_type == "petal.registration_prepared")
+            .count(),
+        1
+    );
+}
+
+fn reopen_registration_authority(journal: Arc<BrokerJournal>, broker_seed: u8) -> BrokerAuthority {
+    BrokerAuthority::open_in_memory(
+        journal,
+        BTreeMap::new(),
+        token("installer-key"),
+        SigningKey::from_bytes(&[2; 32]).verifying_key(),
+        token("ceremony-key"),
+        SigningKey::from_bytes(&[3; 32]).verifying_key(),
+        token("revocation-key"),
+        SigningKey::from_bytes(&[4; 32]).verifying_key(),
+        token("broker-app-1"),
+        SigningKey::from_bytes(&[broker_seed; 32]).verifying_key(),
+        AssuranceRegistry::compiled(vec![]).unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn petal_registration_reads_reject_transplanted_database_identity_and_changed_custody_pin() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("journal.sqlite");
+    let journal = Arc::new(BrokerJournal::open(&path, Arc::new(TestAuditSigner)).unwrap());
+    let authority = reopen_registration_authority(journal.clone(), 7);
+    let h = Harness::new();
+    let request =
+        registration_fixture::proposal(OperationId::from_bytes([87; 32]), h.wallet.clone());
+    let terms = authority.prepare_petal_registration(&request).unwrap();
+    let commit = bloom_broker_api::PetalRegistrationCommitRequest {
+        operation_id: terms.operation_id.clone(),
+        ceremony_receipt: registration_receipt(&h, &terms),
+    };
+    let record = authority.commit_petal_registration(&commit).unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE petal_registration_attempts SET package_hash=?1",
+            [digest(1).as_str()],
+        )
+        .unwrap();
+    assert!(
+        authority.petal_registration(&digest(1)).is_err(),
+        "a record cannot be transplanted under another package lookup key"
+    );
+    connection
+        .execute(
+            "UPDATE petal_registration_attempts SET package_hash=?1",
+            [terms.package_hash.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE petal_registration_attempts SET operation_id=?1",
+            [OperationId::from_bytes([88; 32]).as_str()],
+        )
+        .unwrap();
+    let mut wrong_lookup = commit.clone();
+    wrong_lookup.operation_id = OperationId::from_bytes([88; 32]);
+    assert!(authority.commit_petal_registration(&wrong_lookup).is_err());
+    connection
+        .execute(
+            "UPDATE petal_registration_attempts SET operation_id=?1",
+            [terms.operation_id.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE petal_registration_identities SET lineage_id=?1",
+            [format!("pln1_{}", "b".repeat(52))],
+        )
+        .unwrap();
+    assert!(
+        authority.petal_registration(&terms.package_hash).is_err(),
+        "reserved lineage must remain consistent with signed terms"
+    );
+    connection
+        .execute(
+            "UPDATE petal_registration_identities SET lineage_id=?1",
+            [&terms.lineage_id],
+        )
+        .unwrap();
+    let original_request: String = connection
+        .query_row(
+            "SELECT request_jcs FROM petal_registration_attempts",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut reordered: serde_json::Value = serde_json::from_str(&original_request).unwrap();
+    reordered["requested_routes"]
+        .as_array_mut()
+        .unwrap()
+        .reverse();
+    connection
+        .execute(
+            "UPDATE petal_registration_attempts SET request_jcs=?1",
+            [serde_json::to_string(&reordered).unwrap()],
+        )
+        .unwrap();
+    assert!(
+        authority.petal_registration(&terms.package_hash).is_err(),
+        "stored reviewed arrays must never be normalized during verification"
+    );
+    connection
+        .execute(
+            "UPDATE petal_registration_attempts SET request_jcs=?1",
+            [&original_request],
+        )
+        .unwrap();
+    assert_eq!(
+        authority.petal_registration(&terms.package_hash).unwrap(),
+        Some(record)
+    );
+    let rotated = reopen_registration_authority(journal, 8);
+    assert!(
+        rotated
+            .petal_registration(&terms.package_hash)
+            .unwrap()
+            .is_none()
+    );
+    assert!(rotated.commit_petal_registration(&commit).is_err());
+}
+
+#[test]
+fn petal_registration_audit_failure_rolls_back_the_entire_route_commit() {
+    let fails = Arc::new(AtomicBool::new(false));
+    let journal = Arc::new(
+        BrokerJournal::open_in_memory(Arc::new(SwitchableAuditSigner(fails.clone()))).unwrap(),
+    );
+    let authority = reopen_registration_authority(journal, 7);
+    let h = Harness::new();
+    let request =
+        registration_fixture::proposal(OperationId::from_bytes([89; 32]), h.wallet.clone());
+    let terms = authority.prepare_petal_registration(&request).unwrap();
+    let commit = bloom_broker_api::PetalRegistrationCommitRequest {
+        operation_id: terms.operation_id.clone(),
+        ceremony_receipt: registration_receipt(&h, &terms),
+    };
+    fails.store(true, Ordering::SeqCst);
+    assert!(authority.commit_petal_registration(&commit).is_err());
+    assert!(
+        authority
+            .petal_registration(&terms.package_hash)
+            .unwrap()
+            .is_none()
+    );
+    fails.store(false, Ordering::SeqCst);
+    assert_eq!(
+        authority
+            .commit_petal_registration(&commit)
+            .unwrap()
+            .approved_routes,
+        request.requested_routes
+    );
 }

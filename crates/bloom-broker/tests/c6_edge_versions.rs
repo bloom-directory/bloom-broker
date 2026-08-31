@@ -101,9 +101,9 @@ fn downgrade_client_range() -> ProtocolVersionRange {
 }
 
 fn signer_downgrade_client_range() -> ProtocolVersionRange {
-    // It accepts the Signer's 1.4 hello but advertises 1.0 as its current
+    // It accepts the Signer's 1.5 hello but advertises 1.0 as its current
     // request version, allowing the server-side authority range to reject it.
-    ProtocolVersionRange::new(1, 0, 4)
+    ProtocolVersionRange::new(1, 0, bloom_signer_api::SIGNER_API_CURRENT.minor)
 }
 
 #[tokio::test]

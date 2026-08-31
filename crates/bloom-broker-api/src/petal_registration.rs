@@ -160,10 +160,15 @@ pub struct PetalRegistrationPrepareRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PetalRegistrationPrepareResponse {
-    pub terms: PetalRegistrationTerms,
-    pub ceremony: CustodyPrepareResponse,
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PetalRegistrationPrepareResponse {
+    AwaitingApproval {
+        terms: PetalRegistrationTerms,
+        ceremony: CustodyPrepareResponse,
+    },
+    Registered {
+        registration: PetalRegistration,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -208,4 +213,56 @@ impl PetalRegistration {
 #[serde(deny_unknown_fields)]
 pub struct PetalRegistrationReadRequest {
     pub package_hash: Digest32,
+}
+
+/// Check the complete static proposal, then canonicalize sets before review.
+/// This does not execute artifacts or certify Machine's metadata claims.
+pub fn canonical_petal_registration_request(
+    request: &PetalRegistrationPrepareRequest,
+) -> Result<PetalRegistrationPrepareRequest, ProtocolError> {
+    let checked = bloom_petal_package::check_package_request(
+        request.evidence.clone(),
+        request.requested_routes.clone(),
+    )
+    .map_err(|error| ProtocolError::new(ProtocolErrorCode::ClaimInvalid, error.to_string()))?;
+    let mut canonical = request.clone();
+    canonical.requested_routes = checked.routes;
+    canonical
+        .requested_routes
+        .sort_by(|a, b| a.route_id.cmp(&b.route_id));
+    for route in &mut canonical.requested_routes {
+        for set in [
+            &mut route.capabilities,
+            &mut route.signing_operations,
+            &mut route.key_derive_operations,
+        ] {
+            set.sort();
+            set.dedup();
+        }
+    }
+    let mut entries = checked
+        .evidence
+        .file_pages
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    canonical.evidence.file_pages = entries
+        .chunks(bloom_petal_package::evidence::MAX_PAGE_ENTRIES)
+        .map(|page| page.to_vec())
+        .collect();
+    Ok(canonical)
+}
+
+/// Exact UTF-8 manifest string, JCS encoded, including unverified source claims.
+pub fn petal_registration_manifest_digest(manifest_utf8: &str) -> Result<Digest32, ProtocolError> {
+    digest(b"bloom.petal-registration-manifest/v1\0", &manifest_utf8)
+}
+
+/// Exact reviewed array. Call canonical_petal_registration_request before review;
+/// never normalize a completed record while checking its commitment.
+pub fn petal_registration_permissions_digest(
+    routes: &[RequestedRoutePermission],
+) -> Result<Digest32, ProtocolError> {
+    digest(b"bloom.petal-registration-permissions/v1\0", &routes)
 }

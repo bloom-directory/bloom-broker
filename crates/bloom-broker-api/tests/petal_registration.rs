@@ -261,3 +261,54 @@ fn registration_wire_methods_preserve_operation_identity_and_read_option() {
         json!({"method":"petal.registration_read","body":null})
     );
 }
+
+#[test]
+fn prepare_response_distinguishes_registered_from_live_approval_and_rejects_old_shape() {
+    let old = json!({"terms":terms(), "ceremony":{}});
+    assert!(serde_json::from_value::<PetalRegistrationPrepareResponse>(old).is_err());
+    let response = PetalRegistrationPrepareResponse::Registered {
+        registration: PetalRegistration {
+            terms: terms(),
+            approved_routes: vec![],
+            ceremony_receipt: receipt(),
+            registration_digest: Digest32::from_bytes([9; 32]),
+        },
+    };
+    let mut wire = serde_json::to_value(&response).unwrap();
+    assert_eq!(wire["state"], "registered");
+    assert_eq!(
+        serde_json::from_value::<PetalRegistrationPrepareResponse>(wire.clone()).unwrap(),
+        response
+    );
+    wire["ceremony"] = json!({});
+    assert!(serde_json::from_value::<PetalRegistrationPrepareResponse>(wire).is_err());
+}
+
+#[test]
+fn manifest_and_permission_digest_vectors_preserve_exact_reviewed_bytes() {
+    assert_eq!(
+        petal_registration_manifest_digest("name = \"example\"\n")
+            .unwrap()
+            .as_str(),
+        "e76d053cafd46042e531d86d72cc34658bc2da279151592c57872bb2b750838d"
+    );
+    let routes: Vec<RequestedRoutePermission> = serde_json::from_value(json!([{"route_id": "r000001", "source_path": "petal/example/action.tx.wasm", "capabilities": ["bloom:tx.outbox"], "signing_operations": [], "key_derive_operations": []}])).unwrap();
+    let original = petal_registration_permissions_digest(&routes).unwrap();
+    assert_eq!(
+        original.as_str(),
+        "43f441d1d7a8e913dadd2ccfb24a7a5ee8bfcecb1cf1cc25ff156ed847bd610f"
+    );
+    let mut duplicated = routes.clone();
+    duplicated[0].capabilities.push("bloom:tx.outbox".into());
+    assert_ne!(
+        petal_registration_permissions_digest(&duplicated).unwrap(),
+        original
+    );
+    assert_ne!(
+        petal_registration_manifest_digest("name = \"example\"\n ").unwrap(),
+        petal_registration_manifest_digest("name = \"example\"\n").unwrap()
+    );
+    assert!(!BROKER_API_RANGE.contains(ProtocolVersion::new(1, 4)));
+    assert!(BROKER_API_RANGE.contains(ProtocolVersion::new(1, 5)));
+    assert!(!BROKER_API_RANGE.contains(ProtocolVersion::new(1, 6)));
+}

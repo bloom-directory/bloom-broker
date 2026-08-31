@@ -257,6 +257,35 @@ async function ensureNewCredentialPrf(session, credential, confirmPhase) {
   return {prf: result, assertion: assertionJson(confirmation)};
 }
 
+function renderPetalRegistrationReview(review) {
+  const node = (tag, text) => {
+    const element = document.createElement(tag);
+    element.textContent = text;
+    return element;
+  };
+  reviewNode.replaceChildren(
+    node("h3", "Requested permissions"),
+    node("p", review.disclaimer),
+    node("p", `Package hash: ${review.terms.package_hash}`),
+    node("p", `Owner wallet: ${review.terms.owner_wallet_id} — ${review.owner_wallet_role}`),
+    node("p", review.source_disclosure),
+    node("pre", review.source ? JSON.stringify(review.source, null, 2) : "No source information provided.")
+  );
+  // No truncation: each exact approved route remains separately inspectable.
+  for (const route of review.requested_permissions) {
+    const details = document.createElement("details");
+    details.append(
+      node("summary", `${route.route_id}: ${route.source_path}`),
+      node("pre", `Capabilities: ${route.capabilities.join(", ") || "none"}\nDirect signing requests: ${route.signing_operations.join(", ") || "none"}\nKey derivation requests: ${route.key_derive_operations.join(", ") || "none"}\nDelegated transaction requests: ${(review.delegated_transaction_requests[route.route_id] || []).join(", ") || "none"}`)
+    );
+    reviewNode.append(details);
+  }
+  const bounds = document.createElement("details");
+  bounds.append(node("summary", "Static manifest bounds and exact registration terms"),
+    node("pre", JSON.stringify({manifest_bounds: review.manifest_bounds, terms: review.terms, review_digest: review.review_digest}, null, 2)));
+  reviewNode.append(bounds);
+}
+
 async function load() {
   await cryptoSelfTest();
   await purgeExpiredBrowserState();
@@ -294,7 +323,11 @@ async function load() {
           ceremony_kind: session.ceremony_kind,
           signer_contribution: session.signer_contribution
         }));
-  reviewNode.replaceChildren(pre);
+  if (session.ceremony_kind === "petal_registration") {
+    renderPetalRegistrationReview(session.review_manifest);
+  } else {
+    reviewNode.replaceChildren(pre);
+  }
   recoveryFields.hidden = session.ceremony_kind !== "wallet_recovery";
   const typedInputKinds = new Set([
     "wallet_import", "key_derive"
@@ -441,11 +474,11 @@ async function run(session) {
     if (!credentialPrf) throw new Error("This passkey did not return required PRF output");
     const genericKinds = new Set([
       "wallet_export", "wallet_delete",
-      "backend_enrollment", "key_derive", "policy_update"
+      "backend_enrollment", "key_derive", "policy_update", "petal_registration"
     ]);
     if (genericKinds.has(kind)) {
       let effect = {kind};
-      if (!scopedPetalKey && !genericFields.hidden) {
+      if (kind !== "petal_registration" && !scopedPetalKey && !genericFields.hidden) {
         const supplied = JSON.parse(genericInput.value);
         if (!supplied || Array.isArray(supplied) || typeof supplied !== "object") {
           throw new Error("Custody input must be a JSON object");

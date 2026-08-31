@@ -1,3 +1,4 @@
+mod petal_registration;
 use crate::{
     authority::PolicyAuthorityDiff,
     journal::BrokerJournal,
@@ -371,6 +372,30 @@ pub trait CeremonySigner: Send + Sync {
         now_ms: u64,
     ) -> Result<CustodyResult, SignerProtocolError>;
 
+    fn prepare_petal_registration(
+        &self,
+        request: bloom_signer_api::PetalRegistrationCeremonyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<SignerPreparedCustody, SignerProtocolError> {
+        let _ = (request, now_ms);
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::BackendUnsupported,
+            "typed Petal registration is not implemented by this Signer seam",
+        ))
+    }
+
+    fn complete_petal_registration(
+        &self,
+        request: CustodyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<CustodyResult, SignerProtocolError> {
+        let _ = (request, now_ms);
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::BackendUnsupported,
+            "typed Petal registration is not implemented by this Signer seam",
+        ))
+    }
+
     fn prepare_policy_update(
         &self,
         request: PolicyUpdateCeremonyPrepareRequest,
@@ -736,7 +761,9 @@ impl CeremonyBroker {
             .map_err(signer_error_to_machine)?;
         if matches!(
             request.ceremony_kind,
-            CeremonyKind::SealedApproval | CeremonyKind::PolicyUpdate
+            CeremonyKind::SealedApproval
+                | CeremonyKind::PolicyUpdate
+                | CeremonyKind::PetalRegistration
         ) {
             return Err(kind_mismatch());
         }
@@ -2161,6 +2188,23 @@ async fn complete_session(
                     proof: body.proof,
                     contribution,
                     encrypted_local_prf: body.encrypted_input,
+                },
+                unix_time_ms(),
+            )
+            .map_err(signer_error_to_machine)
+            .and_then(|receipt| serde_json::to_value(receipt).map_err(malformed))
+    } else if ceremony_kind == CeremonyKind::PetalRegistration {
+        broker
+            .inner
+            .signer
+            .complete_petal_registration(
+                CustodyCompleteRequest {
+                    ceremony_kind,
+                    custody_operation_id: operation_id.clone(),
+                    ceremony_id: projection.ceremony_id.clone(),
+                    proof: body.proof,
+                    encrypted_input: body.encrypted_input,
+                    public_binding_digest: body.public_binding_digest,
                 },
                 unix_time_ms(),
             )

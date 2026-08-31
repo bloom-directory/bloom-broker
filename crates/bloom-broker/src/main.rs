@@ -501,6 +501,8 @@ async fn run_with_paths(
             verifying_key(&config.signer_ceremony_public_key_hex)?,
             Token::new(config.signer_revocation_key_id.clone())?,
             verifying_key(&config.signer_revocation_public_key_hex)?,
+            Token::new(config.broker_signing_key_id.clone())?,
+            broker_signing_key.verifying_key(),
             AssuranceRegistry::compiled(Vec::new())?,
         )?);
         #[cfg(feature = "triad-dev-harness")]

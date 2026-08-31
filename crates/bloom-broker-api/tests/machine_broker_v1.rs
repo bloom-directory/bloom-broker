@@ -447,16 +447,16 @@ where
 #[test]
 fn existing_machine_broker_variants_keep_frozen_v1_frames() {
     // Registration contracts have independent vectors in petal_registration.rs;
-    // these historical frame digests must remain unchanged.
+    // the hello/capability aggregates below pin the connected exact 1.5 range.
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "bb59de7ed5b9ca2d968fbd678795365002bc526d09cc77e429bcb68c7ff939b7",
+        "3bee1fa949245af9fa0a07d3c8fc0f5086d36d47310128ebbce5d539ff683a01",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "5163c785f7f6579ccace3dd93d233b96e61e2bd20658fb094b3a3a38f5e728cb",
+        "2c7165815cab163c7e8607d27551d8395373e66308b225f31903e04d565825e6",
     );
 }
 

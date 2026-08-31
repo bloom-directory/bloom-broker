@@ -1,3 +1,4 @@
+mod petal_registration;
 use crate::journal::{
     BrokerJournal, BudgetLimits, JournalError, ReservationRequest, SlidingBudgetLimit,
     SlidingValueLimit,
@@ -351,6 +352,7 @@ pub struct BrokerAuthority {
     revocation_key_id: Token,
     revocation_key: VerifyingKey,
     assurance: AssuranceRegistry,
+    enrollment_digest: Digest32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -373,6 +375,8 @@ impl BrokerAuthority {
         ceremony_key: VerifyingKey,
         revocation_key_id: Token,
         revocation_key: VerifyingKey,
+        broker_signing_key_id: Token,
+        broker_signing_key: VerifyingKey,
         assurance: AssuranceRegistry,
     ) -> Result<Self, AuthorityError> {
         Self::from_connection(
@@ -385,6 +389,8 @@ impl BrokerAuthority {
             ceremony_key,
             revocation_key_id,
             revocation_key,
+            broker_signing_key_id,
+            broker_signing_key,
             assurance,
         )
     }
@@ -399,6 +405,8 @@ impl BrokerAuthority {
         ceremony_key: VerifyingKey,
         revocation_key_id: Token,
         revocation_key: VerifyingKey,
+        broker_signing_key_id: Token,
+        broker_signing_key: VerifyingKey,
         assurance: AssuranceRegistry,
     ) -> Result<Self, AuthorityError> {
         Self::from_connection(
@@ -411,6 +419,8 @@ impl BrokerAuthority {
             ceremony_key,
             revocation_key_id,
             revocation_key,
+            broker_signing_key_id,
+            broker_signing_key,
             assurance,
         )
     }
@@ -426,8 +436,17 @@ impl BrokerAuthority {
         ceremony_key: VerifyingKey,
         revocation_key_id: Token,
         revocation_key: VerifyingKey,
+        broker_signing_key_id: Token,
+        broker_signing_key: VerifyingKey,
         assurance: AssuranceRegistry,
     ) -> Result<Self, AuthorityError> {
+        let enrollment_digest = bloom_broker_api::petal_registration_enrollment_digest(
+            &broker_signing_key_id,
+            &broker_signing_key,
+            &ceremony_key_id,
+            &ceremony_key,
+        )
+        .map_err(storage)?;
         let connection = journal.shared_connection();
         {
             let mut connection = connection
@@ -478,6 +497,7 @@ impl BrokerAuthority {
             );
             ",
             )?;
+            petal_registration::initialize(&connection)?;
             migrate_legacy_authority(&mut connection, &legacy_connection, &journal)?;
         }
         let mut policy_keys = policy_keys;
@@ -506,6 +526,7 @@ impl BrokerAuthority {
             revocation_key_id,
             revocation_key,
             assurance,
+            enrollment_digest,
         })
     }
 
@@ -734,6 +755,10 @@ impl BrokerAuthority {
                     "Signer custody receipt signature is invalid",
                 )
             })?;
+
+        if receipt.ceremony_kind == bloom_broker_api::CeremonyKind::PetalRegistration {
+            return self.complete_petal_registration(receipt);
+        }
 
         if receipt.ceremony_kind == bloom_broker_api::CeremonyKind::WalletDelete {
             let wallet_id = receipt.wallet_id.as_ref().ok_or_else(|| {
