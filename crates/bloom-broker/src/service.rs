@@ -131,6 +131,12 @@ impl BrokerRpcService {
             Request::BrokerCapabilities(_) => {
                 Ok(Response::BrokerCapabilities(self.capabilities()?))
             }
+            Request::PetalRegistrationPrepare(_)
+            | Request::PetalRegistrationCommit(_)
+            | Request::PetalRegistrationRead(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                "Petal registration is not available",
+            )),
             Request::ActionValidate(digest) => Ok(Response::ActionValidate(digest)),
             Request::SealedApprovalPrepare(request) => Ok(Response::SealedApprovalPrepare(
                 self.prepare_approval(request).await?,
@@ -1470,6 +1476,14 @@ impl BrokerRpcService {
             protocol_minor_max: bloom_broker_api::BROKER_API_MINOR_MAX,
             methods: MachineBrokerMethod::ALL
                 .iter()
+                .filter(|method| {
+                    !matches!(
+                        method,
+                        MachineBrokerMethod::PetalRegistrationPrepare
+                            | MachineBrokerMethod::PetalRegistrationCommit
+                            | MachineBrokerMethod::PetalRegistrationRead
+                    )
+                })
                 .map(|method| Token::new(method.as_str()))
                 .collect::<Result<_, _>>()?,
             schemas: vec![Token::new(RPC_ENVELOPE_SCHEMA_V1)?],

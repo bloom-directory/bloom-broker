@@ -621,6 +621,7 @@ fn custody_result_to_machine(value: &CustodyResult) -> bloom_broker_api::Custody
             CeremonyKind::BackendEnrollment => bloom_broker_api::CeremonyKind::BackendEnrollment,
             CeremonyKind::KeyDerive => bloom_broker_api::CeremonyKind::KeyDerive,
             CeremonyKind::PolicyUpdate => bloom_broker_api::CeremonyKind::PolicyUpdate,
+            CeremonyKind::PetalRegistration => bloom_broker_api::CeremonyKind::PetalRegistration,
         }
     }
     fn state(value: bloom_signer_api::CeremonyState) -> CeremonyState {
@@ -670,6 +671,7 @@ fn custody_result_to_machine(value: &CustodyResult) -> bloom_broker_api::Custody
         }
     }
     bloom_broker_api::CustodyResult {
+        petal_registration_terms_digest: value.petal_registration_terms_digest.clone(),
         ceremony_kind: kind(value.ceremony_kind),
         custody_operation_id: value.custody_operation_id.clone(),
         public_status: state(value.public_status),
@@ -1151,6 +1153,7 @@ impl CeremonySigner for MockSigner {
         }
         self.completions.fetch_add(1, Ordering::SeqCst);
         Ok(CustodyResult {
+            petal_registration_terms_digest: None,
             ceremony_kind: request.ceremony_kind,
             custody_operation_id: request.custody_operation_id,
             public_status: request.ceremony_kind.successful_terminal_state().unwrap(),
@@ -1468,6 +1471,39 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         "test",
     )
     .unwrap();
+    let MachineBrokerResponse::BrokerCapabilities(capabilities) = MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::BrokerCapabilities(bloom_broker_api::Empty {}),
+    )
+    .await
+    .unwrap() else {
+        panic!("wrong capabilities response");
+    };
+    for name in [
+        "petal.registration_prepare",
+        "petal.registration_commit",
+        "petal.registration_read",
+    ] {
+        assert!(
+            !capabilities
+                .methods
+                .iter()
+                .any(|method| method.as_str() == name),
+            "unavailable registration method advertised: {name}"
+        );
+    }
+    let error = MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::PetalRegistrationRead(
+            bloom_broker_api::PetalRegistrationReadRequest {
+                package_hash: digest("e1"),
+            },
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+
     let adoption_observer = Arc::new(FailOnceAdoptionObserver {
         authority: authority.clone(),
         custody_attempts: AtomicUsize::new(0),
@@ -1704,6 +1740,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         ProtocolErrorCode::OperationIdConflict
     );
     let premature = CustodyResult {
+        petal_registration_terms_digest: None,
         ceremony_kind: CeremonyKind::PolicyUpdate,
         custody_operation_id: update.operation_id.clone(),
         public_status: bloom_signer_api::CeremonyState::Succeeded,

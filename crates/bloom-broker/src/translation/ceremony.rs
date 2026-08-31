@@ -17,6 +17,7 @@ pub(crate) fn kind_to_signer(value: north::CeremonyKind) -> south::CeremonyKind 
         north::CeremonyKind::BackendEnrollment => south::CeremonyKind::BackendEnrollment,
         north::CeremonyKind::KeyDerive => south::CeremonyKind::KeyDerive,
         north::CeremonyKind::PolicyUpdate => south::CeremonyKind::PolicyUpdate,
+        north::CeremonyKind::PetalRegistration => south::CeremonyKind::PetalRegistration,
     }
 }
 
@@ -34,6 +35,7 @@ pub(crate) fn kind_to_machine(value: south::CeremonyKind) -> north::CeremonyKind
         south::CeremonyKind::BackendEnrollment => north::CeremonyKind::BackendEnrollment,
         south::CeremonyKind::KeyDerive => north::CeremonyKind::KeyDerive,
         south::CeremonyKind::PolicyUpdate => north::CeremonyKind::PolicyUpdate,
+        south::CeremonyKind::PetalRegistration => north::CeremonyKind::PetalRegistration,
     }
 }
 
@@ -74,6 +76,7 @@ mod tests {
             north::CeremonyKind::BackendEnrollment,
             north::CeremonyKind::KeyDerive,
             north::CeremonyKind::PolicyUpdate,
+            north::CeremonyKind::PetalRegistration,
         ];
         for kind in kinds {
             assert_eq!(kind_to_machine(kind_to_signer(kind)), kind);

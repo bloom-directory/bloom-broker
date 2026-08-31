@@ -424,7 +424,9 @@ impl CeremonySigner for BrokerSignerClient {
             CeremonyKind::CredentialRemove => BrokerSignerRequest::CredentialRemovePrepare(request),
             CeremonyKind::BackendEnrollment => BrokerSignerRequest::KeyEnrollPrepare(request),
             CeremonyKind::KeyDerive => BrokerSignerRequest::KeyDerivePrepare(request),
-            CeremonyKind::SealedApproval | CeremonyKind::PolicyUpdate => {
+            CeremonyKind::SealedApproval
+            | CeremonyKind::PolicyUpdate
+            | CeremonyKind::PetalRegistration => {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::CeremonyKindMismatch,
                     "custody kind has no matching prepare method",

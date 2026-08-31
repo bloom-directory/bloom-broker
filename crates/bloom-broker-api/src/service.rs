@@ -329,6 +329,12 @@ pub enum MachineBrokerRequest {
     OperationStatus(OperationRequest),
     #[serde(rename = "operation.cancel")]
     OperationCancel(OperationRequest),
+    #[serde(rename = "petal.registration_prepare")]
+    PetalRegistrationPrepare(crate::PetalRegistrationPrepareRequest),
+    #[serde(rename = "petal.registration_commit")]
+    PetalRegistrationCommit(crate::PetalRegistrationCommitRequest),
+    #[serde(rename = "petal.registration_read")]
+    PetalRegistrationRead(crate::PetalRegistrationReadRequest),
     #[serde(rename = "policy.read")]
     PolicyRead(WalletRequest),
     #[serde(rename = "policy.validate_update")]
@@ -412,6 +418,12 @@ pub enum MachineBrokerResponse {
     OperationStatus(OperationPublicStatus),
     #[serde(rename = "operation.cancel")]
     OperationCancel(OperationPublicStatus),
+    #[serde(rename = "petal.registration_prepare")]
+    PetalRegistrationPrepare(crate::PetalRegistrationPrepareResponse),
+    #[serde(rename = "petal.registration_commit")]
+    PetalRegistrationCommit(crate::PetalRegistration),
+    #[serde(rename = "petal.registration_read")]
+    PetalRegistrationRead(Option<crate::PetalRegistration>),
     #[serde(rename = "policy.read")]
     PolicyRead(SignedPolicySnapshot),
     #[serde(rename = "policy.validate_update")]
@@ -478,6 +490,7 @@ pub fn is_read_only_method(method: &Token) -> bool {
         || method.ends_with(".list")
         || method.ends_with(".list_public")
         || method.ends_with(".get_public")
+        || method == "petal.registration_read"
         || method == "revocation.state"
         || method == "sealed_approval.limit_state"
         || method == "key.derivation_capabilities"
@@ -500,6 +513,8 @@ impl crate::TypedRequestMethod for MachineBrokerRequest {
             Request::OperationStatus(request)
             | Request::OperationCancel(request)
             | Request::CustodyResult(request) => Some(request.operation_id.clone()),
+            Request::PetalRegistrationPrepare(request) => Some(request.operation_id.clone()),
+            Request::PetalRegistrationCommit(request) => Some(request.operation_id.clone()),
             Request::PolicyValidateUpdate(request) => Some(request.operation_id.clone()),
             Request::PolicyCommitUpdate(request) => Some(request.operation_id.clone()),
             Request::WalletRegistrationPrepare(request)
