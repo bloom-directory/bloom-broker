@@ -482,7 +482,8 @@ fn bip39_browser_import_uses_profile_to_control_serialization() {
     // profile from whichever property the operator supplied.
     assert!(run.contains("if (bip39Import)"));
     assert!(run.contains("const mnemonic = mnemonicInput.value"));
-    assert!(run.contains("Enter your 12 or 24 word recovery phrase"));
+    assert!(run.contains("[12, 15, 18, 21, 24].includes(count)"));
+    assert!(run.contains("Enter a 12, 15, 18, 21, or 24 word recovery phrase"));
     assert!(run.contains("credential_prf: encodeUrl(prf.prf),\n          mnemonic\n"));
     assert!(!run.contains("passphrase:"));
     assert!(!run.contains("passphraseInput"));

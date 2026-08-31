@@ -745,8 +745,8 @@ async function run(session) {
       if (bip39Import) {
         const mnemonic = mnemonicInput.value.trim().toLowerCase().split(/\s+/).join(" ");
         const count = mnemonic ? mnemonic.split(" ").length : 0;
-        if (count !== 12 && count !== 24) {
-          throw new Error("Enter your 12 or 24 word recovery phrase");
+        if (![12, 15, 18, 21, 24].includes(count)) {
+          throw new Error("Enter a 12, 15, 18, 21, or 24 word recovery phrase");
         }
         secret = te.encode(canonicalJson({
           credential_prf: encodeUrl(prf.prf),
