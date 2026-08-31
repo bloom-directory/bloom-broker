@@ -397,6 +397,10 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
             "ceremony shell omitted {required}"
         );
     }
+    assert!(
+        !shell.contains("<style>"),
+        "the ceremony shell must not contain CSP-blocked inline styles"
+    );
 
     let stylesheet = include_str!("../src/ceremony_assets/style.css");
     for required in [
@@ -499,7 +503,6 @@ fn bip39_browser_import_uses_profile_to_control_serialization() {
     // import profile must stay hidden despite label styling.
     assert!(!html.contains("passphrase-input"));
     assert!(!html.contains("passphrase-label"));
-    assert!(html.contains("[hidden]{display:none!important}"));
     assert!(css.contains("[hidden]{display:none!important}"));
 }
 
