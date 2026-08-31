@@ -1009,6 +1009,53 @@ async fn account_allocate_retire_replay_cancel_restart_over_real_transport() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_solana_allocation_adopts_successive_accounts_over_real_transport() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut stack = account_stack(directory.path(), "automatic-solana").await;
+    let authenticator = VirtualAuthenticator::generate();
+    let wallet_id = Token::new("successive-solana").unwrap();
+    register_bip39_wallet(&mut stack, &wallet_id, &authenticator, None).await;
+
+    for account in 0..2 {
+        let wallet = wallet_public(&stack, &wallet_id).await;
+        let operation = stack.next_operation();
+        let terms = allocation_terms(
+            &wallet,
+            DerivedAccountRequest {
+                derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                requested_role: Token::new("solana-account").unwrap(),
+                account: None,
+            },
+            operation,
+        );
+        let request = allocate_request(&wallet_id, terms);
+        let prepared = match MachineBrokerService::dispatch(
+            stack.broker.as_ref(),
+            MachineBrokerRequest::AccountAllocatePrepare(request.clone()),
+        )
+        .await
+        .unwrap()
+        {
+            MachineBrokerResponse::AccountAllocatePrepare(prepared) => prepared,
+            response => panic!("unexpected allocate response: {response:?}"),
+        };
+        complete_generic_ceremony(&stack, &request, &prepared, &authenticator, account + 2).await;
+    }
+
+    let accounts = wallet_accounts(&stack, &wallet_id).await;
+    let mut solana_paths = accounts
+        .accounts
+        .iter()
+        .filter(|account| {
+            account.derivation_profile == DerivationProfile::Bip44SolanaSlip10Ed25519V1
+        })
+        .map(|account| account.path.as_str())
+        .collect::<Vec<_>>();
+    solana_paths.sort_unstable();
+    assert_eq!(solana_paths, ["m/44'/501'/0'/0'", "m/44'/501'/1'/0'"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_passkeys_and_recovery_unlock_the_same_bip39_root_over_real_transport() {
     let directory = tempfile::tempdir().unwrap();
     let mut stack = account_stack(directory.path(), "r1").await;

@@ -2882,33 +2882,50 @@ fn migrate_legacy_authority(
     Ok(())
 }
 
-/// The allocated path must be the profile's frozen template instantiated at
-/// exactly the committed account index. The terminal index is reserved by
-/// Signer and therefore free, but the account is human-approved and pinned.
+/// The allocated path must match the profile's frozen template. An explicit
+/// account is pinned exactly. An omitted EVM account means account zero, while
+/// an omitted Solana account delegates selection of the next canonical account
+/// to Signer's authoritative derivation registry.
 fn path_matches_committed_account(
     profile: bloom_broker_api::DerivationProfile,
     path: &str,
     committed_account: Option<u32>,
 ) -> bool {
-    let committed = committed_account.unwrap_or(0);
-    let template = profile
-        .path_template()
-        .replace("<account>'", &format!("{committed}'"));
+    let account = match (committed_account, profile) {
+        (Some(account), _) => Some(account),
+        (None, bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1) => Some(0),
+        (None, bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1) => None,
+    };
+    let template = profile.path_template();
     let expected: Vec<&str> = template.split('/').collect();
     let segments: Vec<&str> = path.split('/').collect();
     if segments.len() != expected.len() {
         return false;
     }
     for (actual, expected) in segments.iter().zip(expected.iter()) {
-        if *expected == "<index>" {
-            if !is_canonical_index(actual) {
-                return false;
-            }
-        } else if actual != expected {
-            return false;
+        match *expected {
+            "<account>'" => match account {
+                Some(account) if *actual != format!("{account}'") => return false,
+                None if !is_canonical_hardened_index(actual) => return false,
+                _ => {}
+            },
+            "<index>" if !is_canonical_index(actual) => return false,
+            "<index>" => {}
+            _ if actual != expected => return false,
+            _ => {}
         }
     }
     true
+}
+
+fn is_canonical_hardened_index(segment: &str) -> bool {
+    let Some(index) = segment.strip_suffix('\'') else {
+        return false;
+    };
+    is_canonical_index(index)
+        && index
+            .parse::<u32>()
+            .is_ok_and(|index| index < (1_u32 << 31))
 }
 
 /// A BIP-44 index segment in canonical form: plain ASCII digits, no sign, no
@@ -3426,5 +3443,35 @@ mod path_index_tests {
                 "{spelling} must not match the committed account"
             );
         }
+    }
+
+    #[test]
+    fn automatic_solana_accounts_accept_only_canonical_signer_allocations() {
+        let profile = bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1;
+        for account in [0, 1, 42, (1_u32 << 31) - 1] {
+            assert!(path_matches_committed_account(
+                profile,
+                &format!("m/44'/501'/{account}'/0'"),
+                None,
+            ));
+        }
+        for path in [
+            "m/44'/501'/+1'/0'",
+            "m/44'/501'/01'/0'",
+            "m/44'/501'/2147483648'/0'",
+            "m/44'/501'/1/0'",
+        ] {
+            assert!(!path_matches_committed_account(profile, path, None));
+        }
+        assert!(path_matches_committed_account(
+            profile,
+            "m/44'/501'/0'/0'",
+            Some(0),
+        ));
+        assert!(!path_matches_committed_account(
+            profile,
+            "m/44'/501'/1'/0'",
+            Some(0),
+        ));
     }
 }
