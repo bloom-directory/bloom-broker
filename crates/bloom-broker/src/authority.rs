@@ -7,9 +7,9 @@ use bloom_broker_api::{
     ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
     ApprovalTombstone, Base64UrlBytes, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite,
     CustodyResult, DeclaredFee, Digest32, KeyRef, MachineSignRequest, OperationId,
-    PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope, PetalUseClaim, PolicyUpdateRequest,
-    ProtocolErrorCode, RevocationState, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
-    Token,
+    PETAL_OUTBOX_OPERATION_CLASSES, PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope,
+    PetalUseClaim, PolicyUpdateRequest, ProtocolErrorCode, ResolvedProvenance, RevocationState,
+    SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads, Token,
 };
 pub use bloom_broker_api::{CanonicalWalletPolicy, PolicyDestination, RequiredVerifier};
 pub use bloom_broker_api::{
@@ -858,52 +858,113 @@ impl BrokerAuthority {
             package_hash: scope.package_hash.clone(),
             route: scope.route.clone(),
         };
-        let record = self.catalog_provenance(&subject)?;
-        let record_digest = record.digest().map_err(storage)?;
-        verify_provenance(
-            &record,
-            &self.installer_key_id,
-            &self.installer_key,
-            &record_digest,
-        )?;
-        let lineage = record.petal_lineage.as_ref().ok_or_else(|| {
-            denied(
-                "PROVENANCE_LINEAGE_MISSING",
-                "Petal package has no installer-verified lineage membership",
-            )
-        })?;
-        if !lineage.active || lineage.lineage_id != scope.lineage_id {
-            return Err(denied(
-                "PROVENANCE_LINEAGE_MISMATCH",
-                "Petal package is not the active member of the requested lineage",
-            ));
-        }
-        if !policy.allowed_petal_packages.contains(&scope.package_hash)
-            && !lineage
-                .predecessor_package_hashes
-                .iter()
-                .any(|predecessor| policy.allowed_petal_packages.contains(predecessor))
-        {
-            return Err(denied(
-                "PROVENANCE_MISMATCH",
-                "wallet policy permits neither this Petal package nor a signed predecessor",
-            ));
-        }
-        if !scope.allowed_routes.contains(&scope.route)
-            || scope
-                .allowed_operation_classes
-                .iter()
-                .any(|operation_class| {
-                    !record
-                        .operation_classes
+        let resolved = self.resolve_provenance(&subject)?;
+        match &resolved {
+            ResolvedProvenance::Installer(record) => {
+                let lineage = record.petal_lineage.as_ref().ok_or_else(|| {
+                    denied(
+                        "PROVENANCE_LINEAGE_MISSING",
+                        "Petal package has no installer-verified lineage membership",
+                    )
+                })?;
+                if !lineage.active || lineage.lineage_id != scope.lineage_id {
+                    return Err(denied(
+                        "PROVENANCE_LINEAGE_MISMATCH",
+                        "Petal package is not the active member of the requested lineage",
+                    ));
+                }
+                if !policy.allowed_petal_packages.contains(&scope.package_hash)
+                    && !lineage
+                        .predecessor_package_hashes
                         .iter()
-                        .any(|declared| &declared.operation_class == operation_class)
-                })
-        {
-            return Err(denied(
-                "PROVENANCE_CLASS_MISMATCH",
-                "Petal key routes or operation classes exceed installer-signed provenance",
-            ));
+                        .any(|predecessor| policy.allowed_petal_packages.contains(predecessor))
+                {
+                    return Err(denied(
+                        "PROVENANCE_MISMATCH",
+                        "wallet policy permits neither this Petal package nor a signed predecessor",
+                    ));
+                }
+                if !scope.allowed_routes.contains(&scope.route)
+                    || scope
+                        .allowed_operation_classes
+                        .iter()
+                        .any(|operation_class| {
+                            !record
+                                .operation_classes
+                                .iter()
+                                .any(|declared| &declared.operation_class == operation_class)
+                        })
+                {
+                    return Err(denied(
+                        "PROVENANCE_CLASS_MISMATCH",
+                        "Petal key routes or operation classes exceed installer-signed provenance",
+                    ));
+                }
+            }
+            ResolvedProvenance::OwnerRegistered { registration, .. } => {
+                if registration.terms.lineage_id != scope.lineage_id {
+                    return Err(denied(
+                        "PROVENANCE_LINEAGE_MISMATCH",
+                        "registered package has a different lineage",
+                    ));
+                }
+                if !policy.allowed_petal_packages.contains(&scope.package_hash) {
+                    return Err(denied(
+                        "PROVENANCE_MISMATCH",
+                        "wallet policy does not permit this exact registered package",
+                    ));
+                }
+                let origin = resolved.owner_route().map_err(storage)?;
+                if !scope.allowed_routes.contains(&scope.route)
+                    || scope.allowed_operation_classes.iter().any(|class| {
+                        !origin
+                            .key_derive_operations
+                            .iter()
+                            .any(|allowed| allowed == class.as_str())
+                    })
+                {
+                    return Err(denied(
+                        "PROVENANCE_CLASS_MISMATCH",
+                        "key scope exceeds the origin's registered derivation ceiling",
+                    ));
+                }
+                let mut covered = BTreeSet::new();
+                for route in &scope.allowed_routes {
+                    let target = ResolvedProvenance::OwnerRegistered {
+                        registration: registration.clone(),
+                        route_id: route.clone(),
+                    };
+                    let signing = target
+                        .operation_classes()
+                        .map_err(|error| denied("PROVENANCE_CLASS_MISMATCH", error.to_string()))?;
+                    let granted: BTreeSet<_> = scope
+                        .allowed_operation_classes
+                        .iter()
+                        .filter(|class| {
+                            signing.iter().any(|entry| &entry.operation_class == *class)
+                        })
+                        .cloned()
+                        .collect();
+                    if route != &scope.route && granted.is_empty() {
+                        return Err(denied(
+                            "PROVENANCE_CLASS_MISMATCH",
+                            "requested target has no signing grant within the key ceiling",
+                        ));
+                    }
+                    covered.extend(granted);
+                }
+                if covered.is_empty()
+                    || scope
+                        .allowed_operation_classes
+                        .iter()
+                        .any(|class| !covered.contains(class))
+                {
+                    return Err(denied(
+                        "PROVENANCE_CLASS_MISMATCH",
+                        "registered target grants do not cover the requested key classes",
+                    ));
+                }
+            }
         }
 
         let scope_digest = scope.digest().map_err(storage)?;
@@ -1147,18 +1208,45 @@ impl BrokerAuthority {
         route: &str,
         allowed_operation_classes: &[Token],
     ) -> Result<(), AuthorityError> {
-        let provenance = self.catalog_provenance(&ProvenanceSubject::Petal {
+        if package_hash != &scope.package_hash
+            && self.petal_registration(&scope.package_hash)?.is_some()
+        {
+            return Err(denied(
+                "PROVENANCE_LINEAGE_MISMATCH",
+                "an owner-registered derived key cannot move to another package hash",
+            ));
+        }
+        let provenance = self.resolve_provenance(&ProvenanceSubject::Petal {
             package_hash: package_hash.clone(),
             route: route.to_owned(),
         })?;
-        let active_lineage = provenance.petal_lineage.as_ref().is_some_and(|membership| {
-            membership.active && membership.lineage_id == scope.lineage_id
-        });
-        let declared_classes: BTreeSet<_> = provenance
-            .operation_classes
+        let active_lineage = match &provenance {
+            ResolvedProvenance::Installer(record) => {
+                record.petal_lineage.as_ref().is_some_and(|membership| {
+                    membership.active && membership.lineage_id == scope.lineage_id
+                })
+            }
+            ResolvedProvenance::OwnerRegistered { registration, .. } => {
+                package_hash == &scope.package_hash
+                    && registration.terms.lineage_id == scope.lineage_id
+            }
+        };
+        let classes = provenance.operation_classes().map_err(storage)?;
+        let declared_classes: BTreeSet<_> = classes
             .iter()
             .map(|declared| &declared.operation_class)
             .collect();
+        // An inert derivation origin cannot become an exact signing target.
+        if matches!(provenance, ResolvedProvenance::OwnerRegistered { .. })
+            && !declared_classes
+                .iter()
+                .any(|class| scope.allowed_operation_classes.contains(class))
+        {
+            return Err(denied(
+                "PROVENANCE_CLASS_MISMATCH",
+                "route has no signing grant within the derived-key ceiling",
+            ));
+        }
         if !active_lineage
             || allowed_operation_classes
                 .iter()
@@ -1230,14 +1318,9 @@ impl BrokerAuthority {
                 "approval epoch differs from Broker's reconciled wallet epoch",
             ));
         }
-        let record = self.catalog_provenance(&subject_for(&terms.subject))?;
-        verify_provenance(
-            &record,
-            &self.installer_key_id,
-            &self.installer_key,
-            &terms.provenance_digest,
-        )?;
-        if !provenance_subject_matches(&terms.subject, &record.subject) {
+        let record = self.resolve_provenance(&subject_for(&terms.subject))?;
+        verify_resolved_digest(&record, &terms.provenance_digest)?;
+        if !provenance_subject_matches(&terms.subject, &record.subject()) {
             return Err(denied(
                 "PROVENANCE_MISMATCH",
                 "provenance subject differs from the approval subject",
@@ -1256,8 +1339,8 @@ impl BrokerAuthority {
                 ..
             } = &terms.selector
             {
-                let declared: BTreeSet<_> = record
-                    .operation_classes
+                let classes = record.operation_classes().map_err(storage)?;
+                let declared: BTreeSet<_> = classes
                     .iter()
                     .map(|entry| entry.operation_class.as_str())
                     .collect();
@@ -1267,22 +1350,17 @@ impl BrokerAuthority {
                 {
                     return Err(denied(
                         "PROVENANCE_CLASS_MISMATCH",
-                        "approval class is absent from installer-signed provenance",
+                        "approval class is absent from verified route provenance",
                     ));
                 }
                 for grant in route_grants {
-                    let granted = self.catalog_provenance(&ProvenanceSubject::Petal {
+                    let granted = self.resolve_provenance(&ProvenanceSubject::Petal {
                         package_hash: package_hash.clone(),
                         route: grant.route.clone(),
                     })?;
-                    verify_provenance(
-                        &granted,
-                        &self.installer_key_id,
-                        &self.installer_key,
-                        &grant.provenance_digest,
-                    )?;
-                    let granted_classes: BTreeSet<_> = granted
-                        .operation_classes
+                    verify_resolved_digest(&granted, &grant.provenance_digest)?;
+                    let classes = granted.operation_classes().map_err(storage)?;
+                    let granted_classes: BTreeSet<_> = classes
                         .iter()
                         .map(|entry| entry.operation_class.as_str())
                         .collect();
@@ -1293,13 +1371,17 @@ impl BrokerAuthority {
                     {
                         return Err(denied(
                             "PROVENANCE_CLASS_MISMATCH",
-                            "route grant class is absent from installer-signed provenance",
+                            "route grant class is absent from verified route provenance",
                         ));
                     }
                 }
             }
         }
-        let provenance_jcs = serde_jcs::to_string(&record).map_err(storage)?;
+        let provenance_jcs = match &record {
+            ResolvedProvenance::Installer(record) => serde_jcs::to_string(record),
+            ResolvedProvenance::OwnerRegistered { .. } => serde_jcs::to_string(&record),
+        }
+        .map_err(storage)?;
         if let Some(predecessor) = &terms.renewal_of {
             let predecessor_terms = self
                 .approval_terms(predecessor)?
@@ -1781,7 +1863,7 @@ impl BrokerAuthority {
             .iter()
             .map(|payload| suite_hash(input.request.crypto_suite, payload))
             .collect();
-        let current_provenance = self.catalog_provenance(&input.request.provenance)?;
+        let current_provenance = self.resolve_provenance(&input.request.provenance)?;
         let multi_route = matches!(
             &terms.selector,
             ApprovalSelector::Petal { route_grants, .. } if !route_grants.is_empty()
@@ -1804,30 +1886,25 @@ impl BrokerAuthority {
         } else {
             terms.provenance_digest.clone()
         };
-        verify_provenance(
-            &current_provenance,
-            &self.installer_key_id,
-            &self.installer_key,
-            &expected_provenance_digest,
-        )?;
+        verify_resolved_digest(&current_provenance, &expected_provenance_digest)?;
         if !multi_route && current_provenance != self.frozen_provenance_for(&terms)? {
             return Err(denied(
                 "PROVENANCE_MISMATCH",
-                "current installer catalog record differs from the approval-frozen record",
+                "current provenance differs from the approval-frozen record",
             ));
         }
         let subject_matches = if multi_route {
             matches!(
-                (&terms.subject, &current_provenance.subject),
+                (&terms.subject, &current_provenance.subject()),
                 (
                     ApprovalSubject::Petal { package_hash, .. },
                     ProvenanceSubject::Petal { package_hash: current_hash, .. }
                 ) if package_hash == current_hash
             )
         } else {
-            provenance_subject_matches(&terms.subject, &current_provenance.subject)
+            provenance_subject_matches(&terms.subject, &current_provenance.subject())
         };
-        if current_provenance.subject != input.request.provenance || !subject_matches {
+        if current_provenance.subject() != input.request.provenance || !subject_matches {
             return Err(denied(
                 "PROVENANCE_MISMATCH",
                 "current provenance differs from the frozen approval record",
@@ -1850,6 +1927,16 @@ impl BrokerAuthority {
                     ));
                 }
                 match claim {
+                    None if matches!(
+                        current_provenance,
+                        ResolvedProvenance::OwnerRegistered { .. }
+                    ) =>
+                    {
+                        return Err(denied(
+                            "PETAL_CLAIM_REQUIRED",
+                            "owner-registered exact signing requires an operation-class claim",
+                        ));
+                    }
                     None => (BTreeMap::new(), None, None),
                     Some(claim) => {
                         let ApprovalSubject::Petal {
@@ -1870,10 +1957,22 @@ impl BrokerAuthority {
                             ));
                         }
                         let declared_classes: Vec<_> = current_provenance
-                            .operation_classes
+                            .operation_classes()
+                            .map_err(storage)?
                             .iter()
                             .map(|entry| entry.operation_class.clone())
                             .collect();
+                        if let Some((scope, _)) = self.scoped_key_record(&terms.key_ref)? {
+                            if !scope
+                                .allowed_operation_classes
+                                .contains(&claim.operation_class)
+                            {
+                                return Err(denied(
+                                    "PETAL_KEY_SCOPE_MISMATCH",
+                                    "claim class exceeds the derived-key ceiling",
+                                ));
+                            }
+                        }
                         self.validate_petal_claim(
                             &terms,
                             &policy,
@@ -2478,7 +2577,7 @@ impl BrokerAuthority {
     fn frozen_provenance_for(
         &self,
         terms: &SealedApprovalTerms,
-    ) -> Result<ProvenanceRecord, AuthorityError> {
+    ) -> Result<ResolvedProvenance, AuthorityError> {
         let approval_id = terms
             .approval_id()
             .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?;
@@ -2487,7 +2586,50 @@ impl BrokerAuthority {
             .ok_or_else(|| denied("APPROVAL_NOT_FOUND", "approval has no durable record"))?
             .provenance_jcs
             .ok_or_else(|| denied("PROVENANCE_REQUIRED", "approval has no frozen provenance"))
-            .and_then(|value| serde_json::from_str(&value).map_err(storage))
+            .and_then(|value| {
+                serde_json::from_str(&value)
+                    .or_else(|_| {
+                        serde_json::from_str::<ProvenanceRecord>(&value)
+                            .map(ResolvedProvenance::Installer)
+                    })
+                    .map_err(storage)
+            })
+    }
+
+    fn resolve_provenance(
+        &self,
+        subject: &ProvenanceSubject,
+    ) -> Result<ResolvedProvenance, AuthorityError> {
+        if let ProvenanceSubject::Petal {
+            package_hash,
+            route,
+        } = subject
+        {
+            if let Some(registration) = self.petal_registration(package_hash)? {
+                let resolved = ResolvedProvenance::OwnerRegistered {
+                    registration,
+                    route_id: route.clone(),
+                };
+                resolved
+                    .owner_route()
+                    .map_err(|error| denied("PROVENANCE_MISMATCH", error.to_string()))?;
+                return Ok(resolved);
+            }
+        }
+        let record = self.catalog_provenance(subject)?;
+        verify_provenance(
+            &record,
+            &self.installer_key_id,
+            &self.installer_key,
+            &record.digest().map_err(storage)?,
+        )?;
+        if &record.subject != subject {
+            return Err(denied(
+                "PROVENANCE_MISMATCH",
+                "catalog record differs from its lookup subject",
+            ));
+        }
+        Ok(ResolvedProvenance::Installer(record))
     }
 
     fn catalog_provenance(
@@ -2735,6 +2877,19 @@ fn enroll_policy_key_from_snapshot(
     Ok(())
 }
 
+fn verify_resolved_digest(
+    record: &ResolvedProvenance,
+    expected: &Digest32,
+) -> Result<(), AuthorityError> {
+    if &record.digest().map_err(storage)? != expected {
+        return Err(denied(
+            "PROVENANCE_MISMATCH",
+            "approval provenance digest does not match verified route",
+        ));
+    }
+    Ok(())
+}
+
 fn verify_provenance(
     record: &ProvenanceRecord,
     expected_key_id: &Token,
@@ -2931,10 +3086,10 @@ fn establishes_authority_fields(capability: &VerifierCapability) -> bool {
 fn account_claim_values(
     terms: &SealedApprovalTerms,
     claim: &PetalUseClaim,
-    provenance: &ProvenanceRecord,
+    provenance: &ResolvedProvenance,
 ) -> Result<BTreeMap<String, bloom_broker_api::DecimalU256>, AuthorityError> {
-    let class = provenance
-        .operation_classes
+    let classes = provenance.operation_classes().map_err(storage)?;
+    let class = classes
         .iter()
         .find(|entry| entry.operation_class == claim.operation_class)
         .ok_or_else(|| denied("PROVENANCE_CLASS_MISMATCH", "claim class is not catalogued"))?;
@@ -2946,7 +3101,41 @@ fn account_claim_values(
             debit.amount.as_str(),
         )?;
     }
-    match (&class.fee_asset, &claim.declared_fee) {
+    let mut expected_fee = class.fee_asset.clone();
+    if matches!(provenance, ResolvedProvenance::OwnerRegistered { .. })
+        && matches!(terms.selector, ApprovalSelector::Exact { .. })
+        && claim.crypto_suite == CryptoSuite::Secp256k1Keccak256Recoverable
+        && PETAL_OUTBOX_OPERATION_CLASSES.contains(&claim.operation_class.as_str())
+        && provenance
+            .owner_route()
+            .map_err(storage)?
+            .capabilities
+            .iter()
+            .any(|cap| cap == "bloom:tx.outbox")
+    {
+        let mut native = terms
+            .limits
+            .value_limits
+            .iter()
+            .filter(|limit| limit.asset.asset == "native");
+        let fee = native.next().ok_or_else(|| {
+            denied(
+                "FEE_REQUIRED",
+                "registered outbox exact approval requires one native fee limit",
+            )
+        })?;
+        if native.next().is_some() {
+            return Err(denied(
+                "FEE_ASSET_MISMATCH",
+                "registered outbox exact approval has multiple native fee assets",
+            ));
+        }
+        expected_fee = Some(PolicyAsset {
+            chain: fee.asset.chain.clone(),
+            asset: fee.asset.asset.clone(),
+        });
+    }
+    match (&expected_fee, &claim.declared_fee) {
         (None, DeclaredFee::None) => {}
         (
             Some(expected),

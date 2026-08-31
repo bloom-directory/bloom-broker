@@ -2520,3 +2520,194 @@ fn petal_registration_audit_failure_rolls_back_the_entire_route_commit() {
         request.requested_routes
     );
 }
+
+fn register_for_authorization(h: &Harness) -> bloom_broker_api::PetalRegistration {
+    let proposal = registration_fixture::proposal(operation(201), token("registration-owner"));
+    let terms = h.authority.prepare_petal_registration(&proposal).unwrap();
+    h.authority
+        .commit_petal_registration(&bloom_broker_api::PetalRegistrationCommitRequest {
+            operation_id: terms.operation_id.clone(),
+            ceremony_receipt: registration_receipt(h, &terms),
+        })
+        .unwrap()
+}
+
+fn registered_digest(registration: &bloom_broker_api::PetalRegistration, route: &str) -> Digest32 {
+    let bytes = serde_jcs::to_vec(&serde_json::json!({
+        "registration_digest": registration.registration_digest,
+        "route_id": route,
+    }))
+    .unwrap();
+    Digest32::from_bytes(
+        Sha256::digest([b"bloom.owner-petal-route/v1".as_slice(), &bytes].concat()).into(),
+    )
+}
+
+fn allow_registered_package(h: &Harness, registration: &bloom_broker_api::PetalRegistration) {
+    let mut snapshot = h.policy_snapshot(2);
+    let mut policy: CanonicalWalletPolicy =
+        serde_json::from_slice(&snapshot.canonical_policy.decode()).unwrap();
+    policy.allowed_petal_packages = vec![registration.terms.package_hash.clone()];
+    let canonical = serde_jcs::to_vec(&policy).unwrap();
+    snapshot.policy_digest = Digest32::from_bytes(Sha256::digest(&canonical).into());
+    snapshot.canonical_policy = Base64UrlBytes::from_bytes(&canonical);
+    sign_zeroed(
+        &mut snapshot,
+        |value| &mut value.signer_signature,
+        POLICY_DOMAIN,
+        &h.policy_key,
+    );
+    h.authority.install_policy(&snapshot).unwrap();
+}
+
+fn registered_approval(
+    h: &Harness,
+    registration: &bloom_broker_api::PetalRegistration,
+) -> SealedApprovalTerms {
+    let mut terms = exact_terms(h, b"transfer");
+    let snapshot = h.authority.policy_snapshot(&h.wallet).unwrap();
+    terms.policy_digest = snapshot.policy_digest;
+    terms.policy_version = snapshot.version;
+    terms.subject = ApprovalSubject::Petal {
+        package_hash: registration.terms.package_hash.clone(),
+        route: "r000002".into(),
+        agent_id: None,
+    };
+    terms.provenance_digest = registered_digest(registration, "r000002");
+    terms.selector = ApprovalSelector::Petal {
+        package_hash: registration.terms.package_hash.clone(),
+        route: "r000002".into(),
+        allowed_operation_classes: vec![token("example.sign")],
+        route_grants: vec![
+            PetalRouteGrant {
+                route: "r000001".into(),
+                allowed_operation_classes: vec![token("transaction.confirm")],
+                provenance_digest: registered_digest(registration, "r000001"),
+            },
+            PetalRouteGrant {
+                route: "r000002".into(),
+                allowed_operation_classes: vec![token("example.sign")],
+                provenance_digest: registered_digest(registration, "r000002"),
+            },
+        ],
+        required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+    };
+    terms.limits.max_operations = DecimalU64::new(2);
+    terms.limits.max_signatures = DecimalU64::new(2);
+    terms
+}
+
+fn registered_input(
+    h: &Harness,
+    terms: &SealedApprovalTerms,
+    route: &str,
+    class: &str,
+    op: u8,
+) -> AuthorizationInput {
+    let mut input = petal_input(
+        terms,
+        &h.provenance(),
+        operation(op),
+        terms.allowed_crypto_suites[0],
+    );
+    let ApprovalSubject::Petal { package_hash, .. } = &terms.subject else {
+        panic!("Petal terms required")
+    };
+    input.request.provenance = ProvenanceSubject::Petal {
+        package_hash: package_hash.clone(),
+        route: route.into(),
+    };
+    let claim = input.request.petal_use_claim.as_mut().unwrap();
+    claim.package_hash = package_hash.clone();
+    claim.route = route.into();
+    claim.operation_class = token(class);
+    claim.declared_fee = DeclaredFee::None;
+    claim.declared_debits.clear();
+    bind_operation_digest(&mut input, terms);
+    input
+}
+
+#[test]
+fn owner_registered_routes_require_exact_policy_and_scoped_approval() {
+    let h = Harness::new();
+    let registration = register_for_authorization(&h);
+    let without_policy = registered_approval(&h, &registration);
+    assert!(
+        h.authority
+            .prepare_approval(&without_policy, &digest(7))
+            .is_err(),
+        "registration owner authentication is not wallet eligibility"
+    );
+    allow_registered_package(&h, &registration);
+    let terms = registered_approval(&h, &registration);
+    let mut bad_digest = terms.clone();
+    bad_digest.provenance_digest = digest(255);
+    assert!(
+        h.authority
+            .prepare_approval(&bad_digest, &digest(7))
+            .is_err()
+    );
+    let mut bad_grant = terms.clone();
+    if let ApprovalSelector::Petal { route_grants, .. } = &mut bad_grant.selector {
+        route_grants[0].allowed_operation_classes = vec![token("example.sign")];
+    }
+    assert!(
+        h.authority
+            .prepare_approval(&bad_grant, &digest(7))
+            .is_err()
+    );
+    let approval_id = h.authority.prepare_approval(&terms, &digest(7)).unwrap();
+    let input = registered_input(&h, &terms, "r000002", "example.sign", 202);
+    assert!(
+        h.authority.authorize(&input).is_err(),
+        "registration receipt cannot sign without approved terms"
+    );
+    h.authority
+        .activate_approval(&h.signed_grant(&terms, approval_id, operation(202)), 1500)
+        .unwrap();
+    for (route, class, op) in [
+        ("missing", "example.sign", 210),
+        ("r000001", "example.sign", 211),
+        ("r000002", "transaction.confirm", 212),
+    ] {
+        assert!(
+            h.authority
+                .authorize(&registered_input(&h, &terms, route, class, op))
+                .is_err()
+        );
+    }
+    let mut wrong_hash = input.clone();
+    if let ProvenanceSubject::Petal { package_hash, .. } = &mut wrong_hash.request.provenance {
+        *package_hash = digest(255);
+    }
+    assert!(h.authority.authorize(&wrong_hash).is_err());
+    let mut expired = input.clone();
+    expired.reserved_at_ms = 2001;
+    assert!(h.authority.authorize(&expired).is_err());
+    let mut renewal = terms.clone();
+    renewal.request_nonce = nonce(222);
+    renewal.renewal_of = Some(terms.approval_id().unwrap());
+    h.authority.prepare_approval(&renewal, &digest(7)).unwrap();
+    h.authority.authorize(&input).unwrap();
+    h.authority
+        .authorize(&registered_input(
+            &h,
+            &terms,
+            "r000001",
+            "transaction.confirm",
+            203,
+        ))
+        .unwrap();
+    assert!(
+        h.authority
+            .authorize(&registered_input(
+                &h,
+                &terms,
+                "r000002",
+                "example.sign",
+                204
+            ))
+            .is_err(),
+        "count exhaustion remains enforced"
+    );
+}

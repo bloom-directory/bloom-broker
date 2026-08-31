@@ -2714,7 +2714,14 @@ fn review_disclosures(
         || matches!(
             request.terms.selector,
             bloom_signer_api::ApprovalSelector::Petal { .. }
-        ) && assurance.is_none();
+        ) && assurance.is_none()
+        || matches!(
+            request.terms.subject,
+            bloom_signer_api::ApprovalSubject::Petal { .. }
+        ) && matches!(
+            request.terms.selector,
+            bloom_signer_api::ApprovalSelector::Exact { .. }
+        );
     if machine_asserted {
         disclosures.push(
             "The displayed limits are asserted by the named Petal. Bloom does not verify them against the payload, and a compromised Petal or Machine can consume the full remaining capacity."

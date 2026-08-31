@@ -10,7 +10,7 @@ pub const PROVENANCE_RECORD_SIGNATURE_DOMAIN: &[u8] = b"bloom-provenance-record/
 pub const PROVENANCE_CATALOG_SCHEMA: &str = "bloom.provenance-catalog.1";
 
 /// Trusted runtime subject assertion supplied by authenticated Machine.
-/// Broker resolves this subject against its own installer-signed catalog; the
+/// Broker resolves this subject against verified installer records or owner registrations; the
 /// Machine never supplies a record or signature for Broker to accept.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -78,6 +78,123 @@ pub struct ProvenanceFeeAsset {
 pub struct ProvenanceCatalog {
     pub schema: String,
     pub records: Vec<ProvenanceRecord>,
+}
+
+/// Provenance resolved from a real installer record or committed owner consent.
+/// This projection is not proof verification; Broker verifies the selected source.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResolvedProvenance {
+    Installer(ProvenanceRecord),
+    OwnerRegistered {
+        registration: crate::PetalRegistration,
+        route_id: String,
+    },
+}
+
+pub const OWNER_PETAL_ROUTE_DOMAIN: &[u8] = b"bloom.owner-petal-route/v1";
+pub const PETAL_OUTBOX_OPERATION_CLASSES: [&str; 3] = [
+    "transaction.confirm",
+    "transaction.replace",
+    "transaction.cancel",
+];
+
+impl ResolvedProvenance {
+    pub fn subject(&self) -> ProvenanceSubject {
+        match self {
+            Self::Installer(record) => record.subject.clone(),
+            Self::OwnerRegistered {
+                registration,
+                route_id,
+            } => ProvenanceSubject::Petal {
+                package_hash: registration.terms.package_hash.clone(),
+                route: route_id.clone(),
+            },
+        }
+    }
+
+    pub fn digest(&self) -> Result<Digest32, ProtocolError> {
+        match self {
+            Self::Installer(record) => record.digest(),
+            Self::OwnerRegistered {
+                registration,
+                route_id,
+            } => {
+                self.owner_route()?;
+                if registration.registration_digest != registration.digest()? {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ProvenanceMismatch,
+                        "owner registration digest differs from its committed record",
+                    ));
+                }
+                #[derive(Serialize)]
+                struct RouteDigest<'a> {
+                    registration_digest: &'a Digest32,
+                    route_id: &'a str,
+                }
+                let bytes = serde_jcs::to_vec(&RouteDigest {
+                    registration_digest: &registration.registration_digest,
+                    route_id,
+                })
+                .map_err(|error| {
+                    ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string())
+                })?;
+                let mut hasher = Sha256::new();
+                hasher.update(OWNER_PETAL_ROUTE_DOMAIN);
+                hasher.update(bytes);
+                Ok(Digest32::from_bytes(hasher.finalize().into()))
+            }
+        }
+    }
+
+    pub fn owner_route(&self) -> Result<&crate::RequestedRoutePermission, ProtocolError> {
+        match self {
+            Self::OwnerRegistered {
+                registration,
+                route_id,
+            } => registration
+                .approved_routes
+                .iter()
+                .find(|route| &route.route_id == route_id),
+            Self::Installer(_) => None,
+        }
+        .ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::ProvenanceMismatch,
+                "route is absent from the owner-approved registration",
+            )
+        })
+    }
+
+    pub fn operation_classes(&self) -> Result<Vec<ProvenanceOperationClass>, ProtocolError> {
+        match self {
+            Self::Installer(record) => Ok(record.operation_classes.clone()),
+            Self::OwnerRegistered { .. } => {
+                let route = self.owner_route()?;
+                let mut classes: std::collections::BTreeSet<_> = route
+                    .signing_operations
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                if route
+                    .capabilities
+                    .iter()
+                    .any(|cap| cap == "bloom:tx.outbox")
+                {
+                    classes.extend(PETAL_OUTBOX_OPERATION_CLASSES);
+                }
+                classes
+                    .into_iter()
+                    .map(|class| {
+                        Ok(ProvenanceOperationClass {
+                            operation_class: Token::new(class)?,
+                            fee_asset: None,
+                        })
+                    })
+                    .collect()
+            }
+        }
+    }
 }
 
 impl ProvenanceRecord {
