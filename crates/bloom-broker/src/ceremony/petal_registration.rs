@@ -23,13 +23,21 @@ impl CeremonyBroker {
         // No authority/database mutex is held across a Signer call or owner interaction.
         let _admission = self.inner.creation_admission.lock();
         let mut existing = authority
-            .existing_petal_registration_terms(&request)
+            .existing_petal_registration_candidate(&request)
             .map_err(authority_error)?;
         if let Some(terms) = &existing {
+            let (mut proposal, _) = authority
+                .petal_registration_proposal(&terms.operation_id)
+                .map_err(authority_error)?;
+            proposal.operation_id = request.operation_id.clone();
+            let same_proposal = proposal == request;
             if let Some(registration) = authority
                 .petal_registration(&terms.package_hash)
                 .map_err(authority_error)?
             {
+                if !same_proposal {
+                    return Err(operation_conflict());
+                }
                 return Ok(PetalRegistrationPrepareResponse::Registered { registration });
             }
             match self
@@ -45,6 +53,11 @@ impl CeremonyBroker {
                             ceremony_receipt: result_to_machine(*receipt),
                         })
                         .map_err(authority_error)?;
+                    // Recover the original approved consent even when the caller
+                    // proposes different terms. Approval can never be replaced.
+                    if !same_proposal {
+                        return Err(operation_conflict());
+                    }
                     return Ok(PetalRegistrationPrepareResponse::Registered { registration });
                 }
                 SignerCeremonyStatus::CompletedApproval(_) => return Err(kind_mismatch()),
@@ -58,6 +71,9 @@ impl CeremonyBroker {
                     existing = None;
                 }
                 SignerCeremonyStatus::Pending => {}
+            }
+            if existing.is_some() && !same_proposal {
+                return Err(operation_conflict());
             }
         }
         if existing.is_none() {

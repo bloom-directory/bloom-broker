@@ -84,19 +84,36 @@ impl BrokerAuthority {
         Ok(terms)
     }
 
-    /// Called before admission to recover a previously reserved exact proposal.
-    pub(crate) fn existing_petal_registration_terms(
+    /// Find a verified candidate before reconciling its Signer lifecycle.
+    /// A package match may have different terms; callers must compare after recovery.
+    pub(crate) fn existing_petal_registration_candidate(
         &self,
         request: &PetalRegistrationPrepareRequest,
     ) -> Result<Option<PetalRegistrationTerms>, AuthorityError> {
         let request = canonical_petal_registration_request(request).map_err(invalid)?;
         let connection = self.lock()?;
         Ok(self
-            .find_registration_attempt(&connection, &request)?
+            .find_registration_candidate(&connection, &request)?
             .map(|attempt| attempt.terms))
     }
 
     fn find_registration_attempt(
+        &self,
+        connection: &Connection,
+        request: &PetalRegistrationPrepareRequest,
+    ) -> Result<Option<Attempt>, AuthorityError> {
+        let existing = self.find_registration_candidate(connection, request)?;
+        if let Some(attempt) = &existing {
+            let mut same = request.clone();
+            same.operation_id = attempt.request.operation_id.clone();
+            if same != attempt.request {
+                return Err(conflict());
+            }
+        }
+        Ok(existing)
+    }
+
+    fn find_registration_candidate(
         &self,
         connection: &Connection,
         request: &PetalRegistrationPrepareRequest,
@@ -128,11 +145,6 @@ impl BrokerAuthority {
         )?;
         if let Some(attempt) = &existing {
             self.validate_attempt(attempt)?;
-            let mut same = request.clone();
-            same.operation_id = attempt.request.operation_id.clone();
-            if same != attempt.request {
-                return Err(conflict());
-            }
         }
         Ok(existing)
     }
