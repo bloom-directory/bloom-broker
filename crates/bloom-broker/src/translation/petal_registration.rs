@@ -2,8 +2,6 @@
 use bloom_broker_api as north;
 use bloom_signer_api as south;
 
-// Connected by the registration handler in the next implementation step.
-#[allow(dead_code)]
 pub(crate) fn terms_to_signer(
     value: north::PetalRegistrationTerms,
 ) -> south::PetalRegistrationTerms {

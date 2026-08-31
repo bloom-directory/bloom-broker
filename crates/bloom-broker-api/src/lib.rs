@@ -49,8 +49,9 @@ pub const RATE_LIMIT_DETAILS_MINOR: u16 = 4;
 /// The negotiated range moves as a unit, so there is no accepted minor that
 /// predates a field the Broker may emit. A 1.3 peer is refused at the hello,
 /// before any response could carry `rate_limit`.
-pub const BROKER_API_MINOR_MIN: u16 = RATE_LIMIT_DETAILS_MINOR;
-pub const BROKER_API_MINOR_MAX: u16 = RATE_LIMIT_DETAILS_MINOR;
+pub const PETAL_REGISTRATION_MINOR: u16 = 5;
+pub const BROKER_API_MINOR_MIN: u16 = PETAL_REGISTRATION_MINOR;
+pub const BROKER_API_MINOR_MAX: u16 = PETAL_REGISTRATION_MINOR;
 pub const BROKER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(BROKER_API_MAJOR, BROKER_API_MINOR_MAX);
 pub const BROKER_API_RANGE: ProtocolVersionRange =

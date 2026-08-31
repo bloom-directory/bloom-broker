@@ -131,11 +131,21 @@ impl BrokerRpcService {
             Request::BrokerCapabilities(_) => {
                 Ok(Response::BrokerCapabilities(self.capabilities()?))
             }
-            Request::PetalRegistrationPrepare(_)
-            | Request::PetalRegistrationCommit(_)
-            | Request::PetalRegistrationRead(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::ServiceUnavailable,
-                "Petal registration is not available",
+            Request::PetalRegistrationPrepare(request) => Ok(Response::PetalRegistrationPrepare(
+                self.ceremony.prepare_petal_registration(
+                    &self.authority,
+                    &request,
+                    self.clock.now_ms(true)?,
+                )?,
+            )),
+            Request::PetalRegistrationCommit(request) => Ok(Response::PetalRegistrationCommit(
+                self.ceremony
+                    .commit_petal_registration(&self.authority, &request)?,
+            )),
+            Request::PetalRegistrationRead(request) => Ok(Response::PetalRegistrationRead(
+                self.authority
+                    .petal_registration(&request.package_hash)
+                    .map_err(authority_error)?,
             )),
             Request::ActionValidate(digest) => Ok(Response::ActionValidate(digest)),
             Request::SealedApprovalPrepare(request) => Ok(Response::SealedApprovalPrepare(
@@ -1476,14 +1486,6 @@ impl BrokerRpcService {
             protocol_minor_max: bloom_broker_api::BROKER_API_MINOR_MAX,
             methods: MachineBrokerMethod::ALL
                 .iter()
-                .filter(|method| {
-                    !matches!(
-                        method,
-                        MachineBrokerMethod::PetalRegistrationPrepare
-                            | MachineBrokerMethod::PetalRegistrationCommit
-                            | MachineBrokerMethod::PetalRegistrationRead
-                    )
-                })
                 .map(|method| Token::new(method.as_str()))
                 .collect::<Result<_, _>>()?,
             schemas: vec![Token::new(RPC_ENVELOPE_SCHEMA_V1)?],
@@ -1793,7 +1795,7 @@ fn jcs_digest(value: &impl serde::Serialize) -> Result<Digest32, ProtocolError> 
     ))
 }
 
-fn authority_error(error: AuthorityError) -> ProtocolError {
+pub(crate) fn authority_error(error: AuthorityError) -> ProtocolError {
     let error_kind = match &error {
         AuthorityError::Journal(_) => "journal",
         AuthorityError::Storage(_) => "storage",
@@ -1822,6 +1824,7 @@ fn authority_error(error: AuthorityError) -> ProtocolError {
                 }
                 "ASSURANCE_UNAVAILABLE" => ProtocolErrorCode::AssuranceUnavailable,
                 "POLICY_BASELINE_STALE" => ProtocolErrorCode::PolicyBaselineStale,
+                "MUTATION_QUOTA_EXCEEDED" => ProtocolErrorCode::CeremonyRateLimited,
                 "OPERATION_ID_CONFLICT" => ProtocolErrorCode::OperationIdConflict,
                 _ => ProtocolErrorCode::ClaimInvalid,
             };
@@ -2036,7 +2039,7 @@ mod tests {
         assert_ne!(previous_broker.build_digest, current_broker.build_digest);
         assert_eq!(
             bloom_signer_api::SIGNER_API_CURRENT,
-            bloom_broker_api::ProtocolVersion::new(1, 4)
+            bloom_broker_api::ProtocolVersion::new(1, 5)
         );
         validate_signer_readiness(&previous_broker, &previous_signer).unwrap();
         validate_signer_readiness(&current_broker, &current_signer).unwrap();

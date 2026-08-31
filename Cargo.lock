@@ -198,9 +198,11 @@ name = "bloom-broker"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "blake3",
  "bloom-audit-checkpoint",
  "bloom-broker-api",
  "bloom-broker-debug-driver",
+ "bloom-petal-package",
  "bloom-platform-containment",
  "bloom-service-activation",
  "bloom-service-observability",
@@ -341,7 +343,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=f9f26c758feb1d0fc5ddcbfed1275d56590a9bdd#f9f26c758feb1d0fc5ddcbfed1275d56590a9bdd"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=3cb4e3b2a788fca360999423be32792bbb7dcc7b#3cb4e3b2a788fca360999423be32792bbb7dcc7b"
 dependencies = [
  "blake3",
  "bloom-audit-checkpoint",
@@ -379,7 +381,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=f9f26c758feb1d0fc5ddcbfed1275d56590a9bdd#f9f26c758feb1d0fc5ddcbfed1275d56590a9bdd"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=3cb4e3b2a788fca360999423be32792bbb7dcc7b#3cb4e3b2a788fca360999423be32792bbb7dcc7b"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek",
@@ -394,7 +396,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-backend-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=f9f26c758feb1d0fc5ddcbfed1275d56590a9bdd#f9f26c758feb1d0fc5ddcbfed1275d56590a9bdd"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=3cb4e3b2a788fca360999423be32792bbb7dcc7b#3cb4e3b2a788fca360999423be32792bbb7dcc7b"
 dependencies = [
  "bloom-signer-api",
  "serde",
@@ -405,7 +407,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-backend-local"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=f9f26c758feb1d0fc5ddcbfed1275d56590a9bdd#f9f26c758feb1d0fc5ddcbfed1275d56590a9bdd"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=3cb4e3b2a788fca360999423be32792bbb7dcc7b#3cb4e3b2a788fca360999423be32792bbb7dcc7b"
 dependencies = [
  "bip32",
  "bloom-signer-api",

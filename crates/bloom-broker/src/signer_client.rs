@@ -447,6 +447,36 @@ impl CeremonySigner for BrokerSignerClient {
         }
     }
 
+    fn prepare_petal_registration(
+        &self,
+        request: bloom_signer_api::PetalRegistrationCeremonyPrepareRequest,
+        _now_ms: u64,
+    ) -> Result<SignerPreparedCustody, ProtocolError> {
+        match self.request(BrokerSignerRequest::CeremonyPrepare(
+            SignerCeremonyPrepareRequest::PetalRegistration(Box::new(request)),
+        ))? {
+            BrokerSignerResponse::CeremonyPrepare(
+                SignerCeremonyPrepareResponse::PetalRegistration(prepared),
+            ) => Ok(prepared),
+            _ => Err(response_mismatch("ceremony.prepare")),
+        }
+    }
+
+    fn complete_petal_registration(
+        &self,
+        request: CustodyCompleteRequest,
+        _now_ms: u64,
+    ) -> Result<CustodyResult, ProtocolError> {
+        match self.request(BrokerSignerRequest::CeremonyComplete(
+            SignerCeremonyCompleteRequest::PetalRegistration(Box::new(request)),
+        ))? {
+            BrokerSignerResponse::CeremonyComplete(
+                SignerCeremonyCompleteResponse::PetalRegistration(result),
+            ) => Ok(*result),
+            _ => Err(response_mismatch("ceremony.complete")),
+        }
+    }
+
     fn prepare_policy_update(
         &self,
         request: PolicyUpdateCeremonyPrepareRequest,
