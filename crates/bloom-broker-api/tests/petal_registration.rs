@@ -312,3 +312,107 @@ fn manifest_and_permission_digest_vectors_preserve_exact_reviewed_bytes() {
     assert!(BROKER_API_RANGE.contains(ProtocolVersion::new(1, 5)));
     assert!(!BROKER_API_RANGE.contains(ProtocolVersion::new(1, 6)));
 }
+
+#[test]
+fn resolved_owner_route_digest_and_signing_classes_are_source_bound() {
+    use sha2::{Digest as _, Sha256};
+    let mut first = route("first");
+    first.signing_operations = vec!["example.sign".into()];
+    first.key_derive_operations = vec!["derive.only".into()];
+    first.capabilities = vec!["bloom:tx.outbox".into()];
+    let mut registration = PetalRegistration {
+        terms: terms(),
+        approved_routes: vec![first, route("second")],
+        ceremony_receipt: receipt(),
+        registration_digest: Digest32::from_bytes([0; 32]),
+    };
+    registration.registration_digest = registration.digest().unwrap();
+    let resolved = ResolvedProvenance::OwnerRegistered {
+        registration: registration.clone(),
+        route_id: "first".into(),
+    };
+    let expected = Sha256::digest(
+        [
+            b"bloom.owner-petal-route/v1".as_slice(),
+            &serde_jcs::to_vec(&json!({
+                "registration_digest": registration.registration_digest, "route_id": "first",
+            }))
+            .unwrap(),
+        ]
+        .concat(),
+    );
+    assert_eq!(
+        resolved.digest().unwrap(),
+        Digest32::from_bytes(expected.into())
+    );
+    assert_eq!(
+        resolved
+            .operation_classes()
+            .unwrap()
+            .iter()
+            .map(|class| class.operation_class.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "example.sign",
+            "transaction.cancel",
+            "transaction.confirm",
+            "transaction.replace"
+        ]
+    );
+    assert!(
+        resolved
+            .operation_classes()
+            .unwrap()
+            .iter()
+            .all(|class| class.fee_asset.is_none())
+    );
+    let second = ResolvedProvenance::OwnerRegistered {
+        registration: registration.clone(),
+        route_id: "second".into(),
+    };
+    assert_ne!(resolved.digest().unwrap(), second.digest().unwrap());
+    assert!(second.operation_classes().unwrap().is_empty());
+    let absent = ResolvedProvenance::OwnerRegistered {
+        registration: registration.clone(),
+        route_id: "absent".into(),
+    };
+    assert!(absent.digest().is_err());
+    let mut tampered = registration;
+    tampered.terms.owner_wallet_id = Token::new("another-owner").unwrap();
+    assert!(
+        ResolvedProvenance::OwnerRegistered {
+            registration: tampered,
+            route_id: "first".into()
+        }
+        .digest()
+        .is_err()
+    );
+    let encoded = serde_json::to_value(&resolved).unwrap();
+    assert_eq!(encoded["source"], "owner_registered");
+    assert!(encoded.get("installer_signature").is_none());
+    assert_eq!(
+        serde_json::from_value::<ResolvedProvenance>(encoded).unwrap(),
+        resolved
+    );
+
+    let installer = ProvenanceRecord {
+        subject: ProvenanceSubject::System {
+            component_id: Token::new("machine").unwrap(),
+            operation_class: Token::new("sign").unwrap(),
+        },
+        publisher: Token::new("installer").unwrap(),
+        petal_lineage: None,
+        operation_classes: vec![ProvenanceOperationClass {
+            operation_class: Token::new("sign").unwrap(),
+            fee_asset: None,
+        }],
+        installer_key_id: Token::new("key").unwrap(),
+        installer_signature: Base64UrlBytes::from_bytes(&[3; 64]),
+    };
+    assert_eq!(
+        ResolvedProvenance::Installer(installer.clone())
+            .digest()
+            .unwrap(),
+        installer.digest().unwrap()
+    );
+}
