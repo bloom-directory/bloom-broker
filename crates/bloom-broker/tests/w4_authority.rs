@@ -383,6 +383,7 @@ fn ac18_wallet_delete_fails_closed_under_audit_degradation() {
         .policy_snapshot(&harness.wallet)
         .expect("baseline policy");
     let mut receipt = CustodyResult {
+        petal_registration_terms_digest: None,
         ceremony_kind: CeremonyKind::WalletDelete,
         custody_operation_id: operation(90),
         public_status: CeremonyState::Completed,
@@ -763,6 +764,7 @@ fn initial_policy_adoption_requires_outer_receipt_and_does_not_poison_key_pin() 
     let accepted_snapshot =
         initial_policy_snapshot(&wallet, &accepted_key, token("accepted-policy-key"));
     let mut receipt = CustodyResult {
+        petal_registration_terms_digest: None,
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation(91),
         public_status: CeremonyState::Completed,
@@ -863,6 +865,7 @@ fn petal_scoped_key_is_frozen_to_installer_provenance_and_petal_approvals() {
     child.locator = "petal-child-1".into();
     child.public_key_fingerprint = digest(95);
     let mut receipt = CustodyResult {
+        petal_registration_terms_digest: None,
         ceremony_kind: CeremonyKind::KeyDerive,
         custody_operation_id: scope.custody_operation_id.clone(),
         public_status: CeremonyState::Succeeded,

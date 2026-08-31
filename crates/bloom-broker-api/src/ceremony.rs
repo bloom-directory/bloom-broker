@@ -74,6 +74,7 @@ pub enum CeremonyKind {
     BackendEnrollment,
     KeyDerive,
     PolicyUpdate,
+    PetalRegistration,
 }
 
 impl CeremonyKind {
@@ -300,6 +301,8 @@ pub struct CustodyResult {
     pub credential_summaries: Vec<CredentialSummary>,
     pub initial_policy: Option<crate::SignedPolicySnapshot>,
     pub receipt_digest: Digest32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub petal_registration_terms_digest: Option<Digest32>,
     pub encrypted_browser_result: Option<EncryptedBrowserResult>,
     pub signer_key_id: Token,
     pub signer_signature: Base64UrlBytes,
@@ -315,6 +318,7 @@ pub struct CredentialSummary {
 
 impl CustodyResult {
     pub fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        self.validate_petal_registration_shape()?;
         #[derive(Serialize)]
         struct Unsigned<'a> {
             ceremony_kind: CeremonyKind,
@@ -325,6 +329,8 @@ impl CustodyResult {
             credential_summaries: &'a [CredentialSummary],
             initial_policy: &'a Option<crate::SignedPolicySnapshot>,
             receipt_digest: &'a Digest32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            petal_registration_terms_digest: &'a Option<Digest32>,
             encrypted_browser_result: &'a Option<EncryptedBrowserResult>,
             signer_key_id: &'a Token,
         }
@@ -337,6 +343,7 @@ impl CustodyResult {
             credential_summaries: &self.credential_summaries,
             initial_policy: &self.initial_policy,
             receipt_digest: &self.receipt_digest,
+            petal_registration_terms_digest: &self.petal_registration_terms_digest,
             encrypted_browser_result: &self.encrypted_browser_result,
             signer_key_id: &self.signer_key_id,
         })

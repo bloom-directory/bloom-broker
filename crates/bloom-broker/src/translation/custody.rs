@@ -80,6 +80,7 @@ pub(crate) fn result_to_machine(value: south::CustodyResult) -> north::CustodyRe
             .collect(),
         initial_policy: value.initial_policy.map(policy::snapshot_to_machine),
         receipt_digest: value.receipt_digest,
+        petal_registration_terms_digest: value.petal_registration_terms_digest,
         encrypted_browser_result: value.encrypted_browser_result.map(|encrypted| {
             north::EncryptedBrowserResult {
                 kem_output: encrypted.kem_output,
@@ -235,6 +236,7 @@ mod tests {
     #[test]
     fn custody_result_preserves_receipt_signature_and_encrypted_output() {
         let result = south::CustodyResult {
+            petal_registration_terms_digest: None,
             ceremony_kind: south::CeremonyKind::WalletExport,
             custody_operation_id: operation(12),
             public_status: south::CeremonyState::Succeeded,
