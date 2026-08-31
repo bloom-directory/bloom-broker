@@ -483,7 +483,8 @@ fn bip39_browser_import_uses_profile_to_control_serialization() {
     assert!(run.contains("if (bip39Import)"));
     assert!(run.contains("const mnemonic = mnemonicInput.value"));
     assert!(run.contains("Enter your 12 or 24 word recovery phrase"));
-    assert!(!run.contains("passphrase: \"\""));
+    assert!(run.contains("credential_prf: encodeUrl(prf.prf),\n          mnemonic\n"));
+    assert!(!run.contains("passphrase:"));
     assert!(!run.contains("passphraseInput"));
     assert!(!run.contains("supplied.passphrase"));
     assert!(!load.contains("passphrase"));
@@ -492,9 +493,9 @@ fn bip39_browser_import_uses_profile_to_control_serialization() {
     assert!(!run.contains("if (supplied.mnemonic)"));
     assert!(!run.contains("if (supplied.raw_private_key)"));
 
-    // v1 deliberately fixes the BIP-39 passphrase to empty. The ceremony
-    // must not ask the operator for an unsupported second secret, and fields
-    // for the other import profile must stay hidden despite label styling.
+    // v1 has no BIP-39 passphrase input. The ceremony must not ask the
+    // operator for an unsupported second secret, and fields for the other
+    // import profile must stay hidden despite label styling.
     assert!(!html.contains("passphrase-input"));
     assert!(!html.contains("passphrase-label"));
     assert!(html.contains("[hidden]{display:none!important}"));
