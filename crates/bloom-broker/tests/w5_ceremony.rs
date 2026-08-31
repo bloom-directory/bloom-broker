@@ -469,7 +469,7 @@ fn bip39_browser_import_uses_profile_to_control_serialization() {
     assert!(run.contains("BIP-39 mnemonic input is required"));
     assert!(run.contains("mnemonic: supplied.mnemonic"));
     assert!(run.contains("BIP-39 passphrases are not supported"));
-    assert!(run.contains("passphrase: \"\""));
+    assert!(!run.contains("passphrase: \"\""));
     assert!(!run.contains("supplied.passphrase"));
     assert!(!load.contains("passphrase"));
     assert!(run.contains("Raw private key input is required"));

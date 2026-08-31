@@ -400,8 +400,7 @@ async function run(session) {
         }
         secret = te.encode(canonicalJson({
           credential_prf: encodeUrl(prf.prf),
-          mnemonic: supplied.mnemonic,
-          passphrase: ""
+          mnemonic: supplied.mnemonic
         }));
       } else {
         if (typeof supplied.raw_private_key !== "string") {
