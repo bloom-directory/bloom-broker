@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 bloom-rpc-wire.workspace = true
-bloom-petal-package.workspace = true
+bloom-petal-contract.workspace = true
 ed25519-dalek.workspace = true
 serde.workspace = true
 serde_jcs.workspace = true

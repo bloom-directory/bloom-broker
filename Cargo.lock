@@ -198,9 +198,11 @@ name = "bloom-broker"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "blake3",
  "bloom-audit-checkpoint",
  "bloom-broker-api",
  "bloom-broker-debug-driver",
+ "bloom-petal-contract",
  "bloom-platform-containment",
  "bloom-service-activation",
  "bloom-service-observability",
@@ -235,7 +237,7 @@ dependencies = [
 name = "bloom-broker-api"
 version = "0.1.0"
 dependencies = [
- "bloom-petal-package",
+ "bloom-petal-contract",
  "bloom-rpc-wire",
  "ed25519-dalek",
  "hex",
@@ -272,21 +274,13 @@ dependencies = [
 [[package]]
 name = "bloom-petal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/petal?rev=61938d0c127cfe03c7e3e55baed0ba1439bc5ca2#61938d0c127cfe03c7e3e55baed0ba1439bc5ca2"
-dependencies = [
- "sha2",
-]
-
-[[package]]
-name = "bloom-petal-package"
-version = "0.1.4"
-source = "git+https://github.com/bloom-directory/bloom.git?rev=534aaef8c40d609574c909719954301af8fa37b5#534aaef8c40d609574c909719954301af8fa37b5"
+source = "git+https://github.com/bloom-directory/petal.git?rev=b9ae4c5673088a9fec5e4574ae1e4a516726d5e5#b9ae4c5673088a9fec5e4574ae1e4a516726d5e5"
 dependencies = [
  "blake3",
- "bloom-petal-contract",
  "hex",
  "serde",
  "serde_jcs",
+ "sha2",
  "thiserror",
  "toml",
  "url",

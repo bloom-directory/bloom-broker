@@ -10,7 +10,7 @@ use crate::{
 };
 
 pub const PETAL_REGISTRATION_SCHEMA: &str = "bloom.petal-registration/1";
-pub use bloom_petal_package::{PackageEvidence, RequestedRoutePermission};
+pub use bloom_petal_contract::{PackageEvidence, RequestedRoutePermission};
 const RECORD_DOMAIN: &[u8] = b"bloom.petal-registration-record/v1";
 const TERMS_DOMAIN: &[u8] = b"bloom.petal-registration-terms/v1\0";
 const ENROLLMENT_DOMAIN: &[u8] = b"bloom.petal-registration-enrollment/v1\0";
@@ -220,7 +220,7 @@ pub struct PetalRegistrationReadRequest {
 pub fn canonical_petal_registration_request(
     request: &PetalRegistrationPrepareRequest,
 ) -> Result<PetalRegistrationPrepareRequest, ProtocolError> {
-    let checked = bloom_petal_package::check_package_request(
+    let checked = bloom_petal_contract::check_package_request(
         request.evidence.clone(),
         request.requested_routes.clone(),
     )
@@ -248,7 +248,7 @@ pub fn canonical_petal_registration_request(
         .collect::<Vec<_>>();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     canonical.evidence.file_pages = entries
-        .chunks(bloom_petal_package::evidence::MAX_PAGE_ENTRIES)
+        .chunks(bloom_petal_contract::evidence::MAX_PAGE_ENTRIES)
         .map(|page| page.to_vec())
         .collect();
     Ok(canonical)

@@ -1,5 +1,5 @@
 use bloom_broker_api::{OperationId, PetalRegistrationPrepareRequest, Token};
-use bloom_petal_package::{
+use bloom_petal_contract::{
     FileDigestEntry, PackageEvidence, RequestedRoutePermission, package_hash_from_entries,
 };
 

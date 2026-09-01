@@ -12,6 +12,7 @@ triad-dev-harness = ["bloom-triad-local-transport/triad-dev-harness"]
 axum.workspace = true
 bloom-broker-api = { path = "../bloom-broker-api" }
 bloom-signer-api.workspace = true
+bloom-petal-contract.workspace = true
 bloom-platform-containment.workspace = true
 bloom-triad-local-transport.workspace = true
 bloom-audit-checkpoint.workspace = true
@@ -36,6 +37,7 @@ tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+blake3 = "1"
 bloom-broker-debug-driver = { path = "../bloom-broker-debug-driver" }
 bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "27e09b757829fc48fd77c322df255143d365213f" }
 futures = "0.3"

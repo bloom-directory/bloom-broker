@@ -106,7 +106,10 @@ fn broker_api_graph_and_sources_are_domain_isolated() {
     for line in graph.lines().filter(|line| line.starts_with("bloom-")) {
         let package = line.split_whitespace().next().unwrap();
         assert!(
-            matches!(package, "bloom-broker-api" | "bloom-rpc-wire"),
+            matches!(
+                package,
+                "bloom-broker-api" | "bloom-petal-contract" | "bloom-rpc-wire"
+            ),
             "Broker API graph contains non-mechanical Bloom dependency {package}:\n{graph}"
         );
     }

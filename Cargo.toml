@@ -13,7 +13,7 @@ rust-version = "1.85"
 license = "MIT"
 
 [workspace.dependencies]
-bloom-petal-package = { git = "https://github.com/bloom-directory/bloom.git", rev = "534aaef8c40d609574c909719954301af8fa37b5" }
+bloom-petal-contract = { git = "https://github.com/bloom-directory/petal.git", rev = "b9ae4c5673088a9fec5e4574ae1e4a516726d5e5" }
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
 bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "27e09b757829fc48fd77c322df255143d365213f" }
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }

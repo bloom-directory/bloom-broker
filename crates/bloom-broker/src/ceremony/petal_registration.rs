@@ -235,9 +235,9 @@ fn registration_review(
 ) -> Result<serde_json::Value, ProtocolError> {
     // Every variable review field derives from the exact manifest/permission bytes
     // committed by terms.digest(), which is the signed WebAuthn review binding.
-    let bounds = bloom_petal_package::parse_manifest_bounds(&request.evidence.manifest_utf8)
+    let bounds = bloom_petal_contract::parse_manifest_bounds(&request.evidence.manifest_utf8)
         .map_err(malformed)?;
-    let manifest = bloom_petal_package::manifest::parse_manifest(&request.evidence.manifest_utf8)
+    let manifest = bloom_petal_contract::manifest::parse_manifest(&request.evidence.manifest_utf8)
         .map_err(malformed)?;
     let delegated = request
         .requested_routes
