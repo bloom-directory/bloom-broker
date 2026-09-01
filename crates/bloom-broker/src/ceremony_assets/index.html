@@ -42,7 +42,7 @@
         <fieldset id="import-fields" hidden>
           <legend>Wallet to import</legend>
           <label id="mnemonic-label">Recovery phrase (12, 15, 18, 21, or 24 words)<textarea id="mnemonic-input" rows="3" autocomplete="off" spellcheck="false" placeholder="word word word …"></textarea></label>
-          <label id="raw-key-label" hidden>Private key<input id="raw-key-input" type="password" autocomplete="off" spellcheck="false"></label>
+          <label id="raw-key-label" hidden>Private key (32-byte hex: 0x… or bare)<input id="raw-key-input" type="password" autocomplete="off" spellcheck="false" placeholder="0x…"></label>
           <p>BIP-39 passphrases are not supported. Import the recovery phrase only.</p>
           <p>Encrypted directly to the Signer before it leaves this page.</p>
         </fieldset>

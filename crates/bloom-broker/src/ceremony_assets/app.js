@@ -533,6 +533,24 @@ function encodeUrl(value) {
   return btoa(String.fromCharCode(...new Uint8Array(value)))
     .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
+/// Signer's raw_private_key field decodes base64url, but owners hold secp256k1
+/// scalars as hex. Accept both spellings a human will realistically paste —
+/// 0x-prefixed or bare, either case — and reject anything else by name.
+function normalizePrivateKey(value) {
+  if (!value) throw new Error("Enter the private key to import");
+  const hex = /^(?:0x)?([0-9a-fA-F]{64})$/.exec(value);
+  if (hex) {
+    const bytes = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) {
+      bytes[i] = parseInt(hex[1].slice(2 * i, 2 * i + 2), 16);
+    }
+    return encodeUrl(bytes);
+  }
+  if (/^[A-Za-z0-9_-]{43}$/.test(value)) return value;
+  throw new Error(
+    "Private key must be a 32-byte secp256k1 scalar as hex (0x… or bare) or base64url"
+  );
+}
 function assertionJson(credential) {
   return {
     credential_id: encodeUrl(credential.rawId),
@@ -753,8 +771,7 @@ async function run(session) {
           mnemonic
         }));
       } else {
-        const rawKey = rawKeyInput.value.trim();
-        if (!rawKey) throw new Error("Enter the private key to import");
+        const rawKey = normalizePrivateKey(rawKeyInput.value.trim());
         secret = te.encode(canonicalJson({
           credential_prf: encodeUrl(prf.prf),
           raw_private_key: rawKey

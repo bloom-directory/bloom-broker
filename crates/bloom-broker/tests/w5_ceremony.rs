@@ -236,6 +236,65 @@ cryptoSelfTest().then(
     assert_eq!(String::from_utf8_lossy(&output.stdout), "browser-crypto-ok");
 }
 
+/// Owners hold imported secp256k1 scalars as hex; Signer decodes base64url.
+/// The shipped page must normalize every realistic hex spelling itself —
+/// asking an owner to hand-convert a private key is both hostile and
+/// error-prone (the mismatch previously surfaced as an opaque
+/// `MALFORMED_FRAME: Invalid last symbol` from deep inside Signer).
+#[test]
+fn browser_page_accepts_hex_private_keys_and_converts_them_to_base64url() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+globalThis.crypto = require("node:crypto").webcrypto;
+globalThis.document = {{getElementById: () => ({{}})}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+{executable}
+const scalar = "01".repeat(32);
+const expected = Buffer.from(scalar, "hex").toString("base64url");
+const cases = [
+  ["0x" + scalar, expected],
+  [scalar, expected],
+  ["0x" + scalar.toUpperCase(), expected],
+  [expected, expected],
+];
+for (const [input, want] of cases) {{
+  const got = normalizePrivateKey(input);
+  if (got !== want) {{
+    console.error("normalizePrivateKey(" + JSON.stringify(input) + ") => " + got + ", wanted " + want);
+    process.exit(1);
+  }}
+}}
+for (const bad of ["", "0x1234", "zz".repeat(32), "0x" + "0".repeat(63)]) {{
+  try {{
+    normalizePrivateKey(bad);
+    console.error("normalizePrivateKey accepted invalid input " + JSON.stringify(bad));
+    process.exit(1);
+  }} catch (error) {{ /* rejected by name: expected */ }}
+}}
+process.stdout.write("hex-normalization-ok");
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "hex-normalization-ok"
+    );
+}
+
 #[test]
 fn browser_ceremony_state_survives_reload_and_reuses_one_output_key() {
     let asset = include_str!("../src/ceremony_assets/app.js");
@@ -493,7 +552,7 @@ fn bip39_browser_import_uses_profile_to_control_serialization() {
     assert!(!run.contains("passphraseInput"));
     assert!(!run.contains("supplied.passphrase"));
     assert!(!load.contains("passphrase"));
-    assert!(run.contains("Enter the private key to import"));
+    assert!(run.contains("normalizePrivateKey(rawKeyInput.value.trim())"));
     assert!(run.contains("raw_private_key: rawKey"));
     assert!(!run.contains("if (supplied.mnemonic)"));
     assert!(!run.contains("if (supplied.raw_private_key)"));
