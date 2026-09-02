@@ -84,6 +84,15 @@ impl AssuranceVerifier for SolanaSystemTransferVerifier {
         let [debit] = claim.declared_debits.as_slice() else {
             return Err("expected exactly one declared debit".to_owned());
         };
+        if destination.chain.as_str() != "solana"
+            || debit.asset.chain.as_str() != "solana"
+            || debit.asset.asset != "native"
+        {
+            return Err(
+                "native Solana transfer requires solana destination and solana:native debit labels"
+                    .to_owned(),
+            );
+        }
         let destination_key = Pubkey::from_str(&destination.destination)
             .map_err(|error| format!("declared destination is not base58: {error}"))?;
         let lamports: u64 = debit
@@ -369,6 +378,35 @@ mod tests {
             assert!(
                 verifier
                     .verify_system(&wrong_amount, Some(&message), Some(&payer.to_bytes()))
+                    .is_err()
+            );
+
+            let mut wrong_destination_chain = claim.clone();
+            wrong_destination_chain.declared_destinations[0].chain =
+                Token::new("ethereum").unwrap();
+            assert!(
+                verifier
+                    .verify_system(
+                        &wrong_destination_chain,
+                        Some(&message),
+                        Some(&payer.to_bytes())
+                    )
+                    .is_err()
+            );
+
+            let mut wrong_debit_chain = claim.clone();
+            wrong_debit_chain.declared_debits[0].asset.chain = Token::new("ethereum").unwrap();
+            assert!(
+                verifier
+                    .verify_system(&wrong_debit_chain, Some(&message), Some(&payer.to_bytes()))
+                    .is_err()
+            );
+
+            let mut wrong_asset = claim.clone();
+            wrong_asset.declared_debits[0].asset.asset = "usdc".to_owned();
+            assert!(
+                verifier
+                    .verify_system(&wrong_asset, Some(&message), Some(&payer.to_bytes()))
                     .is_err()
             );
 
