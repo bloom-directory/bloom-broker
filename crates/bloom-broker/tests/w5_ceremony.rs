@@ -16,15 +16,16 @@ use bloom_broker::{
 };
 use bloom_broker_api::{
     ActivationMode, ApprovalLimits, ApprovalPrepareRequest, ApprovalSelector, ApprovalSubject,
-    Base64UrlBytes, BootEpoch, CanonicalWalletPolicy, CeremonyState, ClaimAssurance,
-    ClaimAssuranceLevel, CryptoSuite, CustodyPrepareResponse, DecimalU64, DeclaredFee, Digest32,
-    KeyRef, KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
-    MachineSignRequest, OperationId, OperationRequest, PROVENANCE_RECORD_SIGNATURE_DOMAIN,
-    PetalKeyScope, PetalLineageMembership, PetalUseClaim, PolicyCommitUpdateRequest,
-    PolicyDestination, PolicyUpdateRequest, ProtocolError, ProtocolErrorCode,
-    ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject, RateLimitDetails, RequestNonce,
-    RevokeRequest, SealedApprovalTerms, SignedJournalHead, SignedPolicySnapshot, SigningPayloads,
-    Token, WalletRequest,
+    AssetId, Base64UrlBytes, BootEpoch, CanonicalWalletPolicy, CeremonyState, ClaimAssurance,
+    ClaimAssuranceLevel, CryptoSuite, CustodyPrepareResponse, DecimalU64, DecimalU256,
+    DeclaredDebit, DeclaredDestination, DeclaredFee, Digest32, KeyRef, KeySpec,
+    MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
+    OperationId, OperationRequest, PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope,
+    PetalLineageMembership, PetalUseClaim, PolicyCommitUpdateRequest, PolicyDestination,
+    PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceOperationClass,
+    ProvenanceRecord, ProvenanceSubject, RateLimitDetails, RequestNonce, RevokeRequest,
+    SealedApprovalTerms, SignedJournalHead, SignedPolicySnapshot, SigningPayloads, Token,
+    WalletRequest,
 };
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer::{
@@ -3425,6 +3426,76 @@ async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
         Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&manifest).unwrap()).into()),
         response.review_manifest_digest
     );
+}
+
+#[tokio::test]
+async fn review_plan_formats_known_asset_base_units_without_hiding_raw_authority_amount() {
+    let signer = Arc::new(MockSigner::new());
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        signer,
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[32; 32]),
+    );
+    let claim = PetalUseClaim {
+        package_hash: digest("91"),
+        route: "/mainnet/exchange/wallet/usd_send.json".into(),
+        operation_class: Token::new("hyperliquid.usd_send").unwrap(),
+        crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+        payload_digest: digest("92"),
+        ordered_hashes: vec![digest("93")],
+        declared_debits: vec![DeclaredDebit {
+            asset: AssetId {
+                chain: Token::new("hyperliquid").unwrap(),
+                asset: "usdc".into(),
+            },
+            amount: DecimalU256::parse("10000").unwrap(),
+        }],
+        declared_destinations: vec![DeclaredDestination {
+            chain: Token::new("hyperliquid").unwrap(),
+            destination: "0xe2b000d7650543f5df13183c089e02d6d8b2145c".into(),
+        }],
+        declared_fee: DeclaredFee::None,
+        nonce: RequestNonce::from_bytes([94; 16]),
+        claim_assurance: ClaimAssurance::MachineAsserted,
+    };
+    let response = broker
+        .prepare_approval(
+            approval_request(),
+            ReviewManifestContext {
+                petal_use_claim: Some(claim),
+                claim_assurance: Some(ClaimAssurance::MachineAsserted),
+                ..ReviewManifestContext::default()
+            },
+            now_ms,
+        )
+        .unwrap();
+    let session = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let projection: serde_json::Value =
+        serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let plan = projection["review_manifest"]["canonical_plan"]
+        .as_str()
+        .unwrap();
+    let plan: serde_json::Value = serde_json::from_str(plan).unwrap();
+    assert_eq!(plan["asset_amounts"][0]["display"], "0.01 USDC");
+    assert_eq!(plan["asset_amounts"][0]["base_units"], "10000");
+    assert_eq!(plan["asset_amounts"][0]["decimals"], 6);
 }
 
 #[tokio::test]

@@ -1797,7 +1797,8 @@ impl CeremonyBroker {
             manifest.petal_use_claim.as_ref(),
             manifest.system_use_claim.as_ref(),
         );
-        let canonical_plan = canonical_review_plan(request, &disclosures)?;
+        let canonical_plan =
+            canonical_review_plan(request, &disclosures, manifest.petal_use_claim.as_ref())?;
         if manifest.approval_id != approval_id
             || manifest.approval_digest != approval_digest
             || manifest.exact_payload_digests != request.exact_ordered_payload_digests
@@ -1836,7 +1837,8 @@ impl CeremonyBroker {
             context.petal_use_claim.as_ref(),
             context.system_use_claim.as_ref(),
         );
-        let canonical_plan = canonical_review_plan(request, &disclosures)?;
+        let canonical_plan =
+            canonical_review_plan(request, &disclosures, context.petal_use_claim.as_ref())?;
         let mut manifest = ReviewManifest {
             schema: Token::new("bloom.review-manifest.v1")?,
             approval_id: request
@@ -2747,18 +2749,112 @@ fn digest(value: &impl Serialize) -> Result<Digest32, ProtocolError> {
 fn canonical_review_plan(
     request: &CeremonyPrepareRequest,
     security_disclosures: &[String],
+    claim: Option<&PetalUseClaim>,
 ) -> Result<String, ProtocolError> {
+    #[derive(Serialize)]
+    struct AssetAmountReview {
+        kind: &'static str,
+        chain: String,
+        asset: String,
+        display: String,
+        base_units: String,
+        decimals: Option<u8>,
+    }
+
     #[derive(Serialize)]
     struct Plan<'a> {
         schema: &'static str,
+        asset_amounts: Vec<AssetAmountReview>,
         terms: &'a bloom_signer_api::SealedApprovalTerms,
         exact_ordered_payload_digests: &'a [Digest32],
         exact_ordered_hashes: &'a [Digest32],
         replacement_approval_id: &'a Option<Digest32>,
         security_disclosures: &'a [String],
     }
+    let mut asset_amounts = Vec::new();
+    if let Some(claim) = claim {
+        asset_amounts.extend(claim.declared_debits.iter().map(|debit| {
+            review_asset_amount(
+                "declared_debit",
+                debit.asset.chain.as_str(),
+                &debit.asset.asset,
+                debit.amount.as_str(),
+            )
+        }));
+        if let bloom_broker_api::DeclaredFee::Fee {
+            chain,
+            asset,
+            amount,
+        } = &claim.declared_fee
+        {
+            asset_amounts.push(review_asset_amount(
+                "declared_fee",
+                chain.as_str(),
+                asset,
+                amount.as_str(),
+            ));
+        }
+    }
+
+    fn review_asset_amount(
+        kind: &'static str,
+        chain: &str,
+        asset: &str,
+        base_units: &str,
+    ) -> AssetAmountReview {
+        let metadata = match (chain, asset) {
+            ("hyperliquid", "usdc") => Some((6, "USDC")),
+            ("solana", "native") | ("solana-mainnet", "native") => Some((9, "SOL")),
+            ("ethereum", "native") | ("base", "native") | ("arbitrum", "native") => {
+                Some((18, "ETH"))
+            }
+            ("polygon", "native") => Some((18, "POL")),
+            _ => None,
+        };
+        let (display, decimals) = metadata.map_or_else(
+            || {
+                (
+                    format!(
+                        "{base_units} raw units of {asset} on {chain} (token decimals unknown)"
+                    ),
+                    None,
+                )
+            },
+            |(decimals, symbol)| {
+                (
+                    format!("{} {symbol}", format_base_units(base_units, decimals)),
+                    Some(decimals),
+                )
+            },
+        );
+        AssetAmountReview {
+            kind,
+            chain: chain.to_owned(),
+            asset: asset.to_owned(),
+            display,
+            base_units: base_units.to_owned(),
+            decimals,
+        }
+    }
+
+    fn format_base_units(base_units: &str, decimals: u8) -> String {
+        if decimals == 0 {
+            return base_units.to_owned();
+        }
+        let decimals = usize::from(decimals);
+        let padded = format!("{:0>width$}", base_units, width = decimals + 1);
+        let split = padded.len() - decimals;
+        let fractional = padded[split..].trim_end_matches('0');
+        if fractional.is_empty() {
+            padded[..split].to_owned()
+        } else {
+            format!("{}.{}", &padded[..split], fractional)
+        }
+    }
+
     serde_jcs::to_string(&Plan {
         schema: "bloom-review-plan/v1",
+        asset_amounts,
         terms: &request.terms,
         exact_ordered_payload_digests: &request.exact_ordered_payload_digests,
         exact_ordered_hashes: &request.exact_ordered_hashes,
