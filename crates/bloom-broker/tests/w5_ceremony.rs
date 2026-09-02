@@ -708,6 +708,22 @@ fn custody_result_to_machine(value: &CustodyResult) -> bloom_broker_api::Custody
     }
 }
 
+async fn broker_custody_result(
+    broker: &BrokerRpcService,
+    operation_id: OperationId,
+) -> bloom_broker_api::CustodyResult {
+    match MachineBrokerService::dispatch(
+        broker,
+        MachineBrokerRequest::CustodyResult(OperationRequest { operation_id }),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::CustodyResult(result) => result,
+        response => panic!("unexpected response: {response:?}"),
+    }
+}
+
 fn key_to_signer(value: &KeyRef) -> bloom_signer_api::KeyRef {
     bloom_signer_api::KeyRef {
         backend: value.backend.clone(),
@@ -1634,6 +1650,15 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     )
     .unwrap();
     let machine_registration_result = custody_result_to_machine(&registration_result);
+    let persisted_registration_result = broker_custody_result(&broker, operation("e1")).await;
+    assert_eq!(
+        restarted_ceremony
+            .public_status(&operation("e1"))
+            .unwrap()
+            .receipt_digest,
+        Some(persisted_registration_result.receipt_digest),
+        "a persisted custody status must expose the signed receipt digest after restart"
+    );
     let wallet_id = machine_registration_result.wallet_id.clone().unwrap();
     let baseline = machine_registration_result.initial_policy.clone().unwrap();
     assert_eq!(authority.policy_snapshot(&wallet_id).unwrap(), baseline);
@@ -1804,6 +1829,16 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .ceremony()
         .expire_sessions(contribution.expires_at_ms.get() + 1)
         .unwrap();
+    let policy_result = broker_custody_result(&broker, update.operation_id.clone()).await;
+    assert_eq!(
+        broker
+            .ceremony()
+            .public_status(&update.operation_id)
+            .unwrap()
+            .receipt_digest,
+        Some(policy_result.receipt_digest),
+        "policy-update status must identify the same signed receipt as custody.result"
+    );
     let commit_request = PolicyCommitUpdateRequest {
         operation_id: update.operation_id,
         ceremony_receipt: custody_result_to_machine(&completed),

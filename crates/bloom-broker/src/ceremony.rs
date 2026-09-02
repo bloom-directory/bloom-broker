@@ -964,7 +964,17 @@ impl CeremonyBroker {
             .ok_or_else(not_found)?;
         let sessions = self.inner.sessions.lock();
         let session = sessions.get(&ceremony_id).ok_or_else(not_found)?;
-        let receipt_digest = session.terminal_result.as_ref().map(digest).transpose()?;
+        let receipt_digest = match session.terminal_result.as_ref() {
+            Some(result) if session.ceremony_kind == CeremonyKind::SealedApproval => {
+                Some(digest(result)?)
+            }
+            Some(result) => Some(
+                serde_json::from_value::<CustodyResult>(result.clone())
+                    .map_err(malformed)?
+                    .receipt_digest,
+            ),
+            None => None,
+        };
         let ceremony_url = if session.state == CeremonyState::AwaitingUser {
             session.token.as_ref().map(session_url)
         } else {
