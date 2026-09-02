@@ -228,7 +228,25 @@ fn driver_error() -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
-    use super::VirtualAuthenticator;
+    use super::{VirtualAuthenticator, development_ceremony_origin, development_ceremony_port};
+
+    #[test]
+    #[ignore = "requires BLOOM_TRIAD_DEV_CEREMONY_PORT from the focused CI invocation"]
+    fn developer_ceremony_origin_tracks_the_selected_port() {
+        let port = std::env::var("BLOOM_TRIAD_DEV_CEREMONY_PORT")
+            .expect("focused CI must select a developer ceremony port")
+            .parse::<u16>()
+            .expect("valid developer ceremony port");
+        assert_ne!(
+            port, 18_734,
+            "the focused CI invocation must use a non-default port"
+        );
+        assert_eq!(development_ceremony_port(), port);
+        assert_eq!(
+            development_ceremony_origin(),
+            format!("http://localhost:{port}")
+        );
+    }
 
     #[test]
     fn seeded_authenticator_is_repeatable_and_domain_separated() {

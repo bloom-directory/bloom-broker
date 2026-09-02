@@ -1,10 +1,11 @@
 //! Linux ceremony-listener acquisition.
 //!
-//! The Linux unit set binds 127.0.0.1:18734 in a `.socket` unit and passes the
-//! descriptor to the Broker through `Sockets=`/`LISTEN_FDS`. The Broker must
-//! therefore consume that descriptor and never bind the address itself — a
-//! second bind can only ever fail with `EADDRINUSE`, and `bind_canonical` has
-//! deliberately no fallback port, so the service would exit.
+//! The Linux unit set binds the configured canonical loopback address in a
+//! `.socket` unit and passes the descriptor to the Broker through
+//! `Sockets=`/`LISTEN_FDS`. The Broker must therefore consume that descriptor
+//! and never bind the address itself — a second bind can only ever fail with
+//! `EADDRINUSE`, and `bind_canonical` has deliberately no fallback port, so the
+//! service would exit.
 //!
 //! The inherited-listener cases run the real acquisition in a child process
 //! with a genuine descriptor while the parent still holds the address. If the
@@ -28,10 +29,13 @@ const CHILD_MODE: &str = "BLOOM_CEREMONY_ACTIVATION_CHILD";
 const ACTIVATION_NAME: &str = "broker-ceremony";
 
 fn expected_ceremony_addr() -> SocketAddr {
+    #[cfg(feature = "triad-dev-harness")]
     let port = std::env::var("BLOOM_TRIAD_DEV_CEREMONY_PORT")
         .ok()
         .map(|value| value.parse::<u16>().expect("valid developer ceremony port"))
         .unwrap_or(CEREMONY_ADDR.port());
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let port = CEREMONY_ADDR.port();
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
 }
 const EXIT_REFUSED: i32 = 72;

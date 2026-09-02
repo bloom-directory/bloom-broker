@@ -1556,9 +1556,29 @@ fn assert_retry_contract(error: &ProtocolError, retry_after_ms: u64, limit: u64,
 }
 
 fn url_token(url: &str) -> String {
-    url.strip_prefix("http://localhost:18734/ceremony/")
+    url.strip_prefix(&format!("{}/ceremony/", test_ceremony_origin()))
         .unwrap()
         .to_owned()
+}
+
+fn test_ceremony_port() -> u16 {
+    #[cfg(feature = "triad-dev-harness")]
+    if let Some(value) = std::env::var_os("BLOOM_TRIAD_DEV_CEREMONY_PORT") {
+        return value
+            .into_string()
+            .expect("developer ceremony port must be UTF-8")
+            .parse()
+            .expect("developer ceremony port must be valid");
+    }
+    CEREMONY_ADDR.port()
+}
+
+fn test_ceremony_host() -> String {
+    format!("localhost:{}", test_ceremony_port())
+}
+
+fn test_ceremony_origin() -> String {
+    format!("http://{}", test_ceremony_host())
 }
 
 fn local_identity(service_id: &str, seed: [u8; 32], epoch: &str) -> LocalIdentity {
@@ -3668,6 +3688,13 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         .ceremony_id
         .to_string();
     let token = url_token(&prepared.ceremony_url);
+    let host = test_ceremony_host();
+    let origin = test_ceremony_origin();
+    assert!(
+        prepared
+            .ceremony_url
+            .starts_with(&format!("{origin}/ceremony/"))
+    );
     assert_eq!(token.len(), 43);
     assert!(!prepared.ceremony_url.contains(['?', '#']));
     let app = broker.router();
@@ -3677,7 +3704,7 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         .oneshot(
             Request::builder()
                 .uri(format!("/ceremony/{token}"))
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, &host)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3700,7 +3727,7 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         .oneshot(
             Request::builder()
                 .uri("/assets/style.css")
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, &host)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3718,7 +3745,7 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         .oneshot(
             Request::builder()
                 .uri("/assets/bloom-primary.svg")
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, &host)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3740,7 +3767,7 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         .oneshot(
             Request::builder()
                 .uri(format!("/ceremony/{}", unknown_token.encoded()))
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, &host)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3757,7 +3784,7 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         .oneshot(
             Request::builder()
                 .uri("/")
-                .header(header::HOST, "127.0.0.1:18734")
+                .header(header::HOST, format!("127.0.0.1:{}", test_ceremony_port()))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3770,7 +3797,7 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         .oneshot(
             Request::builder()
                 .uri(format!("/api/session/{ceremony_id}"))
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, &host)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3783,7 +3810,7 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         .oneshot(
             Request::builder()
                 .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, &host)
                 .header("x-bloom-ceremony-token", &token)
                 .body(Body::empty())
                 .unwrap(),
@@ -3797,7 +3824,7 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         .oneshot(
             Request::builder()
                 .uri(format!("/api/session/{ceremony_id}"))
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, &host)
                 .header("x-bloom-ceremony-token", &token)
                 .body(Body::empty())
                 .unwrap(),
@@ -3833,7 +3860,7 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/session/{ceremony_id}/complete"))
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, &host)
                 .header("x-bloom-ceremony-token", &token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("sec-fetch-site", "same-origin")
@@ -3849,8 +3876,8 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/session/{ceremony_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
+                .header(header::HOST, &host)
+                .header(header::ORIGIN, &origin)
                 .header("x-bloom-ceremony-token", &token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("sec-fetch-site", "same-origin")

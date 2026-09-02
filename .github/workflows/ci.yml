@@ -28,6 +28,18 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --workspace --locked
+      - name: Exercise isolated developer ceremony origin
+        env:
+          BLOOM_TRIAD_DEV_CEREMONY_PORT: "28735"
+        run: |
+          cargo test -p bloom-broker --test w0_ceremony_activation --locked
+          cargo test -p bloom-broker --features triad-dev-harness \
+            --test w0_ceremony_activation --locked
+          cargo test -p bloom-broker --features triad-dev-harness \
+            --test w5_ceremony --locked \
+            assets_headers_host_origin_token_and_opaque_relay_are_enforced -- --exact
+          cargo test -p bloom-broker-debug-driver --lib --locked \
+            tests::developer_ceremony_origin_tracks_the_selected_port -- --exact --ignored
 
   privileged-w0:
     name: privileged W0 listener ownership
