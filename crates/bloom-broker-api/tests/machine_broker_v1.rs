@@ -311,6 +311,17 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
         MachineBrokerRequest::CeremonyStatus(id.clone()),
         MachineBrokerRequest::CeremonyCancel(id),
         MachineBrokerRequest::CustodyResult(operation_request),
+        MachineBrokerRequest::OwnerInputRequest(OwnerInputRequest {
+            operation_id: operation(70),
+            kind: OwnerInputKind::EvmAddress,
+            context: OwnerInputDisplayContext {
+                network: "ethereum".into(),
+                asset: "ETH".into(),
+                amount_base_units: "1000000000000000000".into(),
+                decimals: 18,
+                source: "privacy-pools-note".into(),
+            },
+        }),
     ]
 }
 
@@ -427,6 +438,11 @@ fn machine_responses() -> Vec<MachineBrokerResponse> {
         MachineBrokerResponse::CeremonyStatus(ceremony_status()),
         MachineBrokerResponse::CeremonyCancel(ceremony_status()),
         MachineBrokerResponse::CustodyResult(custody_result()),
+        MachineBrokerResponse::OwnerInputRequest(OwnerInputResponse::Pending {
+            operation_id: operation(70),
+            ceremony_url: "http://localhost:18734/input/token".into(),
+            expires_at_ms: DecimalU64::new(20),
+        }),
     ]
 }
 
@@ -445,16 +461,16 @@ where
 
 #[test]
 fn every_machine_broker_variant_matches_frozen_v1_frames() {
-    assert_eq!(MachineBrokerMethod::ALL.len(), 39);
+    assert_eq!(MachineBrokerMethod::ALL.len(), 40);
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "bb59de7ed5b9ca2d968fbd678795365002bc526d09cc77e429bcb68c7ff939b7",
+        "5cf50647f43147904baf13fdf89c9b12687e46771f66e6aeead9021f5574c542",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "5163c785f7f6579ccace3dd93d233b96e61e2bd20658fb094b3a3a38f5e728cb",
+        "ff690bb67a4d52030df805ab5e5b7b919b0f08ef35c08211b3d123413c4e13d7",
     );
 }
 
