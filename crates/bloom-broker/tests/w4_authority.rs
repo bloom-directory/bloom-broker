@@ -1485,7 +1485,6 @@ fn revocation_and_authorization_linearize_without_post_revoke_reservation() {
     };
     bind_operation_digest(&mut input, &terms);
     let tombstone = signed_approval_tombstone(&harness, terms.approval_id().unwrap());
-    let state = signed_revocation_with_tombstones(&harness, 0, std::slice::from_ref(&tombstone));
     let mut denied_after = petal_input(
         &terms,
         &provenance,
@@ -1504,6 +1503,24 @@ fn revocation_and_authorization_linearize_without_post_revoke_reservation() {
     };
     bind_operation_digest(&mut denied_after, &terms);
 
+    let mut delayed_terms = terms.clone();
+    delayed_terms.request_nonce = nonce(92);
+    let delayed_broker_id = harness
+        .authority
+        .prepare_approval(&delayed_terms, &digest(7))
+        .unwrap();
+    let delayed_signer_id = digest(93);
+    assert_ne!(delayed_broker_id, delayed_signer_id);
+    harness
+        .authority
+        .bind_signer_approval_id(&delayed_broker_id, &delayed_signer_id)
+        .unwrap();
+    let delayed_grant =
+        harness.signed_grant(&delayed_terms, delayed_broker_id.clone(), operation(94));
+    let delayed_tombstone = signed_approval_tombstone(&harness, delayed_signer_id);
+    let tombstones = vec![tombstone, delayed_tombstone];
+    let state = signed_revocation_with_tombstones(&harness, 0, &tombstones);
+
     let authority = Arc::new(harness.authority);
     let authorizing = {
         let authority = authority.clone();
@@ -1512,7 +1529,7 @@ fn revocation_and_authorization_linearize_without_post_revoke_reservation() {
     entered.wait();
     let reconciling = {
         let authority = authority.clone();
-        std::thread::spawn(move || authority.reconcile_revocation(&state, &[tombstone]))
+        std::thread::spawn(move || authority.reconcile_revocation(&state, &tombstones))
     };
     release.wait();
     authorizing.join().unwrap().unwrap();
@@ -1521,6 +1538,23 @@ fn revocation_and_authorization_linearize_without_post_revoke_reservation() {
         EpochReconciliation::Converged
     );
     assert!(authority.authorize(&denied_after).is_err());
+    assert_eq!(
+        authority
+            .approval_public_status(&delayed_broker_id)
+            .unwrap()
+            .state,
+        bloom_broker_api::ApprovalLifecycleState::Failed,
+        "Signer tombstones must stop the mapped Broker approval"
+    );
+    assert!(
+        error_code(
+            authority
+                .activate_approval(&delayed_grant, 1_500)
+                .unwrap_err()
+        )
+        .contains("APPROVAL_REVOKED"),
+        "delayed activation must consult the mapped Signer tombstone"
+    );
 }
 
 #[test]

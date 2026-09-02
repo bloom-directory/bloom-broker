@@ -1478,7 +1478,8 @@ impl BrokerAuthority {
         Ok(signer_terms)
     }
 
-    pub(crate) fn bind_signer_approval_id(
+    /// Persist the stable cross-boundary identity for an approval projection.
+    pub fn bind_signer_approval_id(
         &self,
         broker_approval_id: &Digest32,
         signer_approval_id: &Digest32,
@@ -2478,7 +2479,10 @@ impl BrokerAuthority {
         }
         self.store_signer_tombstones(&state.wallet_id, &sorted)?;
         for tombstone in &sorted {
-            self.stop_approval(&tombstone.approval_id)?;
+            let broker_approval_id = self
+                .broker_approval_id(&tombstone.approval_id)?
+                .unwrap_or_else(|| tombstone.approval_id.clone());
+            self.stop_approval(&broker_approval_id)?;
         }
         let local = self.local_epoch(&state.wallet_id)?;
         let signer = state.wallet_revocation_epoch.get();
@@ -2805,7 +2809,12 @@ impl BrokerAuthority {
         let connection = self.lock()?;
         connection
             .query_row(
-                "SELECT 1 FROM signer_approval_tombstones WHERE approval_id = ?1",
+                "SELECT 1 FROM signer_approval_tombstones
+                 WHERE approval_id = COALESCE(
+                    (SELECT signer_approval_id FROM signer_approval_ids
+                     WHERE broker_approval_id = ?1),
+                    ?1
+                 )",
                 [approval_id.as_str()],
                 |_| Ok(()),
             )
