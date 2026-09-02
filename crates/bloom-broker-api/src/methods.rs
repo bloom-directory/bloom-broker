@@ -25,6 +25,7 @@ method_enum!(MachineBrokerMethod {
     KeyListPublic => "key.list_public", KeyGetPublic => "key.get_public", KeyDerivationCapabilities => "key.derivation_capabilities", KeyDerivePrepare => "key.derive_prepare", KeyListDerived => "key.list_derived", KeyEnrollPrepare => "key.enroll_prepare",
     CredentialListPublic => "credential.list_public", CredentialAddPrepare => "credential.add_prepare", CredentialReplacePrepare => "credential.replace_prepare", CredentialRemovePrepare => "credential.remove_prepare",
     RecoveryPrepare => "recovery.prepare", CeremonyStatus => "ceremony.status", CeremonyCancel => "ceremony.cancel", CustodyResult => "custody.result",
+    OwnerInputRequest => "owner_input.request",
 });
 
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ProtocolError>> + Send + 'a>>;

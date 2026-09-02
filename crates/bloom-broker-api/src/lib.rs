@@ -7,6 +7,7 @@ mod codec;
 mod crypto;
 mod error;
 mod methods;
+mod owner_input;
 mod petal_key;
 mod policy;
 mod provenance;
@@ -21,6 +22,7 @@ pub use codec::*;
 pub use crypto::*;
 pub use error::*;
 pub use methods::*;
+pub use owner_input::*;
 pub use petal_key::*;
 pub use policy::*;
 pub use provenance::*;
@@ -44,11 +46,12 @@ pub const BROKER_API_MAJOR: u16 = 1;
 /// added under 1.3 — a 1.3 peer handed one would reject the whole error
 /// instead of reading the retry hint inside it.
 pub const RATE_LIMIT_DETAILS_MINOR: u16 = 4;
+pub const OWNER_INPUT_MINOR: u16 = 5;
 /// The negotiated range moves as a unit, so there is no accepted minor that
 /// predates a field the Broker may emit. A 1.3 peer is refused at the hello,
 /// before any response could carry `rate_limit`.
-pub const BROKER_API_MINOR_MIN: u16 = RATE_LIMIT_DETAILS_MINOR;
-pub const BROKER_API_MINOR_MAX: u16 = RATE_LIMIT_DETAILS_MINOR;
+pub const BROKER_API_MINOR_MIN: u16 = OWNER_INPUT_MINOR;
+pub const BROKER_API_MINOR_MAX: u16 = OWNER_INPUT_MINOR;
 pub const BROKER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(BROKER_API_MAJOR, BROKER_API_MINOR_MAX);
 pub const BROKER_API_RANGE: ProtocolVersionRange =

@@ -18,9 +18,9 @@ use axum::{
 use bloom_broker_api::{
     ApprovalPrepareState, CeremonyKind as BrokerCeremonyKind,
     CeremonyPublicStatus as BrokerCeremonyPublicStatus, CeremonyState as BrokerCeremonyState,
-    ClaimAssurance, CustodyPrepareResponse, CustodyPrepareState, PetalUseClaim,
-    PolicyUpdatePrepareResponse, ProtocolError, ProtocolErrorCode, RateLimitDetails,
-    SealedApprovalPrepareResponse,
+    ClaimAssurance, CustodyPrepareResponse, CustodyPrepareState, OwnerInputRequest,
+    OwnerInputResponse, PetalUseClaim, PolicyUpdatePrepareResponse, ProtocolError,
+    ProtocolErrorCode, RateLimitDetails, SealedApprovalPrepareResponse,
 };
 use bloom_signer_api::{
     Base64UrlBytes, CeremonyChallenge, CeremonyCompleteRequest, CeremonyKind,
@@ -55,6 +55,8 @@ const INVALID_ATTEMPT_LIMIT: u32 = 8;
 const CANCELLATION_BACKOFF_MS: u64 = 2_000;
 const REVIEW_MANIFEST_DOMAIN: &[u8] = b"bloom-broker-review-manifest/v1";
 const OUTPUT_ACK_TTL_MS: u64 = 5 * 60 * 1_000;
+const OWNER_INPUT_TTL_MS: u64 = 5 * 60 * 1_000;
+const OWNER_INPUT_MAX_BYTES: usize = 256;
 
 /// Compiled default bound on simultaneously live ceremony sessions. This is
 /// the independent limit on concurrent resource usage; the rolling creation
@@ -221,6 +223,8 @@ fn bounded(field: &str, value: u64, ceiling: u64) -> Result<(), ProtocolError> {
 
 const SHELL_HTML: &str = include_str!("ceremony_assets/index.html");
 const APP_JS: &str = include_str!("ceremony_assets/app.js");
+const INPUT_HTML: &str = include_str!("ceremony_assets/input.html");
+const INPUT_JS: &str = include_str!("ceremony_assets/input.js");
 const STYLE_CSS: &str = include_str!("ceremony_assets/style.css");
 const BLOOM_PRIMARY_SVG: &str = include_str!("ceremony_assets/bloom-primary.svg");
 
@@ -438,6 +442,7 @@ struct BrokerInner {
     /// concurrent prepares cannot all reserve the same remaining capacity.
     creation_admission: Mutex<()>,
     sessions: Mutex<HashMap<String, BrowserSession>>,
+    owner_inputs: Mutex<HashMap<OperationId, OwnerInputSession>>,
     operations: Mutex<HashMap<OperationId, String>>,
     cancellation_backoff: Mutex<HashMap<Token, (u32, u64)>>,
     invalid_attempts: Mutex<HashMap<IpAddr, u32>>,
@@ -469,6 +474,30 @@ struct BrowserSession {
     #[serde(default)]
     policy_update: Option<PolicyUpdateCeremonyPrepareRequest>,
     projection: BrowserProjection,
+}
+
+#[derive(Clone)]
+struct OwnerInputSession {
+    request: OwnerInputRequest,
+    request_digest: Digest32,
+    token: Option<Base64UrlBytes>,
+    token_hash: [u8; 32],
+    expires_at_ms: u64,
+    value: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OwnerInputProjection<'a> {
+    operation_id: &'a OperationId,
+    kind: bloom_broker_api::OwnerInputKind,
+    context: &'a bloom_broker_api::OwnerInputDisplayContext,
+    expires_at_ms: DecimalU64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerInputComplete {
+    value: String,
 }
 
 struct NewBrowserSession {
@@ -624,6 +653,7 @@ impl CeremonyBroker {
                 limits,
                 creation_admission: Mutex::new(()),
                 sessions: Mutex::new(HashMap::new()),
+                owner_inputs: Mutex::new(HashMap::new()),
                 operations: Mutex::new(HashMap::new()),
                 cancellation_backoff: Mutex::new(HashMap::new()),
                 invalid_attempts: Mutex::new(HashMap::new()),
@@ -665,6 +695,91 @@ impl CeremonyBroker {
     /// would be a security mutation and is deferred until a clean restart.
     pub fn set_completion_observer_read_only(&self, observer: Arc<dyn CeremonyCompletionObserver>) {
         *self.inner.completion_observer.lock() = Some(observer);
+    }
+
+    /// Request or resume a short-lived, Broker-hosted Petal input form. This
+    /// path intentionally has no Signer or WebAuthn dependency: it keeps the
+    /// submitted value out of agent-facing surfaces, but grants no authority.
+    pub fn request_owner_input(
+        &self,
+        request: OwnerInputRequest,
+        now_ms: u64,
+    ) -> Result<OwnerInputResponse, ProtocolError> {
+        self.expire_sessions(now_ms)?;
+        if now_ms == 0 {
+            return Err(protocol(
+                ProtocolErrorCode::ClockUntrusted,
+                "trusted platform time is required to create private input",
+            ));
+        }
+        for value in [
+            &request.context.network,
+            &request.context.asset,
+            &request.context.amount_base_units,
+            &request.context.source,
+        ] {
+            if value.is_empty() || value.len() > 512 {
+                return Err(protocol(
+                    ProtocolErrorCode::MalformedFrame,
+                    "owner-input display context must contain 1..=512 bytes per field",
+                ));
+            }
+        }
+        let request_digest = digest(&request)?;
+        let mut sessions = self.inner.owner_inputs.lock();
+        if let Some(existing) = sessions.get(&request.operation_id) {
+            if existing.request_digest != request_digest {
+                return Err(operation_conflict());
+            }
+            if existing.value.is_some() {
+                let session = sessions
+                    .remove(&request.operation_id)
+                    .ok_or_else(not_found)?;
+                return Ok(OwnerInputResponse::Ready {
+                    operation_id: request.operation_id,
+                    value: session.value.ok_or_else(not_found)?,
+                });
+            }
+            let token = existing.token.as_ref().ok_or_else(replay)?;
+            return Ok(OwnerInputResponse::Pending {
+                operation_id: request.operation_id,
+                ceremony_url: owner_input_url(token),
+                expires_at_ms: DecimalU64::new(existing.expires_at_ms),
+            });
+        }
+        if self
+            .inner
+            .operations
+            .lock()
+            .contains_key(&request.operation_id)
+            || sessions.len() + self.inner.sessions.lock().len()
+                >= self.inner.limits.maximum_concurrent_sessions()
+        {
+            return Err(protocol(
+                ProtocolErrorCode::QuotaExceeded,
+                "Broker ceremony concurrency quota is exhausted",
+            ));
+        }
+        let mut token_bytes = [0_u8; 32];
+        OsRng.fill_bytes(&mut token_bytes);
+        let token = Base64UrlBytes::from_bytes(&token_bytes);
+        let expires_at_ms = now_ms.saturating_add(OWNER_INPUT_TTL_MS);
+        sessions.insert(
+            request.operation_id.clone(),
+            OwnerInputSession {
+                request: request.clone(),
+                request_digest,
+                token: Some(token.clone()),
+                token_hash: Sha256::digest(token.decode()).into(),
+                expires_at_ms,
+                value: None,
+            },
+        );
+        Ok(OwnerInputResponse::Pending {
+            operation_id: request.operation_id,
+            ceremony_url: owner_input_url(&token),
+            expires_at_ms: DecimalU64::new(expires_at_ms),
+        })
     }
 
     pub fn prepare_approval(
@@ -1086,6 +1201,7 @@ impl CeremonyBroker {
     /// before this is called, so no new browser transition can race the
     /// snapshots below.
     pub fn terminate_live_sessions(&self, now_ms: u64) -> Result<(), ProtocolError> {
+        self.inner.owner_inputs.lock().clear();
         let live = self
             .inner
             .sessions
@@ -1144,7 +1260,9 @@ impl CeremonyBroker {
         Router::new()
             .route("/", get(shell))
             .route("/ceremony/{token}", get(ceremony_shell))
+            .route("/input/{token}", get(owner_input_shell))
             .route("/assets/app.js", get(app_js))
+            .route("/assets/input.js", get(input_js))
             .route("/assets/style.css", get(style_css))
             .route("/assets/bloom-primary.svg", get(bloom_primary_svg))
             .route("/api/session", get(read_session_by_token))
@@ -1160,12 +1278,21 @@ impl CeremonyBroker {
             )
             .route("/api/session/{ceremony_id}/ack", post(acknowledge_result))
             .route("/api/session/{ceremony_id}/cancel", post(cancel_session))
+            .route("/api/input", get(read_owner_input))
+            .route(
+                "/api/input/{operation_id}/complete",
+                post(complete_owner_input),
+            )
             .layer(DefaultBodyLimit::max(MAX_CEREMONY_BODY_BYTES))
             .layer(middleware::from_fn(security_headers))
             .with_state(self.clone())
     }
 
     pub fn expire_sessions(&self, now_ms: u64) -> Result<(), ProtocolError> {
+        self.inner
+            .owner_inputs
+            .lock()
+            .retain(|_, session| session.expires_at_ms > now_ms);
         let expired = self
             .inner
             .sessions
@@ -1961,6 +2088,24 @@ async fn ceremony_shell(
     Html(SHELL_HTML).into_response()
 }
 
+async fn owner_input_shell(
+    State(broker): State<CeremonyBroker>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if validate_host(&headers).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if broker.expire_sessions(unix_time_ms()).is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if broker.owner_input_for_encoded_token(&token).is_none() {
+        broker.record_invalid_browser_token();
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Html(INPUT_HTML).into_response()
+}
+
 async fn app_js(headers: HeaderMap) -> Response {
     if validate_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
@@ -1973,6 +2118,76 @@ async fn app_js(headers: HeaderMap) -> Response {
         APP_JS,
     )
         .into_response()
+}
+
+async fn input_js(headers: HeaderMap) -> Response {
+    if validate_host(&headers).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        INPUT_JS,
+    )
+        .into_response()
+}
+
+async fn read_owner_input(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    let operation_id = match broker.authorize_owner_input_token(&headers) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::FORBIDDEN.into_response(),
+    };
+    let sessions = broker.inner.owner_inputs.lock();
+    let Some(session) = sessions.get(&operation_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Json(OwnerInputProjection {
+        operation_id: &operation_id,
+        kind: session.request.kind,
+        context: &session.request.context,
+        expires_at_ms: DecimalU64::new(session.expires_at_ms),
+    })
+    .into_response()
+}
+
+async fn complete_owner_input(
+    State(broker): State<CeremonyBroker>,
+    Path(operation_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<OwnerInputComplete>,
+) -> Response {
+    let operation_id = match OperationId::new(operation_id) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    if broker
+        .authorize_owner_input(&operation_id, &headers, true)
+        .is_err()
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if body.value.len() > OWNER_INPUT_MAX_BYTES
+        || !matches!(
+            body.value.as_bytes(),
+            [b'0', b'x', rest @ ..]
+                if rest.len() == 40 && rest.iter().all(u8::is_ascii_hexdigit)
+        )
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let mut sessions = broker.inner.owner_inputs.lock();
+    let Some(session) = sessions.get_mut(&operation_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if session.value.is_some() || session.token.is_none() {
+        return StatusCode::CONFLICT.into_response();
+    }
+    session.value = Some(body.value);
+    session.token = None;
+    session.token_hash = [0; 32];
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn style_css(headers: HeaderMap) -> Response {
@@ -2373,6 +2588,62 @@ async fn cancel_session(
 }
 
 impl CeremonyBroker {
+    fn owner_input_for_encoded_token(&self, encoded: &str) -> Option<OperationId> {
+        let supplied = Base64UrlBytes::parse(encoded.to_owned())
+            .ok()
+            .filter(|value| value.decode().len() == 32)?;
+        let hash = <[u8; 32]>::from(Sha256::digest(supplied.decode()));
+        self.inner
+            .owner_inputs
+            .lock()
+            .iter()
+            .find_map(|(operation_id, session)| {
+                (session.token_hash == hash).then(|| operation_id.clone())
+            })
+    }
+
+    fn authorize_owner_input_token(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<OperationId, ProtocolError> {
+        self.expire_sessions(unix_time_ms())?;
+        validate_host(headers)?;
+        let operation_id = headers
+            .get("x-bloom-input-token")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| self.owner_input_for_encoded_token(value));
+        if let Some(operation_id) = operation_id {
+            return Ok(operation_id);
+        }
+        self.record_invalid_browser_token();
+        Err(protocol(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            "invalid private-input session token",
+        ))
+    }
+
+    fn authorize_owner_input(
+        &self,
+        operation_id: &OperationId,
+        headers: &HeaderMap,
+        mutation: bool,
+    ) -> Result<(), ProtocolError> {
+        let authorized = self.authorize_owner_input_token(headers)?;
+        if mutation {
+            require_exact_header(headers, header::ORIGIN, CEREMONY_ORIGIN)?;
+            require_exact_header(headers, header::CONTENT_TYPE, "application/json")?;
+            require_exact_header_name(headers, "sec-fetch-site", "same-origin")?;
+        }
+        if &authorized != operation_id {
+            self.record_invalid_browser_token();
+            return Err(protocol(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "private-input token does not match operation",
+            ));
+        }
+        Ok(())
+    }
+
     fn ceremony_for_encoded_token(&self, encoded: &str) -> Option<String> {
         let supplied = Base64UrlBytes::parse(encoded.to_owned())
             .ok()
@@ -2521,6 +2792,10 @@ fn require_exact_header_name(
 
 fn session_url(token: &Base64UrlBytes) -> String {
     format!("{CEREMONY_ORIGIN}/ceremony/{}", token.encoded())
+}
+
+fn owner_input_url(token: &Base64UrlBytes) -> String {
+    format!("{CEREMONY_ORIGIN}/input/{}", token.encoded())
 }
 
 fn token_for(session: &BrowserSession) -> Base64UrlBytes {

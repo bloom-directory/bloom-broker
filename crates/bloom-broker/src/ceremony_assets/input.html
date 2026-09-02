@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>/bloom — Private input</title>
+  <link rel="icon" href="/assets/bloom-primary.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <main class="page">
+    <header class="brand"><img src="/assets/bloom-primary.svg" width="30" height="30" alt=""><span><strong>/bloom</strong> walletFS</span></header>
+    <div class="layout">
+      <section class="intro">
+        <p class="eyebrow">Private Petal input</p>
+        <h1>Enter it here.</h1>
+        <p class="lede">This value goes to the requesting Petal without appearing in agent-visible chat, commands, logs, or VFS state.</p>
+        <div class="trust"><div class="trust-item"><div><strong>Not an approval</strong>The displayed context is supplied by the Petal. Submitting does not authorize or sign a transaction.</div></div></div>
+      </section>
+      <section class="panel">
+        <header class="panel-header"><p class="panel-kicker">Privacy Pools</p><h2 class="panel-title">Withdrawal recipient</h2><p id="status" role="status">Loading request…</p></header>
+        <section id="review" aria-live="polite"></section>
+        <fieldset><legend>Ethereum recipient</legend><label>Address<input id="private-input" type="text" inputmode="text" autocomplete="off" spellcheck="false" placeholder="0x…"></label><p>The address is released once to the requesting Petal and then removed from Broker memory.</p></fieldset>
+        <div class="actions"><button id="submit" type="button" disabled>Send privately</button></div>
+      </section>
+    </div>
+  </main>
+  <script src="/assets/input.js"></script>
+</body>
+</html>
