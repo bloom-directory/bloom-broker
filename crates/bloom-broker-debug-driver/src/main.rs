@@ -5,10 +5,12 @@ use std::{
     path::PathBuf,
 };
 
+use bloom_broker_api::CeremonyKind as BrokerCeremonyKind;
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer_api::{
     Base64UrlBytes, CeremonyChallenge, CeremonyKind, CustodyHpkeAad, CustodySignerContribution,
-    Digest32, LocalPrfHpkeAad, SignerCeremonyContribution, WebAuthnCeremonyProof,
+    Digest32, LocalPrfHpkeAad, OwnerAttestationChallenge, OwnerAttestationSignerContribution,
+    SignerCeremonyContribution, WebAuthnCeremonyProof,
 };
 
 mod artifact_scan;
@@ -63,7 +65,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let token = ceremony_token(&url)?;
     let session = request("GET", "/api/session", token, None)?;
-    let kind: CeremonyKind = serde_json::from_value(session["ceremony_kind"].clone())?;
+    let kind_value = session["ceremony_kind"].clone();
+    let broker_kind: BrokerCeremonyKind = serde_json::from_value(kind_value.clone())?;
+    let authenticator = VirtualAuthenticator::from_seed(seed.as_bytes());
+
+    if broker_kind == BrokerCeremonyKind::PetalRegistration {
+        let contribution: OwnerAttestationSignerContribution =
+            serde_json::from_value(session["signer_contribution"].clone())?;
+        let challenge: OwnerAttestationChallenge =
+            serde_json::from_value(session["challenges"][0]["binding"].clone())?;
+        let assertion = authenticator.assertion(&challenge.canonical_bytes()?, sign_count);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "proof": WebAuthnCeremonyProof::Assertion { assertion },
+            "encrypted_input": null,
+            "public_binding_digest": contribution.public_binding_digest,
+        }))?;
+        let result = request(
+            "POST",
+            &format!("/api/session/{}/complete", contribution.ceremony_id),
+            token,
+            Some(&body),
+        )?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    let kind: CeremonyKind = serde_json::from_value(kind_value)?;
     let challenges = session["challenges"]
         .as_array()
         .ok_or("ceremony session omitted challenges")?
@@ -72,8 +99,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Result<Vec<_>, _>>()?;
     let public_binding_digest: Digest32 =
         serde_json::from_value(session["challenges"][0]["binding"]["exact_terms_digest"].clone())?;
-    let authenticator = VirtualAuthenticator::from_seed(seed.as_bytes());
-
     if kind == CeremonyKind::SealedApproval {
         let contribution: SignerCeremonyContribution =
             serde_json::from_value(session["signer_contribution"].clone())?;
@@ -176,7 +201,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         CeremonyKind::WalletDelete
         | CeremonyKind::KeyDerive
         | CeremonyKind::PolicyUpdate
-        | CeremonyKind::PetalRegistration
         | CeremonyKind::WalletExport
         | CeremonyKind::BackendEnrollment => {
             let assertion = authenticator.assertion(&challenges[0].canonical_bytes()?, sign_count);
