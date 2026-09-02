@@ -11,6 +11,7 @@ const POLICY_UPDATE_TERMS_DOMAIN: &[u8] = b"bloom-policy-update-terms/v1";
 pub struct CanonicalWalletPolicy {
     pub wallet_id: Token,
     pub maximum_approval_lifetime_ms: u64,
+    #[serde(alias = "allowed_delegated_authorities")]
     pub allowed_petal_packages: Vec<Digest32>,
     pub allowed_destinations: Vec<PolicyDestination>,
     pub required_verifiers: Vec<RequiredVerifier>,

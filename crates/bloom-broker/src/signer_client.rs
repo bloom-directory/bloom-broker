@@ -12,11 +12,12 @@ use bloom_audit_checkpoint::{CheckpointDecision, CheckpointDecisionOutcome, Chec
 use bloom_signer_api::{
     Base64UrlBytes, BrokerSignerRequest, BrokerSignerResponse, CeremonyCompleteRequest,
     CeremonyKind, CustodyBindOutputRecipientRequest, CustodyCompleteRequest, CustodyPrepareRequest,
-    CustodyResult, Digest32, IdRequest, OperationId, PolicyUpdateCeremonyCompleteRequest,
-    PolicyUpdateCeremonyPrepareRequest, ProtocolError, ProtocolErrorCode, SignerActivationReceipt,
-    SignerCeremonyCompleteRequest, SignerCeremonyCompleteResponse, SignerCeremonyPrepareRequest,
-    SignerCeremonyPrepareResponse, SignerCeremonyStatus, SignerPreparedApproval,
-    SignerPreparedCustody, Token, TypedRequestMethod, is_read_only_method,
+    CustodyResult, Digest32, IdRequest, OperationId, OwnerAttestationCompleteRequest,
+    OwnerAttestationPrepareRequest, OwnerAttestationReceipt, PolicyUpdateCeremonyCompleteRequest,
+    PolicyUpdateCeremonyPrepareRequest, PreparedOwnerAttestation, ProtocolError, ProtocolErrorCode,
+    SignerActivationReceipt, SignerCeremonyCompleteRequest, SignerCeremonyCompleteResponse,
+    SignerCeremonyPrepareRequest, SignerCeremonyPrepareResponse, SignerCeremonyStatus,
+    SignerPreparedApproval, SignerPreparedCustody, Token, TypedRequestMethod, is_read_only_method,
 };
 use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
 
@@ -424,9 +425,7 @@ impl CeremonySigner for BrokerSignerClient {
             CeremonyKind::CredentialRemove => BrokerSignerRequest::CredentialRemovePrepare(request),
             CeremonyKind::BackendEnrollment => BrokerSignerRequest::KeyEnrollPrepare(request),
             CeremonyKind::KeyDerive => BrokerSignerRequest::KeyDerivePrepare(request),
-            CeremonyKind::SealedApproval
-            | CeremonyKind::PolicyUpdate
-            | CeremonyKind::PetalRegistration => {
+            CeremonyKind::SealedApproval | CeremonyKind::PolicyUpdate => {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::CeremonyKindMismatch,
                     "custody kind has no matching prepare method",
@@ -447,31 +446,31 @@ impl CeremonySigner for BrokerSignerClient {
         }
     }
 
-    fn prepare_petal_registration(
+    fn prepare_owner_attestation(
         &self,
-        request: bloom_signer_api::PetalRegistrationCeremonyPrepareRequest,
+        request: OwnerAttestationPrepareRequest,
         _now_ms: u64,
-    ) -> Result<SignerPreparedCustody, ProtocolError> {
+    ) -> Result<PreparedOwnerAttestation, ProtocolError> {
         match self.request(BrokerSignerRequest::CeremonyPrepare(
-            SignerCeremonyPrepareRequest::PetalRegistration(Box::new(request)),
+            SignerCeremonyPrepareRequest::OwnerAttestationPrepare(Box::new(request)),
         ))? {
             BrokerSignerResponse::CeremonyPrepare(
-                SignerCeremonyPrepareResponse::PetalRegistration(prepared),
+                SignerCeremonyPrepareResponse::OwnerAttestationPrepare(prepared),
             ) => Ok(prepared),
             _ => Err(response_mismatch("ceremony.prepare")),
         }
     }
 
-    fn complete_petal_registration(
+    fn complete_owner_attestation(
         &self,
-        request: CustodyCompleteRequest,
+        request: OwnerAttestationCompleteRequest,
         _now_ms: u64,
-    ) -> Result<CustodyResult, ProtocolError> {
+    ) -> Result<OwnerAttestationReceipt, ProtocolError> {
         match self.request(BrokerSignerRequest::CeremonyComplete(
-            SignerCeremonyCompleteRequest::PetalRegistration(Box::new(request)),
+            SignerCeremonyCompleteRequest::OwnerAttestationComplete(Box::new(request)),
         ))? {
             BrokerSignerResponse::CeremonyComplete(
-                SignerCeremonyCompleteResponse::PetalRegistration(result),
+                SignerCeremonyCompleteResponse::OwnerAttestationComplete(result),
             ) => Ok(*result),
             _ => Err(response_mismatch("ceremony.complete")),
         }

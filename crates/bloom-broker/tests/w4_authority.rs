@@ -12,9 +12,10 @@ use bloom_broker_api::{
     Base64UrlBytes, BootEpoch, CeremonyKind, CeremonyState, ClaimAssurance, ClaimAssuranceLevel,
     CryptoSuite, CustodyResult, DecimalU64, DecimalU256, DeclaredDebit, DeclaredDestination,
     DeclaredFee, Digest32, KeyRef, KeySpec, MachineSignRequest, OperationId,
-    PROVENANCE_CATALOG_SCHEMA, PetalKeyScope, PetalLineageMembership, PetalRouteGrant,
-    PetalUseClaim, PolicyUpdateRequest, ProvenanceCatalog, RequestNonce, RevocationState,
-    SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads, Token, ValueLimit,
+    PROVENANCE_CATALOG_SCHEMA, PetalKeyScope, PetalLineageMembership, PetalRegistrationReceipt,
+    PetalRouteGrant, PetalUseClaim, PolicyUpdateRequest, ProvenanceCatalog, RequestNonce,
+    RevocationState, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads, Token, ValueLimit,
+    petal_registration_context_digest,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
@@ -34,6 +35,7 @@ const CEREMONY_DOMAIN: &[u8] = b"bloom-broker-ceremony-grant/v1";
 const REVOCATION_DOMAIN: &[u8] = b"bloom-revocation-state/v1";
 const APPROVAL_TOMBSTONE_DOMAIN: &[u8] = b"bloom-approval-tombstone/v1";
 const SIGNER_RECEIPT_DOMAIN: &[u8] = b"bloom-signer-ceremony-receipt/v1";
+const AUTHORITY_EDGE_DOMAIN: &[u8] = b"bloom-authority-edge/v1\0";
 const SIGN_OPERATION_DOMAIN: &[u8] = b"bloom-sign-operation/v1";
 
 #[derive(serde::Serialize)]
@@ -385,7 +387,6 @@ fn ac18_wallet_delete_fails_closed_under_audit_degradation() {
         .policy_snapshot(&harness.wallet)
         .expect("baseline policy");
     let mut receipt = CustodyResult {
-        petal_registration_terms_digest: None,
         ceremony_kind: CeremonyKind::WalletDelete,
         custody_operation_id: operation(90),
         public_status: CeremonyState::Completed,
@@ -778,7 +779,6 @@ fn initial_policy_adoption_requires_outer_receipt_and_does_not_poison_key_pin() 
     let accepted_snapshot =
         initial_policy_snapshot(&wallet, &accepted_key, token("accepted-policy-key"));
     let mut receipt = CustodyResult {
-        petal_registration_terms_digest: None,
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation(91),
         public_status: CeremonyState::Completed,
@@ -879,7 +879,6 @@ fn petal_scoped_key_is_frozen_to_installer_provenance_and_petal_approvals() {
     child.locator = "petal-child-1".into();
     child.public_key_fingerprint = digest(95);
     let mut receipt = CustodyResult {
-        petal_registration_terms_digest: None,
         ceremony_kind: CeremonyKind::KeyDerive,
         custody_operation_id: scope.custody_operation_id.clone(),
         public_status: CeremonyState::Succeeded,
@@ -2174,23 +2173,25 @@ mod registration_fixture;
 fn registration_receipt(
     h: &Harness,
     terms: &bloom_broker_api::PetalRegistrationTerms,
-) -> CustodyResult {
-    let mut receipt: CustodyResult = serde_json::from_value(serde_json::json!({
-        "ceremony_kind": "petal_registration", "custody_operation_id": terms.operation_id,
-        "public_status": "SUCCEEDED", "wallet_id": terms.owner_wallet_id,
-        "public_key_refs": [], "credential_summaries": [], "initial_policy": null,
-        "receipt_digest": "66".repeat(32), "petal_registration_terms_digest": terms.digest().unwrap(),
-        "encrypted_browser_result": null, "signer_key_id": "ceremony-key", "signer_signature": ""
-    })).unwrap();
+) -> PetalRegistrationReceipt {
+    let mut authority_edge = Sha256::new();
+    authority_edge.update(AUTHORITY_EDGE_DOMAIN);
+    authority_edge.update(SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes());
+    authority_edge.update(h.ceremony_key.verifying_key().to_bytes());
+    let mut receipt = PetalRegistrationReceipt {
+        operation_id: terms.operation_id.clone(),
+        ceremony_id: digest(65),
+        owner_wallet_id: terms.owner_wallet_id.clone(),
+        authority_edge_digest: Digest32::from_bytes(authority_edge.finalize().into()),
+        context_digest: petal_registration_context_digest(),
+        subject_digest: terms.digest().unwrap(),
+        receipt_digest: digest(66),
+        signer_key_id: token("ceremony-key"),
+        signer_signature: Base64UrlBytes::from_bytes(&[]),
+    };
     receipt.signer_signature = Base64UrlBytes::from_bytes(
         &h.ceremony_key
-            .sign(
-                &[
-                    SIGNER_RECEIPT_DOMAIN,
-                    &receipt.unsigned_canonical_bytes().unwrap(),
-                ]
-                .concat(),
-            )
+            .sign(&receipt.signature_message().unwrap())
             .to_bytes(),
     );
     receipt
@@ -2236,26 +2237,17 @@ fn petal_registration_commits_complete_exact_routes_only_after_a_valid_receipt()
         let mut forged = receipt.clone();
         match mutated {
             0 => forged.signer_signature = Base64UrlBytes::from_bytes(&[0; 64]),
-            1 => forged.custody_operation_id = OperationId::from_bytes([83; 32]),
-            2 => {
-                forged.ceremony_kind = CeremonyKind::PolicyUpdate;
-                forged.petal_registration_terms_digest = None;
-            }
-            3 => forged.petal_registration_terms_digest = Some(digest(1)),
-            _ => forged.wallet_id = Some(token("different-owner")),
+            1 => forged.operation_id = OperationId::from_bytes([83; 32]),
+            2 => forged.authority_edge_digest = digest(1),
+            3 => forged.subject_digest = digest(1),
+            _ => forged.owner_wallet_id = token("different-owner"),
         }
         if mutated != 0 {
             // These are valid Signer signatures for different terms/kinds. Only
             // exact registration binding, rather than signature alone, rejects them.
             forged.signer_signature = Base64UrlBytes::from_bytes(
                 &h.ceremony_key
-                    .sign(
-                        &[
-                            SIGNER_RECEIPT_DOMAIN,
-                            &forged.unsigned_canonical_bytes().unwrap(),
-                        ]
-                        .concat(),
-                    )
+                    .sign(&forged.signature_message().unwrap())
                     .to_bytes(),
             );
         }

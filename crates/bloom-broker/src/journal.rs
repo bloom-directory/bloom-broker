@@ -946,7 +946,7 @@ impl BrokerJournal {
             || validation_receipt.operation_digest != request.operation_digest
             || validation_receipt.policy_version != request.policy_version
             || validation_receipt.policy_digest != request.policy_digest
-            || validation_receipt.claim_digest != request.petal_use_claim_digest
+            || validation_receipt.claim_digest != request.delegated_use_claim_digest
             || validation_receipt.assurance_digest != request.claim_assurance_digest
             || validation_receipt.broker_key_id != request.broker_signing_key_id
             || validation_receipt.broker_signature.decode().len() != 64
@@ -1411,11 +1411,36 @@ impl BrokerJournal {
         approval_id: &Digest32,
         result: &SigningResult,
     ) -> Result<(), JournalError> {
+        self.publish_result_bound(approval_id, result, approval_id, &result.operation_digest)
+    }
+
+    pub(crate) fn publish_projected_result(
+        &self,
+        approval_id: &Digest32,
+        result: &SigningResult,
+        signer_approval_id: &Digest32,
+        signer_operation_digest: &Digest32,
+    ) -> Result<(), JournalError> {
+        self.publish_result_bound(
+            approval_id,
+            result,
+            signer_approval_id,
+            signer_operation_digest,
+        )
+    }
+
+    fn publish_result_bound(
+        &self,
+        approval_id: &Digest32,
+        result: &SigningResult,
+        signer_approval_id: &Digest32,
+        signer_operation_digest: &Digest32,
+    ) -> Result<(), JournalError> {
         let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         let operation = read_operation(&transaction, &result.operation_id)?
             .ok_or_else(|| protocol(ProtocolErrorCode::ApprovalNotFound, "operation not found"))?;
-        if operation.operation_digest != result.operation_digest {
+        if &operation.operation_digest != signer_operation_digest {
             return Err(protocol(
                 ProtocolErrorCode::OperationIdConflict,
                 "result changed the stable operation digest",
@@ -1448,8 +1473,8 @@ impl BrokerJournal {
         }
         require_reserved(&transaction, approval_id, &result.operation_id)?;
         let validation_receipt = retained_validation_receipt(&transaction, &result.operation_id)?;
-        if validation_receipt.approval_id != *approval_id
-            || validation_receipt.operation_digest != result.operation_digest
+        if &validation_receipt.approval_id != signer_approval_id
+            || &validation_receipt.operation_digest != signer_operation_digest
         {
             return Err(protocol(
                 ProtocolErrorCode::OperationIdConflict,
@@ -1495,6 +1520,40 @@ impl BrokerJournal {
         parent_result: &SigningResult,
         child_results: &[SigningResult],
     ) -> Result<(), JournalError> {
+        self.publish_batch_bound(
+            approval_id,
+            parent_result,
+            child_results,
+            approval_id,
+            &parent_result.operation_digest,
+        )
+    }
+
+    pub(crate) fn publish_projected_batch(
+        &self,
+        approval_id: &Digest32,
+        parent_result: &SigningResult,
+        child_results: &[SigningResult],
+        signer_approval_id: &Digest32,
+        signer_operation_digest: &Digest32,
+    ) -> Result<(), JournalError> {
+        self.publish_batch_bound(
+            approval_id,
+            parent_result,
+            child_results,
+            signer_approval_id,
+            signer_operation_digest,
+        )
+    }
+
+    fn publish_batch_bound(
+        &self,
+        approval_id: &Digest32,
+        parent_result: &SigningResult,
+        child_results: &[SigningResult],
+        signer_approval_id: &Digest32,
+        signer_operation_digest: &Digest32,
+    ) -> Result<(), JournalError> {
         if child_results.is_empty() || child_results.len() > 32 {
             return Err(protocol(
                 ProtocolErrorCode::BackendInvalidRequest,
@@ -1522,7 +1581,7 @@ impl BrokerJournal {
                     "batch parent operation not found",
                 )
             })?;
-        if parent.operation_digest != parent_result.operation_digest {
+        if &parent.operation_digest != signer_operation_digest {
             return Err(protocol(
                 ProtocolErrorCode::OperationIdConflict,
                 "batch result changed the stable operation digest",
@@ -1578,8 +1637,8 @@ impl BrokerJournal {
         require_reserved(&transaction, approval_id, &parent_result.operation_id)?;
         let validation_receipt =
             retained_validation_receipt(&transaction, &parent_result.operation_id)?;
-        if validation_receipt.approval_id != *approval_id
-            || validation_receipt.operation_digest != parent_result.operation_digest
+        if &validation_receipt.approval_id != signer_approval_id
+            || &validation_receipt.operation_digest != signer_operation_digest
         {
             return Err(protocol(
                 ProtocolErrorCode::OperationIdConflict,

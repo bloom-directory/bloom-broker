@@ -3,17 +3,23 @@
 use bloom_broker_api as north;
 use bloom_signer_api as south;
 
-use super::{ceremony, key, policy};
+use super::{ceremony, delegated, key, policy};
 
-fn petal_scope_to_signer(value: north::PetalKeyScope) -> south::PetalKeyScope {
-    south::PetalKeyScope {
+pub(crate) fn petal_scope_to_signer(
+    value: north::PetalKeyScope,
+) -> Result<south::DelegatedKeyScope, north::ProtocolError> {
+    let allowed_resource_ids = value
+        .allowed_routes
+        .iter()
+        .map(|route| delegated::resource_id(route))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(south::DelegatedKeyScope {
         wallet_id: value.wallet_id,
         parent_key_ref: key::key_ref_to_signer(value.parent_key_ref),
-        package_hash: value.package_hash,
-        route: value.route,
-        lineage_id: value.lineage_id,
-        key_slot: value.key_slot,
-        allowed_routes: value.allowed_routes,
+        authority_id: delegated::authority_id(&value.lineage_id)?,
+        active_subject_id: value.package_hash,
+        delegate_id: value.key_slot,
+        allowed_resource_ids,
         allowed_operation_classes: value.allowed_operation_classes,
         allowed_crypto_suites: value
             .allowed_crypto_suites
@@ -22,7 +28,7 @@ fn petal_scope_to_signer(value: north::PetalKeyScope) -> south::PetalKeyScope {
             .collect(),
         maximum_lifetime_ms: value.maximum_lifetime_ms,
         custody_operation_id: value.custody_operation_id,
-    }
+    })
 }
 
 fn legacy_migration_to_signer(
@@ -42,20 +48,30 @@ fn legacy_migration_to_signer(
 
 pub(crate) fn prepare_to_signer(
     value: north::CustodyPrepareRequest,
-) -> south::CustodyPrepareRequest {
-    south::CustodyPrepareRequest {
-        ceremony_kind: ceremony::kind_to_signer(value.ceremony_kind),
+) -> Result<south::CustodyPrepareRequest, north::ProtocolError> {
+    let delegated_key_scope = value
+        .petal_key_scope
+        .map(petal_scope_to_signer)
+        .transpose()?;
+    let exact_terms_digest = match &delegated_key_scope {
+        Some(scope) => scope.request_digest().map_err(|error| {
+            north::ProtocolError::new(north::ProtocolErrorCode::MalformedFrame, error.to_string())
+        })?,
+        None => value.exact_terms_digest,
+    };
+    Ok(south::CustodyPrepareRequest {
+        ceremony_kind: ceremony::kind_to_signer(value.ceremony_kind)?,
         custody_operation_id: value.custody_operation_id,
         wallet_id: value.wallet_id,
         key_ref: value.key_ref.map(key::key_ref_to_signer),
-        exact_terms_digest: value.exact_terms_digest,
+        exact_terms_digest,
         expected_input_class: value.expected_input_class,
         browser_output_recipient_key: value.browser_output_recipient_key,
-        petal_key_scope: value.petal_key_scope.map(petal_scope_to_signer),
+        delegated_key_scope,
         legacy_passkey_migration: value
             .legacy_passkey_migration
             .map(legacy_migration_to_signer),
-    }
+    })
 }
 
 pub(crate) fn result_to_machine(value: south::CustodyResult) -> north::CustodyResult {
@@ -80,7 +96,6 @@ pub(crate) fn result_to_machine(value: south::CustodyResult) -> north::CustodyRe
             .collect(),
         initial_policy: value.initial_policy.map(policy::snapshot_to_machine),
         receipt_digest: value.receipt_digest,
-        petal_registration_terms_digest: value.petal_registration_terms_digest,
         encrypted_browser_result: value.encrypted_browser_result.map(|encrypted| {
             north::EncryptedBrowserResult {
                 kem_output: encrypted.kem_output,
@@ -155,9 +170,9 @@ mod tests {
                 .code,
             north::ProtocolErrorCode::OperationIdConflict
         );
-        let mapped = prepare_to_signer(request);
-        mapped.validate_petal_key_scope_binding().unwrap();
-        let mapped_scope = mapped.petal_key_scope.unwrap();
+        let mapped = prepare_to_signer(request).unwrap();
+        mapped.validate_delegated_key_scope_binding().unwrap();
+        let mapped_scope = mapped.delegated_key_scope.unwrap();
         assert_eq!(mapped.ceremony_kind, south::CeremonyKind::KeyDerive);
         assert_eq!(mapped.custody_operation_id, operation(9));
         assert_eq!(mapped.wallet_id.unwrap().as_str(), "wallet-1");
@@ -167,14 +182,24 @@ mod tests {
             mapped_scope.request_digest().unwrap()
         );
         assert_eq!(mapped.expected_input_class.as_str(), "scope-10");
-        assert_eq!(mapped_scope.package_hash, digest(4));
+        assert_eq!(mapped_scope.active_subject_id, digest(4));
         assert_eq!(
             mapped_scope.parent_key_ref.public_key_fingerprint,
             digest(3)
         );
-        assert_eq!(mapped_scope.route, "/route-5");
-        assert_eq!(mapped_scope.key_slot.as_str(), "agent-6");
-        assert_eq!(mapped_scope.allowed_routes, ["/route-5", "/route-6"]);
+        assert_eq!(mapped_scope.delegate_id.as_str(), "agent-6");
+        assert_eq!(
+            mapped_scope.authority_id,
+            delegated::authority_id("pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap()
+        );
+        assert_eq!(
+            mapped_scope.allowed_resource_ids,
+            [
+                delegated::resource_id("/route-5").unwrap(),
+                delegated::resource_id("/route-6").unwrap()
+            ]
+        );
         assert_eq!(
             mapped_scope.allowed_operation_classes[0].as_str(),
             "purpose-7"
@@ -216,7 +241,7 @@ mod tests {
             legacy_passkey_migration: Some(migration.clone()),
         };
         request.validate_legacy_passkey_migration_binding().unwrap();
-        let mapped = prepare_to_signer(request);
+        let mapped = prepare_to_signer(request).unwrap();
         mapped.validate_legacy_passkey_migration_binding().unwrap();
         let mapped_migration = mapped.legacy_passkey_migration.unwrap();
         assert_eq!(mapped_migration.wallet_name, migration.wallet_name);
@@ -236,7 +261,6 @@ mod tests {
     #[test]
     fn custody_result_preserves_receipt_signature_and_encrypted_output() {
         let result = south::CustodyResult {
-            petal_registration_terms_digest: None,
             ceremony_kind: south::CeremonyKind::WalletExport,
             custody_operation_id: operation(12),
             public_status: south::CeremonyState::Succeeded,

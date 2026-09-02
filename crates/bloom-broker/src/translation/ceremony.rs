@@ -3,8 +3,10 @@
 use bloom_broker_api as north;
 use bloom_signer_api as south;
 
-pub(crate) fn kind_to_signer(value: north::CeremonyKind) -> south::CeremonyKind {
-    match value {
+pub(crate) fn kind_to_signer(
+    value: north::CeremonyKind,
+) -> Result<south::CeremonyKind, north::ProtocolError> {
+    Ok(match value {
         north::CeremonyKind::SealedApproval => south::CeremonyKind::SealedApproval,
         north::CeremonyKind::WalletRegistration => south::CeremonyKind::WalletRegistration,
         north::CeremonyKind::WalletImport => south::CeremonyKind::WalletImport,
@@ -17,8 +19,13 @@ pub(crate) fn kind_to_signer(value: north::CeremonyKind) -> south::CeremonyKind 
         north::CeremonyKind::BackendEnrollment => south::CeremonyKind::BackendEnrollment,
         north::CeremonyKind::KeyDerive => south::CeremonyKind::KeyDerive,
         north::CeremonyKind::PolicyUpdate => south::CeremonyKind::PolicyUpdate,
-        north::CeremonyKind::PetalRegistration => south::CeremonyKind::PetalRegistration,
-    }
+        north::CeremonyKind::PetalRegistration => {
+            return Err(north::ProtocolError::new(
+                north::ProtocolErrorCode::CeremonyKindMismatch,
+                "Petal registration uses generic owner attestation southbound",
+            ));
+        }
+    })
 }
 
 pub(crate) fn kind_to_machine(value: south::CeremonyKind) -> north::CeremonyKind {
@@ -35,7 +42,6 @@ pub(crate) fn kind_to_machine(value: south::CeremonyKind) -> north::CeremonyKind
         south::CeremonyKind::BackendEnrollment => north::CeremonyKind::BackendEnrollment,
         south::CeremonyKind::KeyDerive => north::CeremonyKind::KeyDerive,
         south::CeremonyKind::PolicyUpdate => north::CeremonyKind::PolicyUpdate,
-        south::CeremonyKind::PetalRegistration => north::CeremonyKind::PetalRegistration,
     }
 }
 
@@ -54,6 +60,24 @@ pub(crate) fn state_to_machine(value: south::CeremonyState) -> north::CeremonySt
         south::CeremonyState::Cancelled => north::CeremonyState::Cancelled,
         south::CeremonyState::Expired => north::CeremonyState::Expired,
         south::CeremonyState::Failed => north::CeremonyState::Failed,
+    }
+}
+
+pub(crate) fn state_to_signer(value: north::CeremonyState) -> south::CeremonyState {
+    match value {
+        north::CeremonyState::Prepared => south::CeremonyState::Prepared,
+        north::CeremonyState::AwaitingUser => south::CeremonyState::AwaitingUser,
+        north::CeremonyState::Verifying => south::CeremonyState::Verifying,
+        north::CeremonyState::WalletCommitted => south::CeremonyState::WalletCommitted,
+        north::CeremonyState::AwaitingRecoveryAck => south::CeremonyState::AwaitingRecoveryAck,
+        north::CeremonyState::Completed => south::CeremonyState::Completed,
+        north::CeremonyState::ApprovingRootChange => south::CeremonyState::ApprovingRootChange,
+        north::CeremonyState::CreatingCredential => south::CeremonyState::CreatingCredential,
+        north::CeremonyState::Committing => south::CeremonyState::Committing,
+        north::CeremonyState::Succeeded => south::CeremonyState::Succeeded,
+        north::CeremonyState::Cancelled => south::CeremonyState::Cancelled,
+        north::CeremonyState::Expired => south::CeremonyState::Expired,
+        north::CeremonyState::Failed => south::CeremonyState::Failed,
     }
 }
 
@@ -76,10 +100,10 @@ mod tests {
             north::CeremonyKind::BackendEnrollment,
             north::CeremonyKind::KeyDerive,
             north::CeremonyKind::PolicyUpdate,
-            north::CeremonyKind::PetalRegistration,
         ];
         for kind in kinds {
-            assert_eq!(kind_to_machine(kind_to_signer(kind)), kind);
+            assert_eq!(kind_to_machine(kind_to_signer(kind).unwrap()), kind);
         }
+        assert!(kind_to_signer(north::CeremonyKind::PetalRegistration).is_err());
     }
 }

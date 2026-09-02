@@ -215,7 +215,7 @@ fn request(value: u8) -> UnsignedSignRequest {
         crypto_suite: SignerCryptoSuite::Secp256k1Sha256Recoverable,
         ordered_payload_digests: vec![digest("33")],
         ordered_hashes: vec![digest("55")],
-        petal_use_claim_digest: None,
+        delegated_use_claim_digest: None,
         claim_assurance_digest: None,
         policy_version: DecimalU64::new(1),
         policy_digest: digest("66"),
@@ -238,7 +238,7 @@ fn request(value: u8) -> UnsignedSignRequest {
         ordered_payload_digests: identity.ordered_payload_digests,
         ordered_hashes: identity.ordered_hashes,
         signature_count: DecimalU64::new(1),
-        petal_use_claim_digest: None,
+        delegated_use_claim_digest: None,
         claim_assurance_digest: None,
         policy_version: identity.policy_version,
         policy_digest: identity.policy_digest,
@@ -259,7 +259,7 @@ fn validation_receipt(request: &UnsignedSignRequest) -> BrokerValidationReceipt 
         operation_digest: request.operation_digest.clone(),
         policy_version: request.policy_version.clone(),
         policy_digest: request.policy_digest.clone(),
-        claim_digest: request.petal_use_claim_digest.clone(),
+        claim_digest: request.delegated_use_claim_digest.clone(),
         assurance_digest: request.claim_assurance_digest.clone(),
         reservation_ids: vec![digest("77")],
         effective_claim_assurance: None,
@@ -912,7 +912,7 @@ fn ac06_same_operation_retry_is_stable_and_conflicts_fail_closed() {
     changed.wallet_id = Token::new("wallet-2").unwrap();
     forbidden_retries.push(("wallet_id", changed));
     let mut changed = first.clone();
-    changed.selector_kind = SelectorKind::Petal;
+    changed.selector_kind = SelectorKind::Delegated;
     forbidden_retries.push(("selector_kind", changed));
     let mut changed = first.clone();
     changed.signature_count = DecimalU64::new(2);

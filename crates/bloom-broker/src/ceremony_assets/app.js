@@ -302,7 +302,7 @@ async function load() {
     throw new Error("Ceremony returned an invalid identity");
   }
   const scopedPetalKey = session.ceremony_kind === "key_derive" &&
-    session.signer_contribution?.petal_key_scope;
+    session.signer_contribution?.delegated_key_scope;
   if ([
     "wallet_registration", "wallet_import", "wallet_export",
     "key_derive"
@@ -404,7 +404,7 @@ async function run(session) {
   const legacyPasskeyImport = kind === "wallet_import" &&
     session.signer_contribution?.expected_input_class === "legacy_passkey_v1_prf";
   const scopedPetalKey = kind === "key_derive" &&
-    session.signer_contribution?.petal_key_scope;
+    session.signer_contribution?.delegated_key_scope;
   let proof;
   let secret = null;
   let credentialId = null;
@@ -474,9 +474,11 @@ async function run(session) {
     if (!credentialPrf) throw new Error("This passkey did not return required PRF output");
     const genericKinds = new Set([
       "wallet_export", "wallet_delete",
-      "backend_enrollment", "key_derive", "policy_update", "petal_registration"
+      "backend_enrollment", "key_derive", "policy_update"
     ]);
-    if (genericKinds.has(kind)) {
+    if (kind === "petal_registration") {
+      secret = null;
+    } else if (genericKinds.has(kind)) {
       let effect = {kind};
       if (kind !== "petal_registration" && !scopedPetalKey && !genericFields.hidden) {
         const supplied = JSON.parse(genericInput.value);
@@ -512,7 +514,8 @@ async function run(session) {
     result = await mutate(`/api/session/${ceremonyId}/complete`, {
       proof,
       encrypted_input: encryptedInput,
-      public_binding_digest: session.challenges[0].binding.exact_terms_digest
+      public_binding_digest: session.challenges[0].binding.public_binding_digest ||
+        session.challenges[0].binding.exact_terms_digest
     });
   } catch (error) {
     const recovered = await fetch(`/api/session/${ceremonyId}/result`, {

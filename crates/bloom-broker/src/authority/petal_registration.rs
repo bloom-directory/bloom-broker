@@ -2,8 +2,9 @@
 use super::*;
 use bloom_broker_api::{
     PETAL_REGISTRATION_SCHEMA, PetalRegistration, PetalRegistrationCommitRequest,
-    PetalRegistrationPrepareRequest, PetalRegistrationTerms, canonical_petal_registration_request,
-    petal_registration_manifest_digest, petal_registration_permissions_digest,
+    PetalRegistrationPrepareRequest, PetalRegistrationReceipt, PetalRegistrationTerms,
+    canonical_petal_registration_request, petal_registration_manifest_digest,
+    petal_registration_permissions_digest,
 };
 use rand::{RngCore, rngs::OsRng};
 
@@ -31,11 +32,33 @@ struct Attempt {
     request: PetalRegistrationPrepareRequest,
     terms: PetalRegistrationTerms,
     state: String,
-    receipt: Option<CustodyResult>,
+    receipt: Option<PetalRegistrationReceipt>,
     record: Option<PetalRegistration>,
 }
 
 impl BrokerAuthority {
+    pub(crate) fn validate_owner_attestation_prepare(
+        &self,
+        terms: &bloom_signer_api::OwnerAttestationTerms,
+        prepared: &bloom_signer_api::PreparedOwnerAttestation,
+    ) -> Result<(), AuthorityError> {
+        if terms.authority_edge_digest != self.authority_edge_digest
+            || prepared.contribution.operation_id != terms.operation_id
+            || prepared.contribution.terms_digest != terms.digest().map_err(invalid)?
+            || prepared.contribution.signer_key_id != self.ceremony_key_id
+        {
+            return Err(invalid_missing());
+        }
+        let signature = Signature::from_slice(&prepared.contribution.signer_signature.decode())
+            .map_err(invalid)?;
+        self.ceremony_key
+            .verify_strict(
+                &prepared.contribution.signature_message().map_err(invalid)?,
+                &signature,
+            )
+            .map_err(invalid)
+    }
+
     pub fn prepare_petal_registration(
         &self,
         request: &PetalRegistrationPrepareRequest,
@@ -174,14 +197,14 @@ impl BrokerAuthority {
     /// Keep the validated receipt durable before returning browser completion.
     pub(crate) fn complete_petal_registration(
         &self,
-        receipt: &CustodyResult,
+        receipt: &PetalRegistrationReceipt,
     ) -> Result<(), AuthorityError> {
         let _barrier = self.lock_authorization_barrier()?;
         let mut connection = self.lock_for_mutation()?;
         let attempt = read_attempt(
             &connection,
             "operation_id=?1",
-            [receipt.custody_operation_id.as_str()],
+            [receipt.operation_id.as_str()],
         )?
         .ok_or_else(invalid_missing)?;
         self.validate_attempt(&attempt)?;
@@ -197,7 +220,7 @@ impl BrokerAuthority {
             return Err(conflict());
         }
         let transaction = connection.transaction()?;
-        transaction.execute("UPDATE petal_registration_attempts SET state='completed',receipt_jcs=?2 WHERE operation_id=?1", params![receipt.custody_operation_id.as_str(),canonical(receipt)?])?;
+        transaction.execute("UPDATE petal_registration_attempts SET state='completed',receipt_jcs=?2 WHERE operation_id=?1", params![receipt.operation_id.as_str(),canonical(receipt)?])?;
         self.journal.append_external_audit(
             &transaction,
             "petal.registration_completed",
@@ -332,10 +355,10 @@ impl BrokerAuthority {
     fn validate_registration_receipt(
         &self,
         terms: &PetalRegistrationTerms,
-        receipt: &CustodyResult,
+        receipt: &PetalRegistrationReceipt,
     ) -> Result<(), AuthorityError> {
         receipt
-            .validate_petal_registration_binding(terms)
+            .validate_binding(terms, &self.authority_edge_digest)
             .map_err(invalid)?;
         if terms.enrollment_digest != self.enrollment_digest
             || receipt.signer_key_id != self.ceremony_key_id
@@ -345,14 +368,7 @@ impl BrokerAuthority {
         let signature =
             Signature::from_slice(&receipt.signer_signature.decode()).map_err(invalid)?;
         self.ceremony_key
-            .verify_strict(
-                &[
-                    SIGNER_CEREMONY_RECEIPT_DOMAIN,
-                    &receipt.unsigned_canonical_bytes().map_err(invalid)?,
-                ]
-                .concat(),
-                &signature,
-            )
+            .verify_strict(&receipt.signature_message().map_err(invalid)?, &signature)
             .map_err(invalid)
     }
 }

@@ -37,6 +37,7 @@ const APPROVAL_TOMBSTONE_DOMAIN: &[u8] = b"bloom-approval-tombstone/v1";
 const WALLET_TOMBSTONE_DOMAIN: &[u8] = b"bloom-wallet-tombstone/v1";
 const POLICY_AUTHORITY_DIFF_DOMAIN: &[u8] = b"bloom-policy-authority-diff/v1";
 const SIGN_OPERATION_DOMAIN: &[u8] = b"bloom-sign-operation/v1";
+const AUTHORITY_EDGE_DOMAIN: &[u8] = b"bloom-authority-edge/v1\0";
 
 #[derive(Serialize)]
 struct MachineSignOperationIdentity {
@@ -353,6 +354,7 @@ pub struct BrokerAuthority {
     revocation_key: VerifyingKey,
     assurance: AssuranceRegistry,
     enrollment_digest: Digest32,
+    authority_edge_digest: Digest32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -447,6 +449,11 @@ impl BrokerAuthority {
             &ceremony_key,
         )
         .map_err(storage)?;
+        let mut authority_edge = Sha256::new();
+        authority_edge.update(AUTHORITY_EDGE_DOMAIN);
+        authority_edge.update(broker_signing_key.to_bytes());
+        authority_edge.update(ceremony_key.to_bytes());
+        let authority_edge_digest = Digest32::from_bytes(authority_edge.finalize().into());
         let connection = journal.shared_connection();
         {
             let mut connection = connection
@@ -481,6 +488,10 @@ impl BrokerAuthority {
                 approval_id TEXT PRIMARY KEY,
                 wallet_id TEXT NOT NULL,
                 tombstone_jcs TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS signer_approval_ids (
+                broker_approval_id TEXT PRIMARY KEY,
+                signer_approval_id TEXT NOT NULL UNIQUE
             );
             CREATE TABLE IF NOT EXISTS pending_petal_key_scopes (
                 custody_operation_id TEXT PRIMARY KEY,
@@ -527,7 +538,12 @@ impl BrokerAuthority {
             revocation_key,
             assurance,
             enrollment_digest,
+            authority_edge_digest,
         })
+    }
+
+    pub(crate) fn authority_edge_digest(&self) -> &Digest32 {
+        &self.authority_edge_digest
     }
 
     pub fn verifier_capabilities(&self) -> Vec<VerifierCapability> {
@@ -755,10 +771,6 @@ impl BrokerAuthority {
                     "Signer custody receipt signature is invalid",
                 )
             })?;
-
-        if receipt.ceremony_kind == bloom_broker_api::CeremonyKind::PetalRegistration {
-            return self.complete_petal_registration(receipt);
-        }
 
         if receipt.ceremony_kind == bloom_broker_api::CeremonyKind::WalletDelete {
             let wallet_id = receipt.wallet_id.as_ref().ok_or_else(|| {
@@ -1406,6 +1418,134 @@ impl BrokerAuthority {
         Ok(approval_id)
     }
 
+    pub(crate) fn signer_approval_terms(
+        &self,
+        terms: &SealedApprovalTerms,
+    ) -> Result<bloom_signer_api::SealedApprovalTerms, AuthorityError> {
+        terms
+            .validate()
+            .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?;
+        let projection = if let ApprovalSubject::Petal {
+            package_hash,
+            route,
+            agent_id,
+        } = &terms.subject
+        {
+            self.validate_scoped_key_terms(terms)?;
+            let provenance = self.resolve_provenance(&ProvenanceSubject::Petal {
+                package_hash: package_hash.clone(),
+                route: route.clone(),
+            })?;
+            let lineage_id = match provenance {
+                ResolvedProvenance::OwnerRegistered { registration, .. } => {
+                    registration.terms.lineage_id
+                }
+                ResolvedProvenance::Installer(record) => record
+                    .petal_lineage
+                    .filter(|membership| membership.active)
+                    .map(|membership| membership.lineage_id)
+                    .ok_or_else(|| {
+                        denied(
+                            "PROVENANCE_LINEAGE_MISMATCH",
+                            "Petal approval requires an active lineage for Signer projection",
+                        )
+                    })?,
+            };
+            let delegate_id = match self.scoped_key_record(&terms.key_ref)? {
+                Some((scope, _)) => scope.key_slot,
+                None => crate::translation::delegated::delegate_id(agent_id.as_deref())
+                    .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?,
+            };
+            Some(crate::translation::approval::PetalAuthorityProjection {
+                authority_id: crate::translation::delegated::authority_id(&lineage_id)
+                    .map_err(|error| denied("PROVENANCE_LINEAGE_MISMATCH", error.to_string()))?,
+                delegate_id,
+            })
+        } else {
+            None
+        };
+        let mut signer_terms = crate::translation::approval::validated_terms_to_signer(
+            terms.clone(),
+            projection.as_ref(),
+        )
+        .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?;
+        if let Some(predecessor) = signer_terms.renewal_of.take() {
+            signer_terms.renewal_of = Some(
+                self.signer_approval_id(&predecessor)?
+                    .unwrap_or(predecessor),
+            );
+        }
+        Ok(signer_terms)
+    }
+
+    pub(crate) fn bind_signer_approval_id(
+        &self,
+        broker_approval_id: &Digest32,
+        signer_approval_id: &Digest32,
+    ) -> Result<(), AuthorityError> {
+        let connection = self.lock_for_mutation()?;
+        let existing: Option<(String, String)> = connection
+            .query_row(
+                "SELECT broker_approval_id, signer_approval_id
+                 FROM signer_approval_ids
+                 WHERE broker_approval_id = ?1 OR signer_approval_id = ?2",
+                params![broker_approval_id.as_str(), signer_approval_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((existing_broker, existing_signer)) = existing {
+            if existing_broker != broker_approval_id.as_str()
+                || existing_signer != signer_approval_id.as_str()
+            {
+                return Err(denied(
+                    "APPROVAL_ID_CONFLICT",
+                    "Broker and Signer approval identifiers are already bound differently",
+                ));
+            }
+            return Ok(());
+        }
+        connection.execute(
+            "INSERT INTO signer_approval_ids(broker_approval_id, signer_approval_id)
+             VALUES (?1, ?2)",
+            params![broker_approval_id.as_str(), signer_approval_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn signer_approval_id(
+        &self,
+        broker_approval_id: &Digest32,
+    ) -> Result<Option<Digest32>, AuthorityError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT signer_approval_id FROM signer_approval_ids
+                 WHERE broker_approval_id = ?1",
+                [broker_approval_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| Digest32::new(value).map_err(storage))
+            .transpose()
+    }
+
+    pub(crate) fn broker_approval_id(
+        &self,
+        signer_approval_id: &Digest32,
+    ) -> Result<Option<Digest32>, AuthorityError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT broker_approval_id FROM signer_approval_ids
+                 WHERE signer_approval_id = ?1",
+                [signer_approval_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| Digest32::new(value).map_err(storage))
+            .transpose()
+    }
+
     /// Replace the current installer-owned catalog entry for one exact
     /// provenance subject. Machine callers cannot reach this method; the
     /// installer supplies records out of band and Broker verifies them before
@@ -1601,11 +1741,14 @@ impl BrokerAuthority {
                     "Signer activation receipt signature is invalid",
                 )
             })?;
+        let broker_approval_id = self
+            .broker_approval_id(&receipt.approval_id)?
+            .unwrap_or_else(|| receipt.approval_id.clone());
         let record = self
             .journal
-            .approval_record(&receipt.approval_id)?
+            .approval_record(&broker_approval_id)?
             .ok_or_else(|| denied("APPROVAL_NOT_FOUND", "approval is not prepared"))?;
-        if self.is_tombstoned(&receipt.approval_id)? {
+        if self.is_tombstoned(&broker_approval_id)? {
             return Err(denied(
                 "APPROVAL_REVOKED",
                 "tombstoned approval cannot be activated",
@@ -1613,7 +1756,7 @@ impl BrokerAuthority {
         }
         let terms: SealedApprovalTerms =
             serde_json::from_str(&record.terms_jcs).map_err(storage)?;
-        let signer_terms = crate::translation::approval::validated_terms_to_signer(terms.clone());
+        let signer_terms = self.signer_approval_terms(&terms)?;
         let review_digest = Digest32::new(record.review_manifest_digest)
             .map_err(|error| denied("STORAGE_CORRUPTION", error.to_string()))?;
         let (current_epoch, reconciled) = self.epoch_state(&terms.wallet_id)?;
@@ -1625,7 +1768,7 @@ impl BrokerAuthority {
         }
         if receipt.approval_digest != receipt.approval_id
             || receipt.approval_id
-                != terms
+                != signer_terms
                     .approval_id()
                     .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?
             || receipt.review_manifest_digest != review_digest
@@ -1643,7 +1786,7 @@ impl BrokerAuthority {
         }
         let receipt_jcs = serde_jcs::to_string(receipt).map_err(storage)?;
         self.journal.activate_approval_record(
-            &receipt.approval_id,
+            &broker_approval_id,
             &receipt.activation_operation_id,
             &receipt_jcs,
         )?;
@@ -2831,7 +2974,16 @@ fn verify_policy_snapshot(
     let policy: CanonicalWalletPolicy = serde_json::from_slice(&bytes)
         .map_err(|error| denied("POLICY_INVALID", error.to_string()))?;
     let canonical = serde_jcs::to_vec(&policy).map_err(storage)?;
-    if canonical != bytes
+    let mut generic_value = serde_json::to_value(&policy).map_err(storage)?;
+    let generic = generic_value
+        .as_object_mut()
+        .ok_or_else(|| storage("canonical policy did not encode as an object"))?;
+    let allowed = generic
+        .remove("allowed_petal_packages")
+        .ok_or_else(|| storage("canonical policy omitted its Petal allow-list"))?;
+    generic.insert("allowed_delegated_authorities".into(), allowed);
+    let generic_canonical = serde_jcs::to_vec(&generic_value).map_err(storage)?;
+    if canonical != bytes && generic_canonical != bytes
         || Digest32::from_bytes(Sha256::digest(&bytes).into()) != snapshot.policy_digest
         || policy.wallet_id != snapshot.wallet_id
         || policy.maximum_approval_lifetime_ms == 0

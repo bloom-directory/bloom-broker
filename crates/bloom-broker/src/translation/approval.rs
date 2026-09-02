@@ -3,19 +3,40 @@
 use bloom_broker_api as north;
 use bloom_signer_api as south;
 
-use super::key::{crypto_suite_to_signer, key_ref_to_signer};
+use super::{
+    delegated,
+    key::{crypto_suite_to_signer, key_ref_to_signer},
+};
 
-fn subject_to_signer(value: north::ApprovalSubject) -> south::ApprovalSubject {
-    match value {
+#[derive(Clone, Debug)]
+pub(crate) struct PetalAuthorityProjection {
+    pub authority_id: north::Digest32,
+    pub delegate_id: north::Token,
+}
+
+fn subject_to_signer(
+    value: north::ApprovalSubject,
+    petal: Option<&PetalAuthorityProjection>,
+) -> Result<south::ApprovalSubject, north::ProtocolError> {
+    Ok(match value {
         north::ApprovalSubject::Petal {
             package_hash,
             route,
-            agent_id,
-        } => south::ApprovalSubject::Petal {
-            package_hash,
-            route,
-            agent_id,
-        },
+            ..
+        } => {
+            let petal = petal.ok_or_else(|| {
+                north::ProtocolError::new(
+                    north::ProtocolErrorCode::ProvenanceMismatch,
+                    "Petal approval omitted its verified lineage projection",
+                )
+            })?;
+            south::ApprovalSubject::Delegated {
+                authority_id: petal.authority_id.clone(),
+                active_subject_id: package_hash,
+                resource_id: delegated::resource_id(&route)?,
+                delegate_id: petal.delegate_id.clone(),
+            }
+        }
         north::ApprovalSubject::Cli {
             client_id,
             command_class,
@@ -30,7 +51,7 @@ fn subject_to_signer(value: north::ApprovalSubject) -> south::ApprovalSubject {
             component_id,
             operation_class,
         },
-    }
+    })
 }
 
 fn assurance_to_signer(value: north::ClaimAssuranceLevel) -> south::ClaimAssuranceLevel {
@@ -43,8 +64,11 @@ fn assurance_to_signer(value: north::ClaimAssuranceLevel) -> south::ClaimAssuran
     }
 }
 
-fn selector_to_signer(value: north::ApprovalSelector) -> south::ApprovalSelector {
-    match value {
+fn selector_to_signer(
+    value: north::ApprovalSelector,
+    petal: Option<&PetalAuthorityProjection>,
+) -> Result<south::ApprovalSelector, north::ProtocolError> {
+    Ok(match value {
         north::ApprovalSelector::Exact {
             ordered_payload_digests,
             ordered_hashes,
@@ -58,21 +82,36 @@ fn selector_to_signer(value: north::ApprovalSelector) -> south::ApprovalSelector
             allowed_operation_classes,
             route_grants,
             required_claim_assurance,
-        } => south::ApprovalSelector::Petal {
-            package_hash,
-            route,
-            allowed_operation_classes,
-            route_grants: route_grants
+        } => {
+            let petal = petal.ok_or_else(|| {
+                north::ProtocolError::new(
+                    north::ProtocolErrorCode::ProvenanceMismatch,
+                    "Petal selector omitted its verified lineage projection",
+                )
+            })?;
+            let resource_id = delegated::resource_id(&route)?;
+            let mut resource_grants = route_grants
                 .into_iter()
-                .map(|grant| south::PetalRouteGrant {
-                    route: grant.route,
-                    allowed_operation_classes: grant.allowed_operation_classes,
-                    provenance_digest: grant.provenance_digest,
+                .map(|grant| {
+                    Ok(south::DelegatedResourceGrant {
+                        resource_id: delegated::resource_id(&grant.route)?,
+                        allowed_operation_classes: grant.allowed_operation_classes,
+                        provenance_digest: grant.provenance_digest,
+                    })
                 })
-                .collect(),
-            required_claim_assurance: assurance_to_signer(required_claim_assurance),
-        },
-    }
+                .collect::<Result<Vec<_>, north::ProtocolError>>()?;
+            resource_grants
+                .sort_by(|left, right| left.resource_id.as_str().cmp(right.resource_id.as_str()));
+            south::ApprovalSelector::Delegated {
+                authority_id: petal.authority_id.clone(),
+                active_subject_id: package_hash,
+                resource_id,
+                allowed_operation_classes,
+                resource_grants,
+                required_claim_assurance: assurance_to_signer(required_claim_assurance),
+            }
+        }
+    })
 }
 
 fn activation_to_signer(value: north::ActivationMode) -> south::ActivationMode {
@@ -134,9 +173,10 @@ fn limits_to_signer(value: north::ApprovalLimits) -> south::ApprovalLimits {
 /// Called only after Broker policy and proposal validation has succeeded.
 pub(crate) fn validated_terms_to_signer(
     value: north::SealedApprovalTerms,
-) -> south::SealedApprovalTerms {
-    south::SealedApprovalTerms {
-        subject: subject_to_signer(value.subject),
+    petal: Option<&PetalAuthorityProjection>,
+) -> Result<south::SealedApprovalTerms, north::ProtocolError> {
+    Ok(south::SealedApprovalTerms {
+        subject: subject_to_signer(value.subject, petal)?,
         wallet_id: value.wallet_id,
         key_ref: key_ref_to_signer(value.key_ref),
         allowed_crypto_suites: value
@@ -144,7 +184,7 @@ pub(crate) fn validated_terms_to_signer(
             .into_iter()
             .map(crypto_suite_to_signer)
             .collect(),
-        selector: selector_to_signer(value.selector),
+        selector: selector_to_signer(value.selector, petal)?,
         limits: limits_to_signer(value.limits),
         activation_mode: activation_to_signer(value.activation_mode),
         wallet_revocation_epoch: value.wallet_revocation_epoch,
@@ -156,7 +196,7 @@ pub(crate) fn validated_terms_to_signer(
         not_before_ms: value.not_before_ms,
         expires_at_ms: value.expires_at_ms,
         renewal_of: value.renewal_of,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -226,7 +266,7 @@ mod tests {
             renewal_of: Some(digest(31)),
         };
         terms.validate().unwrap();
-        let mapped = validated_terms_to_signer(terms);
+        let mapped = validated_terms_to_signer(terms, None).unwrap();
 
         assert!(
             matches!(mapped.subject, south::ApprovalSubject::Cli { ref client_id, ref command_class } if client_id.as_str() == "cli-1" && command_class.as_str() == "sign-2")

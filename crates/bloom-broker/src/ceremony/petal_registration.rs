@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     authority::BrokerAuthority,
     service::authority_error,
-    translation::{custody::result_to_machine, petal_registration::terms_to_signer},
+    translation::owner_attestation::{receipt_to_broker, terms_to_signer},
 };
 use bloom_broker_api::{
     PetalRegistration, PetalRegistrationCommitRequest, PetalRegistrationPrepareRequest,
@@ -46,11 +46,11 @@ impl CeremonyBroker {
                 .status(&terms.operation_id)
                 .map_err(signer_error_to_machine)?
             {
-                SignerCeremonyStatus::CompletedCustody(receipt) => {
+                SignerCeremonyStatus::CompletedOwnerAttestation(receipt) => {
                     let registration = authority
                         .commit_petal_registration(&PetalRegistrationCommitRequest {
                             operation_id: terms.operation_id.clone(),
-                            ceremony_receipt: result_to_machine(*receipt),
+                            ceremony_receipt: receipt_to_broker(*receipt),
                         })
                         .map_err(authority_error)?;
                     // Recover the original approved consent even when the caller
@@ -60,7 +60,8 @@ impl CeremonyBroker {
                     }
                     return Ok(PetalRegistrationPrepareResponse::Registered { registration });
                 }
-                SignerCeremonyStatus::CompletedApproval(_) => return Err(kind_mismatch()),
+                SignerCeremonyStatus::CompletedApproval(_)
+                | SignerCeremonyStatus::CompletedCustody(_) => return Err(kind_mismatch()),
                 // A reserved attempt may precede any Signer effect (including a
                 // lost transport request). Keep its operation and quota identity.
                 SignerCeremonyStatus::Missing if self.status(&terms.operation_id).is_none() => {}
@@ -102,30 +103,21 @@ impl CeremonyBroker {
             return Err(operation_conflict());
         }
         let review = registration_review(&proposal, &terms)?;
-        let typed = bloom_signer_api::PetalRegistrationCeremonyPrepareRequest {
-            custody: CustodyPrepareRequest {
-                ceremony_kind: CeremonyKind::PetalRegistration,
-                custody_operation_id: terms.operation_id.clone(),
-                wallet_id: Some(terms.owner_wallet_id.clone()),
-                key_ref: None,
-                exact_terms_digest: terms.digest()?,
-                expected_input_class: Token::new("petal_registration")?,
-                browser_output_recipient_key: None,
-                petal_key_scope: None,
-                legacy_passkey_migration: None,
-            },
-            terms: terms_to_signer(terms.clone()),
+        let owner_terms = terms_to_signer(&terms, authority.authority_edge_digest().clone())?;
+        let typed = bloom_signer_api::OwnerAttestationPrepareRequest {
+            terms: owner_terms.clone(),
         };
-        typed.validate_binding().map_err(signer_error_to_machine)?;
         let request_digest = digest(&(typed.clone(), review.clone()))?;
-        if let Some(ceremony) = self.stable_custody_response(&terms.operation_id, &request_digest) {
+        if let Some(ceremony) =
+            self.stable_owner_attestation_response(&terms.operation_id, &request_digest)
+        {
             return Ok(PetalRegistrationPrepareResponse::AwaitingApproval {
                 terms,
                 ceremony: ceremony?,
             });
         }
         self.enforce_creation_bounds(Some(&terms.owner_wallet_id), false, now_ms)?;
-        let prepared = match self.inner.signer.prepare_petal_registration(typed, now_ms) {
+        let prepared = match self.inner.signer.prepare_owner_attestation(typed, now_ms) {
             Ok(prepared) => prepared,
             Err(error) => {
                 let contract = error.code.contract();
@@ -140,38 +132,52 @@ impl CeremonyBroker {
                 return Err(signer_error_to_machine(error));
             }
         };
+        if prepared.webauthn_options.allowed_credentials.is_empty()
+            || prepared.verification_credentials.is_empty()
+        {
+            let _ = self.inner.signer.cancel(&terms.operation_id);
+            authority
+                .abandon_petal_registration(&terms.operation_id)
+                .map_err(authority_error)?;
+            return Err(protocol(
+                ProtocolErrorCode::ApprovalNotFound,
+                "owner wallet has no active credential for registration attestation",
+            ));
+        }
         let contribution = &prepared.contribution;
-        if contribution.ceremony_kind != CeremonyKind::PetalRegistration
-            || contribution.custody_operation_id != terms.operation_id
-            || contribution.wallet_id.as_ref() != Some(&terms.owner_wallet_id)
-            || contribution.review_manifest_digest != terms.digest()?
-            || contribution.key_ref.is_some()
-            || contribution.browser_output_recipient_key.is_some()
-            || contribution.petal_key_scope.is_some()
-            || contribution.expected_input_class.as_str() != "petal_registration"
-            || !contribution.required_user_verification
+        let contribution_digest = contribution.digest().map_err(signer_error_to_machine)?;
+        let subject_digest = terms.digest()?;
+        let review_digest: Digest32 =
+            serde_json::from_value(review["review_digest"].clone()).map_err(malformed)?;
+        if owner_terms.subject_digest != subject_digest
+            || review_digest != subject_digest
+            || contribution.operation_id != terms.operation_id
+            || contribution.terms_digest != owner_terms.digest().map_err(signer_error_to_machine)?
             || prepared.challenges.len() != 1
             || prepared.challenges.iter().any(|challenge| {
                 challenge.operation_id != terms.operation_id
-                    || challenge.ceremony_kind != CeremonyKind::PetalRegistration
-                    || challenge.exact_terms_digest != contribution.review_manifest_digest
-                    || challenge.review_manifest_digest != contribution.review_manifest_digest
+                    || challenge.ceremony_id != contribution.ceremony_id
+                    || challenge.terms_digest != contribution.terms_digest
+                    || challenge.public_binding_digest != contribution.public_binding_digest
+                    || challenge.signer_contribution_digest != contribution_digest
             })
         {
             return Err(kind_mismatch());
         }
+        authority
+            .validate_owner_attestation_prepare(&owner_terms, &prepared)
+            .map_err(authority_error)?;
         let ceremony_id = contribution.ceremony_id.clone();
-        let expires_at_ms = contribution.expires_at_ms.get();
-        let contribution_digest = contribution.digest().map_err(signer_error_to_machine)?;
+        let expires_at_ms = now_ms.saturating_add(5 * 60 * 1_000);
         let session = self.new_session(NewBrowserSession {
             operation_id: terms.operation_id.clone(),
             request_digest,
             wallet_id: Some(terms.owner_wallet_id.clone()),
             anonymous_registration: false,
-            ceremony_kind: CeremonyKind::PetalRegistration,
+            ceremony_kind: BrokerCeremonyKind::PetalRegistration,
             ceremony_id: ceremony_id.clone(),
             review_manifest: Some(review),
-            challenges: prepared.challenges,
+            challenges: browser_challenges(prepared.challenges)?,
             signer_contribution: serde_json::to_value(prepared.contribution).map_err(malformed)?,
             webauthn_options: prepared.webauthn_options,
             verification_credentials: prepared.verification_credentials,
@@ -214,8 +220,8 @@ impl CeremonyBroker {
             .status(&request.operation_id)
             .map_err(signer_error_to_machine)?
         {
-            SignerCeremonyStatus::CompletedCustody(receipt)
-                if result_to_machine(*receipt.clone()) == request.ceremony_receipt =>
+            SignerCeremonyStatus::CompletedOwnerAttestation(receipt)
+                if receipt_to_broker(*receipt.clone()) == request.ceremony_receipt =>
             {
                 authority
                     .commit_petal_registration(request)
@@ -226,6 +232,32 @@ impl CeremonyBroker {
                 "registration requires its exact completed Signer owner ceremony",
             )),
         }
+    }
+
+    fn stable_owner_attestation_response(
+        &self,
+        operation_id: &OperationId,
+        request_digest: &Digest32,
+    ) -> Option<Result<CustodyPrepareResponse, ProtocolError>> {
+        let id = self.inner.operations.lock().get(operation_id)?.clone();
+        let sessions = self.inner.sessions.lock();
+        let session = sessions.get(&id)?;
+        if &session.request_digest != request_digest {
+            return Some(Err(operation_conflict()));
+        }
+        if is_terminal(session.state) {
+            return Some(Err(replay()));
+        }
+        let contribution: bloom_signer_api::OwnerAttestationSignerContribution =
+            serde_json::from_value(session.projection.signer_contribution.clone()).ok()?;
+        Some(Ok(CustodyPrepareResponse {
+            ceremony_kind: BrokerCeremonyKind::PetalRegistration,
+            custody_operation_id: operation_id.clone(),
+            state: CustodyPrepareState::AwaitingUser,
+            ceremony_url: session_url(&token_for(session)),
+            ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
+            signer_contribution_digest: contribution.digest().ok()?,
+        }))
     }
 }
 

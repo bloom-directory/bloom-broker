@@ -16,16 +16,15 @@ fn terms() -> PetalRegistrationTerms {
     .unwrap()
 }
 
-fn receipt() -> CustodyResult {
+fn receipt() -> PetalRegistrationReceipt {
     serde_json::from_value(json!({
-        "ceremony_kind": "petal_registration",
-        "custody_operation_id": "11".repeat(32),
-        "public_status": "SUCCEEDED",
-        "wallet_id": "wallet-owner",
-        "public_key_refs": [], "credential_summaries": [], "initial_policy": null,
+        "operation_id": "11".repeat(32),
+        "ceremony_id": "12".repeat(32),
+        "owner_wallet_id": "wallet-owner",
+        "authority_edge_digest": "77".repeat(32),
+        "context_digest": petal_registration_context_digest(),
+        "subject_digest": terms().digest().unwrap(),
         "receipt_digest": "66".repeat(32),
-        "petal_registration_terms_digest": terms().digest().unwrap(),
-        "encrypted_browser_result": null,
         "signer_key_id": "signer-key", "signer_signature": ""
     }))
     .unwrap()
@@ -107,68 +106,61 @@ fn enrollment_binds_both_key_ids_and_validated_public_bytes() {
 fn receipt_requires_exact_registration_binding_and_success_shape() {
     let original = receipt();
     original
-        .validate_petal_registration_binding(&terms())
+        .validate_binding(&terms(), &Digest32::from_bytes([0x77; 32]))
         .unwrap();
-    assert_eq!(
-        CeremonyKind::PetalRegistration.successful_terminal_state(),
-        Some(CeremonyState::Succeeded)
-    );
     for (field, value) in [
-        ("ceremony_kind", json!("policy_update")),
-        ("custody_operation_id", json!("77".repeat(32))),
-        ("public_status", json!("COMPLETED")),
-        ("wallet_id", json!("other-owner")),
-        ("petal_registration_terms_digest", json!("77".repeat(32))),
-        ("petal_registration_terms_digest", json!(null)),
-        (
-            "credential_summaries",
-            json!([{"credential_id":"AQ", "rp_id":"localhost", "active":true}]),
-        ),
+        ("operation_id", json!("77".repeat(32))),
+        ("owner_wallet_id", json!("other-owner")),
+        ("authority_edge_digest", json!("88".repeat(32))),
+        ("context_digest", json!("88".repeat(32))),
+        ("subject_digest", json!("88".repeat(32))),
     ] {
         let mut changed = serde_json::to_value(&original).unwrap();
         changed[field] = value;
-        let changed: CustodyResult = serde_json::from_value(changed).unwrap();
+        let changed: PetalRegistrationReceipt = serde_json::from_value(changed).unwrap();
         assert!(
             changed
-                .validate_petal_registration_binding(&terms())
+                .validate_binding(&terms(), &Digest32::from_bytes([0x77; 32]))
                 .is_err(),
             "{field}"
         );
     }
-    let mut missing = original.clone();
-    missing.petal_registration_terms_digest = None;
-    assert!(missing.unsigned_canonical_bytes().is_err());
-    let mut cross_kind = original;
-    cross_kind.ceremony_kind = CeremonyKind::PolicyUpdate;
-    assert!(cross_kind.unsigned_canonical_bytes().is_err());
 }
 
 #[test]
-fn receipt_signature_covers_registration_binding_and_old_kinds_keep_their_bytes() {
+fn receipt_signature_covers_every_generic_attestation_field() {
     let original = receipt();
     let key = SigningKey::from_bytes(&[9; 32]);
-    let bytes = original.unsigned_canonical_bytes().unwrap();
+    let bytes = original.signature_message().unwrap();
     let signature = key.sign(&bytes);
     key.verifying_key()
         .verify_strict(&bytes, &signature)
         .unwrap();
-    let mut changed = original.clone();
-    changed.petal_registration_terms_digest = Some(Digest32::from_bytes([9; 32]));
-    assert!(
-        key.verifying_key()
-            .verify_strict(&changed.unsigned_canonical_bytes().unwrap(), &signature)
-            .is_err()
-    );
-    let mut old = original;
-    old.ceremony_kind = CeremonyKind::PolicyUpdate;
-    old.petal_registration_terms_digest = None;
-    let mut legacy = serde_json::to_value(&old).unwrap();
-    assert!(legacy.get("petal_registration_terms_digest").is_none());
-    legacy.as_object_mut().unwrap().remove("signer_signature");
-    assert_eq!(
-        old.unsigned_canonical_bytes().unwrap(),
-        serde_jcs::to_vec(&legacy).unwrap()
-    );
+    let original_json = serde_json::to_value(&original).unwrap();
+    for field in [
+        "operation_id",
+        "ceremony_id",
+        "owner_wallet_id",
+        "authority_edge_digest",
+        "context_digest",
+        "subject_digest",
+        "receipt_digest",
+        "signer_key_id",
+    ] {
+        let mut changed = original_json.clone();
+        changed[field] = if field == "owner_wallet_id" || field == "signer_key_id" {
+            json!("changed")
+        } else {
+            json!("99".repeat(32))
+        };
+        let changed: PetalRegistrationReceipt = serde_json::from_value(changed).unwrap();
+        assert!(
+            key.verifying_key()
+                .verify_strict(&changed.signature_message().unwrap(), &signature)
+                .is_err(),
+            "{field}"
+        );
+    }
 }
 
 fn route(id: &str) -> RequestedRoutePermission {
@@ -192,7 +184,7 @@ fn record_digest_binds_exact_terms_ordered_routes_and_receipt_excluding_itself()
     let digest = record.digest().unwrap();
     assert_eq!(
         digest.as_str(),
-        "7309a16b85d599382a2fa48d1cd73f2ca4e8f62d7d5d875bcb8ef338fb43f209"
+        "42e46aeed222d1672845a045aa649785dfa2b8ca7ea4ef5b82409400070cb3cc"
     );
     record.registration_digest = digest.clone();
     assert_eq!(record.digest().unwrap(), digest);

@@ -134,7 +134,6 @@ fn policy_snapshot() -> SignedPolicySnapshot {
 
 fn custody_result() -> CustodyResult {
     CustodyResult {
-        petal_registration_terms_digest: None,
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation(14),
         public_status: CeremonyState::Completed,

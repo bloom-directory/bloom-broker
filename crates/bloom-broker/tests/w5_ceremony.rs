@@ -41,10 +41,11 @@ use bloom_signer_api::{
     CeremonyWebAuthnOptions, ControlRequest, ControlResponse, CustodyCompleteRequest,
     CustodyHpkeAad, CustodyOutputHpkeAad, CustodyPrepareRequest, CustodyResult,
     CustodySignerContribution, LegacyPasskeyMigrationPublic, LocalPrfHpkeAad,
-    PolicyUpdateCeremonyCompleteRequest, PolicyUpdateCeremonyPrepareRequest,
-    RevocationControlService, SignerActivationReceipt, SignerCeremonyContribution,
-    SignerCeremonyStatus, SignerPreparedApproval, SignerPreparedCustody, WalletOperationRequest,
-    WebAuthnCeremonyProof,
+    OwnerAttestationChallenge, OwnerAttestationCompleteRequest, OwnerAttestationPrepareRequest,
+    OwnerAttestationReceipt, PolicyUpdateCeremonyCompleteRequest,
+    PolicyUpdateCeremonyPrepareRequest, PreparedOwnerAttestation, RevocationControlService,
+    SignerActivationReceipt, SignerCeremonyContribution, SignerCeremonyStatus,
+    SignerPreparedApproval, SignerPreparedCustody, WalletOperationRequest, WebAuthnCeremonyProof,
 };
 use bloom_triad_local_transport::{EndpointQuota, JournalExchange, LocalIdentity, PeerAcl};
 use ed25519_dalek::{Signer as _, SigningKey, Verifier as _, VerifyingKey};
@@ -603,7 +604,6 @@ fn custody_result_to_machine(value: &CustodyResult) -> bloom_broker_api::Custody
             CeremonyKind::BackendEnrollment => bloom_broker_api::CeremonyKind::BackendEnrollment,
             CeremonyKind::KeyDerive => bloom_broker_api::CeremonyKind::KeyDerive,
             CeremonyKind::PolicyUpdate => bloom_broker_api::CeremonyKind::PolicyUpdate,
-            CeremonyKind::PetalRegistration => bloom_broker_api::CeremonyKind::PetalRegistration,
         }
     }
     fn state(value: bloom_signer_api::CeremonyState) -> CeremonyState {
@@ -653,7 +653,6 @@ fn custody_result_to_machine(value: &CustodyResult) -> bloom_broker_api::Custody
         }
     }
     bloom_broker_api::CustodyResult {
-        petal_registration_terms_digest: value.petal_registration_terms_digest.clone(),
         ceremony_kind: kind(value.ceremony_kind),
         custody_operation_id: value.custody_operation_id.clone(),
         public_status: state(value.public_status),
@@ -742,15 +741,25 @@ fn activation_mode_to_signer(value: ActivationMode) -> bloom_signer_api::Activat
     }
 }
 
-fn petal_scope_to_signer(value: &PetalKeyScope) -> bloom_signer_api::PetalKeyScope {
-    bloom_signer_api::PetalKeyScope {
+fn delegated_digest(domain: &[u8], value: &str) -> Digest32 {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(domain);
+    hasher.update(value.as_bytes());
+    Digest32::from_bytes(hasher.finalize().into())
+}
+
+fn petal_scope_to_signer(value: &PetalKeyScope) -> bloom_signer_api::DelegatedKeyScope {
+    bloom_signer_api::DelegatedKeyScope {
         wallet_id: value.wallet_id.clone(),
         parent_key_ref: key_to_signer(&value.parent_key_ref),
-        package_hash: value.package_hash.clone(),
-        route: value.route.clone(),
-        lineage_id: value.lineage_id.clone(),
-        key_slot: value.key_slot.clone(),
-        allowed_routes: value.allowed_routes.clone(),
+        authority_id: delegated_digest(b"bloom-petal-lineage-authority/v1\0", &value.lineage_id),
+        active_subject_id: value.package_hash.clone(),
+        delegate_id: value.key_slot.clone(),
+        allowed_resource_ids: value
+            .allowed_routes
+            .iter()
+            .map(|route| delegated_digest(b"bloom-petal-route-resource/v1\0", route))
+            .collect(),
         allowed_operation_classes: value.allowed_operation_classes.clone(),
         allowed_crypto_suites: value
             .allowed_crypto_suites
@@ -857,8 +866,24 @@ impl CeremonySigner for RealSigner {
         self.service.complete_custody(request, now_ms)
     }
 
+    fn prepare_owner_attestation(
+        &self,
+        request: OwnerAttestationPrepareRequest,
+        now_ms: u64,
+    ) -> Result<PreparedOwnerAttestation, bloom_signer_api::ProtocolError> {
+        self.service.prepare_owner_attestation(request, now_ms)
+    }
+
+    fn complete_owner_attestation(
+        &self,
+        request: OwnerAttestationCompleteRequest,
+        now_ms: u64,
+    ) -> Result<OwnerAttestationReceipt, bloom_signer_api::ProtocolError> {
+        self.service.complete_owner_attestation(request, now_ms)
+    }
+
     fn cancel(&self, operation_id: &OperationId) -> Result<(), bloom_signer_api::ProtocolError> {
-        self.service.cancel(operation_id)
+        self.service.cancel(operation_id).map(|_| ())
     }
 
     fn bind_custody_output_recipient(
@@ -939,6 +964,9 @@ impl CeremonySigner for RealSigner {
             }
             bloom_signer::ceremony::SignerCeremonyStatus::CompletedCustody(result) => {
                 SignerCeremonyStatus::CompletedCustody(result)
+            }
+            bloom_signer::ceremony::SignerCeremonyStatus::CompletedOwnerAttestation(receipt) => {
+                SignerCeremonyStatus::CompletedOwnerAttestation(receipt)
             }
             bloom_signer::ceremony::SignerCeremonyStatus::Terminal(state) => {
                 SignerCeremonyStatus::Terminal(state)
@@ -1091,7 +1119,7 @@ impl CeremonySigner for MockSigner {
             required_user_verification: true,
             hpke_recipient_key: Base64UrlBytes::from_bytes(&[7; 32]),
             browser_output_recipient_key: request.browser_output_recipient_key,
-            petal_key_scope: request.petal_key_scope,
+            delegated_key_scope: request.delegated_key_scope,
             expires_at_ms: DecimalU64::new(now_ms + 10_000),
             signer_key_id: Token::new("mock-signer").unwrap(),
             signer_signature: Base64UrlBytes::from_bytes(&[]),
@@ -1135,7 +1163,6 @@ impl CeremonySigner for MockSigner {
         }
         self.completions.fetch_add(1, Ordering::SeqCst);
         Ok(CustodyResult {
-            petal_registration_terms_digest: None,
             ceremony_kind: request.ceremony_kind,
             custody_operation_id: request.custody_operation_id,
             public_status: request.ceremony_kind.successful_terminal_state().unwrap(),
@@ -1231,7 +1258,7 @@ fn try_prepare(
             exact_terms_digest: digest("33"),
             expected_input_class: Token::new("policy-document").unwrap(),
             browser_output_recipient_key: None,
-            petal_key_scope: None,
+            delegated_key_scope: None,
             legacy_passkey_migration: None,
         },
         now_ms,
@@ -1265,7 +1292,7 @@ fn try_register(
             exact_terms_digest: digest("34"),
             expected_input_class: Token::new("passkey-prf").unwrap(),
             browser_output_recipient_key: None,
-            petal_key_scope: None,
+            delegated_key_scope: None,
             legacy_passkey_migration: None,
         },
         now_ms,
@@ -1324,7 +1351,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             &signer_database,
             Token::new("broker-app-1").unwrap(),
             SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            SigningKey::from_bytes(&[6; 32]).verifying_key(),
+            SigningKey::from_bytes(&[9; 32]).verifying_key(),
             Token::new("signer-revocation-key").unwrap(),
             SigningKey::from_bytes(&[4; 32]),
             signer_audit_keys(),
@@ -1437,7 +1464,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         Token::new("broker-app-1").unwrap(),
         SigningKey::from_bytes(&[7; 32]),
         journal.clone(),
-        registration_limits.clone(),
+        registration_limits,
     )
     .unwrap();
     let broker = BrokerRpcService::new(
@@ -1732,7 +1759,6 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         ProtocolErrorCode::OperationIdConflict
     );
     let premature = CustodyResult {
-        petal_registration_terms_digest: None,
         ceremony_kind: CeremonyKind::PolicyUpdate,
         custody_operation_id: update.operation_id.clone(),
         public_status: bloom_signer_api::CeremonyState::Succeeded,
@@ -1823,7 +1849,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                     ceremony_id: contribution.ceremony_id,
                     proof: WebAuthnCeremonyProof::Assertion { assertion },
                     encrypted_input: Some(encrypted_input),
-                    public_binding_digest: update.terms_digest().unwrap(),
+                    public_binding_digest: challenge.exact_terms_digest,
                 },
             },
             now_ms + 1_000,
@@ -2010,7 +2036,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                     serde_json::to_vec(&serde_json::json!({
                         "proof": {"kind": "assertion", "assertion": derive_assertion},
                         "encrypted_input": derive_encrypted,
-                        "public_binding_digest": scope.request_digest().unwrap()
+                        "public_binding_digest": derive_challenge.exact_terms_digest
                     }))
                     .unwrap(),
                 ))
@@ -2139,8 +2165,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let approval_aad = LocalPrfHpkeAad {
         ceremony_id: approval_contribution.ceremony_id.clone(),
         signer_nonce: approval_contribution.signer_nonce.clone(),
-        approval_id: approval_terms.approval_id().unwrap(),
-        approval_digest: approval_terms.approval_digest().unwrap(),
+        approval_id: approval_contribution.approval_digest.clone(),
+        approval_digest: approval_contribution.approval_digest.clone(),
         review_manifest_digest: approval_prepared.review_manifest_digest.clone(),
         key_ref: child_key.clone(),
         allowed_crypto_suites: approval_terms
@@ -2179,7 +2205,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                     serde_json::to_vec(&serde_json::json!({
                         "proof": {"kind": "assertion", "assertion": approval_assertion},
                         "encrypted_input": approval_encrypted,
-                        "public_binding_digest": approval_terms.approval_digest().unwrap()
+                        "public_binding_digest": approval_challenge.exact_terms_digest
                     }))
                     .unwrap(),
                 ))
@@ -2198,9 +2224,10 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     )
     .unwrap();
     assert_eq!(
-        approval_receipt.approval_id,
+        approval_prepared.approval_id,
         approval_terms.approval_id().unwrap()
     );
+    assert_ne!(approval_receipt.approval_id, approval_prepared.approval_id);
 
     // An exact one-shot selector may use the same scoped child under its
     // pinned Petal subject. Exact requests intentionally carry no reusable
@@ -2267,8 +2294,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let exact_aad = LocalPrfHpkeAad {
         ceremony_id: exact_contribution.ceremony_id.clone(),
         signer_nonce: exact_contribution.signer_nonce.clone(),
-        approval_id: exact_terms.approval_id().unwrap(),
-        approval_digest: exact_terms.approval_digest().unwrap(),
+        approval_id: exact_contribution.approval_digest.clone(),
+        approval_digest: exact_contribution.approval_digest.clone(),
         review_manifest_digest: exact_prepared.review_manifest_digest.clone(),
         key_ref: child_key.clone(),
         allowed_crypto_suites: exact_terms
@@ -2307,7 +2334,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                     serde_json::to_vec(&serde_json::json!({
                         "proof": {"kind": "assertion", "assertion": exact_assertion},
                         "encrypted_input": exact_encrypted,
-                        "public_binding_digest": exact_terms.approval_digest().unwrap()
+                        "public_binding_digest": exact_challenge.exact_terms_digest
                     }))
                     .unwrap(),
                 ))
@@ -2331,9 +2358,10 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let exact_receipt: SignerActivationReceipt =
         serde_json::from_slice(&exact_complete_body).unwrap();
     assert_eq!(
-        exact_receipt.approval_id,
+        exact_prepared.approval_id,
         exact_terms.approval_id().unwrap()
     );
+    assert_ne!(exact_receipt.approval_id, exact_prepared.approval_id);
 
     let exact_sign = exact_petal_sign_request(
         &exact_terms,
@@ -2480,11 +2508,12 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .validation_receipt(&first_sign.operation_id)
         .unwrap()
         .expect("production sign flow must retain its signed validation receipt");
-    assert_eq!(validation_receipt.approval_id, first_sign.approval_id);
-    assert_eq!(
+    assert_ne!(validation_receipt.approval_id, first_sign.approval_id);
+    assert_ne!(
         validation_receipt.operation_digest,
         first_result.operation_digest
     );
+    assert_eq!(first_result.operation_digest, first_sign.operation_digest);
     assert!(!validation_receipt.reservation_ids.is_empty());
     assert_eq!(validation_receipt.broker_key_id.as_str(), "broker-app-1");
     let validation_signature: [u8; 64] = validation_receipt
@@ -2971,7 +3000,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let restored_backup = restarted_signer_engine
         .export_backup(&wallet_id, None, Vec::new())
         .unwrap();
-    assert!(restored_backup.petal_key_scopes.iter().any(|stored| {
+    assert!(restored_backup.delegated_key_scopes.iter().any(|stored| {
         stored.key_ref == child_key && stored.scope == petal_scope_to_signer(&scope)
     }));
     let restarted_sign = petal_sign_request(
@@ -3333,7 +3362,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                 exact_terms_digest: digest("99"),
                 expected_input_class: Token::new("policy-document").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             1_001,
@@ -3351,7 +3380,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                     exact_terms_digest: digest("33"),
                     expected_input_class: Token::new("policy-document").unwrap(),
                     browser_output_recipient_key: None,
-                    petal_key_scope: None,
+                    delegated_key_scope: None,
                     legacy_passkey_migration: None,
                 },
                 1_001,
@@ -3380,7 +3409,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                     exact_terms_digest: digest("33"),
                     expected_input_class: Token::new("policy-document").unwrap(),
                     browser_output_recipient_key: None,
-                    petal_key_scope: None,
+                    delegated_key_scope: None,
                     legacy_passkey_migration: None,
                 },
                 1_101,
@@ -3423,7 +3452,7 @@ async fn legacy_passkey_prepare_renders_only_digest_bound_public_migration_terms
                 exact_terms_digest,
                 expected_input_class: Token::new("legacy_passkey_v1_prf").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: Some(migration),
             },
             now_ms,
@@ -3521,14 +3550,19 @@ async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() 
     let signer = Arc::new(MockSigner::new());
     let broker = CeremonyBroker::new(signer);
     let parent = approval_request().terms.key_ref;
-    let scope = bloom_signer_api::PetalKeyScope {
+    let scope = bloom_signer_api::DelegatedKeyScope {
         wallet_id: Token::new("wallet-review").unwrap(),
         parent_key_ref: parent.clone(),
-        package_hash: digest("91"),
-        route: "/petals/exchange/sign".into(),
-        lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-        key_slot: Token::new("account-a").unwrap(),
-        allowed_routes: vec!["/petals/exchange/sign".into()],
+        authority_id: delegated_digest(
+            b"bloom-petal-lineage-authority/v1\0",
+            "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        active_subject_id: digest("91"),
+        delegate_id: Token::new("account-a").unwrap(),
+        allowed_resource_ids: vec![delegated_digest(
+            b"bloom-petal-route-resource/v1\0",
+            "/petals/exchange/sign",
+        )],
         allowed_operation_classes: vec![Token::new("exchange-order").unwrap()],
         allowed_crypto_suites: vec![bloom_signer_api::CryptoSuite::Secp256k1Sha256Recoverable],
         maximum_lifetime_ms: DecimalU64::new(60_000),
@@ -3542,7 +3576,7 @@ async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() 
         exact_terms_digest: scope.request_digest().unwrap(),
         expected_input_class: Token::new("petal-key-scope-v1").unwrap(),
         browser_output_recipient_key: None,
-        petal_key_scope: Some(scope.clone()),
+        delegated_key_scope: Some(scope.clone()),
         legacy_passkey_migration: None,
     };
     let now_ms: u64 = std::time::SystemTime::now()
@@ -3572,7 +3606,7 @@ async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() 
         serde_json::to_value(&scope).unwrap()
     );
     assert_eq!(
-        projection["signer_contribution"]["petal_key_scope"],
+        projection["signer_contribution"]["delegated_key_scope"],
         serde_json::to_value(&scope).unwrap()
     );
     assert!(projection["signer_contribution"]["browser_output_recipient_key"].is_null());
@@ -3609,16 +3643,18 @@ async fn machine_asserted_reusable_plan_carries_primary_surface_warning() {
     );
     let mut request = approval_request();
     request.activation_operation_id = operation("18");
-    request.terms.subject = bloom_signer_api::ApprovalSubject::Petal {
-        package_hash: digest("19"),
-        route: "wallet/send".into(),
-        agent_id: None,
+    request.terms.subject = bloom_signer_api::ApprovalSubject::Delegated {
+        authority_id: digest("18"),
+        active_subject_id: digest("19"),
+        resource_id: digest("20"),
+        delegate_id: Token::new("agent-1").unwrap(),
     };
-    request.terms.selector = bloom_signer_api::ApprovalSelector::Petal {
-        package_hash: digest("19"),
-        route: "wallet/send".into(),
+    request.terms.selector = bloom_signer_api::ApprovalSelector::Delegated {
+        authority_id: digest("18"),
+        active_subject_id: digest("19"),
+        resource_id: digest("20"),
         allowed_operation_classes: vec![Token::new("transfer").unwrap()],
-        route_grants: Vec::new(),
+        resource_grants: Vec::new(),
         required_claim_assurance: bloom_signer_api::ClaimAssuranceLevel::MachineAsserted,
     };
     request.exact_ordered_payload_digests.clear();
@@ -3954,7 +3990,7 @@ fn ac18_forced_ceremony_audit_write_failure_rolls_back_session() {
         exact_terms_digest: digest("33"),
         expected_input_class: Token::new("policy-document").unwrap(),
         browser_output_recipient_key: None,
-        petal_key_scope: None,
+        delegated_key_scope: None,
         legacy_passkey_migration: None,
     };
 
@@ -4007,7 +4043,7 @@ fn ac18_populated_ceremony_migration_is_atomic_idempotent_and_retains_source() {
                 exact_terms_digest: digest("39"),
                 expected_input_class: Token::new("policy-document").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             50_000,
@@ -4211,7 +4247,7 @@ fn ac18_ceremony_status_survives_latched_audit_tamper_while_new_sessions_fail() 
                     exact_terms_digest: digest("33"),
                     expected_input_class: Token::new("policy-document").unwrap(),
                     browser_output_recipient_key: None,
-                    petal_key_scope: None,
+                    delegated_key_scope: None,
                     legacy_passkey_migration: None,
                 },
                 41_001,
@@ -4260,7 +4296,7 @@ fn restart_expires_nonterminal_session_and_persists_only_token_hash() {
                 exact_terms_digest: digest("33"),
                 expected_input_class: Token::new("policy-document").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             50_001,
@@ -4656,7 +4692,7 @@ fn zero_effective_time_fails_closed_before_anonymous_creation_quota() {
                     exact_terms_digest: digest("34"),
                     expected_input_class: Token::new("passkey-prf").unwrap(),
                     browser_output_recipient_key: None,
-                    petal_key_scope: None,
+                    delegated_key_scope: None,
                     legacy_passkey_migration: None,
                 },
                 1 + u64::from(index),
@@ -4675,7 +4711,7 @@ fn zero_effective_time_fails_closed_before_anonymous_creation_quota() {
                 exact_terms_digest: digest("34"),
                 expected_input_class: Token::new("passkey-prf").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             0,
@@ -4712,7 +4748,7 @@ fn cancellation_backoff_reports_remaining_cooldown_and_resets_after_expiry() {
                 exact_terms_digest: digest("35"),
                 expected_input_class: Token::new("policy-document").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             10_001,
@@ -4763,7 +4799,7 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
                     exact_terms_digest: digest("d8"),
                     expected_input_class: Token::new("passkey-prf").unwrap(),
                     browser_output_recipient_key: None,
-                    petal_key_scope: None,
+                    delegated_key_scope: None,
                     legacy_passkey_migration: None,
                 },
                 100_000 + u64::from(index),
@@ -4784,7 +4820,7 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
                     exact_terms_digest: digest("d8"),
                     expected_input_class: Token::new("passkey-prf").unwrap(),
                     browser_output_recipient_key: None,
-                    petal_key_scope: None,
+                    delegated_key_scope: None,
                     legacy_passkey_migration: None,
                 },
                 100_010,
@@ -4836,7 +4872,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
                 exact_terms_digest: digest("51"),
                 expected_input_class: Token::new("passkey-prf").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             now_ms,
@@ -4944,7 +4980,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
                 exact_terms_digest: digest("52"),
                 expected_input_class: Token::new("generic-custody-v1").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             now_ms + 1_000,
@@ -5212,7 +5248,10 @@ async fn complete_registration_for_test(
     proposal: bloom_broker_api::PetalRegistrationPrepareRequest,
     counter: u32,
     lose_response: bool,
-) -> (PreparedRegistrationForTest, bloom_broker_api::CustodyResult) {
+) -> (
+    PreparedRegistrationForTest,
+    bloom_broker_api::PetalRegistrationReceipt,
+) {
     let MachineBrokerResponse::PetalRegistrationPrepare(prepared) = MachineBrokerService::dispatch(
         broker,
         MachineBrokerRequest::PetalRegistrationPrepare(proposal.clone()),
@@ -5314,52 +5353,25 @@ async fn complete_registration_for_test(
         assert_eq!(terms, prepared.terms);
         assert_eq!(ceremony, prepared.ceremony);
     }
-    let challenge: CeremonyChallenge =
+    let challenge: OwnerAttestationChallenge =
         serde_json::from_value(session["challenges"][0]["binding"].clone()).unwrap();
-    let contribution: CustodySignerContribution =
+    let contribution: bloom_signer_api::OwnerAttestationSignerContribution =
         serde_json::from_value(session["signer_contribution"].clone()).unwrap();
     let assertion = authenticator.assertion(&challenge.canonical_bytes().unwrap(), counter);
-    let aad = CustodyHpkeAad {
+    let completion = OwnerAttestationCompleteRequest {
+        operation_id: prepared.terms.operation_id.clone(),
         ceremony_id: contribution.ceremony_id.clone(),
-        ceremony_kind: CeremonyKind::PetalRegistration,
-        custody_operation_id: prepared.terms.operation_id.clone(),
-        signer_nonce: contribution.signer_nonce.clone(),
-        signer_contribution_digest: contribution.digest().unwrap(),
-        wallet_id: contribution.wallet_id.clone(),
-        key_ref: None,
-        credential_id: Some(assertion.credential_id.clone()),
-        expected_input_class: Token::new("petal_registration").unwrap(),
-    }
-    .canonical_bytes()
-    .unwrap();
-    let plaintext = serde_jcs::to_vec(&serde_json::json!({
-        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
-        "effect": {"kind":"petal_registration"},
-    }))
-    .unwrap();
-    let encrypted = seal_hpke(
-        &contribution.hpke_recipient_key,
-        b"bloom-custody-input/v1",
-        &aad,
-        &plaintext,
-    )
-    .unwrap();
-    let completion = CustodyCompleteRequest {
-        ceremony_kind: CeremonyKind::PetalRegistration,
-        custody_operation_id: prepared.terms.operation_id.clone(),
-        ceremony_id: contribution.ceremony_id.clone(),
-        proof: WebAuthnCeremonyProof::Assertion { assertion },
-        encrypted_input: Some(encrypted),
-        public_binding_digest: prepared.terms.digest().unwrap(),
+        public_binding_digest: contribution.public_binding_digest.clone(),
+        browser_proof: WebAuthnCeremonyProof::Assertion { assertion },
     };
-    let receipt: CustodyResult = if lose_response {
+    let receipt: OwnerAttestationReceipt = if lose_response {
         let BrokerSignerResponse::CeremonyComplete(
-            bloom_signer_api::SignerCeremonyCompleteResponse::PetalRegistration(receipt),
+            bloom_signer_api::SignerCeremonyCompleteResponse::OwnerAttestationComplete(receipt),
         ) = signer
             .request(BrokerSignerRequest::CeremonyComplete(
-                bloom_signer_api::SignerCeremonyCompleteRequest::PetalRegistration(Box::new(
-                    completion,
-                )),
+                bloom_signer_api::SignerCeremonyCompleteRequest::OwnerAttestationComplete(
+                    Box::new(completion),
+                ),
             ))
             .unwrap()
         else {
@@ -5367,23 +5379,37 @@ async fn complete_registration_for_test(
         };
         *receipt
     } else {
-        let response = app.oneshot(Request::builder().method("POST")
-            .uri(format!("/api/session/{}/complete", contribution.ceremony_id))
-            .header(header::HOST, "localhost:18734").header(header::ORIGIN, "http://localhost:18734")
-            .header("x-bloom-ceremony-token", &token).header(header::CONTENT_TYPE, "application/json").header("sec-fetch-site", "same-origin")
-            .body(Body::from(serde_json::to_vec(&serde_json::json!({
-                "proof": completion.proof, "encrypted_input": completion.encrypted_input,
-                "public_binding_digest": completion.public_binding_digest,
-            })).unwrap())).unwrap()).await.unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/session/{}/complete",
+                        contribution.ceremony_id
+                    ))
+                    .header(header::HOST, "localhost:18734")
+                    .header(header::ORIGIN, "http://localhost:18734")
+                    .header("x-bloom-ceremony-token", &token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "proof": completion.browser_proof, "encrypted_input": null,
+                            "public_binding_digest": completion.public_binding_digest,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
     };
-    assert_eq!(receipt.public_key_refs.len(), 0);
-    assert!(receipt.initial_policy.is_none());
-    assert!(receipt.encrypted_browser_result.is_none());
-    let receipt = custody_result_to_machine(&receipt);
+    let receipt: bloom_broker_api::PetalRegistrationReceipt =
+        serde_json::from_value(serde_json::to_value(receipt).unwrap()).unwrap();
     receipt
-        .validate_petal_registration_binding(&prepared.terms)
+        .validate_binding(&prepared.terms, &receipt.authority_edge_digest)
         .unwrap();
     (prepared, receipt)
 }
@@ -5420,11 +5446,12 @@ assertionJson = ()=>({{credential_id:"AQ"}});
 clearBrowserState = async()=>{{}};
 let sealed;
 hpkeSeal = async(_key,_info,_aad,plaintext)=>{{sealed=JSON.parse(new TextDecoder().decode(plaintext));return {{opaque:true}};}};
-mutate = async(_path,body)=>{{if (!body.encrypted_input.opaque) throw new Error("missing encrypted input");return {{receipt_digest:"done"}};}};
+const ownerAttestationOnly = "{kind}" === "petal_registration";
+mutate = async(_path,body)=>{{if (ownerAttestationOnly ? body.encrypted_input !== null : !body.encrypted_input.opaque) throw new Error("wrong encrypted input");return {{receipt_digest:"done"}};}};
 genericFields.hidden = false;
 genericInput.value = '{{"namespace_id":"must-not-be-collected","authority_signature":"untrusted"}}';
-run({{ceremony_kind:"{kind}", signer_contribution:{{hpke_recipient_key:encodeUrl(new Uint8Array(32)),expected_input_class:"{kind}",petal_key_scope: {scoped} ? {{}} : null}},challenges:[{{binding:{{exact_terms_digest:"11".repeat(32)}}}}]}}).then(()=>{{
- if (canonicalJson(sealed)!==canonicalJson({{credential_prf:encodeUrl(new Uint8Array(32).fill(7)),effect:{{kind:"{kind}"}}}})) throw new Error("closed custody effect accepted generic authority input");
+run({{ceremony_kind:"{kind}", signer_contribution:{{hpke_recipient_key:encodeUrl(new Uint8Array(32)),expected_input_class:"{kind}",delegated_key_scope: {scoped} ? {{}} : null}},challenges:[{{binding:{{exact_terms_digest:"11".repeat(32)}}}}]}}).then(()=>{{
+ if (ownerAttestationOnly ? sealed !== undefined : canonicalJson(sealed)!==canonicalJson({{credential_prf:encodeUrl(new Uint8Array(32).fill(7)),effect:{{kind:"{kind}"}}}})) throw new Error("closed effect accepted generic authority input");
  process.stdout.write("registration-browser-ok");
 }},error=>{{console.error(error);process.exit(1);}});
 "#
@@ -5447,13 +5474,15 @@ struct LoseOneRegistrationPrepareResponse {
     lose_next_success: AtomicBool,
 }
 impl CeremonySigner for LoseOneRegistrationPrepareResponse {
-    fn prepare_petal_registration(
+    fn prepare_owner_attestation(
         &self,
-        request: bloom_signer_api::PetalRegistrationCeremonyPrepareRequest,
+        request: OwnerAttestationPrepareRequest,
         now_ms: u64,
-    ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
-        let prepared = self.inner.prepare_petal_registration(request, now_ms)?;
-        if self.lose_next_success.swap(false, Ordering::SeqCst) {
+    ) -> Result<PreparedOwnerAttestation, bloom_signer_api::ProtocolError> {
+        let prepared = self.inner.prepare_owner_attestation(request, now_ms)?;
+        if !prepared.verification_credentials.is_empty()
+            && self.lose_next_success.swap(false, Ordering::SeqCst)
+        {
             return Err(bloom_signer_api::ProtocolError::new(
                 bloom_signer_api::ProtocolErrorCode::ServiceUnavailable,
                 "injected response loss after actual Signer preparation",
@@ -5461,12 +5490,12 @@ impl CeremonySigner for LoseOneRegistrationPrepareResponse {
         }
         Ok(prepared)
     }
-    fn complete_petal_registration(
+    fn complete_owner_attestation(
         &self,
-        request: CustodyCompleteRequest,
+        request: OwnerAttestationCompleteRequest,
         now_ms: u64,
-    ) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
-        self.inner.complete_petal_registration(request, now_ms)
+    ) -> Result<OwnerAttestationReceipt, bloom_signer_api::ProtocolError> {
+        self.inner.complete_owner_attestation(request, now_ms)
     }
     fn prepare_approval(
         &self,

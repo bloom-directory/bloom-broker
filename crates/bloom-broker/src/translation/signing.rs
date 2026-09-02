@@ -8,7 +8,7 @@ use super::key;
 pub(crate) fn selector_to_signer(value: &north::ApprovalSelector) -> south::SelectorKind {
     match value {
         north::ApprovalSelector::Exact { .. } => south::SelectorKind::Exact,
-        north::ApprovalSelector::Petal { .. } => south::SelectorKind::Petal,
+        north::ApprovalSelector::Petal { .. } => south::SelectorKind::Delegated,
     }
 }
 
@@ -34,10 +34,13 @@ pub(crate) fn assurance_to_signer(value: north::ClaimAssurance) -> south::Signer
     }
 }
 
-pub(crate) fn result_to_machine(value: south::SigningResult) -> north::SigningResult {
+pub(crate) fn result_to_machine(
+    value: south::SigningResult,
+    machine_operation_digest: north::Digest32,
+) -> north::SigningResult {
     north::SigningResult {
         operation_id: value.operation_id,
-        operation_digest: value.operation_digest,
+        operation_digest: machine_operation_digest,
         signatures: value
             .signatures
             .into_iter()
@@ -69,7 +72,7 @@ mod tests {
             required_claim_assurance: north::ClaimAssuranceLevel::MachineAsserted,
         };
         assert_eq!(selector_to_signer(&exact), south::SelectorKind::Exact);
-        assert_eq!(selector_to_signer(&petal), south::SelectorKind::Petal);
+        assert_eq!(selector_to_signer(&petal), south::SelectorKind::Delegated);
     }
 
     #[test]

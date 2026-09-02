@@ -5,8 +5,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    Base64UrlBytes, CeremonyKind, CeremonyState, CustodyPrepareResponse, CustodyResult, Digest32,
-    OperationId, ProtocolError, ProtocolErrorCode, Token,
+    Base64UrlBytes, CustodyPrepareResponse, Digest32, OperationId, ProtocolError,
+    ProtocolErrorCode, Token,
 };
 
 pub const PETAL_REGISTRATION_SCHEMA: &str = "bloom.petal-registration/1";
@@ -14,6 +14,8 @@ pub use bloom_petal_contract::{PackageEvidence, RequestedRoutePermission};
 const RECORD_DOMAIN: &[u8] = b"bloom.petal-registration-record/v1";
 const TERMS_DOMAIN: &[u8] = b"bloom.petal-registration-terms/v1\0";
 const ENROLLMENT_DOMAIN: &[u8] = b"bloom.petal-registration-enrollment/v1\0";
+const OWNER_ATTESTATION_RECEIPT_SIGNATURE_DOMAIN: &[u8] = b"bloom-owner-attestation-receipt/v1\0";
+const REGISTRATION_CONTEXT_DOMAIN: &[u8] = b"bloom-petal-registration-context/v1\0";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -86,42 +88,68 @@ pub fn petal_registration_enrollment_digest(
     )
 }
 
-impl CustodyResult {
-    /// Enforce the registration-specific signed field on all receipt kinds.
-    /// Existing receipt kinds keep their canonical bytes with an absent field.
-    pub fn validate_petal_registration_shape(&self) -> Result<(), ProtocolError> {
-        if self.ceremony_kind == CeremonyKind::PetalRegistration {
-            if self.petal_registration_terms_digest.is_none()
-                || self.public_status != CeremonyState::Succeeded
-                || self.wallet_id.is_none()
-                || !self.public_key_refs.is_empty()
-                || !self.credential_summaries.is_empty()
-                || self.initial_policy.is_some()
-                || self.encrypted_browser_result.is_some()
-            {
-                return Err(binding_error());
-            }
-        } else if self.petal_registration_terms_digest.is_some() {
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PetalRegistrationReceipt {
+    pub operation_id: OperationId,
+    pub ceremony_id: Digest32,
+    pub owner_wallet_id: Token,
+    pub authority_edge_digest: Digest32,
+    pub context_digest: Digest32,
+    pub subject_digest: Digest32,
+    pub receipt_digest: Digest32,
+    pub signer_key_id: Token,
+    pub signer_signature: Base64UrlBytes,
+}
+
+impl PetalRegistrationReceipt {
+    pub fn validate_binding(
+        &self,
+        terms: &PetalRegistrationTerms,
+        authority_edge_digest: &Digest32,
+    ) -> Result<(), ProtocolError> {
+        if self.operation_id != terms.operation_id
+            || self.owner_wallet_id != terms.owner_wallet_id
+            || &self.authority_edge_digest != authority_edge_digest
+            || self.context_digest != petal_registration_context_digest()
+            || self.subject_digest != terms.digest()?
+        {
             return Err(binding_error());
         }
         Ok(())
     }
 
-    /// Exact public terms binding; signature and local enrollment verification
-    /// remain mandatory for any consumer adopting this receipt as authority.
-    pub fn validate_petal_registration_binding(
-        &self,
-        terms: &PetalRegistrationTerms,
-    ) -> Result<(), ProtocolError> {
-        self.validate_petal_registration_shape()?;
-        if self.ceremony_kind != CeremonyKind::PetalRegistration
-            || self.custody_operation_id != terms.operation_id
-            || self.wallet_id.as_ref() != Some(&terms.owner_wallet_id)
-            || self.petal_registration_terms_digest.as_ref() != Some(&terms.digest()?)
-        {
-            return Err(binding_error());
+    pub fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            operation_id: &'a OperationId,
+            ceremony_id: &'a Digest32,
+            owner_wallet_id: &'a Token,
+            authority_edge_digest: &'a Digest32,
+            context_digest: &'a Digest32,
+            subject_digest: &'a Digest32,
+            receipt_digest: &'a Digest32,
+            signer_key_id: &'a Token,
         }
-        Ok(())
+        serde_jcs::to_vec(&Unsigned {
+            operation_id: &self.operation_id,
+            ceremony_id: &self.ceremony_id,
+            owner_wallet_id: &self.owner_wallet_id,
+            authority_edge_digest: &self.authority_edge_digest,
+            context_digest: &self.context_digest,
+            subject_digest: &self.subject_digest,
+            receipt_digest: &self.receipt_digest,
+            signer_key_id: &self.signer_key_id,
+        })
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string()))
+    }
+
+    pub fn signature_message(&self) -> Result<Vec<u8>, ProtocolError> {
+        Ok([
+            OWNER_ATTESTATION_RECEIPT_SIGNATURE_DOMAIN,
+            self.unsigned_canonical_bytes()?.as_slice(),
+        ]
+        .concat())
     }
 }
 
@@ -175,7 +203,7 @@ pub enum PetalRegistrationPrepareResponse {
 #[serde(deny_unknown_fields)]
 pub struct PetalRegistrationCommitRequest {
     pub operation_id: OperationId,
-    pub ceremony_receipt: CustodyResult,
+    pub ceremony_receipt: PetalRegistrationReceipt,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -183,7 +211,7 @@ pub struct PetalRegistrationCommitRequest {
 pub struct PetalRegistration {
     pub terms: PetalRegistrationTerms,
     pub approved_routes: Vec<RequestedRoutePermission>,
-    pub ceremony_receipt: CustodyResult,
+    pub ceremony_receipt: PetalRegistrationReceipt,
     pub registration_digest: Digest32,
 }
 
@@ -196,7 +224,7 @@ impl PetalRegistration {
         struct Record<'a> {
             terms: &'a PetalRegistrationTerms,
             approved_routes: &'a [RequestedRoutePermission],
-            ceremony_receipt: &'a CustodyResult,
+            ceremony_receipt: &'a PetalRegistrationReceipt,
         }
         digest(
             RECORD_DOMAIN,
@@ -207,6 +235,10 @@ impl PetalRegistration {
             },
         )
     }
+}
+
+pub fn petal_registration_context_digest() -> Digest32 {
+    Digest32::from_bytes(Sha256::digest(REGISTRATION_CONTEXT_DOMAIN).into())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
