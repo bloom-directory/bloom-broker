@@ -3,9 +3,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Base64UrlBytes, BootEpoch, CeremonyKind, CustodyPrepareRequest, CustodyPrepareResponse,
     CustodyResult, DecimalU64, Digest32, HelloChallenge, KeyRef, MachineSignRequest, OperationId,
-    PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
-    PolicyUpdateRequest, ProtocolError, RevocationState, SealedApprovalPrepareResponse,
-    SealedApprovalTerms, ServiceFuture, SignedPolicySnapshot, SigningResult, Token,
+    OwnerInputRequest, OwnerInputResponse, PolicyCommitReceipt, PolicyCommitUpdateRequest,
+    PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError, RevocationState,
+    SealedApprovalPrepareResponse, SealedApprovalTerms, ServiceFuture, SignedPolicySnapshot,
+    SigningResult, Token,
 };
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -377,6 +378,8 @@ pub enum MachineBrokerRequest {
     CeremonyCancel(IdRequest),
     #[serde(rename = "custody.result")]
     CustodyResult(OperationRequest),
+    #[serde(rename = "owner_input.request")]
+    OwnerInputRequest(OwnerInputRequest),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -460,6 +463,8 @@ pub enum MachineBrokerResponse {
     CeremonyCancel(CeremonyPublicStatus),
     #[serde(rename = "custody.result")]
     CustodyResult(CustodyResult),
+    #[serde(rename = "owner_input.request")]
+    OwnerInputRequest(OwnerInputResponse),
 }
 pub trait MachineBrokerService: Send + Sync {
     fn dispatch<'a>(
@@ -500,6 +505,7 @@ impl crate::TypedRequestMethod for MachineBrokerRequest {
             Request::OperationStatus(request)
             | Request::OperationCancel(request)
             | Request::CustodyResult(request) => Some(request.operation_id.clone()),
+            Request::OwnerInputRequest(request) => Some(request.operation_id.clone()),
             Request::PolicyValidateUpdate(request) => Some(request.operation_id.clone()),
             Request::PolicyCommitUpdate(request) => Some(request.operation_id.clone()),
             Request::WalletRegistrationPrepare(request)

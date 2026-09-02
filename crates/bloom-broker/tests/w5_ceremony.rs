@@ -19,12 +19,13 @@ use bloom_broker_api::{
     Base64UrlBytes, BootEpoch, CanonicalWalletPolicy, CeremonyState, ClaimAssurance,
     ClaimAssuranceLevel, CryptoSuite, CustodyPrepareResponse, DecimalU64, DeclaredFee, Digest32,
     KeyRef, KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
-    MachineSignRequest, OperationId, OperationRequest, PROVENANCE_RECORD_SIGNATURE_DOMAIN,
-    PetalKeyScope, PetalLineageMembership, PetalUseClaim, PolicyCommitUpdateRequest,
-    PolicyDestination, PolicyUpdateRequest, ProtocolError, ProtocolErrorCode,
-    ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject, RateLimitDetails, RequestNonce,
-    RevokeRequest, SealedApprovalTerms, SignedJournalHead, SignedPolicySnapshot, SigningPayloads,
-    Token, WalletRequest,
+    MachineSignRequest, OperationId, OperationRequest, OwnerInputDisplayContext, OwnerInputKind,
+    OwnerInputRequest, OwnerInputResponse, PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope,
+    PetalLineageMembership, PetalUseClaim, PolicyCommitUpdateRequest, PolicyDestination,
+    PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceOperationClass,
+    ProvenanceRecord, ProvenanceSubject, RateLimitDetails, RequestNonce, RevokeRequest,
+    SealedApprovalTerms, SignedJournalHead, SignedPolicySnapshot, SigningPayloads, Token,
+    WalletRequest,
 };
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer::{
@@ -3295,6 +3296,86 @@ async fn machine_asserted_reusable_plan_carries_primary_surface_warning() {
     assert!(plan.contains("limits are asserted by the named Petal"));
     assert!(plan.contains("compromised Petal or Machine"));
     assert!(plan.contains("full remaining capacity"));
+}
+
+#[tokio::test]
+async fn owner_input_is_browser_only_and_taken_once_without_signer_authority() {
+    let broker = CeremonyBroker::new(Arc::new(MockSigner::new()));
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let request = OwnerInputRequest {
+        operation_id: operation("91"),
+        kind: OwnerInputKind::EvmAddress,
+        context: OwnerInputDisplayContext {
+            network: "mainnet".into(),
+            asset: "eth".into(),
+            amount_base_units: "1000000000000000000".into(),
+            decimals: 18,
+            source: "dev/note-1".into(),
+        },
+    };
+    let first = broker.request_owner_input(request.clone(), now_ms).unwrap();
+    let OwnerInputResponse::Pending { ceremony_url, .. } = first else {
+        panic!("new owner input must be pending");
+    };
+    let token = ceremony_url.rsplit('/').next().unwrap().to_owned();
+    let app = broker.router();
+
+    let projection = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/input")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-input-token", &token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(projection.status(), StatusCode::OK);
+    let projection = projection.into_body().collect().await.unwrap().to_bytes();
+    assert!(!String::from_utf8_lossy(&projection).contains("recipient"));
+
+    let recipient = "0x1111111111111111111111111111111111111111";
+    let completed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/input/{}/complete",
+                    request.operation_id.as_str()
+                ))
+                .header(header::HOST, "localhost:18734")
+                .header(header::ORIGIN, "http://localhost:18734")
+                .header("x-bloom-input-token", &token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"value": recipient})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::NO_CONTENT);
+
+    assert_eq!(
+        broker.request_owner_input(request.clone(), now_ms).unwrap(),
+        OwnerInputResponse::Ready {
+            operation_id: request.operation_id.clone(),
+            value: recipient.into(),
+        }
+    );
+    assert!(matches!(
+        broker.request_owner_input(request, now_ms).unwrap(),
+        OwnerInputResponse::Pending { .. }
+    ));
 }
 
 #[tokio::test]

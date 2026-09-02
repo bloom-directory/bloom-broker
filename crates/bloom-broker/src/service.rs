@@ -548,6 +548,10 @@ impl BrokerRpcService {
                     _ => Err(response_mismatch("custody.result")),
                 }
             }
+            Request::OwnerInputRequest(request) => Ok(Response::OwnerInputRequest(
+                self.ceremony
+                    .request_owner_input(request, self.clock.now_ms(false)?)?,
+            )),
         }
     }
 
