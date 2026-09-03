@@ -471,6 +471,18 @@ struct BrowserSession {
     projection: BrowserProjection,
 }
 
+#[derive(Deserialize)]
+struct StoredSessionIndex {
+    operation_id: OperationId,
+    state: CeremonyState,
+    projection: StoredProjectionIndex,
+}
+
+#[derive(Deserialize)]
+struct StoredProjectionIndex {
+    ceremony_id: Digest32,
+}
+
 struct NewBrowserSession {
     operation_id: OperationId,
     request_digest: Digest32,
@@ -964,7 +976,17 @@ impl CeremonyBroker {
             .ok_or_else(not_found)?;
         let sessions = self.inner.sessions.lock();
         let session = sessions.get(&ceremony_id).ok_or_else(not_found)?;
-        let receipt_digest = session.terminal_result.as_ref().map(digest).transpose()?;
+        let receipt_digest = match session.terminal_result.as_ref() {
+            Some(result) if session.ceremony_kind == CeremonyKind::SealedApproval => {
+                Some(digest(result)?)
+            }
+            Some(result) => Some(
+                serde_json::from_value::<CustodyResult>(result.clone())
+                    .map_err(malformed)?
+                    .receipt_digest,
+            ),
+            None => None,
+        };
         let ceremony_url = if session.state == CeremonyState::AwaitingUser {
             session.token.as_ref().map(session_url)
         } else {
@@ -1386,18 +1408,17 @@ impl CeremonyBroker {
         session: BrowserSession,
     ) -> Result<(), ProtocolError> {
         let id = ceremony_id.as_str().to_owned();
-        if self.inner.sessions.lock().contains_key(&id) {
+        let mut operations = self.inner.operations.lock();
+        let mut sessions = self.inner.sessions.lock();
+        if sessions.contains_key(&id) || operations.contains_key(&session.operation_id) {
             return Err(protocol(
                 ProtocolErrorCode::OperationIdConflict,
-                "Signer reused a ceremony ID",
+                "ceremony ID or operation ID is already in use",
             ));
         }
         self.persist_session(&session)?;
-        self.inner
-            .operations
-            .lock()
-            .insert(session.operation_id.clone(), id.clone());
-        self.inner.sessions.lock().insert(id, session);
+        operations.insert(session.operation_id.clone(), id.clone());
+        sessions.insert(id, session);
         Ok(())
     }
 
@@ -1631,7 +1652,29 @@ impl CeremonyBroker {
             .is_some_and(|journal| journal.audit_degraded());
 
         for (ceremony_id, operation_id, encoded) in rows {
-            let mut session: BrowserSession = serde_json::from_str(&encoded).map_err(malformed)?;
+            let mut session: BrowserSession = match serde_json::from_str(&encoded) {
+                Ok(session) => session,
+                Err(error) => {
+                    let decode_error = error.to_string();
+                    let index: StoredSessionIndex =
+                        serde_json::from_str(&encoded).map_err(|_| malformed(&decode_error))?;
+                    if !is_terminal(index.state)
+                        || operation_id != index.operation_id.as_str()
+                        || ceremony_id != index.projection.ceremony_id.as_str()
+                    {
+                        return Err(malformed(decode_error));
+                    }
+                    self.inner
+                        .operations
+                        .lock()
+                        .insert(index.operation_id, ceremony_id);
+                    tracing::warn!(
+                        event = "ceremony.unsupported_terminal_projection",
+                        "Broker retained replay protection for an unsupported terminal ceremony"
+                    );
+                    continue;
+                }
+            };
             let preserve_awaiting = session.state == CeremonyState::AwaitingRecoveryAck
                 && session.expires_at_ms > unix_time_ms();
             if audit_degraded {
