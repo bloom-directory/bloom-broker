@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let command = args
         .next()
-        .ok_or("usage: bloom-broker-debug-driver complete URL (--authenticator-seed-file PATH | SEED) [options] | assert-machine-secret-confinement --signer-db PATH --authenticator-seed SEED --artifact PATH [...]")?;
+        .ok_or("usage: bloom-broker-debug-driver complete URL (--authenticator-seed-file PATH | SEED) [--mnemonic-file PATH | --raw-private-key VALUE] [options] | assert-machine-secret-confinement --signer-db PATH --authenticator-seed SEED --artifact PATH [...]")?;
     if command == "assert-machine-secret-confinement" {
         return assert_machine_secret_confinement_command(args);
     }
@@ -39,6 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut new_seed = None;
     let mut raw_private_key = None;
+    let mut mnemonic = None;
     let mut sign_count = 1_u32;
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -50,6 +51,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--raw-private-key" => {
                 raw_private_key = Some(args.next().ok_or("--raw-private-key requires a value")?);
+            }
+            "--mnemonic-file" => {
+                let path = PathBuf::from(args.next().ok_or("--mnemonic-file requires a path")?);
+                mnemonic = Some(read_protected_seed_file(&path)?);
             }
             "--sign-count" => {
                 sign_count = args
@@ -128,12 +133,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let assertion = authenticator.assertion(&challenges[1].canonical_bytes()?, sign_count);
             let credential_id = attestation.credential_id.clone();
             let plaintext = if kind == CeremonyKind::WalletImport {
-                let raw_private_key =
-                    raw_private_key.ok_or("wallet_import requires --raw-private-key")?;
-                serde_jcs::to_vec(&serde_json::json!({
-                    "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
-                    "raw_private_key": raw_private_key,
-                }))?
+                match (raw_private_key, mnemonic) {
+                    (Some(_), Some(_)) => {
+                        return Err(
+                            "wallet_import accepts exactly one of --mnemonic-file or --raw-private-key"
+                                .into(),
+                        );
+                    }
+                    (Some(raw_private_key), None) => serde_jcs::to_vec(&serde_json::json!({
+                        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+                        "raw_private_key": raw_private_key,
+                    }))?,
+                    (None, Some(mnemonic)) => serde_jcs::to_vec(&serde_json::json!({
+                        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+                        "mnemonic": mnemonic,
+                    }))?,
+                    (None, None) => {
+                        return Err(
+                            "wallet_import requires --mnemonic-file or --raw-private-key".into(),
+                        );
+                    }
+                }
             } else {
                 authenticator.deterministic_prf().to_vec()
             };
@@ -175,14 +195,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         CeremonyKind::WalletDelete
         | CeremonyKind::KeyDerive
+        | CeremonyKind::AccountAllocate
+        | CeremonyKind::AccountRetire
         | CeremonyKind::PolicyUpdate
         | CeremonyKind::WalletExport
         | CeremonyKind::BackendEnrollment => {
             let assertion = authenticator.assertion(&challenges[0].canonical_bytes()?, sign_count);
             let credential_id = assertion.credential_id.clone();
+            let effect_kind = custody_effect_kind(kind)?;
             let plaintext = serde_jcs::to_vec(&serde_json::json!({
                 "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
-                "effect": {"kind": kind},
+                "effect": {"kind": effect_kind},
             }))?;
             (
                 WebAuthnCeremonyProof::Assertion { assertion },
@@ -254,6 +277,14 @@ fn read_nonempty_seed(path: &std::path::Path) -> Result<String, Box<dyn std::err
         return Err("authenticator seed file is empty".into());
     }
     Ok(seed)
+}
+
+fn custody_effect_kind(kind: CeremonyKind) -> Result<serde_json::Value, serde_json::Error> {
+    Ok(match kind {
+        CeremonyKind::AccountAllocate => serde_json::json!("account_allocate"),
+        CeremonyKind::AccountRetire => serde_json::json!("account_retire"),
+        _ => serde_json::to_value(kind)?,
+    })
 }
 
 fn assert_machine_secret_confinement_command(
@@ -348,7 +379,7 @@ fn request(
 
 #[cfg(test)]
 mod tests {
-    use super::read_protected_seed_file;
+    use super::{CeremonyKind, custody_effect_kind, read_protected_seed_file};
     use std::{fs, path::PathBuf};
 
     fn temp_path(name: &str) -> PathBuf {
@@ -382,5 +413,17 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(read_protected_seed_file(&path).unwrap(), "secret");
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn account_custody_effects_match_the_signer_contract() {
+        assert_eq!(
+            custody_effect_kind(CeremonyKind::AccountAllocate).unwrap(),
+            serde_json::json!("account_allocate")
+        );
+        assert_eq!(
+            custody_effect_kind(CeremonyKind::AccountRetire).unwrap(),
+            serde_json::json!("account_retire")
+        );
     }
 }

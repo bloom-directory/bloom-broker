@@ -913,11 +913,13 @@ fn verified_status_parent(
         .parent()
         .ok_or("Broker startup diagnostic has no parent directory")?;
     let metadata = fs::symlink_metadata(parent)?;
+    // Directory hard links are forbidden by POSIX, so `is_dir` already rules
+    // out substitutes; a link-count floor is not portable (btrfs reports
+    // nlink=1 for empty directories) and adds no guarantee beyond `is_dir`.
     if !metadata.file_type().is_dir()
         || metadata.file_type().is_symlink()
         || metadata.uid() != broker_uid
         || metadata.mode() & 0o7777 != 0o750
-        || metadata.nlink() < 2
     {
         return Err("Broker startup status directory has unsafe metadata".into());
     }

@@ -8,7 +8,8 @@ use bloom_broker_api::{
     MachineBrokerService, MachineSignRequest, OperationId, OperationPublicStatus, OperationState,
     PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, RPC_ENVELOPE_SCHEMA_V1, Readiness,
     ReadinessState, SealedApprovalPrepareResponse, ServiceCapabilities, ServiceFuture,
-    SigningPayloads, Token, VerifierPublicCapability, WalletPublic, WalletRequest,
+    SigningPayloads, Token, VerifierPublicCapability, WalletAccountsPublic, WalletPublic,
+    WalletRequest, WalletSeedProfile,
 };
 use bloom_platform_containment::NetworkContainmentGuard;
 use bloom_signer_api::{
@@ -36,6 +37,7 @@ use crate::{
         approval as translate_approval, custody as translate_custody, error as translate_error,
         key as translate_key, policy as translate_policy, revocation as translate_revocation,
         service as translate_service, signing as translate_signing,
+        wallet_account as translate_wallet_account,
     },
 };
 
@@ -55,6 +57,55 @@ pub struct BrokerRpcService {
     build_digest: Digest32,
     service_version: String,
     network_containment: Option<NetworkContainmentGuard>,
+}
+
+/// The wallet's seed profile, read from the key projection the Signer
+/// published rather than inferred from which fields happen to be populated.
+///
+/// A wallet with no live derived accounts is still describable: what it is
+/// shows in the derivation carried by its keys. Only genuinely
+/// unrepresentable shapes fail, and they fail by name instead of being
+/// rounded to whichever profile looks closest.
+fn seed_profile_from_key_projection(
+    public: &bloom_broker_api::WalletPublic,
+) -> Result<WalletSeedProfile, ProtocolError> {
+    let mut saw_bip32_child = false;
+    for key_ref in &public.key_refs {
+        match key_ref.derivation.as_ref() {
+            // A BIP-39 child proves the seed profile outright.
+            Some(bloom_broker_api::DerivationRef::Bip39Multicurve { .. }) => {
+                return Ok(WalletSeedProfile::Bip39MulticurveV1);
+            }
+            // A BIP-32 child means a legacy pre-BIP-39 wallet.
+            Some(bloom_broker_api::DerivationRef::Bip32Secp256k1 { .. }) => {
+                saw_bip32_child = true;
+            }
+            None => {}
+        }
+    }
+    if saw_bip32_child {
+        // Real custody, but not either Machine-facing profile. Naming it is
+        // the point: silently calling it an imported scalar would assert the
+        // wallet has no derivable seed, which is false and would mislead a
+        // migration decision.
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::BackendUnsupported,
+            "wallet uses legacy BIP-32 custody, which has no wallet.accounts projection; \
+             it must be migrated before derived accounts can be listed",
+        ));
+    }
+    match &public.root_key_ref {
+        // A root with no derived keys at all is a raw single-key import.
+        Some(_) => Ok(WalletSeedProfile::ImportedSecp256k1Scalar),
+        // No root and no derived keys: nothing to characterise. A BIP-39
+        // wallet whose children were all retired still projects its seed
+        // ref, so reaching here means the projection is incomplete.
+        None => Err(ProtocolError::new(
+            ProtocolErrorCode::BackendUnsupported,
+            "wallet projection carries neither a root key nor any derived key, \
+             so its seed profile cannot be established",
+        )),
+    }
 }
 
 impl BrokerRpcService {
@@ -313,11 +364,15 @@ impl BrokerRpcService {
             Request::WalletGetPublic(request) => Ok(Response::WalletGetPublic(
                 self.wallet_public(request.wallet_id).await?,
             )),
+            Request::WalletAccounts(request) => Ok(Response::WalletAccounts(
+                self.wallet_accounts(request.wallet_id).await?,
+            )),
             Request::WalletRegistrationPrepare(request) => {
                 require_custody_kind(
                     request.ceremony_kind,
                     bloom_broker_api::CeremonyKind::WalletRegistration,
                 )?;
+                let request = translate_custody::apply_seed_profile_selection(&request);
                 request.validate_wallet_creation_binding()?;
                 Ok(Response::WalletRegistrationPrepare(
                     self.ceremony.prepare_custody(
@@ -335,6 +390,7 @@ impl BrokerRpcService {
                     request.ceremony_kind,
                     bloom_broker_api::CeremonyKind::WalletImport,
                 )?;
+                let request = translate_custody::apply_seed_profile_selection(&request);
                 request.validate_wallet_creation_binding()?;
                 Ok(Response::WalletImportPrepare(
                     self.ceremony.prepare_custody(
@@ -392,6 +448,48 @@ impl BrokerRpcService {
                     translate_custody::prepare_to_signer(request),
                     self.clock.now_ms(true)?,
                 )?))
+            }
+            Request::AccountAllocatePrepare(request) => {
+                require_custody_kind(
+                    request.ceremony_kind,
+                    bloom_broker_api::CeremonyKind::AccountAllocate,
+                )?;
+                request.validate_account_allocation_binding()?;
+                self.verify_account_terms_baseline(&request).await?;
+                self.verify_wallet_supports_allocation(&request).await?;
+                self.authority
+                    .record_account_terms(
+                        request.account_terms.as_ref().expect("validated terms"),
+                        self.clock.now_ms(false)?,
+                    )
+                    .map_err(authority_error)?;
+                Ok(Response::AccountAllocatePrepare(
+                    self.ceremony.prepare_custody(
+                        translate_custody::prepare_to_signer(request),
+                        self.clock.now_ms(false)?,
+                    )?,
+                ))
+            }
+            Request::AccountRetirePrepare(request) => {
+                require_custody_kind(
+                    request.ceremony_kind,
+                    bloom_broker_api::CeremonyKind::AccountRetire,
+                )?;
+                request.validate_account_retire_binding()?;
+                self.verify_account_terms_baseline(&request).await?;
+                self.verify_retire_target_matches_terms(&request).await?;
+                self.authority
+                    .record_account_terms(
+                        request.account_terms.as_ref().expect("validated terms"),
+                        self.clock.now_ms(false)?,
+                    )
+                    .map_err(authority_error)?;
+                Ok(Response::AccountRetirePrepare(
+                    self.ceremony.prepare_custody(
+                        translate_custody::prepare_to_signer(request),
+                        self.clock.now_ms(false)?,
+                    )?,
+                ))
             }
             Request::CredentialAddPrepare(request) => {
                 require_custody_kind(
@@ -682,6 +780,8 @@ impl BrokerRpcService {
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_request: None,
                 },
                 update: signer_update,
                 broker_validation_receipt: validation,
@@ -813,6 +913,10 @@ impl BrokerRpcService {
             selector_kind: translate_signing::selector_to_signer(&terms.selector),
             ordered_payload_digests: decision.ordered_payload_digests,
             ordered_hashes: decision.ordered_hashes,
+            // Raw preimages are carried only by the message-signing suites,
+            // which arrive with the native Solana authorization path. Every
+            // suite reachable here is digest-signing, so this stays empty.
+            ordered_messages: Vec::new(),
             signature_count: DecimalU64::new(signature_count as u64),
             petal_use_claim_digest: claim_digest,
             claim_assurance_digest: assurance_digest,
@@ -1337,28 +1441,57 @@ impl BrokerRpcService {
             _ => return Err(response_mismatch("key.list_public")),
         };
         let root_key_ref = unique_wallet_root(&keys)?;
-        let derived = match self
+        // A BIP-39 wallet has no signable root: its KeyListPublic already
+        // carries the derived accounts and there is no root to enumerate
+        // derived keys from. Legacy wallets keep the root enumeration.
+        if let Some(root_key_ref) = root_key_ref.clone() {
+            let derived = match self
+                .signer
+                .request_for_machine(BrokerSignerRequest::KeyListDerived(
+                    translate_service::key_request_to_signer(bloom_broker_api::KeyRequest {
+                        key_ref: root_key_ref,
+                    }),
+                ))
+                .await?
+            {
+                BrokerSignerResponse::KeyListDerived(keys) => keys,
+                _ => return Err(response_mismatch("key.list_derived")),
+            };
+            if derived
+                .iter()
+                .any(|key| key.role != bloom_signer_api::KeyRole::Derived)
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::KeyrefMismatch,
+                    "Signer returned a non-derived key from key.list_derived",
+                ));
+            }
+            keys.extend(derived);
+        }
+        let mut key_refs: Vec<bloom_broker_api::KeyRef> = keys
+            .into_iter()
+            .map(|key| translate_key::key_ref_to_machine(key.key_ref))
+            .collect();
+        // BIP-39 derived accounts come from Signer's lock-free registry read;
+        // they are not Signer root keys.
+        if let BrokerSignerResponse::DerivedAccountList(descriptors) = self
             .signer
-            .request_for_machine(BrokerSignerRequest::KeyListDerived(
-                translate_service::key_request_to_signer(bloom_broker_api::KeyRequest {
-                    key_ref: root_key_ref.clone(),
-                }),
+            .request_for_machine(BrokerSignerRequest::DerivedAccountList(
+                bloom_signer_api::WalletRequest {
+                    wallet_id: wallet_id.clone(),
+                },
             ))
             .await?
         {
-            BrokerSignerResponse::KeyListDerived(keys) => keys,
-            _ => return Err(response_mismatch("key.list_derived")),
-        };
-        if derived
-            .iter()
-            .any(|key| key.role != bloom_signer_api::KeyRole::Derived)
-        {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::KeyrefMismatch,
-                "Signer returned a non-derived key from key.list_derived",
-            ));
+            for descriptor in descriptors {
+                let key_ref = translate_key::key_ref_to_machine(descriptor.key_ref);
+                if !key_refs.contains(&key_ref) {
+                    key_refs.push(key_ref);
+                }
+            }
+        } else {
+            return Err(response_mismatch("wallet.derived_accounts"));
         }
-        keys.extend(derived);
         Ok(WalletPublic {
             wallet_revocation_epoch: DecimalU64::new(
                 self.authority
@@ -1368,13 +1501,201 @@ impl BrokerRpcService {
             wallet_id,
             wallet_kind: Token::new("managed")?,
             root_key_ref,
-            key_refs: keys
-                .into_iter()
-                .map(|key| translate_key::key_ref_to_machine(key.key_ref))
-                .collect(),
+            key_refs,
             policy_version: policy.version,
             policy_digest: policy.policy_digest,
         })
+    }
+
+    async fn wallet_accounts(
+        &self,
+        wallet_id: Token,
+    ) -> Result<WalletAccountsPublic, ProtocolError> {
+        // The authoritative lock-free read: Signer serves the persisted
+        // derivation registry without unlocking the backend. Broker owns no
+        // second copy of account inventory.
+        let descriptors = match self
+            .signer
+            .request_for_machine(BrokerSignerRequest::DerivedAccountList(
+                bloom_signer_api::WalletRequest {
+                    wallet_id: wallet_id.clone(),
+                },
+            ))
+            .await?
+        {
+            BrokerSignerResponse::DerivedAccountList(descriptors) => descriptors,
+            _ => return Err(response_mismatch("wallet.derived_accounts")),
+        };
+        if descriptors.is_empty() {
+            // No derived accounts, so the seed profile cannot come from a
+            // descriptor. It is still read from what the Signer projects
+            // rather than inferred from whether a root happens to exist:
+            // that inference reported a legacy BIP-32 wallet as
+            // `imported-secp256k1-scalar`, which is defined as having no
+            // derivable seed — a false statement about custody.
+            let public = self.wallet_public(wallet_id.clone()).await?;
+            let seed_profile = seed_profile_from_key_projection(&public)?;
+            return Ok(WalletAccountsPublic {
+                wallet_id,
+                seed_profile,
+                accounts: Vec::new(),
+            });
+        }
+        // Fail closed on an ambiguous root: every descriptor must name this
+        // wallet and agree on one seed profile before anything is projected.
+        let profile = descriptors[0].wallet_seed_ref.profile;
+        if descriptors
+            .iter()
+            .any(|descriptor| descriptor.wallet_seed_ref.wallet_id != wallet_id)
+            || descriptors
+                .iter()
+                .any(|descriptor| descriptor.wallet_seed_ref.profile != profile)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "wallet derived accounts disagree on their seed root",
+            ));
+        }
+        let targets = translate_wallet_account::production_chain_targets();
+        for descriptor in &descriptors {
+            if !targets
+                .iter()
+                .any(|target| target.accepted_profile == descriptor.derivation_profile)
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::BackendUnsupported,
+                    "wallet contains a derivation profile with no chain projection",
+                ));
+            }
+            let frozen = translate_wallet_account::derivation_profile_to_machine(
+                descriptor.derivation_profile,
+            )
+            .frozen_crypto_suites();
+            let recorded: Vec<bloom_broker_api::CryptoSuite> = descriptor
+                .supported_crypto_suites
+                .iter()
+                .map(|suite| translate_key::crypto_suite_to_machine(*suite))
+                .collect();
+            if recorded != frozen {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::KeyrefMismatch,
+                    "derived account suites do not match its profile's frozen set",
+                ));
+            }
+        }
+        translate_wallet_account::wallet_accounts_to_machine(
+            wallet_id,
+            profile,
+            &descriptors,
+            &targets,
+        )
+    }
+
+    /// The terms' policy/revocation baseline must match Broker's live
+    /// authority state at prepare time; a stale or tampered baseline fails
+    /// closed instead of allocating under terms nobody authorized.
+    async fn verify_account_terms_baseline(
+        &self,
+        request: &bloom_broker_api::CustodyPrepareRequest,
+    ) -> Result<(), ProtocolError> {
+        let terms = request.account_terms.as_ref().expect("validated terms");
+        let wallet_id = terms.wallet_id.clone();
+        let epoch = self
+            .authority
+            .wallet_epoch(&wallet_id)
+            .map_err(authority_error)?;
+        if terms.revocation_epoch.get() != epoch {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::OperationIdConflict,
+                "account terms revocation epoch does not match the wallet",
+            ));
+        }
+        let policy = self
+            .policy_read(&bloom_broker_api::WalletRequest {
+                wallet_id: wallet_id.clone(),
+            })
+            .await?;
+        if terms.policy_version.get() != policy.version.get() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::OperationIdConflict,
+                "account terms policy version does not match the wallet",
+            ));
+        }
+        let now_ms = self.clock.now_ms(false)?;
+        if terms.expires_at_ms.get() <= now_ms {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::LimitExceededFrame,
+                "account terms have expired",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Allocation is legal only against a wallet whose registered accounts
+    /// already agree on the BIP-39 multi-curve seed profile. A legacy
+    /// wallet, an unknown wallet, or a wallet mid-profile-change fails
+    /// closed.
+    async fn verify_wallet_supports_allocation(
+        &self,
+        request: &bloom_broker_api::CustodyPrepareRequest,
+    ) -> Result<(), ProtocolError> {
+        let terms = request.account_terms.as_ref().expect("validated terms");
+        let accounts = self
+            .wallet_accounts(terms.wallet_id.clone())
+            .await
+            .map_err(|error| {
+                ProtocolError::new(
+                    ProtocolErrorCode::KeyrefMismatch,
+                    format!("wallet cannot host account allocation: {}", error.message),
+                )
+            })?;
+        if accounts.seed_profile != terms.seed_profile {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "wallet seed profile does not match the account terms",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Retirement terms must name the child Signer currently holds: the
+    /// live descriptor's fingerprint, profile, wallet, and active lifecycle
+    /// all have to agree with the committed terms.
+    async fn verify_retire_target_matches_terms(
+        &self,
+        request: &bloom_broker_api::CustodyPrepareRequest,
+    ) -> Result<(), ProtocolError> {
+        let terms = request.account_terms.as_ref().expect("validated terms");
+        let key_ref = request.key_ref.clone().expect("validated key ref");
+        let accounts = self.wallet_accounts(terms.wallet_id.clone()).await?;
+        let Some(account) = accounts
+            .accounts
+            .iter()
+            .find(|account| account.key_ref == key_ref)
+        else {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "retired child is not an active derived account of this wallet",
+            ));
+        };
+        if account.public_key_fingerprint
+            != terms
+                .retire_key_fingerprint
+                .clone()
+                .expect("validated terms")
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "retired child fingerprint does not match the account terms",
+            ));
+        }
+        if account.lifecycle != bloom_broker_api::AccountLifecycleState::Active {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "retired child is not active",
+            ));
+        }
+        Ok(())
     }
 
     fn operation_status(
@@ -1490,26 +1811,18 @@ impl BrokerRpcService {
 
 fn unique_wallet_root(
     keys: &[bloom_signer_api::KeyPublic],
-) -> Result<bloom_broker_api::KeyRef, ProtocolError> {
+) -> Result<Option<bloom_broker_api::KeyRef>, ProtocolError> {
     let mut root_keys = keys
         .iter()
         .filter(|key| key.role == bloom_signer_api::KeyRole::WalletRoot);
-    let root_key_ref = root_keys
-        .next()
-        .map(|key| translate_key::key_ref_to_machine(key.key_ref.clone()))
-        .ok_or_else(|| {
-            ProtocolError::new(
-                ProtocolErrorCode::KeyrefMismatch,
-                "Signer returned no wallet root key",
-            )
-        })?;
+    let root_key_ref = root_keys.next().map(|key| key.key_ref.clone());
     if root_keys.next().is_some() {
         return Err(ProtocolError::new(
             ProtocolErrorCode::KeyrefMismatch,
             "Signer returned multiple wallet root keys",
         ));
     }
-    Ok(root_key_ref)
+    Ok(root_key_ref.map(translate_key::key_ref_to_machine))
 }
 
 fn machine_request_requires_containment(request: &MachineBrokerRequest) -> bool {
@@ -1530,6 +1843,8 @@ fn machine_request_requires_containment(request: &MachineBrokerRequest) -> bool 
             | Request::WalletDeletePrepare(_)
             | Request::KeyDerivePrepare(_)
             | Request::KeyEnrollPrepare(_)
+            | Request::AccountAllocatePrepare(_)
+            | Request::AccountRetirePrepare(_)
             | Request::CredentialAddPrepare(_)
             | Request::CredentialReplacePrepare(_)
             | Request::CredentialRemovePrepare(_)
@@ -1875,6 +2190,7 @@ mod tests {
             supported_crypto_suites: vec![
                 bloom_signer_api::CryptoSuite::Secp256k1Keccak256Recoverable,
             ],
+            derived_account: None,
         }
     }
 
@@ -1884,13 +2200,11 @@ mod tests {
         let derived = signer_key(bloom_signer_api::KeyRole::Derived, 2);
         assert_eq!(
             unique_wallet_root(&[derived.clone(), root.clone()]).unwrap(),
-            translate_key::key_ref_to_machine(root.key_ref.clone())
+            Some(translate_key::key_ref_to_machine(root.key_ref.clone()))
         );
 
-        assert_eq!(
-            unique_wallet_root(&[derived]).unwrap_err().code,
-            ProtocolErrorCode::KeyrefMismatch
-        );
+        // A wallet with only derived accounts (a bip39 wallet) has no root.
+        assert_eq!(unique_wallet_root(&[derived]).unwrap(), None);
         assert_eq!(
             unique_wallet_root(&[root, signer_key(bloom_signer_api::KeyRole::WalletRoot, 3),])
                 .unwrap_err()
@@ -2022,7 +2336,7 @@ mod tests {
         assert_ne!(previous_broker.build_digest, current_broker.build_digest);
         assert_eq!(
             bloom_signer_api::SIGNER_API_CURRENT,
-            bloom_broker_api::ProtocolVersion::new(1, 4)
+            bloom_broker_api::ProtocolVersion::new(1, 5)
         );
         validate_signer_readiness(&previous_broker, &previous_signer).unwrap();
         validate_signer_readiness(&current_broker, &current_signer).unwrap();
@@ -2244,5 +2558,95 @@ mod tests {
             .code,
             ProtocolErrorCode::UnauthenticatedPeer
         );
+    }
+
+    /// The seed profile is read from what the Signer projected, never guessed
+    /// from which fields happen to be populated. The guess this replaced
+    /// reported a legacy BIP-32 wallet as `imported-secp256k1-scalar`, which
+    /// is defined as having no derivable seed — a false custody claim, and
+    /// exactly the kind of statement a migration decision would rest on.
+    mod seed_profile_projection {
+        use super::*;
+
+        fn key_ref(
+            derivation: Option<bloom_broker_api::DerivationRef>,
+        ) -> bloom_broker_api::KeyRef {
+            bloom_broker_api::KeyRef {
+                backend: bloom_broker_api::Token::new("local").unwrap(),
+                backend_instance: bloom_broker_api::Token::new("primary").unwrap(),
+                locator: "wallet/primary/k".into(),
+                key_spec: bloom_broker_api::KeySpec::Secp256k1,
+                public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([7; 32]),
+                derivation,
+            }
+        }
+
+        fn public(
+            root: Option<bloom_broker_api::KeyRef>,
+            key_refs: Vec<bloom_broker_api::KeyRef>,
+        ) -> bloom_broker_api::WalletPublic {
+            bloom_broker_api::WalletPublic {
+                wallet_id: bloom_broker_api::Token::new("primary").unwrap(),
+                wallet_kind: bloom_broker_api::Token::new("managed").unwrap(),
+                root_key_ref: root,
+                key_refs,
+                policy_version: bloom_broker_api::DecimalU64::new(1),
+                policy_digest: bloom_broker_api::Digest32::from_bytes([1; 32]),
+                wallet_revocation_epoch: bloom_broker_api::DecimalU64::new(0),
+            }
+        }
+
+        #[test]
+        fn a_bip39_child_proves_the_profile() {
+            let child = key_ref(Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: bloom_broker_api::Token::new("seed").unwrap(),
+                profile: bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                path: "m/44'/60'/0'/0/0".into(),
+            }));
+            assert_eq!(
+                seed_profile_from_key_projection(&public(None, vec![child])).unwrap(),
+                WalletSeedProfile::Bip39MulticurveV1
+            );
+        }
+
+        #[test]
+        fn a_root_with_no_derived_keys_is_an_imported_scalar() {
+            let root = key_ref(None);
+            assert_eq!(
+                seed_profile_from_key_projection(&public(Some(root.clone()), vec![root])).unwrap(),
+                WalletSeedProfile::ImportedSecp256k1Scalar
+            );
+        }
+
+        /// The case the old inference got wrong. A legacy BIP-32 wallet has a
+        /// derivable root, so calling it an imported scalar asserts the
+        /// opposite of the truth. It is named instead.
+        #[test]
+        fn a_legacy_bip32_wallet_is_named_not_relabelled() {
+            let root = key_ref(None);
+            let child = key_ref(Some(bloom_broker_api::DerivationRef::Bip32Secp256k1 {
+                root_key_id: bloom_broker_api::Token::new("primary-root").unwrap(),
+                path: "m/44'/60'/0'/0/0".into(),
+            }));
+            let error =
+                seed_profile_from_key_projection(&public(Some(root), vec![child])).unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::BackendUnsupported);
+            assert!(
+                error.message.contains("legacy BIP-32"),
+                "the error must name the actual custody shape: {}",
+                error.message
+            );
+        }
+
+        #[test]
+        fn an_empty_projection_is_incomplete_not_bip39() {
+            let error = seed_profile_from_key_projection(&public(None, vec![])).unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::BackendUnsupported);
+            assert!(
+                error
+                    .message
+                    .contains("neither a root key nor any derived key")
+            );
+        }
     }
 }

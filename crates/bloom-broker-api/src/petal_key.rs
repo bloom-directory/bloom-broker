@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::HashSet;
 
+use crate::validation::{all_unique, validate_display_identity};
 use crate::{
     CryptoSuite, DecimalU64, Digest32, KeyRef, OperationId, ProtocolError, ProtocolErrorCode, Token,
 };
@@ -81,12 +81,10 @@ impl PetalKeyScope {
         validate_display_identity("Petal requesting route", &self.route, ROUTE_MAX_BYTES)?;
         validate_lineage_id(&self.lineage_id)?;
         validate_display_identity("Petal key slot", self.key_slot.as_str(), AGENT_ID_MAX_BYTES)?;
-        let unique_routes: HashSet<_> = self.allowed_routes.iter().collect();
-        let unique_classes: HashSet<_> = self.allowed_operation_classes.iter().collect();
         if self.allowed_routes.is_empty()
-            || unique_routes.len() != self.allowed_routes.len()
+            || !all_unique(&self.allowed_routes)
             || self.allowed_operation_classes.is_empty()
-            || unique_classes.len() != self.allowed_operation_classes.len()
+            || !all_unique(&self.allowed_operation_classes)
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
@@ -97,10 +95,9 @@ impl PetalKeyScope {
             validate_display_identity("Petal route", route, ROUTE_MAX_BYTES)?;
         }
 
-        let unique_suites: HashSet<_> = self.allowed_crypto_suites.iter().copied().collect();
         if self.allowed_crypto_suites.is_empty()
             || self.allowed_crypto_suites.len() > CryptoSuite::ALL.len()
-            || unique_suites.len() != self.allowed_crypto_suites.len()
+            || !all_unique(&self.allowed_crypto_suites)
             || self
                 .allowed_crypto_suites
                 .iter()
@@ -188,22 +185,6 @@ pub fn validate_lineage_id(value: &str) -> Result<(), ProtocolError> {
         return Err(ProtocolError::new(
             ProtocolErrorCode::MalformedFrame,
             "Petal lineage ID must contain 256-bit lowercase base32 entropy",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_display_identity(
-    field: &str,
-    value: &str,
-    maximum_bytes: usize,
-) -> Result<(), ProtocolError> {
-    if value.is_empty() || value.len() > maximum_bytes || value.chars().any(char::is_control) {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::MalformedFrame,
-            format!(
-                "{field} must contain 1-{maximum_bytes} UTF-8 bytes without control characters"
-            ),
         ));
     }
     Ok(())
