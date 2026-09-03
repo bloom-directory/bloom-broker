@@ -1413,7 +1413,7 @@ impl CeremonyBroker {
         if sessions.contains_key(&id) || operations.contains_key(&session.operation_id) {
             return Err(protocol(
                 ProtocolErrorCode::OperationIdConflict,
-                "Signer reused a ceremony or operation ID",
+                "ceremony ID or operation ID is already in use",
             ));
         }
         self.persist_session(&session)?;
