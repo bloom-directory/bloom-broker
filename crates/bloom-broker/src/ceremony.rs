@@ -20,7 +20,7 @@ use bloom_broker_api::{
     CeremonyPublicStatus as BrokerCeremonyPublicStatus, CeremonyState as BrokerCeremonyState,
     ClaimAssurance, CustodyPrepareResponse, CustodyPrepareState, PetalUseClaim,
     PolicyUpdatePrepareResponse, ProtocolError, ProtocolErrorCode, RateLimitDetails,
-    SealedApprovalPrepareResponse,
+    SealedApprovalPrepareResponse, SystemUseClaim,
 };
 use bloom_signer_api::{
     Base64UrlBytes, CeremonyChallenge, CeremonyCompleteRequest, CeremonyKind,
@@ -227,6 +227,7 @@ const BLOOM_PRIMARY_SVG: &str = include_str!("ceremony_assets/bloom-primary.svg"
 #[derive(Clone, Debug, Default)]
 pub struct ReviewManifestContext {
     pub petal_use_claim: Option<PetalUseClaim>,
+    pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance: Option<ClaimAssurance>,
     pub attributed_advisory_items: Vec<String>,
 }
@@ -242,6 +243,7 @@ pub(crate) struct ReviewManifest {
     pub exact_payload_digests: Vec<Digest32>,
     pub exact_hashes: Vec<Digest32>,
     pub petal_use_claim: Option<PetalUseClaim>,
+    pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance: Option<ClaimAssurance>,
     pub attributed_advisory_items: Vec<String>,
     pub issued_at_ms: DecimalU64,
@@ -262,6 +264,7 @@ impl ReviewManifest {
             exact_payload_digests: &'a [Digest32],
             exact_hashes: &'a [Digest32],
             petal_use_claim: &'a Option<PetalUseClaim>,
+            system_use_claim: &'a Option<SystemUseClaim>,
             claim_assurance: &'a Option<ClaimAssurance>,
             attributed_advisory_items: &'a [String],
             issued_at_ms: &'a DecimalU64,
@@ -277,6 +280,7 @@ impl ReviewManifest {
             exact_payload_digests: &self.exact_payload_digests,
             exact_hashes: &self.exact_hashes,
             petal_use_claim: &self.petal_use_claim,
+            system_use_claim: &self.system_use_claim,
             claim_assurance: &self.claim_assurance,
             attributed_advisory_items: &self.attributed_advisory_items,
             issued_at_ms: &self.issued_at_ms,
@@ -667,7 +671,7 @@ impl CeremonyBroker {
             })
             .collect::<Vec<_>>();
         for (ceremony_id, completed_at_ms) in sessions {
-            self.finalize_committed_session(&ceremony_id, completed_at_ms)?;
+            self.sweep_committed_session(&ceremony_id, completed_at_ms)?;
         }
         Ok(())
     }
@@ -1125,7 +1129,7 @@ impl CeremonyBroker {
             .collect::<Vec<_>>();
         for (ceremony_id, operation_id, state, wallet_id) in live {
             if state == CeremonyState::WalletCommitted {
-                self.finalize_committed_session(&ceremony_id, now_ms)?;
+                self.sweep_committed_session(&ceremony_id, now_ms)?;
                 continue;
             }
             if state == CeremonyState::AwaitingUser {
@@ -1204,7 +1208,7 @@ impl CeremonyBroker {
                 .get(&ceremony_id)
                 .is_some_and(|session| session.state == CeremonyState::WalletCommitted)
             {
-                self.finalize_committed_session(&ceremony_id, now_ms)?;
+                self.sweep_committed_session(&ceremony_id, now_ms)?;
                 continue;
             }
             if self
@@ -1283,10 +1287,78 @@ impl CeremonyBroker {
                 .lock()
                 .insert(ceremony_id.clone(), snapshot);
             if state == CeremonyState::WalletCommitted {
-                self.finalize_committed_session(&ceremony_id, now_ms)?;
+                self.sweep_committed_session(&ceremony_id, now_ms)?;
             }
         }
         Ok(())
+    }
+
+    /// Acquire the canonical ceremony listener for this platform.
+    ///
+    /// macOS binds it directly. Linux always consumes the listener its launch
+    /// manager inherited, including under `triad-dev-harness`: that feature
+    /// selects which identity and manifest are loaded, not how a Linux service
+    /// acquires its socket. This lives in the library rather than the binary
+    /// so the inherited-listener path is directly testable.
+    #[cfg(target_os = "macos")]
+    pub fn acquire_canonical_listener(
+        _activation_name: &str,
+    ) -> Result<StdTcpListener, ProtocolError> {
+        Self::bind_canonical()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn acquire_canonical_listener(
+        activation_name: &str,
+    ) -> Result<StdTcpListener, ProtocolError> {
+        let listener =
+            bloom_service_activation::take_tcp_listener(activation_name).map_err(|error| {
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!(
+                        "no inherited ceremony listener named {activation_name:?}; this service \
+                         is socket-activated and will not bind a listener itself: {error}"
+                    ),
+                )
+            })?;
+        Self::require_canonical_listener(listener)
+    }
+
+    /// Verify that an already-acquired listener is the canonical ceremony
+    /// socket.
+    ///
+    /// An inherited listener is supplied by the launch manager rather than
+    /// chosen by this process, so its address is an input to be checked, not
+    /// an invariant to be assumed. A descriptor bound to any other address is
+    /// refused outright: the ceremony origin, the `Host` header check, and the
+    /// browser's same-origin expectations are all pinned to
+    /// [`CEREMONY_ADDR`], so serving on a different address would silently
+    /// break them rather than fail closed.
+    pub fn require_canonical_listener(
+        listener: StdTcpListener,
+    ) -> Result<StdTcpListener, ProtocolError> {
+        let observed = listener.local_addr().map_err(|error| {
+            protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                format!("inherited ceremony listener has no readable address: {error}"),
+            )
+        })?;
+        if observed != CEREMONY_ADDR {
+            return Err(protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                format!(
+                    "inherited ceremony listener is bound to {observed}, not the canonical \
+                     {CEREMONY_ADDR}; no other address will be served"
+                ),
+            ));
+        }
+        listener.set_nonblocking(true).map_err(|error| {
+            protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                format!("canonical ceremony listener setup failed: {error}"),
+            )
+        })?;
+        Ok(listener)
     }
 
     /// Exclusively acquire the canonical socket. There is deliberately no
@@ -1766,8 +1838,10 @@ impl CeremonyBroker {
             request,
             manifest.claim_assurance.as_ref(),
             manifest.petal_use_claim.as_ref(),
+            manifest.system_use_claim.as_ref(),
         );
-        let canonical_plan = canonical_review_plan(request, &disclosures)?;
+        let canonical_plan =
+            canonical_review_plan(request, &disclosures, manifest.petal_use_claim.as_ref())?;
         if manifest.approval_id != approval_id
             || manifest.approval_digest != approval_digest
             || manifest.exact_payload_digests != request.exact_ordered_payload_digests
@@ -1804,8 +1878,10 @@ impl CeremonyBroker {
             request,
             context.claim_assurance.as_ref(),
             context.petal_use_claim.as_ref(),
+            context.system_use_claim.as_ref(),
         );
-        let canonical_plan = canonical_review_plan(request, &disclosures)?;
+        let canonical_plan =
+            canonical_review_plan(request, &disclosures, context.petal_use_claim.as_ref())?;
         let mut manifest = ReviewManifest {
             schema: Token::new("bloom.review-manifest.v1")?,
             approval_id: request
@@ -1823,6 +1899,7 @@ impl CeremonyBroker {
             exact_payload_digests: request.exact_ordered_payload_digests.clone(),
             exact_hashes: request.exact_ordered_hashes.clone(),
             petal_use_claim: context.petal_use_claim,
+            system_use_claim: context.system_use_claim,
             claim_assurance: context.claim_assurance,
             attributed_advisory_items: context.attributed_advisory_items,
             issued_at_ms: DecimalU64::new(now_ms),
@@ -1928,6 +2005,17 @@ impl CeremonyBroker {
         }
     }
 
+    /// Sweep-side adoption: a permanently rejected session has already been
+    /// terminalized by `finalize_committed_session`, so the sweep continues;
+    /// transient failures still surface so the caller retries later.
+    fn sweep_committed_session(&self, ceremony_id: &str, now_ms: u64) -> Result<(), ProtocolError> {
+        match self.finalize_committed_session(ceremony_id, now_ms) {
+            Ok(_) => Ok(()),
+            Err(error) if error.retry == bloom_broker_api::RetryClass::Never => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     fn finalize_committed_session(
         &self,
         ceremony_id: &str,
@@ -1952,9 +2040,30 @@ impl CeremonyBroker {
         })?;
 
         // Adoption is deliberately after the signed receipt is durable. Every
-        // observer operation is idempotent, so a failure leaves WALLET_COMMITTED
-        // retryable across the same request and process restart.
-        self.notify_completion(committed.ceremony_kind, &receipt, now_ms)?;
+        // observer operation is idempotent, so a transient failure leaves
+        // WALLET_COMMITTED retryable across the same request and process
+        // restart. A permanent rejection (`retry: never`, e.g. an activation
+        // receipt whose validity interval already closed) can never succeed
+        // on retry; leaving it WALLET_COMMITTED would re-fire on every sweep
+        // and every restart, so it is terminalized as FAILED instead.
+        if let Err(error) = self.notify_completion(committed.ceremony_kind, &receipt, now_ms) {
+            if error.retry == bloom_broker_api::RetryClass::Never {
+                eprintln!(
+                    "Broker ceremony {ceremony_id} adoption permanently rejected; marking FAILED: {error}"
+                );
+                let mut failed = committed;
+                failed.state = CeremonyState::Failed;
+                failed.terminal_at_ms = Some(now_ms);
+                failed.token = None;
+                failed.token_hash = [0_u8; 32];
+                self.persist_session(&failed)?;
+                self.inner
+                    .sessions
+                    .lock()
+                    .insert(ceremony_id.to_owned(), failed);
+            }
+            return Err(error);
+        }
 
         let has_sensitive_output = receipt
             .get("encrypted_browser_result")
@@ -2291,6 +2400,15 @@ async fn complete_session(
             // known to be released. If cancellation failed the session stays
             // `Verifying` so the expiry sweep retries the cancel; terminalising
             // here would strand the Signer operation permanently.
+            //
+            // Terminalising regardless would also be safe against the older
+            // Signer, which reported `ApprovalNotFound` for a ceremony it had
+            // already failed closed and so made a benign outcome look like a
+            // failed cancel. That is fixed: cancel is now idempotent for a
+            // ceremony in a durable non-successful terminal, so a cancel that
+            // still fails here is a real unreleased operation and must not be
+            // abandoned. Retry is not blocked in the meantime — the sweep
+            // releases the wallet's quota once the cancel succeeds.
             if released {
                 let snapshot = {
                     let sessions = broker.inner.sessions.lock();
@@ -2674,18 +2792,112 @@ fn digest(value: &impl Serialize) -> Result<Digest32, ProtocolError> {
 fn canonical_review_plan(
     request: &CeremonyPrepareRequest,
     security_disclosures: &[String],
+    claim: Option<&PetalUseClaim>,
 ) -> Result<String, ProtocolError> {
+    #[derive(Serialize)]
+    struct AssetAmountReview {
+        kind: &'static str,
+        chain: String,
+        asset: String,
+        display: String,
+        base_units: String,
+        decimals: Option<u8>,
+    }
+
     #[derive(Serialize)]
     struct Plan<'a> {
         schema: &'static str,
+        asset_amounts: Vec<AssetAmountReview>,
         terms: &'a bloom_signer_api::SealedApprovalTerms,
         exact_ordered_payload_digests: &'a [Digest32],
         exact_ordered_hashes: &'a [Digest32],
         replacement_approval_id: &'a Option<Digest32>,
         security_disclosures: &'a [String],
     }
+    let mut asset_amounts = Vec::new();
+    if let Some(claim) = claim {
+        asset_amounts.extend(claim.declared_debits.iter().map(|debit| {
+            review_asset_amount(
+                "declared_debit",
+                debit.asset.chain.as_str(),
+                &debit.asset.asset,
+                debit.amount.as_str(),
+            )
+        }));
+        if let bloom_broker_api::DeclaredFee::Fee {
+            chain,
+            asset,
+            amount,
+        } = &claim.declared_fee
+        {
+            asset_amounts.push(review_asset_amount(
+                "declared_fee",
+                chain.as_str(),
+                asset,
+                amount.as_str(),
+            ));
+        }
+    }
+
+    fn review_asset_amount(
+        kind: &'static str,
+        chain: &str,
+        asset: &str,
+        base_units: &str,
+    ) -> AssetAmountReview {
+        let metadata = match (chain, asset) {
+            ("hyperliquid", "usdc") => Some((6, "USDC")),
+            ("solana", "native") | ("solana-mainnet", "native") => Some((9, "SOL")),
+            ("ethereum", "native") | ("base", "native") | ("arbitrum", "native") => {
+                Some((18, "ETH"))
+            }
+            ("polygon", "native") => Some((18, "POL")),
+            _ => None,
+        };
+        let (display, decimals) = metadata.map_or_else(
+            || {
+                (
+                    format!(
+                        "{base_units} raw units of {asset} on {chain} (token decimals unknown)"
+                    ),
+                    None,
+                )
+            },
+            |(decimals, symbol)| {
+                (
+                    format!("{} {symbol}", format_base_units(base_units, decimals)),
+                    Some(decimals),
+                )
+            },
+        );
+        AssetAmountReview {
+            kind,
+            chain: chain.to_owned(),
+            asset: asset.to_owned(),
+            display,
+            base_units: base_units.to_owned(),
+            decimals,
+        }
+    }
+
+    fn format_base_units(base_units: &str, decimals: u8) -> String {
+        if decimals == 0 {
+            return base_units.to_owned();
+        }
+        let decimals = usize::from(decimals);
+        let padded = format!("{:0>width$}", base_units, width = decimals + 1);
+        let split = padded.len() - decimals;
+        let fractional = padded[split..].trim_end_matches('0');
+        if fractional.is_empty() {
+            padded[..split].to_owned()
+        } else {
+            format!("{}.{}", &padded[..split], fractional)
+        }
+    }
+
     serde_jcs::to_string(&Plan {
         schema: "bloom-review-plan/v1",
+        asset_amounts,
         terms: &request.terms,
         exact_ordered_payload_digests: &request.exact_ordered_payload_digests,
         exact_ordered_hashes: &request.exact_ordered_hashes,
@@ -2699,6 +2911,7 @@ fn review_disclosures(
     request: &CeremonyPrepareRequest,
     assurance: Option<&ClaimAssurance>,
     claim: Option<&PetalUseClaim>,
+    system_claim: Option<&SystemUseClaim>,
 ) -> Vec<String> {
     let mut disclosures = Vec::new();
     if !request.exact_ordered_payload_digests.is_empty() || !request.exact_ordered_hashes.is_empty()
@@ -2711,15 +2924,21 @@ fn review_disclosures(
     let machine_asserted = matches!(assurance, Some(ClaimAssurance::MachineAsserted))
         || claim
             .is_some_and(|claim| matches!(claim.claim_assurance, ClaimAssurance::MachineAsserted))
+        || system_claim
+            .is_some_and(|claim| matches!(claim.claim_assurance, ClaimAssurance::MachineAsserted))
         || matches!(
             request.terms.selector,
             bloom_signer_api::ApprovalSelector::Petal { .. }
         ) && assurance.is_none();
     if machine_asserted {
-        disclosures.push(
-            "The displayed limits are asserted by the named Petal. Bloom does not verify them against the payload, and a compromised Petal or Machine can consume the full remaining capacity."
-                .to_owned(),
-        );
+        let source = if system_claim.is_some() {
+            "the named system component"
+        } else {
+            "the named Petal"
+        };
+        disclosures.push(format!(
+            "The displayed limits are asserted by {source}. Bloom does not verify them against the payload, and a compromised Petal or Machine can consume the full remaining capacity."
+        ));
     }
     disclosures
 }

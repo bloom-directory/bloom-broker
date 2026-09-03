@@ -13,6 +13,7 @@ mod provenance;
 mod revocation;
 mod service;
 mod signing;
+pub mod solana_vectors;
 mod validation;
 mod wallet_account;
 
@@ -50,8 +51,8 @@ pub const RATE_LIMIT_DETAILS_MINOR: u16 = 4;
 /// The negotiated range moves as a unit, so there is no accepted minor that
 /// predates any field the Broker may emit. Older peers are refused at the
 /// hello before a response can carry a field their strict decoder rejects.
-pub const BROKER_API_MINOR_MIN: u16 = 5;
-pub const BROKER_API_MINOR_MAX: u16 = 5;
+pub const BROKER_API_MINOR_MIN: u16 = 6;
+pub const BROKER_API_MINOR_MAX: u16 = 6;
 pub const BROKER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(BROKER_API_MAJOR, BROKER_API_MINOR_MAX);
 pub const BROKER_API_RANGE: ProtocolVersionRange =

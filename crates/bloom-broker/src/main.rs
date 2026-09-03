@@ -17,12 +17,13 @@ use bloom_audit_checkpoint::{
     CheckpointError, CheckpointSink, CheckpointStore, PinnedAuditKey,
 };
 use bloom_broker::{
+    assurance_verifiers::SolanaSystemTransferVerifier,
     authority::{AssuranceRegistry, BrokerAuthority},
     ceremony::CeremonyBroker,
     clock::BrokerClock,
     journal::{AuditSigner, BrokerJournal},
     service::BrokerRpcService,
-    signer_client::BrokerSignerClient,
+    signer_client::{BrokerSignerClient, checkpoint_failure_requires_degradation},
 };
 use bloom_broker_api::{
     Base64UrlBytes, Digest32, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
@@ -501,7 +502,7 @@ async fn run_with_paths(
             verifying_key(&config.signer_ceremony_public_key_hex)?,
             Token::new(config.signer_revocation_key_id.clone())?,
             verifying_key(&config.signer_revocation_public_key_hex)?,
-            AssuranceRegistry::compiled(Vec::new())?,
+            compiled_assurance_registry()?,
         )?);
         #[cfg(feature = "triad-dev-harness")]
         let provenance_catalog = match std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT") {
@@ -912,6 +913,12 @@ fn verified_status_parent(
     let parent = path
         .parent()
         .ok_or("Broker startup diagnostic has no parent directory")?;
+    // Deliberately no link-count check. Requiring `nlink >= 2` treated the
+    // traditional `.`-plus-parent-entry count as evidence of a real directory,
+    // but btrfs reports `nlink == 1` for every directory, so this refused a
+    // perfectly safe status directory there while proving nothing extra
+    // elsewhere. `is_dir()` establishes the type and `symlink_metadata`
+    // establishes that the name resolves.
     let metadata = fs::symlink_metadata(parent)?;
     // Directory hard links are forbidden by POSIX, so `is_dir` already rules
     // out substitutes; a link-count floor is not portable (btrfs reports
@@ -938,16 +945,15 @@ fn acquire_unix_listener(
     Ok(bloom_service_activation::bind_owned_unix_listener(&path)?)
 }
 
-#[cfg(target_os = "macos")]
-fn acquire_ceremony_listener() -> Result<std::net::TcpListener, Box<dyn std::error::Error>> {
-    Ok(CeremonyBroker::bind_canonical()?)
-}
-
-#[cfg(not(target_os = "macos"))]
+/// Acquire the canonical ceremony listener.
+///
+/// The platform logic lives in `CeremonyBroker::acquire_canonical_listener`
+/// so that the Linux inherited-listener path is covered by a regression rather
+/// than only by running the service.
 fn acquire_ceremony_listener() -> Result<std::net::TcpListener, Box<dyn std::error::Error>> {
     let name = std::env::var("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME")
         .unwrap_or_else(|_| "broker-ceremony".to_string());
-    Ok(bloom_service_activation::take_tcp_listener(&name)?)
+    Ok(CeremonyBroker::acquire_canonical_listener(&name)?)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1140,6 +1146,10 @@ impl BrokerMachineJournals {
             }
             Err(failure) => {
                 let decision = &failure.decision;
+                if !checkpoint_failure_requires_degradation(decision.outcome) {
+                    log_checkpoint_decision(decision, method, operation_id, false);
+                    return Ok(());
+                }
                 self.journal.latch_checkpoint_degradation(
                     checkpoint_outcome(decision.outcome),
                     decision.attempted.sequence,
@@ -1657,11 +1667,30 @@ fn verifying_key(encoded: &str) -> Result<VerifyingKey, ProtocolError> {
     })
 }
 
+fn compiled_assurance_registry()
+-> Result<AssuranceRegistry, bloom_broker::authority::AuthorityError> {
+    AssuranceRegistry::compiled(vec![SolanaSystemTransferVerifier::compiled()])
+}
+
 #[cfg(test)]
 mod startup_failure_tests {
     use super::*;
     use bloom_broker_api::{ApprovalLifecycleState, BootEpoch, ReadinessState};
     use tracing_subscriber::prelude::*;
+
+    #[test]
+    fn production_registry_contains_the_digest_pinned_solana_verifier() {
+        let capabilities = compiled_assurance_registry().unwrap().capabilities();
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(
+            capabilities[0].verifier_id.as_str(),
+            bloom_broker_api::SOLANA_SYSTEM_TRANSFER_VERIFIER_ID
+        );
+        assert_eq!(
+            capabilities[0].artifact_digest.to_bytes(),
+            bloom_broker_api::SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES
+        );
+    }
 
     #[test]
     fn observability_init_fallback_is_fixed_and_sanitized() {
@@ -1874,7 +1903,7 @@ mod startup_failure_tests {
     }
 
     #[test]
-    fn unchanged_machine_head_remains_admissible_without_degradation() {
+    fn unchanged_and_older_machine_heads_remain_admissible_without_degradation() {
         let temporary = tempfile::tempdir().unwrap();
         let journal = Arc::new(
             open_operational_audit_journal(
@@ -1931,6 +1960,15 @@ mod startup_failure_tests {
         for _ in 0..1_000 {
             exchange.checkpoint_request_head(&readiness, &head).unwrap();
         }
+        let newer = bloom_triad_local_transport::sign_journal_head(
+            &machine,
+            9,
+            Digest32::from_bytes([9; 32]),
+        );
+        exchange
+            .checkpoint_request_head(&readiness, &newer)
+            .unwrap();
+        exchange.checkpoint_request_head(&readiness, &head).unwrap();
         assert!(!exchange.journal.audit_degraded());
     }
 

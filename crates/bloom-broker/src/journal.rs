@@ -144,6 +144,7 @@ pub struct OperationSnapshot {
 pub struct ApprovalRecord {
     pub terms_jcs: String,
     pub review_manifest_digest: String,
+    pub approved_claim_digest: Option<String>,
     pub provenance_jcs: Option<String>,
     pub renewal_of: Option<String>,
     pub activation_operation_id: Option<String>,
@@ -319,6 +320,7 @@ impl BrokerJournal {
                 approval_id TEXT PRIMARY KEY REFERENCES approvals(approval_id),
                 terms_jcs TEXT NOT NULL,
                 review_manifest_digest TEXT NOT NULL,
+                approved_claim_digest TEXT,
                 provenance_jcs TEXT,
                 renewal_of TEXT REFERENCES approvals(approval_id),
                 activation_operation_id TEXT UNIQUE,
@@ -389,6 +391,21 @@ impl BrokerJournal {
             );
             ",
         )?;
+        let has_approved_claim_digest = {
+            let mut statement = connection.prepare("PRAGMA table_info(approval_metadata)")?;
+            let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for column in columns {
+                found |= column? == "approved_claim_digest";
+            }
+            found
+        };
+        if !has_approved_claim_digest {
+            connection.execute(
+                "ALTER TABLE approval_metadata ADD COLUMN approved_claim_digest TEXT",
+                [],
+            )?;
+        }
         ensure_column(&connection, "reservations", "observed_utc_ms", "TEXT")?;
         ensure_column(
             &connection,
@@ -605,6 +622,7 @@ impl BrokerJournal {
         approval_id: &Digest32,
         terms_jcs: &str,
         review_manifest_digest: &Digest32,
+        approved_claim_digest: Option<&Digest32>,
         provenance_jcs: Option<&str>,
         renewal_of: Option<&Digest32>,
     ) -> Result<(), JournalError> {
@@ -616,12 +634,14 @@ impl BrokerJournal {
         )?;
         transaction.execute(
             "INSERT INTO approval_metadata(
-                approval_id, terms_jcs, review_manifest_digest, provenance_jcs, renewal_of
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                approval_id, terms_jcs, review_manifest_digest, approved_claim_digest,
+                provenance_jcs, renewal_of
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 approval_id.as_str(),
                 terms_jcs,
                 review_manifest_digest.as_str(),
+                approved_claim_digest.map(Digest32::as_str),
                 provenance_jcs,
                 renewal_of.map(Digest32::as_str)
             ],
@@ -649,7 +669,8 @@ impl BrokerJournal {
         let connection = self.lock()?;
         connection
             .query_row(
-                "SELECT terms_jcs, review_manifest_digest, provenance_jcs, renewal_of,
+                "SELECT terms_jcs, review_manifest_digest, approved_claim_digest,
+                        provenance_jcs, renewal_of,
                         activation_operation_id, ceremony_grant_jcs
                  FROM approval_metadata WHERE approval_id = ?1",
                 [approval_id.as_str()],
@@ -657,10 +678,11 @@ impl BrokerJournal {
                     Ok(ApprovalRecord {
                         terms_jcs: row.get(0)?,
                         review_manifest_digest: row.get(1)?,
-                        provenance_jcs: row.get(2)?,
-                        renewal_of: row.get(3)?,
-                        activation_operation_id: row.get(4)?,
-                        ceremony_grant_jcs: row.get(5)?,
+                        approved_claim_digest: row.get(2)?,
+                        provenance_jcs: row.get(3)?,
+                        renewal_of: row.get(4)?,
+                        activation_operation_id: row.get(5)?,
+                        ceremony_grant_jcs: row.get(6)?,
                     })
                 },
             )
@@ -671,7 +693,8 @@ impl BrokerJournal {
     pub fn approval_records(&self) -> Result<Vec<(Digest32, ApprovalRecord)>, JournalError> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT approval_id, terms_jcs, review_manifest_digest, provenance_jcs, renewal_of,
+            "SELECT approval_id, terms_jcs, review_manifest_digest, approved_claim_digest,
+                    provenance_jcs, renewal_of,
                     activation_operation_id, ceremony_grant_jcs
              FROM approval_metadata ORDER BY approval_id",
         )?;
@@ -681,10 +704,11 @@ impl BrokerJournal {
                 ApprovalRecord {
                     terms_jcs: row.get(1)?,
                     review_manifest_digest: row.get(2)?,
-                    provenance_jcs: row.get(3)?,
-                    renewal_of: row.get(4)?,
-                    activation_operation_id: row.get(5)?,
-                    ceremony_grant_jcs: row.get(6)?,
+                    approved_claim_digest: row.get(3)?,
+                    provenance_jcs: row.get(4)?,
+                    renewal_of: row.get(5)?,
+                    activation_operation_id: row.get(6)?,
+                    ceremony_grant_jcs: row.get(7)?,
                 },
             ))
         })?;

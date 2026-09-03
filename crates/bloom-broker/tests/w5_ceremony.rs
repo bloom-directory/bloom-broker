@@ -16,15 +16,16 @@ use bloom_broker::{
 };
 use bloom_broker_api::{
     ActivationMode, ApprovalLimits, ApprovalPrepareRequest, ApprovalSelector, ApprovalSubject,
-    Base64UrlBytes, BootEpoch, CanonicalWalletPolicy, CeremonyState, ClaimAssurance,
-    ClaimAssuranceLevel, CryptoSuite, CustodyPrepareResponse, DecimalU64, DeclaredFee, Digest32,
-    KeyRef, KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
-    MachineSignRequest, OperationId, OperationRequest, PROVENANCE_RECORD_SIGNATURE_DOMAIN,
-    PetalKeyScope, PetalLineageMembership, PetalUseClaim, PolicyCommitUpdateRequest,
-    PolicyDestination, PolicyUpdateRequest, ProtocolError, ProtocolErrorCode,
-    ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject, RateLimitDetails, RequestNonce,
-    RevokeRequest, SealedApprovalTerms, SignedJournalHead, SignedPolicySnapshot, SigningPayloads,
-    Token, WalletRequest,
+    AssetId, Base64UrlBytes, BootEpoch, CanonicalWalletPolicy, CeremonyState, ClaimAssurance,
+    ClaimAssuranceLevel, CryptoSuite, CustodyPrepareResponse, DecimalU64, DecimalU256,
+    DeclaredDebit, DeclaredDestination, DeclaredFee, Digest32, KeyRef, KeySpec,
+    MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
+    OperationId, OperationRequest, PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope,
+    PetalLineageMembership, PetalUseClaim, PolicyCommitUpdateRequest, PolicyDestination,
+    PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceOperationClass,
+    ProvenanceRecord, ProvenanceSubject, RateLimitDetails, RequestNonce, RevokeRequest,
+    SealedApprovalTerms, SignedJournalHead, SignedPolicySnapshot, SigningPayloads, Token,
+    WalletRequest,
 };
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer::{
@@ -236,6 +237,65 @@ cryptoSelfTest().then(
     assert_eq!(String::from_utf8_lossy(&output.stdout), "browser-crypto-ok");
 }
 
+/// Owners hold imported secp256k1 scalars as hex; Signer decodes base64url.
+/// The shipped page must normalize every realistic hex spelling itself —
+/// asking an owner to hand-convert a private key is both hostile and
+/// error-prone (the mismatch previously surfaced as an opaque
+/// `MALFORMED_FRAME: Invalid last symbol` from deep inside Signer).
+#[test]
+fn browser_page_accepts_hex_private_keys_and_converts_them_to_base64url() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+globalThis.crypto = require("node:crypto").webcrypto;
+globalThis.document = {{getElementById: () => ({{}})}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+{executable}
+const scalar = "01".repeat(32);
+const expected = Buffer.from(scalar, "hex").toString("base64url");
+const cases = [
+  ["0x" + scalar, expected],
+  [scalar, expected],
+  ["0x" + scalar.toUpperCase(), expected],
+  [expected, expected],
+];
+for (const [input, want] of cases) {{
+  const got = normalizePrivateKey(input);
+  if (got !== want) {{
+    console.error("normalizePrivateKey(" + JSON.stringify(input) + ") => " + got + ", wanted " + want);
+    process.exit(1);
+  }}
+}}
+for (const bad of ["", "0x1234", "zz".repeat(32), "0x" + "0".repeat(63)]) {{
+  try {{
+    normalizePrivateKey(bad);
+    console.error("normalizePrivateKey accepted invalid input " + JSON.stringify(bad));
+    process.exit(1);
+  }} catch (error) {{ /* rejected by name: expected */ }}
+}}
+process.stdout.write("hex-normalization-ok");
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "hex-normalization-ok"
+    );
+}
+
 #[test]
 fn browser_ceremony_state_survives_reload_and_reuses_one_output_key() {
     let asset = include_str!("../src/ceremony_assets/app.js");
@@ -367,6 +427,16 @@ process.stdout.write("browser-error-feedback-ok");
 }
 
 #[test]
+fn transfer_review_promises_later_verification_without_claiming_it_already_happened() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    assert!(asset.contains("Estimated network fee"));
+    assert!(asset.contains("Required before signing"));
+    assert!(asset.contains("Bloom will decode the transaction"));
+    assert!(!asset.contains("Bloom decoded the transaction and it matches this summary"));
+    assert!(!asset.contains("transfer.verified"));
+}
+
+#[test]
 fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
     let shell = include_str!("../src/ceremony_assets/index.html");
     for required in [
@@ -387,6 +457,10 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
             "ceremony shell omitted {required}"
         );
     }
+    assert!(
+        !shell.contains("<style>"),
+        "the ceremony shell must not contain CSP-blocked inline styles"
+    );
 
     let stylesheet = include_str!("../src/ceremony_assets/style.css");
     for required in [
@@ -435,13 +509,17 @@ fn legacy_passkey_browser_flow_uses_assertion_prf_and_hides_raw_key_input() {
     assert!(asset.contains("legacy_passkey_v1_prf"));
     assert!(asset.contains("const assertion = await getCredential(session, 0)"));
     assert!(asset.contains("credential_prf: encodeUrl(credentialPrf)"));
-    assert!(asset.contains("Boolean(scopedPetalKey) || legacyPasskeyImport"));
+    assert!(asset.contains(
+        "importFields.hidden = !(session.ceremony_kind === \"wallet_import\" && !legacyPasskeyImport)"
+    ));
     assert!(asset.contains("wallet_import\" && !legacyPasskeyImport"));
 }
 
 #[test]
 fn bip39_browser_import_uses_profile_to_control_serialization() {
     let asset = include_str!("../src/ceremony_assets/app.js");
+    let html = include_str!("../src/ceremony_assets/index.html");
+    let css = include_str!("../src/ceremony_assets/style.css");
     let load = asset
         .split_once("async function load() {")
         .expect("browser asset must define load")
@@ -461,21 +539,44 @@ fn bip39_browser_import_uses_profile_to_control_serialization() {
         assert!(scope.contains("const bip39Import = "));
         assert!(scope.contains("wallet_seed_profile === \"bip39-multicurve-v1\""));
     }
-    assert!(load.contains("genericInput.placeholder = bip39Import"));
+    assert!(load.contains("document.getElementById(\"mnemonic-label\").hidden = !bip39Import"));
+    assert!(load.contains("document.getElementById(\"raw-key-label\").hidden = bip39Import"));
 
     // The serialization branch follows the profile; it never infers the
     // profile from whichever property the operator supplied.
     assert!(run.contains("if (bip39Import)"));
-    assert!(run.contains("BIP-39 mnemonic input is required"));
-    assert!(run.contains("mnemonic: supplied.mnemonic"));
-    assert!(run.contains("BIP-39 passphrases are not supported"));
-    assert!(!run.contains("passphrase: \"\""));
+    assert!(run.contains("const mnemonic = mnemonicInput.value"));
+    assert!(run.contains("[12, 15, 18, 21, 24].includes(count)"));
+    assert!(run.contains("Enter a 12, 15, 18, 21, or 24 word recovery phrase"));
+    assert!(run.contains("credential_prf: encodeUrl(prf.prf),\n          mnemonic\n"));
+    assert!(!run.contains("passphrase:"));
+    assert!(!run.contains("passphraseInput"));
     assert!(!run.contains("supplied.passphrase"));
     assert!(!load.contains("passphrase"));
-    assert!(run.contains("Raw private key input is required"));
-    assert!(run.contains("raw_private_key: supplied.raw_private_key"));
+    assert!(run.contains("normalizePrivateKey(rawKeyInput.value.trim())"));
+    assert!(run.contains("raw_private_key: rawKey"));
     assert!(!run.contains("if (supplied.mnemonic)"));
     assert!(!run.contains("if (supplied.raw_private_key)"));
+
+    // v1 has no BIP-39 passphrase input. The ceremony must not ask the
+    // operator for an unsupported second secret, and fields for the other
+    // import profile must stay hidden despite label styling.
+    assert!(!html.contains("passphrase-input"));
+    assert!(!html.contains("passphrase-label"));
+    assert!(css.contains("[hidden]{display:none!important}"));
+}
+
+#[test]
+fn bip39_browser_export_uses_the_length_neutral_signer_format() {
+    let html = include_str!("../src/ceremony_assets/index.html");
+
+    // This value is encrypted into GenericCustodyEffect and parsed by Signer.
+    // Imported roots retain their original 12/15/18/21/24-word length, so the
+    // browser must use Signer's length-neutral token instead of the obsolete
+    // 24-word-only spelling.
+    assert!(html.contains("value=\"bip39_mnemonic\""));
+    assert!(!html.contains("bip39_mnemonic24"));
+    assert!(!html.contains("the 24 words that restore this wallet"));
 }
 
 fn digest(byte: &str) -> Digest32 {
@@ -576,6 +677,7 @@ fn petal_sign_request(
             payload: Base64UrlBytes::from_bytes(payload),
         },
         petal_use_claim: Some(claim),
+        system_use_claim: None,
         claim_assurance_evidence: None,
         provenance: ProvenanceSubject::Petal {
             package_hash,
@@ -614,6 +716,7 @@ fn exact_petal_sign_request(
             payload: Base64UrlBytes::from_bytes(payload),
         },
         petal_use_claim: None,
+        system_use_claim: None,
         claim_assurance_evidence: None,
         provenance: ProvenanceSubject::Petal {
             package_hash,
@@ -2255,6 +2358,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             operation_id: approval_operation.clone(),
             terms: approval_terms.clone(),
             canonical_plan_facts_digest: digest("d4"),
+            petal_use_claim: None,
+            system_use_claim: None,
         }),
     )
     .await
@@ -2384,6 +2489,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             operation_id: exact_approval_operation.clone(),
             terms: exact_terms.clone(),
             canonical_plan_facts_digest: digest("e7"),
+            petal_use_claim: None,
+            system_use_claim: None,
         }),
     )
     .await
@@ -2611,6 +2718,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                     operation_id: operation(&format!("{:02x}", 0xc0 + index)),
                     terms: denied_terms,
                     canonical_plan_facts_digest: digest("c9"),
+                    petal_use_claim: None,
+                    system_use_claim: None,
                 }),
             )
             .await
@@ -2959,6 +3068,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                 operation_id: operation("dc"),
                 terms: expired_terms,
                 canonical_plan_facts_digest: digest("dd"),
+                petal_use_claim: None,
+                system_use_claim: None,
             }),
         )
         .await
@@ -3350,6 +3461,76 @@ async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
         Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&manifest).unwrap()).into()),
         response.review_manifest_digest
     );
+}
+
+#[tokio::test]
+async fn review_plan_formats_known_asset_base_units_without_hiding_raw_authority_amount() {
+    let signer = Arc::new(MockSigner::new());
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        signer,
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[32; 32]),
+    );
+    let claim = PetalUseClaim {
+        package_hash: digest("91"),
+        route: "/mainnet/exchange/wallet/usd_send.json".into(),
+        operation_class: Token::new("hyperliquid.usd_send").unwrap(),
+        crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+        payload_digest: digest("92"),
+        ordered_hashes: vec![digest("93")],
+        declared_debits: vec![DeclaredDebit {
+            asset: AssetId {
+                chain: Token::new("hyperliquid").unwrap(),
+                asset: "usdc".into(),
+            },
+            amount: DecimalU256::parse("10000").unwrap(),
+        }],
+        declared_destinations: vec![DeclaredDestination {
+            chain: Token::new("hyperliquid").unwrap(),
+            destination: "0xe2b000d7650543f5df13183c089e02d6d8b2145c".into(),
+        }],
+        declared_fee: DeclaredFee::None,
+        nonce: RequestNonce::from_bytes([94; 16]),
+        claim_assurance: ClaimAssurance::MachineAsserted,
+    };
+    let response = broker
+        .prepare_approval(
+            approval_request(),
+            ReviewManifestContext {
+                petal_use_claim: Some(claim),
+                claim_assurance: Some(ClaimAssurance::MachineAsserted),
+                ..ReviewManifestContext::default()
+            },
+            now_ms,
+        )
+        .unwrap();
+    let session = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let projection: serde_json::Value =
+        serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let plan = projection["review_manifest"]["canonical_plan"]
+        .as_str()
+        .unwrap();
+    let plan: serde_json::Value = serde_json::from_str(plan).unwrap();
+    assert_eq!(plan["asset_amounts"][0]["display"], "0.01 USDC");
+    assert_eq!(plan["asset_amounts"][0]["base_units"], "10000");
+    assert_eq!(plan["asset_amounts"][0]["decimals"], 6);
 }
 
 #[tokio::test]
@@ -4911,9 +5092,17 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
     }
     .canonical_bytes()
     .unwrap();
+    let export_html = include_str!("../src/ceremony_assets/index.html");
+    let export_format = export_html
+        .split_once("name=\"export-format\" value=\"")
+        .expect("the shipped browser must offer an export format")
+        .1
+        .split_once('"')
+        .expect("the shipped export format must be quoted")
+        .0;
     let export_input = serde_jcs::to_vec(&serde_json::json!({
         "credential_prf": Base64UrlBytes::from_bytes(&prf),
-        "effect": {"kind": "wallet_export"}
+        "effect": {"kind": "wallet_export", "format": export_format}
     }))
     .unwrap();
     let export_envelope = seal_hpke(
@@ -4985,9 +5174,9 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
             &output_aad,
         )
         .unwrap();
-    let export_json: serde_json::Value =
-        serde_json::from_slice(plaintext.expose_to_backend()).unwrap();
-    assert_eq!(export_json["credentials"].as_array().unwrap().len(), 1);
+    let exported_mnemonic = std::str::from_utf8(plaintext.expose_to_backend()).unwrap();
+    assert_eq!(export_format, "bip39_mnemonic");
+    assert_eq!(exported_mnemonic.split_whitespace().count(), 24);
     let acknowledged = export_app
         .clone()
         .oneshot(

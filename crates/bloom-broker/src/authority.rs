@@ -8,7 +8,7 @@ use bloom_broker_api::{
     CustodyResult, DeclaredFee, Digest32, KeyRef, MachineSignRequest, OperationId,
     PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope, PetalUseClaim, PolicyUpdateRequest,
     ProtocolErrorCode, RevocationState, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
-    Token,
+    SystemUseClaim, Token,
 };
 pub use bloom_broker_api::{CanonicalWalletPolicy, PolicyDestination, RequiredVerifier};
 pub use bloom_broker_api::{
@@ -204,6 +204,10 @@ pub struct CeremonyApprovalGrant {
 #[derive(Clone, Debug)]
 pub struct AuthorizationInput {
     pub request: MachineSignRequest,
+    /// Canonical public key of the account named by the approval terms,
+    /// resolved from the Signer projection before authorization. Native
+    /// Solana claims bind their fee payer to it.
+    pub expected_signer_public_key: Option<[u8; 32]>,
     pub reserved_at_ms: u64,
     pub observed_utc_ms: Option<u64>,
     pub monotonic_anchor_ns: u64,
@@ -240,6 +244,21 @@ pub struct VerifierCapability {
 pub trait AssuranceVerifier: Send + Sync {
     fn capability(&self) -> VerifierCapability;
     fn verify(&self, claim: &PetalUseClaim, evidence: Option<&[u8]>) -> Result<(), String>;
+    /// Verify a native system claim.
+    ///
+    /// `expected_signer` is the canonical public key of the account the
+    /// approval pinned, resolved from `SealedApprovalTerms::key_ref`. A
+    /// verifier that binds a payer must require it: without it the Broker
+    /// approves, reserves quota, and journals a `ProofVerified` transfer
+    /// whose debited account was never established.
+    fn verify_system(
+        &self,
+        _claim: &SystemUseClaim,
+        _evidence: Option<&[u8]>,
+        _expected_signer: Option<&[u8; 32]>,
+    ) -> Result<(), String> {
+        Err("verifier does not accept native system claims".to_owned())
+    }
 }
 
 #[derive(Default)]
@@ -335,6 +354,61 @@ impl AssuranceRegistry {
                     .map_err(|message| denied("ASSURANCE_VERIFICATION_FAILED", message))?;
                 Ok(Some(verifier.capability()))
             }
+        }
+    }
+
+    fn verify_system(
+        &self,
+        claim: &SystemUseClaim,
+        evidence: Option<&[u8]>,
+        expected_signer: Option<&[u8; 32]>,
+    ) -> Result<Option<VerifierCapability>, AuthorityError> {
+        match &claim.claim_assurance {
+            ClaimAssurance::MachineAsserted => Ok(None),
+            ClaimAssurance::ProofVerified {
+                verifier_id,
+                verifier_digest,
+                proof_digest,
+            } => {
+                let evidence = evidence.ok_or_else(|| {
+                    denied(
+                        "ASSURANCE_EVIDENCE_REQUIRED",
+                        "proof-verified system claim requires exact evidence bytes",
+                    )
+                })?;
+                if proof_digest.to_bytes() != Sha256::digest(evidence).as_slice() {
+                    return Err(denied(
+                        "ASSURANCE_EVIDENCE_MISMATCH",
+                        "system claim proof digest does not match its evidence",
+                    ));
+                }
+                let verifier = self
+                    .verifiers
+                    .get(&(
+                        verifier_id.as_str().to_owned(),
+                        verifier_digest.as_str().to_owned(),
+                    ))
+                    .ok_or_else(|| {
+                        denied(
+                            "ASSURANCE_UNAVAILABLE",
+                            "system claim names no compiled digest-pinned verifier",
+                        )
+                    })?;
+                if verifier.capability().assurance != ClaimAssuranceLevel::ProofVerified {
+                    return Err(denied(
+                        "ASSURANCE_MISMATCH",
+                        "compiled verifier does not establish proof_verified assurance",
+                    ));
+                }
+                verifier
+                    .verify_system(claim, Some(evidence), expected_signer)
+                    .map_err(|message| denied("ASSURANCE_VERIFICATION_FAILED", message))?;
+                Ok(Some(verifier.capability()))
+            }
+            ClaimAssurance::InvariantAttested { .. } => Err(denied(
+                "ASSURANCE_MISMATCH",
+                "native system claims require a compiled proof verifier",
+            )),
         }
     }
 }
@@ -1399,6 +1473,15 @@ impl BrokerAuthority {
         terms: &SealedApprovalTerms,
         review_manifest_digest: &Digest32,
     ) -> Result<Digest32, AuthorityError> {
+        self.prepare_approval_with_claim(terms, review_manifest_digest, None)
+    }
+
+    pub fn prepare_approval_with_claim(
+        &self,
+        terms: &SealedApprovalTerms,
+        review_manifest_digest: &Digest32,
+        approved_claim_digest: Option<&Digest32>,
+    ) -> Result<Digest32, AuthorityError> {
         let _barrier = self.lock_authorization_barrier()?;
         terms
             .validate()
@@ -1412,6 +1495,8 @@ impl BrokerAuthority {
                 serde_json::from_str(&existing.terms_jcs).map_err(storage)?;
             if existing_terms == *terms
                 && existing.review_manifest_digest == review_manifest_digest.as_str()
+                && existing.approved_claim_digest.as_deref()
+                    == approved_claim_digest.map(Digest32::as_str)
             {
                 return Ok(approval_id);
             }
@@ -1540,6 +1625,7 @@ impl BrokerAuthority {
             &approval_id,
             &terms_jcs,
             review_manifest_digest,
+            approved_claim_digest,
             Some(&provenance_jcs),
             terms.renewal_of.as_ref(),
         )?;
@@ -2055,14 +2141,18 @@ impl BrokerAuthority {
                 "current provenance differs from the frozen approval record",
             ));
         }
-        let (values, assurance, fee_asset) = match (&terms.selector, &input.request.petal_use_claim)
-        {
+        let (values, assurance, fee_asset) = match (
+            &terms.selector,
+            &input.request.petal_use_claim,
+            &input.request.system_use_claim,
+        ) {
             (
                 ApprovalSelector::Exact {
                     ordered_payload_digests,
                     ordered_hashes: approved_hashes,
                 },
-                claim,
+                petal_claim,
+                system_claim,
             ) => {
                 if ordered_payload_digests != &payload_digests || approved_hashes != &ordered_hashes
                 {
@@ -2071,9 +2161,9 @@ impl BrokerAuthority {
                         "payload bytes, digest, hash, order, count, or algorithm changed",
                     ));
                 }
-                match claim {
-                    None => (BTreeMap::new(), None, None),
-                    Some(claim) => {
+                match (petal_claim, system_claim) {
+                    (None, None) => (BTreeMap::new(), None, None),
+                    (Some(claim), None) => {
                         let ApprovalSubject::Petal {
                             package_hash,
                             route,
@@ -2114,6 +2204,46 @@ impl BrokerAuthority {
                             declared_fee_asset(claim),
                         )
                     }
+                    (None, Some(claim)) => {
+                        let ApprovalSubject::System {
+                            component_id,
+                            operation_class,
+                        } = &terms.subject
+                        else {
+                            return Err(denied(
+                                "SELECTOR_MISMATCH",
+                                "only an exact System approval may carry a system claim",
+                            ));
+                        };
+                        let declared_classes: Vec<_> = current_provenance
+                            .operation_classes
+                            .iter()
+                            .map(|entry| entry.operation_class.clone())
+                            .collect();
+                        self.validate_system_claim(
+                            &terms,
+                            &policy,
+                            input,
+                            claim,
+                            component_id,
+                            operation_class,
+                            &declared_classes,
+                            &payloads,
+                            &ordered_hashes,
+                            &payload_digests,
+                        )?;
+                        (
+                            account_system_claim_values(&terms, claim, &current_provenance)?,
+                            Some(claim.claim_assurance.clone()),
+                            declared_system_fee_asset(claim),
+                        )
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(denied(
+                            "SELECTOR_MISMATCH",
+                            "one signing request cannot carry both Petal and system claims",
+                        ));
+                    }
                 }
             }
             (
@@ -2125,6 +2255,7 @@ impl BrokerAuthority {
                     required_claim_assurance,
                 },
                 Some(claim),
+                None,
             ) => {
                 let (approved_route, approved_classes) = if route_grants.is_empty() {
                     (route.as_str(), allowed_operation_classes.as_slice())
@@ -2170,13 +2301,40 @@ impl BrokerAuthority {
             .petal_use_claim
             .as_ref()
             .map(jcs_digest)
-            .transpose()?;
-        let assurance_digest = input
-            .request
-            .petal_use_claim
-            .as_ref()
-            .map(|claim| jcs_digest(&claim.claim_assurance))
-            .transpose()?;
+            .transpose()?
+            .or(input
+                .request
+                .system_use_claim
+                .as_ref()
+                .map(jcs_digest)
+                .transpose()?);
+        let assurance_digest = match (
+            input.request.petal_use_claim.as_ref(),
+            input.request.system_use_claim.as_ref(),
+        ) {
+            (Some(claim), None) => Some(jcs_digest(&claim.claim_assurance)?),
+            (None, Some(claim)) => Some(jcs_digest(&claim.claim_assurance)?),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err(denied(
+                    "SELECTOR_MISMATCH",
+                    "one signing request cannot carry both Petal and system claims",
+                ));
+            }
+        };
+        let approved_claim_digest = self
+            .journal
+            .approval_record(&input.request.approval_id)?
+            .ok_or_else(|| denied("APPROVAL_NOT_FOUND", "approval metadata is missing"))?
+            .approved_claim_digest;
+        if matches!(terms.selector, ApprovalSelector::Exact { .. })
+            && approved_claim_digest.as_deref() != claim_digest.as_ref().map(Digest32::as_str)
+        {
+            return Err(denied(
+                "SYSTEM_CLAIM_MISMATCH",
+                "signing claim differs from the claim committed by the reviewed approval manifest",
+            ));
+        }
         let operation_digest = MachineSignOperationIdentity {
             operation_id: input.request.operation_id.clone(),
             approval_id: input.request.approval_id.clone(),
@@ -2318,6 +2476,97 @@ impl BrokerAuthority {
             return Err(denied(
                 "DESTINATION_NOT_ALLOWED",
                 "claim names a destination outside wallet policy",
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_system_claim(
+        &self,
+        terms: &SealedApprovalTerms,
+        policy: &CanonicalWalletPolicy,
+        input: &AuthorizationInput,
+        claim: &SystemUseClaim,
+        component_id: &Token,
+        action_class: &Token,
+        allowed_operation_classes: &[Token],
+        payloads: &[Vec<u8>],
+        ordered_hashes: &[Digest32],
+        payload_digests: &[Digest32],
+    ) -> Result<(), AuthorityError> {
+        if payloads.len() != 1
+            || payload_digests.len() != 1
+            || &claim.component_id != component_id
+            || &claim.action_class != action_class
+            || !allowed_operation_classes.contains(&claim.operation_class)
+            || claim.crypto_suite != input.request.crypto_suite
+            || !terms.allowed_crypto_suites.contains(&claim.crypto_suite)
+            || claim.payload_digest != payload_digests[0]
+            || claim.ordered_hashes != ordered_hashes
+            || claim.chain_context.chain_family.as_str() != "solana"
+            || claim.chain_context.genesis_hash.is_empty()
+            || claim.chain_context.recent_blockhash.is_empty()
+        {
+            return Err(denied(
+                "SYSTEM_CLAIM_MISMATCH",
+                "system claim identity, class, payload, hashes, or chain context changed",
+            ));
+        }
+        if assurance_rank(claim.claim_assurance.level())
+            < assurance_rank(ClaimAssuranceLevel::ProofVerified)
+        {
+            return Err(denied(
+                "ASSURANCE_TOO_WEAK",
+                "native Solana system operations require proof-verified assurance",
+            ));
+        }
+        if !policy.required_verifiers.is_empty()
+            && !policy
+                .required_verifiers
+                .iter()
+                .any(|required| assurance_matches(&claim.claim_assurance, required))
+        {
+            return Err(denied(
+                "POLICY_ASSURANCE_REQUIRED",
+                "system claim does not use a verifier required by wallet policy",
+            ));
+        }
+        let evidence = input
+            .request
+            .claim_assurance_evidence
+            .as_ref()
+            .map(Base64UrlBytes::decode);
+        let capability = self
+            .assurance
+            .verify_system(
+                claim,
+                evidence.as_deref(),
+                input.expected_signer_public_key.as_ref(),
+            )?
+            .ok_or_else(|| {
+                denied(
+                    "ASSURANCE_CONTRACT_INCOMPLETE",
+                    "native Solana system operation was not proof verified",
+                )
+            })?;
+        if !establishes_system_authority_fields(&capability) {
+            return Err(denied(
+                "ASSURANCE_CONTRACT_INCOMPLETE",
+                "system verifier does not establish every semantic transfer field",
+            ));
+        }
+        let allowed_destinations: BTreeSet<_> =
+            policy.allowed_destinations.iter().cloned().collect();
+        if claim.declared_destinations.iter().any(|destination| {
+            !allowed_destinations.contains(&PolicyDestination {
+                chain: destination.chain.clone(),
+                destination: destination.destination.clone(),
+            })
+        }) {
+            return Err(denied(
+                "DESTINATION_NOT_ALLOWED",
+                "system claim names a destination outside wallet policy",
             ));
         }
         Ok(())
@@ -3213,25 +3462,70 @@ fn establishes_authority_fields(capability: &VerifierCapability) -> bool {
     })
 }
 
+fn establishes_system_authority_fields(capability: &VerifierCapability) -> bool {
+    const REQUIRED: [&str; 4] = [
+        "payload_digest",
+        "declared_debits",
+        "declared_destinations",
+        "recent_blockhash",
+    ];
+    REQUIRED.iter().all(|required| {
+        capability
+            .established_fields
+            .iter()
+            .any(|field| field.as_str() == *required)
+    })
+}
+
 fn account_claim_values(
     terms: &SealedApprovalTerms,
     claim: &PetalUseClaim,
     provenance: &ProvenanceRecord,
 ) -> Result<BTreeMap<String, bloom_broker_api::DecimalU256>, AuthorityError> {
+    account_declared_values(
+        terms,
+        &claim.operation_class,
+        &claim.declared_debits,
+        &claim.declared_fee,
+        provenance,
+    )
+}
+
+fn account_system_claim_values(
+    terms: &SealedApprovalTerms,
+    claim: &SystemUseClaim,
+    provenance: &ProvenanceRecord,
+) -> Result<BTreeMap<String, bloom_broker_api::DecimalU256>, AuthorityError> {
+    account_declared_values(
+        terms,
+        &claim.operation_class,
+        &claim.declared_debits,
+        &claim.declared_fee,
+        provenance,
+    )
+}
+
+fn account_declared_values(
+    terms: &SealedApprovalTerms,
+    operation_class: &Token,
+    declared_debits: &[bloom_broker_api::DeclaredDebit],
+    declared_fee: &DeclaredFee,
+    provenance: &ProvenanceRecord,
+) -> Result<BTreeMap<String, bloom_broker_api::DecimalU256>, AuthorityError> {
     let class = provenance
         .operation_classes
         .iter()
-        .find(|entry| entry.operation_class == claim.operation_class)
+        .find(|entry| &entry.operation_class == operation_class)
         .ok_or_else(|| denied("PROVENANCE_CLASS_MISMATCH", "claim class is not catalogued"))?;
     let mut values: BTreeMap<String, BigUint> = BTreeMap::new();
-    for debit in &claim.declared_debits {
+    for debit in declared_debits {
         add_value(
             &mut values,
             asset_id(debit.asset.chain.as_str(), &debit.asset.asset),
             debit.amount.as_str(),
         )?;
     }
-    match (&class.fee_asset, &claim.declared_fee) {
+    match (&class.fee_asset, declared_fee) {
         (None, DeclaredFee::None) => {}
         (
             Some(expected),
@@ -3289,6 +3583,13 @@ fn account_claim_values(
 }
 
 fn declared_fee_asset(claim: &PetalUseClaim) -> Option<String> {
+    match &claim.declared_fee {
+        DeclaredFee::Fee { chain, asset, .. } => Some(asset_id(chain.as_str(), asset)),
+        DeclaredFee::None => None,
+    }
+}
+
+fn declared_system_fee_asset(claim: &SystemUseClaim) -> Option<String> {
     match &claim.declared_fee {
         DeclaredFee::Fee { chain, asset, .. } => Some(asset_id(chain.as_str(), asset)),
         DeclaredFee::None => None,
