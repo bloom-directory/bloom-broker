@@ -1826,13 +1826,12 @@ impl CeremonyBroker {
             manifest.petal_use_claim.as_ref(),
             manifest.system_use_claim.as_ref(),
         );
-        let canonical_plan =
-            canonical_review_plan(
-                request,
-                &disclosures,
-                manifest.petal_use_claim.as_ref(),
-                manifest.system_use_claim.as_ref(),
-            )?;
+        let canonical_plan = canonical_review_plan(
+            request,
+            &disclosures,
+            manifest.petal_use_claim.as_ref(),
+            manifest.system_use_claim.as_ref(),
+        )?;
         if manifest.approval_id != approval_id
             || manifest.approval_digest != approval_digest
             || manifest.exact_payload_digests != request.exact_ordered_payload_digests
@@ -1871,13 +1870,12 @@ impl CeremonyBroker {
             context.petal_use_claim.as_ref(),
             context.system_use_claim.as_ref(),
         );
-        let canonical_plan =
-            canonical_review_plan(
-                request,
-                &disclosures,
-                context.petal_use_claim.as_ref(),
-                context.system_use_claim.as_ref(),
-            )?;
+        let canonical_plan = canonical_review_plan(
+            request,
+            &disclosures,
+            context.petal_use_claim.as_ref(),
+            context.system_use_claim.as_ref(),
+        )?;
         let mut manifest = ReviewManifest {
             schema: Token::new("bloom.review-manifest.v1")?,
             approval_id: request

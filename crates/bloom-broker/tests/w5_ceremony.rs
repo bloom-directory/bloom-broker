@@ -2185,9 +2185,27 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             .to_bytes(),
     )
     .unwrap();
+    // The scope is still carried verbatim, but it is no longer the whole
+    // manifest: a key derivation now also renders a title, a sentence naming
+    // the consequence, and a `canonical_plan` the page shows as prose, so the
+    // owner is not authorizing against a bare object.
     assert_eq!(
-        derive_session["review_manifest"],
+        derive_session["review_manifest"]["petal_key_scope"],
         serde_json::to_value(&scope).unwrap()
+    );
+    assert_eq!(
+        derive_session["review_manifest"]["ceremony_kind"],
+        "key_derive"
+    );
+    assert_eq!(
+        derive_session["review_manifest"]["title"],
+        "Derive a Petal-scoped key"
+    );
+    assert!(
+        derive_session["review_manifest"]["canonical_plan"]
+            .as_str()
+            .is_some_and(|plan| plan.contains("Petal scope")),
+        "the plan must name what the derived key is bound to"
     );
     let derive_challenge: CeremonyChallenge =
         serde_json::from_value(derive_session["challenges"][0]["binding"].clone()).unwrap();
@@ -3623,8 +3641,15 @@ async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() 
     let projection: serde_json::Value =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(
-        projection["review_manifest"],
+        projection["review_manifest"]["petal_key_scope"],
         serde_json::to_value(&scope).unwrap()
+    );
+    assert_eq!(projection["review_manifest"]["ceremony_kind"], "key_derive");
+    assert!(
+        projection["review_manifest"]["canonical_plan"]
+            .as_str()
+            .is_some_and(|plan| plan.contains("Petal scope")),
+        "the exact human review must describe the scope, not just carry it"
     );
     assert_eq!(
         projection["signer_contribution"]["petal_key_scope"],
