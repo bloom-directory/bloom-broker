@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use bloom_broker_api::{
-    ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector, Base64UrlBytes, BootEpoch,
+    ApprovalLifecycleState, ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector,
+    Base64UrlBytes, BootEpoch,
     DecimalU64, Digest32, MachineBrokerMethod, MachineBrokerRequest, MachineBrokerResponse,
     MachineBrokerService, MachineSignRequest, OperationId, OperationPublicStatus, OperationState,
     PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, RPC_ENVELOPE_SCHEMA_V1, Readiness,
@@ -743,6 +744,21 @@ impl BrokerRpcService {
         {
             status.ceremony_url = Some(url);
             status.ceremony_expires_at_ms = Some(expires_at_ms);
+            return;
+        }
+        // An approval whose ceremony died still reports `AwaitingCeremony`,
+        // but with no URL to await — a state the caller can neither act on
+        // nor escape, because cancelling also needs a ceremony. Report the
+        // terminal truth so it starts a fresh approval instead of polling a
+        // ceremony that no longer exists.
+        if matches!(
+            status.state,
+            ApprovalLifecycleState::Prepared | ApprovalLifecycleState::AwaitingCeremony
+        ) && self
+            .ceremony
+            .approval_ceremony_unreachable(&status.approval_id)
+        {
+            status.state = ApprovalLifecycleState::Expired;
         }
     }
 

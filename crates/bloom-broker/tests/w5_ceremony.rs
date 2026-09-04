@@ -3429,6 +3429,42 @@ async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
 }
 
 #[tokio::test]
+async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
+    let signer = Arc::new(MockSigner::new());
+    let now_ms: u64 = 1_700_000_000_000;
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        signer,
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[33; 32]),
+    );
+    let response = broker
+        .prepare_approval(approval_request(), ReviewManifestContext::default(), now_ms)
+        .unwrap();
+    let approval_id = response.approval_id.clone();
+
+    assert!(
+        broker.pending_approval_ceremony(&approval_id).is_some(),
+        "a live ceremony hands the owner a URL to complete"
+    );
+    assert!(
+        !broker.approval_ceremony_unreachable(&approval_id),
+        "an approval the owner can still complete is not unreachable"
+    );
+
+    broker.expire_sessions(now_ms + 10_001).unwrap();
+
+    assert!(
+        broker.pending_approval_ceremony(&approval_id).is_none(),
+        "an expired ceremony must not hand out a URL"
+    );
+    assert!(
+        broker.approval_ceremony_unreachable(&approval_id),
+        "once the ceremony expires the owner has no way to reach this approval, so the caller \
+         must be told to start a fresh lineage rather than poll AwaitingCeremony with no URL"
+    );
+}
+
+#[tokio::test]
 async fn review_plan_formats_known_asset_base_units_without_hiding_raw_authority_amount() {
     let signer = Arc::new(MockSigner::new());
     let now_ms: u64 = std::time::SystemTime::now()
