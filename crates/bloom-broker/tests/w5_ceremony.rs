@@ -3465,6 +3465,41 @@ async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
 }
 
 #[tokio::test]
+async fn cancelling_a_ceremony_that_already_died_succeeds_instead_of_stranding_the_caller() {
+    let signer = Arc::new(MockSigner::new());
+    let now_ms: u64 = 1_700_000_000_000;
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        signer,
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[34; 32]),
+    );
+    broker
+        .prepare_approval(approval_request(), ReviewManifestContext::default(), now_ms)
+        .unwrap();
+    let operation_id = operation("17");
+
+    broker.expire_sessions(now_ms + 10_001).unwrap();
+    assert_eq!(
+        broker.status(&operation_id),
+        Some(CeremonyState::Expired),
+        "the ceremony lapsed without ever reaching the wallet"
+    );
+
+    // Regression: this returned OPERATION_ID_CONFLICT. The operation could then
+    // be neither completed nor abandoned, and the only way out was editing
+    // durable state by hand.
+    broker
+        .cancel(&operation_id, now_ms + 10_002)
+        .expect("cancelling an already-dead ceremony is what the caller asked for");
+
+    assert_eq!(
+        broker.status(&operation_id),
+        Some(CeremonyState::Expired),
+        "cancel is a no-op here and must not relabel how the ceremony actually ended"
+    );
+}
+
+#[tokio::test]
 async fn review_plan_formats_known_asset_base_units_without_hiding_raw_authority_amount() {
     let signer = Arc::new(MockSigner::new());
     let now_ms: u64 = std::time::SystemTime::now()

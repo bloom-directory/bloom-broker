@@ -1077,10 +1077,24 @@ impl CeremonyBroker {
         let (wallet_id, snapshot) = {
             let sessions = self.inner.sessions.lock();
             let session = sessions.get(&ceremony_id).ok_or_else(not_found)?;
+            // A ceremony that died without ever committing is already what a
+            // caller asking to cancel wants it to be, so report success rather
+            // than an error it cannot act on. Refusing here strands the caller:
+            // the operation can no longer be completed *or* abandoned, and the
+            // only way out is editing durable state by hand.
+            if matches!(
+                session.state,
+                CeremonyState::Cancelled | CeremonyState::Expired | CeremonyState::Failed
+            ) {
+                return Ok(());
+            }
+            // Anything that reached the wallet is a different matter: it may
+            // have taken effect, and reporting it cancelled would misdescribe
+            // what happened.
             if session.state != CeremonyState::AwaitingUser {
                 return Err(protocol(
                     ProtocolErrorCode::OperationIdConflict,
-                    "terminal ceremony cannot be cancelled",
+                    "ceremony is past the point where it can be cancelled",
                 ));
             }
             let mut snapshot = session.clone();
