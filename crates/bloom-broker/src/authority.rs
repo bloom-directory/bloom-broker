@@ -1341,7 +1341,7 @@ impl BrokerAuthority {
         Ok(())
     }
 
-    pub(crate) fn scoped_key_record(
+    fn scoped_key_record(
         &self,
         key_ref: &KeyRef,
     ) -> Result<Option<(PetalKeyScope, u64)>, AuthorityError> {

@@ -31,7 +31,7 @@ pub(crate) fn key_to_machine(value: south::KeyPublic) -> north::KeyPublic {
             .into_iter()
             .map(key::crypto_suite_to_machine)
             .collect(),
-        petal_scope_expires_at_ms: None,
+        petal_scope_expires_at_ms: value.petal_scope_expires_at_ms,
     }
 }
 
@@ -123,12 +123,17 @@ mod tests {
             addresses: vec!["address-6".into()],
             supported_crypto_suites: vec![south::CryptoSuite::Secp256k1Sha256Recoverable],
             derived_account: None,
+            petal_scope_expires_at_ms: Some(north::DecimalU64::new(60_000)),
         });
         assert_eq!(key.key_ref.backend.as_str(), "backend-1");
         assert_eq!(key.key_ref.backend_instance.as_str(), "instance-2");
         assert_eq!(key.key_ref.locator, "locator-3");
         assert_eq!(key.key_ref.public_key_fingerprint, digest(4));
         assert_eq!(key.role, north::KeyRole::WalletRoot);
+        assert_eq!(
+            key.petal_scope_expires_at_ms,
+            Some(north::DecimalU64::new(60_000))
+        );
         assert_eq!(key.canonical_public_key.decode(), vec![5]);
         assert_eq!(key.addresses, ["address-6"]);
         assert_eq!(
