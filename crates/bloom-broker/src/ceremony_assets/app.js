@@ -246,6 +246,36 @@ function describePetalScope(scope) {
     button: app === "Pump.fun" ? "Create Pump.fun session key" : "Create temporary key"
   };
 }
+function describePetalApproval(manifest) {
+  let plan;
+  try { plan = JSON.parse(manifest?.canonical_plan || "{}"); } catch (_) { return null; }
+  const terms = plan?.terms;
+  const selector = terms?.selector;
+  if (selector?.kind !== "petal") return null;
+  const classes = Array.isArray(selector.allowed_operation_classes)
+    ? selector.allowed_operation_classes.map(String) : [];
+  const prefixes = [...new Set(classes.map(value => value.split(".")[0]).filter(Boolean))];
+  const app = prefixes.length === 1 && prefixes[0] === "pumpfun" ? "Pump.fun" : "this Petal";
+  const actions = [...new Set(classes.map(value => {
+    const action = value.includes(".") ? value.slice(value.indexOf(".") + 1) : value;
+    return PETAL_ACTIONS[action] || action.replace(/[_-]/g, " ");
+  }))];
+  const operations = Number(terms?.limits?.max_operations);
+  const operationLimit = Number.isSafeInteger(operations) && operations > 0
+    ? `Up to ${operations} signed actions` : "Limited by the session rules";
+  return {
+    sentence: `Finish setting up a temporary <strong>${app}</strong> session. It can sign only the actions listed below until the timer expires. No funds move in this step, and your main wallet key stays inside Bloom.`,
+    facts: [
+      ["App", app],
+      ["Can", naturalList(actions)],
+      ["Limit", operationLimit],
+      ["Main wallet key", "Stays inside Bloom"]
+    ],
+    title: app === "Pump.fun" ? "Finish Pump.fun session setup" : "Finish temporary session setup",
+    button: app === "Pump.fun" ? "Finish Pump.fun setup" : "Finish session setup",
+    warning: `${app} creates transactions within these permissions. If the app is compromised, it could use the remaining session capacity before the timer expires.`
+  };
+}
 // Policy updates: say what changes, in the order a person cares about.
 function describePolicy(manifest) {
   const diff = manifest?.authority_diff;
@@ -309,9 +339,20 @@ function renderReview(session) {
   const warns = [];
   let transfer = null;
   let petalScope = null;
+  let petalApproval = null;
   if (kind === "sealed_approval") {
     transfer = describeTransfer(session.review_manifest);
-    if (transfer) summaryHtml = transfer.sentence;
+    if (transfer) {
+      summaryHtml = transfer.sentence;
+    } else {
+      petalApproval = describePetalApproval(session.review_manifest);
+      if (petalApproval) {
+        transfer = petalApproval;
+        summaryHtml = petalApproval.sentence;
+        approve.textContent = petalApproval.button;
+        if (pageTitle) pageTitle.textContent = petalApproval.title;
+      }
+    }
   } else if (kind === "policy_update") {
     transfer = describePolicy(session.review_manifest);
     if (transfer) summaryHtml = transfer.sentence;
@@ -345,7 +386,8 @@ function renderReview(session) {
     // Proof verification occurs during authorization, after this review.
     // Never suppress the plan's present-tense disclosure merely because the
     // Machine requested proof verification for the later signing step.
-    for (const item of planDisclosures(session.review_manifest)) warns.push(item);
+    if (petalApproval) warns.push(petalApproval.warning);
+    else for (const item of planDisclosures(session.review_manifest)) warns.push(item);
   }
   const parts = [
     el("p", {class: "summary", html: summaryHtml}),

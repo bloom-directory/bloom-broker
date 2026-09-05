@@ -380,6 +380,94 @@ if (nodes.approve.textContent !== "Create Pump.fun session key") {{
     );
 }
 
+#[test]
+fn reusable_pumpfun_approval_is_plain_language_with_raw_grants_collapsed() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  setAttribute() {{}}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+const packageHash = "b868911206a002dd48c11fb59e8aaa8bd8b4716f70b671e10be18bd24bf7c738";
+const plan = {{
+  security_disclosures: ["The displayed limits are asserted by the named Petal."],
+  terms: {{
+    wallet_id: "main",
+    limits: {{max_operations: "256", max_signatures: "256"}},
+    selector: {{
+      kind: "petal",
+      package_hash: packageHash,
+      route: "r000007",
+      allowed_operation_classes: ["pumpfun.buy", "pumpfun.sell", "pumpfun.sweep"],
+      required_claim_assurance: "machine_asserted",
+      route_grants: [{{route: "r000010", allowed_operation_classes: ["pumpfun.buy"]}}]
+    }}
+  }}
+}};
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 300000,
+  signer_contribution: {{wallet_id: "main"}},
+  review_manifest: {{
+    wallet_id: "main",
+    canonical_plan: JSON.stringify(plan),
+    approval_id: "internal-approval-id"
+  }}
+}});
+const primary = allText({{textContent: "", innerHTML: "", children:
+  nodes.review.children.filter(child => child?.name !== "details")}});
+const technical = allText(nodes.review.children.find(child => child?.name === "details"));
+for (const phrase of ["Finish setting up", "Pump.fun", "buy tokens", "sell tokens",
+                      "return unused SOL", "Up to 256 signed actions",
+                      "main wallet key stays inside Bloom"]) {{
+  if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
+}}
+for (const internal of [packageHash, "route_grants", "machine_asserted", "r000010",
+                        "limits are asserted by the named Petal"]) {{
+  if (primary.includes(internal)) throw new Error(`primary review exposed ${{internal}}: ${{primary}}`);
+}}
+if (!technical.includes(packageHash) || !technical.includes("route_grants")) {{
+  throw new Error(`technical details omitted the exact signed plan: ${{technical}}`);
+}}
+if (nodes["page-title"].textContent !== "Finish Pump.fun session setup" ||
+    nodes.approve.textContent !== "Finish Pump.fun setup") {{
+  throw new Error(`unexpected title or button: ${{nodes["page-title"].textContent}} / ${{nodes.approve.textContent}}`);
+}}
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Owners hold imported secp256k1 scalars as hex; Signer decodes base64url.
 /// The shipped page must normalize every realistic hex spelling itself —
 /// asking an owner to hand-convert a private key is both hostile and
