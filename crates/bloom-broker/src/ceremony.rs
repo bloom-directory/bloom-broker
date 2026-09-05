@@ -3279,9 +3279,9 @@ fn custody_review_text(kind: CeremonyKind) -> (&'static str, &'static str) {
              select it for signing.",
         ),
         CeremonyKind::KeyDerive => (
-            "Derive a Petal-scoped key",
-            "Signer derives a child key bound to the Petal scope shown below. The Petal may \
-             use it only for the operations that scope names.",
+            "Create a temporary Petal key",
+            "Allow an installed Petal to use a temporary child key for only the listed actions \
+             and time. No funds move now, and the wallet's main key remains in Signer.",
         ),
         // Rejected earlier in custody preparation and reviewed by their own
         // paths; named so this match stays exhaustive.

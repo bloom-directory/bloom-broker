@@ -70,9 +70,9 @@ const KINDS = {
     button: "Approve rules with passkey"
   },
   key_derive: {
-    title: "Derive a key",
-    summary: "Derive a scoped key from wallet <strong>{wallet}</strong>.",
-    button: "Derive with passkey"
+    title: "Create a temporary app key",
+    summary: "Allow an installed Petal to use a temporary key from wallet <strong>{wallet}</strong>.",
+    button: "Create temporary key"
   },
   backend_enrollment: {
     title: "Enrol a signing backend",
@@ -207,6 +207,45 @@ function describeKey(ref) {
   else if (ref.key_spec) account = `${ref.key_spec} key ${shortDigest(ref.public_key_fingerprint || ref.locator || "")}`;
   return {wallet, account};
 }
+const PETAL_ACTIONS = {
+  create: "create tokens",
+  buy: "buy tokens",
+  sell: "sell tokens",
+  collect_fees: "collect fees",
+  sharing_config: "manage fee sharing",
+  close_token_account: "close empty token accounts",
+  sweep: "return unused SOL"
+};
+function naturalList(items) {
+  if (items.length < 2) return items[0] || "";
+  if (items.length === 2) return `${items[0]} and ${items[1]}`;
+  return `${items.slice(0, -1).join(", ")}, and ${items.at(-1)}`;
+}
+function describePetalScope(scope) {
+  if (!scope || typeof scope !== "object") return null;
+  const classes = Array.isArray(scope.allowed_operation_classes)
+    ? scope.allowed_operation_classes.map(String) : [];
+  const prefixes = [...new Set(classes.map(value => value.split(".")[0]).filter(Boolean))];
+  const app = prefixes.length === 1 && prefixes[0] === "pumpfun"
+    ? "Pump.fun"
+    : "this Petal";
+  const actions = [...new Set(classes.map(value => {
+    const action = value.includes(".") ? value.slice(value.indexOf(".") + 1) : value;
+    return PETAL_ACTIONS[action] || action.replace(/[_-]/g, " ");
+  }))];
+  const lifetime = Number(scope.maximum_lifetime_ms);
+  const duration = Number.isFinite(lifetime) && lifetime > 0 ? fmtRemaining(lifetime) : "a limited time";
+  return {
+    sentence: `Allow <strong>${app}</strong> to use a temporary Solana session key for up to <strong>${duration}</strong>. No funds move in this step, and your main wallet key stays inside Bloom.`,
+    facts: [
+      ["App", app],
+      ["Can", naturalList(actions)],
+      ["Session lasts", `Up to ${duration}`],
+      ["Main wallet key", "Stays inside Bloom"]
+    ],
+    button: app === "Pump.fun" ? "Create Pump.fun session key" : "Create temporary key"
+  };
+}
 // Policy updates: say what changes, in the order a person cares about.
 function describePolicy(manifest) {
   const diff = manifest?.authority_diff;
@@ -269,12 +308,19 @@ function renderReview(session) {
     : meta.summary.replace("{wallet}", escapeHtml(walletName || "this wallet"));
   const warns = [];
   let transfer = null;
+  let petalScope = null;
   if (kind === "sealed_approval") {
     transfer = describeTransfer(session.review_manifest);
     if (transfer) summaryHtml = transfer.sentence;
   } else if (kind === "policy_update") {
     transfer = describePolicy(session.review_manifest);
     if (transfer) summaryHtml = transfer.sentence;
+  } else if (kind === "key_derive" && contribution.petal_key_scope) {
+    petalScope = describePetalScope(contribution.petal_key_scope);
+    if (petalScope) {
+      summaryHtml = petalScope.sentence;
+      approve.textContent = petalScope.button;
+    }
   }
   fact("Wallet", walletName);
   if (kind !== "sealed_approval" &&
@@ -287,7 +333,9 @@ function renderReview(session) {
   } else if (keyInfo.account) {
     fact("Account", keyInfo.account);
   }
-  if (contribution.petal_key_scope) {
+  if (petalScope) {
+    for (const [label, value, mono] of petalScope.facts) fact(label, value, mono);
+  } else if (contribution.petal_key_scope) {
     fact("Scope", canonicalJson(contribution.petal_key_scope), true);
   }
   const expiry = el("span", {class: "expiry"});
@@ -303,7 +351,7 @@ function renderReview(session) {
     el("p", {class: "summary", html: summaryHtml}),
     facts
   ];
-  if (custodyManifest && typeof manifest.canonical_plan === "string" &&
+  if (kind !== "key_derive" && custodyManifest && typeof manifest.canonical_plan === "string" &&
       manifest.canonical_plan.trim()) {
     parts.push(el("div", {class: "plan"},
       el("pre", {}, manifest.canonical_plan)));

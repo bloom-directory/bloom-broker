@@ -298,6 +298,88 @@ if (nodes["page-title"].textContent !== "Remove a passkey from a wallet" ||
     );
 }
 
+#[test]
+fn key_derive_primary_review_explains_the_session_without_internal_scope_json() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  setAttribute() {{}}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+const scope = {{
+  allowed_operation_classes: ["pumpfun.buy", "pumpfun.sell", "pumpfun.sweep"],
+  allowed_routes: ["r000010", "r000011", "r000020"],
+  custody_operation_id: "internal-operation-id",
+  maximum_lifetime_ms: "3600000",
+  package_hash: "b868911206a002dd48c11fb59e8aaa8bd8b4716f70b671e10be18bd24bf7c738"
+}};
+renderReview({{
+  ceremony_kind: "key_derive",
+  expires_at_ms: Date.now() + 300000,
+  signer_contribution: {{
+    wallet_id: "main",
+    key_ref: {{key_spec: "ed25519", derivation: {{path: "m/44'/501'/0'/0'"}}}},
+    petal_key_scope: scope
+  }},
+  review_manifest: {{
+    schema: "bloom.custody_ceremony_review.v1",
+    title: "Create a temporary Petal key",
+    summary: "technical fallback",
+    canonical_plan: "internal-operation-id",
+    petal_key_scope: scope
+  }}
+}});
+const primary = allText({{textContent: "", innerHTML: "", children:
+  nodes.review.children.filter(child => child?.name !== "details")}});
+const technical = allText(nodes.review.children.find(child => child?.name === "details"));
+for (const phrase of ["Pump.fun", "No funds move", "buy tokens", "sell tokens",
+                      "return unused SOL", "main wallet key stays inside Bloom", "Up to 1h 0m"]) {{
+  if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
+}}
+for (const internal of ["allowed_routes", "custody_operation_id", "package_hash", "r000010"]) {{
+  if (primary.includes(internal)) throw new Error(`primary review exposed ${{internal}}: ${{primary}}`);
+}}
+if (!technical.includes(scope.package_hash) || !technical.includes("allowed_routes")) {{
+  throw new Error(`technical details omitted the exact signed scope: ${{technical}}`);
+}}
+if (nodes.approve.textContent !== "Create Pump.fun session key") {{
+  throw new Error(`unexpected approval label: ${{nodes.approve.textContent}}`);
+}}
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Owners hold imported secp256k1 scalars as hex; Signer decodes base64url.
 /// The shipped page must normalize every realistic hex spelling itself —
 /// asking an owner to hand-convert a private key is both hostile and
@@ -2275,7 +2357,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     );
     assert_eq!(
         derive_session["review_manifest"]["title"],
-        "Derive a Petal-scoped key"
+        "Create a temporary Petal key"
     );
     assert!(
         derive_session["review_manifest"]["canonical_plan"]
