@@ -19,6 +19,24 @@ use sha2::{Digest as _, Sha256};
 
 type BloomKem = X25519HkdfSha256;
 
+pub fn development_ceremony_port() -> u16 {
+    #[cfg(feature = "triad-dev-harness")]
+    if let Some(value) = std::env::var_os("BLOOM_TRIAD_DEV_CEREMONY_PORT") {
+        return value
+            .into_string()
+            .expect("BLOOM_TRIAD_DEV_CEREMONY_PORT must be UTF-8")
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .expect("BLOOM_TRIAD_DEV_CEREMONY_PORT must be an integer from 1 to 65535");
+    }
+    18_734
+}
+
+pub fn development_ceremony_origin() -> String {
+    format!("http://localhost:{}", development_ceremony_port())
+}
+
 pub struct VirtualAuthenticator {
     signing_key: SigningKey,
     credential_id: Base64UrlBytes,
@@ -185,7 +203,7 @@ fn client_data(kind: &str, challenge: &[u8]) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "type": kind,
         "challenge": Base64UrlBytes::from_bytes(challenge),
-        "origin": "http://localhost:18734",
+        "origin": development_ceremony_origin(),
         "crossOrigin": false
     }))
     .expect("client data serializes")
@@ -211,7 +229,33 @@ fn driver_error() -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
-    use super::VirtualAuthenticator;
+    use super::{VirtualAuthenticator, development_ceremony_origin, development_ceremony_port};
+
+    #[cfg(not(feature = "triad-dev-harness"))]
+    #[test]
+    fn production_scoped_origin_ignores_the_developer_override() {
+        assert_eq!(development_ceremony_port(), 18_734);
+        assert_eq!(development_ceremony_origin(), "http://localhost:18734");
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    #[ignore = "requires BLOOM_TRIAD_DEV_CEREMONY_PORT from the focused CI invocation"]
+    fn developer_ceremony_origin_tracks_the_selected_port() {
+        let port = std::env::var("BLOOM_TRIAD_DEV_CEREMONY_PORT")
+            .expect("focused CI must select a developer ceremony port")
+            .parse::<u16>()
+            .expect("valid developer ceremony port");
+        assert_ne!(
+            port, 18_734,
+            "the focused CI invocation must use a non-default port"
+        );
+        assert_eq!(development_ceremony_port(), port);
+        assert_eq!(
+            development_ceremony_origin(),
+            format!("http://localhost:{port}")
+        );
+    }
 
     #[test]
     fn seeded_authenticator_is_repeatable_and_domain_separated() {

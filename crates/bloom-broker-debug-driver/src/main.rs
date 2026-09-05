@@ -5,7 +5,9 @@ use std::{
     path::PathBuf,
 };
 
-use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
+use bloom_broker_debug_driver::{
+    VirtualAuthenticator, development_ceremony_origin, development_ceremony_port, seal_hpke,
+};
 use bloom_signer_api::{
     Base64UrlBytes, CeremonyChallenge, CeremonyKind, CustodyHpkeAad, CustodySignerContribution,
     Digest32, LocalPrfHpkeAad, SignerCeremonyContribution, WebAuthnCeremonyProof,
@@ -322,9 +324,9 @@ fn assert_machine_secret_confinement_command(
 }
 
 fn ceremony_token(url: &str) -> Result<&str, Box<dyn std::error::Error>> {
-    let prefix = "http://localhost:18734/ceremony/";
+    let prefix = format!("{}/ceremony/", development_ceremony_origin());
     let token = url
-        .strip_prefix(prefix)
+        .strip_prefix(&prefix)
         .ok_or("ceremony URL is not the canonical Broker origin")?;
     if token.len() != 43 || token.contains('/') {
         return Err("ceremony URL has an invalid session token".into());
@@ -339,15 +341,18 @@ fn request(
     body: Option<&[u8]>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let body = body.unwrap_or_default();
-    let mut stream = TcpStream::connect("127.0.0.1:18734")?;
+    let port = development_ceremony_port();
+    let origin = development_ceremony_origin();
+    let host = format!("localhost:{port}");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: localhost:18734\r\nConnection: close\r\nX-Bloom-Ceremony-Token: {token}\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nX-Bloom-Ceremony-Token: {token}\r\n"
     )?;
     if method == "POST" {
         write!(
             stream,
-            "Origin: http://localhost:18734\r\nSec-Fetch-Site: same-origin\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+            "Origin: {origin}\r\nSec-Fetch-Site: same-origin\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
             body.len()
         )?;
     }

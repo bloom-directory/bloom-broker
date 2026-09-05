@@ -48,6 +48,8 @@ use std::{
 
 pub const CEREMONY_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_734);
 pub const CEREMONY_ORIGIN: &str = "http://localhost:18734";
+#[cfg(feature = "triad-dev-harness")]
+const DEV_CEREMONY_PORT_ENV: &str = "BLOOM_TRIAD_DEV_CEREMONY_PORT";
 pub const MAX_CEREMONY_BODY_BYTES: usize = 16 * 1024;
 pub const CEREMONY_OWNER_HEADER: &str = "x-bloom-ceremony-owner";
 pub const CEREMONY_OWNER_VALUE: &str = "bloom-broker-v1";
@@ -69,6 +71,30 @@ pub const DEFAULT_MAXIMUM_CREATIONS_PER_WALLET: usize = 12;
 /// creation is unauthenticated, so it stays deliberately tighter than the
 /// per-wallet quota.
 pub const DEFAULT_MAXIMUM_ANONYMOUS_REGISTRATIONS: usize = 4;
+
+fn configured_ceremony_addr() -> SocketAddr {
+    #[cfg(feature = "triad-dev-harness")]
+    if let Some(value) = std::env::var_os(DEV_CEREMONY_PORT_ENV) {
+        let value = value
+            .into_string()
+            .expect("BLOOM_TRIAD_DEV_CEREMONY_PORT must be UTF-8");
+        let port = value
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .expect("BLOOM_TRIAD_DEV_CEREMONY_PORT must be an integer from 1 to 65535");
+        return SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    }
+    CEREMONY_ADDR
+}
+
+fn configured_ceremony_origin() -> String {
+    format!("http://localhost:{}", configured_ceremony_addr().port())
+}
+
+fn configured_ceremony_host() -> String {
+    format!("localhost:{}", configured_ceremony_addr().port())
+}
 
 /// Ceilings that keep a configured value inside what the admission
 /// calculations can represent and what one Broker process can actually hold
@@ -1321,12 +1347,13 @@ impl CeremonyBroker {
                 format!("inherited ceremony listener has no readable address: {error}"),
             )
         })?;
-        if observed != CEREMONY_ADDR {
+        let expected = configured_ceremony_addr();
+        if observed != expected {
             return Err(protocol(
                 ProtocolErrorCode::ServiceUnavailable,
                 format!(
                     "inherited ceremony listener is bound to {observed}, not the canonical \
-                     {CEREMONY_ADDR}; no other address will be served"
+                     {expected}; no other address will be served"
                 ),
             ));
         }
@@ -1342,11 +1369,12 @@ impl CeremonyBroker {
     /// Exclusively acquire the canonical socket. There is deliberately no
     /// fallback address or port.
     pub fn bind_canonical() -> Result<StdTcpListener, ProtocolError> {
-        let listener = StdTcpListener::bind(CEREMONY_ADDR).map_err(|error| {
+        let expected = configured_ceremony_addr();
+        let listener = StdTcpListener::bind(expected).map_err(|error| {
             protocol(
                 ProtocolErrorCode::ServiceUnavailable,
                 format!(
-                    "fatal canonical ceremony listener ownership conflict at {CEREMONY_ADDR}; no fallback port will be used: {error}"
+                    "fatal canonical ceremony listener ownership conflict at {expected}; no fallback port will be used: {error}"
                 ),
             )
         })?;
@@ -1390,7 +1418,7 @@ impl CeremonyBroker {
         if listener
             .local_addr()
             .map_err(|error| protocol(ProtocolErrorCode::ServiceUnavailable, error.to_string()))?
-            != CEREMONY_ADDR
+            != configured_ceremony_addr()
         {
             return Err(protocol(
                 ProtocolErrorCode::ServiceUnavailable,
@@ -2535,7 +2563,11 @@ impl CeremonyBroker {
         self.expire_sessions(unix_time_ms())?;
         validate_host(headers)?;
         if mutation {
-            require_exact_header(headers, header::ORIGIN, CEREMONY_ORIGIN)?;
+            require_exact_header(
+                headers,
+                header::ORIGIN,
+                configured_ceremony_origin().as_str(),
+            )?;
             require_exact_header(headers, header::CONTENT_TYPE, "application/json")?;
             require_exact_header_name(headers, "sec-fetch-site", "same-origin")?;
         }
@@ -2611,7 +2643,7 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
 }
 
 fn validate_host(headers: &HeaderMap) -> Result<(), ProtocolError> {
-    require_exact_header(headers, header::HOST, "localhost:18734")
+    require_exact_header(headers, header::HOST, configured_ceremony_host().as_str())
 }
 
 fn require_exact_header(
@@ -2638,7 +2670,11 @@ fn require_exact_header_name(
 }
 
 fn session_url(token: &Base64UrlBytes) -> String {
-    format!("{CEREMONY_ORIGIN}/ceremony/{}", token.encoded())
+    format!(
+        "{}/ceremony/{}",
+        configured_ceremony_origin(),
+        token.encoded()
+    )
 }
 
 fn token_for(session: &BrowserSession) -> Base64UrlBytes {

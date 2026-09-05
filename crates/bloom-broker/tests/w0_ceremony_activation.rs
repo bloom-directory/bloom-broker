@@ -1,10 +1,11 @@
 //! Linux ceremony-listener acquisition.
 //!
-//! The Linux unit set binds 127.0.0.1:18734 in a `.socket` unit and passes the
-//! descriptor to the Broker through `Sockets=`/`LISTEN_FDS`. The Broker must
-//! therefore consume that descriptor and never bind the address itself — a
-//! second bind can only ever fail with `EADDRINUSE`, and `bind_canonical` has
-//! deliberately no fallback port, so the service would exit.
+//! The Linux unit set binds the configured canonical loopback address in a
+//! `.socket` unit and passes the descriptor to the Broker through
+//! `Sockets=`/`LISTEN_FDS`. The Broker must therefore consume that descriptor
+//! and never bind the address itself — a second bind can only ever fail with
+//! `EADDRINUSE`, and `bind_canonical` has deliberately no fallback port, so the
+//! service would exit.
 //!
 //! The inherited-listener cases run the real acquisition in a child process
 //! with a genuine descriptor while the parent still holds the address. If the
@@ -26,6 +27,17 @@ use bloom_broker::ceremony::{CEREMONY_ADDR, CeremonyBroker};
 
 const CHILD_MODE: &str = "BLOOM_CEREMONY_ACTIVATION_CHILD";
 const ACTIVATION_NAME: &str = "broker-ceremony";
+
+fn expected_ceremony_addr() -> SocketAddr {
+    #[cfg(feature = "triad-dev-harness")]
+    let port = std::env::var("BLOOM_TRIAD_DEV_CEREMONY_PORT")
+        .ok()
+        .map(|value| value.parse::<u16>().expect("valid developer ceremony port"))
+        .unwrap_or(CEREMONY_ADDR.port());
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let port = CEREMONY_ADDR.port();
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+}
 const EXIT_REFUSED: i32 = 72;
 /// The single test the child re-exec must run so it reaches `run_child`.
 const CHILD_TEST: &str = "linux_ceremony_listener_is_inherited_and_never_rebound";
@@ -132,13 +144,14 @@ fn linux_ceremony_listener_is_inherited_and_never_rebound() {
 
     // Hold the canonical address for the whole test. Every child below runs
     // while it is held, so any attempt to bind it would fail.
-    let held = TcpListener::bind(CEREMONY_ADDR)
+    let expected = expected_ceremony_addr();
+    let held = TcpListener::bind(expected)
         .expect("the test must own the canonical address before the children run");
 
     // The verifier accepts a listener that really is on the canonical address.
     let checked = CeremonyBroker::require_canonical_listener(duplicate(held.as_raw_fd()).into())
         .expect("the canonical address must be accepted");
-    assert_eq!(checked.local_addr().unwrap(), CEREMONY_ADDR);
+    assert_eq!(checked.local_addr().unwrap(), expected);
     drop(checked);
 
     // A descriptor on any other address is refused, and the refusal names the
@@ -146,7 +159,7 @@ fn linux_ceremony_listener_is_inherited_and_never_rebound() {
     let wrong = TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
         .expect("bind an ephemeral listener");
     let observed = wrong.local_addr().unwrap();
-    assert_ne!(observed, CEREMONY_ADDR);
+    assert_ne!(observed, expected);
     let refused = CeremonyBroker::require_canonical_listener(wrong)
         .expect_err("a listener on another address must never be served");
     assert!(
@@ -172,7 +185,7 @@ fn linux_ceremony_listener_is_inherited_and_never_rebound() {
          held.\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
-        stdout.contains(&format!("INHERITED {CEREMONY_ADDR}")),
+        stdout.contains(&format!("INHERITED {expected}")),
         "the child must report the canonical address.\nstdout: {stdout}\nstderr: {stderr}"
     );
 
