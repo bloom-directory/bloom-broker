@@ -38,7 +38,12 @@ jobs:
           cargo test -p bloom-broker --features triad-dev-harness \
             --test w5_ceremony --locked \
             assets_headers_host_origin_token_and_opaque_relay_are_enforced -- --exact
+          cargo test -p bloom-broker --features triad-dev-harness \
+            --test w5_ceremony --locked \
+            prebound_canonical_listener_is_a_fatal_no_fallback_failure -- --exact
           cargo test -p bloom-broker-debug-driver --lib --locked \
+            tests::production_scoped_origin_ignores_the_developer_override -- --exact
+          cargo test -p bloom-broker-debug-driver --features triad-dev-harness --lib --locked \
             tests::developer_ceremony_origin_tracks_the_selected_port -- --exact --ignored
 
   privileged-w0:

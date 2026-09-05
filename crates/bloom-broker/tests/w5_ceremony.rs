@@ -3893,14 +3893,15 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
 
 #[test]
 fn prebound_canonical_listener_is_a_fatal_no_fallback_failure() {
-    let listener = match std::net::TcpListener::bind(CEREMONY_ADDR) {
+    let expected = format!("127.0.0.1:{}", test_ceremony_port());
+    let listener = match std::net::TcpListener::bind(&expected) {
         Ok(listener) => Some(listener),
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
         Err(error) => panic!("cannot establish canonical-listener precondition: {error}"),
     };
     let error = CeremonyBroker::bind_canonical().unwrap_err();
     assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
-    assert!(error.message.contains("18734"));
+    assert!(error.message.contains(&expected));
     drop(listener);
 }
 

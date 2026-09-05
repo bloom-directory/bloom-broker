@@ -20,16 +20,17 @@ use sha2::{Digest as _, Sha256};
 type BloomKem = X25519HkdfSha256;
 
 pub fn development_ceremony_port() -> u16 {
-    std::env::var("BLOOM_TRIAD_DEV_CEREMONY_PORT")
-        .ok()
-        .map(|value| {
-            value
-                .parse::<u16>()
-                .ok()
-                .filter(|port| *port != 0)
-                .expect("BLOOM_TRIAD_DEV_CEREMONY_PORT must be an integer from 1 to 65535")
-        })
-        .unwrap_or(18_734)
+    #[cfg(feature = "triad-dev-harness")]
+    if let Some(value) = std::env::var_os("BLOOM_TRIAD_DEV_CEREMONY_PORT") {
+        return value
+            .into_string()
+            .expect("BLOOM_TRIAD_DEV_CEREMONY_PORT must be UTF-8")
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .expect("BLOOM_TRIAD_DEV_CEREMONY_PORT must be an integer from 1 to 65535");
+    }
+    18_734
 }
 
 pub fn development_ceremony_origin() -> String {
@@ -230,6 +231,14 @@ fn driver_error() -> ProtocolError {
 mod tests {
     use super::{VirtualAuthenticator, development_ceremony_origin, development_ceremony_port};
 
+    #[cfg(not(feature = "triad-dev-harness"))]
+    #[test]
+    fn production_scoped_origin_ignores_the_developer_override() {
+        assert_eq!(development_ceremony_port(), 18_734);
+        assert_eq!(development_ceremony_origin(), "http://localhost:18734");
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
     #[test]
     #[ignore = "requires BLOOM_TRIAD_DEV_CEREMONY_PORT from the focused CI invocation"]
     fn developer_ceremony_origin_tracks_the_selected_port() {

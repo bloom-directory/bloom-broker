@@ -6,7 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-triad-dev-harness = ["bloom-triad-local-transport/triad-dev-harness"]
+triad-dev-harness = [
+    "bloom-broker-debug-driver/triad-dev-harness",
+    "bloom-triad-local-transport/triad-dev-harness",
+]
 
 [dependencies]
 axum.workspace = true
