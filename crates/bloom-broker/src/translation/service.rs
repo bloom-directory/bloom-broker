@@ -31,6 +31,7 @@ pub(crate) fn key_to_machine(value: south::KeyPublic) -> north::KeyPublic {
             .into_iter()
             .map(key::crypto_suite_to_machine)
             .collect(),
+        petal_scope_expires_at_ms: None,
     }
 }
 

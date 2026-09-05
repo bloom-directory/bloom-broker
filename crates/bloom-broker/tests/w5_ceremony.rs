@@ -2450,6 +2450,27 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         response => panic!("unexpected response: {response:?}"),
     };
     assert_eq!(projected_result, custody_result_to_machine(&derive_result));
+    let projected_key = match MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::KeyGetPublic(bloom_broker_api::KeyRequest {
+            key_ref: projected_result.public_key_refs[0].clone(),
+        }),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::KeyGetPublic(key) => key,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    assert_eq!(projected_key.key_ref, projected_result.public_key_refs[0]);
+    assert!(
+        projected_key
+            .petal_scope_expires_at_ms
+            .is_some_and(|expires_at_ms| {
+                expires_at_ms.get() >= scope_started_ms + scope_lifetime_ms
+            }),
+        "Machine must receive the absolute Petal key expiry recorded by Broker"
+    );
 
     let approval_now_ms: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

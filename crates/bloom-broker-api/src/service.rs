@@ -238,6 +238,10 @@ pub struct KeyPublic {
     pub canonical_public_key: Base64UrlBytes,
     pub addresses: Vec<String>,
     pub supported_crypto_suites: Vec<crate::CryptoSuite>,
+    /// Absolute expiry for a Signer-owned Petal-scoped key. Other keys do not
+    /// carry this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub petal_scope_expires_at_ms: Option<DecimalU64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

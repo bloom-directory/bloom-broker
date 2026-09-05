@@ -561,9 +561,15 @@ impl BrokerRpcService {
                     ))
                     .await?
                 {
-                    BrokerSignerResponse::KeyGetPublic(key) => Ok(Response::KeyGetPublic(
-                        translate_service::key_to_machine(key),
-                    )),
+                    BrokerSignerResponse::KeyGetPublic(key) => {
+                        let mut key = translate_service::key_to_machine(key);
+                        key.petal_scope_expires_at_ms = self
+                            .authority
+                            .scoped_key_record(&key.key_ref)
+                            .map_err(authority_error)?
+                            .map(|(_, expires_at_ms)| DecimalU64::new(expires_at_ms));
+                        Ok(Response::KeyGetPublic(key))
+                    }
                     _ => Err(response_mismatch("key.get_public")),
                 }
             }
