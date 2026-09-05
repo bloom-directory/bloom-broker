@@ -198,7 +198,7 @@ impl BrokerRpcService {
                     .approval_public_list(&request.wallet_id)
                     .map_err(authority_error)?;
                 for status in &mut statuses {
-                    self.attach_pending_approval_ceremony(status);
+                    self.attach_pending_approval_ceremony(status)?;
                 }
                 Ok(Response::SealedApprovalList(statuses))
             }
@@ -730,20 +730,21 @@ impl BrokerRpcService {
             .authority
             .approval_public_status(approval_id)
             .map_err(authority_error)?;
-        self.attach_pending_approval_ceremony(&mut status);
+        self.attach_pending_approval_ceremony(&mut status)?;
         Ok(status)
     }
 
     fn attach_pending_approval_ceremony(
         &self,
         status: &mut bloom_broker_api::ApprovalPublicStatus,
-    ) {
-        if let Some((url, expires_at_ms)) =
-            self.ceremony.pending_approval_ceremony(&status.approval_id)
+    ) -> Result<(), ProtocolError> {
+        if let Some((url, expires_at_ms)) = self
+            .ceremony
+            .pending_approval_ceremony(&status.approval_id, self.clock.now_ms(false)?)?
         {
             status.ceremony_url = Some(url);
             status.ceremony_expires_at_ms = Some(expires_at_ms);
-            return;
+            return Ok(());
         }
         // An approval whose ceremony died still reports `AwaitingCeremony`,
         // but with no URL to await — a state the caller can neither act on
@@ -759,6 +760,7 @@ impl BrokerRpcService {
         {
             status.state = ApprovalLifecycleState::Expired;
         }
+        Ok(())
     }
 
     async fn prepare_policy_update(

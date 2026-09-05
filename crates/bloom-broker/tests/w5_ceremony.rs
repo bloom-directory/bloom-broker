@@ -237,6 +237,67 @@ cryptoSelfTest().then(
     assert_eq!(String::from_utf8_lossy(&output.stdout), "browser-crypto-ok");
 }
 
+#[test]
+fn custody_manifest_is_rendered_on_the_primary_review_surface() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  setAttribute() {{}}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+const operation = "op_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+renderReview({{
+  ceremony_kind: "credential_remove",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "wallet-primary"}},
+  review_manifest: {{
+    schema: "bloom.custody_ceremony_review.v1",
+    title: "Remove a passkey from a wallet",
+    summary: "This credential stops being an authority for this wallet.",
+    canonical_plan: `Remove a passkey\n\nOperation     ${{operation}}`
+  }}
+}});
+const rendered = allText(nodes.review);
+if (nodes["page-title"].textContent !== "Remove a passkey from a wallet" ||
+    !rendered.includes("This credential stops being an authority") ||
+    !rendered.includes(operation)) {{
+  throw new Error(`custody manifest was not rendered: ${{rendered}}`);
+}}
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Owners hold imported secp256k1 scalars as hex; Signer decodes base64url.
 /// The shipped page must normalize every realistic hex spelling itself —
 /// asking an owner to hand-convert a private key is both hostile and
@@ -782,6 +843,7 @@ struct MockSigner {
     first_custody_release: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     pending: parking_lot::Mutex<HashSet<OperationId>>,
     reject_completion: bool,
+    sensitive_result: bool,
     cancellation_fails: AtomicBool,
 }
 
@@ -1221,7 +1283,15 @@ impl MockSigner {
             first_custody_release: parking_lot::Mutex::new(None),
             pending: parking_lot::Mutex::new(HashSet::new()),
             reject_completion: false,
+            sensitive_result: false,
             cancellation_fails: AtomicBool::new(false),
+        }
+    }
+
+    fn with_sensitive_result() -> Self {
+        Self {
+            sensitive_result: true,
+            ..Self::new()
         }
     }
 
@@ -1407,7 +1477,13 @@ impl CeremonySigner for MockSigner {
             credential_summaries: Vec::new(),
             initial_policy: None,
             receipt_digest: digest("44"),
-            encrypted_browser_result: None,
+            encrypted_browser_result: self.sensitive_result.then(|| {
+                serde_json::from_value(serde_json::json!({
+                    "kem_output": "a2Vt",
+                    "ciphertext": "Y2lwaGVydGV4dA"
+                }))
+                .unwrap()
+            }),
             signer_key_id: Token::new("mock-signer-key").unwrap(),
             signer_signature: Base64UrlBytes::from_bytes(&[0; 64]),
         })
@@ -3461,7 +3537,10 @@ async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
     let approval_id = response.approval_id.clone();
 
     assert!(
-        broker.pending_approval_ceremony(&approval_id).is_some(),
+        broker
+            .pending_approval_ceremony(&approval_id, now_ms)
+            .unwrap()
+            .is_some(),
         "a live ceremony hands the owner a URL to complete"
     );
     assert!(
@@ -3469,10 +3548,11 @@ async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
         "an approval the owner can still complete is not unreachable"
     );
 
-    broker.expire_sessions(now_ms + 10_001).unwrap();
-
     assert!(
-        broker.pending_approval_ceremony(&approval_id).is_none(),
+        broker
+            .pending_approval_ceremony(&approval_id, now_ms + 10_001)
+            .unwrap()
+            .is_none(),
         "an expired ceremony must not hand out a URL"
     );
     assert!(
@@ -3515,6 +3595,77 @@ async fn cancelling_a_ceremony_that_already_died_succeeds_instead_of_stranding_t
         Some(CeremonyState::Expired),
         "cancel is a no-op here and must not relabel how the ceremony actually ended"
     );
+}
+
+#[tokio::test]
+async fn cancelling_a_failed_session_with_a_committed_sensitive_result_is_rejected() {
+    let signer = Arc::new(MockSigner::with_sensitive_result());
+    let broker = CeremonyBroker::new(signer);
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let operation_id = operation("18");
+    let prepared = prepare(
+        &broker,
+        operation_id.clone(),
+        Some(Token::new("wallet-sensitive-result").unwrap()),
+        now_ms,
+    );
+    let status = broker.public_status(&operation_id).unwrap();
+    let ceremony_id = status.ceremony_id.to_string();
+    let token = url_token(&prepared.ceremony_url);
+    let completed = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/session/{ceremony_id}/complete"))
+                .header(header::HOST, "localhost:18734")
+                .header(header::ORIGIN, "http://localhost:18734")
+                .header("x-bloom-ceremony-token", token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "proof": {
+                            "kind": "assertion",
+                            "assertion": {
+                                "credential_id": "Y3JlZGVudGlhbA",
+                                "authenticator_data": "YXV0aA",
+                                "client_data_json": "e30",
+                                "signature": "c2ln",
+                                "user_handle": null
+                            }
+                        },
+                        "encrypted_input": null,
+                        "public_binding_digest": digest("33")
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
+    let awaiting_ack = broker.public_status(&operation_id).unwrap();
+    assert_eq!(awaiting_ack.state, CeremonyState::AwaitingRecoveryAck);
+
+    broker
+        .expire_sessions(awaiting_ack.expires_at_ms.get() + 1)
+        .unwrap();
+    let failed = broker.public_status(&operation_id).unwrap();
+    assert_eq!(failed.state, CeremonyState::Failed);
+    assert!(
+        failed.receipt_digest.is_some(),
+        "the committed wallet result must survive acknowledgement expiry"
+    );
+    let error = broker
+        .cancel(&operation_id, awaiting_ack.expires_at_ms.get() + 2)
+        .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::OperationIdConflict);
 }
 
 #[tokio::test]

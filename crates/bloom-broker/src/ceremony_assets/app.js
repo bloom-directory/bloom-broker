@@ -240,14 +240,17 @@ function planDisclosures(manifest) {
 function renderReview(session) {
   const kind = session.ceremony_kind;
   const meta = KINDS[kind] || {title: kind.replace(/_/g, " "), summary: "", button: "Continue with passkey"};
+  const manifest = session.review_manifest;
+  const custodyManifest = manifest?.schema === "bloom.custody_ceremony_review.v1";
   const contribution = session.signer_contribution || {};
-  const wallet = contribution.wallet_id || session.review_manifest?.wallet_id || "";
+  const wallet = contribution.wallet_id || manifest?.wallet_name || manifest?.wallet_id || "";
   panelKicker.textContent = "Step 1 of 2 · Check";
   panelTitle.textContent = "What will happen";
   approve.textContent = meta.button;
   const pageTitle = document.getElementById("page-title");
   const pageLede = document.getElementById("page-lede");
-  if (pageTitle) pageTitle.textContent = meta.title;
+  if (pageTitle) pageTitle.textContent = custodyManifest && manifest.title
+    ? manifest.title : meta.title;
   if (pageLede) {
     pageLede.textContent = meta.lede ||
       "Read what will happen, then press the button. Your device will ask for your fingerprint, face, or PIN.";
@@ -261,7 +264,9 @@ function renderReview(session) {
   const ref = contribution.key_ref;
   const keyInfo = describeKey(ref);
   const walletName = wallet || keyInfo.wallet || "";
-  let summaryHtml = meta.summary.replace("{wallet}", escapeHtml(walletName || "this wallet"));
+  let summaryHtml = custodyManifest && manifest.summary
+    ? escapeHtml(manifest.summary)
+    : meta.summary.replace("{wallet}", escapeHtml(walletName || "this wallet"));
   const warns = [];
   let transfer = null;
   if (kind === "sealed_approval") {
@@ -298,6 +303,11 @@ function renderReview(session) {
     el("p", {class: "summary", html: summaryHtml}),
     facts
   ];
+  if (custodyManifest && typeof manifest.canonical_plan === "string" &&
+      manifest.canonical_plan.trim()) {
+    parts.push(el("div", {class: "plan"},
+      el("pre", {}, manifest.canonical_plan)));
+  }
   if (meta.warn) warns.unshift(meta.warn);
   for (const w of warns) parts.push(el("p", {class: "warn"}, w));
 

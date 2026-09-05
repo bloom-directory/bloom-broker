@@ -974,8 +974,13 @@ impl CeremonyBroker {
     pub fn pending_approval_ceremony(
         &self,
         approval_id: &Digest32,
-    ) -> Option<(String, DecimalU64)> {
-        self.inner.sessions.lock().values().find_map(|session| {
+        now_ms: u64,
+    ) -> Result<Option<(String, DecimalU64)>, ProtocolError> {
+        // Status/list requests are a lifecycle boundary just like opening the
+        // browser. Sweep first so an owner who never opened the page cannot
+        // leave an expired AwaitingUser row masquerading as a live URL.
+        self.expire_sessions(now_ms)?;
+        Ok(self.inner.sessions.lock().values().find_map(|session| {
             if session.ceremony_kind != CeremonyKind::SealedApproval
                 || session.state != CeremonyState::AwaitingUser
             {
@@ -994,7 +999,7 @@ impl CeremonyBroker {
                 .token
                 .as_ref()
                 .map(|token| (session_url(token), DecimalU64::new(session.expires_at_ms)))
-        })
+        }))
     }
 
     /// True when every owner ceremony minted for this approval died without
@@ -1085,7 +1090,8 @@ impl CeremonyBroker {
             if matches!(
                 session.state,
                 CeremonyState::Cancelled | CeremonyState::Expired | CeremonyState::Failed
-            ) {
+            ) && session.terminal_result.is_none()
+            {
                 return Ok(());
             }
             // Anything that reached the wallet is a different matter: it may
