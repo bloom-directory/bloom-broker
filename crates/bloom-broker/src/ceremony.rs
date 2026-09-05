@@ -1131,16 +1131,9 @@ impl CeremonyBroker {
             .lock()
             .iter()
             .filter(|(_, session)| !is_terminal(session.state))
-            .map(|(id, session)| {
-                (
-                    id.clone(),
-                    session.operation_id.clone(),
-                    session.state,
-                    session.wallet_id.clone(),
-                )
-            })
+            .map(|(id, session)| (id.clone(), session.operation_id.clone(), session.state))
             .collect::<Vec<_>>();
-        for (ceremony_id, operation_id, state, wallet_id) in live {
+        for (ceremony_id, operation_id, state) in live {
             if state == CeremonyState::WalletCommitted {
                 self.sweep_committed_session(&ceremony_id, now_ms)?;
                 continue;
@@ -1170,11 +1163,9 @@ impl CeremonyBroker {
             };
             self.persist_session(&snapshot)?;
             self.inner.sessions.lock().insert(ceremony_id, snapshot);
-            if state == CeremonyState::AwaitingUser
-                && let Some(wallet_id) = &wallet_id
-            {
-                self.record_backoff(wallet_id, now_ms);
-            }
+            // Losing the authenticated Machine session is infrastructure
+            // cleanup, not an owner cancellation. Counting it as one lets
+            // routine restarts exponentially lock a wallet out of ceremonies.
         }
         Ok(())
     }

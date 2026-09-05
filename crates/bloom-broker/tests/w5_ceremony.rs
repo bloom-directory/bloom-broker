@@ -4320,12 +4320,8 @@ fn login_session_disconnect_terminalizes_every_live_browser_session() {
     let signer = Arc::new(MockSigner::new());
     let broker = CeremonyBroker::new(signer.clone());
     let operation_id = operation("af");
-    prepare(
-        &broker,
-        operation_id.clone(),
-        Some(Token::new("wallet-logout").unwrap()),
-        10_000,
-    );
+    let wallet = Token::new("wallet-logout").unwrap();
+    prepare(&broker, operation_id.clone(), Some(wallet.clone()), 10_000);
 
     broker.terminate_live_sessions(10_001).unwrap();
 
@@ -4333,6 +4329,7 @@ fn login_session_disconnect_terminalizes_every_live_browser_session() {
     assert_eq!(status.state, CeremonyState::Cancelled);
     assert!(status.ceremony_url.is_none());
     assert_eq!(signer.cancellations.load(Ordering::SeqCst), 1);
+    prepare(&broker, operation("b0"), Some(wallet), 10_002);
 }
 
 #[tokio::test]
