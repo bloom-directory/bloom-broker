@@ -142,6 +142,7 @@ mod tests {
             operation_id: OperationId::from_bytes([2; 32]),
             canonical_plan_facts_digest: digest.clone(),
             evm_review_payloads: vec![Base64UrlBytes::from_bytes(bytes)],
+            safe_review_payloads: Vec::new(),
             terms: SealedApprovalTerms {
                 subject: ApprovalSubject::Cli {
                     client_id: token("machine"),

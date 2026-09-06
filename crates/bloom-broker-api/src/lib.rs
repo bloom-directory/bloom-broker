@@ -46,10 +46,11 @@ pub const BROKER_API_MAJOR: u16 = 1;
 pub const RATE_LIMIT_DETAILS_MINOR: u16 = 4;
 /// First minor supporting full native EVM preimages during exact approval review.
 pub const EVM_REVIEW_PAYLOADS_MINOR: u16 = 5;
+pub const SAFE_REVIEW_PAYLOADS_MINOR: u16 = 6;
 /// Strict decoders must agree on the review request shape before exchanging
 /// messages. Machine and Broker must be upgraded together for native EVM review.
-pub const BROKER_API_MINOR_MIN: u16 = EVM_REVIEW_PAYLOADS_MINOR;
-pub const BROKER_API_MINOR_MAX: u16 = EVM_REVIEW_PAYLOADS_MINOR;
+pub const BROKER_API_MINOR_MIN: u16 = SAFE_REVIEW_PAYLOADS_MINOR;
+pub const BROKER_API_MINOR_MAX: u16 = SAFE_REVIEW_PAYLOADS_MINOR;
 pub const BROKER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(BROKER_API_MAJOR, BROKER_API_MINOR_MAX);
 pub const BROKER_API_RANGE: ProtocolVersionRange =
