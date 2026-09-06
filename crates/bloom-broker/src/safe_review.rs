@@ -348,7 +348,7 @@ fn dynamic_bytes(
     let offset = U256::from_be_slice(&data[offset_word * 32..offset_word * 32 + 32])
         .try_into()
         .map_err(|_| invalid("delegatecall ABI offset is too large"))?;
-    if offset % 32 != 0 || offset + 32 > data.len() {
+    if offset != head_words * 32 || offset + 32 > data.len() {
         return Err(invalid("delegatecall ABI offset is invalid"));
     }
     let length: usize = U256::from_be_slice(&data[offset..offset + 32])
@@ -358,7 +358,11 @@ fn dynamic_bytes(
         .checked_add(32)
         .and_then(|start| start.checked_add(length))
         .ok_or_else(|| invalid("delegatecall ABI length overflow"))?;
-    if end > data.len() || data[end..].iter().any(|byte| *byte != 0) {
+    let padded_end = end
+        .checked_add(31)
+        .map(|value| value / 32 * 32)
+        .ok_or_else(|| invalid("delegatecall ABI padding overflow"))?;
+    if padded_end != data.len() || data[end..].iter().any(|byte| *byte != 0) {
         return Err(invalid(
             "delegatecall ABI bytes are truncated or noncanonical",
         ));
@@ -465,6 +469,11 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
             } else {
                 let create = keccak256("performCreate(uint256,bytes)");
                 let create2 = keccak256("performCreate2(uint256,bytes,bytes32)");
+                let deployment_value = if data.len() >= 36 {
+                    U256::from_be_slice(&data[4..36])
+                } else {
+                    return Err(invalid("CreateCall calldata is truncated"));
+                };
                 let (kind, initcode, salt) = if data[..4] == create.as_slice()[..4] {
                     if data.len() < 68 {
                         return Err(invalid("CreateCall calldata is truncated"));
@@ -486,7 +495,7 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
                     return Err(invalid("contract deployment initcode is empty"));
                 }
                 let mut result = format!(
-                    "Action: Deploy contract ({kind})\nInitcode keccak256: {:#x}",
+                    "Action: Deploy contract ({kind})\nDeployment value (wei): {deployment_value}\nInitcode keccak256: {:#x}",
                     keccak256(initcode)
                 );
                 if let Some(salt) = salt {
@@ -700,6 +709,34 @@ mod tests {
         value["safe_tx"]["data"] = serde_json::json!("0x01");
         let envelope: Envelope = serde_json::from_value(value).unwrap();
         assert!(classify(&envelope).is_err());
+    }
+
+    #[test]
+    fn create_review_discloses_endowment_and_requires_canonical_abi() {
+        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        let mut calldata = keccak256("performCreate(uint256,bytes)").as_slice()[..4].to_vec();
+        calldata.extend_from_slice(&U256::from(9).to_be_bytes::<32>());
+        calldata.extend_from_slice(&U256::from(64).to_be_bytes::<32>());
+        calldata.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
+        calldata.push(0);
+        calldata.extend_from_slice(&[0; 31]);
+        value["safe_tx"]["to"] = serde_json::json!("0x9b35af71d77eaf8d7e40252370304687390a1a52");
+        value["safe_tx"]["value"] = serde_json::json!("0");
+        value["safe_tx"]["operation"] = serde_json::json!(1);
+        value["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(&calldata)));
+        value["library_code_hash"] =
+            serde_json::json!("0x2b3060c55fcb8275653e99ad511a71f67ba76934ed66a7d74d6e68b52afff889");
+        let parsed: Envelope = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            classify(&parsed)
+                .unwrap()
+                .contains("Deployment value (wei): 9")
+        );
+
+        calldata.extend_from_slice(&[0; 32]);
+        value["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(calldata)));
+        let parsed: Envelope = serde_json::from_value(value).unwrap();
+        assert!(classify(&parsed).is_err());
     }
 
     #[test]
