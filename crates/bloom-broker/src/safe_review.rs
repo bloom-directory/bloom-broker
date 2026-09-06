@@ -26,6 +26,7 @@ struct Envelope {
     safe_address: String,
     safe_version: String,
     singleton: String,
+    singleton_code_hash: String,
     owner: String,
     owners: Vec<String>,
     threshold: String,
@@ -171,7 +172,61 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
     {
         return Err(invalid("unsupported Safe review schema or Safe version"));
     }
-    address(&envelope.singleton, "singleton")?;
+    let singleton = address(&envelope.singleton, "singleton")?;
+    let singleton = format!("{singleton:#x}");
+    let code_hash = envelope.singleton_code_hash.to_ascii_lowercase();
+    let supported_singleton = [
+        (
+            "1.3.0",
+            "0xd9db270c1b5e3bd161e8c8503c55ceabee709552",
+            "0xbba688fbdb21ad2bb58bc320638b43d94e7d100f6f3ebaab0a4e4de6304b1c2e",
+        ),
+        (
+            "1.3.0",
+            "0x69f4d1788e39c87893c980c06edf4b7f686e2938",
+            "0xbba688fbdb21ad2bb58bc320638b43d94e7d100f6f3ebaab0a4e4de6304b1c2e",
+        ),
+        (
+            "1.3.0",
+            "0x3e5c63644e683549055b9be8653de26e0b4cd36e",
+            "0x21842597390c4c6e3c1239e434a682b054bd9548eee5e9b1d6a4482731023c0f",
+        ),
+        (
+            "1.3.0",
+            "0xfb1bffc9d739b8d520daf37df666da4c687191ea",
+            "0x21842597390c4c6e3c1239e434a682b054bd9548eee5e9b1d6a4482731023c0f",
+        ),
+        (
+            "1.4.1",
+            "0x41675c099f32341bf84bfc5382af534df5c7461a",
+            "0x1fe2df852ba3299d6534ef416eefa406e56ced995bca886ab7a553e6d0c5e1c4",
+        ),
+        (
+            "1.4.1",
+            "0x29fcb43b46531bca003ddc8fcb67ffe91900c762",
+            "0xb1f926978a0f44a2c0ec8fe822418ae969bd8c3f18d61e5103100339894f81ff",
+        ),
+        (
+            "1.5.0",
+            "0xff51a5898e281db6dfc7855790607438df2ca44b",
+            "0xdda019cbd7c867a533a2a86e5c53434fdc50b13122b5a5ddb4a8df61b31c20f2",
+        ),
+        (
+            "1.5.0",
+            "0xedd160febbd92e350d4d398fb636302fccd67c7e",
+            "0x180193227186ccb85316c94db1f0d156ed932b14712cfaac78901899178572dc",
+        ),
+    ]
+    .contains(&(
+        envelope.safe_version.as_str(),
+        singleton.as_str(),
+        code_hash.as_str(),
+    ));
+    if !supported_singleton {
+        return Err(invalid(
+            "Safe singleton address/code hash is not a pinned official deployment",
+        ));
+    }
     address(&envelope.guard, "guard")?;
     address(&envelope.fallback_handler, "fallback_handler")?;
     if envelope.owners.is_empty()
@@ -512,7 +567,8 @@ mod tests {
             "chain_id":"31337",
             "safe_address":"0x1000000000000000000000000000000000000000",
             "safe_version":"1.4.1",
-            "singleton":"0x2000000000000000000000000000000000000000",
+            "singleton":"0x41675c099f32341bf84bfc5382af534df5c7461a",
+            "singleton_code_hash":"0x1fe2df852ba3299d6534ef416eefa406e56ced995bca886ab7a553e6d0c5e1c4",
             "owner":"0x3000000000000000000000000000000000000000",
             "owners":["0x3000000000000000000000000000000000000000"],
             "threshold":"1",
