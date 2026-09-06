@@ -144,9 +144,9 @@ fn safe_preimage(envelope: &Envelope) -> Result<Vec<u8>, ProtocolError> {
     Ok(preimage)
 }
 
-fn exact_bytes<'a>(
-    request: &'a ApprovalPrepareRequest,
-) -> Result<(&'a [Digest32], &'a [Digest32]), ProtocolError> {
+fn exact_bytes(
+    request: &ApprovalPrepareRequest,
+) -> Result<(&[Digest32], &[Digest32]), ProtocolError> {
     let ApprovalSelector::Exact {
         ordered_payload_digests,
         ordered_hashes,
@@ -365,6 +365,9 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
     match envelope.safe_tx.operation {
         0 => {
             if to == safe {
+                if value.is_zero() && data.is_empty() {
+                    return Ok("Action: Reject competing Safe transaction\nValue: 0".into());
+                }
                 return Err(invalid(
                     "Safe self-calls and configuration changes are not supported",
                 ));
@@ -670,5 +673,19 @@ mod tests {
         let mut request = request;
         request.safe_review_payloads[0] = Base64UrlBytes::from_bytes(&changed);
         assert!(review(&request, &policy(), from).is_err());
+    }
+
+    #[test]
+    fn permits_only_the_canonical_same_nonce_rejection_self_call() {
+        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        value["safe_tx"]["to"] = value["safe_address"].clone();
+        value["safe_tx"]["value"] = serde_json::json!("0");
+        value["safe_tx"]["data"] = serde_json::json!("0x");
+        let envelope: Envelope = serde_json::from_value(value.clone()).unwrap();
+        assert!(classify(&envelope).unwrap().contains("Reject competing"));
+
+        value["safe_tx"]["data"] = serde_json::json!("0x01");
+        let envelope: Envelope = serde_json::from_value(value).unwrap();
+        assert!(classify(&envelope).is_err());
     }
 }
