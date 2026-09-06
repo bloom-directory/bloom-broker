@@ -40,13 +40,22 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::HashMap,
-    future::Future,
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener},
+    future::{Future, IntoFuture},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
     path::Path as FsPath,
     sync::Arc,
 };
 
-pub const CEREMONY_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_734);
+/// Canonical IPv4 loopback ceremony listener address.
+pub const CEREMONY_ADDR_V4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_734);
+/// Canonical IPv6 loopback ceremony listener address. Chromium and many
+/// other modern browsers resolve `localhost` to `::1` before `127.0.0.1`,
+/// so the canonical ceremony origin is reachable only when the Broker also
+/// binds the IPv6 loopback family explicitly.
+pub const CEREMONY_ADDR_V6: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 18_734);
+/// Every address on which the canonical ceremony listener may be reached.
+/// A listener on any address outside this set is refused at acquisition.
+pub const CEREMONY_LOOPBACK_ADDRS: [SocketAddr; 2] = [CEREMONY_ADDR_V4, CEREMONY_ADDR_V6];
 pub const CEREMONY_ORIGIN: &str = "http://localhost:18734";
 pub const MAX_CEREMONY_BODY_BYTES: usize = 16 * 1024;
 pub const CEREMONY_OWNER_HEADER: &str = "x-bloom-ceremony-owner";
@@ -1360,49 +1369,71 @@ impl CeremonyBroker {
         Ok(())
     }
 
-    /// Acquire the canonical ceremony listener for this platform.
+    /// Acquire the canonical ceremony listener pair for this platform.
     ///
-    /// macOS binds it directly. Linux always consumes the listener its launch
-    /// manager inherited, including under `triad-dev-harness`: that feature
-    /// selects which identity and manifest are loaded, not how a Linux service
-    /// acquires its socket. This lives in the library rather than the binary
-    /// so the inherited-listener path is directly testable.
+    /// The canonical ceremony origin is `http://localhost:18734`, and Chromium
+    /// resolves `localhost` to `::1` before `127.0.0.1`, so the Broker must
+    /// own both the IPv4 and the IPv6 loopback socket on the canonical port.
+    /// macOS binds them directly. Linux always consumes the listeners its
+    /// launch manager inherited, including under `triad-dev-harness`: that
+    /// feature selects which identity and manifest are loaded, not how a
+    /// Linux service acquires its sockets. This lives in the library rather
+    /// than the binary so the inherited-listener path is directly testable.
+    ///
+    /// The pair is returned in canonical order: IPv4 first, IPv6 second.
+    /// Callers must serve both listeners concurrently; the ceremony origin
+    /// resolves to whichever family the browser chose.
     #[cfg(target_os = "macos")]
-    pub fn acquire_canonical_listener(
-        _activation_name: &str,
-    ) -> Result<StdTcpListener, ProtocolError> {
-        Self::bind_canonical()
+    pub fn acquire_canonical_loopback_listeners(
+        _v4_activation_name: &str,
+        _v6_activation_name: &str,
+    ) -> Result<(StdTcpListener, StdTcpListener), ProtocolError> {
+        Self::bind_canonical_loopback()
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub fn acquire_canonical_listener(
-        activation_name: &str,
-    ) -> Result<StdTcpListener, ProtocolError> {
-        let listener =
-            bloom_service_activation::take_tcp_listener(activation_name).map_err(|error| {
+    pub fn acquire_canonical_loopback_listeners(
+        v4_activation_name: &str,
+        v6_activation_name: &str,
+    ) -> Result<(StdTcpListener, StdTcpListener), ProtocolError> {
+        let v4 = bloom_service_activation::take_tcp_listener(v4_activation_name).map_err(
+            |error| {
                 protocol(
                     ProtocolErrorCode::ServiceUnavailable,
                     format!(
-                        "no inherited ceremony listener named {activation_name:?}; this service \
-                         is socket-activated and will not bind a listener itself: {error}"
+                        "no inherited IPv4 ceremony listener named {v4_activation_name:?}; this                          service is socket-activated and will not bind a listener itself: {error}"
                     ),
                 )
-            })?;
-        Self::require_canonical_listener(listener)
+            },
+        )?;
+        let v6 = bloom_service_activation::take_tcp_listener(v6_activation_name).map_err(
+            |error| {
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!(
+                        "no inherited IPv6 ceremony listener named {v6_activation_name:?}; this                          service is socket-activated and will not bind a listener itself: {error}"
+                    ),
+                )
+            },
+        )?;
+        let v4 = Self::require_canonical_loopback_listener(v4, CEREMONY_ADDR_V4)?;
+        let v6 = Self::require_canonical_loopback_listener(v6, CEREMONY_ADDR_V6)?;
+        Ok((v4, v6))
     }
 
     /// Verify that an already-acquired listener is the canonical ceremony
-    /// socket.
+    /// socket for `expected_family`.
     ///
     /// An inherited listener is supplied by the launch manager rather than
     /// chosen by this process, so its address is an input to be checked, not
-    /// an invariant to be assumed. A descriptor bound to any other address is
-    /// refused outright: the ceremony origin, the `Host` header check, and the
-    /// browser's same-origin expectations are all pinned to
-    /// [`CEREMONY_ADDR`], so serving on a different address would silently
-    /// break them rather than fail closed.
-    pub fn require_canonical_listener(
+    /// an invariant to be assumed. A descriptor bound to any other address
+    /// is refused outright: the ceremony origin, the `Host` header check,
+    /// and the browser's same-origin expectations are all pinned to
+    /// [`CEREMONY_LOOPBACK_ADDRS`], so serving on a different address would
+    /// silently break them rather than fail closed.
+    pub fn require_canonical_loopback_listener(
         listener: StdTcpListener,
+        expected_family: SocketAddr,
     ) -> Result<StdTcpListener, ProtocolError> {
         let observed = listener.local_addr().map_err(|error| {
             protocol(
@@ -1410,12 +1441,19 @@ impl CeremonyBroker {
                 format!("inherited ceremony listener has no readable address: {error}"),
             )
         })?;
-        if observed != CEREMONY_ADDR {
+        if !CEREMONY_LOOPBACK_ADDRS.contains(&observed) {
             return Err(protocol(
                 ProtocolErrorCode::ServiceUnavailable,
                 format!(
-                    "inherited ceremony listener is bound to {observed}, not the canonical \
-                     {CEREMONY_ADDR}; no other address will be served"
+                    "inherited ceremony listener is bound to {observed}; expected one of                      {CEREMONY_LOOPBACK_ADDRS:?} but no other address will be served"
+                ),
+            ));
+        }
+        if observed != expected_family {
+            return Err(protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                format!(
+                    "inherited ceremony listener for {expected_family} is bound to {observed};                      addresses cannot be cross-paired across loopback families"
                 ),
             ));
         }
@@ -1428,14 +1466,20 @@ impl CeremonyBroker {
         Ok(listener)
     }
 
-    /// Exclusively acquire the canonical socket. There is deliberately no
-    /// fallback address or port.
-    pub fn bind_canonical() -> Result<StdTcpListener, ProtocolError> {
-        let listener = StdTcpListener::bind(CEREMONY_ADDR).map_err(|error| {
+    /// Exclusively acquire both canonical loopback sockets. There is
+    /// deliberately no fallback address or port.
+    pub fn bind_canonical_loopback() -> Result<(StdTcpListener, StdTcpListener), ProtocolError> {
+        let v4 = Self::bind_loopback_one(CEREMONY_ADDR_V4)?;
+        let v6 = Self::bind_loopback_one(CEREMONY_ADDR_V6)?;
+        Ok((v4, v6))
+    }
+
+    fn bind_loopback_one(addr: SocketAddr) -> Result<StdTcpListener, ProtocolError> {
+        let listener = StdTcpListener::bind(addr).map_err(|error| {
             protocol(
                 ProtocolErrorCode::ServiceUnavailable,
                 format!(
-                    "fatal canonical ceremony listener ownership conflict at {CEREMONY_ADDR}; no fallback port will be used: {error}"
+                    "fatal canonical ceremony listener ownership conflict at {addr}; no fallback                      address or port will be used: {error}"
                 ),
             )
         })?;
@@ -1448,56 +1492,73 @@ impl CeremonyBroker {
         Ok(listener)
     }
 
-    pub async fn serve_canonical(self) -> Result<(), ProtocolError> {
-        let listener = Self::bind_canonical()?;
-        self.serve_listener(listener).await
-    }
-
-    pub async fn serve_canonical_until<F>(self, shutdown: F) -> Result<(), ProtocolError>
+    /// Bind and serve both canonical loopback listeners until `shutdown`
+    /// resolves. macOS-only.
+    pub async fn serve_canonical_loopback_until<F>(self, shutdown: F) -> Result<(), ProtocolError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let listener = Self::bind_canonical()?;
-        self.serve_listener_until(listener, shutdown).await
+        let (v4, v6) = Self::bind_canonical_loopback()?;
+        self.serve_loopback_listeners_until(v4, v6, shutdown).await
     }
 
-    /// Accept a canonical listener inherited from a launch/socket activation
-    /// manager. A listener for any other address is rejected.
-    pub async fn serve_listener(self, listener: StdTcpListener) -> Result<(), ProtocolError> {
-        self.serve_listener_until(listener, std::future::pending())
-            .await
-    }
-
-    pub async fn serve_listener_until<F>(
+    /// Serve an already-acquired pair of canonical loopback listeners until
+    /// `shutdown` resolves. Linux uses this with descriptors inherited from
+    /// the launch manager; tests use it with synthesized listeners. Both
+    /// listeners run under one graceful shutdown. If either server exits,
+    /// its peer is also asked to stop so the pair cannot strand shutdown.
+    pub async fn serve_loopback_listeners_until<F>(
         self,
-        listener: StdTcpListener,
+        v4: StdTcpListener,
+        v6: StdTcpListener,
         shutdown: F,
     ) -> Result<(), ProtocolError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        if listener
-            .local_addr()
-            .map_err(|error| protocol(ProtocolErrorCode::ServiceUnavailable, error.to_string()))?
-            != CEREMONY_ADDR
-        {
-            return Err(protocol(
-                ProtocolErrorCode::ServiceUnavailable,
-                "inherited ceremony listener is not the canonical listener",
-            ));
-        }
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| protocol(ProtocolErrorCode::ServiceUnavailable, error.to_string()))?;
-        let listener = tokio::net::TcpListener::from_std(listener).map_err(|error| {
+        let router = self.router();
+        let v4 = tokio::net::TcpListener::from_std(v4).map_err(|error| {
             protocol(
                 ProtocolErrorCode::ServiceUnavailable,
-                format!("canonical ceremony listener handoff failed: {error}"),
+                format!("canonical IPv4 ceremony listener handoff failed: {error}"),
             )
         })?;
-        axum::serve(listener, self.router())
-            .with_graceful_shutdown(shutdown)
-            .await
+        let v6 = tokio::net::TcpListener::from_std(v6).map_err(|error| {
+            protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                format!("canonical IPv6 ceremony listener handoff failed: {error}"),
+            )
+        })?;
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let wait_for_stop = |mut stop: tokio::sync::watch::Receiver<bool>| async move {
+            while !*stop.borrow() && stop.changed().await.is_ok() {}
+        };
+        let v4_router = router.clone();
+        let v6_router = router;
+        let v4_server = axum::serve(v4, v4_router)
+            .with_graceful_shutdown(wait_for_stop(stop_rx.clone()))
+            .into_future();
+        let v6_server = axum::serve(v6, v6_router)
+            .with_graceful_shutdown(wait_for_stop(stop_rx))
+            .into_future();
+        tokio::pin!(v4_server, v6_server, shutdown);
+
+        let (v4_result, v6_result) = tokio::select! {
+            () = &mut shutdown => {
+                let _ = stop_tx.send(true);
+                tokio::join!(&mut v4_server, &mut v6_server)
+            }
+            result = &mut v4_server => {
+                let _ = stop_tx.send(true);
+                (result, v6_server.await)
+            }
+            result = &mut v6_server => {
+                let _ = stop_tx.send(true);
+                (v4_server.await, result)
+            }
+        };
+        v4_result
+            .and(v6_result)
             .map_err(|error| protocol(ProtocolErrorCode::ServiceUnavailable, error.to_string()))
     }
 
@@ -2744,7 +2805,7 @@ fn validate_host(headers: &HeaderMap) -> Result<(), ProtocolError> {
     require_loopback_header(
         headers,
         header::HOST,
-        &["127.0.0.1:18734", "localhost:18734"],
+        &["127.0.0.1:18734", "[::1]:18734", "localhost:18734"],
     )
 }
 
@@ -2752,7 +2813,11 @@ fn validate_origin(headers: &HeaderMap) -> Result<(), ProtocolError> {
     require_loopback_header(
         headers,
         header::ORIGIN,
-        &["http://127.0.0.1:18734", "http://localhost:18734"],
+        &[
+            "http://127.0.0.1:18734",
+            "http://[::1]:18734",
+            "http://localhost:18734",
+        ],
     )
 }
 
