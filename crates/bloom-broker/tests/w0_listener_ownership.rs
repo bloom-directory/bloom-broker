@@ -15,7 +15,8 @@ mod linux {
     fn two_cross_uid_brokers_fail_closed_on_the_canonical_listener() {
         match std::env::var(CHILD_MODE).as_deref() {
             Ok("hold") => {
-                let _listener = CeremonyBroker::bind_canonical()
+                let _listener = CeremonyBroker::bind_canonical_loopback()
+                    .map(|(v4, _)| v4)
                     .expect("first Broker must acquire the canonical listener");
                 println!("BLOOM_W0_READY");
                 std::io::stdout().flush().unwrap();
@@ -24,11 +25,11 @@ mod linux {
                 return;
             }
             Ok("conflict") => {
-                let error = CeremonyBroker::bind_canonical()
+                let error = CeremonyBroker::bind_canonical_loopback()
                     .expect_err("second Broker must not share the canonical listener");
                 eprintln!("{error}");
                 assert!(error.message.contains("fatal canonical ceremony listener"));
-                assert!(error.message.contains("no fallback port"));
+                assert!(error.message.contains("no fallback"));
                 std::process::exit(73);
             }
             Ok(mode) => panic!("unknown W0 child mode {mode}"),

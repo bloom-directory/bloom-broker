@@ -6,7 +6,7 @@ use bloom_audit_checkpoint::{AppendOutcome, CheckpointError, CheckpointSink};
 use bloom_broker::{
     authority::{AssuranceRegistry, BrokerAuthority, canonical_policy_authority_diff},
     ceremony::{
-        CEREMONY_ADDR, CEREMONY_OWNER_HEADER, CEREMONY_OWNER_VALUE, CeremonyBroker,
+        CEREMONY_ADDR_V4, CEREMONY_OWNER_HEADER, CEREMONY_OWNER_VALUE, CeremonyBroker,
         CeremonyCompletionObserver, CeremonyLimits, CeremonySigner, ReviewManifestContext,
     },
     clock::BrokerClock,
@@ -4302,12 +4302,14 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
 
 #[test]
 fn prebound_canonical_listener_is_a_fatal_no_fallback_failure() {
-    let listener = match std::net::TcpListener::bind(CEREMONY_ADDR) {
+    let listener = match std::net::TcpListener::bind(CEREMONY_ADDR_V4) {
         Ok(listener) => Some(listener),
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
         Err(error) => panic!("cannot establish canonical-listener precondition: {error}"),
     };
-    let error = CeremonyBroker::bind_canonical().unwrap_err();
+    let error = CeremonyBroker::bind_canonical_loopback()
+        .map(|(v4, _)| v4)
+        .unwrap_err();
     assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
     assert!(error.message.contains("18734"));
     drop(listener);
@@ -4331,14 +4333,21 @@ fn login_session_disconnect_terminalizes_every_live_browser_session() {
 }
 
 #[tokio::test]
-async fn inherited_listener_handover_rejects_every_noncanonical_socket() {
+async fn paired_loopback_servers_return_when_shutdown_resolves() {
     let signer = Arc::new(MockSigner::new());
     let broker = CeremonyBroker::new(signer);
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    assert_eq!(
-        broker.serve_listener(listener).await.unwrap_err().code,
-        ProtocolErrorCode::ServiceUnavailable
-    );
+    let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let v6 = std::net::TcpListener::bind("[::1]:0").unwrap();
+    v4.set_nonblocking(true).unwrap();
+    v6.set_nonblocking(true).unwrap();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        broker.serve_loopback_listeners_until(v4, v6, async {}),
+    )
+    .await
+    .expect("paired listeners must not strand shutdown")
+    .unwrap();
 }
 
 #[test]
