@@ -70,9 +70,9 @@ const KINDS = {
     button: "Approve rules with passkey"
   },
   key_derive: {
-    title: "Derive a key",
-    summary: "Derive a scoped key from wallet <strong>{wallet}</strong>.",
-    button: "Derive with passkey"
+    title: "Create a temporary app key",
+    summary: "Allow an installed Petal to use a temporary key from wallet <strong>{wallet}</strong>.",
+    button: "Create temporary key"
   },
   backend_enrollment: {
     title: "Enrol a signing backend",
@@ -207,6 +207,75 @@ function describeKey(ref) {
   else if (ref.key_spec) account = `${ref.key_spec} key ${shortDigest(ref.public_key_fingerprint || ref.locator || "")}`;
   return {wallet, account};
 }
+const PETAL_ACTIONS = {
+  create: "create tokens",
+  buy: "buy tokens",
+  sell: "sell tokens",
+  collect_fees: "collect fees",
+  sharing_config: "manage fee sharing",
+  close_token_account: "close empty token accounts",
+  sweep: "return unused SOL"
+};
+function naturalList(items) {
+  if (items.length < 2) return items[0] || "";
+  if (items.length === 2) return `${items[0]} and ${items[1]}`;
+  return `${items.slice(0, -1).join(", ")}, and ${items.at(-1)}`;
+}
+function describePetalScope(scope) {
+  if (!scope || typeof scope !== "object") return null;
+  const classes = Array.isArray(scope.allowed_operation_classes)
+    ? scope.allowed_operation_classes.map(String) : [];
+  const prefixes = [...new Set(classes.map(value => value.split(".")[0]).filter(Boolean))];
+  const app = prefixes.length === 1 && prefixes[0] === "pumpfun"
+    ? "Pump.fun"
+    : "this Petal";
+  const actions = [...new Set(classes.map(value => {
+    const action = value.includes(".") ? value.slice(value.indexOf(".") + 1) : value;
+    return PETAL_ACTIONS[action] || action.replace(/[_-]/g, " ");
+  }))];
+  const lifetime = Number(scope.maximum_lifetime_ms);
+  const duration = Number.isFinite(lifetime) && lifetime > 0 ? fmtRemaining(lifetime) : "a limited time";
+  return {
+    sentence: `Allow <strong>${app}</strong> to use a temporary Solana session key for up to <strong>${duration}</strong>. No funds move in this step, and your main wallet key stays inside Bloom.`,
+    facts: [
+      ["App", app],
+      ["Can", naturalList(actions)],
+      ["Session lasts", `Up to ${duration}`],
+      ["Main wallet key", "Stays inside Bloom"]
+    ],
+    button: app === "Pump.fun" ? "Create Pump.fun session key" : "Create temporary key"
+  };
+}
+function describePetalApproval(manifest) {
+  let plan;
+  try { plan = JSON.parse(manifest?.canonical_plan || "{}"); } catch (_) { return null; }
+  const terms = plan?.terms;
+  const selector = terms?.selector;
+  if (selector?.kind !== "petal") return null;
+  const classes = Array.isArray(selector.allowed_operation_classes)
+    ? selector.allowed_operation_classes.map(String) : [];
+  const prefixes = [...new Set(classes.map(value => value.split(".")[0]).filter(Boolean))];
+  const app = prefixes.length === 1 && prefixes[0] === "pumpfun" ? "Pump.fun" : "this Petal";
+  const actions = [...new Set(classes.map(value => {
+    const action = value.includes(".") ? value.slice(value.indexOf(".") + 1) : value;
+    return PETAL_ACTIONS[action] || action.replace(/[_-]/g, " ");
+  }))];
+  const operations = Number(terms?.limits?.max_operations);
+  const operationLimit = Number.isSafeInteger(operations) && operations > 0
+    ? `Up to ${operations} signed actions` : "Limited by the session rules";
+  return {
+    sentence: `Finish setting up a temporary <strong>${app}</strong> session. It can sign only the actions listed below until the timer expires. No funds move in this step, and your main wallet key stays inside Bloom.`,
+    facts: [
+      ["App", app],
+      ["Can", naturalList(actions)],
+      ["Limit", operationLimit],
+      ["Main wallet key", "Stays inside Bloom"]
+    ],
+    title: app === "Pump.fun" ? "Finish Pump.fun session setup" : "Finish temporary session setup",
+    button: app === "Pump.fun" ? "Finish Pump.fun setup" : "Finish session setup",
+    warning: `${app} creates transactions within these permissions. If the app is compromised, it could use the remaining session capacity before the timer expires.`
+  };
+}
 // Policy updates: say what changes, in the order a person cares about.
 function describePolicy(manifest) {
   const diff = manifest?.authority_diff;
@@ -240,14 +309,17 @@ function planDisclosures(manifest) {
 function renderReview(session) {
   const kind = session.ceremony_kind;
   const meta = KINDS[kind] || {title: kind.replace(/_/g, " "), summary: "", button: "Continue with passkey"};
+  const manifest = session.review_manifest;
+  const custodyManifest = manifest?.schema === "bloom.custody_ceremony_review.v1";
   const contribution = session.signer_contribution || {};
-  const wallet = contribution.wallet_id || session.review_manifest?.wallet_id || "";
+  const wallet = contribution.wallet_id || manifest?.wallet_name || manifest?.wallet_id || "";
   panelKicker.textContent = "Step 1 of 2 · Check";
   panelTitle.textContent = "What will happen";
   approve.textContent = meta.button;
   const pageTitle = document.getElementById("page-title");
   const pageLede = document.getElementById("page-lede");
-  if (pageTitle) pageTitle.textContent = meta.title;
+  if (pageTitle) pageTitle.textContent = custodyManifest && manifest.title
+    ? manifest.title : meta.title;
   if (pageLede) {
     pageLede.textContent = meta.lede ||
       "Read what will happen, then press the button. Your device will ask for your fingerprint, face, or PIN.";
@@ -261,15 +333,35 @@ function renderReview(session) {
   const ref = contribution.key_ref;
   const keyInfo = describeKey(ref);
   const walletName = wallet || keyInfo.wallet || "";
-  let summaryHtml = meta.summary.replace("{wallet}", escapeHtml(walletName || "this wallet"));
+  let summaryHtml = custodyManifest && manifest.summary
+    ? escapeHtml(manifest.summary)
+    : meta.summary.replace("{wallet}", escapeHtml(walletName || "this wallet"));
   const warns = [];
   let transfer = null;
+  let petalScope = null;
+  let petalApproval = null;
   if (kind === "sealed_approval") {
     transfer = describeTransfer(session.review_manifest);
-    if (transfer) summaryHtml = transfer.sentence;
+    if (transfer) {
+      summaryHtml = transfer.sentence;
+    } else {
+      petalApproval = describePetalApproval(session.review_manifest);
+      if (petalApproval) {
+        transfer = petalApproval;
+        summaryHtml = petalApproval.sentence;
+        approve.textContent = petalApproval.button;
+        if (pageTitle) pageTitle.textContent = petalApproval.title;
+      }
+    }
   } else if (kind === "policy_update") {
     transfer = describePolicy(session.review_manifest);
     if (transfer) summaryHtml = transfer.sentence;
+  } else if (kind === "key_derive" && contribution.petal_key_scope) {
+    petalScope = describePetalScope(contribution.petal_key_scope);
+    if (petalScope) {
+      summaryHtml = petalScope.sentence;
+      approve.textContent = petalScope.button;
+    }
   }
   fact("Wallet", walletName);
   if (kind !== "sealed_approval" &&
@@ -282,7 +374,9 @@ function renderReview(session) {
   } else if (keyInfo.account) {
     fact("Account", keyInfo.account);
   }
-  if (contribution.petal_key_scope) {
+  if (petalScope) {
+    for (const [label, value, mono] of petalScope.facts) fact(label, value, mono);
+  } else if (contribution.petal_key_scope) {
     fact("Scope", canonicalJson(contribution.petal_key_scope), true);
   }
   const expiry = el("span", {class: "expiry"});
@@ -292,12 +386,18 @@ function renderReview(session) {
     // Proof verification occurs during authorization, after this review.
     // Never suppress the plan's present-tense disclosure merely because the
     // Machine requested proof verification for the later signing step.
-    for (const item of planDisclosures(session.review_manifest)) warns.push(item);
+    if (petalApproval) warns.push(petalApproval.warning);
+    else for (const item of planDisclosures(session.review_manifest)) warns.push(item);
   }
   const parts = [
     el("p", {class: "summary", html: summaryHtml}),
     facts
   ];
+  if (kind !== "key_derive" && custodyManifest && typeof manifest.canonical_plan === "string" &&
+      manifest.canonical_plan.trim()) {
+    parts.push(el("div", {class: "plan"},
+      el("pre", {}, manifest.canonical_plan)));
+  }
   if (meta.warn) warns.unshift(meta.warn);
   for (const w of warns) parts.push(el("p", {class: "warn"}, w));
 

@@ -237,6 +237,237 @@ cryptoSelfTest().then(
     assert_eq!(String::from_utf8_lossy(&output.stdout), "browser-crypto-ok");
 }
 
+#[test]
+fn custody_manifest_is_rendered_on_the_primary_review_surface() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  setAttribute() {{}}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+const operation = "op_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+renderReview({{
+  ceremony_kind: "credential_remove",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "wallet-primary"}},
+  review_manifest: {{
+    schema: "bloom.custody_ceremony_review.v1",
+    title: "Remove a passkey from a wallet",
+    summary: "This credential stops being an authority for this wallet.",
+    canonical_plan: `Remove a passkey\n\nOperation     ${{operation}}`
+  }}
+}});
+const rendered = allText(nodes.review);
+if (nodes["page-title"].textContent !== "Remove a passkey from a wallet" ||
+    !rendered.includes("This credential stops being an authority") ||
+    !rendered.includes(operation)) {{
+  throw new Error(`custody manifest was not rendered: ${{rendered}}`);
+}}
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn key_derive_primary_review_explains_the_session_without_internal_scope_json() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  setAttribute() {{}}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+const scope = {{
+  allowed_operation_classes: ["pumpfun.buy", "pumpfun.sell", "pumpfun.sweep"],
+  allowed_routes: ["r000010", "r000011", "r000020"],
+  custody_operation_id: "internal-operation-id",
+  maximum_lifetime_ms: "3600000",
+  package_hash: "b868911206a002dd48c11fb59e8aaa8bd8b4716f70b671e10be18bd24bf7c738"
+}};
+renderReview({{
+  ceremony_kind: "key_derive",
+  expires_at_ms: Date.now() + 300000,
+  signer_contribution: {{
+    wallet_id: "main",
+    key_ref: {{key_spec: "ed25519", derivation: {{path: "m/44'/501'/0'/0'"}}}},
+    petal_key_scope: scope
+  }},
+  review_manifest: {{
+    schema: "bloom.custody_ceremony_review.v1",
+    title: "Create a temporary Petal key",
+    summary: "technical fallback",
+    canonical_plan: "internal-operation-id",
+    petal_key_scope: scope
+  }}
+}});
+const primary = allText({{textContent: "", innerHTML: "", children:
+  nodes.review.children.filter(child => child?.name !== "details")}});
+const technical = allText(nodes.review.children.find(child => child?.name === "details"));
+for (const phrase of ["Pump.fun", "No funds move", "buy tokens", "sell tokens",
+                      "return unused SOL", "main wallet key stays inside Bloom", "Up to 1h 0m"]) {{
+  if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
+}}
+for (const internal of ["allowed_routes", "custody_operation_id", "package_hash", "r000010"]) {{
+  if (primary.includes(internal)) throw new Error(`primary review exposed ${{internal}}: ${{primary}}`);
+}}
+if (!technical.includes(scope.package_hash) || !technical.includes("allowed_routes")) {{
+  throw new Error(`technical details omitted the exact signed scope: ${{technical}}`);
+}}
+if (nodes.approve.textContent !== "Create Pump.fun session key") {{
+  throw new Error(`unexpected approval label: ${{nodes.approve.textContent}}`);
+}}
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn reusable_pumpfun_approval_is_plain_language_with_raw_grants_collapsed() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  setAttribute() {{}}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+const packageHash = "b868911206a002dd48c11fb59e8aaa8bd8b4716f70b671e10be18bd24bf7c738";
+const plan = {{
+  security_disclosures: ["The displayed limits are asserted by the named Petal."],
+  terms: {{
+    wallet_id: "main",
+    limits: {{max_operations: "256", max_signatures: "256"}},
+    selector: {{
+      kind: "petal",
+      package_hash: packageHash,
+      route: "r000007",
+      allowed_operation_classes: ["pumpfun.buy", "pumpfun.sell", "pumpfun.sweep"],
+      required_claim_assurance: "machine_asserted",
+      route_grants: [{{route: "r000010", allowed_operation_classes: ["pumpfun.buy"]}}]
+    }}
+  }}
+}};
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 300000,
+  signer_contribution: {{wallet_id: "main"}},
+  review_manifest: {{
+    wallet_id: "main",
+    canonical_plan: JSON.stringify(plan),
+    approval_id: "internal-approval-id"
+  }}
+}});
+const primary = allText({{textContent: "", innerHTML: "", children:
+  nodes.review.children.filter(child => child?.name !== "details")}});
+const technical = allText(nodes.review.children.find(child => child?.name === "details"));
+for (const phrase of ["Finish setting up", "Pump.fun", "buy tokens", "sell tokens",
+                      "return unused SOL", "Up to 256 signed actions",
+                      "main wallet key stays inside Bloom"]) {{
+  if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
+}}
+for (const internal of [packageHash, "route_grants", "machine_asserted", "r000010",
+                        "limits are asserted by the named Petal"]) {{
+  if (primary.includes(internal)) throw new Error(`primary review exposed ${{internal}}: ${{primary}}`);
+}}
+if (!technical.includes(packageHash) || !technical.includes("route_grants")) {{
+  throw new Error(`technical details omitted the exact signed plan: ${{technical}}`);
+}}
+if (nodes["page-title"].textContent !== "Finish Pump.fun session setup" ||
+    nodes.approve.textContent !== "Finish Pump.fun setup") {{
+  throw new Error(`unexpected title or button: ${{nodes["page-title"].textContent}} / ${{nodes.approve.textContent}}`);
+}}
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Owners hold imported secp256k1 scalars as hex; Signer decodes base64url.
 /// The shipped page must normalize every realistic hex spelling itself —
 /// asking an owner to hand-convert a private key is both hostile and
@@ -782,6 +1013,7 @@ struct MockSigner {
     first_custody_release: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     pending: parking_lot::Mutex<HashSet<OperationId>>,
     reject_completion: bool,
+    sensitive_result: bool,
     cancellation_fails: AtomicBool,
 }
 
@@ -1221,7 +1453,15 @@ impl MockSigner {
             first_custody_release: parking_lot::Mutex::new(None),
             pending: parking_lot::Mutex::new(HashSet::new()),
             reject_completion: false,
+            sensitive_result: false,
             cancellation_fails: AtomicBool::new(false),
+        }
+    }
+
+    fn with_sensitive_result() -> Self {
+        Self {
+            sensitive_result: true,
+            ..Self::new()
         }
     }
 
@@ -1407,7 +1647,13 @@ impl CeremonySigner for MockSigner {
             credential_summaries: Vec::new(),
             initial_policy: None,
             receipt_digest: digest("44"),
-            encrypted_browser_result: None,
+            encrypted_browser_result: self.sensitive_result.then(|| {
+                serde_json::from_value(serde_json::json!({
+                    "kem_output": "a2Vt",
+                    "ciphertext": "Y2lwaGVydGV4dA"
+                }))
+                .unwrap()
+            }),
             signer_key_id: Token::new("mock-signer-key").unwrap(),
             signer_signature: Base64UrlBytes::from_bytes(&[0; 64]),
         })
@@ -2185,9 +2431,27 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             .to_bytes(),
     )
     .unwrap();
+    // The scope is still carried verbatim, but it is no longer the whole
+    // manifest: a key derivation now also renders a title, a sentence naming
+    // the consequence, and a `canonical_plan` the page shows as prose, so the
+    // owner is not authorizing against a bare object.
     assert_eq!(
-        derive_session["review_manifest"],
+        derive_session["review_manifest"]["petal_key_scope"],
         serde_json::to_value(&scope).unwrap()
+    );
+    assert_eq!(
+        derive_session["review_manifest"]["ceremony_kind"],
+        "key_derive"
+    );
+    assert_eq!(
+        derive_session["review_manifest"]["title"],
+        "Create a temporary Petal key"
+    );
+    assert!(
+        derive_session["review_manifest"]["canonical_plan"]
+            .as_str()
+            .is_some_and(|plan| plan.contains("Petal scope")),
+        "the plan must name what the derived key is bound to"
     );
     let derive_challenge: CeremonyChallenge =
         serde_json::from_value(derive_session["challenges"][0]["binding"].clone()).unwrap();
@@ -2274,6 +2538,27 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         response => panic!("unexpected response: {response:?}"),
     };
     assert_eq!(projected_result, custody_result_to_machine(&derive_result));
+    let projected_key = match MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::KeyGetPublic(bloom_broker_api::KeyRequest {
+            key_ref: projected_result.public_key_refs[0].clone(),
+        }),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::KeyGetPublic(key) => key,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    assert_eq!(projected_key.key_ref, projected_result.public_key_refs[0]);
+    assert!(
+        projected_key
+            .petal_scope_expires_at_ms
+            .is_some_and(|expires_at_ms| {
+                expires_at_ms.get() >= scope_started_ms + scope_lifetime_ms
+            }),
+        "Machine must receive the absolute Petal key expiry recorded by Broker"
+    );
 
     let approval_now_ms: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3429,6 +3714,152 @@ async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
 }
 
 #[tokio::test]
+async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
+    let signer = Arc::new(MockSigner::new());
+    let now_ms: u64 = 1_700_000_000_000;
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        signer,
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[33; 32]),
+    );
+    let response = broker
+        .prepare_approval(approval_request(), ReviewManifestContext::default(), now_ms)
+        .unwrap();
+    let approval_id = response.approval_id.clone();
+
+    assert!(
+        broker
+            .pending_approval_ceremony(&approval_id, now_ms)
+            .unwrap()
+            .is_some(),
+        "a live ceremony hands the owner a URL to complete"
+    );
+    assert!(
+        !broker.approval_ceremony_unreachable(&approval_id),
+        "an approval the owner can still complete is not unreachable"
+    );
+
+    assert!(
+        broker
+            .pending_approval_ceremony(&approval_id, now_ms + 10_001)
+            .unwrap()
+            .is_none(),
+        "an expired ceremony must not hand out a URL"
+    );
+    assert!(
+        broker.approval_ceremony_unreachable(&approval_id),
+        "once the ceremony expires the owner has no way to reach this approval, so the caller \
+         must be told to start a fresh lineage rather than poll AwaitingCeremony with no URL"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_ceremony_that_already_died_succeeds_instead_of_stranding_the_caller() {
+    let signer = Arc::new(MockSigner::new());
+    let now_ms: u64 = 1_700_000_000_000;
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        signer,
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[34; 32]),
+    );
+    broker
+        .prepare_approval(approval_request(), ReviewManifestContext::default(), now_ms)
+        .unwrap();
+    let operation_id = operation("17");
+
+    broker.expire_sessions(now_ms + 10_001).unwrap();
+    assert_eq!(
+        broker.status(&operation_id),
+        Some(CeremonyState::Expired),
+        "the ceremony lapsed without ever reaching the wallet"
+    );
+
+    // Regression: this returned OPERATION_ID_CONFLICT. The operation could then
+    // be neither completed nor abandoned, and the only way out was editing
+    // durable state by hand.
+    broker
+        .cancel(&operation_id, now_ms + 10_002)
+        .expect("cancelling an already-dead ceremony is what the caller asked for");
+
+    assert_eq!(
+        broker.status(&operation_id),
+        Some(CeremonyState::Expired),
+        "cancel is a no-op here and must not relabel how the ceremony actually ended"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_failed_session_with_a_committed_sensitive_result_is_rejected() {
+    let signer = Arc::new(MockSigner::with_sensitive_result());
+    let broker = CeremonyBroker::new(signer);
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let operation_id = operation("18");
+    let prepared = prepare(
+        &broker,
+        operation_id.clone(),
+        Some(Token::new("wallet-sensitive-result").unwrap()),
+        now_ms,
+    );
+    let status = broker.public_status(&operation_id).unwrap();
+    let ceremony_id = status.ceremony_id.to_string();
+    let token = url_token(&prepared.ceremony_url);
+    let completed = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/session/{ceremony_id}/complete"))
+                .header(header::HOST, "localhost:18734")
+                .header(header::ORIGIN, "http://localhost:18734")
+                .header("x-bloom-ceremony-token", token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "proof": {
+                            "kind": "assertion",
+                            "assertion": {
+                                "credential_id": "Y3JlZGVudGlhbA",
+                                "authenticator_data": "YXV0aA",
+                                "client_data_json": "e30",
+                                "signature": "c2ln",
+                                "user_handle": null
+                            }
+                        },
+                        "encrypted_input": null,
+                        "public_binding_digest": digest("33")
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
+    let awaiting_ack = broker.public_status(&operation_id).unwrap();
+    assert_eq!(awaiting_ack.state, CeremonyState::AwaitingRecoveryAck);
+
+    broker
+        .expire_sessions(awaiting_ack.expires_at_ms.get() + 1)
+        .unwrap();
+    let failed = broker.public_status(&operation_id).unwrap();
+    assert_eq!(failed.state, CeremonyState::Failed);
+    assert!(
+        failed.receipt_digest.is_some(),
+        "the committed wallet result must survive acknowledgement expiry"
+    );
+    let error = broker
+        .cancel(&operation_id, awaiting_ack.expires_at_ms.get() + 2)
+        .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::OperationIdConflict);
+}
+
+#[tokio::test]
 async fn review_plan_formats_known_asset_base_units_without_hiding_raw_authority_amount() {
     let signer = Arc::new(MockSigner::new());
     let now_ms: u64 = std::time::SystemTime::now()
@@ -3552,8 +3983,15 @@ async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() 
     let projection: serde_json::Value =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(
-        projection["review_manifest"],
+        projection["review_manifest"]["petal_key_scope"],
         serde_json::to_value(&scope).unwrap()
+    );
+    assert_eq!(projection["review_manifest"]["ceremony_kind"], "key_derive");
+    assert!(
+        projection["review_manifest"]["canonical_plan"]
+            .as_str()
+            .is_some_and(|plan| plan.contains("Petal scope")),
+        "the exact human review must describe the scope, not just carry it"
     );
     assert_eq!(
         projection["signer_contribution"]["petal_key_scope"],
@@ -3882,12 +4320,8 @@ fn login_session_disconnect_terminalizes_every_live_browser_session() {
     let signer = Arc::new(MockSigner::new());
     let broker = CeremonyBroker::new(signer.clone());
     let operation_id = operation("af");
-    prepare(
-        &broker,
-        operation_id.clone(),
-        Some(Token::new("wallet-logout").unwrap()),
-        10_000,
-    );
+    let wallet = Token::new("wallet-logout").unwrap();
+    prepare(&broker, operation_id.clone(), Some(wallet.clone()), 10_000);
 
     broker.terminate_live_sessions(10_001).unwrap();
 
@@ -3895,6 +4329,7 @@ fn login_session_disconnect_terminalizes_every_live_browser_session() {
     assert_eq!(status.state, CeremonyState::Cancelled);
     assert!(status.ceremony_url.is_none());
     assert_eq!(signer.cancellations.load(Ordering::SeqCst), 1);
+    prepare(&broker, operation("b0"), Some(wallet), 10_002);
 }
 
 #[tokio::test]
@@ -4725,6 +5160,18 @@ fn cancellation_backoff_reports_remaining_cooldown_and_resets_after_expiry() {
     );
 
     prepare(&broker, operation("c3"), Some(wallet), 12_000);
+}
+
+#[test]
+fn automatic_expiry_does_not_impose_cancellation_backoff() {
+    let signer = Arc::new(MockSigner::new());
+    let broker = CeremonyBroker::new(signer);
+    let wallet = Token::new("wallet-expired-review").unwrap();
+    prepare(&broker, operation("e1"), Some(wallet.clone()), 10_000);
+
+    broker.expire_sessions(20_001).unwrap();
+
+    prepare(&broker, operation("e2"), Some(wallet), 20_002);
 }
 
 #[test]

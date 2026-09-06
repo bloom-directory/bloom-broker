@@ -797,29 +797,11 @@ impl CeremonyBroker {
             anonymous_registration,
             ceremony_kind: request.ceremony_kind,
             ceremony_id: ceremony_id.clone(),
-            review_manifest: if let Some(migration) = &request.legacy_passkey_migration {
-                Some(serde_json::json!({
-                    "schema": "bloom.legacy_passkey_migration_review.v1",
-                    "title": "Import existing passkey wallet into Triad custody",
-                    "wallet_name": migration.wallet_name,
-                    "address": migration.address,
-                    "public_key_fingerprint": migration.public_key_fingerprint,
-                    "credential_id_fingerprint": migration.credential_id_fingerprint,
-                    "legacy_format_version": migration.legacy_format_version,
-                    "bundle_digest": migration.bundle_digest,
-                    "policy_mode": migration.policy_mode,
-                    "existing_passkey_remains_authority": true,
-                    "creates_current_wkek_custody": true,
-                    "legacy_policy_is_not_imported": true
-                }))
-            } else {
-                request
-                    .petal_key_scope
-                    .as_ref()
-                    .map(serde_json::to_value)
-                    .transpose()
-                    .map_err(malformed)?
-            },
+            review_manifest: custody_review_manifest(
+                &request,
+                prepared.contribution.wallet_id.as_ref(),
+                anonymous_registration,
+            )?,
             challenges: prepared.challenges,
             signer_contribution: serde_json::to_value(prepared.contribution).map_err(malformed)?,
             webauthn_options: prepared.webauthn_options,
@@ -992,8 +974,13 @@ impl CeremonyBroker {
     pub fn pending_approval_ceremony(
         &self,
         approval_id: &Digest32,
-    ) -> Option<(String, DecimalU64)> {
-        self.inner.sessions.lock().values().find_map(|session| {
+        now_ms: u64,
+    ) -> Result<Option<(String, DecimalU64)>, ProtocolError> {
+        // Status/list requests are a lifecycle boundary just like opening the
+        // browser. Sweep first so an owner who never opened the page cannot
+        // leave an expired AwaitingUser row masquerading as a live URL.
+        self.expire_sessions(now_ms)?;
+        Ok(self.inner.sessions.lock().values().find_map(|session| {
             if session.ceremony_kind != CeremonyKind::SealedApproval
                 || session.state != CeremonyState::AwaitingUser
             {
@@ -1012,7 +999,40 @@ impl CeremonyBroker {
                 .token
                 .as_ref()
                 .map(|token| (session_url(token), DecimalU64::new(session.expires_at_ms)))
-        })
+        }))
+    }
+
+    /// True when every owner ceremony minted for this approval died without
+    /// activating it. No URL exists for the owner and none can appear, so a
+    /// caller waiting on this approval is waiting on nothing.
+    ///
+    /// A completed ceremony is deliberately not counted: that approval is on
+    /// its way to `Active`, and reporting it dead would strand a signature the
+    /// owner already authorised.
+    pub fn approval_ceremony_unreachable(&self, approval_id: &Digest32) -> bool {
+        let mut saw_ceremony = false;
+        for session in self.inner.sessions.lock().values() {
+            if session.ceremony_kind != CeremonyKind::SealedApproval {
+                continue;
+            }
+            let manifest_approval_id = session
+                .projection
+                .review_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.get("approval_id"))
+                .and_then(|value| value.as_str());
+            if manifest_approval_id != Some(approval_id.as_str()) {
+                continue;
+            }
+            if !matches!(
+                session.state,
+                CeremonyState::Cancelled | CeremonyState::Expired | CeremonyState::Failed
+            ) {
+                return false;
+            }
+            saw_ceremony = true;
+        }
+        saw_ceremony
     }
 
     pub fn completed_policy_update(
@@ -1062,10 +1082,25 @@ impl CeremonyBroker {
         let (wallet_id, snapshot) = {
             let sessions = self.inner.sessions.lock();
             let session = sessions.get(&ceremony_id).ok_or_else(not_found)?;
+            // A ceremony that died without ever committing is already what a
+            // caller asking to cancel wants it to be, so report success rather
+            // than an error it cannot act on. Refusing here strands the caller:
+            // the operation can no longer be completed *or* abandoned, and the
+            // only way out is editing durable state by hand.
+            if matches!(
+                session.state,
+                CeremonyState::Cancelled | CeremonyState::Expired | CeremonyState::Failed
+            ) && session.terminal_result.is_none()
+            {
+                return Ok(());
+            }
+            // Anything that reached the wallet is a different matter: it may
+            // have taken effect, and reporting it cancelled would misdescribe
+            // what happened.
             if session.state != CeremonyState::AwaitingUser {
                 return Err(protocol(
                     ProtocolErrorCode::OperationIdConflict,
-                    "terminal ceremony cannot be cancelled",
+                    "ceremony is past the point where it can be cancelled",
                 ));
             }
             let mut snapshot = session.clone();
@@ -1096,16 +1131,9 @@ impl CeremonyBroker {
             .lock()
             .iter()
             .filter(|(_, session)| !is_terminal(session.state))
-            .map(|(id, session)| {
-                (
-                    id.clone(),
-                    session.operation_id.clone(),
-                    session.state,
-                    session.wallet_id.clone(),
-                )
-            })
+            .map(|(id, session)| (id.clone(), session.operation_id.clone(), session.state))
             .collect::<Vec<_>>();
-        for (ceremony_id, operation_id, state, wallet_id) in live {
+        for (ceremony_id, operation_id, state) in live {
             if state == CeremonyState::WalletCommitted {
                 self.sweep_committed_session(&ceremony_id, now_ms)?;
                 continue;
@@ -1135,11 +1163,9 @@ impl CeremonyBroker {
             };
             self.persist_session(&snapshot)?;
             self.inner.sessions.lock().insert(ceremony_id, snapshot);
-            if state == CeremonyState::AwaitingUser
-                && let Some(wallet_id) = &wallet_id
-            {
-                self.record_backoff(wallet_id, now_ms);
-            }
+            // Losing the authenticated Machine session is infrastructure
+            // cleanup, not an owner cancellation. Counting it as one lets
+            // routine restarts exponentially lock a wallet out of ceremonies.
         }
         Ok(())
     }
@@ -1247,11 +1273,7 @@ impl CeremonyBroker {
                 }
                 snapshot
             };
-            if state == CeremonyState::Expired {
-                if let Some(wallet_id) = &snapshot.wallet_id {
-                    self.record_backoff(wallet_id, now_ms);
-                }
-            } else if state == CeremonyState::WalletCommitted {
+            if state == CeremonyState::WalletCommitted {
                 validate_completion_identity(
                     snapshot.ceremony_kind,
                     &snapshot.operation_id,
@@ -1797,8 +1819,12 @@ impl CeremonyBroker {
             manifest.petal_use_claim.as_ref(),
             manifest.system_use_claim.as_ref(),
         );
-        let canonical_plan =
-            canonical_review_plan(request, &disclosures, manifest.petal_use_claim.as_ref())?;
+        let canonical_plan = canonical_review_plan(
+            request,
+            &disclosures,
+            manifest.petal_use_claim.as_ref(),
+            manifest.system_use_claim.as_ref(),
+        )?;
         if manifest.approval_id != approval_id
             || manifest.approval_digest != approval_digest
             || manifest.exact_payload_digests != request.exact_ordered_payload_digests
@@ -1837,8 +1863,12 @@ impl CeremonyBroker {
             context.petal_use_claim.as_ref(),
             context.system_use_claim.as_ref(),
         );
-        let canonical_plan =
-            canonical_review_plan(request, &disclosures, context.petal_use_claim.as_ref())?;
+        let canonical_plan = canonical_review_plan(
+            request,
+            &disclosures,
+            context.petal_use_claim.as_ref(),
+            context.system_use_claim.as_ref(),
+        )?;
         let mut manifest = ReviewManifest {
             schema: Token::new("bloom.review-manifest.v1")?,
             approval_id: request
@@ -2750,6 +2780,7 @@ fn canonical_review_plan(
     request: &CeremonyPrepareRequest,
     security_disclosures: &[String],
     claim: Option<&PetalUseClaim>,
+    system_claim: Option<&SystemUseClaim>,
 ) -> Result<String, ProtocolError> {
     #[derive(Serialize)]
     struct AssetAmountReview {
@@ -2772,6 +2803,34 @@ fn canonical_review_plan(
         security_disclosures: &'a [String],
     }
     let mut asset_amounts = Vec::new();
+    // A system claim declares the same amounts a Petal claim does. Reading
+    // only the Petal claim left system operations — an ordinary transaction
+    // confirmation among them — rendering as bare digests, so the owner was
+    // asked to approve a transfer without being shown its value or
+    // destination.
+    if let Some(system) = system_claim {
+        asset_amounts.extend(system.declared_debits.iter().map(|debit| {
+            review_asset_amount(
+                "declared_debit",
+                debit.asset.chain.as_str(),
+                &debit.asset.asset,
+                debit.amount.as_str(),
+            )
+        }));
+        if let bloom_broker_api::DeclaredFee::Fee {
+            chain,
+            asset,
+            amount,
+        } = &system.declared_fee
+        {
+            asset_amounts.push(review_asset_amount(
+                "declared_fee",
+                chain.as_str(),
+                asset,
+                amount.as_str(),
+            ));
+        }
+    }
     if let Some(claim) = claim {
         asset_amounts.extend(claim.declared_debits.iter().map(|debit| {
             review_asset_amount(
@@ -3143,4 +3202,158 @@ fn rolling_quota_exhausted(
         Some(details) => ProtocolError::rate_limited(message, details),
         None => protocol(ProtocolErrorCode::CeremonyRateLimited, message),
     }
+}
+
+/// One line naming the operation, and one line stating its consequence.
+///
+/// Deliberately plain: the owner is being asked to authorize custody with a
+/// hardware credential, and the only honest basis for that is a sentence they
+/// can actually read.
+fn custody_review_text(kind: CeremonyKind) -> (&'static str, &'static str) {
+    match kind {
+        CeremonyKind::WalletRegistration => (
+            "Create a new wallet",
+            "Signer creates custody for a new wallet and binds the passkey you are about to \
+             use as its authority. No existing wallet is changed.",
+        ),
+        CeremonyKind::WalletImport => (
+            "Import an existing wallet",
+            "Signer takes custody of a private key you supply in this browser. The key is \
+             entered here and never passes through the Machine process.",
+        ),
+        CeremonyKind::WalletExport => (
+            "Export wallet secret material",
+            "Signer releases this wallet's secret material to this browser. Anyone who \
+             obtains it controls the wallet.",
+        ),
+        CeremonyKind::WalletDelete => (
+            "Permanently delete a wallet",
+            "Signer destroys this wallet's custody. This cannot be undone, and Bloom cannot \
+             recover the wallet or anything it holds afterwards.",
+        ),
+        CeremonyKind::WalletRecovery => (
+            "Recover a wallet",
+            "Signer restores custody for this wallet from recovery material you supply in \
+             this browser.",
+        ),
+        CeremonyKind::CredentialAdd => (
+            "Add a passkey to a wallet",
+            "The passkey you are about to use becomes an additional authority for this \
+             wallet. Existing credentials keep working.",
+        ),
+        CeremonyKind::CredentialReplace => (
+            "Replace a wallet's passkey",
+            "The passkey you are about to use replaces the current credential for this \
+             wallet. The wallet address does not change.",
+        ),
+        CeremonyKind::CredentialRemove => (
+            "Remove a passkey from a wallet",
+            "This credential stops being an authority for this wallet. Removing your only \
+             credential leaves the wallet unusable.",
+        ),
+        CeremonyKind::BackendEnrollment => (
+            "Enroll a signing backend",
+            "Signer enrolls a signing backend for this wallet.",
+        ),
+        CeremonyKind::AccountAllocate => (
+            "Allocate a derived account",
+            "Signer derives a new account under this wallet's root and publishes its public \
+             key. The wallet's existing accounts are unaffected.",
+        ),
+        CeremonyKind::AccountRetire => (
+            "Retire a derived account",
+            "Signer retires the account named below. Bloom stops projecting it and will not \
+             select it for signing.",
+        ),
+        CeremonyKind::KeyDerive => (
+            "Create a temporary Petal key",
+            "Allow an installed Petal to use a temporary child key for only the listed actions \
+             and time. No funds move now, and the wallet's main key remains in Signer.",
+        ),
+        // Rejected earlier in custody preparation and reviewed by their own
+        // paths; named so this match stays exhaustive.
+        CeremonyKind::SealedApproval => (
+            "Approve an action",
+            "Authorize the exact action described below.",
+        ),
+        CeremonyKind::PolicyUpdate => (
+            "Update wallet policy",
+            "Replace this wallet's spending policy with the one described below.",
+        ),
+    }
+}
+
+/// Build the human-readable review a custody ceremony page renders.
+///
+/// The browser shows `review_manifest` when the session carries one and
+/// otherwise falls back to dumping the raw Signer contribution. Returning
+/// `None` therefore asks an owner to authorize custody against a page of
+/// base64, which is not consent in any meaningful sense, so every kind gets a
+/// manifest. Legacy passkey migration keeps its more specific review.
+///
+/// This is what the page displays. The value the passkey binds is the Signer
+/// contribution's own `review_manifest_digest`, so this text must describe
+/// that operation faithfully rather than stand in for it.
+fn custody_review_manifest(
+    request: &CustodyPrepareRequest,
+    wallet_id: Option<&Token>,
+    anonymous_registration: bool,
+) -> Result<Option<serde_json::Value>, ProtocolError> {
+    if let Some(migration) = &request.legacy_passkey_migration {
+        return Ok(Some(serde_json::json!({
+            "schema": "bloom.legacy_passkey_migration_review.v1",
+            "title": "Import existing passkey wallet into Triad custody",
+            "wallet_name": migration.wallet_name,
+            "address": migration.address,
+            "public_key_fingerprint": migration.public_key_fingerprint,
+            "credential_id_fingerprint": migration.credential_id_fingerprint,
+            "legacy_format_version": migration.legacy_format_version,
+            "bundle_digest": migration.bundle_digest,
+            "policy_mode": migration.policy_mode,
+            "existing_passkey_remains_authority": true,
+            "creates_current_wkek_custody": true,
+            "legacy_policy_is_not_imported": true
+        })));
+    }
+
+    let (title, summary) = custody_review_text(request.ceremony_kind);
+
+    // The page renders `canonical_plan` as plain text and only falls back to
+    // dumping this object as JSON, so the prose form is what an owner
+    // actually reads. Identifiers are shown in full so they can be compared
+    // against what the CLI printed before the browser was opened.
+    let mut plan = format!("{title}\n\n{summary}\n\n");
+    if let Some(wallet) = wallet_id {
+        plan.push_str(&format!("Wallet name   {}\n", wallet.as_str()));
+    }
+    plan.push_str(&format!(
+        "Operation     {}\nCredential    {}\n",
+        request.custody_operation_id,
+        request.expected_input_class.as_str(),
+    ));
+    if request.key_ref.is_some() {
+        plan.push_str("Key           shown in full below\n");
+    }
+    if request.petal_key_scope.is_some() {
+        plan.push_str("Petal scope   shown in full below\n");
+    }
+
+    let mut manifest = serde_json::json!({
+        "schema": "bloom.custody_ceremony_review.v1",
+        "canonical_plan": plan,
+        "title": title,
+        "summary": summary,
+        "ceremony_kind": kind_to_machine(request.ceremony_kind),
+        "wallet_name": wallet_id.map(Token::as_str),
+        "operation_id": serde_json::to_value(&request.custody_operation_id).map_err(malformed)?,
+        "credential_input": request.expected_input_class.as_str(),
+        "creates_new_wallet": anonymous_registration,
+    });
+    if let Some(scope) = &request.petal_key_scope {
+        manifest["petal_key_scope"] = serde_json::to_value(scope).map_err(malformed)?;
+    }
+    if let Some(key_ref) = &request.key_ref {
+        manifest["key_ref"] = serde_json::to_value(key_ref).map_err(malformed)?;
+    }
+    Ok(Some(manifest))
 }

@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use bloom_broker_api::{
-    ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector, Base64UrlBytes, BootEpoch,
-    DecimalU64, Digest32, MachineBrokerMethod, MachineBrokerRequest, MachineBrokerResponse,
-    MachineBrokerService, MachineSignRequest, OperationId, OperationPublicStatus, OperationState,
-    PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, RPC_ENVELOPE_SCHEMA_V1, Readiness,
-    ReadinessState, SealedApprovalPrepareResponse, ServiceCapabilities, ServiceFuture,
-    SigningPayloads, Token, VerifierPublicCapability, WalletAccountsPublic, WalletPublic,
-    WalletRequest, WalletSeedProfile,
+    ApprovalLifecycleState, ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector,
+    Base64UrlBytes, BootEpoch, DecimalU64, Digest32, MachineBrokerMethod, MachineBrokerRequest,
+    MachineBrokerResponse, MachineBrokerService, MachineSignRequest, OperationId,
+    OperationPublicStatus, OperationState, PolicyUpdateRequest, ProtocolError, ProtocolErrorCode,
+    RPC_ENVELOPE_SCHEMA_V1, Readiness, ReadinessState, SealedApprovalPrepareResponse,
+    ServiceCapabilities, ServiceFuture, SigningPayloads, Token, VerifierPublicCapability,
+    WalletAccountsPublic, WalletPublic, WalletRequest, WalletSeedProfile,
 };
 use bloom_platform_containment::NetworkContainmentGuard;
 use bloom_signer_api::{
@@ -198,7 +198,7 @@ impl BrokerRpcService {
                     .approval_public_list(&request.wallet_id)
                     .map_err(authority_error)?;
                 for status in &mut statuses {
-                    self.attach_pending_approval_ceremony(status);
+                    self.attach_pending_approval_ceremony(status)?;
                 }
                 Ok(Response::SealedApprovalList(statuses))
             }
@@ -730,20 +730,37 @@ impl BrokerRpcService {
             .authority
             .approval_public_status(approval_id)
             .map_err(authority_error)?;
-        self.attach_pending_approval_ceremony(&mut status);
+        self.attach_pending_approval_ceremony(&mut status)?;
         Ok(status)
     }
 
     fn attach_pending_approval_ceremony(
         &self,
         status: &mut bloom_broker_api::ApprovalPublicStatus,
-    ) {
-        if let Some((url, expires_at_ms)) =
-            self.ceremony.pending_approval_ceremony(&status.approval_id)
+    ) -> Result<(), ProtocolError> {
+        if let Some((url, expires_at_ms)) = self
+            .ceremony
+            .pending_approval_ceremony(&status.approval_id, self.clock.now_ms(false)?)?
         {
             status.ceremony_url = Some(url);
             status.ceremony_expires_at_ms = Some(expires_at_ms);
+            return Ok(());
         }
+        // An approval whose ceremony died still reports `AwaitingCeremony`,
+        // but with no URL to await — a state the caller can neither act on
+        // nor escape, because cancelling also needs a ceremony. Report the
+        // terminal truth so it starts a fresh approval instead of polling a
+        // ceremony that no longer exists.
+        if matches!(
+            status.state,
+            ApprovalLifecycleState::Prepared | ApprovalLifecycleState::AwaitingCeremony
+        ) && self
+            .ceremony
+            .approval_ceremony_unreachable(&status.approval_id)
+        {
+            status.state = ApprovalLifecycleState::Expired;
+        }
+        Ok(())
     }
 
     async fn prepare_policy_update(
@@ -2296,6 +2313,7 @@ mod tests {
                 bloom_signer_api::CryptoSuite::Secp256k1Keccak256Recoverable,
             ],
             derived_account: None,
+            petal_scope_expires_at_ms: None,
         }
     }
 
