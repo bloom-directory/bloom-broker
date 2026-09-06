@@ -280,6 +280,7 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
 }
 
 struct Library {
+    version: &'static str,
     kind: &'static str,
     address: &'static str,
     code_hash: &'static str,
@@ -287,41 +288,49 @@ struct Library {
 
 const LIBRARIES: &[Library] = &[
     Library {
+        version: "1.3.0",
         kind: "MultiSendCallOnly",
         address: "0x40a2accbd92bca938b02010e17a5b8929b49130d",
         code_hash: "0xa9865ac2d9c7a1591619b188c4d88167b50df6cc0c5327fcbd1c8c75f7c066ad",
     },
     Library {
+        version: "1.3.0",
         kind: "MultiSendCallOnly",
         address: "0xa1dabef33b3b82c7814b6d82a79e50f4ac44102b",
         code_hash: "0xa9865ac2d9c7a1591619b188c4d88167b50df6cc0c5327fcbd1c8c75f7c066ad",
     },
     Library {
+        version: "1.4.1",
         kind: "MultiSendCallOnly",
         address: "0x9641d764fc13c8b624c04430c7356c1c7c8102e2",
         code_hash: "0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939",
     },
     Library {
+        version: "1.5.0",
         kind: "MultiSendCallOnly",
         address: "0xa83c336b20401af773b6219ba5027174338d1836",
         code_hash: "0xcdbdcec38d2f1c7d961b0029ff8416b7e86e9974d6f0e9c9580c7d17fcfb6663",
     },
     Library {
+        version: "1.3.0",
         kind: "CreateCall",
         address: "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4",
         code_hash: "0x8155d988823a4f6f1bcbc76a64af8e510c4ce68819290d43cf24956bd24dee82",
     },
     Library {
+        version: "1.3.0",
         kind: "CreateCall",
         address: "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d",
         code_hash: "0x8155d988823a4f6f1bcbc76a64af8e510c4ce68819290d43cf24956bd24dee82",
     },
     Library {
+        version: "1.4.1",
         kind: "CreateCall",
         address: "0x9b35af71d77eaf8d7e40252370304687390a1a52",
         code_hash: "0x2b3060c55fcb8275653e99ad511a71f67ba76934ed66a7d74d6e68b52afff889",
     },
     Library {
+        version: "1.5.0",
         kind: "CreateCall",
         address: "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4",
         code_hash: "0x6b7d8d29bdf7004c4617d95041923774f3f7e74b056bff55c1861c9ec92ce54f",
@@ -400,7 +409,11 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
                 .to_ascii_lowercase();
             let library = LIBRARIES
                 .iter()
-                .find(|entry| entry.address == target && entry.code_hash == hash)
+                .find(|entry| {
+                    entry.version == envelope.safe_version
+                        && entry.address == target
+                        && entry.code_hash == hash
+                })
                 .ok_or_else(|| {
                     invalid("delegatecall target/code hash is not a pinned Safe library")
                 })?;
@@ -685,6 +698,29 @@ mod tests {
         assert!(classify(&envelope).unwrap().contains("Reject competing"));
 
         value["safe_tx"]["data"] = serde_json::json!("0x01");
+        let envelope: Envelope = serde_json::from_value(value).unwrap();
+        assert!(classify(&envelope).is_err());
+    }
+
+    #[test]
+    fn rejects_refunds_unpinned_singletons_and_cross_version_libraries() {
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        value["safe_tx"]["gas_price"] = serde_json::json!("1");
+        let canonical = serde_jcs::to_vec(&value).unwrap();
+        assert!(review(&request(canonical), &policy(), from).is_err());
+
+        value["safe_tx"]["gas_price"] = serde_json::json!("0");
+        value["singleton"] = serde_json::json!("0x4000000000000000000000000000000000000000");
+        let canonical = serde_jcs::to_vec(&value).unwrap();
+        assert!(review(&request(canonical), &policy(), from).is_err());
+
+        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        value["safe_tx"]["operation"] = serde_json::json!(1);
+        value["safe_tx"]["to"] = serde_json::json!("0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4");
+        value["safe_tx"]["value"] = serde_json::json!("0");
+        value["library_code_hash"] =
+            serde_json::json!("0x6b7d8d29bdf7004c4617d95041923774f3f7e74b056bff55c1861c9ec92ce54f");
         let envelope: Envelope = serde_json::from_value(value).unwrap();
         assert!(classify(&envelope).is_err());
     }
