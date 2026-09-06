@@ -1802,9 +1802,7 @@ fn assert_retry_contract(error: &ProtocolError, retry_after_ms: u64, limit: u64,
 }
 
 fn url_token(url: &str) -> String {
-    url.strip_prefix("http://localhost:18734/ceremony/")
-        .unwrap()
-        .to_owned()
+    url.rsplit_once("/ceremony/").unwrap().1.to_owned()
 }
 
 fn local_identity(service_id: &str, seed: [u8; 32], epoch: &str) -> LocalIdentity {
@@ -4195,7 +4193,7 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         .oneshot(
             Request::builder()
                 .uri("/")
-                .header(header::HOST, "127.0.0.1:18734")
+                .header(header::HOST, "attacker.invalid:18734")
                 .body(Body::empty())
                 .unwrap(),
         )
