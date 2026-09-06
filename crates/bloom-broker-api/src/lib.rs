@@ -44,11 +44,12 @@ pub const BROKER_API_MAJOR: u16 = 1;
 /// added under 1.3 — a 1.3 peer handed one would reject the whole error
 /// instead of reading the retry hint inside it.
 pub const RATE_LIMIT_DETAILS_MINOR: u16 = 4;
-/// The negotiated range moves as a unit, so there is no accepted minor that
-/// predates a field the Broker may emit. A 1.3 peer is refused at the hello,
-/// before any response could carry `rate_limit`.
-pub const BROKER_API_MINOR_MIN: u16 = RATE_LIMIT_DETAILS_MINOR;
-pub const BROKER_API_MINOR_MAX: u16 = RATE_LIMIT_DETAILS_MINOR;
+/// First minor supporting full native EVM preimages during exact approval review.
+pub const EVM_REVIEW_PAYLOADS_MINOR: u16 = 5;
+/// Strict decoders must agree on the review request shape before exchanging
+/// messages. Machine and Broker must be upgraded together for native EVM review.
+pub const BROKER_API_MINOR_MIN: u16 = EVM_REVIEW_PAYLOADS_MINOR;
+pub const BROKER_API_MINOR_MAX: u16 = EVM_REVIEW_PAYLOADS_MINOR;
 pub const BROKER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(BROKER_API_MAJOR, BROKER_API_MINOR_MAX);
 pub const BROKER_API_RANGE: ProtocolVersionRange =

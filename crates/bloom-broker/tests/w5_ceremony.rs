@@ -2097,6 +2097,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let approval_prepared = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_review_payloads: Vec::new(),
             operation_id: approval_operation.clone(),
             terms: approval_terms.clone(),
             canonical_plan_facts_digest: digest("d4"),
@@ -2226,6 +2227,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let exact_prepared = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_review_payloads: Vec::new(),
             operation_id: exact_approval_operation.clone(),
             terms: exact_terms.clone(),
             canonical_plan_facts_digest: digest("e7"),
@@ -2453,6 +2455,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             MachineBrokerService::dispatch(
                 &broker,
                 MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                    evm_review_payloads: Vec::new(),
                     operation_id: operation(&format!("{:02x}", 0xc0 + index)),
                     terms: denied_terms,
                     canonical_plan_facts_digest: digest("c9"),
@@ -2801,6 +2804,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         MachineBrokerService::dispatch(
             &restarted_scoped_broker,
             MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                evm_review_payloads: Vec::new(),
                 operation_id: operation("dc"),
                 terms: expired_terms,
                 canonical_plan_facts_digest: digest("dd"),
@@ -3177,6 +3181,7 @@ async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
     assert!(canonical_plan.contains("max_operations"));
     assert!(canonical_plan.contains("root-key"));
     assert!(canonical_plan.contains("Bloom has not established the execution effects"));
+    assert!(canonical_plan.contains("machine supplied descriptions are advisory"));
     let broker_signature: Base64UrlBytes =
         serde_json::from_value(manifest["broker_signature"].clone()).unwrap();
     assert_eq!(broker_signature.decode().len(), 64);

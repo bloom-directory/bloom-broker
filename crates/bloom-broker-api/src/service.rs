@@ -95,6 +95,10 @@ pub struct ApprovalPrepareRequest {
     pub operation_id: OperationId,
     pub terms: SealedApprovalTerms,
     pub canonical_plan_facts_digest: Digest32,
+    /// Optional native EVM signing preimages. Broker verifies the exact selector
+    /// and decodes these bytes itself before constructing the owner review.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evm_review_payloads: Vec<Base64UrlBytes>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
