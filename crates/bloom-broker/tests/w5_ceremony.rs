@@ -5163,6 +5163,18 @@ fn cancellation_backoff_reports_remaining_cooldown_and_resets_after_expiry() {
 }
 
 #[test]
+fn automatic_expiry_does_not_impose_cancellation_backoff() {
+    let signer = Arc::new(MockSigner::new());
+    let broker = CeremonyBroker::new(signer);
+    let wallet = Token::new("wallet-expired-review").unwrap();
+    prepare(&broker, operation("e1"), Some(wallet.clone()), 10_000);
+
+    broker.expire_sessions(20_001).unwrap();
+
+    prepare(&broker, operation("e2"), Some(wallet), 20_002);
+}
+
+#[test]
 fn requested_wallet_ids_still_count_as_new_registration_attempts() {
     let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
     let engine = Arc::new(

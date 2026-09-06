@@ -1273,11 +1273,7 @@ impl CeremonyBroker {
                 }
                 snapshot
             };
-            if state == CeremonyState::Expired {
-                if let Some(wallet_id) = &snapshot.wallet_id {
-                    self.record_backoff(wallet_id, now_ms);
-                }
-            } else if state == CeremonyState::WalletCommitted {
+            if state == CeremonyState::WalletCommitted {
                 validate_completion_identity(
                     snapshot.ceremony_kind,
                     &snapshot.operation_id,
