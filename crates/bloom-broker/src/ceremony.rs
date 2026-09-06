@@ -47,7 +47,7 @@ use std::{
 };
 
 pub const CEREMONY_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_734);
-pub const CEREMONY_ORIGIN: &str = "http://127.0.0.1:18734";
+pub const CEREMONY_ORIGIN: &str = "http://localhost:18734";
 pub const MAX_CEREMONY_BODY_BYTES: usize = 16 * 1024;
 pub const CEREMONY_OWNER_HEADER: &str = "x-bloom-ceremony-owner";
 pub const CEREMONY_OWNER_VALUE: &str = "bloom-broker-v1";
@@ -435,6 +435,34 @@ pub struct CeremonyBroker {
     inner: Arc<BrokerInner>,
 }
 
+#[derive(Clone, Copy)]
+enum BackoffClock {
+    Trusted,
+    Monotonic,
+}
+
+#[derive(Clone, Copy)]
+enum BackoffDeadline {
+    Trusted(u64),
+    Monotonic(std::time::Instant),
+}
+
+impl BackoffDeadline {
+    fn remaining_ms(self, trusted_now_ms: u64) -> u64 {
+        match self {
+            Self::Trusted(until_ms) => until_ms.saturating_sub(trusted_now_ms),
+            Self::Monotonic(until) => until
+                .checked_duration_since(std::time::Instant::now())
+                .map(|remaining| {
+                    u64::try_from(remaining.as_millis())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(u64::from(remaining.subsec_nanos() % 1_000_000 != 0))
+                })
+                .unwrap_or(0),
+        }
+    }
+}
+
 struct BrokerInner {
     signer: Arc<dyn CeremonySigner>,
     limits: CeremonyLimits,
@@ -443,7 +471,7 @@ struct BrokerInner {
     creation_admission: Mutex<()>,
     sessions: Mutex<HashMap<String, BrowserSession>>,
     operations: Mutex<HashMap<OperationId, String>>,
-    cancellation_backoff: Mutex<HashMap<Token, (u32, u64)>>,
+    cancellation_backoff: Mutex<HashMap<Token, (u32, BackoffDeadline)>>,
     invalid_attempts: Mutex<HashMap<IpAddr, u32>>,
     database: Option<Arc<std::sync::Mutex<Connection>>>,
     journal: Option<Arc<BrokerJournal>>,
@@ -1072,6 +1100,23 @@ impl CeremonyBroker {
     }
 
     pub fn cancel(&self, operation_id: &OperationId, now_ms: u64) -> Result<(), ProtocolError> {
+        self.cancel_with_backoff(operation_id, now_ms, BackoffClock::Trusted)
+    }
+
+    fn cancel_from_browser(
+        &self,
+        operation_id: &OperationId,
+        now_ms: u64,
+    ) -> Result<(), ProtocolError> {
+        self.cancel_with_backoff(operation_id, now_ms, BackoffClock::Monotonic)
+    }
+
+    fn cancel_with_backoff(
+        &self,
+        operation_id: &OperationId,
+        now_ms: u64,
+        backoff_clock: BackoffClock,
+    ) -> Result<(), ProtocolError> {
         let ceremony_id = self
             .inner
             .operations
@@ -1115,7 +1160,7 @@ impl CeremonyBroker {
         self.persist_session(&snapshot)?;
         self.inner.sessions.lock().insert(ceremony_id, snapshot);
         if let Some(wallet_id) = &wallet_id {
-            self.record_backoff(wallet_id, now_ms);
+            self.record_backoff(wallet_id, now_ms, backoff_clock);
         }
         Ok(())
     }
@@ -1553,23 +1598,23 @@ impl CeremonyBroker {
             let mut backoffs = self.inner.cancellation_backoff.lock();
             if backoffs
                 .get(wallet_id)
-                .is_some_and(|(_, until)| *until <= now_ms)
+                .is_some_and(|(_, deadline)| deadline.remaining_ms(now_ms) == 0)
             {
                 // Backoff is a cooldown, not durable strike history.  Leaving
                 // the old count here made every later cancellation escalate
                 // forever until the Broker process restarted.
                 backoffs.remove(wallet_id);
             }
-            if let Some((strikes, until)) = backoffs
+            if let Some((strikes, deadline)) = backoffs
                 .get(wallet_id)
                 .copied()
-                .filter(|(_, until)| *until > now_ms)
+                .filter(|(_, deadline)| deadline.remaining_ms(now_ms) > 0)
             {
                 // Same code, same structured contract as the rolling quotas: a
                 // caller acts on the metadata, never on the message. The
                 // cooldown admits one creation once it elapses, so its limit
                 // is 1 over a window of the current backoff.
-                let remaining_ms = until.saturating_sub(now_ms);
+                let remaining_ms = deadline.remaining_ms(now_ms);
                 let message = format!(
                     "wallet ceremony is in cancellation backoff; retry after {remaining_ms} ms"
                 );
@@ -1678,17 +1723,21 @@ impl CeremonyBroker {
         }))
     }
 
-    fn record_backoff(&self, wallet_id: &Token, now_ms: u64) {
+    fn record_backoff(&self, wallet_id: &Token, now_ms: u64, clock: BackoffClock) {
         let mut backoffs = self.inner.cancellation_backoff.lock();
-        let (count, _) = backoffs.get(wallet_id).copied().unwrap_or((0, 0));
+        let (count, _) = backoffs
+            .get(wallet_id)
+            .copied()
+            .unwrap_or((0, BackoffDeadline::Trusted(0)));
         let next_count = count.saturating_add(1);
-        backoffs.insert(
-            wallet_id.clone(),
-            (
-                next_count,
-                now_ms.saturating_add(backoff_window_ms(next_count)),
+        let window_ms = backoff_window_ms(next_count);
+        let deadline = match clock {
+            BackoffClock::Trusted => BackoffDeadline::Trusted(now_ms.saturating_add(window_ms)),
+            BackoffClock::Monotonic => BackoffDeadline::Monotonic(
+                std::time::Instant::now() + std::time::Duration::from_millis(window_ms),
             ),
-        );
+        };
+        backoffs.insert(wallet_id.clone(), (next_count, deadline));
     }
 
     fn reload_and_reconcile_nonterminal(&self) -> Result<(), ProtocolError> {
@@ -2512,7 +2561,15 @@ async fn cancel_session(
         .get(&ceremony_id)
         .map(|session| session.operation_id.clone());
     match operation {
-        Some(operation) if broker.cancel(&operation, unix_time_ms()).is_ok() => {
+        // Browser wall time and the Broker's trusted clock can diverge while
+        // the latter is being repaired. The in-memory cancellation throttle
+        // therefore uses elapsed monotonic time; the terminal audit timestamp
+        // remains ordinary wall time like the other browser transitions.
+        Some(operation)
+            if broker
+                .cancel_from_browser(&operation, unix_time_ms())
+                .is_ok() =>
+        {
             StatusCode::NO_CONTENT.into_response()
         }
         Some(_) => StatusCode::CONFLICT.into_response(),
