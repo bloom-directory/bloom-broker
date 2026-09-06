@@ -576,7 +576,7 @@ impl BrokerRpcService {
                 "native EVM approval requires full review payloads; upgrade Bloom Machine",
             ));
         }
-        if !request.evm_review_payloads.is_empty() {
+        if !request.evm_review_payloads.is_empty() || !request.safe_review_payloads.is_empty() {
             use k256::elliptic_curve::sec1::ToEncodedPoint as _;
             let response = self
                 .signer
@@ -614,6 +614,9 @@ impl BrokerRpcService {
                     )
                 })?;
             context.attributed_advisory_items = crate::evm_review::review(&request, &policy, from)?;
+            context
+                .attributed_advisory_items
+                .extend(crate::safe_review::review(&request, &policy, from)?);
         }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
             ApprovalSelector::Exact {
@@ -767,6 +770,7 @@ impl BrokerRpcService {
         }
         self.prepare_approval(ApprovalPrepareRequest {
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
             operation_id: request.operation_id,
             canonical_plan_facts_digest: request.replacement_terms.approval_digest()?,
             terms: request.replacement_terms,

@@ -259,6 +259,7 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
         MachineBrokerRequest::ActionValidate(digest(58)),
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
             operation_id: operation(54),
             terms: approval_terms(),
             canonical_plan_facts_digest: digest(59),
@@ -446,18 +447,18 @@ where
 
 #[test]
 fn every_machine_broker_variant_matches_frozen_v1_frames() {
-    // Protocol 1.5 changes the hello/capability frames; empty review payloads
+    // Protocol 1.6 changes the hello/capability frames; empty review payloads
     // remain omitted from the pre-existing approval request vectors.
     assert_eq!(MachineBrokerMethod::ALL.len(), 39);
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "3bee1fa949245af9fa0a07d3c8fc0f5086d36d47310128ebbce5d539ff683a01",
+        "eb6307cc1fee2eb17861967b5890c2827ea937d6adfad3a08c39d70a66ffd5bc",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "2c7165815cab163c7e8607d27551d8395373e66308b225f31903e04d565825e6",
+        "461e997131ab141d831aaef345c3fde9b606eb1884e87d986a3eb130d1253749",
     );
 }
 

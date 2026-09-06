@@ -99,6 +99,10 @@ pub struct ApprovalPrepareRequest {
     /// and decodes these bytes itself before constructing the owner review.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evm_review_payloads: Vec<Base64UrlBytes>,
+    /// Canonical Safe review envelopes. Broker reconstructs the Safe EIP-712
+    /// preimage from each envelope and binds it to the exact selector.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safe_review_payloads: Vec<Base64UrlBytes>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
