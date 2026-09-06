@@ -333,9 +333,7 @@ async fn account_stack_with_backup(
 }
 
 fn url_token(url: &str) -> String {
-    url.strip_prefix("http://localhost:18734/ceremony/")
-        .unwrap()
-        .to_owned()
+    url.rsplit_once("/ceremony/").unwrap().1.to_owned()
 }
 
 async fn get_session(

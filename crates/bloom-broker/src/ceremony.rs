@@ -47,7 +47,7 @@ use std::{
 };
 
 pub const CEREMONY_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_734);
-pub const CEREMONY_ORIGIN: &str = "http://localhost:18734";
+pub const CEREMONY_ORIGIN: &str = "http://127.0.0.1:18734";
 pub const MAX_CEREMONY_BODY_BYTES: usize = 16 * 1024;
 pub const CEREMONY_OWNER_HEADER: &str = "x-bloom-ceremony-owner";
 pub const CEREMONY_OWNER_VALUE: &str = "bloom-broker-v1";
@@ -2608,7 +2608,7 @@ impl CeremonyBroker {
         self.expire_sessions(unix_time_ms())?;
         validate_host(headers)?;
         if mutation {
-            require_exact_header(headers, header::ORIGIN, CEREMONY_ORIGIN)?;
+            validate_origin(headers)?;
             require_exact_header(headers, header::CONTENT_TYPE, "application/json")?;
             require_exact_header_name(headers, "sec-fetch-site", "same-origin")?;
         }
@@ -2684,7 +2684,38 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
 }
 
 fn validate_host(headers: &HeaderMap) -> Result<(), ProtocolError> {
-    require_exact_header(headers, header::HOST, "localhost:18734")
+    require_loopback_header(
+        headers,
+        header::HOST,
+        &["127.0.0.1:18734", "localhost:18734"],
+    )
+}
+
+fn validate_origin(headers: &HeaderMap) -> Result<(), ProtocolError> {
+    require_loopback_header(
+        headers,
+        header::ORIGIN,
+        &["http://127.0.0.1:18734", "http://localhost:18734"],
+    )
+}
+
+fn require_loopback_header(
+    headers: &HeaderMap,
+    name: header::HeaderName,
+    allowed: &[&str],
+) -> Result<(), ProtocolError> {
+    if headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| allowed.contains(&value))
+    {
+        Ok(())
+    } else {
+        Err(protocol(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            "ceremony request has an invalid security header",
+        ))
+    }
 }
 
 fn require_exact_header(
