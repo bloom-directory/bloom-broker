@@ -10,6 +10,8 @@ triad-dev-harness = ["bloom-triad-local-transport/triad-dev-harness"]
 
 [dependencies]
 axum.workspace = true
+alloy = { version = "2.0.5", default-features = false, features = ["std", "consensus", "rlp", "k256"] }
+k256.workspace = true
 bloom-broker-api = { path = "../bloom-broker-api" }
 bloom-signer-api.workspace = true
 bloom-platform-containment.workspace = true

@@ -556,6 +556,65 @@ impl BrokerRpcService {
         request: ApprovalPrepareRequest,
     ) -> Result<SealedApprovalPrepareResponse, ProtocolError> {
         self.reconcile_wallet(&request.terms.wallet_id).await?;
+        let mut context = ReviewManifestContext::default();
+        let native_evm = match &request.terms.subject {
+            bloom_broker_api::ApprovalSubject::Cli { command_class, .. } => matches!(
+                command_class.as_str(),
+                "transaction.confirm" | "transaction.replace" | "transaction.cancel"
+            ),
+            bloom_broker_api::ApprovalSubject::System {
+                operation_class, ..
+            } => matches!(
+                operation_class.as_str(),
+                "transaction.confirm" | "transaction.replace" | "transaction.cancel"
+            ),
+            _ => false,
+        };
+        if native_evm && request.evm_review_payloads.is_empty() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::SelectorMismatch,
+                "native EVM approval requires full review payloads; upgrade Bloom Machine",
+            ));
+        }
+        if !request.evm_review_payloads.is_empty() {
+            use k256::elliptic_curve::sec1::ToEncodedPoint as _;
+            let response = self
+                .signer
+                .request_for_machine(BrokerSignerRequest::KeyGetPublic(
+                    translate_service::key_request_to_signer(bloom_broker_api::KeyRequest {
+                        key_ref: request.terms.key_ref.clone(),
+                    }),
+                ))
+                .await?;
+            let BrokerSignerResponse::KeyGetPublic(key) = response else {
+                return Err(response_mismatch("key.get_public"));
+            };
+            let key = translate_service::key_to_machine(key);
+            if key.key_ref != request.terms.key_ref {
+                return Err(response_mismatch("EVM review key identity"));
+            }
+            let public = k256::PublicKey::from_sec1_bytes(&key.canonical_public_key.decode())
+                .map_err(|_| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "invalid EVM public key",
+                    )
+                })?;
+            let encoded = public.to_encoded_point(false);
+            let from = alloy::primitives::Address::from_raw_public_key(&encoded.as_bytes()[1..]);
+            let snapshot = self
+                .authority
+                .policy_snapshot(&request.terms.wallet_id)
+                .map_err(authority_error)?;
+            let policy =
+                serde_json::from_slice(&snapshot.canonical_policy.decode()).map_err(|_| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "invalid canonical policy",
+                    )
+                })?;
+            context.attributed_advisory_items = crate::evm_review::review(&request, &policy, from)?;
+        }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
             ApprovalSelector::Exact {
                 ordered_payload_digests,
@@ -571,11 +630,9 @@ impl BrokerRpcService {
             exact_ordered_hashes,
             replacement_approval_id: request.terms.renewal_of.clone(),
         };
-        let response = self.ceremony.prepare_approval(
-            ceremony_request,
-            ReviewManifestContext::default(),
-            self.clock.now_ms(true)?,
-        )?;
+        let response =
+            self.ceremony
+                .prepare_approval(ceremony_request, context, self.clock.now_ms(true)?)?;
         if let Err(error) = self
             .authority
             .prepare_approval(&request.terms, &response.review_manifest_digest)
@@ -709,6 +766,7 @@ impl BrokerRpcService {
             ));
         }
         self.prepare_approval(ApprovalPrepareRequest {
+            evm_review_payloads: Vec::new(),
             operation_id: request.operation_id,
             canonical_plan_facts_digest: request.replacement_terms.approval_digest()?,
             terms: request.replacement_terms,
