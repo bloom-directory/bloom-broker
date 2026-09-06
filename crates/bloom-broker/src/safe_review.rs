@@ -224,7 +224,7 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
     ));
     if !supported_singleton {
         return Err(invalid(
-            "Safe singleton address/code hash is not a pinned official deployment",
+            "reported Safe singleton and code hash are not a pinned official deployment",
         ));
     }
     address(&envelope.guard, "guard")?;
@@ -279,6 +279,14 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
     Ok(())
 }
 
+/// Pinned official Safe deployments.
+///
+/// Only `safe_tx.to` is bound to the signed digest, so the address half of a
+/// delegatecall pin is a real constraint: a delegatecall can only reach one of
+/// these addresses. The `*_code_hash` halves are Petal-reported and are matched
+/// against these constants, not against chain state — Broker holds no chain
+/// client — so they constrain which values a Petal must report, not what the
+/// Safe actually is. The singleton row is entirely Petal-reported.
 struct Library {
     version: &'static str,
     kind: &'static str,
@@ -370,6 +378,26 @@ fn dynamic_bytes(
     Ok(&data[offset + 32..end])
 }
 
+/// One disclosed line per call-only batch entry, decoded the same way a
+/// top-level call is.
+fn entry_summary(index: usize, to: Address, value: U256, data: &[u8]) -> String {
+    if data.len() == 68 && data[..4] == [0xa9, 0x05, 0x9c, 0xbb] {
+        format!(
+            "  {index}. ERC-20 transfer token={to} recipient={} amount (base units)={}",
+            Address::from_slice(&data[16..36]),
+            U256::from_be_slice(&data[36..68])
+        )
+    } else if data.is_empty() {
+        format!("  {index}. Native transfer recipient={to} value (wei)={value}")
+    } else {
+        format!(
+            "  {index}. Contract call to={to} value (wei)={value} selector=0x{} calldata keccak256={:#x}",
+            hex::encode(&data[..data.len().min(4)]),
+            keccak256(data)
+        )
+    }
+}
+
 fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
     let safe = address(&envelope.safe_address, "safe_address")?;
     let to = address(&envelope.safe_tx.to, "safe_tx.to")?;
@@ -419,7 +447,9 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
                         && entry.code_hash == hash
                 })
                 .ok_or_else(|| {
-                    invalid("delegatecall target/code hash is not a pinned Safe library")
+                    invalid(
+                        "delegatecall target is not a pinned Safe library for the reported version",
+                    )
                 })?;
             if data.len() < 4 {
                 return Err(invalid("Safe library calldata is truncated"));
@@ -430,8 +460,9 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
                 }
                 let packed = dynamic_bytes(&data[4..], 1, 0)?;
                 let mut cursor = 0;
-                let mut calls = 0;
+                let mut calls = 0usize;
                 let mut total = U256::ZERO;
+                let mut entries = Vec::new();
                 while cursor < packed.len() {
                     if calls == 32 || packed.len() - cursor < 85 {
                         return Err(invalid("MultiSendCallOnly batch is malformed or too large"));
@@ -447,23 +478,36 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
                     let length: usize = U256::from_be_slice(&packed[cursor + 53..cursor + 85])
                         .try_into()
                         .map_err(|_| invalid("MultiSend call data length is too large"))?;
-                    cursor = cursor
+                    let data_start = cursor
                         .checked_add(85)
-                        .and_then(|next| next.checked_add(length))
                         .ok_or_else(|| invalid("MultiSend call data length overflow"))?;
-                    if cursor > packed.len() {
+                    let next = data_start
+                        .checked_add(length)
+                        .ok_or_else(|| invalid("MultiSend call data length overflow"))?;
+                    if next > packed.len() {
                         return Err(invalid("MultiSend call data is truncated"));
                     }
                     total = total
                         .checked_add(call_value)
                         .ok_or_else(|| invalid("MultiSend native value overflow"))?;
                     calls += 1;
+                    // Disclose each entry. Without this a batch is the cheapest
+                    // way to hide an arbitrary call behind an opaque hash: the
+                    // same transfer sent directly is fully decoded.
+                    entries.push(entry_summary(
+                        calls,
+                        destination,
+                        call_value,
+                        &packed[data_start..next],
+                    ));
+                    cursor = next;
                 }
                 if calls == 0 {
                     return Err(invalid("MultiSendCallOnly batch is empty"));
                 }
                 Ok(format!(
-                    "Action: Call-only batch\nCalls: {calls}\nTotal native value (wei): {total}\nPacked calls keccak256: {:#x}",
+                    "Action: Call-only batch\nCalls: {calls}\nTotal native value (wei): {total}\n{}\nPacked calls keccak256: {:#x}",
+                    entries.join("\n"),
                     keccak256(packed)
                 ))
             } else {
@@ -557,24 +601,34 @@ pub(crate) fn review(
     let action = classify(&envelope)?;
     let safe = address(&envelope.safe_address, "safe_address")?;
     let to = address(&envelope.safe_tx.to, "safe_tx.to")?;
-    Ok(vec![format!(
-        "Broker-decoded Safe transaction\nSafe: {safe}\nSafe version: {}\nSingleton: {}\nChain ID: {chain}\nOwner: {from}\nOwners: {}\nThreshold: {}\nSafe nonce: {}\nOperation: {}\nDestination: {to}\nNative value (wei): {}\nSafe transaction hash: {:#x}\nGuard: {}\nEnabled modules: {}\nFallback handler: {}\n{action}\nSafe gas reimbursement: disabled",
-        envelope.safe_version,
-        envelope.singleton,
-        envelope.owners.join(", "),
-        envelope.threshold,
-        envelope.safe_tx.nonce,
-        envelope.safe_tx.operation,
-        envelope.safe_tx.value,
-        keccak256(&preimage),
-        envelope.guard,
-        if envelope.modules.is_empty() {
-            "none".into()
-        } else {
-            envelope.modules.join(", ")
-        },
-        envelope.fallback_handler,
-    )])
+    // Only the EIP-712 members are constrained by the digest comparison above.
+    // Everything else in the envelope is a Petal assertion that Broker has no
+    // way to corroborate — it holds no chain client — so the two groups are
+    // reported separately rather than under one heading that implies Broker
+    // established all of it.
+    Ok(vec![
+        format!(
+            "Broker-verified Safe transaction (rebuilt from the signed payload)\nSafe: {safe}\nChain ID: {chain}\nSigning owner: {from}\nSafe nonce: {}\nOperation: {}\nDestination: {to}\nNative value (wei): {}\nSafe transaction hash: {:#x}\n{action}\nSafe gas reimbursement: disabled",
+            envelope.safe_tx.nonce,
+            envelope.safe_tx.operation,
+            envelope.safe_tx.value,
+            keccak256(&preimage),
+        ),
+        format!(
+            "Reported by the Petal, NOT verified by Broker\nSafe version: {}\nSingleton: {}\nOwners: {}\nThreshold: {}\nGuard: {}\nEnabled modules: {}\nFallback handler: {}\nThese describe the Safe's configuration. Broker cannot read chain state, so it cannot confirm them; in particular the threshold shown may not be the number of signatures the Safe actually requires.",
+            envelope.safe_version,
+            envelope.singleton,
+            envelope.owners.join(", "),
+            envelope.threshold,
+            envelope.guard,
+            if envelope.modules.is_empty() {
+                "none".into()
+            } else {
+                envelope.modules.join(", ")
+            },
+            envelope.fallback_handler,
+        ),
+    ])
 }
 
 #[cfg(test)]
@@ -737,6 +791,95 @@ mod tests {
         value["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(calldata)));
         let parsed: Envelope = serde_json::from_value(value).unwrap();
         assert!(classify(&parsed).is_err());
+    }
+
+    fn multisend_entry(to: &str, value: u64, data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0_u8];
+        out.extend_from_slice(address(to, "to").unwrap().as_slice());
+        out.extend_from_slice(&U256::from(value).to_be_bytes::<32>());
+        out.extend_from_slice(&U256::from(data.len()).to_be_bytes::<32>());
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn multisend_calldata(packed: &[u8]) -> Vec<u8> {
+        let mut data = keccak256("multiSend(bytes)").as_slice()[..4].to_vec();
+        data.extend_from_slice(&U256::from(32).to_be_bytes::<32>());
+        data.extend_from_slice(&U256::from(packed.len()).to_be_bytes::<32>());
+        data.extend_from_slice(packed);
+        data.resize(4 + 64 + packed.len().div_ceil(32) * 32, 0);
+        data
+    }
+
+    #[test]
+    fn call_only_batches_disclose_every_entry() {
+        let mut erc20 = vec![0xa9, 0x05, 0x9c, 0xbb];
+        erc20.extend_from_slice(&[0; 12]);
+        erc20.extend_from_slice(
+            address("0x4000000000000000000000000000000000000000", "to")
+                .unwrap()
+                .as_slice(),
+        );
+        erc20.extend_from_slice(&U256::from(7).to_be_bytes::<32>());
+
+        let mut packed = multisend_entry("0x5000000000000000000000000000000000000000", 2, &erc20);
+        packed.extend(multisend_entry(
+            "0x6000000000000000000000000000000000000000",
+            3,
+            &[],
+        ));
+
+        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        value["safe_tx"]["to"] = serde_json::json!("0x9641d764fc13c8b624c04430c7356c1c7c8102e2");
+        value["safe_tx"]["value"] = serde_json::json!("0");
+        value["safe_tx"]["operation"] = serde_json::json!(1);
+        value["safe_tx"]["data"] =
+            serde_json::json!(format!("0x{}", hex::encode(multisend_calldata(&packed))));
+        value["library_code_hash"] =
+            serde_json::json!("0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939");
+        let parsed: Envelope = serde_json::from_value(value).unwrap();
+        let action = classify(&parsed).unwrap();
+
+        // A batch must not be a cheaper way to hide a call than sending it
+        // directly: every destination and amount is disclosed.
+        assert!(action.contains("Calls: 2"));
+        assert!(action.contains("Total native value (wei): 5"));
+        assert!(action.contains(
+            "1. ERC-20 transfer token=0x5000000000000000000000000000000000000000 recipient=0x4000000000000000000000000000000000000000 amount (base units)=7"
+        ));
+        assert!(action.contains(
+            "2. Native transfer recipient=0x6000000000000000000000000000000000000000 value (wei)=3"
+        ));
+    }
+
+    #[test]
+    fn unverifiable_safe_state_is_reported_separately_from_the_rebuilt_transaction() {
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        // `threshold` is not an EIP-712 member, so the digest cannot constrain
+        // it and Broker has no chain client to check it against. It must not be
+        // presented as something Broker established.
+        value["threshold"] = serde_json::json!("3");
+        value["owners"] = serde_json::json!([
+            "0x3000000000000000000000000000000000000000",
+            "0xaaaa000000000000000000000000000000000000",
+            "0xbbbb000000000000000000000000000000000000"
+        ]);
+        let canonical = serde_jcs::to_vec(&value).unwrap();
+        let items = review(&request(canonical), &policy(), from).unwrap();
+        assert_eq!(items.len(), 2);
+
+        let verified = &items[0];
+        assert!(verified.starts_with("Broker-verified Safe transaction"));
+        assert!(verified.contains("Safe nonce: 4"));
+        assert!(verified.contains("Native transfer"));
+        assert!(!verified.contains("Threshold"));
+        assert!(!verified.contains("Guard"));
+
+        let reported = &items[1];
+        assert!(reported.starts_with("Reported by the Petal, NOT verified by Broker"));
+        assert!(reported.contains("Threshold: 3"));
+        assert!(reported.contains("Fallback handler"));
     }
 
     #[test]

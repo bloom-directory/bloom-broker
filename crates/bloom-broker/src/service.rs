@@ -613,10 +613,19 @@ impl BrokerRpcService {
                         "invalid canonical policy",
                     )
                 })?;
-            context.attributed_advisory_items = crate::evm_review::review(&request, &policy, from)?;
-            context
-                .attributed_advisory_items
-                .extend(crate::safe_review::review(&request, &policy, from)?);
+            let mut items = crate::evm_review::review(&request, &policy, from)?;
+            items.extend(crate::safe_review::review(&request, &policy, from)?);
+            // Both reviewers return items whenever their payload list is
+            // non-empty, and this branch is only entered when one of them is.
+            // An empty result therefore means review payloads were accepted but
+            // no review reached the owner, which must never be approvable.
+            if items.is_empty() {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::SelectorMismatch,
+                    "review payloads were supplied but produced no owner review",
+                ));
+            }
+            context.attributed_advisory_items = items;
         }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
             ApprovalSelector::Exact {
