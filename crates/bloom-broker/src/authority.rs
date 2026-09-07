@@ -21,7 +21,7 @@ use num_bigint::BigUint;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use sha3::Keccak256;
+use sha3::{Digest as _, Keccak256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
