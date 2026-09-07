@@ -507,6 +507,25 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn wrapping_keys_match_independent_hkdf_sha256_vectors() {
+        // Independently computed using Python hashlib.sha256 and hmac (RFC 5869
+        // extract, then one expand block). Credential salt uses canonical JSON
+        // with credential_id before wallet_id and unpadded base64url bytes.
+        let wallet_id = "hkdf-compatibility-wallet";
+        let credential_id = Base64UrlBytes::from_bytes(&[3_u8; 32]);
+        let credential_key = credential_wrap_key(&[7_u8; 32], wallet_id, &credential_id).unwrap();
+        assert_eq!(
+            hex::encode(credential_key.as_slice()),
+            "ad56429fde5b3fa85e3d6a8842081d6b38555c5549900a7f415e45e1366c1748"
+        );
+        let backend_key = local_backend_key(&[11_u8; 32], wallet_id).unwrap();
+        assert_eq!(
+            hex::encode(backend_key.as_slice()),
+            "2a619a86b1866496af259355bd60946c118d742d136603e690ecfec6cc260ffe"
+        );
+    }
+
     fn fixture() -> (PathBuf, PathBuf, Vec<u8>, Vec<u8>, Vec<u8>, String) {
         let root = std::env::temp_dir().join(format!(
             "bloom-ma08-scanner-{}-{}",
