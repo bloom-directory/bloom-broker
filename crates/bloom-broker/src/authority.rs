@@ -5,10 +5,10 @@ use crate::journal::{
 use bloom_broker_api::{
     ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
     ApprovalTombstone, Base64UrlBytes, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite,
-    CustodyResult, DeclaredFee, Digest32, KeyRef, MachineSignRequest, OperationId,
-    PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope, PetalUseClaim, PolicyUpdateRequest,
-    ProtocolErrorCode, RevocationState, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
-    SystemUseClaim, Token,
+    CustodyResult, DeclaredDestination, DeclaredFee, Digest32, KeyRef, MachineSignRequest,
+    OperationId, PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope, PetalUseClaim,
+    PolicyUpdateRequest, ProtocolErrorCode, RevocationState, SealedApprovalTerms,
+    SignedPolicySnapshot, SigningPayloads, SystemUseClaim, Token,
 };
 pub use bloom_broker_api::{CanonicalWalletPolicy, PolicyDestination, RequiredVerifier};
 pub use bloom_broker_api::{
@@ -208,6 +208,12 @@ pub struct AuthorizationInput {
     /// resolved from the Signer projection before authorization. Native
     /// Solana claims bind their fee payer to it.
     pub expected_signer_public_key: Option<[u8; 32]>,
+    /// Addresses of this wallet's own active derived accounts, resolved from
+    /// the Signer projection before authorization. Paying one of these is the
+    /// wallet paying itself, so it does not need a policy allowlist entry.
+    /// Empty whenever the projection yields nothing, which leaves the
+    /// destination check exactly as strict as it was.
+    pub wallet_owned_addresses: BTreeSet<String>,
     pub reserved_at_ms: u64,
     pub observed_utc_ms: Option<u64>,
     pub monotonic_anchor_ns: u64,
@@ -2518,14 +2524,7 @@ impl BrokerAuthority {
                 "verifier contract does not establish every selector and accounting field",
             ));
         }
-        let allowed_destinations: BTreeSet<_> =
-            policy.allowed_destinations.iter().cloned().collect();
-        if claim.declared_destinations.iter().any(|destination| {
-            !allowed_destinations.contains(&PolicyDestination {
-                chain: destination.chain.clone(),
-                destination: destination.destination.clone(),
-            })
-        }) {
+        if !destinations_are_permitted(policy, input, &claim.declared_destinations) {
             return Err(denied(
                 "DESTINATION_NOT_ALLOWED",
                 "claim names a destination outside wallet policy",
@@ -2609,14 +2608,7 @@ impl BrokerAuthority {
                 "system verifier does not establish every semantic transfer field",
             ));
         }
-        let allowed_destinations: BTreeSet<_> =
-            policy.allowed_destinations.iter().cloned().collect();
-        if claim.declared_destinations.iter().any(|destination| {
-            !allowed_destinations.contains(&PolicyDestination {
-                chain: destination.chain.clone(),
-                destination: destination.destination.clone(),
-            })
-        }) {
+        if !destinations_are_permitted(policy, input, &claim.declared_destinations) {
             return Err(denied(
                 "DESTINATION_NOT_ALLOWED",
                 "system claim names a destination outside wallet policy",
@@ -3733,6 +3725,40 @@ fn budget_limits(terms: &SealedApprovalTerms) -> BudgetLimits {
 
 fn asset_id(chain: &str, asset: &str) -> String {
     format!("{chain}:{asset}")
+}
+
+/// Whether every declared destination is one this wallet may pay.
+///
+/// Wallet policy names third-party destinations explicitly. A wallet's own
+/// derived accounts are permitted without appearing there: the funds never
+/// leave the wallet's key tree, and what the receiving key may then do is
+/// already bounded by its Petal key scope, its routes and its lifetime.
+///
+/// Requiring them in the allowlist is not merely redundant, it is
+/// unsatisfiable in advance. A child's derivation index is allocated inside
+/// the ceremony that derives it, so the address does not exist until after
+/// that ceremony has completed — which forces the owner to run a second
+/// policy-update ceremony just to let the wallet pay itself.
+///
+/// Only the address is compared, not the chain. The address is the account:
+/// one seed controls it on every chain of its family, and addresses of
+/// different families cannot collide. `wallet_owned_addresses` carries only
+/// active accounts of this wallet, so a retired child, another wallet's
+/// child, and an unattested address are all still refused here.
+fn destinations_are_permitted(
+    policy: &CanonicalWalletPolicy,
+    input: &AuthorizationInput,
+    declared: &[DeclaredDestination],
+) -> bool {
+    let allowed: BTreeSet<_> = policy.allowed_destinations.iter().cloned().collect();
+    declared.iter().all(|destination| {
+        allowed.contains(&PolicyDestination {
+            chain: destination.chain.clone(),
+            destination: destination.destination.clone(),
+        }) || input
+            .wallet_owned_addresses
+            .contains(&destination.destination)
+    })
 }
 
 fn denied(code: &'static str, message: impl Into<String>) -> AuthorityError {

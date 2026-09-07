@@ -1563,6 +1563,151 @@ fn native_solana_destination_outside_policy_is_denied() {
 }
 
 #[test]
+fn native_solana_destination_owned_by_this_wallet_needs_no_policy_entry() {
+    // The wallet paying one of its own derived accounts is the funding step
+    // every session key needs. The address is allocated inside the ceremony
+    // that derives it, so no policy approved beforehand could have named it.
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let destination = bloom_solana_verify::Pubkey::from_bytes([0x44; 32]);
+    let blockhash = [0x07; 32];
+    let message = bloom_solana_verify::system_transfer::transfer_message(
+        bloom_solana_verify::Pubkey::from_bytes([0x01; 32]),
+        destination,
+        1_000_000,
+        blockhash,
+    )
+    .unwrap()
+    .serialize();
+    let claim = solana_claim_for(
+        &message,
+        &destination.to_string(),
+        blockhash,
+        ClaimAssurance::ProofVerified {
+            verifier_id: token(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID),
+            verifier_digest: Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES),
+            proof_digest: Digest32::from_bytes(Sha256::digest(&message).into()),
+        },
+    );
+    let terms = solana_terms(&harness, &provenance, &message, 120);
+    harness.activate_with_system_claim(&terms, &provenance, &claim);
+    let mut input = solana_input(
+        &terms,
+        &provenance,
+        operation(120),
+        &message,
+        claim.clone(),
+        &message,
+        Some([0x01; 32]),
+    );
+    input.wallet_owned_addresses.insert(destination.to_string());
+
+    let decision = harness.authority.authorize(&input).unwrap();
+    assert_eq!(decision.effective_assurance, Some(claim.claim_assurance));
+}
+
+#[test]
+fn a_destination_owned_by_some_other_wallet_is_still_denied() {
+    // The owned set is per wallet and compared by exact address. A non-empty
+    // set must not soften the check for anything it does not name.
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let destination = bloom_solana_verify::Pubkey::from_bytes([0x44; 32]);
+    let blockhash = [0x07; 32];
+    let message = bloom_solana_verify::system_transfer::transfer_message(
+        bloom_solana_verify::Pubkey::from_bytes([0x01; 32]),
+        destination,
+        1_000_000,
+        blockhash,
+    )
+    .unwrap()
+    .serialize();
+    let claim = solana_claim_for(
+        &message,
+        &destination.to_string(),
+        blockhash,
+        ClaimAssurance::ProofVerified {
+            verifier_id: token(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID),
+            verifier_digest: Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES),
+            proof_digest: Digest32::from_bytes(Sha256::digest(&message).into()),
+        },
+    );
+    let terms = solana_terms(&harness, &provenance, &message, 121);
+    harness.activate_with_system_claim(&terms, &provenance, &claim);
+    let mut input = solana_input(
+        &terms,
+        &provenance,
+        operation(121),
+        &message,
+        claim,
+        &message,
+        Some([0x01; 32]),
+    );
+    input
+        .wallet_owned_addresses
+        .insert(bloom_solana_verify::Pubkey::from_bytes([0x55; 32]).to_string());
+
+    assert!(
+        error_code(harness.authority.authorize(&input).unwrap_err())
+            .contains("DESTINATION_NOT_ALLOWED")
+    );
+}
+
+#[test]
+fn petal_destination_outside_policy_is_denied() {
+    let harness = Harness::new();
+    let provenance = harness.provenance();
+    let terms = petal_terms(&harness, &provenance);
+    harness.activate(&terms, Some(&provenance));
+    let mut input = petal_input(
+        &terms,
+        &provenance,
+        operation(122),
+        CryptoSuite::Secp256k1Sha256Recoverable,
+    );
+    input
+        .request
+        .petal_use_claim
+        .as_mut()
+        .unwrap()
+        .declared_destinations[0]
+        .destination = "0xstranger".into();
+    bind_operation_digest(&mut input, &terms);
+
+    assert!(
+        error_code(harness.authority.authorize(&input).unwrap_err())
+            .contains("DESTINATION_NOT_ALLOWED")
+    );
+}
+
+#[test]
+fn petal_destination_owned_by_this_wallet_needs_no_policy_entry() {
+    let harness = Harness::new();
+    let provenance = harness.provenance();
+    let terms = petal_terms(&harness, &provenance);
+    harness.activate(&terms, Some(&provenance));
+    let mut input = petal_input(
+        &terms,
+        &provenance,
+        operation(123),
+        CryptoSuite::Secp256k1Sha256Recoverable,
+    );
+    input
+        .request
+        .petal_use_claim
+        .as_mut()
+        .unwrap()
+        .declared_destinations[0]
+        .destination = "0xownchild".into();
+    input
+        .wallet_owned_addresses
+        .insert("0xownchild".to_string());
+    bind_operation_digest(&mut input, &terms);
+
+    harness.authority.authorize(&input).unwrap();
+}
+
+#[test]
 fn concurrent_renewal_has_one_atomic_winner_and_never_reactivates_predecessor() {
     let harness = Harness::new();
     let provenance = harness.system_provenance();
@@ -2062,6 +2207,7 @@ fn solana_input(
     expected_signer_public_key: Option<[u8; 32]>,
 ) -> AuthorizationInput {
     let mut input = AuthorizationInput {
+        wallet_owned_addresses: Default::default(),
         expected_signer_public_key,
         request: MachineSignRequest {
             operation_id,
@@ -2146,6 +2292,7 @@ fn exact_input(
     payload: &[u8],
 ) -> AuthorizationInput {
     let mut input = AuthorizationInput {
+        wallet_owned_addresses: Default::default(),
         expected_signer_public_key: None,
         request: MachineSignRequest {
             operation_id,
@@ -2177,6 +2324,7 @@ fn exact_batch_input(
     payloads: &[&[u8]],
 ) -> AuthorizationInput {
     let mut input = AuthorizationInput {
+        wallet_owned_addresses: Default::default(),
         expected_signer_public_key: None,
         request: MachineSignRequest {
             operation_id,
@@ -2234,6 +2382,7 @@ fn petal_input(
     };
     let claim_nonce = nonce(operation_id.to_bytes()[31]);
     let mut input = AuthorizationInput {
+        wallet_owned_addresses: Default::default(),
         expected_signer_public_key: None,
         request: MachineSignRequest {
             operation_id,

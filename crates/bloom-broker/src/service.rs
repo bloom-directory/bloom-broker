@@ -1,5 +1,6 @@
 //! Production Machine→Broker and revoke-control RPC implementation.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bloom_broker_api::{
@@ -918,13 +919,21 @@ impl BrokerRpcService {
         // key, so a native Solana claim can bind its fee payer to it. This is
         // the only layer that can: authority is synchronous and journal-
         // backed, while the account projection comes from the Signer.
-        let expected_signer_public_key = self.resolve_terms_signer_public_key(&terms).await?;
+        //
+        // The same projection answers a second question authority cannot ask:
+        // which addresses this wallet already owns. Paying one of those is the
+        // wallet paying itself, and must not require an allowlist entry naming
+        // a child that did not exist when the policy was approved.
+        let accounts = self.wallet_accounts(terms.wallet_id.clone()).await?;
+        let expected_signer_public_key = terms_signer_public_key(&terms, &accounts);
+        let wallet_owned_addresses = wallet_owned_addresses(&accounts);
         let decision = self
             .authority
             .authorize_for_clock_profile(
                 &AuthorizationInput {
                     request: request.clone(),
                     expected_signer_public_key,
+                    wallet_owned_addresses,
                     reserved_at_ms,
                     observed_utc_ms: clock.observed_utc_ms,
                     monotonic_anchor_ns: clock.monotonic_anchor_ns,
@@ -1398,37 +1407,6 @@ impl BrokerRpcService {
     /// — every non-Solana approval — so this stays a no-op for existing
     /// flows. Native Solana verification refuses to proceed on `None` rather
     /// than treating an unresolvable account as unconstrained.
-    async fn resolve_terms_signer_public_key(
-        &self,
-        terms: &bloom_broker_api::SealedApprovalTerms,
-    ) -> Result<Option<[u8; 32]>, ProtocolError> {
-        if terms.key_ref.key_spec != bloom_broker_api::KeySpec::Ed25519 {
-            return Ok(None);
-        }
-        let accounts = self.wallet_accounts(terms.wallet_id.clone()).await?;
-        let Some(account) = accounts
-            .accounts
-            .iter()
-            .find(|account| account.key_ref == terms.key_ref)
-        else {
-            return Ok(None);
-        };
-        if account.public_key_encoding != bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer {
-            return Ok(None);
-        }
-        // Canonical Ed25519 SPKI DER: a fixed 12-byte prefix then the raw key.
-        const ED25519_SPKI_PREFIX: [u8; 12] = [
-            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-        ];
-        let spki = account.canonical_public_key.decode();
-        if spki.len() != 44 || spki[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX {
-            return Ok(None);
-        }
-        let mut key = [0_u8; 32];
-        key.copy_from_slice(&spki[ED25519_SPKI_PREFIX.len()..]);
-        Ok(Some(key))
-    }
-
     async fn reconcile_wallet(&self, wallet_id: &Token) -> Result<(), ProtocolError> {
         let mut snapshot = self.revocation_snapshot(wallet_id).await?;
         loop {
@@ -2217,6 +2195,51 @@ fn jcs_digest(value: &impl serde::Serialize) -> Result<Digest32, ProtocolError> 
     ))
 }
 
+/// The canonical Ed25519 public key of the account an approval pinned, or
+/// `None` when the terms do not name an Ed25519 account this wallet projects.
+fn terms_signer_public_key(
+    terms: &bloom_broker_api::SealedApprovalTerms,
+    accounts: &bloom_broker_api::WalletAccountsPublic,
+) -> Option<[u8; 32]> {
+    if terms.key_ref.key_spec != bloom_broker_api::KeySpec::Ed25519 {
+        return None;
+    }
+    let account = accounts
+        .accounts
+        .iter()
+        .find(|account| account.key_ref == terms.key_ref)?;
+    if account.public_key_encoding != bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer {
+        return None;
+    }
+    // Canonical Ed25519 SPKI DER: a fixed 12-byte prefix then the raw key.
+    const ED25519_SPKI_PREFIX: [u8; 12] = [
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    let spki = account.canonical_public_key.decode();
+    if spki.len() != 44 || spki[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX {
+        return None;
+    }
+    let mut key = [0_u8; 32];
+    key.copy_from_slice(&spki[ED25519_SPKI_PREFIX.len()..]);
+    Some(key)
+}
+
+/// Every address this wallet currently owns, across all chain projections of
+/// its active derived accounts.
+///
+/// Retired accounts are excluded: retirement is how a wallet stops owning a
+/// child, and a destination check that ignored it would keep honouring an
+/// address the owner has already withdrawn.
+fn wallet_owned_addresses(accounts: &bloom_broker_api::WalletAccountsPublic) -> BTreeSet<String> {
+    accounts
+        .accounts
+        .iter()
+        .filter(|account| account.lifecycle == bloom_broker_api::AccountLifecycleState::Active)
+        .flat_map(|account| account.chain_projections.iter())
+        .map(|projection| projection.address.clone())
+        .collect()
+}
+
 fn authority_error(error: AuthorityError) -> ProtocolError {
     let error_kind = match &error {
         AuthorityError::Journal(_) => "journal",
@@ -2280,6 +2303,66 @@ mod tests {
     use crate::journal::OperationSnapshot;
     use bloom_broker_api::OperationState;
     use bloom_signer_api::{CryptoSuite, NormalizedSignature, SignerClaimAssurance, SigningResult};
+
+    fn derived_account(
+        locator: &str,
+        address: &str,
+        lifecycle: bloom_broker_api::AccountLifecycleState,
+    ) -> bloom_broker_api::DerivedAccountPublic {
+        bloom_broker_api::DerivedAccountPublic {
+            key_ref: bloom_broker_api::KeyRef {
+                backend: Token::new("local").unwrap(),
+                backend_instance: Token::new("wallet-root-test").unwrap(),
+                locator: locator.into(),
+                key_spec: bloom_broker_api::KeySpec::Ed25519,
+                public_key_fingerprint: Digest32::from_bytes([0x11; 32]),
+                derivation: None,
+            },
+            wallet_seed_profile: WalletSeedProfile::Bip39MulticurveV1,
+            derivation_profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            path: "m/44'/501'/0'/0'".into(),
+            canonical_public_key: Base64UrlBytes::from_bytes(&[0x22; 44]),
+            public_key_encoding: bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer,
+            public_key_fingerprint: Digest32::from_bytes([0x11; 32]),
+            supported_crypto_suites: vec![bloom_broker_api::CryptoSuite::Ed25519Message],
+            chain_projections: vec![bloom_broker_api::ChainAccountProjection {
+                chain_family: Token::new("solana").unwrap(),
+                caip2: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp".into(),
+                caip10: format!("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp:{address}"),
+                address: address.into(),
+                address_encoding: bloom_broker_api::AddressEncoding::Base58,
+            }],
+            lifecycle,
+        }
+    }
+
+    #[test]
+    fn only_active_derived_accounts_count_as_addresses_the_wallet_owns() {
+        // Retirement is how an owner stops owning a child. A destination check
+        // that kept honouring a retired address would outlive the withdrawal.
+        let accounts = WalletAccountsPublic {
+            wallet_id: Token::new("main").unwrap(),
+            seed_profile: WalletSeedProfile::Bip39MulticurveV1,
+            accounts: vec![
+                derived_account(
+                    "active",
+                    "GWGW3TzM5dEDV38xK1F8chQJptJ6aywQkwksgfhKztEu",
+                    bloom_broker_api::AccountLifecycleState::Active,
+                ),
+                derived_account(
+                    "retired",
+                    "9pcUafcrPCajWf8LD8YqJ13zxKEDbufpsaJAUR2dhPRC",
+                    bloom_broker_api::AccountLifecycleState::Retired,
+                ),
+            ],
+        };
+
+        let owned = wallet_owned_addresses(&accounts);
+
+        assert!(owned.contains("GWGW3TzM5dEDV38xK1F8chQJptJ6aywQkwksgfhKztEu"));
+        assert!(!owned.contains("9pcUafcrPCajWf8LD8YqJ13zxKEDbufpsaJAUR2dhPRC"));
+        assert_eq!(owned.len(), 1);
+    }
 
     fn readiness(service_id: &str, build: u8, state: ReadinessState) -> Readiness {
         Readiness {
