@@ -666,6 +666,7 @@ impl BrokerRpcService {
                 ordered_hashes,
             } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
             ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
+            ApprovalSelector::System { .. } => (Vec::new(), Vec::new()),
         };
         let ceremony_request = bloom_signer_api::CeremonyPrepareRequest {
             activation_operation_id: request.operation_id.clone(),

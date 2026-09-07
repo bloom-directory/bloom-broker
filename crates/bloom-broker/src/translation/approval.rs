@@ -72,6 +72,19 @@ fn selector_to_signer(value: north::ApprovalSelector) -> south::ApprovalSelector
                 .collect(),
             required_claim_assurance: assurance_to_signer(required_claim_assurance),
         },
+        north::ApprovalSelector::System {
+            component_id,
+            action_class,
+            allowed_operation_classes,
+            required_claim_assurance,
+            intent_digest,
+        } => south::ApprovalSelector::System {
+            component_id,
+            action_class,
+            allowed_operation_classes,
+            required_claim_assurance: assurance_to_signer(required_claim_assurance),
+            intent_digest,
+        },
     }
 }
 

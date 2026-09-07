@@ -9,6 +9,7 @@ pub(crate) fn selector_to_signer(value: &north::ApprovalSelector) -> south::Sele
     match value {
         north::ApprovalSelector::Exact { .. } => south::SelectorKind::Exact,
         north::ApprovalSelector::Petal { .. } => south::SelectorKind::Petal,
+        north::ApprovalSelector::System { .. } => south::SelectorKind::System,
     }
 }
 
