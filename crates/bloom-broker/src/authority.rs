@@ -1432,6 +1432,12 @@ impl BrokerAuthority {
                     )?;
                 }
             }
+            ApprovalSelector::System { .. } => {
+                return Err(denied(
+                    "PETAL_KEY_SCOPE_MISMATCH",
+                    "a Petal-scoped key cannot use a system selector",
+                ));
+            }
         }
         Ok(())
     }
@@ -1906,6 +1912,10 @@ impl BrokerAuthority {
                     required_claim_assurance,
                     ..
                 } => Some(required_claim_assurance),
+                ApprovalSelector::System {
+                    required_claim_assurance,
+                    ..
+                } => Some(required_claim_assurance),
                 ApprovalSelector::Exact { .. } => None,
             },
             ceremony_url: None,
@@ -2289,10 +2299,53 @@ impl BrokerAuthority {
                     declared_fee_asset(claim),
                 )
             }
+            (
+                ApprovalSelector::System {
+                    component_id,
+                    action_class,
+                    allowed_operation_classes,
+                    required_claim_assurance,
+                    intent_digest,
+                },
+                None,
+                Some(claim),
+            ) => {
+                if assurance_rank(claim.claim_assurance.level())
+                    < assurance_rank(*required_claim_assurance)
+                {
+                    return Err(denied(
+                        "ASSURANCE_TOO_WEAK",
+                        "system claim assurance is below the approved requirement",
+                    ));
+                }
+                if claim.approval_intent_digest().map_err(storage)? != *intent_digest {
+                    return Err(denied(
+                        "SYSTEM_CLAIM_MISMATCH",
+                        "system claim changes the approved economic intent",
+                    ));
+                }
+                self.validate_system_claim(
+                    &terms,
+                    &policy,
+                    input,
+                    claim,
+                    component_id,
+                    action_class,
+                    allowed_operation_classes,
+                    &payloads,
+                    &ordered_hashes,
+                    &payload_digests,
+                )?;
+                (
+                    account_system_claim_values(&terms, claim, &current_provenance)?,
+                    Some(claim.claim_assurance.clone()),
+                    declared_system_fee_asset(claim),
+                )
+            }
             _ => {
                 return Err(denied(
                     "SELECTOR_MISMATCH",
-                    "Petal selectors require a Petal claim",
+                    "scoped selectors require their matching claim",
                 ));
             }
         };
