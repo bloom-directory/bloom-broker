@@ -2375,7 +2375,7 @@ fn petal_input(
     let payload_hash = Digest32::from_bytes(Sha256::digest(payload).into());
     let ordered_hash = match suite {
         CryptoSuite::Secp256k1Keccak256Recoverable => {
-            use sha3::Keccak256;
+            use sha3::{Digest as _, Keccak256};
             Digest32::from_bytes(Keccak256::digest(payload).into())
         }
         _ => payload_hash,
@@ -2456,7 +2456,7 @@ fn bind_operation_digest(input: &mut AuthorizationInput, terms: &SealedApprovalT
         .iter()
         .map(|payload| match input.request.crypto_suite {
             CryptoSuite::Secp256k1Keccak256Recoverable => {
-                use sha3::Keccak256;
+                use sha3::{Digest as _, Keccak256};
                 Digest32::from_bytes(Keccak256::digest(payload).into())
             }
             _ => Digest32::from_bytes(Sha256::digest(payload).into()),
