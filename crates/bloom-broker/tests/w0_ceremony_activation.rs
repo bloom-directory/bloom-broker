@@ -23,20 +23,16 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Stdio};
 
-use bloom_broker::ceremony::{CEREMONY_ADDR, CeremonyBroker};
+use bloom_broker::ceremony::CeremonyBroker;
 
 const CHILD_MODE: &str = "BLOOM_CEREMONY_ACTIVATION_CHILD";
 const ACTIVATION_NAME: &str = "broker-ceremony";
 
 fn expected_ceremony_addr() -> SocketAddr {
-    #[cfg(feature = "triad-dev-harness")]
-    let port = std::env::var("BLOOM_TRIAD_DEV_CEREMONY_PORT")
-        .ok()
-        .map(|value| value.parse::<u16>().expect("valid developer ceremony port"))
-        .unwrap_or(CEREMONY_ADDR.port());
-    #[cfg(not(feature = "triad-dev-harness"))]
-    let port = CEREMONY_ADDR.port();
-    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+    SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::LOCALHOST,
+        bloom_broker_debug_driver::development_ceremony_port(),
+    ))
 }
 const EXIT_REFUSED: i32 = 72;
 /// The single test the child re-exec must run so it reaches `run_child`.

@@ -72,7 +72,7 @@ pub const DEFAULT_MAXIMUM_CREATIONS_PER_WALLET: usize = 12;
 /// per-wallet quota.
 pub const DEFAULT_MAXIMUM_ANONYMOUS_REGISTRATIONS: usize = 4;
 
-fn configured_ceremony_addr() -> SocketAddr {
+pub fn configured_ceremony_addr() -> SocketAddr {
     #[cfg(feature = "triad-dev-harness")]
     if let Some(value) = std::env::var_os(DEV_CEREMONY_PORT_ENV) {
         let value = value

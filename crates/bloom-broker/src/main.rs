@@ -19,7 +19,7 @@ use bloom_audit_checkpoint::{
 use bloom_broker::{
     assurance_verifiers::SolanaSystemTransferVerifier,
     authority::{AssuranceRegistry, BrokerAuthority},
-    ceremony::CeremonyBroker,
+    ceremony::{CeremonyBroker, configured_ceremony_addr},
     clock::BrokerClock,
     journal::{AuditSigner, BrokerJournal},
     service::BrokerRpcService,
@@ -134,7 +134,7 @@ struct StartupFailure {
     schema: &'static str,
     state: &'static str,
     incident: &'static str,
-    address: &'static str,
+    address: String,
     message: &'static str,
     observed_at_ms: u64,
 }
@@ -807,7 +807,10 @@ fn write_listener_conflict(
             schema: "bloom.broker-startup.1",
             state: "fatal",
             incident,
-            address: "127.0.0.1:18734",
+            // The record must name the address the broker actually
+            // contested — the same configured address bind_canonical
+            // interpolates into its own error message.
+            address: configured_ceremony_addr().to_string(),
             message,
             observed_at_ms: unix_time_ms()?,
         },
@@ -2178,7 +2181,7 @@ mod startup_failure_tests {
             schema: "bloom.broker-startup.1",
             state: "fatal",
             incident: "foreign_or_unverifiable_process",
-            address: "127.0.0.1:18734",
+            address: "127.0.0.1:18734".to_string(),
             message: "a foreign or unverifiable process owns the Bloom ceremony listener",
             observed_at_ms: 1,
         };
@@ -2199,5 +2202,56 @@ mod startup_failure_tests {
 
         std::os::unix::fs::symlink("/dev/null", &path).expect("substitute status path");
         assert!(write_startup_failure(&path, metadata.uid(), &failure).is_err());
+    }
+
+    fn status_directory() -> (tempfile::TempDir, std::path::PathBuf, u32) {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o750))
+            .expect("set status directory permissions");
+        let metadata = fs::symlink_metadata(temporary.path()).expect("status directory metadata");
+        let path = temporary.path().join("broker-startup.json");
+        (temporary, path, metadata.uid())
+    }
+
+    fn listener_conflict_record(path: &std::path::Path) -> serde_json::Value {
+        write_listener_conflict(
+            path,
+            fs::symlink_metadata(path.parent().unwrap()).unwrap().uid(),
+            None,
+        )
+        .expect("write listener conflict");
+        serde_json::from_slice(&fs::read(path).expect("read startup failure"))
+            .expect("parse startup failure")
+    }
+
+    /// The incident record must name the address the broker actually
+    /// attempted to bind. In a default build that is always the fixed
+    /// production listener, whatever the environment holds.
+    #[test]
+    fn listener_conflict_record_names_the_attempted_address() {
+        let (_temporary, path, _uid) = status_directory();
+        let value = listener_conflict_record(&path);
+        assert_eq!(value["state"], "fatal");
+        assert_eq!(value["address"], "127.0.0.1:18734");
+    }
+
+    /// Under the developer harness the attempted address is the selected
+    /// port, and the record agrees with the bind error by construction:
+    /// both read the same `configured_ceremony_addr()`.
+    #[test]
+    #[ignore = "run by CI with BLOOM_TRIAD_DEV_CEREMONY_PORT set; both feature arms"]
+    fn listener_conflict_record_reports_the_selected_port_in_harness_builds() {
+        let port = std::env::var("BLOOM_TRIAD_DEV_CEREMONY_PORT")
+            .expect("focused CI must select a developer ceremony port")
+            .parse::<u16>()
+            .expect("valid developer ceremony port");
+        let expected = if cfg!(feature = "triad-dev-harness") {
+            format!("127.0.0.1:{port}")
+        } else {
+            "127.0.0.1:18734".to_owned()
+        };
+        let (_temporary, path, _uid) = status_directory();
+        let value = listener_conflict_record(&path);
+        assert_eq!(value["address"], expected);
     }
 }

@@ -6,9 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
+# Both edges below reach dev-dependencies, so they take effect for `cargo
+# test` and are intentionally inert for `cargo build`: they exist so
+# `cargo test -p bloom-broker --features triad-dev-harness` compiles the
+# debug driver and the pinned signer with the same harness origin the
+# broker itself serves. The signer edge only changes behaviour once the pin
+# advances past the commit that introduced the developer origin.
 triad-dev-harness = [
     "bloom-broker-debug-driver/triad-dev-harness",
     "bloom-triad-local-transport/triad-dev-harness",
+    "bloom-signer/triad-dev-harness",
 ]
 
 [dependencies]

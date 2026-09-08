@@ -6,8 +6,8 @@ use bloom_audit_checkpoint::{AppendOutcome, CheckpointError, CheckpointSink};
 use bloom_broker::{
     authority::{AssuranceRegistry, BrokerAuthority, canonical_policy_authority_diff},
     ceremony::{
-        CEREMONY_ADDR, CEREMONY_OWNER_HEADER, CEREMONY_OWNER_VALUE, CeremonyBroker,
-        CeremonyCompletionObserver, CeremonyLimits, CeremonySigner, ReviewManifestContext,
+        CEREMONY_OWNER_HEADER, CEREMONY_OWNER_VALUE, CeremonyBroker, CeremonyCompletionObserver,
+        CeremonyLimits, CeremonySigner, ReviewManifestContext,
     },
     clock::BrokerClock,
     journal::{AuditSigner, BrokerJournal},
@@ -1578,15 +1578,9 @@ fn url_token(url: &str) -> String {
 }
 
 fn test_ceremony_port() -> u16 {
-    #[cfg(feature = "triad-dev-harness")]
-    if let Some(value) = std::env::var_os("BLOOM_TRIAD_DEV_CEREMONY_PORT") {
-        return value
-            .into_string()
-            .expect("developer ceremony port must be UTF-8")
-            .parse()
-            .expect("developer ceremony port must be valid");
-    }
-    CEREMONY_ADDR.port()
+    // One parser, shared with the debug driver and the broker itself, so an
+    // invalid value — including port zero — behaves identically everywhere.
+    bloom_broker_debug_driver::development_ceremony_port()
 }
 
 fn test_ceremony_host() -> String {
@@ -1594,7 +1588,7 @@ fn test_ceremony_host() -> String {
 }
 
 fn test_ceremony_origin() -> String {
-    format!("http://{}", test_ceremony_host())
+    bloom_broker_debug_driver::development_ceremony_origin()
 }
 
 fn local_identity(service_id: &str, seed: [u8; 32], epoch: &str) -> LocalIdentity {
@@ -1805,7 +1799,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .oneshot(
             Request::builder()
                 .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, test_ceremony_host())
                 .header("x-bloom-ceremony-token", &registration_token)
                 .body(Body::empty())
                 .unwrap(),
@@ -1853,8 +1847,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         Request::builder()
             .method("POST")
             .uri(format!("/api/session/{registration_id}/complete"))
-            .header(header::HOST, "localhost:18734")
-            .header(header::ORIGIN, "http://localhost:18734")
+            .header(header::HOST, test_ceremony_host())
+            .header(header::ORIGIN, test_ceremony_origin())
             .header("x-bloom-ceremony-token", &registration_token)
             .header(header::CONTENT_TYPE, "application/json")
             .header("sec-fetch-site", "same-origin")
@@ -2035,7 +2029,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .oneshot(
             Request::builder()
                 .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, test_ceremony_host())
                 .header("x-bloom-ceremony-token", token)
                 .body(Body::empty())
                 .unwrap(),
@@ -2224,7 +2218,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .oneshot(
             Request::builder()
                 .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, test_ceremony_host())
                 .header("x-bloom-ceremony-token", &derive_token)
                 .body(Body::empty())
                 .unwrap(),
@@ -2285,8 +2279,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/session/{derive_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
+                .header(header::HOST, test_ceremony_host())
+                .header(header::ORIGIN, test_ceremony_origin())
                 .header("x-bloom-ceremony-token", &derive_token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("sec-fetch-site", "same-origin")
@@ -2400,7 +2394,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .oneshot(
             Request::builder()
                 .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, test_ceremony_host())
                 .header("x-bloom-ceremony-token", &approval_token)
                 .body(Body::empty())
                 .unwrap(),
@@ -2456,8 +2450,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/session/{approval_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
+                .header(header::HOST, test_ceremony_host())
+                .header(header::ORIGIN, test_ceremony_origin())
                 .header("x-bloom-ceremony-token", &approval_token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("sec-fetch-site", "same-origin")
@@ -2531,7 +2525,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .oneshot(
             Request::builder()
                 .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, test_ceremony_host())
                 .header("x-bloom-ceremony-token", &exact_token)
                 .body(Body::empty())
                 .unwrap(),
@@ -2586,8 +2580,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/session/{exact_ceremony_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
+                .header(header::HOST, test_ceremony_host())
+                .header(header::ORIGIN, test_ceremony_origin())
                 .header("x-bloom-ceremony-token", &exact_token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("sec-fetch-site", "same-origin")
@@ -3401,7 +3395,7 @@ async fn legacy_passkey_prepare_renders_only_digest_bound_public_migration_terms
         .oneshot(
             Request::builder()
                 .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, test_ceremony_host())
                 .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
                 .body(Body::empty())
                 .unwrap(),
@@ -3459,7 +3453,7 @@ async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
         .oneshot(
             Request::builder()
                 .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, test_ceremony_host())
                 .header("x-bloom-ceremony-token", token)
                 .body(Body::empty())
                 .unwrap(),
@@ -3535,7 +3529,7 @@ async fn review_plan_formats_known_asset_base_units_without_hiding_raw_authority
         .oneshot(
             Request::builder()
                 .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, test_ceremony_host())
                 .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
                 .body(Body::empty())
                 .unwrap(),
@@ -3597,7 +3591,7 @@ async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() 
         .oneshot(
             Request::builder()
                 .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, test_ceremony_host())
                 .header("x-bloom-ceremony-token", token)
                 .body(Body::empty())
                 .unwrap(),
@@ -3684,7 +3678,7 @@ async fn machine_asserted_reusable_plan_carries_primary_surface_warning() {
         .oneshot(
             Request::builder()
                 .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, test_ceremony_host())
                 .header("x-bloom-ceremony-token", token)
                 .body(Body::empty())
                 .unwrap(),
@@ -4378,8 +4372,8 @@ async fn rejected_proof_stays_verifying_until_a_retried_cancel_releases_the_sign
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/session/{ceremony_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
+                .header(header::HOST, test_ceremony_host())
+                .header(header::ORIGIN, test_ceremony_origin())
                 .header("x-bloom-ceremony-token", &token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("sec-fetch-site", "same-origin")
@@ -4411,7 +4405,7 @@ async fn rejected_proof_stays_verifying_until_a_retried_cancel_releases_the_sign
         .oneshot(
             Request::builder()
                 .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, test_ceremony_host())
                 .header("x-bloom-ceremony-token", &token)
                 .body(Body::empty())
                 .unwrap(),
@@ -4457,7 +4451,7 @@ async fn rejected_proof_stays_verifying_until_a_retried_cancel_releases_the_sign
         .oneshot(
             Request::builder()
                 .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, test_ceremony_host())
                 .header("x-bloom-ceremony-token", &token)
                 .body(Body::empty())
                 .unwrap(),
@@ -4898,7 +4892,7 @@ async fn bip39_import_session_projects_the_authoritative_signer_profile() {
         .oneshot(
             Request::builder()
                 .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, test_ceremony_host())
                 .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
                 .body(Body::empty())
                 .unwrap(),
@@ -4968,7 +4962,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         .oneshot(
             Request::builder()
                 .uri(format!("/api/session/{ceremony_id}"))
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, test_ceremony_host())
                 .header("x-bloom-ceremony-token", &token)
                 .body(Body::empty())
                 .unwrap(),
@@ -5035,8 +5029,8 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/session/{ceremony_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
+                .header(header::HOST, test_ceremony_host())
+                .header(header::ORIGIN, test_ceremony_origin())
                 .header("x-bloom-ceremony-token", token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("sec-fetch-site", "same-origin")
@@ -5080,8 +5074,8 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/session/{export_id}/output-key"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
+                .header(header::HOST, test_ceremony_host())
+                .header(header::ORIGIN, test_ceremony_origin())
                 .header("x-bloom-ceremony-token", &export_token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("sec-fetch-site", "same-origin")
@@ -5146,8 +5140,8 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/session/{export_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
+                .header(header::HOST, test_ceremony_host())
+                .header(header::ORIGIN, test_ceremony_origin())
                 .header("x-bloom-ceremony-token", &export_token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("sec-fetch-site", "same-origin")
@@ -5174,7 +5168,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         .oneshot(
             Request::builder()
                 .uri(format!("/api/session/{export_id}/result"))
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, test_ceremony_host())
                 .header("x-bloom-ceremony-token", &export_token)
                 .body(Body::empty())
                 .unwrap(),
@@ -5211,8 +5205,8 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/session/{export_id}/ack"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
+                .header(header::HOST, test_ceremony_host())
+                .header(header::ORIGIN, test_ceremony_origin())
                 .header("x-bloom-ceremony-token", &export_token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("sec-fetch-site", "same-origin")
@@ -5226,7 +5220,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         .oneshot(
             Request::builder()
                 .uri(format!("/api/session/{export_id}/result"))
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, test_ceremony_host())
                 .header("x-bloom-ceremony-token", export_token)
                 .body(Body::empty())
                 .unwrap(),

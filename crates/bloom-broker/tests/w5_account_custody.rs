@@ -24,7 +24,9 @@ use bloom_broker_api::{
     ProvenanceRecord, ProvenanceSubject, RequestNonce, SealedApprovalTerms, SigningPayloads, Token,
     WalletAccountsPublic, WalletPublic, WalletRequest, WalletSeedProfile,
 };
-use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
+use bloom_broker_debug_driver::{
+    VirtualAuthenticator, development_ceremony_origin, development_ceremony_port, seal_hpke,
+};
 use bloom_signer::{
     ceremony::SignerCeremonyService,
     clock::SignerClock,
@@ -333,9 +335,13 @@ async fn account_stack_with_backup(
 }
 
 fn url_token(url: &str) -> String {
-    url.strip_prefix("http://localhost:18734/ceremony/")
+    url.strip_prefix(&format!("{}/ceremony/", development_ceremony_origin()))
         .unwrap()
         .to_owned()
+}
+
+fn ceremony_host_header() -> String {
+    format!("localhost:{}", development_ceremony_port())
 }
 
 async fn get_session(
@@ -349,7 +355,7 @@ async fn get_session(
         .oneshot(
             Request::builder()
                 .uri(format!("/api/session/{ceremony_id}"))
-                .header(header::HOST, "localhost:18734")
+                .header(header::HOST, ceremony_host_header())
                 .header("x-bloom-ceremony-token", token)
                 .body(Body::empty())
                 .unwrap(),
@@ -373,8 +379,8 @@ async fn post_complete(
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/session/{ceremony_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
+                .header(header::HOST, ceremony_host_header())
+                .header(header::ORIGIN, development_ceremony_origin())
                 .header("x-bloom-ceremony-token", token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("sec-fetch-site", "same-origin")
@@ -517,8 +523,8 @@ async fn register_bip39_wallet(
                 Request::builder()
                     .method("POST")
                     .uri(format!("/api/session/{ceremony_id}/output-key"))
-                    .header(header::HOST, "localhost:18734")
-                    .header(header::ORIGIN, "http://localhost:18734")
+                    .header(header::HOST, ceremony_host_header())
+                    .header(header::ORIGIN, development_ceremony_origin())
                     .header("x-bloom-ceremony-token", &token)
                     .header(header::CONTENT_TYPE, "application/json")
                     .header("sec-fetch-site", "same-origin")
@@ -593,8 +599,8 @@ async fn register_bip39_wallet(
                 Request::builder()
                     .method("POST")
                     .uri(format!("/api/session/{ceremony_id}/ack"))
-                    .header(header::HOST, "localhost:18734")
-                    .header(header::ORIGIN, "http://localhost:18734")
+                    .header(header::HOST, ceremony_host_header())
+                    .header(header::ORIGIN, development_ceremony_origin())
                     .header("x-bloom-ceremony-token", &token)
                     .header(header::CONTENT_TYPE, "application/json")
                     .header("sec-fetch-site", "same-origin")

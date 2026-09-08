@@ -26,6 +26,11 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # The harness feature gates real code (`configured_ceremony_addr` and
+      # the driver helpers); without this arm a lint regression there lands
+      # silently because the default arm never compiles it.
+      - name: Run clippy on the developer harness feature set
+        run: cargo clippy --workspace --all-targets --features triad-dev-harness --locked -- -D warnings
       - name: Run tests
         run: cargo test --workspace --locked
       - name: Exercise isolated developer ceremony origin
@@ -41,6 +46,10 @@ jobs:
           cargo test -p bloom-broker --features triad-dev-harness \
             --test w5_ceremony --locked \
             prebound_canonical_listener_is_a_fatal_no_fallback_failure -- --exact
+          cargo test -p bloom-broker --locked --bin bloom-broker \
+            startup_failure_tests::listener_conflict_record_reports_the_selected_port_in_harness_builds -- --exact --ignored
+          cargo test -p bloom-broker --features triad-dev-harness --locked --bin bloom-broker \
+            startup_failure_tests::listener_conflict_record_reports_the_selected_port_in_harness_builds -- --exact --ignored
           cargo test -p bloom-broker-debug-driver --lib --locked \
             tests::production_scoped_origin_ignores_the_developer_override -- --exact
           cargo test -p bloom-broker-debug-driver --features triad-dev-harness --lib --locked \
