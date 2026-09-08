@@ -47,7 +47,7 @@ use std::{
 };
 
 pub const CEREMONY_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_734);
-pub const CEREMONY_ORIGIN: &str = "http://127.0.0.1:18734";
+pub const CEREMONY_ORIGIN: &str = "http://localhost:18734";
 pub const MAX_CEREMONY_BODY_BYTES: usize = 16 * 1024;
 pub const CEREMONY_OWNER_HEADER: &str = "x-bloom-ceremony-owner";
 pub const CEREMONY_OWNER_VALUE: &str = "bloom-broker-v1";
