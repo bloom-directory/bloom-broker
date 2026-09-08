@@ -1562,6 +1562,260 @@ fn native_solana_destination_outside_policy_is_denied() {
     );
 }
 
+/// Terms whose selector binds the reviewed system intent rather than literal
+/// payload bytes. The intent digest is computed from the same claim the owner
+/// reviewed; only chain-freshness fields may later differ.
+fn system_intent_terms(
+    harness: &Harness,
+    provenance: &ProvenanceRecord,
+    claim: &SystemUseClaim,
+    nonce_byte: u8,
+) -> SealedApprovalTerms {
+    let mut terms = solana_terms(harness, provenance, b"unused-for-intent", nonce_byte);
+    terms.selector = ApprovalSelector::System {
+        component_id: token("bloom-machine"),
+        action_class: token("solana.transfer.confirm"),
+        allowed_operation_classes: vec![token("solana.native-transfer")],
+        required_claim_assurance: ClaimAssuranceLevel::ProofVerified,
+        intent_digest: claim.approval_intent_digest().unwrap(),
+    };
+    terms
+}
+
+fn solana_transfer(
+    payer: [u8; 32],
+    destination: [u8; 32],
+    lamports: u64,
+    blockhash: [u8; 32],
+) -> (Vec<u8>, SystemUseClaim) {
+    let message = bloom_solana_verify::system_transfer::transfer_message(
+        bloom_solana_verify::Pubkey::from_bytes(payer),
+        bloom_solana_verify::Pubkey::from_bytes(destination),
+        lamports,
+        blockhash,
+    )
+    .unwrap()
+    .serialize();
+    let mut claim = solana_claim_for(
+        &message,
+        &bloom_solana_verify::Pubkey::from_bytes(destination).to_string(),
+        blockhash,
+        ClaimAssurance::ProofVerified {
+            verifier_id: token(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID),
+            verifier_digest: Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES),
+            proof_digest: digest(0),
+        },
+    );
+    claim.declared_debits[0].amount = DecimalU256::parse(&lamports.to_string()).unwrap();
+    // Each fetched blockhash arrives with its own validity height; vary both
+    // so the refreshed claim differs from the reviewed one exactly on the
+    // freshness pair.
+    claim.chain_context.last_valid_block_height = DecimalU64::new(100 + u64::from(blockhash[0]));
+    claim = with_evidence_digest(claim, &message);
+    (message, claim)
+}
+
+#[test]
+fn system_intent_approval_covers_a_refreshed_blockhash() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (message_one, claim_one) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    let terms = system_intent_terms(&harness, &provenance, &claim_one, 91);
+    harness.activate_with_system_claim(&terms, &provenance, &claim_one);
+
+    // The owner reviewed message one. By the time the ceremony completed, the
+    // cluster had moved on, so the caller rebuilt the identical economic
+    // transfer with a fresh blockhash and its matching validity height.
+    let (message_two, claim_two) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x08; 32]);
+    assert_ne!(
+        claim_one.chain_context.recent_blockhash,
+        claim_two.chain_context.recent_blockhash
+    );
+    assert_ne!(
+        claim_one.chain_context.last_valid_block_height,
+        claim_two.chain_context.last_valid_block_height
+    );
+    assert_eq!(
+        claim_one.approval_intent_digest().unwrap(),
+        claim_two.approval_intent_digest().unwrap(),
+        "a blockhash refresh alone must not change the reviewed intent"
+    );
+
+    let input = solana_input(
+        &terms,
+        &provenance,
+        operation(91),
+        &message_two,
+        claim_two.clone(),
+        &message_two,
+        Some([0x01; 32]),
+    );
+    let decision = harness.authority.authorize(&input).unwrap();
+    assert_eq!(
+        decision.effective_assurance,
+        Some(claim_two.claim_assurance)
+    );
+}
+
+#[test]
+fn system_intent_approval_denies_a_changed_intent() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (_, claim_one) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    let terms = system_intent_terms(&harness, &provenance, &claim_one, 92);
+    harness.activate_with_system_claim(&terms, &provenance, &claim_one);
+
+    let (inflated, inflated_claim) = solana_transfer([0x01; 32], [0x02; 32], 2_000_000, [0x08; 32]);
+    assert!(
+        error_code(
+            harness
+                .authority
+                .authorize(&solana_input(
+                    &terms,
+                    &provenance,
+                    operation(92),
+                    &inflated,
+                    inflated_claim,
+                    &inflated,
+                    Some([0x01; 32]),
+                ))
+                .unwrap_err()
+        )
+        .contains("SYSTEM_CLAIM_MISMATCH"),
+        "a refreshed payload that changes the reviewed amount must be denied"
+    );
+
+    let (redirected, redirected_claim) =
+        solana_transfer([0x01; 32], [0x45; 32], 1_000_000, [0x08; 32]);
+    let redirected_error = error_code(
+        harness
+            .authority
+            .authorize(&solana_input(
+                &terms,
+                &provenance,
+                operation(93),
+                &redirected,
+                redirected_claim,
+                &redirected,
+                Some([0x01; 32]),
+            ))
+            .unwrap_err(),
+    );
+    assert!(
+        redirected_error.contains("SYSTEM_CLAIM_MISMATCH")
+            || redirected_error.contains("DESTINATION_NOT_ALLOWED"),
+        "a refreshed payload that changes the reviewed destination must be denied: {redirected_error}"
+    );
+}
+
+#[test]
+fn system_intent_terms_must_be_single_use_and_single_signature() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (message, claim) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+
+    let mut widened = system_intent_terms(&harness, &provenance, &claim, 94);
+    widened.limits.max_operations = DecimalU64::new(2);
+    assert!(
+        error_code(
+            harness
+                .authority
+                .prepare_approval(&widened, &digest(7))
+                .unwrap_err()
+        )
+        .contains("SELECTOR_MISMATCH"),
+        "a system approval that could cover two operations must be rejected at preparation"
+    );
+
+    let mut multi_signature = system_intent_terms(&harness, &provenance, &claim, 95);
+    multi_signature.limits.max_signatures = DecimalU64::new(2);
+    assert!(
+        error_code(
+            harness
+                .authority
+                .prepare_approval(&multi_signature, &digest(7))
+                .unwrap_err()
+        )
+        .contains("SELECTOR_MISMATCH"),
+        "a system approval that could produce two signatures must be rejected at preparation"
+    );
+}
+
+#[test]
+fn system_intent_approval_cannot_authorize_a_second_transfer() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (_, claim_one) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    let terms = system_intent_terms(&harness, &provenance, &claim_one, 96);
+    harness.activate_with_system_claim(&terms, &provenance, &claim_one);
+
+    let (message_two, claim_two) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x08; 32]);
+    harness
+        .authority
+        .authorize(&solana_input(
+            &terms,
+            &provenance,
+            operation(96),
+            &message_two,
+            claim_two,
+            &message_two,
+            Some([0x01; 32]),
+        ))
+        .unwrap();
+
+    let (message_three, claim_three) =
+        solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x09; 32]);
+    assert!(
+        error_code(
+            harness
+                .authority
+                .authorize(&solana_input(
+                    &terms,
+                    &provenance,
+                    operation(97),
+                    &message_three,
+                    claim_three,
+                    &message_three,
+                    Some([0x01; 32]),
+                ))
+                .unwrap_err()
+        )
+        .contains("LIMIT_EXCEEDED_OPERATIONS"),
+        "one system approval must not pay twice, even for the same reviewed intent"
+    );
+}
+
+#[test]
+fn an_exact_approval_cannot_cover_a_refreshed_blockhash() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (message_one, claim_one) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    // Exact terms pin the literal reviewed bytes; the intent selector above is
+    // what makes a refresh possible, so the exact path must refuse it.
+    let terms = solana_terms(&harness, &provenance, &message_one, 98);
+    harness.activate_with_system_claim(&terms, &provenance, &claim_one);
+
+    let (message_two, claim_two) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x08; 32]);
+    assert!(
+        error_code(
+            harness
+                .authority
+                .authorize(&solana_input(
+                    &terms,
+                    &provenance,
+                    operation(98),
+                    &message_two,
+                    claim_two,
+                    &message_two,
+                    Some([0x01; 32]),
+                ))
+                .unwrap_err()
+        )
+        .contains("SELECTOR_MISMATCH"),
+        "an exact approval must never cover a rebuilt payload, refreshed blockhash included"
+    );
+}
+
 #[test]
 fn concurrent_renewal_has_one_atomic_winner_and_never_reactivates_predecessor() {
     let harness = Harness::new();
