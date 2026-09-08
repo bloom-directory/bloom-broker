@@ -1606,7 +1606,7 @@ fn solana_transfer(
             proof_digest: digest(0),
         },
     );
-    claim.declared_debits[0].amount = DecimalU256::parse(&lamports.to_string()).unwrap();
+    claim.declared_debits[0].amount = DecimalU256::parse(lamports.to_string()).unwrap();
     // Each fetched blockhash arrives with its own validity height; vary both
     // so the refreshed claim differs from the reviewed one exactly on the
     // freshness pair.
@@ -1619,7 +1619,7 @@ fn solana_transfer(
 fn system_intent_approval_covers_a_refreshed_blockhash() {
     let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
     let provenance = harness.solana_provenance();
-    let (message_one, claim_one) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    let (_, claim_one) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
     let terms = system_intent_terms(&harness, &provenance, &claim_one, 91);
     harness.activate_with_system_claim(&terms, &provenance, &claim_one);
 
@@ -1712,7 +1712,7 @@ fn system_intent_approval_denies_a_changed_intent() {
 fn system_intent_terms_must_be_single_use_and_single_signature() {
     let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
     let provenance = harness.solana_provenance();
-    let (message, claim) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    let (_, claim) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
 
     let mut widened = system_intent_terms(&harness, &provenance, &claim, 94);
     widened.limits.max_operations = DecimalU64::new(2);
