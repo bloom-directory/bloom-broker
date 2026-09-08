@@ -203,17 +203,15 @@ fn verified_decryptable_record_needles(
             .try_into()
             .map_err(|_| "Signer credential wrap contains a malformed nonce")?;
         let wkek = Zeroizing::new(
-            XChaCha20Poly1305::new(
-                <&Key>::try_from(credential_key.as_slice()).expect("HKDF produces a 32-byte key"),
-            )
-            .decrypt(
-                <&XNonce>::from(&wrap_nonce),
-                Payload {
-                    msg: &credential_wrap.wrapped_wkek.ciphertext.decode(),
-                    aad: &credential_aad,
-                },
-            )
-            .map_err(|_| "deterministic credential PRF did not unwrap Signer WKEK")?,
+            XChaCha20Poly1305::new(<&Key>::from(credential_key.as_slice()))
+                .decrypt(
+                    <&XNonce>::from(&wrap_nonce),
+                    Payload {
+                        msg: &credential_wrap.wrapped_wkek.ciphertext.decode(),
+                        aad: &credential_aad,
+                    },
+                )
+                .map_err(|_| "deterministic credential PRF did not unwrap Signer WKEK")?,
         );
         let backend_key = local_backend_key(&wkek, &custody.wallet_id)?;
         if backup.wrap_format_version != 1 || backup.nonce.decode().len() != 24 {
@@ -228,10 +226,7 @@ fn verified_decryptable_record_needles(
             .decode()
             .try_into()
             .map_err(|_| "Signer local-backend encrypted record contains a malformed nonce")?;
-        let plaintext = XChaCha20Poly1305::new(
-            <&Key>::try_from(backend_key.as_slice()).expect("HKDF produces a 32-byte key"),
-        )
-        .decrypt(
+        let plaintext = XChaCha20Poly1305::new(<&Key>::from(backend_key.as_slice())).decrypt(
             <&XNonce>::from(&nonce),
             Payload {
                 msg: &backup.encrypted_seed.decode(),
@@ -561,17 +556,15 @@ mod tests {
             wrap_format_version: 1,
         })
         .unwrap();
-        let wrapped_wkek = XChaCha20Poly1305::new(
-            <&Key>::try_from(credential_key.as_slice()).expect("HKDF produces a 32-byte key"),
-        )
-        .encrypt(
-            <&XNonce>::from(&wrap_nonce),
-            Payload {
-                msg: &wkek,
-                aad: &credential_aad,
-            },
-        )
-        .unwrap();
+        let wrapped_wkek = XChaCha20Poly1305::new(<&Key>::from(credential_key.as_slice()))
+            .encrypt(
+                <&XNonce>::from(&wrap_nonce),
+                Payload {
+                    msg: &wkek,
+                    aad: &credential_aad,
+                },
+            )
+            .unwrap();
         let backend_key = local_backend_key(&wkek, backend_instance).unwrap();
         let root_seed = [0x42; 32];
         let child_path = "m/2147483647'/0'";
@@ -605,17 +598,15 @@ mod tests {
         aad.extend_from_slice(backend_instance.as_bytes());
         aad.extend_from_slice(root_key_id.as_bytes());
         aad.extend_from_slice(&1_u32.to_be_bytes());
-        let ciphertext = XChaCha20Poly1305::new(
-            <&Key>::try_from(backend_key.as_slice()).expect("HKDF produces a 32-byte key"),
-        )
-        .encrypt(
-            <&XNonce>::from(&nonce),
-            Payload {
-                msg: &root_seed,
-                aad: &aad,
-            },
-        )
-        .unwrap();
+        let ciphertext = XChaCha20Poly1305::new(<&Key>::from(backend_key.as_slice()))
+            .encrypt(
+                <&XNonce>::from(&nonce),
+                Payload {
+                    msg: &root_seed,
+                    aad: &aad,
+                },
+            )
+            .unwrap();
         let record = serde_json::json!({
             "root_key_id": root_key_id,
             "root_material_kind": "bip32_seed",
