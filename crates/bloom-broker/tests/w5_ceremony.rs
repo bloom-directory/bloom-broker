@@ -5195,6 +5195,64 @@ fn cancellation_backoff_reports_remaining_cooldown_and_resets_after_expiry() {
     prepare(&broker, operation("c3"), Some(wallet), 12_000);
 }
 
+#[tokio::test]
+async fn browser_cancellation_keeps_backoff_in_the_trusted_clock_domain() {
+    let signer = Arc::new(MockSigner::new());
+    let broker = CeremonyBroker::new(signer);
+    let wallet = Token::new("wallet-browser-cancellation-clock").unwrap();
+    let trusted_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 100_000;
+    let prepared = prepare(&broker, operation("c4"), Some(wallet.clone()), trusted_now);
+    let token = prepared.ceremony_url.rsplit('/').next().unwrap();
+    let app = broker.router();
+    let projection = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(projection.status(), StatusCode::OK);
+    let projection: serde_json::Value =
+        serde_json::from_slice(&projection.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    let ceremony_id = projection["ceremony_id"].as_str().unwrap();
+    let cancelled = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/session/{ceremony_id}/cancel"))
+                .header(header::HOST, "localhost:18734")
+                .header(header::ORIGIN, "http://localhost:18734")
+                .header("x-bloom-ceremony-token", token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status(), StatusCode::NO_CONTENT);
+
+    let error = try_prepare(&broker, operation("c5"), Some(wallet), trusted_now + 1).unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::CeremonyRateLimited);
+    let remaining_ms = error
+        .message
+        .strip_prefix("wallet ceremony is in cancellation backoff; retry after ")
+        .and_then(|value| value.strip_suffix(" ms"))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap();
+    assert!((1..=2_000).contains(&remaining_ms), "{}", error.message);
+}
+
 #[test]
 fn automatic_expiry_does_not_impose_cancellation_backoff() {
     let signer = Arc::new(MockSigner::new());
