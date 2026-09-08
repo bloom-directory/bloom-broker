@@ -50,6 +50,10 @@ jobs:
             startup_failure_tests::listener_conflict_record_reports_the_selected_port_in_harness_builds -- --exact --ignored
           cargo test -p bloom-broker --features triad-dev-harness --locked --bin bloom-broker \
             startup_failure_tests::listener_conflict_record_reports_the_selected_port_in_harness_builds -- --exact --ignored
+          # The whole binary target, not just the focused test, so an
+          # assertion that holds only for the fixed production address
+          # cannot hide behind --exact filtering in harness builds.
+          cargo test -p bloom-broker --features triad-dev-harness --locked --bin bloom-broker
           cargo test -p bloom-broker-debug-driver --lib --locked \
             tests::production_scoped_origin_ignores_the_developer_override -- --exact
           cargo test -p bloom-broker-debug-driver --features triad-dev-harness --lib --locked \

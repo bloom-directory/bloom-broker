@@ -1578,8 +1578,9 @@ fn url_token(url: &str) -> String {
 }
 
 fn test_ceremony_port() -> u16 {
-    // One parser, shared with the debug driver and the broker itself, so an
-    // invalid value — including port zero — behaves identically everywhere.
+    // The debug driver's parser, so tests and driver agree on what the env
+    // means — including rejecting port zero. (The broker's own production
+    // parser stays separate by design: it fails at listener acquisition.)
     bloom_broker_debug_driver::development_ceremony_port()
 }
 

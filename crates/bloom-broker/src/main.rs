@@ -2226,7 +2226,11 @@ mod startup_failure_tests {
 
     /// The incident record must name the address the broker actually
     /// attempted to bind. In a default build that is always the fixed
-    /// production listener, whatever the environment holds.
+    /// production listener, whatever the environment holds. Harness builds
+    /// record the configured address instead; the ignored test below pins
+    /// that in both feature arms, so this assertion is compiled only where
+    /// the fixed address is unconditional.
+    #[cfg(not(feature = "triad-dev-harness"))]
     #[test]
     fn listener_conflict_record_names_the_attempted_address() {
         let (_temporary, path, _uid) = status_directory();
