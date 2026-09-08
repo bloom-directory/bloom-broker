@@ -13,6 +13,10 @@ const rawKeyInput = document.getElementById("raw-key-input");
 const panelTitle = document.getElementById("panel-title");
 const panelKicker = document.getElementById("panel-kicker");
 
+// Every standard English BIP-39 recovery-phrase length. Import and export
+// must agree on the same set.
+const MNEMONIC_WORD_COUNTS = [12, 15, 18, 21, 24];
+
 // Human-readable framing for every ceremony kind. Nothing here changes what
 // is signed or bound; the exact signed material stays available under
 // "Signed details" and is what the passkey attests to.
@@ -326,7 +330,7 @@ function renderResult(session, plaintext) {
   let parsed = null;
   try { parsed = JSON.parse(text); } catch (_) {}
   const words = text.split(/\s+/);
-  const isMnemonic = !parsed && (words.length === 12 || words.length === 24) &&
+  const isMnemonic = !parsed && MNEMONIC_WORD_COUNTS.includes(words.length) &&
     words.every(w => /^[a-z]+$/.test(w));
   const parts = [];
   markDone(isMnemonic ? "Your recovery phrase" : "Result");
@@ -763,7 +767,7 @@ async function run(session) {
       if (bip39Import) {
         const mnemonic = mnemonicInput.value.trim().toLowerCase().split(/\s+/).join(" ");
         const count = mnemonic ? mnemonic.split(" ").length : 0;
-        if (![12, 15, 18, 21, 24].includes(count)) {
+        if (!MNEMONIC_WORD_COUNTS.includes(count)) {
           throw new Error("Enter a 12, 15, 18, 21, or 24 word recovery phrase");
         }
         secret = te.encode(canonicalJson({
