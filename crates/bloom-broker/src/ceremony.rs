@@ -1379,7 +1379,7 @@ impl CeremonyBroker {
                 protocol(
                     ProtocolErrorCode::ServiceUnavailable,
                     format!(
-                        "no inherited IPv4 ceremony listener named {v4_activation_name:?}; this                          service is socket-activated and will not bind a listener itself: {error}"
+                        "no inherited IPv4 ceremony listener named {v4_activation_name:?}; this service is socket-activated and will not bind a listener itself: {error}"
                     ),
                 )
             },
@@ -1389,7 +1389,7 @@ impl CeremonyBroker {
                 protocol(
                     ProtocolErrorCode::ServiceUnavailable,
                     format!(
-                        "no inherited IPv6 ceremony listener named {v6_activation_name:?}; this                          service is socket-activated and will not bind a listener itself: {error}"
+                        "no inherited IPv6 ceremony listener named {v6_activation_name:?}; this service is socket-activated and will not bind a listener itself: {error}"
                     ),
                 )
             },
@@ -1457,7 +1457,7 @@ impl CeremonyBroker {
             protocol(
                 ProtocolErrorCode::ServiceUnavailable,
                 format!(
-                    "fatal canonical ceremony listener ownership conflict at {addr}; no fallback                      address or port will be used: {error}"
+                    "fatal canonical ceremony listener ownership conflict at {addr}; no fallback port will be used: {error}"
                 ),
             )
         })?;
