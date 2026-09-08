@@ -34,7 +34,7 @@ use bloom_signer_api::{
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use parking_lot::Mutex;
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng as _, rngs::SysRng};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1364,7 +1364,9 @@ impl CeremonyBroker {
 
     fn new_session(&self, new: NewBrowserSession) -> Result<BrowserSession, ProtocolError> {
         let mut token_bytes = [0_u8; 32];
-        OsRng.fill_bytes(&mut token_bytes);
+        SysRng
+            .try_fill_bytes(&mut token_bytes)
+            .expect("OS randomness unavailable");
         Ok(BrowserSession {
             operation_id: new.operation_id.clone(),
             request_digest: new.request_digest,

@@ -17,7 +17,7 @@ use bloom_signer_api::{
     PolicyValidationReceipt, RevocationControlService, SignRequest, UnsignedSignRequest,
 };
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _};
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng as _, rngs::SysRng};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
@@ -756,7 +756,9 @@ impl BrokerRpcService {
             )
             .map_err(authority_error)?;
         let mut attempt_bytes = [0_u8; 32];
-        OsRng.fill_bytes(&mut attempt_bytes);
+        SysRng
+            .try_fill_bytes(&mut attempt_bytes)
+            .expect("OS randomness unavailable");
         let claim_digest = request
             .petal_use_claim
             .as_ref()
@@ -1240,7 +1242,9 @@ impl BrokerRpcService {
                         ));
                     }
                     let mut operation_bytes = [0_u8; 32];
-                    OsRng.fill_bytes(&mut operation_bytes);
+                    SysRng
+                        .try_fill_bytes(&mut operation_bytes)
+                        .expect("OS randomness unavailable");
                     let operation_id = OperationId::from_bytes(operation_bytes);
                     match self
                         .signer
