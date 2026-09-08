@@ -6,6 +6,7 @@ use crate::{
     PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
     PolicyUpdateRequest, ProtocolError, RevocationState, SealedApprovalPrepareResponse,
     SealedApprovalTerms, ServiceFuture, SignedPolicySnapshot, SigningResult, Token,
+    WalletAccountsPublic,
 };
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -207,8 +208,10 @@ pub struct WalletPublic {
     pub wallet_id: Token,
     pub wallet_kind: Token,
     /// Signer-identified wallet root for exact owner-authority operations.
-    /// Machine must not derive this identity from list order or backend data.
-    pub root_key_ref: KeyRef,
+    /// Machine must not derive this identity from list order or backend
+    /// data. `None` for BIP-39 wallets: their root is a non-signable seed
+    /// and only derived accounts are addressable.
+    pub root_key_ref: Option<KeyRef>,
     pub key_refs: Vec<KeyRef>,
     pub policy_version: DecimalU64,
     pub policy_digest: Digest32,
@@ -297,6 +300,8 @@ pub struct CeremonyPublicStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+// Boxing the large request would change this frozen wire protocol's public shape.
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "method", content = "body", deny_unknown_fields)]
 pub enum MachineBrokerRequest {
     #[serde(rename = "system.hello")]
@@ -349,6 +354,8 @@ pub enum MachineBrokerRequest {
     WalletExportPrepare(CustodyPrepareRequest),
     #[serde(rename = "wallet.delete_prepare")]
     WalletDeletePrepare(CustodyPrepareRequest),
+    #[serde(rename = "wallet.accounts")]
+    WalletAccounts(WalletRequest),
     #[serde(rename = "key.list_public")]
     KeyListPublic(WalletRequest),
     #[serde(rename = "key.get_public")]
@@ -361,6 +368,10 @@ pub enum MachineBrokerRequest {
     KeyListDerived(KeyRequest),
     #[serde(rename = "key.enroll_prepare")]
     KeyEnrollPrepare(CustodyPrepareRequest),
+    #[serde(rename = "account.allocate_prepare")]
+    AccountAllocatePrepare(CustodyPrepareRequest),
+    #[serde(rename = "account.retire_prepare")]
+    AccountRetirePrepare(CustodyPrepareRequest),
     #[serde(rename = "credential.list_public")]
     CredentialListPublic(WalletRequest),
     #[serde(rename = "credential.add_prepare")]
@@ -432,6 +443,8 @@ pub enum MachineBrokerResponse {
     WalletExportPrepare(CustodyPrepareResponse),
     #[serde(rename = "wallet.delete_prepare")]
     WalletDeletePrepare(CustodyPrepareResponse),
+    #[serde(rename = "wallet.accounts")]
+    WalletAccounts(WalletAccountsPublic),
     #[serde(rename = "key.list_public")]
     KeyListPublic(Vec<KeyPublic>),
     #[serde(rename = "key.get_public")]
@@ -444,6 +457,10 @@ pub enum MachineBrokerResponse {
     KeyDerivePrepare(CustodyPrepareResponse),
     #[serde(rename = "key.enroll_prepare")]
     KeyEnrollPrepare(CustodyPrepareResponse),
+    #[serde(rename = "account.allocate_prepare")]
+    AccountAllocatePrepare(CustodyPrepareResponse),
+    #[serde(rename = "account.retire_prepare")]
+    AccountRetirePrepare(CustodyPrepareResponse),
     #[serde(rename = "credential.list_public")]
     CredentialListPublic(Vec<CredentialPublic>),
     #[serde(rename = "credential.add_prepare")]
@@ -482,6 +499,7 @@ pub fn is_read_only_method(method: &Token) -> bool {
         || method == "sealed_approval.limit_state"
         || method == "key.derivation_capabilities"
         || method == "key.list_derived"
+        || method == "wallet.accounts"
         || method == "credential.list_public"
         || method == "custody.result"
 }
@@ -509,6 +527,8 @@ impl crate::TypedRequestMethod for MachineBrokerRequest {
             | Request::WalletDeletePrepare(request)
             | Request::KeyDerivePrepare(request)
             | Request::KeyEnrollPrepare(request)
+            | Request::AccountAllocatePrepare(request)
+            | Request::AccountRetirePrepare(request)
             | Request::CredentialAddPrepare(request)
             | Request::CredentialReplacePrepare(request)
             | Request::CredentialRemovePrepare(request)

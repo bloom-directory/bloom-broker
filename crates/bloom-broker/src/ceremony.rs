@@ -2609,6 +2609,8 @@ fn ceremony_kind_name(kind: CeremonyKind) -> &'static str {
         CeremonyKind::BackendEnrollment => "backend_enrollment",
         CeremonyKind::KeyDerive => "key_derive",
         CeremonyKind::PolicyUpdate => "policy_update",
+        CeremonyKind::AccountAllocate => "account_allocate",
+        CeremonyKind::AccountRetire => "account_retire",
     }
 }
 

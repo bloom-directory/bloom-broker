@@ -158,6 +158,52 @@ impl AuditSigner for SwitchableAuditSigner {
     }
 }
 
+/// Every custody ceremony the Broker can prepare must be completable in the
+/// shipped page.
+///
+/// `account_allocate` and `account_retire` were missing from the page's kind
+/// handling while the Broker, Signer, and Machine CLI all supported them, so
+/// `bloom wallet account-allocate` produced a ceremony URL that could never be
+/// completed: the page sent no custody input and the Broker rejected the
+/// completion while parsing it. Nothing caught that, because every test
+/// completed these ceremonies through the API rather than the page.
+#[test]
+fn the_shipped_page_handles_every_custody_ceremony_kind() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+
+    // Kinds whose completion is PRF plus a typed effect, with no operator
+    // input. The page must list them, or it sends nothing at all.
+    for kind in [
+        "wallet_export",
+        "wallet_delete",
+        "backend_enrollment",
+        "key_derive",
+        "policy_update",
+        "account_allocate",
+        "account_retire",
+    ] {
+        assert!(
+            asset.contains(&format!("\"{kind}\"")),
+            "the ceremony page does not handle the {kind} ceremony, so it cannot be completed"
+        );
+    }
+
+    // Kinds the page handles through their own branches.
+    for kind in [
+        "sealed_approval",
+        "wallet_registration",
+        "wallet_import",
+        "wallet_recovery",
+        "credential_add",
+        "credential_replace",
+    ] {
+        assert!(
+            asset.contains(&format!("\"{kind}\"")),
+            "the ceremony page does not mention the {kind} ceremony"
+        );
+    }
+}
+
 #[test]
 fn browser_crypto_self_test_executes_the_shipped_asset() {
     let asset = include_str!("../src/ceremony_assets/app.js");
@@ -393,6 +439,45 @@ fn legacy_passkey_browser_flow_uses_assertion_prf_and_hides_raw_key_input() {
     assert!(asset.contains("wallet_import\" && !legacyPasskeyImport"));
 }
 
+#[test]
+fn bip39_browser_import_uses_profile_to_control_serialization() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let load = asset
+        .split_once("async function load() {")
+        .expect("browser asset must define load")
+        .1
+        .split_once("\nfunction fromHex")
+        .expect("load must end before the crypto helpers")
+        .0;
+    let run = asset
+        .split_once("async function run(session) {")
+        .expect("browser asset must define run")
+        .1;
+
+    // Both browser phases must make their decision from the signed Signer
+    // contribution. Keeping these assertions scoped catches a declaration in
+    // run() that leaves load() with an undefined variable.
+    for scope in [load, run] {
+        assert!(scope.contains("const bip39Import = "));
+        assert!(scope.contains("wallet_seed_profile === \"bip39-multicurve-v1\""));
+    }
+    assert!(load.contains("genericInput.placeholder = bip39Import"));
+
+    // The serialization branch follows the profile; it never infers the
+    // profile from whichever property the operator supplied.
+    assert!(run.contains("if (bip39Import)"));
+    assert!(run.contains("BIP-39 mnemonic input is required"));
+    assert!(run.contains("mnemonic: supplied.mnemonic"));
+    assert!(run.contains("BIP-39 passphrases are not supported"));
+    assert!(!run.contains("passphrase: \"\""));
+    assert!(!run.contains("supplied.passphrase"));
+    assert!(!load.contains("passphrase"));
+    assert!(run.contains("Raw private key input is required"));
+    assert!(run.contains("raw_private_key: supplied.raw_private_key"));
+    assert!(!run.contains("if (supplied.mnemonic)"));
+    assert!(!run.contains("if (supplied.raw_private_key)"));
+}
+
 fn digest(byte: &str) -> Digest32 {
     Digest32::new(byte.repeat(32)).unwrap()
 }
@@ -601,6 +686,31 @@ struct RealSigner {
     service: Arc<SignerCeremonyService>,
 }
 
+fn real_ceremony_signer() -> Arc<RealSigner> {
+    let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
+    let engine = Arc::new(
+        SignerEngine::open_in_memory(
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
+            SigningKey::from_bytes(&[6; 32]).verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            signer_audit_keys(),
+            registry,
+        )
+        .unwrap(),
+    );
+    let service = Arc::new(
+        SignerCeremonyService::new(
+            engine,
+            Token::new("signer-ceremony-key").unwrap(),
+            SigningKey::from_bytes(&[9; 32]),
+        )
+        .unwrap(),
+    );
+    Arc::new(RealSigner { service })
+}
+
 struct FailOnceAdoptionObserver {
     authority: Arc<BrokerAuthority>,
     custody_attempts: AtomicUsize,
@@ -620,6 +730,8 @@ fn custody_result_to_machine(value: &CustodyResult) -> bloom_broker_api::Custody
             CeremonyKind::CredentialRemove => bloom_broker_api::CeremonyKind::CredentialRemove,
             CeremonyKind::BackendEnrollment => bloom_broker_api::CeremonyKind::BackendEnrollment,
             CeremonyKind::KeyDerive => bloom_broker_api::CeremonyKind::KeyDerive,
+            CeremonyKind::AccountAllocate => bloom_broker_api::CeremonyKind::AccountAllocate,
+            CeremonyKind::AccountRetire => bloom_broker_api::CeremonyKind::AccountRetire,
             CeremonyKind::PolicyUpdate => bloom_broker_api::CeremonyKind::PolicyUpdate,
         }
     }
@@ -666,6 +778,22 @@ fn custody_result_to_machine(value: &CustodyResult) -> bloom_broker_api::Custody
                             path: path.clone(),
                         }
                     }
+                    bloom_signer_api::DerivationRef::Bip39Multicurve {
+                        wallet_seed_ref,
+                        profile,
+                        path,
+                    } => bloom_broker_api::DerivationRef::Bip39Multicurve {
+                        wallet_seed_ref: wallet_seed_ref.clone(),
+                        profile: match profile {
+                            bloom_signer_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
+                                bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1
+                            }
+                            bloom_signer_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+                                bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1
+                            }
+                        },
+                        path: path.clone(),
+                    },
                 }),
         }
     }
@@ -744,6 +872,22 @@ fn key_to_signer(value: &KeyRef) -> bloom_signer_api::KeyRef {
                         path: path.clone(),
                     }
                 }
+                bloom_broker_api::DerivationRef::Bip39Multicurve {
+                    wallet_seed_ref,
+                    profile,
+                    path,
+                } => bloom_signer_api::DerivationRef::Bip39Multicurve {
+                    wallet_seed_ref: wallet_seed_ref.clone(),
+                    profile: match profile {
+                        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
+                            bloom_signer_api::DerivationProfile::Bip44EvmSecp256k1V1
+                        }
+                        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+                            bloom_signer_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1
+                        }
+                    },
+                    path: path.clone(),
+                },
             }),
     }
 }
@@ -1124,6 +1268,7 @@ impl CeremonySigner for MockSigner {
             hpke_recipient_key: Base64UrlBytes::from_bytes(&[7; 32]),
             browser_output_recipient_key: request.browser_output_recipient_key,
             petal_key_scope: request.petal_key_scope,
+            wallet_seed_profile: request.wallet_seed_profile,
             expires_at_ms: DecimalU64::new(now_ms + 10_000),
             signer_key_id: Token::new("mock-signer").unwrap(),
             signer_signature: Base64UrlBytes::from_bytes(&[]),
@@ -1264,6 +1409,8 @@ fn try_prepare(
             browser_output_recipient_key: None,
             petal_key_scope: None,
             legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: None,
         },
         now_ms,
     )
@@ -1298,6 +1445,8 @@ fn try_register(
             browser_output_recipient_key: None,
             petal_key_scope: None,
             legacy_passkey_migration: None,
+            wallet_seed_profile: Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1),
+            derivation_request: None,
         },
         now_ms,
     )
@@ -1506,6 +1655,9 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             browser_output_recipient_key: None,
             petal_key_scope: None,
             legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: None,
+            account_terms: None,
         }),
     )
     .await
@@ -1929,6 +2081,9 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             browser_output_recipient_key: None,
             petal_key_scope: Some(scope.clone()),
             legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: None,
+            account_terms: None,
         }),
     )
     .await
@@ -2963,14 +3118,17 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let MachineBrokerResponse::WalletGetPublic(read_wallet) = read_wallet else {
         panic!("wrong wallet projection response");
     };
-    assert!(read_wallet.root_key_ref.derivation.is_none());
-    assert!(read_wallet.key_refs.contains(&read_wallet.root_key_ref));
     assert!(
-        read_wallet
-            .key_refs
-            .iter()
-            .any(|key_ref| key_ref.derivation.is_some()),
-        "derived keys must not displace or alias the explicit wallet root"
+        read_wallet.root_key_ref.is_none(),
+        "a BIP-39 seed is not a signable root key"
+    );
+    assert!(
+        !read_wallet.key_refs.is_empty()
+            && read_wallet
+                .key_refs
+                .iter()
+                .all(|key_ref| key_ref.derivation.is_some()),
+        "BIP-39 wallet projection must contain only derived account keys"
     );
     restarted_signer_server.abort();
     signer_server.abort();
@@ -3005,6 +3163,8 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
             },
             1_001,
         )
@@ -3023,6 +3183,8 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_request: None,
                 },
                 1_001,
             )
@@ -3052,6 +3214,8 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_request: None,
                 },
                 1_101,
             )
@@ -3095,6 +3259,8 @@ async fn legacy_passkey_prepare_renders_only_digest_bound_public_migration_terms
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: Some(migration),
+                wallet_seed_profile: None,
+                derivation_request: None,
             },
             now_ms,
         )
@@ -3214,6 +3380,8 @@ async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() 
         browser_output_recipient_key: None,
         petal_key_scope: Some(scope.clone()),
         legacy_passkey_migration: None,
+        wallet_seed_profile: None,
+        derivation_request: None,
     };
     let now_ms: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3626,6 +3794,8 @@ fn ac18_forced_ceremony_audit_write_failure_rolls_back_session() {
         browser_output_recipient_key: None,
         petal_key_scope: None,
         legacy_passkey_migration: None,
+        wallet_seed_profile: None,
+        derivation_request: None,
     };
 
     fail.store(true, Ordering::SeqCst);
@@ -3679,6 +3849,8 @@ fn ac18_populated_ceremony_migration_is_atomic_idempotent_and_retains_source() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
             },
             50_000,
         )
@@ -3883,6 +4055,8 @@ fn ac18_ceremony_status_survives_latched_audit_tamper_while_new_sessions_fail() 
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_request: None,
                 },
                 41_001,
             )
@@ -3932,6 +4106,8 @@ fn restart_expires_nonterminal_session_and_persists_only_token_hash() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
             },
             50_001,
         )
@@ -4328,6 +4504,10 @@ fn zero_effective_time_fails_closed_before_anonymous_creation_quota() {
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: Some(
+                        bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1,
+                    ),
+                    derivation_request: None,
                 },
                 1 + u64::from(index),
             )
@@ -4347,6 +4527,8 @@ fn zero_effective_time_fails_closed_before_anonymous_creation_quota() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                wallet_seed_profile: Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1),
+                derivation_request: None,
             },
             0,
         )
@@ -4384,6 +4566,8 @@ fn cancellation_backoff_reports_remaining_cooldown_and_resets_after_expiry() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
             },
             10_001,
         )
@@ -4435,6 +4619,10 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: Some(
+                        bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1,
+                    ),
+                    derivation_request: None,
                 },
                 100_000 + u64::from(index),
             )
@@ -4456,6 +4644,10 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: Some(
+                        bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1,
+                    ),
+                    derivation_request: None,
                 },
                 100_010,
             )
@@ -4466,29 +4658,70 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
 }
 
 #[tokio::test]
+async fn bip39_import_session_projects_the_authoritative_signer_profile() {
+    let broker = CeremonyBroker::new(real_ceremony_signer());
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let response = broker
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::WalletImport,
+                custody_operation_id: operation("40"),
+                wallet_id: Some(Token::new("imported-wallet").unwrap()),
+                key_ref: None,
+                exact_terms_digest: digest("50"),
+                expected_input_class: Token::new("passkey-prf").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1),
+                derivation_request: None,
+            },
+            now_ms,
+        )
+        .unwrap();
+    let session_response = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session_response.status(), StatusCode::OK);
+    let session: serde_json::Value = serde_json::from_slice(
+        &session_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        session["signer_contribution"]["wallet_seed_profile"],
+        "bip39-multicurve-v1"
+    );
+    let contribution: CustodySignerContribution =
+        serde_json::from_value(session["signer_contribution"].clone()).unwrap();
+    assert_eq!(
+        contribution.wallet_seed_profile,
+        Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1)
+    );
+}
+
+#[tokio::test]
 async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() {
-    let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
-    let engine = Arc::new(
-        SignerEngine::open_in_memory(
-            Token::new("broker-app-1").unwrap(),
-            SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            SigningKey::from_bytes(&[6; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            signer_audit_keys(),
-            registry,
-        )
-        .unwrap(),
-    );
-    let service = Arc::new(
-        SignerCeremonyService::new(
-            engine,
-            Token::new("signer-ceremony-key").unwrap(),
-            SigningKey::from_bytes(&[9; 32]),
-        )
-        .unwrap(),
-    );
-    let broker = CeremonyBroker::new(Arc::new(RealSigner { service }));
+    let broker = CeremonyBroker::new(real_ceremony_signer());
     let now_ms: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -4508,6 +4741,8 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                wallet_seed_profile: Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1),
+                derivation_request: None,
             },
             now_ms,
         )
@@ -4616,6 +4851,8 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
             },
             now_ms + 1_000,
         )
