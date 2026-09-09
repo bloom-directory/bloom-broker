@@ -302,6 +302,10 @@ fn persist_checkpoint_diagnosed(
         }
         Err(failure) => {
             let decision = &failure.decision;
+            if !checkpoint_failure_requires_degradation(decision.outcome) {
+                log_checkpoint_decision(decision, method, operation_id, edge, false);
+                return Ok(());
+            }
             journal.latch_checkpoint_degradation(
                 checkpoint_outcome(decision.outcome),
                 decision.attempted.sequence,
@@ -325,6 +329,13 @@ fn persist_checkpoint_diagnosed(
             }))
         }
     }
+}
+
+/// A validly signed older head is not an integrity failure: the checkpoint
+/// store already retains a newer head for that peer. Bad signatures and
+/// same-sequence forks are classified separately and must still fail closed.
+pub fn checkpoint_failure_requires_degradation(outcome: CheckpointDecisionOutcome) -> bool {
+    !matches!(outcome, CheckpointDecisionOutcome::SequenceRollback)
 }
 
 fn log_checkpoint_decision(
@@ -562,6 +573,21 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     static CHECKPOINT_TRACING_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn only_a_valid_older_checkpoint_is_a_benign_append_failure() {
+        assert!(!checkpoint_failure_requires_degradation(
+            CheckpointDecisionOutcome::SequenceRollback
+        ));
+        for fatal in [
+            CheckpointDecisionOutcome::SequenceConflict,
+            CheckpointDecisionOutcome::InvalidSignature,
+            CheckpointDecisionOutcome::UnpinnedPeer,
+            CheckpointDecisionOutcome::StorageOrConfigurationFailure,
+        ] {
+            assert!(checkpoint_failure_requires_degradation(fatal));
+        }
+    }
 
     struct TestAuditSigner;
 

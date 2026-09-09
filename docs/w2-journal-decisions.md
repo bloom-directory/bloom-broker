@@ -31,6 +31,11 @@
   signing-key-ID failure latches mutation denial without disabling reads and
   status. Required peer/OS checkpoint persistence may explicitly set the same
   latch.
+- A validly signed peer head older than the independently retained head is a
+  benign checkpoint rollback: retaining the newer head already satisfies the
+  durability invariant, so Broker logs the decision without disabling
+  mutations. A bad signature, same-sequence fork, unpinned peer, or checkpoint
+  storage/configuration failure still fails closed and latches mutation denial.
 - A corrupt or signing-key-mismatched existing journal does not prevent the
   Broker from constructing its durable read/status projections. Startup keeps
   the journal latch set, skips clock observation, provenance synchronization,
