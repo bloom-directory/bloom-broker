@@ -302,6 +302,18 @@ fn persist_checkpoint_diagnosed(
         }
         Err(failure) => {
             let decision = &failure.decision;
+            // Broker heads are sampled before dispatch while Machine RPCs can
+            // commit concurrently. A valid older Broker head can therefore be
+            // ordinary checkpoint reordering. Signer responses, by contrast,
+            // pass through this worker serially and must fail closed.
+            if matches!(
+                decision.outcome,
+                CheckpointDecisionOutcome::SequenceRollback
+            ) && edge != "broker_signer_response"
+            {
+                log_checkpoint_decision(decision, method, operation_id, edge, false);
+                return Ok(());
+            }
             journal.latch_checkpoint_degradation(
                 checkpoint_outcome(decision.outcome),
                 decision.attempted.sequence,
@@ -733,6 +745,22 @@ mod tests {
 
         assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
         assert!(journal.audit_degraded());
+    }
+
+    #[test]
+    fn broker_pre_dispatch_sequence_rollback_does_not_degrade() {
+        let journal = BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).unwrap();
+        let result = persist_checkpoint_diagnosed(
+            &journal,
+            &RollbackCheckpointSink,
+            Some(&Token::new("signer.sign").unwrap()),
+            Some("11"),
+            &peer_head(),
+            "broker_signer_pre_dispatch",
+        );
+
+        assert!(result.is_ok());
+        assert!(!journal.audit_degraded());
     }
 
     #[test]
