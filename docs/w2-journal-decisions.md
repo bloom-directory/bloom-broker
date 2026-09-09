@@ -31,6 +31,11 @@
   signing-key-ID failure latches mutation denial without disabling reads and
   status. Required peer/OS checkpoint persistence may explicitly set the same
   latch.
+- Machine RPC connections are processed concurrently, so a valid request head
+  older than the independently retained Machine head can be an in-flight
+  reordering and does not disable mutations. Signer RPC responses are
+  serialized; an older Signer head has no equivalent ordering explanation and
+  remains a fail-closed checkpoint rollback.
 - A corrupt or signing-key-mismatched existing journal does not prevent the
   Broker from constructing its durable read/status projections. Startup keeps
   the journal latch set, skips clock observation, provenance synchronization,
