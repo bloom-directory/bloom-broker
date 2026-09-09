@@ -1475,7 +1475,11 @@ impl CeremonyBroker {
     }
 
     fn bind_loopback_one(addr: SocketAddr) -> Result<StdTcpListener, ProtocolError> {
-        let listener = StdTcpListener::bind(addr).map_err(|error| {
+        #[cfg(unix)]
+        let bound = Self::bind_loopback_reuse(addr);
+        #[cfg(not(unix))]
+        let bound = StdTcpListener::bind(addr);
+        let listener = bound.map_err(|error| {
             protocol(
                 ProtocolErrorCode::ServiceUnavailable,
                 format!(
@@ -1490,6 +1494,27 @@ impl CeremonyBroker {
             )
         })?;
         Ok(listener)
+    }
+
+    /// Bind one loopback listener with `SO_REUSEADDR` set.
+    ///
+    /// Connections a previous lifecycle served can hold the port in
+    /// `TIME_WAIT` for up to a minute after every party closes, and a Broker
+    /// restarted inside that window must still acquire its canonical
+    /// listener — restart-after-serving is exactly when it is needed. The
+    /// flag only relaxes conflicts against sockets that are no longer
+    /// listening: a second live Broker still fails with `EADDRINUSE`, which
+    /// the W0 ownership test pins.
+    #[cfg(unix)]
+    fn bind_loopback_reuse(addr: SocketAddr) -> std::io::Result<StdTcpListener> {
+        use socket2::{Domain, Protocol, Socket, Type};
+
+        let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        socket.bind(&addr.into())?;
+        // Matches std::net::TcpListener::bind's backlog.
+        socket.listen(128)?;
+        Ok(socket.into())
     }
 
     /// Bind and serve both canonical loopback listeners until `shutdown`
