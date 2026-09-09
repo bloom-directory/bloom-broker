@@ -176,6 +176,11 @@ pub struct CustodyPrepareRequest {
     /// Derived-account allocation request (AccountAllocate custody only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derivation_request: Option<crate::DerivedAccountRequest>,
+    /// Multi-family allocation requests (AccountAllocate custody only).
+    /// Exactly one of `derivation_request` and `derivation_requests` must be
+    /// set; Signer allocates every requested family under one number.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derivation_requests: Vec<crate::DerivedAccountRequest>,
     /// Exact allocation/retirement terms (AccountAllocate/AccountRetire only).
     /// `exact_terms_digest` must equal `AccountTerms::request_digest` so the
     /// reviewed terms, not an opaque caller string, bind the ceremony.
@@ -193,6 +198,12 @@ impl CustodyPrepareRequest {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::CeremonyKindMismatch,
                     "wallet_seed_profile is valid only for registration and import",
+                ));
+            }
+            if !self.derivation_requests.is_empty() {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::CeremonyKindMismatch,
+                    "derivation_requests are valid only for AccountAllocate",
                 ));
             }
             return Ok(());
@@ -258,6 +269,12 @@ impl CustodyPrepareRequest {
                 "Petal key scope is valid only for key-derive custody",
             ));
         }
+        if !self.derivation_requests.is_empty() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::CeremonyKindMismatch,
+                "derivation_requests are valid only for AccountAllocate",
+            ));
+        }
         scope.validate()?;
         if scope.custody_operation_id != self.custody_operation_id {
             return Err(ProtocolError::new(
@@ -302,12 +319,20 @@ impl CustodyPrepareRequest {
                 "account allocation binding is valid only for AccountAllocate",
             ));
         }
-        let Some(request) = &self.derivation_request else {
+        let single = self.derivation_request.clone();
+        let several = self.derivation_requests.clone();
+        if single.is_some() == (!several.is_empty()) {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
-                "AccountAllocate requires a derivation_request",
+                "AccountAllocate carries exactly one of derivation_request or derivation_requests",
             ));
-        };
+        }
+        if let Some(request) = &single {
+            validate_single_derivation_request(request)?;
+        }
+        if !several.is_empty() {
+            validate_derivation_requests(&several)?;
+        }
         if self.wallet_id.is_none() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
@@ -320,27 +345,33 @@ impl CustodyPrepareRequest {
                 "account allocation derives its child KeyRef inside Signer",
             ));
         }
-        if !matches!(
-            request.derivation_profile,
-            DerivationProfile::Bip44EvmSecp256k1V1 | DerivationProfile::Bip44SolanaSlip10Ed25519V1
-        ) {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "unsupported derivation profile for account allocation",
-            ));
-        }
         let terms = self.validate_account_terms_common()?;
-        if terms.derivation != Some(request.clone()) {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::OperationIdConflict,
-                "account terms derivation does not match the custody request",
-            ));
-        }
         if terms.retire_key_fingerprint.is_some() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::OperationIdConflict,
                 "allocation terms cannot carry a retirement fingerprint",
             ));
+        }
+        match (single, several.as_slice()) {
+            (Some(request), _) => {
+                if !terms.derivations.is_empty() || terms.derivation != Some(request) {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::OperationIdConflict,
+                        "account terms derivation does not match the custody request",
+                    ));
+                }
+            }
+            (None, several) => {
+                if terms.derivation.is_some()
+                    || terms.derivations.is_empty()
+                    || terms.derivations.as_slice() != several
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::OperationIdConflict,
+                        "account terms derivations do not match the custody request",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -368,10 +399,10 @@ impl CustodyPrepareRequest {
                 "AccountRetire requires an authoritative wallet ID",
             ));
         }
-        if self.derivation_request.is_some() {
+        if self.derivation_request.is_some() || !self.derivation_requests.is_empty() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
-                "AccountRetire cannot carry a derivation_request",
+                "AccountRetire cannot carry a derivation request",
             ));
         }
         let Some(crate::DerivationRef::Bip39Multicurve {
@@ -392,7 +423,7 @@ impl CustodyPrepareRequest {
             ));
         }
         let terms = self.validate_account_terms_common()?;
-        if terms.derivation.is_some() {
+        if terms.derivation.is_some() || !terms.derivations.is_empty() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::OperationIdConflict,
                 "retirement terms cannot carry a derivation request",
@@ -462,6 +493,55 @@ impl CustodyPrepareRequest {
     }
 }
 
+/// One family's allocation request, as the wallet-level single-family rule
+/// allows it: a projectable profile, and the EVM profile pinned at most to
+/// hardened account zero.
+fn validate_single_derivation_request(
+    request: &DerivedAccountRequest,
+) -> Result<(), ProtocolError> {
+    if !matches!(
+        request.derivation_profile,
+        DerivationProfile::Bip44EvmSecp256k1V1 | DerivationProfile::Bip44SolanaSlip10Ed25519V1
+    ) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::BackendUnsupported,
+            "unsupported derivation profile for account allocation",
+        ));
+    }
+    if request.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1
+        && request.account.is_some_and(|account| account != 0)
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::MalformedFrame,
+            "the EVM allocation profile allocates under hardened account zero",
+        ));
+    }
+    Ok(())
+}
+
+/// The multi-family request list: at most one request per profile, every EVM
+/// request under hardened account zero, and no pinned account anywhere —
+/// Signer chooses the one number every family shares.
+fn validate_derivation_requests(requests: &[DerivedAccountRequest]) -> Result<(), ProtocolError> {
+    let mut profiles = std::collections::HashSet::new();
+    for request in requests {
+        validate_single_derivation_request(request)?;
+        if !profiles.insert(request.derivation_profile) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "multi-family allocation repeats a derivation profile",
+            ));
+        }
+        if request.account.is_some() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "multi-family allocation never pins an account; Signer chooses the number",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Exact, reviewed terms for derived-account allocation and retirement.
 ///
 /// These are the facts the human approves in the ceremony: which wallet and
@@ -479,8 +559,15 @@ pub struct AccountTerms {
     /// Only `bip39-multicurve-v1` wallets expose derivable accounts.
     pub seed_profile: WalletSeedProfile,
     /// Allocation only: the committed derivation request. `None` for
-    /// retirement.
+    /// retirement. Exactly one of `derivation` and a non-empty `derivations`
+    /// is set, mirroring the custody request the terms review.
     pub derivation: Option<DerivedAccountRequest>,
+    /// Allocation only: the committed multi-family derivation requests. The
+    /// global `path_template`, `key_spec` and `allowed_crypto_suites` describe
+    /// the EVM family when one is requested, otherwise the Solana family;
+    /// every listed family's frozen shape follows from its profile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derivations: Vec<DerivedAccountRequest>,
     /// Retirement only: fingerprint of the child being retired. `None` for
     /// allocation.
     pub retire_key_fingerprint: Option<Digest32>,
@@ -516,8 +603,14 @@ impl AccountTerms {
                 "account terms require the bip39-multicurve-v1 seed profile",
             ));
         }
-        match (&self.derivation, self.retire_key_fingerprint.as_ref()) {
-            (Some(_), Some(_)) | (None, None) => {
+        let single = self.derivation.as_ref();
+        let several = self.derivations.as_slice();
+        match (
+            single.is_some(),
+            !several.is_empty(),
+            self.retire_key_fingerprint.as_ref(),
+        ) {
+            (true, _, Some(_)) | (true, true, _) | (false, false, None) => {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::MalformedFrame,
                     "account terms carry either a derivation or a retirement fingerprint",
@@ -525,18 +618,30 @@ impl AccountTerms {
             }
             _ => {}
         }
-        if let Some(request) = &self.derivation {
+        if let Some(request) = single {
+            validate_single_derivation_request(request)?;
             let profile = request.derivation_profile;
-            if !matches!(
-                profile,
-                DerivationProfile::Bip44EvmSecp256k1V1
-                    | DerivationProfile::Bip44SolanaSlip10Ed25519V1
-            ) {
+            if self.path_template != profile.path_template()
+                || self.key_spec != profile.key_spec()
+                || self.allowed_crypto_suites != profile.frozen_crypto_suites()
+            {
                 return Err(ProtocolError::new(
-                    ProtocolErrorCode::BackendUnsupported,
-                    "unsupported derivation profile in account terms",
+                    ProtocolErrorCode::OperationIdConflict,
+                    "account terms do not match the derivation profile's frozen shape",
                 ));
             }
+        }
+        if !several.is_empty() {
+            validate_derivation_requests(several)?;
+            // The reviewed global shape is the EVM family's when the request
+            // includes one, otherwise the one Solana family's.
+            let anchor = several
+                .iter()
+                .find(|request| {
+                    request.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1
+                })
+                .unwrap_or(&several[0]);
+            let profile = anchor.derivation_profile;
             if self.path_template != profile.path_template()
                 || self.key_spec != profile.key_spec()
                 || self.allowed_crypto_suites != profile.frozen_crypto_suites()
@@ -566,6 +671,16 @@ impl AccountTerms {
             ));
         }
         Ok(())
+    }
+
+    /// Every derivation the terms commit to, in request order: the single
+    /// request when present, otherwise the multi-family list.
+    pub fn effective_derivations(&self) -> Vec<&DerivedAccountRequest> {
+        match (&self.derivation, self.derivations.as_slice()) {
+            (Some(single), _) => vec![single],
+            (None, several) if !several.is_empty() => several.iter().collect(),
+            _ => Vec::new(),
+        }
     }
 
     pub fn request_digest(&self) -> Result<Digest32, ProtocolError> {
@@ -675,6 +790,7 @@ mod tests {
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
             derivation_request: None,
+            derivation_requests: Vec::new(),
             account_terms: None,
         }
     }
@@ -705,6 +821,7 @@ mod tests {
                 requested_role: Token::new("primary-evm").unwrap(),
                 account: Some(0),
             }),
+            derivations: Vec::new(),
             retire_key_fingerprint: None,
             path_template: DerivationProfile::Bip44EvmSecp256k1V1
                 .path_template()
@@ -727,9 +844,144 @@ mod tests {
         request.custody_operation_id = terms.replay_id.clone();
         request.expected_input_class = Token::new("generic-custody-v1").unwrap();
         request.derivation_request = terms.derivation.clone();
+        request.derivation_requests = terms.derivations.clone();
         request.exact_terms_digest = terms.request_digest().unwrap();
         request.account_terms = Some(terms);
         request
+    }
+
+    fn multi_family_terms(requests: Vec<DerivedAccountRequest>) -> AccountTerms {
+        let anchor = requests
+            .iter()
+            .find(|request| request.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1)
+            .unwrap_or(&requests[0]);
+        let profile = anchor.derivation_profile;
+        AccountTerms {
+            schema: Token::new(ACCOUNT_TERMS_SCHEMA).unwrap(),
+            wallet_id: Token::new("quiet-lilac").unwrap(),
+            seed_profile: WalletSeedProfile::Bip39MulticurveV1,
+            derivation: None,
+            derivations: requests,
+            retire_key_fingerprint: None,
+            path_template: profile.path_template().to_owned(),
+            key_spec: profile.key_spec(),
+            allowed_crypto_suites: profile.frozen_crypto_suites().to_vec(),
+            policy_version: DecimalU64::new(1),
+            revocation_epoch: DecimalU64::new(1),
+            replay_id: OperationId::from_bytes([4; 32]),
+            expires_at_ms: DecimalU64::new(60_000),
+            audit_purpose: Token::new("allocate-derived-account").unwrap(),
+        }
+    }
+
+    fn evm_request() -> DerivedAccountRequest {
+        DerivedAccountRequest {
+            derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
+            requested_role: Token::new("primary-evm").unwrap(),
+            account: None,
+        }
+    }
+
+    fn solana_request() -> DerivedAccountRequest {
+        DerivedAccountRequest {
+            derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            requested_role: Token::new("solana-account").unwrap(),
+            account: None,
+        }
+    }
+
+    #[test]
+    fn multi_family_allocation_binding_accepts_the_reviewed_list() {
+        let terms = multi_family_terms(vec![evm_request(), solana_request()]);
+        allocate_prepare(terms)
+            .validate_account_allocation_binding()
+            .unwrap();
+    }
+
+    #[test]
+    fn multi_family_allocation_binding_rejects_bad_shapes() {
+        let both = multi_family_terms(vec![evm_request(), solana_request()]);
+        let mut both = allocate_prepare(both);
+        both.derivation_request = Some(evm_request());
+        assert_eq!(
+            both.validate_account_allocation_binding().unwrap_err().code,
+            ProtocolErrorCode::MalformedFrame
+        );
+
+        let neither = multi_family_terms(vec![evm_request(), solana_request()]);
+        let mut neither = allocate_prepare(neither);
+        neither.derivation_requests = Vec::new();
+        assert_eq!(
+            neither
+                .validate_account_allocation_binding()
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::MalformedFrame
+        );
+
+        let duplicated = multi_family_terms(vec![evm_request(), evm_request()]);
+        assert_eq!(
+            allocate_prepare(duplicated)
+                .validate_account_allocation_binding()
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::MalformedFrame
+        );
+
+        let pinned = multi_family_terms(vec![
+            DerivedAccountRequest {
+                derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
+                requested_role: Token::new("primary-evm").unwrap(),
+                account: Some(0),
+            },
+            solana_request(),
+        ]);
+        assert_eq!(
+            allocate_prepare(pinned)
+                .validate_account_allocation_binding()
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::MalformedFrame
+        );
+
+        let nonzero_evm = multi_family_terms(vec![DerivedAccountRequest {
+            derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
+            requested_role: Token::new("secondary-evm").unwrap(),
+            account: Some(1),
+        }]);
+        assert_eq!(
+            allocate_prepare(nonzero_evm)
+                .validate_account_allocation_binding()
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::MalformedFrame
+        );
+
+        let divergent_terms = multi_family_terms(vec![evm_request(), solana_request()]);
+        let mut divergent = allocate_prepare(divergent_terms);
+        divergent.derivation_requests = vec![evm_request()];
+        assert_eq!(
+            divergent
+                .validate_account_allocation_binding()
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::OperationIdConflict
+        );
+    }
+
+    #[test]
+    fn single_family_allocation_refuses_list_shaped_terms() {
+        let terms = multi_family_terms(vec![evm_request(), solana_request()]);
+        let mut request = allocate_prepare(terms);
+        request.derivation_request = Some(evm_request());
+        request.derivation_requests = Vec::new();
+        assert_eq!(
+            request
+                .validate_account_allocation_binding()
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::OperationIdConflict
+        );
     }
 
     fn retire_prepare(terms: AccountTerms, fingerprint: Digest32) -> CustodyPrepareRequest {

@@ -889,10 +889,11 @@ impl BrokerAuthority {
         Ok(())
     }
 
-    /// Fail-closed adoption of an allocation receipt: the returned child
-    /// must be exactly the child the committed terms asked for — same
-    /// wallet, same derivation profile, same committed account index, and a
-    /// path shape matching the profile's frozen template.
+    /// Fail-closed adoption of an allocation receipt: the returned children
+    /// must be exactly the children the committed terms asked for — one per
+    /// committed request, same wallet, same derivation profile and role, a
+    /// path shape matching the profile's frozen template, and, for a
+    /// multi-family request, one shared account number across the families.
     fn adopt_account_allocation(
         &self,
         receipt: &CustodyResult,
@@ -902,40 +903,79 @@ impl BrokerAuthority {
         if state == "ADOPTED" {
             return Ok(());
         }
-        let derivation = terms.derivation.clone().ok_or_else(|| {
-            denied(
+        let requests = terms.effective_derivations();
+        if requests.is_empty() {
+            return Err(denied(
                 "CUSTODY_RECEIPT_INVALID",
                 "committed allocation terms carry no derivation request",
-            )
-        })?;
+            ));
+        }
         if receipt.wallet_id.as_ref() != Some(&terms.wallet_id)
-            || receipt.public_key_refs.len() != 1
+            || receipt.public_key_refs.len() != requests.len()
         {
             return Err(denied(
                 "CUSTODY_RECEIPT_INVALID",
                 "allocation receipt wallet or child count contradicts the committed terms",
             ));
         }
-        let child = &receipt.public_key_refs[0];
-        let Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
-            wallet_seed_ref,
-            profile,
-            path,
-        }) = child.derivation.clone()
-        else {
+        let mut by_profile: std::collections::HashMap<
+            bloom_broker_api::DerivationProfile,
+            (&bloom_broker_api::KeyRef, String),
+        > = std::collections::HashMap::new();
+        for child in &receipt.public_key_refs {
+            let Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                wallet_seed_ref,
+                profile,
+                path,
+            }) = child.derivation.clone()
+            else {
+                return Err(denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "allocated child is not a bip39 derived account",
+                ));
+            };
+            if wallet_seed_ref != terms.wallet_id {
+                return Err(denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "allocated child belongs to a different wallet",
+                ));
+            }
+            if by_profile.insert(profile, (child, path)).is_some() {
+                return Err(denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "allocation receipt repeats a derivation profile",
+                ));
+            }
+        }
+        let mut adopted: Vec<(&bloom_broker_api::KeyRef, u32)> = Vec::new();
+        for request in &requests {
+            let profile = request.derivation_profile;
+            let Some((child, path)) = by_profile.get(&profile) else {
+                return Err(denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "allocation receipt is missing a requested derivation profile",
+                ));
+            };
+            if child.key_spec != profile.key_spec()
+                || !path_matches_committed_account(profile, path, request.account)
+            {
+                return Err(denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "allocated child does not match the committed derivation request",
+                ));
+            }
+            let number = committed_path_number(profile, path).ok_or_else(|| {
+                denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "allocated child path carries no account number",
+                )
+            })?;
+            adopted.push((child, number));
+        }
+        if adopted.len() > 1 && !adopted.iter().all(|(_, number)| *number == adopted[0].1) {
             return Err(denied(
                 "CUSTODY_RECEIPT_INVALID",
-                "allocated child is not a bip39 derived account",
-            ));
-        };
-        if wallet_seed_ref != terms.wallet_id
-            || profile != derivation.derivation_profile
-            || child.key_spec != derivation.derivation_profile.key_spec()
-            || !path_matches_committed_account(profile, &path, derivation.account)
-        {
-            return Err(denied(
-                "CUSTODY_RECEIPT_INVALID",
-                "allocated child does not match the committed derivation request",
+                "multi-family allocation children disagree on the account number",
             ));
         }
         let mut connection = self.journal.lock_for_mutation()?;
@@ -962,8 +1002,10 @@ impl BrokerAuthority {
             &serde_json::json!({
                 "custody_operation_id": receipt.custody_operation_id,
                 "wallet_id": terms.wallet_id,
-                "child_fingerprint": child.public_key_fingerprint,
-                "derivation_profile": derivation.derivation_profile,
+                "children": adopted.iter().map(|(child, number)| serde_json::json!({
+                    "child_fingerprint": child.public_key_fingerprint,
+                    "account_number": number,
+                })).collect::<Vec<_>>(),
                 "observed_at_ms": now_ms.to_string()
             }),
         )?;
@@ -2917,6 +2959,21 @@ fn migrate_legacy_authority(
 /// account is pinned exactly. An omitted EVM account means account zero, while
 /// an omitted Solana account delegates selection of the next canonical account
 /// to Signer's authoritative derivation registry.
+/// The account number a committed derived-account path encodes: the EVM
+/// address index under hardened account zero, or the Solana hardened
+/// account. Callers run the frozen-template shape check first.
+fn committed_path_number(profile: bloom_broker_api::DerivationProfile, path: &str) -> Option<u32> {
+    let digits = match profile {
+        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
+            path.strip_prefix("m/44'/60'/0'/0/")?
+        }
+        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+            path.strip_prefix("m/44'/501'/")?.strip_suffix("'/0'")?
+        }
+    };
+    digits.parse::<u32>().ok()
+}
+
 fn path_matches_committed_account(
     profile: bloom_broker_api::DerivationProfile,
     path: &str,

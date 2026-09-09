@@ -119,6 +119,7 @@ fn custody_prepare() -> CustodyPrepareRequest {
         legacy_passkey_migration: None,
         wallet_seed_profile: None,
         derivation_request: None,
+        derivation_requests: Vec::new(),
         account_terms: None,
     }
 }
@@ -380,6 +381,7 @@ fn account_allocate_terms() -> AccountTerms {
         replay_id: operation(70),
         expires_at_ms: DecimalU64::new(120),
         audit_purpose: token("allocate-derived-account"),
+        derivations: Vec::new(),
     }
 }
 
@@ -397,6 +399,7 @@ fn account_allocate_prepare() -> CustodyPrepareRequest {
         legacy_passkey_migration: None,
         wallet_seed_profile: None,
         derivation_request: terms.derivation.clone(),
+        derivation_requests: Vec::new(),
         account_terms: Some(terms),
     }
 }
@@ -417,6 +420,7 @@ fn account_retire_prepare() -> CustodyPrepareRequest {
         legacy_passkey_migration: None,
         wallet_seed_profile: None,
         derivation_request: None,
+        derivation_requests: Vec::new(),
         account_terms: Some(terms),
     }
 }

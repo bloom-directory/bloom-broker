@@ -511,6 +511,9 @@ impl BrokerRpcService {
                 request.validate_account_allocation_binding()?;
                 self.verify_account_terms_baseline(&request).await?;
                 self.verify_wallet_supports_allocation(&request).await?;
+                let review = request.account_terms.as_ref().map(|terms| {
+                    crate::ceremony::account_terms_review(&request.ceremony_kind, terms)
+                });
                 self.authority
                     .record_account_terms(
                         request.account_terms.as_ref().expect("validated terms"),
@@ -518,8 +521,9 @@ impl BrokerRpcService {
                     )
                     .map_err(authority_error)?;
                 Ok(Response::AccountAllocatePrepare(
-                    self.ceremony.prepare_custody(
+                    self.ceremony.prepare_custody_reviewed(
                         translate_custody::prepare_to_signer(request),
+                        review,
                         self.clock.now_ms(false)?,
                     )?,
                 ))
@@ -532,6 +536,9 @@ impl BrokerRpcService {
                 request.validate_account_retire_binding()?;
                 self.verify_account_terms_baseline(&request).await?;
                 self.verify_retire_target_matches_terms(&request).await?;
+                let review = request.account_terms.as_ref().map(|terms| {
+                    crate::ceremony::account_terms_review(&request.ceremony_kind, terms)
+                });
                 self.authority
                     .record_account_terms(
                         request.account_terms.as_ref().expect("validated terms"),
@@ -539,8 +546,9 @@ impl BrokerRpcService {
                     )
                     .map_err(authority_error)?;
                 Ok(Response::AccountRetirePrepare(
-                    self.ceremony.prepare_custody(
+                    self.ceremony.prepare_custody_reviewed(
                         translate_custody::prepare_to_signer(request),
+                        review,
                         self.clock.now_ms(false)?,
                     )?,
                 ))
@@ -836,6 +844,7 @@ impl BrokerRpcService {
                     legacy_passkey_migration: None,
                     wallet_seed_profile: None,
                     derivation_request: None,
+                    derivation_requests: Vec::new(),
                 },
                 update: signer_update,
                 broker_validation_receipt: validation,

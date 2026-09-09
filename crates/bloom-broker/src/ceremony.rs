@@ -739,6 +739,18 @@ impl CeremonyBroker {
         request: CustodyPrepareRequest,
         now_ms: u64,
     ) -> Result<CustodyPrepareResponse, ProtocolError> {
+        self.prepare_custody_reviewed(request, None, now_ms)
+    }
+
+    /// [`Self::prepare_custody`] with a broker-authored review JSON the
+    /// browser shows for account ceremonies: the owner approves the exact
+    /// families, roles and frozen path templates before any key exists.
+    pub fn prepare_custody_reviewed(
+        &self,
+        request: CustodyPrepareRequest,
+        account_review: Option<serde_json::Value>,
+        now_ms: u64,
+    ) -> Result<CustodyPrepareResponse, ProtocolError> {
         self.expire_sessions(now_ms)?;
         request
             .validate_legacy_passkey_migration_binding()
@@ -820,6 +832,8 @@ impl CeremonyBroker {
                     "creates_current_wkek_custody": true,
                     "legacy_policy_is_not_imported": true
                 }))
+            } else if account_review.is_some() {
+                account_review
             } else {
                 request
                     .petal_key_scope
@@ -2669,6 +2683,45 @@ fn digest(value: &impl Serialize) -> Result<Digest32, ProtocolError> {
     Ok(Digest32::from_bytes(
         Sha256::digest(serde_jcs::to_vec(value).map_err(malformed)?).into(),
     ))
+}
+
+/// The browser-visible review of one account ceremony: every requested
+/// family with its role, pinned account (single-family only; Signer chooses
+/// the number for a multi-family request), frozen path template and key
+/// material shape.
+pub(crate) fn account_terms_review(
+    kind: &bloom_broker_api::CeremonyKind,
+    terms: &bloom_broker_api::AccountTerms,
+) -> serde_json::Value {
+    let families: Vec<serde_json::Value> = terms
+        .effective_derivations()
+        .iter()
+        .map(|request| {
+            let profile = request.derivation_profile;
+            serde_json::json!({
+                "derivation_profile": profile,
+                "requested_role": request.requested_role,
+                "pinned_account": request.account,
+                "path_template": profile.path_template(),
+                "key_spec": profile.key_spec(),
+                "allowed_crypto_suites": profile.frozen_crypto_suites(),
+            })
+        })
+        .collect();
+    let title = match kind {
+        bloom_broker_api::CeremonyKind::AccountRetire => "Retire one derived account key",
+        _ => "Allocate account key(s)",
+    };
+    serde_json::json!({
+        "schema": "bloom.account_terms_review.v1",
+        "title": title,
+        "wallet_id": terms.wallet_id,
+        "seed_profile": terms.seed_profile,
+        "families": families,
+        "retire_key_fingerprint": terms.retire_key_fingerprint,
+        "policy_version": terms.policy_version,
+        "revocation_epoch": terms.revocation_epoch,
+    })
 }
 
 fn canonical_review_plan(

@@ -1411,6 +1411,7 @@ fn try_prepare(
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
             derivation_request: None,
+            derivation_requests: Vec::new(),
         },
         now_ms,
     )
@@ -1447,6 +1448,7 @@ fn try_register(
             legacy_passkey_migration: None,
             wallet_seed_profile: Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1),
             derivation_request: None,
+            derivation_requests: Vec::new(),
         },
         now_ms,
     )
@@ -1657,6 +1659,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
             derivation_request: None,
+            derivation_requests: Vec::new(),
             account_terms: None,
         }),
     )
@@ -2083,6 +2086,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
             derivation_request: None,
+            derivation_requests: Vec::new(),
             account_terms: None,
         }),
     )
@@ -3202,6 +3206,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
                 derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             1_001,
         )
@@ -3222,6 +3227,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                     legacy_passkey_migration: None,
                     wallet_seed_profile: None,
                     derivation_request: None,
+                    derivation_requests: Vec::new(),
                 },
                 1_001,
             )
@@ -3253,6 +3259,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                     legacy_passkey_migration: None,
                     wallet_seed_profile: None,
                     derivation_request: None,
+                    derivation_requests: Vec::new(),
                 },
                 1_101,
             )
@@ -3298,6 +3305,7 @@ async fn legacy_passkey_prepare_renders_only_digest_bound_public_migration_terms
                 legacy_passkey_migration: Some(migration),
                 wallet_seed_profile: None,
                 derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             now_ms,
         )
@@ -3419,6 +3427,7 @@ async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() 
         legacy_passkey_migration: None,
         wallet_seed_profile: None,
         derivation_request: None,
+        derivation_requests: Vec::new(),
     };
     let now_ms: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3833,6 +3842,7 @@ fn ac18_forced_ceremony_audit_write_failure_rolls_back_session() {
         legacy_passkey_migration: None,
         wallet_seed_profile: None,
         derivation_request: None,
+        derivation_requests: Vec::new(),
     };
 
     fail.store(true, Ordering::SeqCst);
@@ -3888,6 +3898,7 @@ fn ac18_populated_ceremony_migration_is_atomic_idempotent_and_retains_source() {
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
                 derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             50_000,
         )
@@ -4094,6 +4105,7 @@ fn ac18_ceremony_status_survives_latched_audit_tamper_while_new_sessions_fail() 
                     legacy_passkey_migration: None,
                     wallet_seed_profile: None,
                     derivation_request: None,
+                    derivation_requests: Vec::new(),
                 },
                 41_001,
             )
@@ -4145,6 +4157,7 @@ fn restart_expires_nonterminal_session_and_persists_only_token_hash() {
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
                 derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             50_001,
         )
@@ -4545,6 +4558,7 @@ fn zero_effective_time_fails_closed_before_anonymous_creation_quota() {
                         bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1,
                     ),
                     derivation_request: None,
+                    derivation_requests: Vec::new(),
                 },
                 1 + u64::from(index),
             )
@@ -4566,6 +4580,7 @@ fn zero_effective_time_fails_closed_before_anonymous_creation_quota() {
                 legacy_passkey_migration: None,
                 wallet_seed_profile: Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1),
                 derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             0,
         )
@@ -4605,6 +4620,7 @@ fn cancellation_backoff_reports_remaining_cooldown_and_resets_after_expiry() {
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
                 derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             10_001,
         )
@@ -4660,6 +4676,7 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
                         bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1,
                     ),
                     derivation_request: None,
+                    derivation_requests: Vec::new(),
                 },
                 100_000 + u64::from(index),
             )
@@ -4685,6 +4702,7 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
                         bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1,
                     ),
                     derivation_request: None,
+                    derivation_requests: Vec::new(),
                 },
                 100_010,
             )
@@ -4717,6 +4735,7 @@ async fn bip39_import_session_projects_the_authoritative_signer_profile() {
                 legacy_passkey_migration: None,
                 wallet_seed_profile: Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1),
                 derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             now_ms,
         )
@@ -4780,6 +4799,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
                 legacy_passkey_migration: None,
                 wallet_seed_profile: Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1),
                 derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             now_ms,
         )
@@ -4890,6 +4910,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
                 derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             now_ms + 1_000,
         )

@@ -630,6 +630,7 @@ fn custody_request(
         legacy_passkey_migration: None,
         wallet_seed_profile: None,
         derivation_request: None,
+        derivation_requests: Vec::new(),
         account_terms: None,
     }
 }
@@ -754,6 +755,7 @@ fn allocation_terms(
         replay_id,
         expires_at_ms: DecimalU64::new(now_plus(600)),
         audit_purpose: Token::new("allocate-derived-account").unwrap(),
+        derivations: Vec::new(),
     }
 }
 
@@ -770,8 +772,55 @@ fn allocate_request(
         Token::new("generic-custody-v1").unwrap(),
     );
     request.derivation_request = terms.derivation.clone();
+    request.derivation_requests = terms.derivations.clone();
     request.account_terms = Some(terms);
     request
+}
+
+/// Multi-family allocation terms: the global frozen shape is the EVM
+/// family's when one is requested, and Signer chooses the shared number.
+fn multi_family_terms(
+    wallet: &WalletPublic,
+    requests: Vec<DerivedAccountRequest>,
+    replay_id: OperationId,
+) -> AccountTerms {
+    let anchor = requests
+        .iter()
+        .find(|request| request.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1)
+        .unwrap_or(&requests[0]);
+    let profile = anchor.derivation_profile;
+    AccountTerms {
+        schema: Token::new("bloom.account_terms.v1").unwrap(),
+        wallet_id: wallet.wallet_id.clone(),
+        seed_profile: WalletSeedProfile::Bip39MulticurveV1,
+        derivation: None,
+        derivations: requests,
+        retire_key_fingerprint: None,
+        path_template: profile.path_template().to_owned(),
+        key_spec: profile.key_spec(),
+        allowed_crypto_suites: profile.frozen_crypto_suites().to_vec(),
+        policy_version: wallet.policy_version.clone(),
+        revocation_epoch: wallet.wallet_revocation_epoch.clone(),
+        replay_id,
+        expires_at_ms: DecimalU64::new(now_plus(600)),
+        audit_purpose: Token::new("allocate-derived-account").unwrap(),
+    }
+}
+
+fn evm_family_request() -> DerivedAccountRequest {
+    DerivedAccountRequest {
+        derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
+        requested_role: Token::new("primary-evm").unwrap(),
+        account: None,
+    }
+}
+
+fn solana_family_request() -> DerivedAccountRequest {
+    DerivedAccountRequest {
+        derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+        requested_role: Token::new("solana-account").unwrap(),
+        account: None,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -879,7 +928,7 @@ async fn account_allocate_retire_replay_cancel_restart_over_real_transport() {
         DerivedAccountRequest {
             derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
             requested_role: Token::new("secondary-evm").unwrap(),
-            account: Some(1),
+            account: Some(0),
         },
         cancel_operation.clone(),
     );
@@ -942,6 +991,7 @@ async fn account_allocate_retire_replay_cancel_restart_over_real_transport() {
         replay_id: retire_operation.clone(),
         expires_at_ms: DecimalU64::new(now_plus(600)),
         audit_purpose: Token::new("retire-derived-account").unwrap(),
+        derivations: Vec::new(),
     };
     let mut retire_request = custody_request(
         CeremonyKind::AccountRetire,
@@ -1053,6 +1103,89 @@ async fn automatic_solana_allocation_adopts_successive_accounts_over_real_transp
         .collect::<Vec<_>>();
     solana_paths.sort_unstable();
     assert_eq!(solana_paths, ["m/44'/501'/0'/0'", "m/44'/501'/1'/0'"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_family_allocation_shares_one_number_over_real_transport() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut stack = account_stack(directory.path(), "two-family").await;
+    let authenticator = VirtualAuthenticator::generate();
+    let wallet_id = Token::new("paired-accounts").unwrap();
+    register_bip39_wallet(&mut stack, &wallet_id, &authenticator, None).await;
+
+    // The owner reviews both families, their roles and frozen templates in
+    // the ceremony before any key exists.
+    let public = wallet_public(&stack, &wallet_id).await;
+    let operation = stack.next_operation();
+    let terms = multi_family_terms(
+        &public,
+        vec![evm_family_request(), solana_family_request()],
+        operation.clone(),
+    );
+    let request = allocate_request(&wallet_id, terms);
+    let prepared = match MachineBrokerService::dispatch(
+        stack.broker.as_ref(),
+        MachineBrokerRequest::AccountAllocatePrepare(request.clone()),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::AccountAllocatePrepare(prepared) => prepared,
+        response => panic!("unexpected allocate response: {response:?}"),
+    };
+    let ceremony_id = stack
+        .broker
+        .ceremony()
+        .public_status(&request.custody_operation_id)
+        .unwrap()
+        .ceremony_id
+        .to_string();
+    let session = get_session(
+        stack.broker.as_ref(),
+        &ceremony_id,
+        &url_token(&prepared.ceremony_url),
+    )
+    .await;
+    let review = &session["review_manifest"];
+    assert_eq!(review["schema"], "bloom.account_terms_review.v1");
+    assert_eq!(review["families"].as_array().unwrap().len(), 2);
+
+    let result = complete_generic_ceremony(&stack, &request, &prepared, &authenticator, 2).await;
+    assert_eq!(result.public_key_refs.len(), 2);
+
+    // Both children sit under the one number after the registration child:
+    // EVM index 1 and Solana account 1.
+    let accounts = wallet_accounts(&stack, &wallet_id).await;
+    let evm_path = accounts
+        .accounts
+        .iter()
+        .find(|account| {
+            account.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1
+                && account.path != "m/44'/60'/0'/0/0"
+        })
+        .map(|account| account.path.as_str())
+        .unwrap();
+    let solana_paths: Vec<&str> = accounts
+        .accounts
+        .iter()
+        .filter(|account| {
+            account.derivation_profile == DerivationProfile::Bip44SolanaSlip10Ed25519V1
+        })
+        .map(|account| account.path.as_str())
+        .collect();
+    assert_eq!(evm_path, "m/44'/60'/0'/0/1");
+    assert_eq!(solana_paths, ["m/44'/501'/1'/0'"]);
+
+    // A retry after completion reads the same terminal receipt: the same
+    // two children, with nothing allocated further. (Machine layers its own
+    // request-status file over this so a retry never re-prepares.)
+    let replayed_result = custody_result(&stack, &operation).await;
+    assert_eq!(
+        result.public_key_refs, replayed_result.public_key_refs,
+        "a retry must return the same children"
+    );
+    let after = wallet_accounts(&stack, &wallet_id).await;
+    assert_eq!(after.accounts.len(), accounts.accounts.len());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1299,8 +1432,8 @@ async fn two_passkeys_and_recovery_unlock_the_same_bip39_root_over_real_transpor
         &public_after_recovery,
         DerivedAccountRequest {
             derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
-            requested_role: Token::new("recovered-evm").unwrap(),
-            account: Some(1),
+            requested_role: Token::new("primary-evm").unwrap(),
+            account: Some(0),
         },
         evm_two_operation.clone(),
     );
@@ -1450,6 +1583,7 @@ async fn account_allocation_fails_closed_on_stale_and_foreign_terms() {
         replay_id: retire_operation.clone(),
         expires_at_ms: DecimalU64::new(now_plus(600)),
         audit_purpose: Token::new("retire-derived-account").unwrap(),
+        derivations: Vec::new(),
     };
     let child = wallet_accounts(&stack, &wallet_id).await.accounts[0].clone();
     let mut foreign_request = custody_request(
