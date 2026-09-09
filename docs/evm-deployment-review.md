@@ -1,8 +1,9 @@
 # Exact EVM deployment review
 
-Machine/Broker protocol 1.5 adds `evm_review_payloads` to
-`sealed_approval.prepare`. Upgrade both services together: strict 1.4 decoders
-cannot accept this field, and 1.5 refuses native `transaction.confirm`,
+Machine/Broker protocol 1.6 adds `evm_review_payloads` to
+`sealed_approval.prepare` (1.5 introduced BIP-39 account custody). Upgrade both
+services together: strict 1.5 and earlier decoders cannot accept this field,
+and 1.6 refuses native `transaction.confirm`,
 `transaction.replace`, and `transaction.cancel` preparations without payloads.
 Signer protocol and the Sealed Approval selector remain unchanged.
 

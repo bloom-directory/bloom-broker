@@ -913,11 +913,13 @@ fn verified_status_parent(
         .parent()
         .ok_or("Broker startup diagnostic has no parent directory")?;
     let metadata = fs::symlink_metadata(parent)?;
+    // Directory hard links are forbidden by POSIX, so `is_dir` already rules
+    // out substitutes; a link-count floor is not portable (btrfs reports
+    // nlink=1 for empty directories) and adds no guarantee beyond `is_dir`.
     if !metadata.file_type().is_dir()
         || metadata.file_type().is_symlink()
         || metadata.uid() != broker_uid
         || metadata.mode() & 0o7777 != 0o750
-        || metadata.nlink() < 2
     {
         return Err("Broker startup status directory has unsafe metadata".into());
     }
@@ -2159,5 +2161,15 @@ mod startup_failure_tests {
 
         std::os::unix::fs::symlink("/dev/null", &path).expect("substitute status path");
         assert!(write_startup_failure(&path, metadata.uid(), &failure).is_err());
+    }
+
+    #[test]
+    fn status_directory_is_accepted_regardless_of_link_count() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o750))
+            .expect("set status directory permissions");
+        let metadata = fs::symlink_metadata(temporary.path()).expect("status directory metadata");
+        let path = temporary.path().join("broker-startup.json");
+        assert!(verified_status_parent(&path, metadata.uid()).is_ok());
     }
 }
