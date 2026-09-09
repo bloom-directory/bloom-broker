@@ -544,14 +544,12 @@ fn every_machine_broker_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "6f67bf98e2299c78a906d522bf5fd0a730ea9f76b7fd1ccd8308274be650a0f5",
-        "bcb648dce4e11c5f38bc8555fd325299a2bdeb0f256345696ecb76b6c9d15030",
+        "eb7e1d6394c5a9f74edbced3ebd13f347e20ae1aa9de8bf089e693e3c84664aa",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "d4fb9416db443d5fbf0a8a083f4d74763475b0785583ac7a01f31ddd0196a341",
-        "6c4ef3a304d6e2d493a6cf3c6ca45fcfc971f519a6b0cbaed1523aaf1c9701c9",
+        "78b67e7d3c1ad1604e0b6662fe2320df503dbd007918d93540727d220130cc39",
     );
 }
 

@@ -15,8 +15,9 @@ use bloom_broker_api::{
     DeclaredDebit, DeclaredDestination, DeclaredFee, DerivationProfile, DerivedAccountRequest,
     Digest32, KeyRef, KeySpec, MachineSignRequest, OperationId, PROVENANCE_CATALOG_SCHEMA,
     PetalKeyScope, PetalLineageMembership, PetalRouteGrant, PetalUseClaim, PolicyUpdateRequest,
-    ProvenanceCatalog, RequestNonce, RevocationState, SealedApprovalTerms, SignedPolicySnapshot,
-    SigningPayloads, Token, ValueLimit,
+    ProvenanceCatalog, RequestNonce, RevocationState, SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES,
+    SOLANA_SYSTEM_TRANSFER_VERIFIER_ID, SealedApprovalTerms, SignedPolicySnapshot,
+    SigningPayloads, SystemChainContext, SystemUseClaim, Token, ValueLimit,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
