@@ -118,7 +118,6 @@ fn custody_prepare() -> CustodyPrepareRequest {
         petal_key_scope: None,
         legacy_passkey_migration: None,
         wallet_seed_profile: None,
-        derivation_request: None,
         derivation_requests: Vec::new(),
         account_terms: None,
     }
@@ -366,11 +365,11 @@ fn account_allocate_terms() -> AccountTerms {
         schema: token("bloom.account_terms.v1"),
         wallet_id: token("wallet"),
         seed_profile: WalletSeedProfile::Bip39MulticurveV1,
-        derivation: Some(DerivedAccountRequest {
+        derivations: vec![DerivedAccountRequest {
             derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
             requested_role: token("primary-evm"),
-            account: Some(0),
-        }),
+            account: None,
+        }],
         retire_key_fingerprint: None,
         path_template: DerivationProfile::Bip44EvmSecp256k1V1
             .path_template()
@@ -384,7 +383,6 @@ fn account_allocate_terms() -> AccountTerms {
         replay_id: operation(70),
         expires_at_ms: DecimalU64::new(120),
         audit_purpose: token("allocate-derived-account"),
-        derivations: Vec::new(),
     }
 }
 
@@ -401,15 +399,14 @@ fn account_allocate_prepare() -> CustodyPrepareRequest {
         petal_key_scope: None,
         legacy_passkey_migration: None,
         wallet_seed_profile: None,
-        derivation_request: terms.derivation.clone(),
-        derivation_requests: Vec::new(),
+        derivation_requests: terms.derivations.clone(),
         account_terms: Some(terms),
     }
 }
 
 fn account_retire_prepare() -> CustodyPrepareRequest {
     let mut terms = account_allocate_terms();
-    terms.derivation = None;
+    terms.derivations.clear();
     terms.retire_key_fingerprint = Some(digest(74));
     CustodyPrepareRequest {
         ceremony_kind: CeremonyKind::AccountRetire,
@@ -422,7 +419,6 @@ fn account_retire_prepare() -> CustodyPrepareRequest {
         petal_key_scope: None,
         legacy_passkey_migration: None,
         wallet_seed_profile: None,
-        derivation_request: None,
         derivation_requests: Vec::new(),
         account_terms: Some(terms),
     }
@@ -544,7 +540,7 @@ fn every_machine_broker_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "eb7e1d6394c5a9f74edbced3ebd13f347e20ae1aa9de8bf089e693e3c84664aa",
+        "abbf7bd16412516c7744d5b62f9533e42b8d5c5797a8b358de4f3de9276ee760",
     );
     assert_wire_digest(
         "machine responses",
