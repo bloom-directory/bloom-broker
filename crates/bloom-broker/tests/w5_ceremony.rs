@@ -2907,6 +2907,43 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .await
         .is_err()
     );
+    // Stopping a session revokes every approval bound to its key, resolved
+    // from Broker's own journal rather than a caller's list. The single
+    // revoke afterwards is the idempotent path over an already revoked
+    // approval, through Broker and Signer alike.
+    let revoked_for_key = MachineBrokerService::dispatch(
+        &restarted_scoped_broker,
+        MachineBrokerRequest::SealedApprovalRevokeForKey(bloom_broker_api::RevokeForKeyRequest {
+            operation_id: operation("d9"),
+            wallet_id: wallet_id.clone(),
+            key_ref: approval_terms.key_ref.clone(),
+            reason: "fixture session stop".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    let MachineBrokerResponse::SealedApprovalRevokeForKey(statuses) = revoked_for_key else {
+        panic!("revoke_for_key answers with the affected approvals");
+    };
+    assert!(statuses.iter().any(|status| {
+        status.approval_id == approval_terms.approval_id().unwrap()
+            && status.state == bloom_broker_api::ApprovalLifecycleState::Revoked
+    }));
+    let repeated = MachineBrokerService::dispatch(
+        &restarted_scoped_broker,
+        MachineBrokerRequest::SealedApprovalRevokeForKey(bloom_broker_api::RevokeForKeyRequest {
+            operation_id: operation("d9"),
+            wallet_id: wallet_id.clone(),
+            key_ref: approval_terms.key_ref.clone(),
+            reason: "fixture session stop".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        repeated,
+        MachineBrokerResponse::SealedApprovalRevokeForKey(again) if again == statuses
+    ));
     let revoked = MachineBrokerService::dispatch(
         &restarted_scoped_broker,
         MachineBrokerRequest::SealedApprovalRevoke(RevokeRequest {

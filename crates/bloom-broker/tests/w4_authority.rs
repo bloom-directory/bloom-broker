@@ -950,7 +950,64 @@ fn petal_scoped_key_is_frozen_to_installer_provenance_and_petal_approvals() {
         "an inactive secondary grant must not inherit the origin route's lineage"
     );
 
+    // The scope was adopted at 1_000 with a 10_000 ms lifetime, so it expires
+    // at 11_000. A reusable approval may not outlast it; an Exact approval,
+    // reviewed by the owner payload by payload, may, so the funds behind a
+    // delegated key stay recoverable after the scope lapses.
+    let mut late_reusable = terms.clone();
+    late_reusable.issued_at_ms = DecimalU64::new(11_400);
+    late_reusable.not_before_ms = DecimalU64::new(11_500);
+    late_reusable.expires_at_ms = DecimalU64::new(12_000);
+    assert!(
+        error_code(
+            harness
+                .authority
+                .prepare_approval(&late_reusable, &digest(7))
+                .unwrap_err()
+        )
+        .contains("PETAL_KEY_SCOPE_MISMATCH"),
+        "a reusable approval must not outlast the key scope"
+    );
+    let mut late_exact = late_reusable.clone();
+    let recovery_hash = Digest32::from_bytes(Sha256::digest(b"sweep").into());
+    late_exact.selector = ApprovalSelector::Exact {
+        ordered_payload_digests: vec![recovery_hash.clone()],
+        ordered_hashes: vec![recovery_hash],
+    };
+    late_exact.limits.max_operations = DecimalU64::new(1);
+    late_exact.limits.max_signatures = DecimalU64::new(1);
+    harness
+        .authority
+        .prepare_approval(&late_exact, &digest(7))
+        .expect("an Exact approval outlives the key scope");
+
     harness.activate(&terms, Some(&provenance));
+
+    // A by-key revocation acts on every journalled approval bound to the key
+    // and on nothing else: the activated approval is listed under the child,
+    // the refused non-Petal terms are not, and the parent key's list does not
+    // contain the child's approval.
+    let bound = harness
+        .authority
+        .approvals_for_key(&harness.wallet, &child)
+        .unwrap();
+    assert!(bound.iter().any(|(id, state)| {
+        *id == terms.approval_id().unwrap()
+            && *state == bloom_broker_api::ApprovalLifecycleState::Active
+    }));
+    assert!(
+        bound
+            .iter()
+            .all(|(id, _)| *id != non_petal.approval_id().unwrap())
+    );
+    assert!(
+        harness
+            .authority
+            .approvals_for_key(&harness.wallet, &key_ref())
+            .unwrap()
+            .iter()
+            .all(|(id, _)| *id != terms.approval_id().unwrap())
+    );
     harness
         .authority
         .authorize(&petal_input(

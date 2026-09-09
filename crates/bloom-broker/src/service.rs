@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use bloom_broker_api::{
-    ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector, Base64UrlBytes, BootEpoch,
-    DecimalU64, Digest32, MachineBrokerMethod, MachineBrokerRequest, MachineBrokerResponse,
-    MachineBrokerService, MachineSignRequest, OperationId, OperationPublicStatus, OperationState,
-    PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, RPC_ENVELOPE_SCHEMA_V1, Readiness,
-    ReadinessState, SealedApprovalPrepareResponse, ServiceCapabilities, ServiceFuture,
-    SigningPayloads, Token, VerifierPublicCapability, WalletAccountsPublic, WalletPublic,
-    WalletRequest, WalletSeedProfile,
+    ApprovalLifecycleState, ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector,
+    Base64UrlBytes, BootEpoch, DecimalU64, Digest32, MachineBrokerMethod, MachineBrokerRequest,
+    MachineBrokerResponse, MachineBrokerService, MachineSignRequest, OperationId,
+    OperationPublicStatus, OperationState, PolicyUpdateRequest, ProtocolError, ProtocolErrorCode,
+    RPC_ENVELOPE_SCHEMA_V1, Readiness, ReadinessState, RevokeRequest,
+    SealedApprovalPrepareResponse, ServiceCapabilities, ServiceFuture, SigningPayloads, Token,
+    VerifierPublicCapability, WalletAccountsPublic, WalletPublic, WalletRequest, WalletSeedProfile,
 };
 use bloom_platform_containment::NetworkContainmentGuard;
 use bloom_signer_api::{
@@ -219,6 +219,60 @@ impl BrokerRpcService {
                 Ok(Response::SealedApprovalRevoke(
                     self.approval_public_status(&request.approval_id)?,
                 ))
+            }
+            Request::SealedApprovalRevokeForKey(request) => {
+                // The set comes from Broker's own journal: a caller's record
+                // of approval ids may be stale, and every approval on a key
+                // is automation that must stop together.
+                let bound = self
+                    .authority
+                    .approvals_for_key(&request.wallet_id, &request.key_ref)
+                    .map_err(authority_error)?;
+                let mut statuses = Vec::with_capacity(bound.len());
+                for (approval_id, state) in bound {
+                    // Signer only ever learned of approvals that reached it.
+                    // A prepared or awaiting approval fails locally, which is
+                    // what keeps its ceremony from completing after this.
+                    let signer_may_hold = matches!(
+                        state,
+                        ApprovalLifecycleState::Orphaned
+                            | ApprovalLifecycleState::Active
+                            | ApprovalLifecycleState::Exhausted
+                            | ApprovalLifecycleState::Expired
+                            | ApprovalLifecycleState::Revoked
+                    );
+                    if signer_may_hold {
+                        // Signer first, so a failure here leaves nothing half
+                        // done locally. A fresh operation id per call: Signer
+                        // records each revocation by operation id and treats
+                        // an already revoked approval as success, so a retry
+                        // of this request is safe and reaches Signer again.
+                        let mut operation_bytes = [0_u8; 32];
+                        OsRng.fill_bytes(&mut operation_bytes);
+                        let revoke = RevokeRequest {
+                            operation_id: OperationId::from_bytes(operation_bytes),
+                            approval_id: approval_id.clone(),
+                            wallet_id: request.wallet_id.clone(),
+                            reason: request.reason.clone(),
+                        };
+                        match self
+                            .signer
+                            .request_for_machine(BrokerSignerRequest::SealedApprovalRevoke(
+                                translate_revocation::revoke_request_to_signer(revoke),
+                            ))
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(error) if error.code == ProtocolErrorCode::ApprovalNotFound => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    self.authority
+                        .revoke_local_approval(&approval_id)
+                        .map_err(authority_error)?;
+                    statuses.push(self.approval_public_status(&approval_id)?);
+                }
+                Ok(Response::SealedApprovalRevokeForKey(statuses))
             }
             Request::SealedApprovalRevokeAll(request) => {
                 let current = self

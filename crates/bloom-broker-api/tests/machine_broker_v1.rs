@@ -274,6 +274,12 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
             wallet_id: token("wallet"),
             reason: "reviewed".into(),
         }),
+        MachineBrokerRequest::SealedApprovalRevokeForKey(RevokeForKeyRequest {
+            operation_id: operation(63),
+            wallet_id: token("wallet"),
+            key_ref: key_ref(),
+            reason: "session stopped".into(),
+        }),
         MachineBrokerRequest::SealedApprovalRevokeAll(WalletOperationRequest {
             operation_id: operation(61),
             wallet_id: token("wallet"),
@@ -463,6 +469,7 @@ fn machine_responses() -> Vec<MachineBrokerResponse> {
             quarantined_signatures: DecimalU64::new(0),
         }),
         MachineBrokerResponse::SealedApprovalRevoke(approval_status()),
+        MachineBrokerResponse::SealedApprovalRevokeForKey(vec![approval_status()]),
         MachineBrokerResponse::SealedApprovalRevokeAll(revocation_state()),
         MachineBrokerResponse::SealedApprovalRenew(SealedApprovalPrepareResponse {
             approval_id: digest(35),
@@ -526,16 +533,16 @@ where
 
 #[test]
 fn every_machine_broker_variant_matches_frozen_v1_frames() {
-    assert_eq!(MachineBrokerMethod::ALL.len(), 42);
+    assert_eq!(MachineBrokerMethod::ALL.len(), 43);
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "e4b26f00a6e71211bdde751e05719a1351a7951f740c2ce3dbb4ff4d15fc0cb7",
+        "6f67bf98e2299c78a906d522bf5fd0a730ea9f76b7fd1ccd8308274be650a0f5",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "2386da024a2fdfcf6b8bf57d4e4e52f938ef04b1e26d3ec9b43328e6eede8cb1",
+        "d4fb9416db443d5fbf0a8a083f4d74763475b0785583ac7a01f31ddd0196a341",
     );
 }
 

@@ -1301,9 +1301,16 @@ impl BrokerAuthority {
                 if scope.allowed_routes.contains(route)
                     && agent_id.as_deref().is_none_or(|agent| agent == scope.key_slot.as_str())
         );
+        // The scope's expiry caps automation: a reusable Petal approval may
+        // not outlast it. An Exact approval is reviewed by the owner payload by
+        // payload and stays available after the scope expires, so the funds
+        // behind a delegated key remain recoverable. Signer applies the same
+        // rule in its own validator.
+        let outlives_scope = matches!(terms.selector, ApprovalSelector::Petal { .. })
+            && terms.expires_at_ms.get() > expires_at_ms;
         if !identity_matches
             || terms.wallet_id != scope.wallet_id
-            || terms.expires_at_ms.get() > expires_at_ms
+            || outlives_scope
             || terms
                 .allowed_crypto_suites
                 .iter()
@@ -1825,6 +1832,30 @@ impl BrokerAuthority {
             ceremony_url: None,
             ceremony_expires_at_ms: None,
         })
+    }
+
+    /// Every approval in the journal whose terms bind `key_ref` under
+    /// `wallet_id`, with its current lifecycle state. This is the set a
+    /// by-key revocation acts on; it comes from Broker's journal, never from a
+    /// caller's list of approval ids.
+    pub fn approvals_for_key(
+        &self,
+        wallet_id: &Token,
+        key_ref: &KeyRef,
+    ) -> Result<Vec<(Digest32, ApprovalLifecycleState)>, AuthorityError> {
+        let mut bound = Vec::new();
+        for (approval_id, record) in self.journal.approval_records()? {
+            let terms: SealedApprovalTerms =
+                serde_json::from_str(&record.terms_jcs).map_err(storage)?;
+            if &terms.wallet_id != wallet_id || &terms.key_ref != key_ref {
+                continue;
+            }
+            let Some(state) = self.journal.approval_state(&approval_id)? else {
+                continue;
+            };
+            bound.push((approval_id, state));
+        }
+        Ok(bound)
     }
 
     pub fn approval_public_list(
