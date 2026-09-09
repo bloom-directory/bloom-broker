@@ -546,7 +546,11 @@ fn bip39_browser_import_uses_profile_to_control_serialization() {
     // profile from whichever property the operator supplied.
     assert!(run.contains("if (bip39Import)"));
     assert!(run.contains("const mnemonic = mnemonicInput.value"));
-    assert!(run.contains("[12, 15, 18, 21, 24].includes(count)"));
+    // Import and export must gate on the same shared word-count set, so a
+    // 15, 18, or 21-word phrase renders as a recovery phrase on export too.
+    assert!(asset.contains("const MNEMONIC_WORD_COUNTS = [12, 15, 18, 21, 24];"));
+    assert!(run.contains("!MNEMONIC_WORD_COUNTS.includes(count)"));
+    assert!(asset.contains("!parsed && MNEMONIC_WORD_COUNTS.includes(words.length)"));
     assert!(run.contains("Enter a 12, 15, 18, 21, or 24 word recovery phrase"));
     assert!(run.contains("credential_prf: encodeUrl(prf.prf),\n          mnemonic\n"));
     assert!(!run.contains("passphrase:"));

@@ -13,6 +13,10 @@ const rawKeyInput = document.getElementById("raw-key-input");
 const panelTitle = document.getElementById("panel-title");
 const panelKicker = document.getElementById("panel-kicker");
 
+// Every standard English BIP-39 recovery-phrase length. Import and export
+// must agree on the same set.
+const MNEMONIC_WORD_COUNTS = [12, 15, 18, 21, 24];
+
 // Human-readable framing for every ceremony kind. Nothing here changes what
 // is signed or bound; the exact signed material stays available under
 // "Signed details" and is what the passkey attests to.
@@ -136,22 +140,6 @@ function startExpiry(session, node) {
   expiryTimer = setInterval(tick, 1000);
 }
 
-// Amount formatting for the assets Bloom currently moves. Anything unknown is
-// shown as the raw integer plus its asset name rather than guessed.
-const NATIVE_UNITS = {
-  solana: ["SOL", 9], ethereum: ["ETH", 18], mainnet: ["ETH", 18], base: ["ETH", 18],
-  arbitrum: ["ETH", 18], optimism: ["ETH", 18], polygon: ["POL", 18], bsc: ["BNB", 18],
-  avalanche: ["AVAX", 18], gnosis: ["xDAI", 18], anvil: ["ETH", 18]
-};
-function fmtAmount(chain, asset, raw) {
-  const unit = asset === "native" ? NATIVE_UNITS[chain] : null;
-  if (!unit) return `${raw} ${asset === "native" ? chain : asset}`;
-  const [symbol, decimals] = unit;
-  const digits = String(raw).padStart(decimals + 1, "0");
-  const whole = digits.slice(0, -decimals);
-  const frac = digits.slice(-decimals).replace(/0+$/, "");
-  return `${whole}${frac ? "." + frac : ""} ${symbol}`;
-}
 function chainLabel(chain, ctx) {
   if (chain === "solana") {
     return ctx?.genesis_hash === "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
@@ -168,7 +156,15 @@ function describeTransfer(manifest) {
   const fee = claim.declared_fee;
   const ctx = claim.chain_context;
   const chain = debits[0]?.asset?.chain || dests[0]?.chain || ctx?.chain_family || "";
-  const amounts = debits.map(d => fmtAmount(d.asset.chain, d.asset.asset, d.amount));
+
+  // Amounts come from the server's signed review plan, never from a page-side
+  // table, so the page cannot promise a unit or decimals the plan lacks. The
+  // server already renders unknown assets as raw units.
+  let plan = {};
+  try { plan = JSON.parse(manifest?.canonical_plan || "{}"); } catch (_) {}
+  const reviewed = plan.asset_amounts || [];
+  const reviewedDebits = reviewed.filter(a => a.kind === "declared_debit");
+  const amounts = debits.map((d, i) => reviewedDebits[i]?.display || `${d.amount} ${d.asset.asset}`);
   const to = dests.map(d => d.destination);
   const network = chainLabel(chain, ctx);
   let sentence;
@@ -182,7 +178,10 @@ function describeTransfer(manifest) {
   const facts = [];
   if (to.length) facts.push(["To", to.join(", "), true]);
   if (amounts.length) facts.push(["Amount", amounts.join(" + ")]);
-  if (fee && fee.amount) facts.push(["Estimated network fee", fmtAmount(fee.chain, fee.asset, fee.amount)]);
+  if (fee && fee.amount) {
+    const reviewedFee = reviewed.find(a => a.kind === "declared_fee");
+    facts.push(["Estimated network fee", reviewedFee?.display || `${fee.amount} ${fee.asset}`]);
+  }
   facts.push(["Network", network]);
   if (claim.route) facts.push(["Requested by", `Petal ${claim.route}`]);
   const assurance = claim.claim_assurance?.kind || manifest?.claim_assurance?.kind;
@@ -326,7 +325,7 @@ function renderResult(session, plaintext) {
   let parsed = null;
   try { parsed = JSON.parse(text); } catch (_) {}
   const words = text.split(/\s+/);
-  const isMnemonic = !parsed && (words.length === 12 || words.length === 24) &&
+  const isMnemonic = !parsed && MNEMONIC_WORD_COUNTS.includes(words.length) &&
     words.every(w => /^[a-z]+$/.test(w));
   const parts = [];
   markDone(isMnemonic ? "Your recovery phrase" : "Result");
@@ -763,7 +762,7 @@ async function run(session) {
       if (bip39Import) {
         const mnemonic = mnemonicInput.value.trim().toLowerCase().split(/\s+/).join(" ");
         const count = mnemonic ? mnemonic.split(" ").length : 0;
-        if (![12, 15, 18, 21, 24].includes(count)) {
+        if (!MNEMONIC_WORD_COUNTS.includes(count)) {
           throw new Error("Enter a 12, 15, 18, 21, or 24 word recovery phrase");
         }
         secret = te.encode(canonicalJson({
