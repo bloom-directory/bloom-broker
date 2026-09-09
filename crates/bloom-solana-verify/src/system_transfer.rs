@@ -57,18 +57,6 @@ pub fn decode_transfer_data(data: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(data[4..12].try_into().ok()?))
 }
 
-/// The canonical compiled instruction for a native transfer.
-pub fn transfer_instruction(lamports: u64) -> Result<CompiledInstruction, SystemTransferError> {
-    if lamports == 0 {
-        return Err(SystemTransferError::ZeroLamports);
-    }
-    Ok(CompiledInstruction {
-        program_id_index: 2,
-        accounts: vec![0, 1],
-        data: transfer_data(lamports),
-    })
-}
-
 /// Build the canonical legacy message for a single-signer native transfer.
 ///
 /// `account_keys = [fee_payer, destination, system_program]`, one transfer
