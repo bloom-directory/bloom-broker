@@ -61,6 +61,8 @@ use std::sync::{
 };
 use tower::ServiceExt as _;
 
+static CANONICAL_LISTENERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn test_time_source() -> &'static str {
     #[cfg(target_os = "linux")]
     return "linux-system-clock";
@@ -4223,18 +4225,43 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         "another local user cannot discover a ceremony without its 256-bit token"
     );
 
-    let wrong_host = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/")
-                .header(header::HOST, "attacker.invalid:18734")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(wrong_host.status(), StatusCode::FORBIDDEN);
+    for host in ["attacker.invalid:18734", "127.0.0.1:18734", "[::1]:18734"] {
+        let wrong_host = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_host.status(), StatusCode::FORBIDDEN);
+    }
+    for origin in [
+        "http://127.0.0.1:18734",
+        "http://[::1]:18734",
+        "http://attacker.invalid:18734",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/session/{ceremony_id}/cancel"))
+                    .header(header::HOST, "localhost:18734")
+                    .header(header::ORIGIN, origin)
+                    .header("x-bloom-ceremony-token", &token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 
     let no_token = app
         .clone()
@@ -4335,8 +4362,9 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
     assert_eq!(signer.cancellations.load(Ordering::SeqCst), 0);
 }
 
-#[test]
-fn prebound_canonical_listener_is_a_fatal_no_fallback_failure() {
+#[tokio::test]
+async fn prebound_canonical_listener_is_a_fatal_no_fallback_failure() {
+    let _guard = CANONICAL_LISTENERS.lock().await;
     let listener = match std::net::TcpListener::bind(CEREMONY_ADDR_V4) {
         Ok(listener) => Some(listener),
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
@@ -4368,18 +4396,57 @@ fn login_session_disconnect_terminalizes_every_live_browser_session() {
 }
 
 #[tokio::test]
-async fn paired_loopback_servers_return_when_shutdown_resolves() {
+async fn paired_loopback_servers_validate_serve_both_families_and_shutdown() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let _guard = CANONICAL_LISTENERS.lock().await;
     let signer = Arc::new(MockSigner::new());
     let broker = CeremonyBroker::new(signer);
-    let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let v6 = std::net::TcpListener::bind("[::1]:0").unwrap();
-    v4.set_nonblocking(true).unwrap();
-    v6.set_nonblocking(true).unwrap();
-
-    tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        broker.serve_loopback_listeners_until(v4, v6, async {}),
-    )
+    let (v4, v6) = CeremonyBroker::bind_canonical_loopback().unwrap();
+    for (first, second) in [
+        (
+            std::net::TcpListener::bind("0.0.0.0:0").unwrap(),
+            v6.try_clone().unwrap(),
+        ),
+        (
+            v4.try_clone().unwrap(),
+            std::net::TcpListener::bind("[::1]:0").unwrap(),
+        ),
+        (v6.try_clone().unwrap(), v4.try_clone().unwrap()),
+    ] {
+        assert_eq!(
+            broker
+                .clone()
+                .serve_loopback_listeners_until(first, second, async {})
+                .await
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::ServiceUnavailable
+        );
+    }
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = broker.serve_loopback_listeners_until(v4, v6, async {
+        let _ = stopped.await;
+    });
+    let client = async {
+        for address in ["127.0.0.1:18734", "[::1]:18734"] {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: localhost:18734\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "{address}: {response}"
+            );
+        }
+        stop.send(()).unwrap();
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (result, ()) = tokio::join!(server, client);
+        result
+    })
     .await
     .expect("paired listeners must not strand shutdown")
     .unwrap();
@@ -5205,7 +5272,7 @@ fn cancellation_backoff_reports_remaining_cooldown_and_resets_after_expiry() {
 }
 
 #[tokio::test]
-async fn browser_cancellation_keeps_backoff_in_the_trusted_clock_domain() {
+async fn browser_cancellation_uses_monotonic_backoff_despite_trusted_clock_skew() {
     let signer = Arc::new(MockSigner::new());
     let broker = CeremonyBroker::new(signer);
     let wallet = Token::new("wallet-browser-cancellation-clock").unwrap();

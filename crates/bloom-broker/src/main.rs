@@ -353,8 +353,9 @@ async fn run_with_paths(
                 listeners
             }
             Err(error) => {
+                tracing::error!(%error, "cannot acquire ceremony listener pair");
                 if let Some(path) = startup_status_path.as_deref() {
-                    write_listener_conflict(path, broker_effective_uid, containment.as_ref())?;
+                    write_listener_failure(path, broker_effective_uid)?;
                 }
                 return Err(error);
             }
@@ -787,53 +788,19 @@ fn is_session_disconnect(error: &std::io::Error) -> bool {
     )
 }
 
-fn write_listener_conflict(
-    path: &Path,
-    broker_uid: u32,
-    containment: Option<&NetworkContainmentGuard>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let bloom_shaped = canonical_listener_is_bloom_shaped(containment);
-    let (incident, message) = if bloom_shaped {
-        (
-            "another_login_session",
-            "another login session owns the Bloom ceremony listener",
-        )
-    } else {
-        (
-            "foreign_or_unverifiable_process",
-            "a foreign or unverifiable process owns the Bloom ceremony listener",
-        )
-    };
+fn write_listener_failure(path: &Path, broker_uid: u32) -> Result<(), Box<dyn std::error::Error>> {
     write_startup_failure(
         path,
         broker_uid,
         &StartupFailure {
             schema: "bloom.broker-startup.1",
             state: "fatal",
-            incident,
-            address: "127.0.0.1:18734",
-            message,
+            incident: "ceremony_listeners_unavailable",
+            address: "localhost:18734",
+            message: "could not acquire both ceremony loopback listeners; see Broker service logs",
             observed_at_ms: unix_time_ms()?,
         },
     )
-}
-
-fn canonical_listener_is_bloom_shaped(containment: Option<&NetworkContainmentGuard>) -> bool {
-    let Some(containment) = containment else {
-        return false;
-    };
-    for attempt in 0..4 {
-        if matches!(
-            containment.boolean_claim("ceremony_listener_bloom_shaped"),
-            Ok(Some(true))
-        ) {
-            return true;
-        }
-        if attempt != 3 {
-            std::thread::sleep(Duration::from_millis(750));
-        }
-    }
-    false
 }
 
 fn write_startup_failure(

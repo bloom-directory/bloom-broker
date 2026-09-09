@@ -1479,7 +1479,7 @@ impl CeremonyBroker {
             protocol(
                 ProtocolErrorCode::ServiceUnavailable,
                 format!(
-                    "fatal canonical ceremony listener ownership conflict at {addr}; no fallback port will be used: {error}"
+                    "cannot bind canonical ceremony listener at {addr}; no fallback port will be used: {error}"
                 ),
             )
         })?;
@@ -1516,6 +1516,8 @@ impl CeremonyBroker {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let v4 = Self::require_canonical_loopback_listener(v4, CEREMONY_ADDR_V4)?;
+        let v6 = Self::require_canonical_loopback_listener(v6, CEREMONY_ADDR_V6)?;
         let router = self.router();
         let v4 = tokio::net::TcpListener::from_std(v4).map_err(|error| {
             protocol(
@@ -2802,42 +2804,11 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
 }
 
 fn validate_host(headers: &HeaderMap) -> Result<(), ProtocolError> {
-    require_loopback_header(
-        headers,
-        header::HOST,
-        &["127.0.0.1:18734", "[::1]:18734", "localhost:18734"],
-    )
+    require_exact_header(headers, header::HOST, "localhost:18734")
 }
 
 fn validate_origin(headers: &HeaderMap) -> Result<(), ProtocolError> {
-    require_loopback_header(
-        headers,
-        header::ORIGIN,
-        &[
-            "http://127.0.0.1:18734",
-            "http://[::1]:18734",
-            "http://localhost:18734",
-        ],
-    )
-}
-
-fn require_loopback_header(
-    headers: &HeaderMap,
-    name: header::HeaderName,
-    allowed: &[&str],
-) -> Result<(), ProtocolError> {
-    if headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| allowed.contains(&value))
-    {
-        Ok(())
-    } else {
-        Err(protocol(
-            ProtocolErrorCode::UnauthenticatedPeer,
-            "ceremony request has an invalid security header",
-        ))
-    }
+    require_exact_header(headers, header::ORIGIN, CEREMONY_ORIGIN)
 }
 
 fn require_exact_header(
