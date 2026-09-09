@@ -1475,11 +1475,15 @@ impl CeremonyBroker {
     }
 
     fn bind_loopback_one(addr: SocketAddr) -> Result<StdTcpListener, ProtocolError> {
-        let listener = StdTcpListener::bind(addr).map_err(|error| {
+        #[cfg(unix)]
+        let bound = Self::bind_loopback_reuse(addr);
+        #[cfg(not(unix))]
+        let bound = StdTcpListener::bind(addr);
+        let listener = bound.map_err(|error| {
             protocol(
                 ProtocolErrorCode::ServiceUnavailable,
                 format!(
-                    "fatal canonical ceremony listener ownership conflict at {addr}; no fallback port will be used: {error}"
+                    "cannot bind canonical ceremony listener at {addr}; no fallback port will be used: {error}"
                 ),
             )
         })?;
@@ -1490,6 +1494,27 @@ impl CeremonyBroker {
             )
         })?;
         Ok(listener)
+    }
+
+    /// Bind one loopback listener with `SO_REUSEADDR` set.
+    ///
+    /// Connections a previous lifecycle served can hold the port in
+    /// `TIME_WAIT` for up to a minute after every party closes, and a Broker
+    /// restarted inside that window must still acquire its canonical
+    /// listener — restart-after-serving is exactly when it is needed. The
+    /// flag only relaxes conflicts against sockets that are no longer
+    /// listening: a second live Broker still fails with `EADDRINUSE`, which
+    /// the W0 ownership test pins.
+    #[cfg(unix)]
+    fn bind_loopback_reuse(addr: SocketAddr) -> std::io::Result<StdTcpListener> {
+        use socket2::{Domain, Protocol, Socket, Type};
+
+        let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        socket.bind(&addr.into())?;
+        // Matches std::net::TcpListener::bind's backlog.
+        socket.listen(128)?;
+        Ok(socket.into())
     }
 
     /// Bind and serve both canonical loopback listeners until `shutdown`
@@ -1516,6 +1541,8 @@ impl CeremonyBroker {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let v4 = Self::require_canonical_loopback_listener(v4, CEREMONY_ADDR_V4)?;
+        let v6 = Self::require_canonical_loopback_listener(v6, CEREMONY_ADDR_V6)?;
         let router = self.router();
         let v4 = tokio::net::TcpListener::from_std(v4).map_err(|error| {
             protocol(
@@ -2802,42 +2829,11 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
 }
 
 fn validate_host(headers: &HeaderMap) -> Result<(), ProtocolError> {
-    require_loopback_header(
-        headers,
-        header::HOST,
-        &["127.0.0.1:18734", "[::1]:18734", "localhost:18734"],
-    )
+    require_exact_header(headers, header::HOST, "localhost:18734")
 }
 
 fn validate_origin(headers: &HeaderMap) -> Result<(), ProtocolError> {
-    require_loopback_header(
-        headers,
-        header::ORIGIN,
-        &[
-            "http://127.0.0.1:18734",
-            "http://[::1]:18734",
-            "http://localhost:18734",
-        ],
-    )
-}
-
-fn require_loopback_header(
-    headers: &HeaderMap,
-    name: header::HeaderName,
-    allowed: &[&str],
-) -> Result<(), ProtocolError> {
-    if headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| allowed.contains(&value))
-    {
-        Ok(())
-    } else {
-        Err(protocol(
-            ProtocolErrorCode::UnauthenticatedPeer,
-            "ceremony request has an invalid security header",
-        ))
-    }
+    require_exact_header(headers, header::ORIGIN, CEREMONY_ORIGIN)
 }
 
 fn require_exact_header(
