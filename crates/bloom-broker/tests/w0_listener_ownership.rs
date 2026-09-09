@@ -28,7 +28,11 @@ mod linux {
                 let error = CeremonyBroker::bind_canonical_loopback()
                     .expect_err("second Broker must not share the canonical listener");
                 eprintln!("{error}");
-                assert!(error.message.contains("fatal canonical ceremony listener"));
+                assert!(
+                    error
+                        .message
+                        .contains("cannot bind canonical ceremony listener")
+                );
                 assert!(error.message.contains("no fallback"));
                 std::process::exit(73);
             }
@@ -91,7 +95,7 @@ mod linux {
             String::from_utf8_lossy(&second.stderr)
         );
         let second_stderr = String::from_utf8_lossy(&second.stderr);
-        assert!(second_stderr.contains("fatal canonical ceremony listener"));
+        assert!(second_stderr.contains("cannot bind canonical ceremony listener"));
         assert!(second_stderr.contains("no fallback port"));
 
         drop(first.stdin.take());
