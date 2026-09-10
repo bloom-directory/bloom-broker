@@ -1438,10 +1438,11 @@ impl BrokerAuthority {
         let scope_bound = match terms.selector {
             ApprovalSelector::Exact { .. } => false,
             ApprovalSelector::Petal { .. } => true,
-            // A System approval names one intent and then signs a payload
-            // refreshed after that review, so it is not the payload-by-payload
-            // review that earns Exact its exemption. Signer's validator makes
-            // the same call.
+            // Unreachable, and fail-closed if that ever changes: `validate`
+            // pairs a System selector only with a System subject, and the
+            // identity check above refuses any subject that is not this
+            // scope's Petal. A System approval on a Petal-derived key is
+            // therefore already denied before this value is read.
             ApprovalSelector::System { .. } => true,
         };
         let outlives_scope = scope_bound && terms.expires_at_ms.get() > expires_at_ms;

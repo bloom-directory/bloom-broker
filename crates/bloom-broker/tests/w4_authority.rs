@@ -3535,6 +3535,55 @@ fn ac_a_key_stop_refuses_approvals_prepared_after_it() {
     );
 }
 
+/// A System approval is reviewed once against one intent and then signs a
+/// payload refreshed after that review, so it is automation in the sense the
+/// stop cares about: the owner is not at the keyboard when it is used. A
+/// stopped key must not admit a new one.
+///
+/// This pins the `System` arm of `ensure_key_not_stopped`, which is the only
+/// selector arm added for System that is reachable — the scope-bound check
+/// refuses a System subject before its own arm is read.
+#[test]
+fn ac_a_key_stop_refuses_a_system_approval_but_not_a_fresh_exact_one() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (_, claim) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    let terms = system_intent_terms(&harness, &provenance, &claim, 95);
+    harness.authority.install_provenance(&provenance).unwrap();
+
+    harness
+        .authority
+        .stop_key(
+            &harness.wallet,
+            &terms.key_ref,
+            operation(45).as_str(),
+            2_000,
+        )
+        .unwrap();
+
+    let error = harness
+        .authority
+        .prepare_approval(&terms, &digest(9))
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            bloom_broker::authority::AuthorityError::Denied { code, .. } if *code == "KEY_STOPPED"
+        ),
+        "a System approval prepared after the stop must be refused with KEY_STOPPED, got {error:?}"
+    );
+
+    // The owner is still not automation. An Exact approval on the same
+    // stopped key, reviewed payload by payload, prepares as before, so the
+    // funds behind the key stay recoverable.
+    let recovery = solana_terms(&harness, &provenance, b"sweep after stop", 7);
+    assert_eq!(recovery.key_ref, terms.key_ref);
+    harness
+        .authority
+        .prepare_approval(&recovery, &digest(7))
+        .expect("a fresh Exact approval on the stopped key must still prepare");
+}
+
 #[test]
 fn ac_a_key_stop_fences_a_pending_exact_ceremony_but_not_a_fresh_one() {
     let (harness, provenance, _scope, child) = scoped_petal_child();
