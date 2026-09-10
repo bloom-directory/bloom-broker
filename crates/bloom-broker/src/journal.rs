@@ -130,6 +130,11 @@ impl From<rusqlite::Error> for JournalError {
     }
 }
 
+/// `operations.kind` for a signing or policy operation.
+pub const OPERATION_KIND: &str = "operation";
+/// `operations.kind` for a by-key stop: irreversible, never cancellable.
+pub const KEY_REVOCATION_KIND: &str = "key_revocation";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationSnapshot {
     pub operation_id: OperationId,
@@ -138,6 +143,8 @@ pub struct OperationSnapshot {
     pub is_batch: bool,
     pub retry_binding_digest: Digest32,
     pub result: Option<SigningResult>,
+    /// `OPERATION_KIND` or `KEY_REVOCATION_KIND`.
+    pub kind: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -421,6 +428,16 @@ impl BrokerJournal {
         )?;
         ensure_column(&connection, "clock_state", "observed_utc_ms", "TEXT")?;
         ensure_column(&connection, "operations", "validation_receipt_jcs", "TEXT")?;
+        // A by-key stop is irreversible once its marker is durable, so its
+        // row is a different kind from a signing operation: it never takes
+        // the generic transitions (cancel included) and completes only
+        // through `complete_key_revocation`.
+        ensure_column(
+            &connection,
+            "operations",
+            "kind",
+            "TEXT NOT NULL DEFAULT 'operation'",
+        )?;
         ensure_column(
             &connection,
             "clock_state",
@@ -1055,6 +1072,7 @@ impl BrokerJournal {
                 is_batch,
                 retry_binding_digest,
                 result: None,
+                kind: OPERATION_KIND.to_owned(),
             }
         };
         let prior_attempt: Option<String> = transaction
@@ -1110,17 +1128,17 @@ impl BrokerJournal {
         parameters_digest: &Digest32,
     ) -> Result<Option<Vec<(Digest32, OperationId)>>, JournalError> {
         let connection = self.lock()?;
-        let stored: Option<String> = connection
+        let stored: Option<(String, String)> = connection
             .query_row(
-                "SELECT operation_digest FROM operations WHERE operation_id = ?1",
+                "SELECT operation_digest, kind FROM operations WHERE operation_id = ?1",
                 [operation_id.as_str()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let Some(stored) = stored else {
+        let Some((stored, kind)) = stored else {
             return Ok(None);
         };
-        if stored != parameters_digest.as_str() {
+        if kind != KEY_REVOCATION_KIND || stored != parameters_digest.as_str() {
             return Err(protocol(
                 ProtocolErrorCode::OperationIdConflict,
                 "by-key revocation operation ID was reused with a different wallet, key, or reason",
@@ -1162,15 +1180,15 @@ impl BrokerJournal {
     ) -> Result<(), JournalError> {
         let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
-        let existing: Option<String> = transaction
+        let existing: Option<(String, String)> = transaction
             .query_row(
-                "SELECT operation_digest FROM operations WHERE operation_id = ?1",
+                "SELECT operation_digest, kind FROM operations WHERE operation_id = ?1",
                 [operation_id.as_str()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if let Some(stored) = existing {
-            if stored != parameters_digest.as_str() {
+        if let Some((stored, kind)) = existing {
+            if kind != KEY_REVOCATION_KIND || stored != parameters_digest.as_str() {
                 return Err(protocol(
                     ProtocolErrorCode::OperationIdConflict,
                     "by-key revocation operation ID was reused with a different wallet, key, or reason",
@@ -1182,9 +1200,13 @@ impl BrokerJournal {
         transaction.execute(
             "INSERT INTO operations(
                 operation_id, operation_digest, retry_binding_digest, state, is_batch,
-                validation_receipt_jcs
-             ) VALUES (?1, ?2, ?2, 'RECEIVED', 0, NULL)",
-            params![operation_id.as_str(), parameters_digest.as_str()],
+                validation_receipt_jcs, kind
+             ) VALUES (?1, ?2, ?2, 'RECEIVED', 0, NULL, ?3)",
+            params![
+                operation_id.as_str(),
+                parameters_digest.as_str(),
+                KEY_REVOCATION_KIND
+            ],
         )?;
         for (approval_id, revocation_id) in targets {
             transaction.execute(
@@ -1280,6 +1302,17 @@ impl BrokerJournal {
         let transaction = connection.transaction()?;
         let current = read_operation(&transaction, operation_id)?
             .ok_or_else(|| protocol(ProtocolErrorCode::ApprovalNotFound, "operation not found"))?;
+        if current.kind == KEY_REVOCATION_KIND {
+            // The stop marker behind a by-key revocation cannot be undone,
+            // so the operation cannot be cancelled or moved through the
+            // signing states; it completes only through
+            // `complete_key_revocation`.
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "a by-key revocation is irreversible and cannot be cancelled",
+            )
+            .into());
+        }
         if current.result.is_some() || !valid_operation_transition(current.state, next) {
             return Err(protocol(
                 ProtocolErrorCode::OperationIdConflict,
@@ -2917,7 +2950,7 @@ fn read_operation(
 ) -> Result<Option<OperationSnapshot>, JournalError> {
     let row = connection
         .query_row(
-            "SELECT operation_digest, retry_binding_digest, state, is_batch, result_jcs
+            "SELECT operation_digest, retry_binding_digest, state, is_batch, result_jcs, kind
              FROM operations WHERE operation_id = ?1",
             [operation_id.as_str()],
             |row| {
@@ -2927,22 +2960,26 @@ fn read_operation(
                     row.get::<_, String>(2)?,
                     row.get::<_, bool>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             },
         )
         .optional()?;
-    row.map(|(digest, retry_binding_digest, state, is_batch, result)| {
-        Ok(OperationSnapshot {
-            operation_id: operation_id.clone(),
-            operation_digest: Digest32::new(digest)?,
-            state: parse_operation_state(&state)?,
-            is_batch,
-            retry_binding_digest: Digest32::new(retry_binding_digest)?,
-            result: result
-                .map(|value| serde_json::from_str(&value).map_err(storage))
-                .transpose()?,
-        })
-    })
+    row.map(
+        |(digest, retry_binding_digest, state, is_batch, result, kind)| {
+            Ok(OperationSnapshot {
+                operation_id: operation_id.clone(),
+                operation_digest: Digest32::new(digest)?,
+                state: parse_operation_state(&state)?,
+                is_batch,
+                retry_binding_digest: Digest32::new(retry_binding_digest)?,
+                result: result
+                    .map(|value| serde_json::from_str(&value).map_err(storage))
+                    .transpose()?,
+                kind,
+            })
+        },
+    )
     .transpose()
 }
 

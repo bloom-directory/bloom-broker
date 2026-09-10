@@ -332,11 +332,15 @@ impl BrokerRpcService {
                         .map_err(authority_error)?;
                     statuses.push(self.approval_public_status(&approval_id)?);
                 }
-                if first_execution {
-                    self.journal
-                        .complete_key_revocation(&request.operation_id)
-                        .map_err(journal_error)?;
-                }
+                // Every pass that revoked all of its targets completes the
+                // durable operation, not only the first: an execution that
+                // crashed or hit a transient Signer error after
+                // `begin_key_revocation` leaves the row RECEIVED, and the
+                // retry that finishes the job is the one that gets here.
+                // Completion is idempotent.
+                self.journal
+                    .complete_key_revocation(&request.operation_id)
+                    .map_err(journal_error)?;
                 Ok(Response::SealedApprovalRevokeForKey(statuses))
             }
             Request::SealedApprovalRevokeAll(request) => {
@@ -2631,6 +2635,7 @@ mod tests {
                 is_batch: signature_count > 1,
                 retry_binding_digest: Digest32::from_bytes([0x53; 32]),
                 result: None,
+                kind: crate::journal::OPERATION_KIND.to_owned(),
             },
             SigningResult {
                 operation_id,

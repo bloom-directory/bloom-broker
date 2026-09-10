@@ -3141,6 +3141,126 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         "OPERATION_ID_CONFLICT",
         "reusing the outer id with different parameters must be refused"
     );
+    // A stop is irreversible once its marker is durable, so it is not a
+    // cancellable operation: cancel is refused and the status keeps
+    // reporting the real state.
+    let stop_status = |id: &str| {
+        MachineBrokerService::dispatch(
+            &restarted_scoped_broker,
+            MachineBrokerRequest::OperationStatus(bloom_broker_api::OperationRequest {
+                operation_id: operation(id),
+            }),
+        )
+    };
+    let stop_cancel = |id: &str| {
+        MachineBrokerService::dispatch(
+            &restarted_scoped_broker,
+            MachineBrokerRequest::OperationCancel(bloom_broker_api::OperationRequest {
+                operation_id: operation(id),
+            }),
+        )
+    };
+    assert!(matches!(
+        stop_status("e0").await.unwrap(),
+        MachineBrokerResponse::OperationStatus(status)
+            if status.state == bloom_broker_api::OperationState::Succeeded
+    ));
+    // An execution that crashed, or hit a transient Signer error, after
+    // binding the outer id leaves the stop RECEIVED with its target set
+    // stored. That is the state a retry finds; reproduce it directly.
+    let crashed_stop = operation("e4");
+    let crashed_targets: Vec<(Digest32, OperationId)> = replay_authority
+        .stop_key(
+            &wallet_id,
+            &approval_terms.key_ref,
+            crashed_stop.as_str(),
+            1_000,
+        )
+        .unwrap()
+        .into_iter()
+        .enumerate()
+        .map(|(index, (approval_id, _state))| {
+            (
+                approval_id,
+                OperationId::from_bytes([0xe4 + index as u8; 32]),
+            )
+        })
+        .collect();
+    assert!(
+        crashed_targets
+            .iter()
+            .any(|(id, _)| *id == raced_approval_id),
+        "fixture: the raced approval is in the crashed stop's target set"
+    );
+    // The same parameter binding the service computes: JCS sorts keys, so
+    // the field order here does not matter.
+    let crashed_parameters = Digest32::from_bytes(
+        sha2::Sha256::digest(
+            serde_jcs::to_vec(&serde_json::json!({
+                "wallet_id": wallet_id,
+                "key_ref": approval_terms.key_ref,
+                "reason": "fixture session stop",
+            }))
+            .unwrap(),
+        )
+        .into(),
+    );
+    restarted_journal
+        .begin_key_revocation(&crashed_stop, &crashed_parameters, &crashed_targets)
+        .unwrap();
+    assert!(matches!(
+        stop_status("e4").await.unwrap(),
+        MachineBrokerResponse::OperationStatus(status)
+            if status.state == bloom_broker_api::OperationState::Received
+    ));
+    let cancel_received = stop_cancel("e4").await.unwrap_err();
+    assert_eq!(
+        cancel_received.code.as_str(),
+        "OPERATION_ID_CONFLICT",
+        "a by-key stop awaiting completion cannot be cancelled"
+    );
+    assert!(matches!(
+        stop_status("e4").await.unwrap(),
+        MachineBrokerResponse::OperationStatus(status)
+            if status.state == bloom_broker_api::OperationState::Received
+    ));
+    // The retry takes the stored branch, revokes every stored target, and
+    // must complete the durable operation even though it is not the first
+    // execution.
+    let retried = MachineBrokerService::dispatch(
+        &restarted_scoped_broker,
+        MachineBrokerRequest::SealedApprovalRevokeForKey(bloom_broker_api::RevokeForKeyRequest {
+            operation_id: crashed_stop.clone(),
+            wallet_id: wallet_id.clone(),
+            key_ref: approval_terms.key_ref.clone(),
+            reason: "fixture session stop".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        &retried,
+        MachineBrokerResponse::SealedApprovalRevokeForKey(list)
+            if list.iter().any(|status| status.approval_id == raced_approval_id)
+    ));
+    assert_ne!(
+        restarted_journal
+            .approval_state(&raced_approval_id)
+            .unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony),
+        "the retry revokes the stored targets"
+    );
+    assert!(matches!(
+        stop_status("e4").await.unwrap(),
+        MachineBrokerResponse::OperationStatus(status)
+            if status.state == bloom_broker_api::OperationState::Succeeded
+    ));
+    let cancel_succeeded = stop_cancel("e4").await.unwrap();
+    assert!(matches!(
+        cancel_succeeded,
+        MachineBrokerResponse::OperationCancel(status)
+            if status.state == bloom_broker_api::OperationState::Succeeded
+    ));
     let revoked = MachineBrokerService::dispatch(
         &restarted_scoped_broker,
         MachineBrokerRequest::SealedApprovalRevoke(RevokeRequest {
