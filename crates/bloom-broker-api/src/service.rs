@@ -119,6 +119,19 @@ pub struct RevokeRequest {
     pub reason: String,
 }
 
+/// Revoke every Sealed Approval whose terms bind one key. Broker resolves the
+/// set from its own journal, so a caller whose record of approval ids is stale
+/// still stops all of the key's automation. Idempotent: approvals already
+/// revoked or failed are reported as they stand.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevokeForKeyRequest {
+    pub operation_id: OperationId,
+    pub wallet_id: Token,
+    pub key_ref: KeyRef,
+    pub reason: String,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ApprovalLifecycleState {
     #[serde(rename = "PREPARED")]
@@ -238,10 +251,6 @@ pub struct KeyPublic {
     pub canonical_public_key: Base64UrlBytes,
     pub addresses: Vec<String>,
     pub supported_crypto_suites: Vec<crate::CryptoSuite>,
-    /// Absolute expiry for a Signer-owned Petal-scoped key. Other keys do not
-    /// carry this field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub petal_scope_expires_at_ms: Option<DecimalU64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -332,6 +341,8 @@ pub enum MachineBrokerRequest {
     SealedApprovalRevoke(RevokeRequest),
     #[serde(rename = "sealed_approval.revoke_all")]
     SealedApprovalRevokeAll(WalletOperationRequest),
+    #[serde(rename = "sealed_approval.revoke_for_key")]
+    SealedApprovalRevokeForKey(RevokeForKeyRequest),
     #[serde(rename = "sealed_approval.renew")]
     SealedApprovalRenew(ApprovalRenewRequest),
     #[serde(rename = "signing.sign")]
@@ -421,6 +432,8 @@ pub enum MachineBrokerResponse {
     SealedApprovalRevoke(ApprovalPublicStatus),
     #[serde(rename = "sealed_approval.revoke_all")]
     SealedApprovalRevokeAll(RevocationState),
+    #[serde(rename = "sealed_approval.revoke_for_key")]
+    SealedApprovalRevokeForKey(Vec<ApprovalPublicStatus>),
     #[serde(rename = "sealed_approval.renew")]
     SealedApprovalRenew(SealedApprovalPrepareResponse),
     #[serde(rename = "signing.sign")]
@@ -520,6 +533,7 @@ impl crate::TypedRequestMethod for MachineBrokerRequest {
             Request::SealedApprovalRenew(request) => Some(request.operation_id.clone()),
             Request::SealedApprovalRevoke(request) => Some(request.operation_id.clone()),
             Request::SealedApprovalRevokeAll(request) => Some(request.operation_id.clone()),
+            Request::SealedApprovalRevokeForKey(request) => Some(request.operation_id.clone()),
             Request::SigningSign(request) | Request::SigningSignBatch(request) => {
                 Some(request.operation_id.clone())
             }
