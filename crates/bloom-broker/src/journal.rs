@@ -130,6 +130,11 @@ impl From<rusqlite::Error> for JournalError {
     }
 }
 
+/// `operations.kind` for a signing or policy operation.
+pub const OPERATION_KIND: &str = "operation";
+/// `operations.kind` for a by-key stop: irreversible, never cancellable.
+pub const KEY_REVOCATION_KIND: &str = "key_revocation";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationSnapshot {
     pub operation_id: OperationId,
@@ -138,12 +143,15 @@ pub struct OperationSnapshot {
     pub is_batch: bool,
     pub retry_binding_digest: Digest32,
     pub result: Option<SigningResult>,
+    /// `OPERATION_KIND` or `KEY_REVOCATION_KIND`.
+    pub kind: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalRecord {
     pub terms_jcs: String,
     pub review_manifest_digest: String,
+    pub approved_claim_digest: Option<String>,
     pub provenance_jcs: Option<String>,
     pub renewal_of: Option<String>,
     pub activation_operation_id: Option<String>,
@@ -319,6 +327,7 @@ impl BrokerJournal {
                 approval_id TEXT PRIMARY KEY REFERENCES approvals(approval_id),
                 terms_jcs TEXT NOT NULL,
                 review_manifest_digest TEXT NOT NULL,
+                approved_claim_digest TEXT,
                 provenance_jcs TEXT,
                 renewal_of TEXT REFERENCES approvals(approval_id),
                 activation_operation_id TEXT UNIQUE,
@@ -389,6 +398,21 @@ impl BrokerJournal {
             );
             ",
         )?;
+        let has_approved_claim_digest = {
+            let mut statement = connection.prepare("PRAGMA table_info(approval_metadata)")?;
+            let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for column in columns {
+                found |= column? == "approved_claim_digest";
+            }
+            found
+        };
+        if !has_approved_claim_digest {
+            connection.execute(
+                "ALTER TABLE approval_metadata ADD COLUMN approved_claim_digest TEXT",
+                [],
+            )?;
+        }
         ensure_column(&connection, "reservations", "observed_utc_ms", "TEXT")?;
         ensure_column(
             &connection,
@@ -404,6 +428,16 @@ impl BrokerJournal {
         )?;
         ensure_column(&connection, "clock_state", "observed_utc_ms", "TEXT")?;
         ensure_column(&connection, "operations", "validation_receipt_jcs", "TEXT")?;
+        // A by-key stop is irreversible once its marker is durable, so its
+        // row is a different kind from a signing operation: it never takes
+        // the generic transitions (cancel included) and completes only
+        // through `complete_key_revocation`.
+        ensure_column(
+            &connection,
+            "operations",
+            "kind",
+            "TEXT NOT NULL DEFAULT 'operation'",
+        )?;
         ensure_column(
             &connection,
             "clock_state",
@@ -605,6 +639,7 @@ impl BrokerJournal {
         approval_id: &Digest32,
         terms_jcs: &str,
         review_manifest_digest: &Digest32,
+        approved_claim_digest: Option<&Digest32>,
         provenance_jcs: Option<&str>,
         renewal_of: Option<&Digest32>,
     ) -> Result<(), JournalError> {
@@ -616,12 +651,14 @@ impl BrokerJournal {
         )?;
         transaction.execute(
             "INSERT INTO approval_metadata(
-                approval_id, terms_jcs, review_manifest_digest, provenance_jcs, renewal_of
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                approval_id, terms_jcs, review_manifest_digest, approved_claim_digest,
+                provenance_jcs, renewal_of
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 approval_id.as_str(),
                 terms_jcs,
                 review_manifest_digest.as_str(),
+                approved_claim_digest.map(Digest32::as_str),
                 provenance_jcs,
                 renewal_of.map(Digest32::as_str)
             ],
@@ -649,7 +686,8 @@ impl BrokerJournal {
         let connection = self.lock()?;
         connection
             .query_row(
-                "SELECT terms_jcs, review_manifest_digest, provenance_jcs, renewal_of,
+                "SELECT terms_jcs, review_manifest_digest, approved_claim_digest,
+                        provenance_jcs, renewal_of,
                         activation_operation_id, ceremony_grant_jcs
                  FROM approval_metadata WHERE approval_id = ?1",
                 [approval_id.as_str()],
@@ -657,10 +695,11 @@ impl BrokerJournal {
                     Ok(ApprovalRecord {
                         terms_jcs: row.get(0)?,
                         review_manifest_digest: row.get(1)?,
-                        provenance_jcs: row.get(2)?,
-                        renewal_of: row.get(3)?,
-                        activation_operation_id: row.get(4)?,
-                        ceremony_grant_jcs: row.get(5)?,
+                        approved_claim_digest: row.get(2)?,
+                        provenance_jcs: row.get(3)?,
+                        renewal_of: row.get(4)?,
+                        activation_operation_id: row.get(5)?,
+                        ceremony_grant_jcs: row.get(6)?,
                     })
                 },
             )
@@ -671,7 +710,8 @@ impl BrokerJournal {
     pub fn approval_records(&self) -> Result<Vec<(Digest32, ApprovalRecord)>, JournalError> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT approval_id, terms_jcs, review_manifest_digest, provenance_jcs, renewal_of,
+            "SELECT approval_id, terms_jcs, review_manifest_digest, approved_claim_digest,
+                    provenance_jcs, renewal_of,
                     activation_operation_id, ceremony_grant_jcs
              FROM approval_metadata ORDER BY approval_id",
         )?;
@@ -681,10 +721,11 @@ impl BrokerJournal {
                 ApprovalRecord {
                     terms_jcs: row.get(1)?,
                     review_manifest_digest: row.get(2)?,
-                    provenance_jcs: row.get(3)?,
-                    renewal_of: row.get(4)?,
-                    activation_operation_id: row.get(5)?,
-                    ceremony_grant_jcs: row.get(6)?,
+                    approved_claim_digest: row.get(3)?,
+                    provenance_jcs: row.get(4)?,
+                    renewal_of: row.get(5)?,
+                    activation_operation_id: row.get(6)?,
+                    ceremony_grant_jcs: row.get(7)?,
                 },
             ))
         })?;
@@ -1031,6 +1072,7 @@ impl BrokerJournal {
                 is_batch,
                 retry_binding_digest,
                 result: None,
+                kind: OPERATION_KIND.to_owned(),
             }
         };
         let prior_attempt: Option<String> = transaction
@@ -1076,6 +1118,171 @@ impl BrokerJournal {
         Ok(snapshot)
     }
 
+    /// The target set a by-key revocation recorded for `operation_id`,
+    /// when that id was already used for one with the same
+    /// `parameters_digest`. `None` means the id is fresh; reuse for
+    /// different parameters is refused.
+    pub fn key_revocation_targets(
+        &self,
+        operation_id: &OperationId,
+        parameters_digest: &Digest32,
+    ) -> Result<Option<Vec<(Digest32, OperationId)>>, JournalError> {
+        let connection = self.lock()?;
+        let stored: Option<(String, String)> = connection
+            .query_row(
+                "SELECT operation_digest, kind FROM operations WHERE operation_id = ?1",
+                [operation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((stored, kind)) = stored else {
+            return Ok(None);
+        };
+        if kind != KEY_REVOCATION_KIND || stored != parameters_digest.as_str() {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "by-key revocation operation ID was reused with a different wallet, key, or reason",
+            )
+            .into());
+        }
+        let mut statement = connection.prepare(
+            "SELECT attempt_id, attempt_digest FROM operation_attempts
+             WHERE operation_id = ?1 ORDER BY attempt_id",
+        )?;
+        let stored: Vec<(String, String)> = statement
+            .query_map([operation_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut targets = Vec::with_capacity(stored.len());
+        for (approval_id, revocation_id) in stored {
+            targets.push((
+                Digest32::new(approval_id)?,
+                OperationId::new(revocation_id)?,
+            ));
+        }
+        Ok(Some(targets))
+    }
+
+    /// Bind a by-key revocation to the caller's outer operation id and
+    /// persist the enumerated target set. One operation id may only ever
+    /// name one `(wallet_id, key_ref, reason)` triple: `parameters_digest`
+    /// refuses reuse for different parameters, and the returned target set
+    /// is exactly the approvals recorded by the first execution, so a
+    /// delayed replay can never sweep an approval created later. The
+    /// per-target revocation id is deterministic over
+    /// `(outer operation id, approval id)`.
+    pub fn begin_key_revocation(
+        &self,
+        operation_id: &OperationId,
+        parameters_digest: &Digest32,
+        targets: &[(Digest32, OperationId)],
+    ) -> Result<(), JournalError> {
+        self.begin_key_revocation_with_effects(operation_id, parameters_digest, targets, |_| Ok(()))
+            .map(|_| ())
+    }
+
+    /// Admission and authority effects share one commit. The callback is never
+    /// run for a replay or a conflicting operation ID.
+    pub(crate) fn begin_key_revocation_with_effects(
+        &self,
+        operation_id: &OperationId,
+        parameters_digest: &Digest32,
+        targets: &[(Digest32, OperationId)],
+        effects: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<(), JournalError>,
+    ) -> Result<bool, JournalError> {
+        let mut connection = self.lock_for_mutation()?;
+        let transaction = connection.transaction()?;
+        let existing: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT operation_digest, kind FROM operations WHERE operation_id = ?1",
+                [operation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((stored, kind)) = existing {
+            if kind != KEY_REVOCATION_KIND || stored != parameters_digest.as_str() {
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "by-key revocation operation ID was reused with a different wallet, key, or reason",
+                )
+                .into());
+            }
+            return Ok(false);
+        }
+        transaction.execute(
+            "INSERT INTO operations(
+                operation_id, operation_digest, retry_binding_digest, state, is_batch,
+                validation_receipt_jcs, kind
+             ) VALUES (?1, ?2, ?2, 'RECEIVED', 0, NULL, ?3)",
+            params![
+                operation_id.as_str(),
+                parameters_digest.as_str(),
+                KEY_REVOCATION_KIND
+            ],
+        )?;
+        for (approval_id, revocation_id) in targets {
+            transaction.execute(
+                "INSERT INTO operation_attempts(operation_id, attempt_id, attempt_digest)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    operation_id.as_str(),
+                    approval_id.as_str(),
+                    revocation_id.as_str()
+                ],
+            )?;
+        }
+        self.append_audit_transaction(
+            &transaction,
+            "key.revocation.received",
+            &serde_json::json!({
+                "operation_id": operation_id,
+                "parameters_digest": parameters_digest,
+                "targets": targets.iter().map(|(approval_id, revocation_id)| {
+                    serde_json::json!({
+                        "approval_id": approval_id,
+                        "revocation_id": revocation_id
+                    })
+                }).collect::<Vec<_>>()
+            }),
+            self.audit_signer.as_ref(),
+        )?;
+        effects(&transaction)?;
+        transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
+        self.after_durable(DurablePoint::OperationReceived)?;
+        Ok(true)
+    }
+
+    /// Mark a by-key revocation complete. Idempotent: completing an
+    /// already-completed stop succeeds without touching durable state.
+    pub fn complete_key_revocation(&self, operation_id: &OperationId) -> Result<(), JournalError> {
+        let mut connection = self.lock_for_mutation()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE operations SET state = 'SUCCEEDED'
+             WHERE operation_id = ?1 AND state = 'RECEIVED'",
+            [operation_id.as_str()],
+        )?;
+        if changed > 0 {
+            self.append_audit_transaction(
+                &transaction,
+                "key.revocation.succeeded",
+                &serde_json::json!({"operation_id": operation_id}),
+                self.audit_signer.as_ref(),
+            )?;
+            transaction.commit()?;
+            drop(connection);
+            self.checkpoint_committed_head()?;
+            self.after_durable(DurablePoint::OperationTransition)?;
+        } else {
+            transaction.commit()?;
+            drop(connection);
+        }
+        Ok(())
+    }
+
     pub fn operation(
         &self,
         operation_id: &OperationId,
@@ -1109,6 +1316,17 @@ impl BrokerJournal {
         let transaction = connection.transaction()?;
         let current = read_operation(&transaction, operation_id)?
             .ok_or_else(|| protocol(ProtocolErrorCode::ApprovalNotFound, "operation not found"))?;
+        if current.kind == KEY_REVOCATION_KIND {
+            // The stop marker behind a by-key revocation cannot be undone,
+            // so the operation cannot be cancelled or moved through the
+            // signing states; it completes only through
+            // `complete_key_revocation`.
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "a by-key revocation is irreversible and cannot be cancelled",
+            )
+            .into());
+        }
         if current.result.is_some() || !valid_operation_transition(current.state, next) {
             return Err(protocol(
                 ProtocolErrorCode::OperationIdConflict,
@@ -2746,7 +2964,7 @@ fn read_operation(
 ) -> Result<Option<OperationSnapshot>, JournalError> {
     let row = connection
         .query_row(
-            "SELECT operation_digest, retry_binding_digest, state, is_batch, result_jcs
+            "SELECT operation_digest, retry_binding_digest, state, is_batch, result_jcs, kind
              FROM operations WHERE operation_id = ?1",
             [operation_id.as_str()],
             |row| {
@@ -2756,22 +2974,26 @@ fn read_operation(
                     row.get::<_, String>(2)?,
                     row.get::<_, bool>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             },
         )
         .optional()?;
-    row.map(|(digest, retry_binding_digest, state, is_batch, result)| {
-        Ok(OperationSnapshot {
-            operation_id: operation_id.clone(),
-            operation_digest: Digest32::new(digest)?,
-            state: parse_operation_state(&state)?,
-            is_batch,
-            retry_binding_digest: Digest32::new(retry_binding_digest)?,
-            result: result
-                .map(|value| serde_json::from_str(&value).map_err(storage))
-                .transpose()?,
-        })
-    })
+    row.map(
+        |(digest, retry_binding_digest, state, is_batch, result, kind)| {
+            Ok(OperationSnapshot {
+                operation_id: operation_id.clone(),
+                operation_digest: Digest32::new(digest)?,
+                state: parse_operation_state(&state)?,
+                is_batch,
+                retry_binding_digest: Digest32::new(retry_binding_digest)?,
+                result: result
+                    .map(|value| serde_json::from_str(&value).map_err(storage))
+                    .transpose()?,
+                kind,
+            })
+        },
+    )
     .transpose()
 }
 

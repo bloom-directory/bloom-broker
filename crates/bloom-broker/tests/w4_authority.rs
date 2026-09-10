@@ -1,4 +1,5 @@
 use bloom_broker::{
+    assurance_verifiers::SolanaSystemTransferVerifier,
     authority::{
         AssuranceRegistry, AssuranceVerifier, AuthorizationInput, BrokerAuthority,
         CanonicalWalletPolicy, CeremonyApprovalGrant, EpochReconciliation, PolicyAsset,
@@ -8,13 +9,15 @@ use bloom_broker::{
     journal::{AuditSigner, BrokerJournal},
 };
 use bloom_broker_api::{
-    ActivationMode, ApprovalLimits, ApprovalSelector, ApprovalSubject, ApprovalTombstone, AssetId,
-    Base64UrlBytes, BootEpoch, CeremonyKind, CeremonyState, ClaimAssurance, ClaimAssuranceLevel,
-    CryptoSuite, CustodyResult, DecimalU64, DecimalU256, DeclaredDebit, DeclaredDestination,
-    DeclaredFee, Digest32, KeyRef, KeySpec, MachineSignRequest, OperationId,
-    PROVENANCE_CATALOG_SCHEMA, PetalKeyScope, PetalLineageMembership, PetalRouteGrant,
-    PetalUseClaim, PolicyUpdateRequest, ProvenanceCatalog, RequestNonce, RevocationState,
-    SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads, Token, ValueLimit,
+    AccountTerms, ActivationMode, ApprovalLimits, ApprovalSelector, ApprovalSubject,
+    ApprovalTombstone, AssetId, Base64UrlBytes, BootEpoch, CeremonyKind, CeremonyState,
+    ClaimAssurance, ClaimAssuranceLevel, CryptoSuite, CustodyResult, DecimalU64, DecimalU256,
+    DeclaredDebit, DeclaredDestination, DeclaredFee, DerivationProfile, DerivedAccountRequest,
+    Digest32, KeyRef, KeySpec, MachineSignRequest, OperationId, PROVENANCE_CATALOG_SCHEMA,
+    PetalKeyScope, PetalLineageMembership, PetalRouteGrant, PetalUseClaim, PolicyUpdateRequest,
+    ProvenanceCatalog, RequestNonce, RevocationState, SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES,
+    SOLANA_SYSTEM_TRANSFER_VERIFIER_ID, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
+    SystemChainContext, SystemUseClaim, Token, ValueLimit,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
@@ -200,30 +203,75 @@ impl Harness {
     }
 
     fn new_with_verifiers(verifiers: Vec<Arc<dyn AssuranceVerifier>>) -> Self {
+        Self::build(None, verifiers)
+    }
+
+    /// A file-backed harness at `directory`, so a test can drop it and open
+    /// the same stores again. The policy is installed only on the first
+    /// open; a reopen finds it persisted.
+    fn open_at(directory: &std::path::Path) -> Self {
+        Self::build(Some(directory), vec![])
+    }
+
+    fn build(
+        directory: Option<&std::path::Path>,
+        verifiers: Vec<Arc<dyn AssuranceVerifier>>,
+    ) -> Self {
         let policy_key = SigningKey::from_bytes(&[1; 32]);
         let installer_key = SigningKey::from_bytes(&[2; 32]);
         let ceremony_key = SigningKey::from_bytes(&[3; 32]);
         let revocation_key = SigningKey::from_bytes(&[4; 32]);
         let wallet = token("wallet-1");
-        let journal =
-            Arc::new(BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).expect("journal"));
+        let journal = Arc::new(match directory {
+            None => BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).expect("journal"),
+            Some(directory) => {
+                BrokerJournal::open(directory.join("journal.sqlite"), Arc::new(TestAuditSigner))
+                    .expect("journal")
+            }
+        });
         let mut policy_keys = BTreeMap::new();
         policy_keys.insert(
             wallet.as_str().to_owned(),
             (token("policy-key"), policy_key.verifying_key()),
         );
-        let authority = BrokerAuthority::open_in_memory(
-            journal.clone(),
-            policy_keys,
-            token("installer-key"),
-            installer_key.verifying_key(),
-            token("ceremony-key"),
-            ceremony_key.verifying_key(),
-            token("revocation-key"),
-            revocation_key.verifying_key(),
-            AssuranceRegistry::compiled(verifiers).unwrap(),
-        )
-        .unwrap();
+        let registry = AssuranceRegistry::compiled(verifiers).unwrap();
+        let (authority, first_open) = match directory {
+            None => (
+                BrokerAuthority::open_in_memory(
+                    journal.clone(),
+                    policy_keys,
+                    token("installer-key"),
+                    installer_key.verifying_key(),
+                    token("ceremony-key"),
+                    ceremony_key.verifying_key(),
+                    token("revocation-key"),
+                    revocation_key.verifying_key(),
+                    registry,
+                )
+                .unwrap(),
+                true,
+            ),
+            Some(directory) => {
+                let path = directory.join("authority.sqlite");
+                let first_open = !path.exists();
+                (
+                    BrokerAuthority::open(
+                        &path,
+                        journal.clone(),
+                        policy_keys,
+                        token("installer-key"),
+                        installer_key.verifying_key(),
+                        token("ceremony-key"),
+                        ceremony_key.verifying_key(),
+                        token("revocation-key"),
+                        revocation_key.verifying_key(),
+                        registry,
+                    )
+                    .unwrap(),
+                    first_open,
+                )
+            }
+        };
         let harness = Self {
             authority,
             journal,
@@ -233,10 +281,12 @@ impl Harness {
             revocation_key,
             wallet,
         };
-        harness
-            .authority
-            .install_policy(&harness.policy_snapshot(1))
-            .unwrap();
+        if first_open {
+            harness
+                .authority
+                .install_policy(&harness.policy_snapshot(1))
+                .unwrap();
+        }
         harness
     }
 
@@ -245,10 +295,16 @@ impl Harness {
             wallet_id: self.wallet.clone(),
             maximum_approval_lifetime_ms: 100_000,
             allowed_petal_packages: vec![digest(9)],
-            allowed_destinations: vec![PolicyDestination {
-                chain: token("ethereum"),
-                destination: "0xrecipient".into(),
-            }],
+            allowed_destinations: vec![
+                PolicyDestination {
+                    chain: token("ethereum"),
+                    destination: "0xrecipient".into(),
+                },
+                PolicyDestination {
+                    chain: token("solana"),
+                    destination: solana_destination(),
+                },
+            ],
             required_verifiers: vec![],
         };
         let canonical = serde_jcs::to_vec(&policy).unwrap();
@@ -336,6 +392,33 @@ impl Harness {
         record
     }
 
+    fn solana_provenance(&self) -> ProvenanceRecord {
+        let mut record = ProvenanceRecord {
+            subject: ProvenanceSubject::System {
+                component_id: token("bloom-machine"),
+                operation_class: token("solana.transfer.confirm"),
+            },
+            publisher: token("bloom-installer"),
+            petal_lineage: None,
+            operation_classes: vec![ProvenanceOperationClass {
+                operation_class: token("solana.native-transfer"),
+                fee_asset: Some(PolicyAsset {
+                    chain: token("solana"),
+                    asset: "native".into(),
+                }),
+            }],
+            installer_key_id: token("installer-key"),
+            installer_signature: Base64UrlBytes::from_bytes(&[]),
+        };
+        sign_zeroed(
+            &mut record,
+            |value| &mut value.installer_signature,
+            PROVENANCE_DOMAIN,
+            &self.installer_key,
+        );
+        record
+    }
+
     fn activate(&self, terms: &SealedApprovalTerms, provenance: Option<&ProvenanceRecord>) {
         let review = digest(7);
         self.authority
@@ -344,6 +427,24 @@ impl Harness {
         let approval_id = self.authority.prepare_approval(terms, &review).unwrap();
         let grant = self.signed_grant(terms, approval_id, operation(3));
         self.authority.activate_approval(&grant, 1_500).unwrap();
+        self.authority.activate_approval(&grant, 1_500).unwrap();
+    }
+
+    fn activate_with_system_claim(
+        &self,
+        terms: &SealedApprovalTerms,
+        provenance: &ProvenanceRecord,
+        claim: &SystemUseClaim,
+    ) {
+        let review = digest(7);
+        self.authority.install_provenance(provenance).unwrap();
+        let claim_digest =
+            Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(claim).unwrap()).into());
+        let approval_id = self
+            .authority
+            .prepare_approval_with_claim(terms, &review, Some(&claim_digest))
+            .unwrap();
+        let grant = self.signed_grant(terms, approval_id, operation(3));
         self.authority.activate_approval(&grant, 1_500).unwrap();
     }
 
@@ -950,7 +1051,64 @@ fn petal_scoped_key_is_frozen_to_installer_provenance_and_petal_approvals() {
         "an inactive secondary grant must not inherit the origin route's lineage"
     );
 
+    // The scope was adopted at 1_000 with a 10_000 ms lifetime, so it expires
+    // at 11_000. A reusable approval may not outlast it; an Exact approval,
+    // reviewed by the owner payload by payload, may, so the funds behind a
+    // delegated key stay recoverable after the scope lapses.
+    let mut late_reusable = terms.clone();
+    late_reusable.issued_at_ms = DecimalU64::new(11_400);
+    late_reusable.not_before_ms = DecimalU64::new(11_500);
+    late_reusable.expires_at_ms = DecimalU64::new(12_000);
+    assert!(
+        error_code(
+            harness
+                .authority
+                .prepare_approval(&late_reusable, &digest(7))
+                .unwrap_err()
+        )
+        .contains("PETAL_KEY_SCOPE_MISMATCH"),
+        "a reusable approval must not outlast the key scope"
+    );
+    let mut late_exact = late_reusable.clone();
+    let recovery_hash = Digest32::from_bytes(Sha256::digest(b"sweep").into());
+    late_exact.selector = ApprovalSelector::Exact {
+        ordered_payload_digests: vec![recovery_hash.clone()],
+        ordered_hashes: vec![recovery_hash],
+    };
+    late_exact.limits.max_operations = DecimalU64::new(1);
+    late_exact.limits.max_signatures = DecimalU64::new(1);
+    harness
+        .authority
+        .prepare_approval(&late_exact, &digest(7))
+        .expect("an Exact approval outlives the key scope");
+
     harness.activate(&terms, Some(&provenance));
+
+    // A by-key revocation acts on every journalled approval bound to the key
+    // and on nothing else: the activated approval is listed under the child,
+    // the refused non-Petal terms are not, and the parent key's list does not
+    // contain the child's approval.
+    let bound = harness
+        .authority
+        .approvals_for_key(&harness.wallet, &child)
+        .unwrap();
+    assert!(bound.iter().any(|(id, state)| {
+        *id == terms.approval_id().unwrap()
+            && *state == bloom_broker_api::ApprovalLifecycleState::Active
+    }));
+    assert!(
+        bound
+            .iter()
+            .all(|(id, _)| *id != non_petal.approval_id().unwrap())
+    );
+    assert!(
+        harness
+            .authority
+            .approvals_for_key(&harness.wallet, &key_ref())
+            .unwrap()
+            .iter()
+            .all(|(id, _)| *id != terms.approval_id().unwrap())
+    );
     harness
         .authority
         .authorize(&petal_input(
@@ -1384,6 +1542,131 @@ fn assurance_contract_fields_and_proof_evidence_are_enforced() {
 }
 
 #[test]
+fn native_solana_system_claim_reaches_the_compiled_verifier() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (message, claim) = solana_message_and_claim(ClaimAssurance::ProofVerified {
+        verifier_id: token(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID),
+        verifier_digest: Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES),
+        proof_digest: digest(0),
+    });
+    let claim = with_evidence_digest(claim, &message);
+    let terms = solana_terms(&harness, &provenance, &message, 81);
+    harness.activate_with_system_claim(&terms, &provenance, &claim);
+
+    let input = solana_input(
+        &terms,
+        &provenance,
+        operation(81),
+        &message,
+        claim.clone(),
+        &message,
+        // The account the approval pins is the message\'s payer.
+        Some([0x01; 32]),
+    );
+    let decision = harness.authority.authorize(&input).unwrap();
+    assert_eq!(decision.effective_assurance, Some(claim.claim_assurance));
+    assert_eq!(
+        decision.reserved_values["solana:native"].as_str(),
+        "1005000"
+    );
+}
+
+#[test]
+fn native_solana_machine_asserted_claim_is_denied() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (message, claim) = solana_message_and_claim(ClaimAssurance::MachineAsserted);
+    let terms = solana_terms(&harness, &provenance, &message, 82);
+    harness.activate_with_system_claim(&terms, &provenance, &claim);
+    let input = solana_input(
+        &terms,
+        &provenance,
+        operation(82),
+        &message,
+        claim,
+        &message,
+        // The account the approval pins is the message\'s payer.
+        Some([0x01; 32]),
+    );
+
+    assert!(
+        error_code(harness.authority.authorize(&input).unwrap_err()).contains("ASSURANCE_TOO_WEAK")
+    );
+}
+
+#[test]
+fn native_solana_mismatched_assurance_evidence_is_denied() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (message, claim) = solana_message_and_claim(ClaimAssurance::ProofVerified {
+        verifier_id: token(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID),
+        verifier_digest: Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES),
+        proof_digest: digest(0),
+    });
+    let claim = with_evidence_digest(claim, &message);
+    let terms = solana_terms(&harness, &provenance, &message, 83);
+    harness.activate_with_system_claim(&terms, &provenance, &claim);
+    let input = solana_input(
+        &terms,
+        &provenance,
+        operation(83),
+        &message,
+        claim,
+        b"different-message-evidence",
+        Some([0x01; 32]),
+    );
+
+    assert!(
+        error_code(harness.authority.authorize(&input).unwrap_err())
+            .contains("ASSURANCE_EVIDENCE_MISMATCH")
+    );
+}
+
+#[test]
+fn native_solana_destination_outside_policy_is_denied() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let destination = bloom_solana_verify::Pubkey::from_bytes([0x44; 32]);
+    let blockhash = [0x07; 32];
+    let message = bloom_solana_verify::system_transfer::transfer_message(
+        bloom_solana_verify::Pubkey::from_bytes([0x01; 32]),
+        destination,
+        1_000_000,
+        blockhash,
+    )
+    .unwrap()
+    .serialize();
+    let claim = solana_claim_for(
+        &message,
+        &destination.to_string(),
+        blockhash,
+        ClaimAssurance::ProofVerified {
+            verifier_id: token(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID),
+            verifier_digest: Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES),
+            proof_digest: Digest32::from_bytes(Sha256::digest(&message).into()),
+        },
+    );
+    let terms = solana_terms(&harness, &provenance, &message, 84);
+    harness.activate_with_system_claim(&terms, &provenance, &claim);
+    let input = solana_input(
+        &terms,
+        &provenance,
+        operation(84),
+        &message,
+        claim,
+        &message,
+        // The account the approval pins is the message\'s payer.
+        Some([0x01; 32]),
+    );
+
+    assert!(
+        error_code(harness.authority.authorize(&input).unwrap_err())
+            .contains("DESTINATION_NOT_ALLOWED")
+    );
+}
+
+#[test]
 fn concurrent_renewal_has_one_atomic_winner_and_never_reactivates_predecessor() {
     let harness = Harness::new();
     let provenance = harness.system_provenance();
@@ -1761,6 +2044,152 @@ fn exact_terms(harness: &Harness, payload: &[u8]) -> SealedApprovalTerms {
     }
 }
 
+fn solana_destination() -> String {
+    bloom_solana_verify::Pubkey::from_bytes([0x02; 32]).to_string()
+}
+
+fn solana_message_and_claim(assurance: ClaimAssurance) -> (Vec<u8>, SystemUseClaim) {
+    let blockhash = [0x07; 32];
+    let destination = bloom_solana_verify::Pubkey::from_bytes([0x02; 32]);
+    let message = bloom_solana_verify::system_transfer::transfer_message(
+        bloom_solana_verify::Pubkey::from_bytes([0x01; 32]),
+        destination,
+        1_000_000,
+        blockhash,
+    )
+    .unwrap()
+    .serialize();
+    let claim = solana_claim_for(&message, &destination.to_string(), blockhash, assurance);
+    (message, claim)
+}
+
+fn solana_claim_for(
+    message: &[u8],
+    destination: &str,
+    blockhash: [u8; 32],
+    claim_assurance: ClaimAssurance,
+) -> SystemUseClaim {
+    let payload_digest = Digest32::from_bytes(Sha256::digest(message).into());
+    SystemUseClaim {
+        component_id: token("bloom-machine"),
+        action_class: token("solana.transfer.confirm"),
+        operation_class: token("solana.native-transfer"),
+        crypto_suite: CryptoSuite::Ed25519Message,
+        payload_digest: payload_digest.clone(),
+        ordered_hashes: vec![payload_digest],
+        declared_debits: vec![DeclaredDebit {
+            asset: AssetId {
+                chain: token("solana"),
+                asset: "native".into(),
+            },
+            amount: DecimalU256::parse("1000000").unwrap(),
+        }],
+        declared_destinations: vec![DeclaredDestination {
+            chain: token("solana"),
+            destination: destination.into(),
+        }],
+        declared_fee: DeclaredFee::Fee {
+            chain: token("solana"),
+            asset: "native".into(),
+            amount: DecimalU256::parse("5000").unwrap(),
+        },
+        nonce: nonce(81),
+        chain_context: SystemChainContext {
+            chain_family: token("solana"),
+            genesis_hash: "local-validator-genesis".into(),
+            recent_blockhash: bs58::encode(blockhash).into_string(),
+            last_valid_block_height: DecimalU64::new(123),
+        },
+        claim_assurance,
+    }
+}
+
+fn with_evidence_digest(mut claim: SystemUseClaim, evidence: &[u8]) -> SystemUseClaim {
+    let ClaimAssurance::ProofVerified { proof_digest, .. } = &mut claim.claim_assurance else {
+        panic!("test claim must be proof verified");
+    };
+    *proof_digest = Digest32::from_bytes(Sha256::digest(evidence).into());
+    claim
+}
+
+fn solana_terms(
+    harness: &Harness,
+    provenance: &ProvenanceRecord,
+    message: &[u8],
+    nonce_byte: u8,
+) -> SealedApprovalTerms {
+    let payload_digest = Digest32::from_bytes(Sha256::digest(message).into());
+    let mut derived_key = key_ref();
+    derived_key.key_spec = KeySpec::Ed25519;
+    derived_key.locator = "wallet/derived/solana-0".into();
+    SealedApprovalTerms {
+        subject: ApprovalSubject::System {
+            component_id: token("bloom-machine"),
+            operation_class: token("solana.transfer.confirm"),
+        },
+        wallet_id: harness.wallet.clone(),
+        key_ref: derived_key,
+        allowed_crypto_suites: vec![CryptoSuite::Ed25519Message],
+        selector: ApprovalSelector::Exact {
+            ordered_payload_digests: vec![payload_digest.clone()],
+            ordered_hashes: vec![payload_digest],
+        },
+        limits: ApprovalLimits {
+            max_operations: DecimalU64::new(1),
+            max_signatures: DecimalU64::new(1),
+            operation_rate_limits: vec![],
+            signature_rate_limits: vec![],
+            value_limits: vec![value_limit("solana", "native", "2000000")],
+        },
+        activation_mode: ActivationMode::BootBound,
+        wallet_revocation_epoch: DecimalU64::new(0),
+        policy_version: DecimalU64::new(1),
+        policy_digest: harness.policy_snapshot(1).policy_digest,
+        provenance_digest: Digest32::from_bytes(
+            Sha256::digest(serde_jcs::to_vec(provenance).unwrap()).into(),
+        ),
+        request_nonce: nonce(nonce_byte),
+        issued_at_ms: DecimalU64::new(900),
+        not_before_ms: DecimalU64::new(1_000),
+        expires_at_ms: DecimalU64::new(2_000),
+        renewal_of: None,
+    }
+}
+
+fn solana_input(
+    terms: &SealedApprovalTerms,
+    provenance: &ProvenanceRecord,
+    operation_id: OperationId,
+    message: &[u8],
+    claim: SystemUseClaim,
+    evidence: &[u8],
+    expected_signer_public_key: Option<[u8; 32]>,
+) -> AuthorizationInput {
+    let mut input = AuthorizationInput {
+        expected_signer_public_key,
+        request: MachineSignRequest {
+            operation_id,
+            operation_digest: digest(5),
+            approval_id: terms.approval_id().unwrap(),
+            key_ref: terms.key_ref.clone(),
+            crypto_suite: CryptoSuite::Ed25519Message,
+            payloads: SigningPayloads::Single {
+                payload: Base64UrlBytes::from_bytes(message),
+            },
+            petal_use_claim: None,
+            system_use_claim: Some(claim),
+            claim_assurance_evidence: Some(Base64UrlBytes::from_bytes(evidence)),
+            provenance: provenance.subject.clone(),
+        },
+        reserved_at_ms: 1_500,
+        observed_utc_ms: Some(1_500),
+        monotonic_anchor_ns: 1_000_000,
+        clock_boot_epoch: BootEpoch::from_bytes([1; 16]),
+    };
+    bind_operation_digest(&mut input, terms);
+    input
+}
+
 fn petal_terms(harness: &Harness, provenance: &ProvenanceRecord) -> SealedApprovalTerms {
     harness.authority.install_provenance(provenance).unwrap();
     let (package_hash, route) = match &provenance.subject {
@@ -1821,6 +2250,7 @@ fn exact_input(
     payload: &[u8],
 ) -> AuthorizationInput {
     let mut input = AuthorizationInput {
+        expected_signer_public_key: None,
         request: MachineSignRequest {
             operation_id,
             operation_digest: digest(5),
@@ -1831,6 +2261,7 @@ fn exact_input(
                 payload: Base64UrlBytes::from_bytes(payload),
             },
             petal_use_claim: None,
+            system_use_claim: None,
             claim_assurance_evidence: None,
             provenance: harness.system_provenance().subject,
         },
@@ -1850,6 +2281,7 @@ fn exact_batch_input(
     payloads: &[&[u8]],
 ) -> AuthorizationInput {
     let mut input = AuthorizationInput {
+        expected_signer_public_key: None,
         request: MachineSignRequest {
             operation_id,
             operation_digest: digest(5),
@@ -1863,6 +2295,7 @@ fn exact_batch_input(
                     .collect(),
             },
             petal_use_claim: None,
+            system_use_claim: None,
             claim_assurance_evidence: None,
             provenance: harness.system_provenance().subject,
         },
@@ -1905,6 +2338,7 @@ fn petal_input(
     };
     let claim_nonce = nonce(operation_id.to_bytes()[31]);
     let mut input = AuthorizationInput {
+        expected_signer_public_key: None,
         request: MachineSignRequest {
             operation_id,
             operation_digest: digest(5),
@@ -1949,6 +2383,7 @@ fn petal_input(
                 nonce: claim_nonce.clone(),
                 claim_assurance: ClaimAssurance::MachineAsserted,
             }),
+            system_use_claim: None,
             claim_assurance_evidence: None,
             provenance: provenance.subject.clone(),
         },
@@ -1982,14 +2417,31 @@ fn bind_operation_digest(input: &mut AuthorizationInput, terms: &SealedApprovalT
             _ => Digest32::from_bytes(Sha256::digest(payload).into()),
         })
         .collect();
-    let claim_digest = input.request.petal_use_claim.as_ref().map(|claim| {
-        Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(claim).unwrap()).into())
-    });
-    let assurance_digest = input.request.petal_use_claim.as_ref().map(|claim| {
-        Digest32::from_bytes(
-            Sha256::digest(serde_jcs::to_vec(&claim.claim_assurance).unwrap()).into(),
-        )
-    });
+    let claim_digest = input
+        .request
+        .petal_use_claim
+        .as_ref()
+        .map(|claim| Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(claim).unwrap()).into()))
+        .or_else(|| {
+            input.request.system_use_claim.as_ref().map(|claim| {
+                Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(claim).unwrap()).into())
+            })
+        });
+    let assurance_digest = input
+        .request
+        .petal_use_claim
+        .as_ref()
+        .map(|claim| &claim.claim_assurance)
+        .or_else(|| {
+            input
+                .request
+                .system_use_claim
+                .as_ref()
+                .map(|claim| &claim.claim_assurance)
+        })
+        .map(|assurance| {
+            Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(assurance).unwrap()).into())
+        });
     input.request.operation_digest = TestSignOperationIdentity {
         operation_id: input.request.operation_id.clone(),
         approval_id: input.request.approval_id.clone(),
@@ -2149,4 +2601,797 @@ fn nonce(byte: u8) -> RequestNonce {
 
 fn error_code(error: impl ToString) -> String {
     error.to_string()
+}
+
+fn multi_family_child_key_ref(profile: DerivationProfile, path: &str) -> KeyRef {
+    KeyRef {
+        backend: token("local"),
+        backend_instance: token("wallet-1"),
+        locator: path.to_owned(),
+        key_spec: profile.key_spec(),
+        public_key_fingerprint: digest(u8::try_from(path.len()).unwrap_or(9)),
+        derivation: Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+            wallet_seed_ref: token("wallet-1"),
+            profile,
+            path: path.to_owned(),
+        }),
+    }
+}
+
+fn multi_family_terms(
+    requests: Vec<DerivedAccountRequest>,
+    replay_id: OperationId,
+) -> AccountTerms {
+    let anchor = requests
+        .iter()
+        .find(|request| request.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1)
+        .unwrap_or(&requests[0]);
+    let profile = anchor.derivation_profile;
+    AccountTerms {
+        schema: token("bloom.account_terms.v1"),
+        wallet_id: token("wallet-1"),
+        seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+        derivations: requests,
+        retire_key_fingerprint: None,
+        path_template: profile.path_template().to_owned(),
+        key_spec: profile.key_spec(),
+        allowed_crypto_suites: profile.frozen_crypto_suites().to_vec(),
+        policy_version: DecimalU64::new(1),
+        revocation_epoch: DecimalU64::new(0),
+        replay_id,
+        expires_at_ms: DecimalU64::new(60_000),
+        audit_purpose: token("allocate-derived-account"),
+    }
+}
+
+fn evm_family_request() -> DerivedAccountRequest {
+    DerivedAccountRequest {
+        derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
+        requested_role: token("primary-evm"),
+        account: None,
+    }
+}
+
+fn solana_family_request() -> DerivedAccountRequest {
+    DerivedAccountRequest {
+        derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+        requested_role: token("solana-account"),
+        account: None,
+    }
+}
+
+fn signed_allocation_receipt(
+    harness: &Harness,
+    replay_id: &OperationId,
+    children: Vec<KeyRef>,
+) -> CustodyResult {
+    let mut receipt = CustodyResult {
+        ceremony_kind: CeremonyKind::AccountAllocate,
+        custody_operation_id: replay_id.clone(),
+        public_status: CeremonyState::Succeeded,
+        wallet_id: Some(harness.wallet.clone()),
+        public_key_refs: children,
+        credential_summaries: Vec::new(),
+        initial_policy: None,
+        receipt_digest: digest(91),
+        encrypted_browser_result: None,
+        signer_key_id: token("ceremony-key"),
+        signer_signature: Base64UrlBytes::from_bytes(&[]),
+    };
+    sign_custody_receipt(&mut receipt, &harness.ceremony_key);
+    receipt
+}
+
+#[test]
+fn ac_multi_family_allocation_receipt_matching_number_is_adopted() {
+    let harness = Harness::new();
+    let replay = operation(91);
+    let terms = multi_family_terms(
+        vec![evm_family_request(), solana_family_request()],
+        replay.clone(),
+    );
+    harness
+        .authority
+        .record_account_terms(&terms, 1_000)
+        .unwrap();
+
+    let receipt = signed_allocation_receipt(
+        &harness,
+        &replay,
+        vec![
+            multi_family_child_key_ref(DerivationProfile::Bip44EvmSecp256k1V1, "m/44'/60'/0'/0/3"),
+            multi_family_child_key_ref(
+                DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/3'/0'",
+            ),
+        ],
+    );
+    harness
+        .authority
+        .adopt_custody_receipt(&receipt, 1_000)
+        .unwrap();
+    // Re-adoption of the same receipt is idempotent.
+    harness
+        .authority
+        .adopt_custody_receipt(&receipt, 1_100)
+        .unwrap();
+
+    // The receipt's child order is not meaningful: matching is by profile.
+    let swapped_replay = operation(95);
+    let swapped_terms = multi_family_terms(
+        vec![evm_family_request(), solana_family_request()],
+        swapped_replay.clone(),
+    );
+    harness
+        .authority
+        .record_account_terms(&swapped_terms, 1_000)
+        .unwrap();
+    let swapped = signed_allocation_receipt(
+        &harness,
+        &swapped_replay,
+        vec![
+            multi_family_child_key_ref(
+                DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/4'/0'",
+            ),
+            multi_family_child_key_ref(DerivationProfile::Bip44EvmSecp256k1V1, "m/44'/60'/0'/0/4"),
+        ],
+    );
+    harness
+        .authority
+        .adopt_custody_receipt(&swapped, 1_000)
+        .unwrap();
+}
+
+#[test]
+fn ac_multi_family_allocation_receipt_rejections_fail_closed() {
+    let harness = Harness::new();
+    let two_family = operation(91);
+    let terms = multi_family_terms(
+        vec![evm_family_request(), solana_family_request()],
+        two_family.clone(),
+    );
+    harness
+        .authority
+        .record_account_terms(&terms, 1_000)
+        .unwrap();
+
+    let evm_child =
+        multi_family_child_key_ref(DerivationProfile::Bip44EvmSecp256k1V1, "m/44'/60'/0'/0/3");
+    let solana_child = multi_family_child_key_ref(
+        DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+        "m/44'/501'/3'/0'",
+    );
+    let mismatched_solana = multi_family_child_key_ref(
+        DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+        "m/44'/501'/4'/0'",
+    );
+    let substituted_evm =
+        multi_family_child_key_ref(DerivationProfile::Bip44EvmSecp256k1V1, "m/44'/60'/5'/0/3");
+
+    // A single child cannot satisfy two committed families.
+    let single = signed_allocation_receipt(&harness, &two_family, vec![evm_child.clone()]);
+    assert!(
+        harness
+            .authority
+            .adopt_custody_receipt(&single, 1_000)
+            .is_err()
+    );
+
+    // An extra child is refused outright.
+    let extra = signed_allocation_receipt(
+        &harness,
+        &two_family,
+        vec![
+            evm_child.clone(),
+            solana_child.clone(),
+            solana_child.clone(),
+        ],
+    );
+    assert!(
+        harness
+            .authority
+            .adopt_custody_receipt(&extra, 1_000)
+            .is_err()
+    );
+
+    // Families that disagree on the number are refused.
+    let diverged = signed_allocation_receipt(
+        &harness,
+        &two_family,
+        vec![evm_child.clone(), mismatched_solana],
+    );
+    assert!(
+        harness
+            .authority
+            .adopt_custody_receipt(&diverged, 1_000)
+            .is_err()
+    );
+
+    // A substituted EVM child outside hardened account zero is refused.
+    let substituted = signed_allocation_receipt(
+        &harness,
+        &two_family,
+        vec![substituted_evm, solana_child.clone()],
+    );
+    assert!(
+        harness
+            .authority
+            .adopt_custody_receipt(&substituted, 1_000)
+            .is_err()
+    );
+
+    // Two children of the same profile cannot stand in for both families.
+    let duplicate =
+        signed_allocation_receipt(&harness, &two_family, vec![evm_child.clone(), evm_child]);
+    assert!(
+        harness
+            .authority
+            .adopt_custody_receipt(&duplicate, 1_000)
+            .is_err()
+    );
+}
+
+#[test]
+fn ac_single_family_allocation_receipt_still_adopts_one_child() {
+    let harness = Harness::new();
+    let replay = operation(92);
+    let terms = multi_family_terms(vec![evm_family_request()], replay.clone());
+    harness
+        .authority
+        .record_account_terms(&terms, 1_000)
+        .unwrap();
+
+    let receipt = signed_allocation_receipt(
+        &harness,
+        &replay,
+        vec![multi_family_child_key_ref(
+            DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+        )],
+    );
+    harness
+        .authority
+        .adopt_custody_receipt(&receipt, 1_000)
+        .unwrap();
+}
+
+/// The scoped-key setup the by-key revocation tests need: an installed petal
+/// provenance, an adopted derived child, and terms binding that child.
+fn scoped_petal_child() -> (Harness, ProvenanceRecord, PetalKeyScope, KeyRef) {
+    let harness = Harness::new();
+    let (provenance, scope, child) = scoped_petal_child_on(&harness);
+    (harness, provenance, scope, child)
+}
+
+/// A reusable Petal approval on the scoped child: the automation a stop
+/// must end.
+fn scoped_petal_terms(
+    harness: &Harness,
+    provenance: &ProvenanceRecord,
+    child: &KeyRef,
+) -> SealedApprovalTerms {
+    let mut terms = petal_terms(harness, provenance);
+    terms.key_ref = child.clone();
+    terms.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Sha256Recoverable];
+    if let ApprovalSelector::Petal {
+        allowed_operation_classes,
+        ..
+    } = &mut terms.selector
+    {
+        *allowed_operation_classes = vec![token("transfer")];
+    }
+    terms
+}
+
+/// An owner-reviewed Exact approval on the scoped child: the recovery
+/// sweep a stop must leave possible.
+fn scoped_exact_terms(
+    harness: &Harness,
+    provenance: &ProvenanceRecord,
+    child: &KeyRef,
+    payload: &[u8],
+    nonce_byte: u8,
+) -> SealedApprovalTerms {
+    let mut terms = scoped_petal_terms(harness, provenance, child);
+    let hash = Digest32::from_bytes(Sha256::digest(payload).into());
+    terms.selector = ApprovalSelector::Exact {
+        ordered_payload_digests: vec![hash.clone()],
+        ordered_hashes: vec![hash],
+    };
+    terms.limits.max_operations = DecimalU64::new(1);
+    terms.limits.max_signatures = DecimalU64::new(1);
+    terms.limits.value_limits = vec![];
+    terms.request_nonce = nonce(nonce_byte);
+    terms
+}
+
+fn scoped_petal_child_on(harness: &Harness) -> (ProvenanceRecord, PetalKeyScope, KeyRef) {
+    let provenance = harness.provenance();
+    harness.authority.install_provenance(&provenance).unwrap();
+    let scope = PetalKeyScope {
+        wallet_id: harness.wallet.clone(),
+        parent_key_ref: key_ref(),
+        package_hash: digest(9),
+        route: "/sign".into(),
+        lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        key_slot: token("advisory"),
+        allowed_routes: vec!["/sign".into()],
+        allowed_operation_classes: vec![token("transfer")],
+        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
+        maximum_lifetime_ms: DecimalU64::new(10_000),
+        custody_operation_id: operation(94),
+    };
+    harness.authority.prepare_petal_key_scope(&scope).unwrap();
+    let mut child = key_ref();
+    child.locator = "petal-child-1".into();
+    child.public_key_fingerprint = digest(95);
+    let mut receipt = CustodyResult {
+        ceremony_kind: CeremonyKind::KeyDerive,
+        custody_operation_id: scope.custody_operation_id.clone(),
+        public_status: CeremonyState::Succeeded,
+        wallet_id: Some(harness.wallet.clone()),
+        public_key_refs: vec![child.clone()],
+        credential_summaries: vec![],
+        initial_policy: None,
+        receipt_digest: digest(96),
+        encrypted_browser_result: None,
+        signer_key_id: token("ceremony-key"),
+        signer_signature: Base64UrlBytes::from_bytes(&[]),
+    };
+    sign_custody_receipt(&mut receipt, &harness.ceremony_key);
+    harness
+        .authority
+        .adopt_custody_receipt(&receipt, 1_000)
+        .unwrap();
+    (provenance, scope, child)
+}
+
+#[test]
+fn ac_by_key_revocation_fails_a_pending_ceremony_so_it_cannot_complete_afterwards() {
+    let (harness, provenance, _scope, child) = scoped_petal_child();
+    let mut terms = petal_terms(&harness, &provenance);
+    terms.key_ref = child.clone();
+    terms.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Sha256Recoverable];
+    if let ApprovalSelector::Petal {
+        allowed_operation_classes,
+        ..
+    } = &mut terms.selector
+    {
+        *allowed_operation_classes = vec![token("transfer")];
+    }
+    let approval_id = harness
+        .authority
+        .prepare_approval(&terms, &digest(7))
+        .unwrap();
+    // The approval is journalled for the key while its ceremony is pending.
+    assert!(
+        harness
+            .authority
+            .approvals_for_key(&harness.wallet, &child)
+            .unwrap()
+            .iter()
+            .any(|(id, _)| *id == approval_id)
+    );
+
+    // What `sealed_approval.revoke_for_key` does to each pending approval.
+    harness
+        .authority
+        .revoke_local_approval(&approval_id)
+        .unwrap();
+
+    // A ceremony opened before the stop cannot complete afterwards.
+    let grant = harness.signed_grant(&terms, approval_id.clone(), operation(3));
+    assert!(
+        harness.authority.activate_approval(&grant, 1_500).is_err(),
+        "a pre-stop ceremony grant must not activate"
+    );
+    let states = harness
+        .authority
+        .approvals_for_key(&harness.wallet, &child)
+        .unwrap();
+    assert!(states.iter().any(|(id, state)| {
+        *id == approval_id && *state == bloom_broker_api::ApprovalLifecycleState::Failed
+    }));
+    // Stopping is idempotent and authorize refuses the stopped key.
+    let again = approval_id.clone();
+    harness.authority.revoke_local_approval(&again).unwrap();
+    assert!(
+        harness
+            .authority
+            .authorize(&petal_input(
+                &terms,
+                &provenance,
+                operation(96),
+                CryptoSuite::Secp256k1Sha256Recoverable,
+            ))
+            .is_err()
+    );
+}
+
+#[test]
+fn ac_a_key_stop_refuses_approvals_prepared_after_it() {
+    let (harness, provenance, _scope, child) = scoped_petal_child();
+    // The stop marker is durable before any enumeration happens; an
+    // approval prepared afterwards must be refused at the Broker's single
+    // preparation chokepoint, so the stop cannot be outrun.
+    harness
+        .authority
+        .stop_key(&harness.wallet, &child, operation(41).as_str(), 2_000)
+        .unwrap();
+    let mut terms = petal_terms(&harness, &provenance);
+    terms.key_ref = child.clone();
+    terms.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Sha256Recoverable];
+    if let ApprovalSelector::Petal {
+        allowed_operation_classes,
+        ..
+    } = &mut terms.selector
+    {
+        *allowed_operation_classes = vec![token("transfer")];
+    }
+    let error = harness
+        .authority
+        .prepare_approval(&terms, &digest(8))
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            bloom_broker::authority::AuthorityError::Denied { code, .. } if *code == "KEY_STOPPED"
+        ),
+        "preparation after the stop must be refused with KEY_STOPPED, got {error:?}"
+    );
+    // The owner is not automation. A fresh Exact approval, reviewed payload
+    // by payload in a new ceremony, prepares and activates on the stopped
+    // key so the funds behind it stay recoverable; every other scope check
+    // still applies to it.
+    let recovery = scoped_exact_terms(&harness, &provenance, &child, b"sweep after stop", 7);
+    let recovery_id = harness
+        .authority
+        .prepare_approval(&recovery, &digest(7))
+        .unwrap();
+    let grant = harness.signed_grant(&recovery, recovery_id.clone(), operation(43));
+    harness.authority.activate_approval(&grant, 1_600).unwrap();
+    assert_eq!(
+        harness.journal.approval_state(&recovery_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::Active)
+    );
+    let mut off_scope = scoped_exact_terms(&harness, &provenance, &child, b"other route", 8);
+    off_scope.subject = ApprovalSubject::Petal {
+        package_hash: digest(9),
+        route: "/elsewhere".into(),
+        agent_id: Some("advisory".into()),
+    };
+    assert!(
+        harness
+            .authority
+            .prepare_approval(&off_scope, &digest(8))
+            .is_err(),
+        "the stop exemption does not relax the scope's own checks"
+    );
+}
+
+#[test]
+fn ac_a_key_stop_fences_a_pending_exact_ceremony_but_not_a_fresh_one() {
+    let (harness, provenance, _scope, child) = scoped_petal_child();
+    // An Exact ceremony opened before the stop is not fresh: the stop
+    // fences it under the barrier, so an owner proof produced for it later
+    // cannot activate it, even though a fresh Exact approval on the same
+    // stopped key can.
+    let pending = scoped_exact_terms(&harness, &provenance, &child, b"pre-stop sweep", 7);
+    let pending_id = harness
+        .authority
+        .prepare_approval(&pending, &digest(7))
+        .unwrap();
+    let pending_grant = harness.signed_grant(&pending, pending_id.clone(), operation(3));
+    let targets = harness
+        .authority
+        .stop_key(&harness.wallet, &child, operation(42).as_str(), 1_500)
+        .unwrap();
+    assert!(targets.iter().any(|(id, _)| *id == pending_id));
+    assert_eq!(
+        harness.journal.approval_state(&pending_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::Failed),
+        "the stop fences the pending ceremony durably"
+    );
+    assert!(
+        harness
+            .authority
+            .activate_approval(&pending_grant, 1_600)
+            .is_err(),
+        "a ceremony opened before the stop cannot activate after it"
+    );
+    assert_eq!(
+        harness.journal.approval_state(&pending_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::Failed)
+    );
+    let fresh = scoped_exact_terms(&harness, &provenance, &child, b"post-stop sweep", 8);
+    let fresh_id = harness
+        .authority
+        .prepare_approval(&fresh, &digest(7))
+        .unwrap();
+    let fresh_grant = harness.signed_grant(&fresh, fresh_id.clone(), operation(44));
+    harness
+        .authority
+        .activate_approval(&fresh_grant, 1_700)
+        .unwrap();
+    assert_eq!(
+        harness.journal.approval_state(&fresh_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::Active)
+    );
+}
+
+#[test]
+fn ac_a_key_stop_survives_restart_and_still_admits_fresh_exact_recovery() {
+    let directory = tempfile::tempdir().unwrap();
+    let child = {
+        let harness = Harness::open_at(directory.path());
+        let (_provenance, _scope, child) = scoped_petal_child_on(&harness);
+        harness
+            .authority
+            .stop_key(&harness.wallet, &child, operation(41).as_str(), 1_200)
+            .unwrap();
+        child
+    };
+    // Reopened from disk: the marker still ends automation on the key and
+    // still admits owner recovery.
+    let harness = Harness::open_at(directory.path());
+    let provenance = harness.provenance();
+    let error = harness
+        .authority
+        .prepare_approval(
+            &scoped_petal_terms(&harness, &provenance, &child),
+            &digest(8),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        bloom_broker::authority::AuthorityError::Denied { code, .. } if *code == "KEY_STOPPED"
+    ));
+    let recovery = scoped_exact_terms(&harness, &provenance, &child, b"sweep after restart", 7);
+    let recovery_id = harness
+        .authority
+        .prepare_approval(&recovery, &digest(7))
+        .unwrap();
+    let grant = harness.signed_grant(&recovery, recovery_id.clone(), operation(45));
+    harness.authority.activate_approval(&grant, 1_500).unwrap();
+    assert_eq!(
+        harness.journal.approval_state(&recovery_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::Active)
+    );
+}
+
+#[test]
+fn ac_a_key_stop_refuses_activation_of_a_ceremony_prepared_before_it() {
+    let (harness, provenance, _scope, child) = scoped_petal_child();
+    let mut terms = petal_terms(&harness, &provenance);
+    terms.key_ref = child.clone();
+    terms.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Sha256Recoverable];
+    if let ApprovalSelector::Petal {
+        allowed_operation_classes,
+        ..
+    } = &mut terms.selector
+    {
+        *allowed_operation_classes = vec![token("transfer")];
+    }
+    let approval_id = harness
+        .authority
+        .prepare_approval(&terms, &digest(7))
+        .unwrap();
+    // The grant was issued while the key was live; the stop happens after
+    // the ceremony was prepared but before it completes.
+    let grant = harness.signed_grant(&terms, approval_id.clone(), operation(3));
+    harness
+        .authority
+        .stop_key(&harness.wallet, &child, operation(42).as_str(), 1_500)
+        .unwrap();
+    let error = harness
+        .authority
+        .activate_approval(&grant, 1_600)
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            bloom_broker::authority::AuthorityError::Denied { code, .. } if *code == "KEY_STOPPED"
+        ),
+        "activation after the stop must be refused with KEY_STOPPED, got {error:?}"
+    );
+    // The stop fenced the pending ceremony when it recorded the marker, so
+    // the approval is durably dead, never active.
+    assert_eq!(
+        harness.journal.approval_state(&approval_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::Failed)
+    );
+}
+
+#[test]
+fn ac_ceremony_completion_racing_by_key_revocation_ends_unusable() {
+    let (harness, provenance, _scope, child) = scoped_petal_child();
+    let mut terms = petal_terms(&harness, &provenance);
+    terms.key_ref = child.clone();
+    terms.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Sha256Recoverable];
+    if let ApprovalSelector::Petal {
+        allowed_operation_classes,
+        ..
+    } = &mut terms.selector
+    {
+        *allowed_operation_classes = vec![token("transfer")];
+    }
+    let approval_id = harness
+        .authority
+        .prepare_approval(&terms, &digest(7))
+        .unwrap();
+    let grant = harness.signed_grant(&terms, approval_id, operation(3));
+    let wallet = harness.wallet.clone();
+    let authority = Arc::new(harness.authority);
+    let completing = {
+        let authority = authority.clone();
+        let grant = grant.clone();
+        std::thread::spawn(move || authority.activate_approval(&grant, 1_500))
+    };
+    let stopping = {
+        let authority = authority.clone();
+        let wallet = wallet.clone();
+        let child = child.clone();
+        std::thread::spawn(move || {
+            for (id, _) in authority.approvals_for_key(&wallet, &child).unwrap() {
+                authority.revoke_local_approval(&id).unwrap();
+            }
+        })
+    };
+    // Both interleavings are legitimate: the ceremony may complete just
+    // before the stop revokes the approval, or the stop may fail it first
+    // so completion then errors. The outcome of the completing thread is
+    // therefore not asserted; the end state is, either way.
+    let _ = completing.join().unwrap();
+    stopping.join().unwrap();
+
+    // Whatever the interleaving, the stop runs to the end and the key ends
+    // with no live reusable authority.
+    let states = authority.approvals_for_key(&wallet, &child).unwrap();
+    assert!(states.iter().all(|(_, state)| !matches!(
+        state,
+        bloom_broker_api::ApprovalLifecycleState::Active
+            | bloom_broker_api::ApprovalLifecycleState::Prepared
+            | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
+    )));
+    assert!(
+        authority
+            .authorize(&petal_input(
+                &terms,
+                &provenance,
+                operation(95),
+                CryptoSuite::Secp256k1Sha256Recoverable,
+            ))
+            .is_err()
+    );
+}
+
+#[test]
+fn concurrent_key_stops_bind_identity_before_any_authority_effect() {
+    let directory = tempfile::tempdir().unwrap();
+    let harness = Harness::open_at(directory.path());
+    let (_, _, child) = scoped_petal_child_on(&harness);
+    let mut other = child.clone();
+    other.public_key_fingerprint = digest(99);
+    let requests = [child, other].map(|key_ref| bloom_broker_api::RevokeForKeyRequest {
+        operation_id: operation(71),
+        wallet_id: harness.wallet.clone(),
+        key_ref,
+        reason: "stop session".into(),
+    });
+    let start = Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                let start = &start;
+                let authority = &harness.authority;
+                scope.spawn(move || {
+                    start.wait();
+                    authority.admit_key_revocation(request, 2_000)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let winner = results.iter().position(|result| result.is_ok()).unwrap();
+    assert!(
+        results[1 - winner]
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("OPERATION_ID_CONFLICT")
+    );
+    let connection = rusqlite::Connection::open(directory.path().join("journal.sqlite")).unwrap();
+    let stopped: Vec<String> = connection
+        .prepare("SELECT key_ref FROM key_stops")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        stopped,
+        vec![serde_jcs::to_string(&requests[winner].key_ref).unwrap()]
+    );
+}
+
+#[test]
+fn key_stop_admission_rolls_back_and_replay_preserves_fresh_exact() {
+    let directory = tempfile::tempdir().unwrap();
+    let harness = Harness::open_at(directory.path());
+    let (provenance, _, child) = scoped_petal_child_on(&harness);
+    let pending = scoped_exact_terms(&harness, &provenance, &child, b"pending", 71);
+    let pending_id = harness
+        .authority
+        .prepare_approval(&pending, &digest(7))
+        .unwrap();
+    let request = bloom_broker_api::RevokeForKeyRequest {
+        operation_id: operation(72),
+        wallet_id: harness.wallet.clone(),
+        key_ref: child.clone(),
+        reason: "stop session".into(),
+    };
+    let connection = rusqlite::Connection::open(directory.path().join("journal.sqlite")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_stop_fence BEFORE UPDATE ON approvals
+        BEGIN SELECT RAISE(ABORT, 'injected stop fence failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        harness
+            .authority
+            .admit_key_revocation(&request, 1_500)
+            .is_err()
+    );
+    assert!(
+        harness
+            .journal
+            .operation(&request.operation_id)
+            .unwrap()
+            .is_none()
+    );
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM key_stops", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(
+        harness.journal.approval_state(&pending_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony)
+    );
+    connection
+        .execute_batch("DROP TRIGGER fail_stop_fence")
+        .unwrap();
+    let (targets, first) = harness
+        .authority
+        .admit_key_revocation(&request, 1_500)
+        .unwrap();
+    assert!(first);
+    assert_eq!(
+        harness.journal.approval_state(&pending_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::Failed)
+    );
+    let fresh = scoped_exact_terms(&harness, &provenance, &child, b"fresh", 72);
+    let fresh_id = harness
+        .authority
+        .prepare_approval(&fresh, &digest(7))
+        .unwrap();
+    drop(harness);
+    let reopened = Harness::open_at(directory.path());
+    let (replayed, first) = reopened
+        .authority
+        .admit_key_revocation(&request, 1_600)
+        .unwrap();
+    assert!(!first);
+    assert_eq!(replayed, targets);
+    assert!(!replayed.iter().any(|(id, _)| id == &fresh_id));
+    assert_eq!(
+        reopened.journal.approval_state(&fresh_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony)
+    );
 }

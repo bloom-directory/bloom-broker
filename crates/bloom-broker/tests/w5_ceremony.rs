@@ -16,15 +16,16 @@ use bloom_broker::{
 };
 use bloom_broker_api::{
     ActivationMode, ApprovalLimits, ApprovalPrepareRequest, ApprovalSelector, ApprovalSubject,
-    Base64UrlBytes, BootEpoch, CanonicalWalletPolicy, CeremonyState, ClaimAssurance,
-    ClaimAssuranceLevel, CryptoSuite, CustodyPrepareResponse, DecimalU64, DeclaredFee, Digest32,
-    KeyRef, KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
-    MachineSignRequest, OperationId, OperationRequest, PROVENANCE_RECORD_SIGNATURE_DOMAIN,
-    PetalKeyScope, PetalLineageMembership, PetalUseClaim, PolicyCommitUpdateRequest,
-    PolicyDestination, PolicyUpdateRequest, ProtocolError, ProtocolErrorCode,
-    ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject, RateLimitDetails, RequestNonce,
-    RevokeRequest, SealedApprovalTerms, SignedJournalHead, SignedPolicySnapshot, SigningPayloads,
-    Token, WalletRequest,
+    AssetId, Base64UrlBytes, BootEpoch, CanonicalWalletPolicy, CeremonyState, ClaimAssurance,
+    ClaimAssuranceLevel, CryptoSuite, CustodyPrepareResponse, DecimalU64, DecimalU256,
+    DeclaredDebit, DeclaredDestination, DeclaredFee, Digest32, KeyRef, KeySpec,
+    MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
+    OperationId, OperationRequest, PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope,
+    PetalLineageMembership, PetalUseClaim, PolicyCommitUpdateRequest, PolicyDestination,
+    PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceOperationClass,
+    ProvenanceRecord, ProvenanceSubject, RateLimitDetails, RequestNonce, RevokeRequest,
+    SealedApprovalTerms, SignedJournalHead, SignedPolicySnapshot, SigningPayloads, Token,
+    WalletRequest,
 };
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer::{
@@ -236,6 +237,65 @@ cryptoSelfTest().then(
     assert_eq!(String::from_utf8_lossy(&output.stdout), "browser-crypto-ok");
 }
 
+/// Owners hold imported secp256k1 scalars as hex; Signer decodes base64url.
+/// The shipped page must normalize every realistic hex spelling itself —
+/// asking an owner to hand-convert a private key is both hostile and
+/// error-prone (the mismatch previously surfaced as an opaque
+/// `MALFORMED_FRAME: Invalid last symbol` from deep inside Signer).
+#[test]
+fn browser_page_accepts_hex_private_keys_and_converts_them_to_base64url() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+globalThis.crypto = require("node:crypto").webcrypto;
+globalThis.document = {{getElementById: () => ({{}})}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+{executable}
+const scalar = "01".repeat(32);
+const expected = Buffer.from(scalar, "hex").toString("base64url");
+const cases = [
+  ["0x" + scalar, expected],
+  [scalar, expected],
+  ["0x" + scalar.toUpperCase(), expected],
+  [expected, expected],
+];
+for (const [input, want] of cases) {{
+  const got = normalizePrivateKey(input);
+  if (got !== want) {{
+    console.error("normalizePrivateKey(" + JSON.stringify(input) + ") => " + got + ", wanted " + want);
+    process.exit(1);
+  }}
+}}
+for (const bad of ["", "0x1234", "zz".repeat(32), "0x" + "0".repeat(63)]) {{
+  try {{
+    normalizePrivateKey(bad);
+    console.error("normalizePrivateKey accepted invalid input " + JSON.stringify(bad));
+    process.exit(1);
+  }} catch (error) {{ /* rejected by name: expected */ }}
+}}
+process.stdout.write("hex-normalization-ok");
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "hex-normalization-ok"
+    );
+}
+
 #[test]
 fn browser_ceremony_state_survives_reload_and_reuses_one_output_key() {
     let asset = include_str!("../src/ceremony_assets/app.js");
@@ -367,6 +427,16 @@ process.stdout.write("browser-error-feedback-ok");
 }
 
 #[test]
+fn transfer_review_promises_later_verification_without_claiming_it_already_happened() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    assert!(asset.contains("Estimated network fee"));
+    assert!(asset.contains("Required before signing"));
+    assert!(asset.contains("Bloom will decode the transaction"));
+    assert!(!asset.contains("Bloom decoded the transaction and it matches this summary"));
+    assert!(!asset.contains("transfer.verified"));
+}
+
+#[test]
 fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
     let shell = include_str!("../src/ceremony_assets/index.html");
     for required in [
@@ -387,6 +457,10 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
             "ceremony shell omitted {required}"
         );
     }
+    assert!(
+        !shell.contains("<style>"),
+        "the ceremony shell must not contain CSP-blocked inline styles"
+    );
 
     let stylesheet = include_str!("../src/ceremony_assets/style.css");
     for required in [
@@ -435,13 +509,17 @@ fn legacy_passkey_browser_flow_uses_assertion_prf_and_hides_raw_key_input() {
     assert!(asset.contains("legacy_passkey_v1_prf"));
     assert!(asset.contains("const assertion = await getCredential(session, 0)"));
     assert!(asset.contains("credential_prf: encodeUrl(credentialPrf)"));
-    assert!(asset.contains("Boolean(scopedPetalKey) || legacyPasskeyImport"));
+    assert!(asset.contains(
+        "importFields.hidden = !(session.ceremony_kind === \"wallet_import\" && !legacyPasskeyImport)"
+    ));
     assert!(asset.contains("wallet_import\" && !legacyPasskeyImport"));
 }
 
 #[test]
 fn bip39_browser_import_uses_profile_to_control_serialization() {
     let asset = include_str!("../src/ceremony_assets/app.js");
+    let html = include_str!("../src/ceremony_assets/index.html");
+    let css = include_str!("../src/ceremony_assets/style.css");
     let load = asset
         .split_once("async function load() {")
         .expect("browser asset must define load")
@@ -461,21 +539,48 @@ fn bip39_browser_import_uses_profile_to_control_serialization() {
         assert!(scope.contains("const bip39Import = "));
         assert!(scope.contains("wallet_seed_profile === \"bip39-multicurve-v1\""));
     }
-    assert!(load.contains("genericInput.placeholder = bip39Import"));
+    assert!(load.contains("document.getElementById(\"mnemonic-label\").hidden = !bip39Import"));
+    assert!(load.contains("document.getElementById(\"raw-key-label\").hidden = bip39Import"));
 
     // The serialization branch follows the profile; it never infers the
     // profile from whichever property the operator supplied.
     assert!(run.contains("if (bip39Import)"));
-    assert!(run.contains("BIP-39 mnemonic input is required"));
-    assert!(run.contains("mnemonic: supplied.mnemonic"));
-    assert!(run.contains("BIP-39 passphrases are not supported"));
-    assert!(!run.contains("passphrase: \"\""));
+    assert!(run.contains("const mnemonic = mnemonicInput.value"));
+    // Import and export must gate on the same shared word-count set, so a
+    // 15, 18, or 21-word phrase renders as a recovery phrase on export too.
+    assert!(asset.contains("const MNEMONIC_WORD_COUNTS = [12, 15, 18, 21, 24];"));
+    assert!(run.contains("!MNEMONIC_WORD_COUNTS.includes(count)"));
+    assert!(asset.contains("!parsed && MNEMONIC_WORD_COUNTS.includes(words.length)"));
+    assert!(run.contains("Enter a 12, 15, 18, 21, or 24 word recovery phrase"));
+    assert!(run.contains("credential_prf: encodeUrl(prf.prf),\n          mnemonic\n"));
+    assert!(!run.contains("passphrase:"));
+    assert!(!run.contains("passphraseInput"));
     assert!(!run.contains("supplied.passphrase"));
     assert!(!load.contains("passphrase"));
-    assert!(run.contains("Raw private key input is required"));
-    assert!(run.contains("raw_private_key: supplied.raw_private_key"));
+    assert!(run.contains("normalizePrivateKey(rawKeyInput.value.trim())"));
+    assert!(run.contains("raw_private_key: rawKey"));
     assert!(!run.contains("if (supplied.mnemonic)"));
     assert!(!run.contains("if (supplied.raw_private_key)"));
+
+    // v1 has no BIP-39 passphrase input. The ceremony must not ask the
+    // operator for an unsupported second secret, and fields for the other
+    // import profile must stay hidden despite label styling.
+    assert!(!html.contains("passphrase-input"));
+    assert!(!html.contains("passphrase-label"));
+    assert!(css.contains("[hidden]{display:none!important}"));
+}
+
+#[test]
+fn bip39_browser_export_uses_the_length_neutral_signer_format() {
+    let html = include_str!("../src/ceremony_assets/index.html");
+
+    // This value is encrypted into GenericCustodyEffect and parsed by Signer.
+    // Imported roots retain their original 12/15/18/21/24-word length, so the
+    // browser must use Signer's length-neutral token instead of the obsolete
+    // 24-word-only spelling.
+    assert!(html.contains("value=\"bip39_mnemonic\""));
+    assert!(!html.contains("bip39_mnemonic24"));
+    assert!(!html.contains("the 24 words that restore this wallet"));
 }
 
 fn digest(byte: &str) -> Digest32 {
@@ -576,6 +681,7 @@ fn petal_sign_request(
             payload: Base64UrlBytes::from_bytes(payload),
         },
         petal_use_claim: Some(claim),
+        system_use_claim: None,
         claim_assurance_evidence: None,
         provenance: ProvenanceSubject::Petal {
             package_hash,
@@ -614,6 +720,7 @@ fn exact_petal_sign_request(
             payload: Base64UrlBytes::from_bytes(payload),
         },
         petal_use_claim: None,
+        system_use_claim: None,
         claim_assurance_evidence: None,
         provenance: ProvenanceSubject::Petal {
             package_hash,
@@ -1410,7 +1517,7 @@ fn try_prepare(
             petal_key_scope: None,
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
-            derivation_request: None,
+            derivation_requests: Vec::new(),
         },
         now_ms,
     )
@@ -1446,7 +1553,7 @@ fn try_register(
             petal_key_scope: None,
             legacy_passkey_migration: None,
             wallet_seed_profile: Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1),
-            derivation_request: None,
+            derivation_requests: Vec::new(),
         },
         now_ms,
     )
@@ -1466,6 +1573,140 @@ fn assert_retry_contract(error: &ProtocolError, retry_after_ms: u64, limit: u64,
         "unexpected retry contract in {}",
         error.message
     );
+}
+
+/// Prepare an approval on the scoped key through the Machine RPC.
+async fn prepare_scoped_approval(
+    broker: &BrokerRpcService,
+    terms: &SealedApprovalTerms,
+    operation_id: OperationId,
+) -> Result<bloom_broker_api::SealedApprovalPrepareResponse, ProtocolError> {
+    match MachineBrokerService::dispatch(
+        broker,
+        MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            operation_id,
+            terms: terms.clone(),
+            canonical_plan_facts_digest: digest("e7"),
+            petal_use_claim: None,
+            system_use_claim: None,
+        }),
+    )
+    .await?
+    {
+        MachineBrokerResponse::SealedApprovalPrepare(prepared) => Ok(prepared),
+        response => panic!("unexpected response: {response:?}"),
+    }
+}
+
+/// Drive a prepared scoped-key approval's browser ceremony to completion
+/// with the owner's authenticator, through the Broker's ceremony router and
+/// the real Signer. Returns the completion status and body so a refusal is
+/// as assertable as a receipt.
+async fn complete_scoped_ceremony(
+    broker: &BrokerRpcService,
+    authenticator: &VirtualAuthenticator,
+    terms: &SealedApprovalTerms,
+    prepared: &bloom_broker_api::SealedApprovalPrepareResponse,
+    operation_id: &OperationId,
+    child_key: &bloom_signer_api::KeyRef,
+    sign_count: u32,
+) -> (StatusCode, Vec<u8>) {
+    let token = url_token(&prepared.ceremony_url);
+    let ceremony_id = broker
+        .ceremony()
+        .public_status(operation_id)
+        .unwrap()
+        .ceremony_id
+        .to_string();
+    let app = broker.ceremony().router();
+    let session_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", &token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let session_status = session_response.status();
+    let session_body = session_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    if session_status != StatusCode::OK {
+        return (session_status, session_body.to_vec());
+    }
+    let session: serde_json::Value = serde_json::from_slice(&session_body).unwrap();
+    let challenge: CeremonyChallenge =
+        serde_json::from_value(session["challenges"][0]["binding"].clone()).unwrap();
+    let contribution: SignerCeremonyContribution =
+        serde_json::from_value(session["signer_contribution"].clone()).unwrap();
+    let assertion = authenticator.assertion(&challenge.canonical_bytes().unwrap(), sign_count);
+    let aad = LocalPrfHpkeAad {
+        ceremony_id: contribution.ceremony_id.clone(),
+        signer_nonce: contribution.signer_nonce.clone(),
+        approval_id: terms.approval_id().unwrap(),
+        approval_digest: terms.approval_digest().unwrap(),
+        review_manifest_digest: prepared.review_manifest_digest.clone(),
+        key_ref: child_key.clone(),
+        allowed_crypto_suites: terms
+            .allowed_crypto_suites
+            .iter()
+            .cloned()
+            .map(crypto_suite_to_signer)
+            .collect(),
+        credential_id: assertion.credential_id.clone(),
+        activation_mode: activation_mode_to_signer(terms.activation_mode.clone()),
+        wallet_revocation_epoch: terms.wallet_revocation_epoch.clone(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let encrypted = seal_hpke(
+        contribution
+            .ephemeral_encryption_public_key
+            .as_ref()
+            .unwrap(),
+        b"bloom-local-prf/v1",
+        &aad,
+        &authenticator.deterministic_prf(),
+    )
+    .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/session/{ceremony_id}/complete"))
+                .header(header::HOST, "localhost:18734")
+                .header(header::ORIGIN, "http://localhost:18734")
+                .header("x-bloom-ceremony-token", &token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "proof": {"kind": "assertion", "assertion": assertion},
+                        "encrypted_input": encrypted,
+                        "public_binding_digest": terms.approval_digest().unwrap()
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, body)
 }
 
 fn url_token(url: &str) -> String {
@@ -1656,7 +1897,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             petal_key_scope: None,
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
-            derivation_request: None,
+            derivation_requests: Vec::new(),
             account_terms: None,
         }),
     )
@@ -2082,7 +2323,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             petal_key_scope: Some(scope.clone()),
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
-            derivation_request: None,
+            derivation_requests: Vec::new(),
             account_terms: None,
         }),
     )
@@ -2255,6 +2496,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             operation_id: approval_operation.clone(),
             terms: approval_terms.clone(),
             canonical_plan_facts_digest: digest("d4"),
+            petal_use_claim: None,
+            system_use_claim: None,
         }),
     )
     .await
@@ -2384,6 +2627,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             operation_id: exact_approval_operation.clone(),
             terms: exact_terms.clone(),
             canonical_plan_facts_digest: digest("e7"),
+            petal_use_claim: None,
+            system_use_claim: None,
         }),
     )
     .await
@@ -2611,6 +2856,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                     operation_id: operation(&format!("{:02x}", 0xc0 + index)),
                     terms: denied_terms,
                     canonical_plan_facts_digest: digest("c9"),
+                    petal_use_claim: None,
+                    system_use_claim: None,
                 }),
             )
             .await
@@ -2859,6 +3106,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         )
         .unwrap(),
     );
+    let replay_authority = restarted_authority.clone();
     let restarted_scoped_broker = BrokerRpcService::new(
         restarted_authority,
         restarted_journal.clone(),
@@ -2907,6 +3155,464 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .await
         .is_err()
     );
+    // Stopping a session revokes every approval bound to its key, resolved
+    // from Broker's own journal rather than a caller's list. A key with no
+    // approvals stops successfully with an empty set: stopping an idle
+    // session must not be an error. The single revoke afterwards is the
+    // idempotent path over an already revoked approval, through Broker and
+    // Signer alike.
+    let mut unknown_key = approval_terms.key_ref.clone();
+    unknown_key.locator = "petal-child-unbound".into();
+    let unbound = MachineBrokerService::dispatch(
+        &restarted_scoped_broker,
+        MachineBrokerRequest::SealedApprovalRevokeForKey(bloom_broker_api::RevokeForKeyRequest {
+            operation_id: operation("dd"),
+            wallet_id: wallet_id.clone(),
+            key_ref: unknown_key,
+            reason: "fixture session stop".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(unbound, MachineBrokerResponse::SealedApprovalRevokeForKey(list) if list.is_empty())
+    );
+    let revoked_for_key = MachineBrokerService::dispatch(
+        &restarted_scoped_broker,
+        MachineBrokerRequest::SealedApprovalRevokeForKey(bloom_broker_api::RevokeForKeyRequest {
+            operation_id: operation("e0"),
+            wallet_id: wallet_id.clone(),
+            key_ref: approval_terms.key_ref.clone(),
+            reason: "fixture session stop".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    let MachineBrokerResponse::SealedApprovalRevokeForKey(statuses) = revoked_for_key else {
+        panic!("revoke_for_key answers with the affected approvals");
+    };
+    assert!(statuses.iter().any(|status| {
+        status.approval_id == approval_terms.approval_id().unwrap()
+            && status.state == bloom_broker_api::ApprovalLifecycleState::Revoked
+    }));
+    let repeated = MachineBrokerService::dispatch(
+        &restarted_scoped_broker,
+        MachineBrokerRequest::SealedApprovalRevokeForKey(bloom_broker_api::RevokeForKeyRequest {
+            operation_id: operation("e0"),
+            wallet_id: wallet_id.clone(),
+            key_ref: approval_terms.key_ref.clone(),
+            reason: "fixture session stop".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        repeated,
+        MachineBrokerResponse::SealedApprovalRevokeForKey(again) if again == statuses
+    ));
+    // The outer operation id owns the whole stop. An approval that reaches
+    // the journal after the first execution enumerated its target set —
+    // the race the durable stop marker closes at the service edge — must
+    // not be swept by the replay: it acts only on the stored targets.
+    let mut raced_terms = approval_terms.clone();
+    raced_terms.request_nonce = RequestNonce::from_bytes([0xed; 16]);
+    let raced_approval_id = raced_terms.approval_id().unwrap();
+    let raced_terms_jcs = serde_jcs::to_string(&raced_terms).unwrap();
+    restarted_journal
+        .create_approval_record(
+            &raced_approval_id,
+            &raced_terms_jcs,
+            &digest("ee"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(
+        replay_authority
+            .approvals_for_key(&wallet_id, &approval_terms.key_ref)
+            .unwrap()
+            .iter()
+            .any(|(id, _)| *id == raced_approval_id),
+        "fixture: the raced approval is journalled on the stopped key"
+    );
+    let replayed = MachineBrokerService::dispatch(
+        &restarted_scoped_broker,
+        MachineBrokerRequest::SealedApprovalRevokeForKey(bloom_broker_api::RevokeForKeyRequest {
+            operation_id: operation("e0"),
+            wallet_id: wallet_id.clone(),
+            key_ref: approval_terms.key_ref.clone(),
+            reason: "fixture session stop".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&replayed, MachineBrokerResponse::SealedApprovalRevokeForKey(again) if again == &statuses),
+        "a replay returns the stored target statuses"
+    );
+    assert_eq!(
+        restarted_journal
+            .approval_state(&raced_approval_id)
+            .unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony),
+        "a replay must not revoke an approval created after the first call"
+    );
+    // Reuse of the outer id for a different stop is refused outright.
+    let mismatched = MachineBrokerService::dispatch(
+        &restarted_scoped_broker,
+        MachineBrokerRequest::SealedApprovalRevokeForKey(bloom_broker_api::RevokeForKeyRequest {
+            operation_id: operation("e0"),
+            wallet_id: wallet_id.clone(),
+            key_ref: approval_terms.key_ref.clone(),
+            reason: "a different reason".into(),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        mismatched.code.as_str(),
+        "OPERATION_ID_CONFLICT",
+        "reusing the outer id with different parameters must be refused"
+    );
+    // A stop is irreversible once its marker is durable, so it is not a
+    // cancellable operation: cancel is refused and the status keeps
+    // reporting the real state.
+    let stop_status = |id: &str| {
+        MachineBrokerService::dispatch(
+            &restarted_scoped_broker,
+            MachineBrokerRequest::OperationStatus(bloom_broker_api::OperationRequest {
+                operation_id: operation(id),
+            }),
+        )
+    };
+    let stop_cancel = |id: &str| {
+        MachineBrokerService::dispatch(
+            &restarted_scoped_broker,
+            MachineBrokerRequest::OperationCancel(bloom_broker_api::OperationRequest {
+                operation_id: operation(id),
+            }),
+        )
+    };
+    assert!(matches!(
+        stop_status("e0").await.unwrap(),
+        MachineBrokerResponse::OperationStatus(status)
+            if status.state == bloom_broker_api::OperationState::Succeeded
+    ));
+    // An execution that crashed, or hit a transient Signer error, after
+    // binding the outer id leaves the stop RECEIVED with its target set
+    // stored. That is the state a retry finds; reproduce it directly.
+    let crashed_stop = operation("e4");
+    let crashed_targets: Vec<(Digest32, OperationId)> = replay_authority
+        .stop_key(
+            &wallet_id,
+            &approval_terms.key_ref,
+            crashed_stop.as_str(),
+            1_000,
+        )
+        .unwrap()
+        .into_iter()
+        .enumerate()
+        .map(|(index, (approval_id, _state))| {
+            (
+                approval_id,
+                OperationId::from_bytes([0xe4 + index as u8; 32]),
+            )
+        })
+        .collect();
+    assert!(
+        crashed_targets
+            .iter()
+            .any(|(id, _)| *id == raced_approval_id),
+        "fixture: the raced approval is in the crashed stop's target set"
+    );
+    // The same parameter binding the service computes: JCS sorts keys, so
+    // the field order here does not matter.
+    let crashed_parameters = Digest32::from_bytes(
+        sha2::Sha256::digest(
+            serde_jcs::to_vec(&serde_json::json!({
+                "wallet_id": wallet_id,
+                "key_ref": approval_terms.key_ref,
+                "reason": "fixture session stop",
+            }))
+            .unwrap(),
+        )
+        .into(),
+    );
+    restarted_journal
+        .begin_key_revocation(&crashed_stop, &crashed_parameters, &crashed_targets)
+        .unwrap();
+    assert!(matches!(
+        stop_status("e4").await.unwrap(),
+        MachineBrokerResponse::OperationStatus(status)
+            if status.state == bloom_broker_api::OperationState::Received
+    ));
+    let cancel_received = stop_cancel("e4").await.unwrap_err();
+    assert_eq!(
+        cancel_received.code.as_str(),
+        "OPERATION_ID_CONFLICT",
+        "a by-key stop awaiting completion cannot be cancelled"
+    );
+    assert!(matches!(
+        stop_status("e4").await.unwrap(),
+        MachineBrokerResponse::OperationStatus(status)
+            if status.state == bloom_broker_api::OperationState::Received
+    ));
+    // The retry takes the stored branch, revokes every stored target, and
+    // must complete the durable operation even though it is not the first
+    // execution.
+    let retried = MachineBrokerService::dispatch(
+        &restarted_scoped_broker,
+        MachineBrokerRequest::SealedApprovalRevokeForKey(bloom_broker_api::RevokeForKeyRequest {
+            operation_id: crashed_stop.clone(),
+            wallet_id: wallet_id.clone(),
+            key_ref: approval_terms.key_ref.clone(),
+            reason: "fixture session stop".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        &retried,
+        MachineBrokerResponse::SealedApprovalRevokeForKey(list)
+            if list.iter().any(|status| status.approval_id == raced_approval_id)
+    ));
+    assert_ne!(
+        restarted_journal
+            .approval_state(&raced_approval_id)
+            .unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony),
+        "the retry revokes the stored targets"
+    );
+    assert!(matches!(
+        stop_status("e4").await.unwrap(),
+        MachineBrokerResponse::OperationStatus(status)
+            if status.state == bloom_broker_api::OperationState::Succeeded
+    ));
+    let cancel_succeeded = stop_cancel("e4").await.unwrap();
+    assert!(matches!(
+        cancel_succeeded,
+        MachineBrokerResponse::OperationCancel(status)
+            if status.state == bloom_broker_api::OperationState::Succeeded
+    ));
+    // Stopping a session ends its automation, not the owner's reach. On the
+    // stopped key, through the real Signer: a reusable Petal approval is
+    // refused at preparation; a fresh owner-reviewed Exact approval
+    // prepares, completes its ceremony and signs the recovery sweep; an
+    // Exact ceremony opened before a stop is fenced by it and cannot
+    // activate afterwards; and recovery stays open after that second stop.
+    let current_epoch = DecimalU64::new(replay_authority.wallet_epoch(&wallet_id).unwrap());
+    let mut reusable_again = approval_terms.clone();
+    reusable_again.request_nonce = RequestNonce::from_bytes([0xe5; 16]);
+    reusable_again.wallet_revocation_epoch = current_epoch.clone();
+    // A short window issued now, inside the still-live scope, so the only
+    // thing that can refuse it is the stop.
+    let reusable_now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    reusable_again.issued_at_ms = DecimalU64::new(reusable_now_ms);
+    reusable_again.not_before_ms = DecimalU64::new(reusable_now_ms);
+    reusable_again.expires_at_ms = DecimalU64::new(reusable_now_ms + 5_000);
+    let reusable_refused =
+        prepare_scoped_approval(&restarted_scoped_broker, &reusable_again, operation("e5"))
+            .await
+            .unwrap_err();
+    assert_eq!(
+        reusable_refused.code,
+        ProtocolErrorCode::ApprovalRevoked,
+        "reusable automation on a stopped key is refused: {reusable_refused:?}"
+    );
+    assert!(
+        reusable_refused.message.contains("stopped"),
+        "{reusable_refused:?}"
+    );
+    // A refused preparation cancels its ceremony, which puts the wallet
+    // into the ceremony cancellation backoff; wait it out before the next
+    // preparation so a rate limit cannot masquerade as a refusal.
+    let cancellation_backoff = || tokio::time::sleep(std::time::Duration::from_millis(2_100));
+    cancellation_backoff().await;
+    let recovery_terms = |payload: &[u8], nonce: u8| {
+        let payload_digest = Digest32::from_bytes(sha2::Sha256::digest(payload).into());
+        let mut terms = approval_terms.clone();
+        terms.selector = ApprovalSelector::Exact {
+            ordered_payload_digests: vec![payload_digest.clone()],
+            ordered_hashes: vec![payload_digest],
+        };
+        terms.limits.max_operations = DecimalU64::new(1);
+        terms.limits.max_signatures = DecimalU64::new(1);
+        terms.request_nonce = RequestNonce::from_bytes([nonce; 16]);
+        terms.wallet_revocation_epoch = current_epoch.clone();
+        // Issued now, for most of the scope's maximum lifetime: the
+        // ceremony's own validity window must fit inside the approval's.
+        let now_ms: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap();
+        terms.issued_at_ms = DecimalU64::new(now_ms);
+        terms.not_before_ms = DecimalU64::new(now_ms);
+        terms.expires_at_ms = DecimalU64::new(now_ms + 50_000);
+        terms
+    };
+    let sweep_payload = b"fixture-recovery-sweep";
+    let sweep = recovery_terms(sweep_payload, 0xe6);
+    let sweep_operation = operation("e6");
+    let sweep_prepared =
+        prepare_scoped_approval(&restarted_scoped_broker, &sweep, sweep_operation.clone())
+            .await
+            .unwrap();
+    let (sweep_status, sweep_body) = complete_scoped_ceremony(
+        &restarted_scoped_broker,
+        &authenticator,
+        &sweep,
+        &sweep_prepared,
+        &sweep_operation,
+        &child_key,
+        6,
+    )
+    .await;
+    assert_eq!(
+        sweep_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&sweep_body)
+    );
+    let sweep_receipt: SignerActivationReceipt = serde_json::from_slice(&sweep_body).unwrap();
+    assert_eq!(sweep_receipt.approval_id, sweep.approval_id().unwrap());
+    let sweep_sign = exact_petal_sign_request(
+        &sweep,
+        operation("e7"),
+        petal_package.clone(),
+        petal_route,
+        sweep_payload,
+    );
+    assert!(matches!(
+        MachineBrokerService::dispatch(
+            &restarted_scoped_broker,
+            MachineBrokerRequest::SigningSign(sweep_sign),
+        )
+        .await
+        .unwrap(),
+        MachineBrokerResponse::SigningSign(_)
+    ));
+    // A second Exact ceremony is opened and left pending, then the key is
+    // stopped again: the stop revokes the active recovery approval and
+    // fences the pending one, and the owner's proof for the pending one
+    // no longer activates anything.
+    let fenced = recovery_terms(b"fixture-pre-stop-sweep", 0xe8);
+    let fenced_operation = operation("e8");
+    let fenced_prepared =
+        prepare_scoped_approval(&restarted_scoped_broker, &fenced, fenced_operation.clone())
+            .await
+            .unwrap();
+    let second_stop = MachineBrokerService::dispatch(
+        &restarted_scoped_broker,
+        MachineBrokerRequest::SealedApprovalRevokeForKey(bloom_broker_api::RevokeForKeyRequest {
+            operation_id: operation("e9"),
+            wallet_id: wallet_id.clone(),
+            key_ref: approval_terms.key_ref.clone(),
+            reason: "fixture session stop again".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    let MachineBrokerResponse::SealedApprovalRevokeForKey(second_statuses) = second_stop else {
+        panic!("revoke_for_key answers with the affected approvals");
+    };
+    assert!(second_statuses.iter().any(|status| {
+        status.approval_id == sweep.approval_id().unwrap()
+            && status.state == bloom_broker_api::ApprovalLifecycleState::Revoked
+    }));
+    assert_eq!(
+        restarted_journal
+            .approval_state(&fenced.approval_id().unwrap())
+            .unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::Failed),
+        "the stop fences the pending Exact ceremony"
+    );
+    let (fenced_status, fenced_body) = complete_scoped_ceremony(
+        &restarted_scoped_broker,
+        &authenticator,
+        &fenced,
+        &fenced_prepared,
+        &fenced_operation,
+        &child_key,
+        7,
+    )
+    .await;
+    assert_ne!(
+        fenced_status,
+        StatusCode::OK,
+        "a ceremony opened before the stop must not activate after it: {}",
+        String::from_utf8_lossy(&fenced_body)
+    );
+    assert_ne!(
+        restarted_journal
+            .approval_state(&fenced.approval_id().unwrap())
+            .unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::Active)
+    );
+    let revoked_sweep_sign = exact_petal_sign_request(
+        &sweep,
+        operation("ea"),
+        petal_package.clone(),
+        petal_route,
+        sweep_payload,
+    );
+    assert!(
+        MachineBrokerService::dispatch(
+            &restarted_scoped_broker,
+            MachineBrokerRequest::SigningSign(revoked_sweep_sign),
+        )
+        .await
+        .is_err(),
+        "the stop revoked the earlier recovery approval"
+    );
+    cancellation_backoff().await;
+    // Recovery is still open after the second stop: a fresh Exact approval
+    // completes and signs.
+    let again_payload = b"fixture-recovery-sweep-again";
+    let again = recovery_terms(again_payload, 0xeb);
+    let again_operation = operation("eb");
+    let again_prepared =
+        prepare_scoped_approval(&restarted_scoped_broker, &again, again_operation.clone())
+            .await
+            .unwrap();
+    let (again_status, again_body) = complete_scoped_ceremony(
+        &restarted_scoped_broker,
+        &authenticator,
+        &again,
+        &again_prepared,
+        &again_operation,
+        &child_key,
+        8,
+    )
+    .await;
+    assert_eq!(
+        again_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&again_body)
+    );
+    assert!(matches!(
+        MachineBrokerService::dispatch(
+            &restarted_scoped_broker,
+            MachineBrokerRequest::SigningSign(exact_petal_sign_request(
+                &again,
+                operation("ec"),
+                petal_package.clone(),
+                petal_route,
+                again_payload,
+            )),
+        )
+        .await
+        .unwrap(),
+        MachineBrokerResponse::SigningSign(_)
+    ));
     let revoked = MachineBrokerService::dispatch(
         &restarted_scoped_broker,
         MachineBrokerRequest::SealedApprovalRevoke(RevokeRequest {
@@ -2959,6 +3665,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                 operation_id: operation("dc"),
                 terms: expired_terms,
                 canonical_plan_facts_digest: digest("dd"),
+                petal_use_claim: None,
+                system_use_claim: None,
             }),
         )
         .await
@@ -3164,7 +3872,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
-                derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             1_001,
         )
@@ -3184,7 +3892,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
                     wallet_seed_profile: None,
-                    derivation_request: None,
+                    derivation_requests: Vec::new(),
                 },
                 1_001,
             )
@@ -3215,7 +3923,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
                     wallet_seed_profile: None,
-                    derivation_request: None,
+                    derivation_requests: Vec::new(),
                 },
                 1_101,
             )
@@ -3260,7 +3968,7 @@ async fn legacy_passkey_prepare_renders_only_digest_bound_public_migration_terms
                 petal_key_scope: None,
                 legacy_passkey_migration: Some(migration),
                 wallet_seed_profile: None,
-                derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             now_ms,
         )
@@ -3353,6 +4061,76 @@ async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
 }
 
 #[tokio::test]
+async fn review_plan_formats_known_asset_base_units_without_hiding_raw_authority_amount() {
+    let signer = Arc::new(MockSigner::new());
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        signer,
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[32; 32]),
+    );
+    let claim = PetalUseClaim {
+        package_hash: digest("91"),
+        route: "/mainnet/exchange/wallet/usd_send.json".into(),
+        operation_class: Token::new("hyperliquid.usd_send").unwrap(),
+        crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+        payload_digest: digest("92"),
+        ordered_hashes: vec![digest("93")],
+        declared_debits: vec![DeclaredDebit {
+            asset: AssetId {
+                chain: Token::new("hyperliquid").unwrap(),
+                asset: "usdc".into(),
+            },
+            amount: DecimalU256::parse("10000").unwrap(),
+        }],
+        declared_destinations: vec![DeclaredDestination {
+            chain: Token::new("hyperliquid").unwrap(),
+            destination: "0xe2b000d7650543f5df13183c089e02d6d8b2145c".into(),
+        }],
+        declared_fee: DeclaredFee::None,
+        nonce: RequestNonce::from_bytes([94; 16]),
+        claim_assurance: ClaimAssurance::MachineAsserted,
+    };
+    let response = broker
+        .prepare_approval(
+            approval_request(),
+            ReviewManifestContext {
+                petal_use_claim: Some(claim),
+                claim_assurance: Some(ClaimAssurance::MachineAsserted),
+                ..ReviewManifestContext::default()
+            },
+            now_ms,
+        )
+        .unwrap();
+    let session = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let projection: serde_json::Value =
+        serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let plan = projection["review_manifest"]["canonical_plan"]
+        .as_str()
+        .unwrap();
+    let plan: serde_json::Value = serde_json::from_str(plan).unwrap();
+    assert_eq!(plan["asset_amounts"][0]["display"], "0.01 USDC");
+    assert_eq!(plan["asset_amounts"][0]["base_units"], "10000");
+    assert_eq!(plan["asset_amounts"][0]["decimals"], 6);
+}
+
+#[tokio::test]
 async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() {
     let signer = Arc::new(MockSigner::new());
     let broker = CeremonyBroker::new(signer);
@@ -3381,7 +4159,7 @@ async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() 
         petal_key_scope: Some(scope.clone()),
         legacy_passkey_migration: None,
         wallet_seed_profile: None,
-        derivation_request: None,
+        derivation_requests: Vec::new(),
     };
     let now_ms: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3795,7 +4573,7 @@ fn ac18_forced_ceremony_audit_write_failure_rolls_back_session() {
         petal_key_scope: None,
         legacy_passkey_migration: None,
         wallet_seed_profile: None,
-        derivation_request: None,
+        derivation_requests: Vec::new(),
     };
 
     fail.store(true, Ordering::SeqCst);
@@ -3850,7 +4628,7 @@ fn ac18_populated_ceremony_migration_is_atomic_idempotent_and_retains_source() {
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
-                derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             50_000,
         )
@@ -4056,7 +4834,7 @@ fn ac18_ceremony_status_survives_latched_audit_tamper_while_new_sessions_fail() 
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
                     wallet_seed_profile: None,
-                    derivation_request: None,
+                    derivation_requests: Vec::new(),
                 },
                 41_001,
             )
@@ -4107,7 +4885,7 @@ fn restart_expires_nonterminal_session_and_persists_only_token_hash() {
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
-                derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             50_001,
         )
@@ -4507,7 +5285,7 @@ fn zero_effective_time_fails_closed_before_anonymous_creation_quota() {
                     wallet_seed_profile: Some(
                         bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1,
                     ),
-                    derivation_request: None,
+                    derivation_requests: Vec::new(),
                 },
                 1 + u64::from(index),
             )
@@ -4528,7 +5306,7 @@ fn zero_effective_time_fails_closed_before_anonymous_creation_quota() {
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1),
-                derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             0,
         )
@@ -4567,7 +5345,7 @@ fn cancellation_backoff_reports_remaining_cooldown_and_resets_after_expiry() {
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
-                derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             10_001,
         )
@@ -4622,7 +5400,7 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
                     wallet_seed_profile: Some(
                         bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1,
                     ),
-                    derivation_request: None,
+                    derivation_requests: Vec::new(),
                 },
                 100_000 + u64::from(index),
             )
@@ -4647,7 +5425,7 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
                     wallet_seed_profile: Some(
                         bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1,
                     ),
-                    derivation_request: None,
+                    derivation_requests: Vec::new(),
                 },
                 100_010,
             )
@@ -4679,7 +5457,7 @@ async fn bip39_import_session_projects_the_authoritative_signer_profile() {
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1),
-                derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             now_ms,
         )
@@ -4742,7 +5520,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1),
-                derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             now_ms,
         )
@@ -4852,7 +5630,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
-                derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             now_ms + 1_000,
         )
@@ -4911,9 +5689,17 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
     }
     .canonical_bytes()
     .unwrap();
+    let export_html = include_str!("../src/ceremony_assets/index.html");
+    let export_format = export_html
+        .split_once("name=\"export-format\" value=\"")
+        .expect("the shipped browser must offer an export format")
+        .1
+        .split_once('"')
+        .expect("the shipped export format must be quoted")
+        .0;
     let export_input = serde_jcs::to_vec(&serde_json::json!({
         "credential_prf": Base64UrlBytes::from_bytes(&prf),
-        "effect": {"kind": "wallet_export"}
+        "effect": {"kind": "wallet_export", "format": export_format}
     }))
     .unwrap();
     let export_envelope = seal_hpke(
@@ -4985,9 +5771,9 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
             &output_aad,
         )
         .unwrap();
-    let export_json: serde_json::Value =
-        serde_json::from_slice(plaintext.expose_to_backend()).unwrap();
-    assert_eq!(export_json["credentials"].as_array().unwrap().len(), 1);
+    let exported_mnemonic = std::str::from_utf8(plaintext.expose_to_backend()).unwrap();
+    assert_eq!(export_format, "bip39_mnemonic");
+    assert_eq!(exported_mnemonic.split_whitespace().count(), 24);
     let acknowledged = export_app
         .clone()
         .oneshot(

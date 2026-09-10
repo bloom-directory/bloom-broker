@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Base64UrlBytes, BootEpoch, CeremonyKind, CustodyPrepareRequest, CustodyPrepareResponse,
     CustodyResult, DecimalU64, Digest32, HelloChallenge, KeyRef, MachineSignRequest, OperationId,
-    PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
+    PetalUseClaim, PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
     PolicyUpdateRequest, ProtocolError, RevocationState, SealedApprovalPrepareResponse,
-    SealedApprovalTerms, ServiceFuture, SignedPolicySnapshot, SigningResult, Token,
+    SealedApprovalTerms, ServiceFuture, SignedPolicySnapshot, SigningResult, SystemUseClaim, Token,
     WalletAccountsPublic,
 };
 
@@ -96,6 +96,10 @@ pub struct ApprovalPrepareRequest {
     pub operation_id: OperationId,
     pub terms: SealedApprovalTerms,
     pub canonical_plan_facts_digest: Digest32,
+    #[serde(default)]
+    pub petal_use_claim: Option<PetalUseClaim>,
+    #[serde(default)]
+    pub system_use_claim: Option<SystemUseClaim>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -112,6 +116,19 @@ pub struct RevokeRequest {
     pub operation_id: OperationId,
     pub approval_id: Digest32,
     pub wallet_id: Token,
+    pub reason: String,
+}
+
+/// Revoke every Sealed Approval whose terms bind one key. Broker resolves the
+/// set from its own journal, so a caller whose record of approval ids is stale
+/// still stops all of the key's automation. Idempotent: approvals already
+/// revoked or failed are reported as they stand.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevokeForKeyRequest {
+    pub operation_id: OperationId,
+    pub wallet_id: Token,
+    pub key_ref: KeyRef,
     pub reason: String,
 }
 
@@ -324,6 +341,8 @@ pub enum MachineBrokerRequest {
     SealedApprovalRevoke(RevokeRequest),
     #[serde(rename = "sealed_approval.revoke_all")]
     SealedApprovalRevokeAll(WalletOperationRequest),
+    #[serde(rename = "sealed_approval.revoke_for_key")]
+    SealedApprovalRevokeForKey(RevokeForKeyRequest),
     #[serde(rename = "sealed_approval.renew")]
     SealedApprovalRenew(ApprovalRenewRequest),
     #[serde(rename = "signing.sign")]
@@ -413,6 +432,8 @@ pub enum MachineBrokerResponse {
     SealedApprovalRevoke(ApprovalPublicStatus),
     #[serde(rename = "sealed_approval.revoke_all")]
     SealedApprovalRevokeAll(RevocationState),
+    #[serde(rename = "sealed_approval.revoke_for_key")]
+    SealedApprovalRevokeForKey(Vec<ApprovalPublicStatus>),
     #[serde(rename = "sealed_approval.renew")]
     SealedApprovalRenew(SealedApprovalPrepareResponse),
     #[serde(rename = "signing.sign")]
@@ -512,6 +533,7 @@ impl crate::TypedRequestMethod for MachineBrokerRequest {
             Request::SealedApprovalRenew(request) => Some(request.operation_id.clone()),
             Request::SealedApprovalRevoke(request) => Some(request.operation_id.clone()),
             Request::SealedApprovalRevokeAll(request) => Some(request.operation_id.clone()),
+            Request::SealedApprovalRevokeForKey(request) => Some(request.operation_id.clone()),
             Request::SigningSign(request) | Request::SigningSignBatch(request) => {
                 Some(request.operation_id.clone())
             }
