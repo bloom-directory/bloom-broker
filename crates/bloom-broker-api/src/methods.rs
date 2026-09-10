@@ -18,7 +18,7 @@ macro_rules! method_enum {
 
 method_enum!(MachineBrokerMethod {
     SystemHello => "system.hello", BrokerReadiness => "broker.readiness", BrokerCapabilities => "broker.capabilities", ActionValidate => "action.validate",
-    SealedApprovalPrepare => "sealed_approval.prepare", SealedApprovalStatus => "sealed_approval.status", SealedApprovalList => "sealed_approval.list", SealedApprovalLimitState => "sealed_approval.limit_state", SealedApprovalRevoke => "sealed_approval.revoke", SealedApprovalRevokeAll => "sealed_approval.revoke_all", SealedApprovalRenew => "sealed_approval.renew",
+    SealedApprovalPrepare => "sealed_approval.prepare", SealedApprovalStatus => "sealed_approval.status", SealedApprovalList => "sealed_approval.list", SealedApprovalLimitState => "sealed_approval.limit_state", SealedApprovalRevoke => "sealed_approval.revoke", SealedApprovalRevokeAll => "sealed_approval.revoke_all", SealedApprovalRevokeForKey => "sealed_approval.revoke_for_key", SealedApprovalRenew => "sealed_approval.renew",
     SigningSign => "signing.sign", SigningSignBatch => "signing.sign_batch", OperationStatus => "operation.status", OperationCancel => "operation.cancel",
     PolicyRead => "policy.read", PolicyValidateUpdate => "policy.validate_update", PolicyCommitUpdate => "policy.commit_update",
     WalletListPublic => "wallet.list_public", WalletGetPublic => "wallet.get_public", WalletRegistrationPrepare => "wallet.registration_prepare", WalletUnlockPrepare => "wallet.unlock_prepare", WalletImportPrepare => "wallet.import_prepare", WalletExportPrepare => "wallet.export_prepare", WalletDeletePrepare => "wallet.delete_prepare", WalletAccounts => "wallet.accounts",
