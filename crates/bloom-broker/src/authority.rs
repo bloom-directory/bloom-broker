@@ -1178,7 +1178,8 @@ impl BrokerAuthority {
                 "account custody completed without Broker-committed terms",
             ));
         };
-        let terms = decode_stored_account_terms(&terms_jcs)?;
+        let terms: bloom_broker_api::AccountTerms =
+            serde_json::from_str(&terms_jcs).map_err(storage)?;
         terms
             .validate()
             .map_err(|error| denied("ACCOUNT_TERMS_INVALID", error.to_string()))?;
@@ -3238,35 +3239,6 @@ fn petal_payload_batch_digest(payloads: &[Vec<u8>]) -> Digest32 {
 // path so subsequent starts are idempotent. The legacy file is intentionally
 // left untouched as a rollback artifact; all subsequent reads and writes use
 // the consolidated database.
-/// Decode account terms as this Broker committed them. Rows written before
-/// allocation went list-only carry it as a singular `derivation`; the wire
-/// shape is list-only now, so fold that one request into `derivations` and decode the
-/// current struct. The stored `terms_digest` is left as recorded: it is the
-/// digest of the JCS the peer sent, and adoption compares against that.
-fn decode_stored_account_terms(
-    terms_jcs: &str,
-) -> Result<bloom_broker_api::AccountTerms, AuthorityError> {
-    let mut value: serde_json::Value = serde_json::from_str(terms_jcs).map_err(storage)?;
-    if let Some(object) = value.as_object_mut() {
-        if let Some(single) = object.remove("derivation") {
-            if !single.is_null() {
-                let list = object
-                    .entry("derivations")
-                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-                match list.as_array_mut() {
-                    Some(list) if list.is_empty() => list.push(single),
-                    _ => {
-                        return Err(storage(
-                            "stored account terms carry both a singular and a list derivation",
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    serde_json::from_value(value).map_err(storage)
-}
-
 fn migrate_legacy_authority(
     target: &mut Connection,
     legacy: &Connection,
@@ -3920,72 +3892,6 @@ fn denied(code: &'static str, message: impl Into<String>) -> AuthorityError {
 
 fn storage(error: impl ToString) -> AuthorityError {
     AuthorityError::Storage(error.to_string())
-}
-
-#[cfg(test)]
-mod stored_account_terms_tests {
-    use super::*;
-    use bloom_broker_api::{
-        ACCOUNT_TERMS_SCHEMA, AccountTerms, DecimalU64, DerivationProfile, DerivedAccountRequest,
-        OperationId, Token, WalletSeedProfile,
-    };
-
-    fn list_form() -> AccountTerms {
-        let profile = DerivationProfile::Bip44EvmSecp256k1V1;
-        AccountTerms {
-            schema: Token::new(ACCOUNT_TERMS_SCHEMA).unwrap(),
-            wallet_id: Token::new("quiet-lilac").unwrap(),
-            seed_profile: WalletSeedProfile::Bip39MulticurveV1,
-            derivations: vec![DerivedAccountRequest {
-                derivation_profile: profile,
-                requested_role: Token::new("primary-evm").unwrap(),
-                account: None,
-            }],
-            retire_key_fingerprint: None,
-            path_template: profile.path_template().to_owned(),
-            key_spec: profile.key_spec(),
-            allowed_crypto_suites: profile.frozen_crypto_suites().to_vec(),
-            policy_version: DecimalU64::new(1),
-            revocation_epoch: DecimalU64::new(1),
-            replay_id: OperationId::from_bytes([4; 32]),
-            expires_at_ms: DecimalU64::new(60_000),
-            audit_purpose: Token::new("allocate-derived-account").unwrap(),
-        }
-    }
-
-    /// A row committed by a Broker before allocation went list-only carries
-    /// it as a singular `derivation`. It must still load after an upgrade, as
-    /// the same terms in list form.
-    #[test]
-    fn a_singular_row_from_before_list_only_terms_decodes_as_the_list_form() {
-        let expected = list_form();
-        let mut stored: serde_json::Value = serde_json::to_value(&expected).unwrap();
-        let object = stored.as_object_mut().unwrap();
-        let single = object.remove("derivations").unwrap()[0].clone();
-        object.insert("derivation".into(), single);
-        let stored = serde_jcs::to_string(&stored).unwrap();
-        assert!(
-            stored.contains("\"derivation\":"),
-            "fixture is the old shape"
-        );
-        assert!(
-            !stored.contains("\"derivations\""),
-            "fixture is the old shape"
-        );
-
-        assert_eq!(decode_stored_account_terms(&stored).unwrap(), expected);
-        let current = serde_jcs::to_string(&expected).unwrap();
-        assert_eq!(decode_stored_account_terms(&current).unwrap(), expected);
-    }
-
-    #[test]
-    fn a_row_carrying_both_shapes_is_refused() {
-        let mut stored: serde_json::Value = serde_json::to_value(list_form()).unwrap();
-        let single = stored["derivations"][0].clone();
-        stored["derivation"] = single;
-        let stored = serde_jcs::to_string(&stored).unwrap();
-        assert!(decode_stored_account_terms(&stored).is_err());
-    }
 }
 
 #[cfg(test)]
