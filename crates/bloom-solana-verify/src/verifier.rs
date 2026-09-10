@@ -42,7 +42,6 @@ pub enum RejectionReason {
     /// More than one required signer (multisigner/partial signing form).
     MultipleSigners { count: u8 },
     /// A signer other than the fee payer was marked read-only (ambiguous role).
-    ReadonlySigner { count: u8 },
     /// The account layout is not exactly [fee_payer, destination, system_program].
     UnexpectedAccountLayout { account_count: usize },
     /// The fee payer is not the selected Ed25519 child public key.
@@ -125,12 +124,6 @@ pub fn verify_native_transfer(
             count: message.header.num_required_signatures,
         });
     }
-    if message.header.num_readonly_signed_accounts != 0 {
-        return Err(RejectionReason::ReadonlySigner {
-            count: message.header.num_readonly_signed_accounts,
-        });
-    }
-
     // Canonical account layout: [fee_payer, destination, system_program].
     if message.account_keys.len() != 3 {
         return Err(RejectionReason::UnexpectedAccountLayout {
