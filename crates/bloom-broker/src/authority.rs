@@ -2004,13 +2004,109 @@ impl BrokerAuthority {
         Ok(bound)
     }
 
-    /// Durably stop a key. The marker is written and the bound approval set
-    /// enumerated under one hold of the authorization barrier, so a prepare
-    /// racing this stop either completes before the marker is durable — and
-    /// is inside the returned set — or observes the marker and is refused;
-    /// nothing on the key can be prepared or activated afterwards. A
-    /// stopped key is a dead key: session stop revokes every approval on
-    /// it, so the marker is never cleared.
+    /// Admit a stop while excluding approval preparation/activation. Identity,
+    /// targets, the stop marker and pending-ceremony fences commit atomically.
+    /// Replays return the original targets without stopping fresh Exact recovery.
+    pub fn admit_key_revocation(
+        &self,
+        request: &bloom_broker_api::RevokeForKeyRequest,
+        stopped_at_ms: u64,
+    ) -> Result<(Vec<(Digest32, OperationId)>, bool), AuthorityError> {
+        let _barrier = self.lock_authorization_barrier()?;
+        let parameters_digest = Digest32::from_bytes(
+            Sha256::digest(
+                serde_jcs::to_vec(&serde_json::json!({
+                    "wallet_id": request.wallet_id,
+                    "key_ref": request.key_ref,
+                    "reason": request.reason,
+                }))
+                .map_err(storage)?,
+            )
+            .into(),
+        );
+        if let Some(targets) = self
+            .journal
+            .key_revocation_targets(&request.operation_id, &parameters_digest)?
+        {
+            return Ok((targets, false));
+        }
+        let bound = self.approvals_for_key(&request.wallet_id, &request.key_ref)?;
+        let mut targets: Vec<_> = bound
+            .iter()
+            .map(|(id, _)| {
+                let mut hasher = Sha256::new();
+                hasher.update(b"bloom.broker.key-revocation.v1");
+                hasher.update(request.operation_id.to_bytes());
+                hasher.update(id.to_bytes());
+                (
+                    id.clone(),
+                    OperationId::from_bytes(hasher.finalize().into()),
+                )
+            })
+            .collect();
+        targets.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        let key_ref_jcs = serde_jcs::to_string(&request.key_ref).map_err(storage)?;
+        let stopped_at = i64::try_from(stopped_at_ms).map_err(storage)?;
+        let first = self.journal.begin_key_revocation_with_effects(
+            &request.operation_id,
+            &parameters_digest,
+            &targets,
+            |transaction| {
+                transaction.execute(
+                    "INSERT INTO key_stops(wallet_id, key_ref, operation_id, stopped_at_ms)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(wallet_id, key_ref) DO UPDATE SET
+                     operation_id=excluded.operation_id, stopped_at_ms=excluded.stopped_at_ms",
+                    params![
+                        request.wallet_id.as_str(),
+                        key_ref_jcs,
+                        request.operation_id.as_str(),
+                        stopped_at
+                    ],
+                )?;
+                self.journal.append_external_audit(
+                    transaction,
+                    "approval.key_stopped",
+                    &serde_json::json!({"wallet_id": request.wallet_id,
+                        "key_ref_jcs": key_ref_jcs, "operation_id": request.operation_id,
+                        "stopped_at_ms": stopped_at_ms}),
+                )?;
+                for (id, _) in &bound {
+                    let state: String = transaction.query_row(
+                        "SELECT state FROM approvals WHERE approval_id = ?1",
+                        [id.as_str()],
+                        |row| row.get(0),
+                    )?;
+                    if state == "PREPARED" || state == "AWAITING_CEREMONY" {
+                        transaction.execute(
+                            "UPDATE approvals SET state = 'FAILED' WHERE approval_id = ?1",
+                            [id.as_str()],
+                        )?;
+                        self.journal.append_external_audit(
+                            transaction,
+                            "approval.transition",
+                            &serde_json::json!({"approval_id": id, "from": state, "to": "FAILED"}),
+                        )?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        if first {
+            Ok((targets, true))
+        } else {
+            Ok((
+                self.journal
+                    .key_revocation_targets(&request.operation_id, &parameters_digest)?
+                    .ok_or_else(|| storage("admitted key stop is missing"))?,
+                false,
+            ))
+        }
+    }
+
+    /// Apply a local stop without RPC operation admission. Production by-key
+    /// requests use `admit_key_revocation` to bind their identity atomically.
+    /// Reusable automation stays stopped; fresh Exact recovery remains allowed.
     pub fn stop_key(
         &self,
         wallet_id: &Token,
