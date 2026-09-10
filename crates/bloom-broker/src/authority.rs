@@ -2046,7 +2046,8 @@ impl BrokerAuthority {
             .collect();
         targets.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         let key_ref_jcs = serde_jcs::to_string(&request.key_ref).map_err(storage)?;
-        let stopped_at = i64::try_from(stopped_at_ms).map_err(storage)?;
+        let stopped_at = i64::try_from(stopped_at_ms)
+            .map_err(|_| storage("key stop timestamp is out of range"))?;
         let first = self.journal.begin_key_revocation_with_effects(
             &request.operation_id,
             &parameters_digest,
