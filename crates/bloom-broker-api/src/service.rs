@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Base64UrlBytes, BootEpoch, CeremonyKind, CustodyPrepareRequest, CustodyPrepareResponse,
     CustodyResult, DecimalU64, Digest32, HelloChallenge, KeyRef, MachineSignRequest, OperationId,
-    PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
+    PetalUseClaim, PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
     PolicyUpdateRequest, ProtocolError, RevocationState, SealedApprovalPrepareResponse,
-    SealedApprovalTerms, ServiceFuture, SignedPolicySnapshot, SigningResult, Token,
+    SealedApprovalTerms, ServiceFuture, SignedPolicySnapshot, SigningResult, SystemUseClaim, Token,
     WalletAccountsPublic,
 };
 
@@ -100,6 +100,10 @@ pub struct ApprovalPrepareRequest {
     /// and decodes these bytes itself before constructing the owner review.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evm_review_payloads: Vec<Base64UrlBytes>,
+    #[serde(default)]
+    pub petal_use_claim: Option<PetalUseClaim>,
+    #[serde(default)]
+    pub system_use_claim: Option<SystemUseClaim>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

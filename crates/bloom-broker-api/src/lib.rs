@@ -13,6 +13,7 @@ mod provenance;
 mod revocation;
 mod service;
 mod signing;
+pub mod solana_vectors;
 mod validation;
 mod wallet_account;
 
@@ -47,8 +48,9 @@ pub const BROKER_API_MAJOR: u16 = 1;
 /// added under 1.3 — a 1.3 peer handed one would reject the whole error
 /// instead of reading the retry hint inside it.
 pub const RATE_LIMIT_DETAILS_MINOR: u16 = 4;
-/// Minor 5 introduced the BIP-39 account custody surface. Minor 6 is the first
-/// minor supporting full native EVM preimages during exact approval review.
+/// Minor 5 introduced the BIP-39 account custody surface. Minor 6 adds the
+/// native system assurance claims and is the first minor supporting full
+/// native EVM preimages during exact approval review.
 pub const EVM_REVIEW_PAYLOADS_MINOR: u16 = 6;
 /// The negotiated range moves as a unit, so there is no accepted minor that
 /// predates any field the Broker may emit. Older peers are refused at the

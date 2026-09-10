@@ -204,6 +204,7 @@ fn machine_sign() -> MachineSignRequest {
             payload: Base64UrlBytes::from_bytes(&[36]),
         },
         petal_use_claim: None,
+        system_use_claim: None,
         claim_assurance_evidence: None,
         provenance: ProvenanceSubject::Cli {
             client_id: token("cli"),
@@ -265,6 +266,8 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
             operation_id: operation(54),
             terms: approval_terms(),
             canonical_plan_facts_digest: digest(59),
+            petal_use_claim: None,
+            system_use_claim: None,
         }),
         MachineBrokerRequest::SealedApprovalStatus(id.clone()),
         MachineBrokerRequest::SealedApprovalList(wallet.clone()),
@@ -527,13 +530,14 @@ where
 
 #[test]
 fn every_machine_broker_variant_matches_frozen_v1_frames() {
-    // Protocol 1.6 changes the hello/capability frames; empty review payloads
-    // remain omitted from the pre-existing approval request vectors.
+    // Protocol 1.6 adds the native assurance claims and the EVM review
+    // payload field to the request frames; empty review payloads remain
+    // omitted from the pre-existing approval request vectors.
     assert_eq!(MachineBrokerMethod::ALL.len(), 42);
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "2ade846a1f3f02d75e75dc89a49bda80aab5da859e8beefd6c13b2b29c9090f5",
+        "bcb648dce4e11c5f38bc8555fd325299a2bdeb0f256345696ecb76b6c9d15030",
     );
     assert_wire_digest(
         "machine responses",

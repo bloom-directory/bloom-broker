@@ -302,6 +302,18 @@ fn persist_checkpoint_diagnosed(
         }
         Err(failure) => {
             let decision = &failure.decision;
+            // Broker heads are sampled before dispatch while Machine RPCs can
+            // commit concurrently. A valid older Broker head can therefore be
+            // ordinary checkpoint reordering. Signer responses, by contrast,
+            // pass through this worker serially and must fail closed.
+            if matches!(
+                decision.outcome,
+                CheckpointDecisionOutcome::SequenceRollback
+            ) && edge != "broker_signer_response"
+            {
+                log_checkpoint_decision(decision, method, operation_id, edge, false);
+                return Ok(());
+            }
             journal.latch_checkpoint_degradation(
                 checkpoint_outcome(decision.outcome),
                 decision.attempted.sequence,
@@ -588,6 +600,8 @@ mod tests {
 
     struct FailingCheckpointSink;
 
+    struct RollbackCheckpointSink;
+
     #[derive(Default)]
     struct RetainingCheckpointSink(Mutex<BTreeMap<Token, SignedJournalHead>>);
 
@@ -668,6 +682,15 @@ mod tests {
         }
     }
 
+    impl CheckpointSink for RollbackCheckpointSink {
+        fn append_peer_head(
+            &self,
+            _peer_head: &SignedJournalHead,
+        ) -> Result<AppendOutcome, CheckpointError> {
+            Err(CheckpointError::SequenceRollback)
+        }
+    }
+
     fn peer_head() -> SignedJournalHead {
         SignedJournalHead {
             service_id: Token::new("bloom-signer").unwrap(),
@@ -706,6 +729,38 @@ mod tests {
             .code,
             ProtocolErrorCode::ServiceUnavailable
         );
+    }
+
+    #[test]
+    fn signer_sequence_rollback_latches_degradation_and_rejects_mutation() {
+        let journal = BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).unwrap();
+        let error = persist_response_checkpoint(
+            &journal,
+            &RollbackCheckpointSink,
+            &Token::new("signer.sign").unwrap(),
+            Some("11"),
+            &peer_head(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+        assert!(journal.audit_degraded());
+    }
+
+    #[test]
+    fn broker_pre_dispatch_sequence_rollback_does_not_degrade() {
+        let journal = BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).unwrap();
+        let result = persist_checkpoint_diagnosed(
+            &journal,
+            &RollbackCheckpointSink,
+            Some(&Token::new("signer.sign").unwrap()),
+            Some("11"),
+            &peer_head(),
+            "broker_signer_pre_dispatch",
+        );
+
+        assert!(result.is_ok());
+        assert!(!journal.audit_degraded());
     }
 
     #[test]
