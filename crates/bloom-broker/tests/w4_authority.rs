@@ -3265,3 +3265,133 @@ fn ac_ceremony_completion_racing_by_key_revocation_ends_unusable() {
             .is_err()
     );
 }
+
+#[test]
+fn concurrent_key_stops_bind_identity_before_any_authority_effect() {
+    let directory = tempfile::tempdir().unwrap();
+    let harness = Harness::open_at(directory.path());
+    let (_, _, child) = scoped_petal_child_on(&harness);
+    let mut other = child.clone();
+    other.public_key_fingerprint = digest(99);
+    let requests = [child, other].map(|key_ref| bloom_broker_api::RevokeForKeyRequest {
+        operation_id: operation(71),
+        wallet_id: harness.wallet.clone(),
+        key_ref,
+        reason: "stop session".into(),
+    });
+    let start = Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                let start = &start;
+                let authority = &harness.authority;
+                scope.spawn(move || {
+                    start.wait();
+                    authority.admit_key_revocation(request, 2_000)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let winner = results.iter().position(|result| result.is_ok()).unwrap();
+    assert!(
+        results[1 - winner]
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("OPERATION_ID_CONFLICT")
+    );
+    let connection = rusqlite::Connection::open(directory.path().join("journal.sqlite")).unwrap();
+    let stopped: Vec<String> = connection
+        .prepare("SELECT key_ref FROM key_stops")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        stopped,
+        vec![serde_jcs::to_string(&requests[winner].key_ref).unwrap()]
+    );
+}
+
+#[test]
+fn key_stop_admission_rolls_back_and_replay_preserves_fresh_exact() {
+    let directory = tempfile::tempdir().unwrap();
+    let harness = Harness::open_at(directory.path());
+    let (provenance, _, child) = scoped_petal_child_on(&harness);
+    let pending = scoped_exact_terms(&harness, &provenance, &child, b"pending", 71);
+    let pending_id = harness
+        .authority
+        .prepare_approval(&pending, &digest(7))
+        .unwrap();
+    let request = bloom_broker_api::RevokeForKeyRequest {
+        operation_id: operation(72),
+        wallet_id: harness.wallet.clone(),
+        key_ref: child.clone(),
+        reason: "stop session".into(),
+    };
+    let connection = rusqlite::Connection::open(directory.path().join("journal.sqlite")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_stop_fence BEFORE UPDATE ON approvals
+        BEGIN SELECT RAISE(ABORT, 'injected stop fence failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        harness
+            .authority
+            .admit_key_revocation(&request, 1_500)
+            .is_err()
+    );
+    assert!(
+        harness
+            .journal
+            .operation(&request.operation_id)
+            .unwrap()
+            .is_none()
+    );
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM key_stops", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(
+        harness.journal.approval_state(&pending_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony)
+    );
+    connection
+        .execute_batch("DROP TRIGGER fail_stop_fence")
+        .unwrap();
+    let (targets, first) = harness
+        .authority
+        .admit_key_revocation(&request, 1_500)
+        .unwrap();
+    assert!(first);
+    assert_eq!(
+        harness.journal.approval_state(&pending_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::Failed)
+    );
+    let fresh = scoped_exact_terms(&harness, &provenance, &child, b"fresh", 72);
+    let fresh_id = harness
+        .authority
+        .prepare_approval(&fresh, &digest(7))
+        .unwrap();
+    drop(harness);
+    let reopened = Harness::open_at(directory.path());
+    let (replayed, first) = reopened
+        .authority
+        .admit_key_revocation(&request, 1_600)
+        .unwrap();
+    assert!(!first);
+    assert_eq!(replayed, targets);
+    assert!(!replayed.iter().any(|(id, _)| id == &fresh_id));
+    assert_eq!(
+        reopened.journal.approval_state(&fresh_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony)
+    );
+}

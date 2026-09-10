@@ -1178,6 +1178,19 @@ impl BrokerJournal {
         parameters_digest: &Digest32,
         targets: &[(Digest32, OperationId)],
     ) -> Result<(), JournalError> {
+        self.begin_key_revocation_with_effects(operation_id, parameters_digest, targets, |_| Ok(()))
+            .map(|_| ())
+    }
+
+    /// Admission and authority effects share one commit. The callback is never
+    /// run for a replay or a conflicting operation ID.
+    pub(crate) fn begin_key_revocation_with_effects(
+        &self,
+        operation_id: &OperationId,
+        parameters_digest: &Digest32,
+        targets: &[(Digest32, OperationId)],
+        effects: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<(), JournalError>,
+    ) -> Result<bool, JournalError> {
         let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         let existing: Option<(String, String)> = transaction
@@ -1195,7 +1208,7 @@ impl BrokerJournal {
                 )
                 .into());
             }
-            return Ok(());
+            return Ok(false);
         }
         transaction.execute(
             "INSERT INTO operations(
@@ -1234,11 +1247,12 @@ impl BrokerJournal {
             }),
             self.audit_signer.as_ref(),
         )?;
+        effects(&transaction)?;
         transaction.commit()?;
         drop(connection);
         self.checkpoint_committed_head()?;
         self.after_durable(DurablePoint::OperationReceived)?;
-        Ok(())
+        Ok(true)
     }
 
     /// Mark a by-key revocation complete. Idempotent: completing an

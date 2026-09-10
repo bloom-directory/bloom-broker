@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector, Base64UrlBytes, BootEpoch,
-    DecimalU64, Digest32, KeyRef, MachineBrokerMethod, MachineBrokerRequest, MachineBrokerResponse,
+    DecimalU64, Digest32, MachineBrokerMethod, MachineBrokerRequest, MachineBrokerResponse,
     MachineBrokerService, MachineSignRequest, OperationId, OperationPublicStatus, OperationState,
     PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, RPC_ENVELOPE_SCHEMA_V1, Readiness,
     ReadinessState, RevokeRequest, SealedApprovalPrepareResponse, ServiceCapabilities,
@@ -221,73 +221,22 @@ impl BrokerRpcService {
                 ))
             }
             Request::SealedApprovalRevokeForKey(request) => {
-                // The set comes from Broker's own journal: a caller's record
-                // of approval ids may be stale, and every approval on a key
-                // is automation that must stop together. The whole stop is
-                // owned by the caller's outer operation id: the first
-                // execution writes a durable stop marker and enumerates the
-                // bound set under the authorization barrier (so an approval
-                // racing the stop is either inside the set or refused at
-                // preparation and activation forever after), and binds that
-                // id to `(wallet, key, reason)` together with the enumerated
-                // target set. A delayed replay therefore re-revokes exactly
-                // the stored targets and can never sweep an approval created
-                // after the original call; reuse of the id for different
-                // parameters is refused.
-                let parameters = RevokeForKeyParameters {
-                    wallet_id: &request.wallet_id,
-                    key_ref: &request.key_ref,
-                    reason: &request.reason,
-                };
-                let parameters_digest = jcs_digest(&parameters)?;
-                let stored = self
-                    .journal
-                    .key_revocation_targets(&request.operation_id, &parameters_digest)
-                    .map_err(journal_error)?;
-                let (targets, first_execution) = match stored {
-                    Some(targets) => (targets, false),
-                    None => {
-                        let stopped_at_ms = u64::try_from(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map_err(|_| {
-                                    ProtocolError::new(
-                                        ProtocolErrorCode::ServiceUnavailable,
-                                        "host clock precedes the Unix epoch",
-                                    )
-                                })?
-                                .as_millis(),
-                        )
-                        .unwrap_or(u64::MAX);
-                        let bound = self
-                            .authority
-                            .stop_key(
-                                &request.wallet_id,
-                                &request.key_ref,
-                                request.operation_id.as_str(),
-                                stopped_at_ms,
+                let stopped_at_ms = u64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|_| {
+                            ProtocolError::new(
+                                ProtocolErrorCode::ServiceUnavailable,
+                                "host clock precedes the Unix epoch",
                             )
-                            .map_err(authority_error)?;
-                        let mut targets: Vec<(Digest32, OperationId)> = bound
-                            .iter()
-                            .map(|(approval_id, _state)| {
-                                (
-                                    approval_id.clone(),
-                                    derived_revocation_id(&request.operation_id, approval_id),
-                                )
-                            })
-                            .collect();
-                        targets.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
-                        self.journal
-                            .begin_key_revocation(
-                                &request.operation_id,
-                                &parameters_digest,
-                                &targets,
-                            )
-                            .map_err(journal_error)?;
-                        (targets, true)
-                    }
-                };
+                        })?
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX);
+                let (targets, first_execution) = self
+                    .authority
+                    .admit_key_revocation(&request, stopped_at_ms)
+                    .map_err(authority_error)?;
                 let mut statuses = Vec::with_capacity(targets.len());
                 for (approval_id, revocation_id) in targets {
                     // Every bound approval is revoked at Signer, whatever its
@@ -2322,27 +2271,6 @@ fn require_custody_kind(
         ));
     }
     Ok(())
-}
-
-/// The stable parameter binding of a by-key revocation: one outer
-/// operation id may only ever name one `(wallet, key, reason)`.
-#[derive(serde::Serialize)]
-struct RevokeForKeyParameters<'a> {
-    wallet_id: &'a Token,
-    key_ref: &'a KeyRef,
-    reason: &'a str,
-}
-
-/// Deterministic per-target Signer revocation id for a by-key stop:
-/// SHA-256 over a domain tag, the outer operation id, and the approval
-/// id. Recorded in the journal next to its outer operation so one stop's
-/// target set is auditable without a snapshot of the enumeration.
-fn derived_revocation_id(outer: &OperationId, approval_id: &Digest32) -> OperationId {
-    let mut hasher = Sha256::new();
-    hasher.update(b"bloom.broker.key-revocation.v1");
-    hasher.update(outer.to_bytes());
-    hasher.update(approval_id.to_bytes());
-    OperationId::from_bytes(hasher.finalize().into())
 }
 
 fn jcs_digest(value: &impl serde::Serialize) -> Result<Digest32, ProtocolError> {
