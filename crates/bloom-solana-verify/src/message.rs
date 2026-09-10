@@ -36,9 +36,6 @@ pub const MESSAGE_VERSION_PREFIX: u8 = 0x80;
 /// length and the 128-byte header requirement).
 pub const MAX_ACCOUNT_KEYS: usize = 256;
 
-/// Fixed serialized length of the three header bytes.
-pub const MESSAGE_HEADER_LENGTH: usize = 3;
-
 /// The three-byte message header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageHeader {

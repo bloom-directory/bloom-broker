@@ -884,12 +884,6 @@ fn verified_status_parent(
     let parent = path
         .parent()
         .ok_or("Broker startup diagnostic has no parent directory")?;
-    // Deliberately no link-count check. Requiring `nlink >= 2` treated the
-    // traditional `.`-plus-parent-entry count as evidence of a real directory,
-    // but btrfs reports `nlink == 1` for every directory, so this refused a
-    // perfectly safe status directory there while proving nothing extra
-    // elsewhere. `is_dir()` establishes the type and `symlink_metadata`
-    // establishes that the name resolves.
     let metadata = fs::symlink_metadata(parent)?;
     // Directory hard links are forbidden by POSIX, so `is_dir` already rules
     // out substitutes; a link-count floor is not portable (btrfs reports
@@ -2178,5 +2172,15 @@ mod startup_failure_tests {
 
         std::os::unix::fs::symlink("/dev/null", &path).expect("substitute status path");
         assert!(write_startup_failure(&path, metadata.uid(), &failure).is_err());
+    }
+
+    #[test]
+    fn status_directory_is_accepted_regardless_of_link_count() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o750))
+            .expect("set status directory permissions");
+        let metadata = fs::symlink_metadata(temporary.path()).expect("status directory metadata");
+        let path = temporary.path().join("broker-startup.json");
+        assert!(verified_status_parent(&path, metadata.uid()).is_ok());
     }
 }
