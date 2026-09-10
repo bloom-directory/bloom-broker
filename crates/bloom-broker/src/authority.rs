@@ -965,9 +965,11 @@ impl BrokerAuthority {
 
     /// Fail-closed adoption of an allocation receipt: the returned children
     /// must be exactly the children the committed terms asked for — one per
-    /// committed request, same wallet, same derivation profile and role, a
-    /// path shape matching the profile's frozen template, and, for a
-    /// multi-family request, one shared account number across the families.
+    /// committed request, same wallet, same derivation profile, a path shape
+    /// matching the profile's frozen template, and, for a multi-family
+    /// request, one shared account number across the families. The requested
+    /// roles are reviewed by the owner through the terms, which the digest
+    /// binds; the receipt itself carries no role to check here.
     fn adopt_account_allocation(
         &self,
         receipt: &CustodyResult,

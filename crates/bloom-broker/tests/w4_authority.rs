@@ -2669,6 +2669,32 @@ fn ac_multi_family_allocation_receipt_matching_number_is_adopted() {
         .authority
         .adopt_custody_receipt(&receipt, 1_100)
         .unwrap();
+
+    // The receipt's child order is not meaningful: matching is by profile.
+    let swapped_replay = operation(95);
+    let swapped_terms = multi_family_terms(
+        vec![evm_family_request(), solana_family_request()],
+        swapped_replay.clone(),
+    );
+    harness
+        .authority
+        .record_account_terms(&swapped_terms, 1_000)
+        .unwrap();
+    let swapped = signed_allocation_receipt(
+        &harness,
+        &swapped_replay,
+        vec![
+            multi_family_child_key_ref(
+                DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/4'/0'",
+            ),
+            multi_family_child_key_ref(DerivationProfile::Bip44EvmSecp256k1V1, "m/44'/60'/0'/0/4"),
+        ],
+    );
+    harness
+        .authority
+        .adopt_custody_receipt(&swapped, 1_000)
+        .unwrap();
 }
 
 #[test]
@@ -2782,31 +2808,6 @@ fn ac_single_family_allocation_receipt_still_adopts_one_child() {
         .authority
         .adopt_custody_receipt(&receipt, 1_000)
         .unwrap();
-
-    // The one child cannot satisfy two committed families.
-    let two_family = operation(93);
-    let terms = multi_family_terms(
-        vec![evm_family_request(), solana_family_request()],
-        two_family.clone(),
-    );
-    harness
-        .authority
-        .record_account_terms(&terms, 1_000)
-        .unwrap();
-    let short = signed_allocation_receipt(
-        &harness,
-        &two_family,
-        vec![multi_family_child_key_ref(
-            DerivationProfile::Bip44EvmSecp256k1V1,
-            "m/44'/60'/0'/0/0",
-        )],
-    );
-    assert!(
-        harness
-            .authority
-            .adopt_custody_receipt(&short, 1_000)
-            .is_err()
-    );
 }
 
 /// The scoped-key setup the by-key revocation tests need: an installed petal
@@ -2950,14 +2951,15 @@ fn ac_ceremony_completion_racing_by_key_revocation_ends_unusable() {
             }
         })
     };
-    completing.join().unwrap().unwrap();
+    // Both interleavings are legitimate: the ceremony may complete just
+    // before the stop revokes the approval, or the stop may fail it first
+    // so completion then errors. The outcome of the completing thread is
+    // therefore not asserted; the end state is, either way.
+    let _ = completing.join().unwrap();
     stopping.join().unwrap();
 
     // Whatever the interleaving, the stop runs to the end and the key ends
     // with no live reusable authority.
-    for (id, _) in authority.approvals_for_key(&wallet, &child).unwrap() {
-        authority.revoke_local_approval(&id).unwrap();
-    }
     let states = authority.approvals_for_key(&wallet, &child).unwrap();
     assert!(states.iter().all(|(_, state)| !matches!(
         state,

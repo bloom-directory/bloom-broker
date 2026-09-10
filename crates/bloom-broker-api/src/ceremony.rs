@@ -605,18 +605,14 @@ impl AccountTerms {
         }
         let single = self.derivation.as_ref();
         let several = self.derivations.as_slice();
-        match (
-            single.is_some(),
-            !several.is_empty(),
-            self.retire_key_fingerprint.as_ref(),
-        ) {
-            (true, _, Some(_)) | (true, true, _) | (false, false, None) => {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::MalformedFrame,
-                    "account terms carry either a derivation or a retirement fingerprint",
-                ));
-            }
-            _ => {}
+        let carries_derivation = single.is_some() || !several.is_empty();
+        if carries_derivation == self.retire_key_fingerprint.is_some()
+            || (single.is_some() && !several.is_empty())
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "account terms carry either a derivation or a retirement fingerprint",
+            ));
         }
         if let Some(request) = single {
             validate_single_derivation_request(request)?;
@@ -966,6 +962,35 @@ mod tests {
                 .unwrap_err()
                 .code,
             ProtocolErrorCode::OperationIdConflict
+        );
+    }
+
+    #[test]
+    fn account_terms_never_mix_derivations_with_a_retirement_fingerprint() {
+        // The list form of the allocation half must satisfy the same
+        // either-or rule as the single form: carrying derivations together
+        // with a retirement fingerprint is malformed, and so is carrying
+        // neither.
+        let mut mixed = multi_family_terms(vec![evm_request(), solana_request()]);
+        mixed.retire_key_fingerprint = Some(Digest32::from_bytes([7; 32]));
+        assert_eq!(
+            mixed.validate().unwrap_err().code,
+            ProtocolErrorCode::MalformedFrame
+        );
+
+        let mut single_mixed = multi_family_terms(vec![evm_request(), solana_request()]);
+        single_mixed.derivation = Some(evm_request());
+        single_mixed.retire_key_fingerprint = Some(Digest32::from_bytes([7; 32]));
+        assert_eq!(
+            single_mixed.validate().unwrap_err().code,
+            ProtocolErrorCode::MalformedFrame
+        );
+
+        let mut empty = multi_family_terms(vec![evm_request(), solana_request()]);
+        empty.derivations = Vec::new();
+        assert_eq!(
+            empty.validate().unwrap_err().code,
+            ProtocolErrorCode::MalformedFrame
         );
     }
 

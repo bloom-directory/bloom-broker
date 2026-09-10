@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use bloom_broker_api::{
-    ApprovalLifecycleState, ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector,
-    Base64UrlBytes, BootEpoch, DecimalU64, Digest32, MachineBrokerMethod, MachineBrokerRequest,
-    MachineBrokerResponse, MachineBrokerService, MachineSignRequest, OperationId,
-    OperationPublicStatus, OperationState, PolicyUpdateRequest, ProtocolError, ProtocolErrorCode,
-    RPC_ENVELOPE_SCHEMA_V1, Readiness, ReadinessState, RevokeRequest,
-    SealedApprovalPrepareResponse, ServiceCapabilities, ServiceFuture, SigningPayloads, Token,
-    VerifierPublicCapability, WalletAccountsPublic, WalletPublic, WalletRequest, WalletSeedProfile,
+    ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector, Base64UrlBytes, BootEpoch,
+    DecimalU64, Digest32, MachineBrokerMethod, MachineBrokerRequest, MachineBrokerResponse,
+    MachineBrokerService, MachineSignRequest, OperationId, OperationPublicStatus, OperationState,
+    PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, RPC_ENVELOPE_SCHEMA_V1, Readiness,
+    ReadinessState, RevokeRequest, SealedApprovalPrepareResponse, ServiceCapabilities,
+    ServiceFuture, SigningPayloads, Token, VerifierPublicCapability, WalletAccountsPublic,
+    WalletPublic, WalletRequest, WalletSeedProfile,
 };
 use bloom_platform_containment::NetworkContainmentGuard;
 use bloom_signer_api::{
@@ -229,43 +229,36 @@ impl BrokerRpcService {
                     .approvals_for_key(&request.wallet_id, &request.key_ref)
                     .map_err(authority_error)?;
                 let mut statuses = Vec::with_capacity(bound.len());
-                for (approval_id, state) in bound {
-                    // Signer only ever learned of approvals that reached it.
-                    // A prepared or awaiting approval fails locally, which is
-                    // what keeps its ceremony from completing after this.
-                    let signer_may_hold = matches!(
-                        state,
-                        ApprovalLifecycleState::Orphaned
-                            | ApprovalLifecycleState::Active
-                            | ApprovalLifecycleState::Exhausted
-                            | ApprovalLifecycleState::Expired
-                            | ApprovalLifecycleState::Revoked
-                    );
-                    if signer_may_hold {
-                        // Signer first, so a failure here leaves nothing half
-                        // done locally. A fresh operation id per call: Signer
-                        // records each revocation by operation id and treats
-                        // an already revoked approval as success, so a retry
-                        // of this request is safe and reaches Signer again.
-                        let mut operation_bytes = [0_u8; 32];
-                        OsRng.fill_bytes(&mut operation_bytes);
-                        let revoke = RevokeRequest {
-                            operation_id: OperationId::from_bytes(operation_bytes),
-                            approval_id: approval_id.clone(),
-                            wallet_id: request.wallet_id.clone(),
-                            reason: request.reason.clone(),
-                        };
-                        match self
-                            .signer
-                            .request_for_machine(BrokerSignerRequest::SealedApprovalRevoke(
-                                translate_revocation::revoke_request_to_signer(revoke),
-                            ))
-                            .await
-                        {
-                            Ok(_) => {}
-                            Err(error) if error.code == ProtocolErrorCode::ApprovalNotFound => {}
-                            Err(error) => return Err(error),
-                        }
+                for (approval_id, _state) in bound {
+                    // Every bound approval is revoked at Signer, whatever its
+                    // local state reads at listing time: a ceremony can be
+                    // completing concurrently, so any snapshot can be stale
+                    // and an approval Signer never learned of simply answers
+                    // ApprovalNotFound. Signer first, so a failure here
+                    // leaves nothing half done locally. A fresh operation id
+                    // per call: Signer records each revocation by operation id
+                    // and treats an already revoked approval as success, so a
+                    // retry of this request is safe and reaches Signer again.
+                    // A prepared or awaiting approval also fails locally,
+                    // which keeps its ceremony from completing after this.
+                    let mut operation_bytes = [0_u8; 32];
+                    OsRng.fill_bytes(&mut operation_bytes);
+                    let revoke = RevokeRequest {
+                        operation_id: OperationId::from_bytes(operation_bytes),
+                        approval_id: approval_id.clone(),
+                        wallet_id: request.wallet_id.clone(),
+                        reason: request.reason.clone(),
+                    };
+                    match self
+                        .signer
+                        .request_for_machine(BrokerSignerRequest::SealedApprovalRevoke(
+                            translate_revocation::revoke_request_to_signer(revoke),
+                        ))
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(error) if error.code == ProtocolErrorCode::ApprovalNotFound => {}
+                        Err(error) => return Err(error),
                     }
                     self.authority
                         .revoke_local_approval(&approval_id)

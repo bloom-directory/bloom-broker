@@ -836,7 +836,12 @@ impl CeremonyBroker {
                     "creates_current_wkek_custody": true,
                     "legacy_policy_is_not_imported": true
                 }))
-            } else if account_review.is_some() {
+            } else if account_review.is_some()
+                && matches!(
+                    request.ceremony_kind,
+                    CeremonyKind::AccountAllocate | CeremonyKind::AccountRetire
+                )
+            {
                 account_review
             } else {
                 request

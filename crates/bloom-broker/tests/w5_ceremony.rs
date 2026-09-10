@@ -3025,9 +3025,27 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .is_err()
     );
     // Stopping a session revokes every approval bound to its key, resolved
-    // from Broker's own journal rather than a caller's list. The single
-    // revoke afterwards is the idempotent path over an already revoked
-    // approval, through Broker and Signer alike.
+    // from Broker's own journal rather than a caller's list. A key with no
+    // approvals stops successfully with an empty set: stopping an idle
+    // session must not be an error. The single revoke afterwards is the
+    // idempotent path over an already revoked approval, through Broker and
+    // Signer alike.
+    let mut unknown_key = approval_terms.key_ref.clone();
+    unknown_key.locator = "petal-child-unbound".into();
+    let unbound = MachineBrokerService::dispatch(
+        &restarted_scoped_broker,
+        MachineBrokerRequest::SealedApprovalRevokeForKey(bloom_broker_api::RevokeForKeyRequest {
+            operation_id: operation("dd"),
+            wallet_id: wallet_id.clone(),
+            key_ref: unknown_key,
+            reason: "fixture session stop".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(unbound, MachineBrokerResponse::SealedApprovalRevokeForKey(list) if list.is_empty())
+    );
     let revoked_for_key = MachineBrokerService::dispatch(
         &restarted_scoped_broker,
         MachineBrokerRequest::SealedApprovalRevokeForKey(bloom_broker_api::RevokeForKeyRequest {
