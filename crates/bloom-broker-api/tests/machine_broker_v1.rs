@@ -117,6 +117,9 @@ fn custody_prepare() -> CustodyPrepareRequest {
         browser_output_recipient_key: None,
         petal_key_scope: None,
         legacy_passkey_migration: None,
+        wallet_seed_profile: None,
+        derivation_request: None,
+        account_terms: None,
     }
 }
 
@@ -201,6 +204,7 @@ fn machine_sign() -> MachineSignRequest {
             payload: Base64UrlBytes::from_bytes(&[36]),
         },
         petal_use_claim: None,
+        system_use_claim: None,
         claim_assurance_evidence: None,
         provenance: ProvenanceSubject::Cli {
             client_id: token("cli"),
@@ -263,6 +267,8 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
             operation_id: operation(54),
             terms: approval_terms(),
             canonical_plan_facts_digest: digest(59),
+            petal_use_claim: None,
+            system_use_claim: None,
         }),
         MachineBrokerRequest::SealedApprovalStatus(id.clone()),
         MachineBrokerRequest::SealedApprovalList(wallet.clone()),
@@ -299,12 +305,15 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
         MachineBrokerRequest::WalletImportPrepare(custody_prepare()),
         MachineBrokerRequest::WalletExportPrepare(custody_prepare()),
         MachineBrokerRequest::WalletDeletePrepare(custody_prepare()),
+        MachineBrokerRequest::WalletAccounts(wallet.clone()),
         MachineBrokerRequest::KeyListPublic(wallet.clone()),
         MachineBrokerRequest::KeyGetPublic(KeyRequest { key_ref: key_ref() }),
         MachineBrokerRequest::KeyDerivationCapabilities(KeyRequest { key_ref: key_ref() }),
         MachineBrokerRequest::KeyDerivePrepare(custody_prepare()),
         MachineBrokerRequest::KeyListDerived(KeyRequest { key_ref: key_ref() }),
         MachineBrokerRequest::KeyEnrollPrepare(custody_prepare()),
+        MachineBrokerRequest::AccountAllocatePrepare(account_allocate_prepare()),
+        MachineBrokerRequest::AccountRetirePrepare(account_retire_prepare()),
         MachineBrokerRequest::CredentialListPublic(wallet),
         MachineBrokerRequest::CredentialAddPrepare(custody_prepare()),
         MachineBrokerRequest::CredentialReplacePrepare(custody_prepare()),
@@ -320,7 +329,7 @@ fn wallet_public() -> WalletPublic {
     WalletPublic {
         wallet_id: token("wallet"),
         wallet_kind: token("local"),
-        root_key_ref: key_ref(),
+        root_key_ref: Some(key_ref()),
         key_refs: vec![key_ref()],
         policy_version: DecimalU64::new(1),
         policy_digest: digest(16),
@@ -344,6 +353,78 @@ fn credential_public() -> CredentialPublic {
         wallet_id: token("wallet"),
         created_at_ms: DecimalU64::new(10),
         state: CredentialState::Active,
+    }
+}
+
+fn account_allocate_terms() -> AccountTerms {
+    AccountTerms {
+        schema: token("bloom.account_terms.v1"),
+        wallet_id: token("wallet"),
+        seed_profile: WalletSeedProfile::Bip39MulticurveV1,
+        derivation: Some(DerivedAccountRequest {
+            derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
+            requested_role: token("primary-evm"),
+            account: Some(0),
+        }),
+        retire_key_fingerprint: None,
+        path_template: DerivationProfile::Bip44EvmSecp256k1V1
+            .path_template()
+            .to_owned(),
+        key_spec: KeySpec::Secp256k1,
+        allowed_crypto_suites: DerivationProfile::Bip44EvmSecp256k1V1
+            .frozen_crypto_suites()
+            .to_vec(),
+        policy_version: DecimalU64::new(1),
+        revocation_epoch: DecimalU64::new(1),
+        replay_id: operation(70),
+        expires_at_ms: DecimalU64::new(120),
+        audit_purpose: token("allocate-derived-account"),
+    }
+}
+
+fn account_allocate_prepare() -> CustodyPrepareRequest {
+    let terms = account_allocate_terms();
+    CustodyPrepareRequest {
+        ceremony_kind: CeremonyKind::AccountAllocate,
+        custody_operation_id: operation(70),
+        wallet_id: Some(token("wallet")),
+        key_ref: None,
+        exact_terms_digest: terms.request_digest().unwrap(),
+        expected_input_class: token("generic-custody-v1"),
+        browser_output_recipient_key: None,
+        petal_key_scope: None,
+        legacy_passkey_migration: None,
+        wallet_seed_profile: None,
+        derivation_request: terms.derivation.clone(),
+        account_terms: Some(terms),
+    }
+}
+
+fn account_retire_prepare() -> CustodyPrepareRequest {
+    let mut terms = account_allocate_terms();
+    terms.derivation = None;
+    terms.retire_key_fingerprint = Some(digest(74));
+    CustodyPrepareRequest {
+        ceremony_kind: CeremonyKind::AccountRetire,
+        custody_operation_id: operation(72),
+        wallet_id: Some(token("wallet")),
+        key_ref: Some(key_ref()),
+        exact_terms_digest: terms.request_digest().unwrap(),
+        expected_input_class: token("generic-custody-v1"),
+        browser_output_recipient_key: None,
+        petal_key_scope: None,
+        legacy_passkey_migration: None,
+        wallet_seed_profile: None,
+        derivation_request: None,
+        account_terms: Some(terms),
+    }
+}
+
+fn wallet_accounts() -> WalletAccountsPublic {
+    WalletAccountsPublic {
+        wallet_id: token("wallet"),
+        seed_profile: WalletSeedProfile::Bip39MulticurveV1,
+        accounts: vec![],
     }
 }
 
@@ -415,12 +496,15 @@ fn machine_responses() -> Vec<MachineBrokerResponse> {
         MachineBrokerResponse::WalletImportPrepare(custody_prepared.clone()),
         MachineBrokerResponse::WalletExportPrepare(custody_prepared.clone()),
         MachineBrokerResponse::WalletDeletePrepare(custody_prepared.clone()),
+        MachineBrokerResponse::WalletAccounts(wallet_accounts()),
         MachineBrokerResponse::KeyListPublic(vec![key_public()]),
         MachineBrokerResponse::KeyGetPublic(key_public()),
         MachineBrokerResponse::KeyDerivationCapabilities(vec![token("bip32")]),
         MachineBrokerResponse::KeyListDerived(vec![key_public()]),
         MachineBrokerResponse::KeyDerivePrepare(custody_prepared.clone()),
         MachineBrokerResponse::KeyEnrollPrepare(custody_prepared.clone()),
+        MachineBrokerResponse::AccountAllocatePrepare(custody_prepared.clone()),
+        MachineBrokerResponse::AccountRetirePrepare(custody_prepared.clone()),
         MachineBrokerResponse::CredentialListPublic(vec![credential_public()]),
         MachineBrokerResponse::CredentialAddPrepare(custody_prepared.clone()),
         MachineBrokerResponse::CredentialReplacePrepare(custody_prepared.clone()),
@@ -447,18 +531,19 @@ where
 
 #[test]
 fn every_machine_broker_variant_matches_frozen_v1_frames() {
-    // Protocol 1.6 changes the hello/capability frames; empty review payloads
-    // remain omitted from the pre-existing approval request vectors.
-    assert_eq!(MachineBrokerMethod::ALL.len(), 39);
+    // Protocol 1.6 adds the native assurance claims, the EVM review payload
+    // field, and the Safe review envelopes to the frames; empty review payload
+    // vectors remain omitted from the pre-existing approval request vectors.
+    assert_eq!(MachineBrokerMethod::ALL.len(), 42);
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "eb6307cc1fee2eb17861967b5890c2827ea937d6adfad3a08c39d70a66ffd5bc",
+        "bcb648dce4e11c5f38bc8555fd325299a2bdeb0f256345696ecb76b6c9d15030",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "461e997131ab141d831aaef345c3fde9b606eb1884e87d986a3eb130d1253749",
+        "6c4ef3a304d6e2d493a6cf3c6ca45fcfc971f519a6b0cbaed1523aaf1c9701c9",
     );
 }
 

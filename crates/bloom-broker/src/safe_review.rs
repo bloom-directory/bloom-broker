@@ -600,6 +600,8 @@ mod tests {
             canonical_plan_facts_digest: digest.clone(),
             evm_review_payloads: vec![],
             safe_review_payloads: vec![Base64UrlBytes::from_bytes(&review)],
+            petal_use_claim: None,
+            system_use_claim: None,
             terms: SealedApprovalTerms {
                 subject: ApprovalSubject::Petal {
                     package_hash: digest.clone(),

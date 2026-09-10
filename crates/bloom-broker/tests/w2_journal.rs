@@ -180,7 +180,7 @@ fn open_journal(path: &std::path::Path) -> BrokerJournal {
 fn install_reservation_approval(journal: &BrokerJournal) {
     let approval_id = digest("22");
     journal
-        .create_approval_record(&approval_id, "{}", &digest("aa"), None, None)
+        .create_approval_record(&approval_id, "{}", &digest("aa"), None, None, None)
         .unwrap();
     journal
         .activate_approval_record(&approval_id, &operation_id(250), "{}")
@@ -237,6 +237,7 @@ fn request(value: u8) -> UnsignedSignRequest {
         selector_kind: SelectorKind::Exact,
         ordered_payload_digests: identity.ordered_payload_digests,
         ordered_hashes: identity.ordered_hashes,
+        ordered_messages: Vec::new(),
         signature_count: DecimalU64::new(1),
         petal_use_claim_digest: None,
         claim_assurance_digest: None,

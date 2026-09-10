@@ -1,6 +1,6 @@
 use crate::{
     Base64UrlBytes, CryptoSuite, Digest32, KeyRef, OperationId, PetalUseClaim, ProvenanceSubject,
-    SigningPayloads,
+    SigningPayloads, SystemUseClaim,
 };
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +14,8 @@ pub struct MachineSignRequest {
     pub crypto_suite: CryptoSuite,
     pub payloads: SigningPayloads,
     pub petal_use_claim: Option<PetalUseClaim>,
+    #[serde(default)]
+    pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance_evidence: Option<Base64UrlBytes>,
     pub provenance: ProvenanceSubject,
 }

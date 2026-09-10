@@ -13,6 +13,9 @@ mod provenance;
 mod revocation;
 mod service;
 mod signing;
+pub mod solana_vectors;
+mod validation;
+mod wallet_account;
 
 pub use approval::*;
 pub use ceremony::*;
@@ -27,6 +30,7 @@ pub use provenance::*;
 pub use revocation::*;
 pub use service::*;
 pub use signing::*;
+pub use wallet_account::*;
 
 pub use bloom_rpc_wire::{
     AuthenticatedPeer, Base64UrlBytes, BootEpoch, DecimalU64, DecimalU256, Digest32, EnvelopeKind,
@@ -44,11 +48,17 @@ pub const BROKER_API_MAJOR: u16 = 1;
 /// added under 1.3 — a 1.3 peer handed one would reject the whole error
 /// instead of reading the retry hint inside it.
 pub const RATE_LIMIT_DETAILS_MINOR: u16 = 4;
-/// First minor supporting full native EVM preimages during exact approval review.
-pub const EVM_REVIEW_PAYLOADS_MINOR: u16 = 5;
+/// Minor 5 introduced the BIP-39 account custody surface. Minor 6 adds the
+/// native system assurance claims and is the first minor supporting full
+/// native EVM preimages during exact approval review.
+pub const EVM_REVIEW_PAYLOADS_MINOR: u16 = 6;
+/// Minor 6 also carries the canonical Safe review envelopes, so all three
+/// review surfaces share one negotiated minor.
 pub const SAFE_REVIEW_PAYLOADS_MINOR: u16 = 6;
-/// Strict decoders must agree on the review request shape before exchanging
-/// messages. Machine and Broker must be upgraded together for native EVM review.
+/// The negotiated range moves as a unit, so there is no accepted minor that
+/// predates any field the Broker may emit. Older peers are refused at the
+/// hello before a response can carry a field their strict decoder rejects.
+/// Machine and Broker must be upgraded together for native EVM and Safe review.
 pub const BROKER_API_MINOR_MIN: u16 = SAFE_REVIEW_PAYLOADS_MINOR;
 pub const BROKER_API_MINOR_MAX: u16 = SAFE_REVIEW_PAYLOADS_MINOR;
 pub const BROKER_API_CURRENT: ProtocolVersion =

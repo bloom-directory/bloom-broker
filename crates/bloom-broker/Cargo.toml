@@ -14,12 +14,14 @@ alloy = { version = "2.0.5", default-features = false, features = ["std", "conse
 k256.workspace = true
 bloom-broker-api = { path = "../bloom-broker-api" }
 bloom-signer-api.workspace = true
+bloom-solana-verify.workspace = true
 bloom-platform-containment.workspace = true
 bloom-triad-local-transport.workspace = true
 bloom-audit-checkpoint.workspace = true
 bloom-service-activation.workspace = true
 bloom-service-observability.workspace = true
 bloom-trusted-time.workspace = true
+bs58.workspace = true
 config.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
@@ -39,10 +41,16 @@ zeroize.workspace = true
 
 [dev-dependencies]
 bloom-broker-debug-driver = { path = "../bloom-broker-debug-driver" }
-bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "0126ba4589ad8cf504d2f04c8e36471727964089" }
+# The socket-activation regression hands a real descriptor to a child process
+# between fork and exec, which needs dup2/fcntl directly.
+libc = "0.2"
+bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "d72d038cff514c3b81de0514b6ad07c134359b4b" }
+bloom-signer-vectors.workspace = true
 futures = "0.3"
 http-body-util = "0.1"
+k256.workspace = true
 tempfile = "3"
+tracing = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "json"] }
