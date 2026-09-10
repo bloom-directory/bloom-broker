@@ -2380,6 +2380,11 @@ impl BrokerAuthority {
             .approval_record(&input.request.approval_id)?
             .ok_or_else(|| denied("APPROVAL_NOT_FOUND", "approval metadata is missing"))?
             .approved_claim_digest;
+        // Exact approvals bind the literal reviewed bytes, so the signing
+        // claim must equal the reviewed one byte for byte. System approvals
+        // deliberately admit a freshness-updated claim: their binding is
+        // the selector's intent digest, compared against the claim above,
+        // so the reviewed claim's JCS is not the sign-time authority there.
         if matches!(terms.selector, ApprovalSelector::Exact { .. })
             && approved_claim_digest.as_deref() != claim_digest.as_ref().map(Digest32::as_str)
         {

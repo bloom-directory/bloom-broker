@@ -1785,6 +1785,217 @@ fn system_intent_approval_cannot_authorize_a_second_transfer() {
     );
 }
 
+/// A Signer seam that answers approval preparation locally. The reviewed
+/// binding is enforced before any Signer round trip, so a stub that records
+/// whether it was reached distinguishes a refused prepare from a prepared
+/// one without a live Signer.
+#[derive(Default)]
+struct StubCeremonySigner {
+    prepared: std::sync::atomic::AtomicBool,
+}
+
+impl bloom_broker::ceremony::CeremonySigner for StubCeremonySigner {
+    fn prepare_approval(
+        &self,
+        request: bloom_signer_api::CeremonyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<bloom_signer_api::SignerPreparedApproval, bloom_signer_api::ProtocolError> {
+        self.prepared
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ceremony_id =
+            Digest32::from_bytes(Sha256::digest(request.activation_operation_id.to_bytes()).into());
+        Ok(bloom_signer_api::SignerPreparedApproval {
+            contribution: bloom_signer_api::SignerCeremonyContribution {
+                ceremony_id,
+                signer_nonce: digest(61),
+                approval_digest: request.terms.approval_digest()?,
+                review_manifest_digest: request.review_manifest_digest.clone(),
+                key_ref: request.terms.key_ref.clone(),
+                allowed_crypto_suites: Vec::new(),
+                activation_mode: request.terms.activation_mode.clone(),
+                wallet_revocation_epoch: request.terms.wallet_revocation_epoch.clone(),
+                required_user_verification: true,
+                ephemeral_encryption_public_key: None,
+                expires_at_ms: bloom_signer_api::DecimalU64::new(now_ms + 60_000),
+                signer_key_id: token("stub-signer-key"),
+                signer_signature: Base64UrlBytes::from_bytes(&[]),
+            },
+            challenges: Vec::new(),
+            webauthn_options: bloom_signer_api::CeremonyWebAuthnOptions {
+                allowed_credentials: Vec::new(),
+                registration_user_handle: None,
+                registration_prf_salt: None,
+            },
+            verification_credentials: Vec::new(),
+        })
+    }
+
+    fn complete_approval(
+        &self,
+        request: bloom_signer_api::CeremonyCompleteRequest,
+        _now_ms: u64,
+    ) -> Result<bloom_signer_api::SignerActivationReceipt, bloom_signer_api::ProtocolError> {
+        unreachable!("this stub only prepares approvals: {request:?}")
+    }
+
+    fn prepare_custody(
+        &self,
+        request: bloom_signer_api::CustodyPrepareRequest,
+        _now_ms: u64,
+    ) -> Result<bloom_signer_api::SignerPreparedCustody, bloom_signer_api::ProtocolError> {
+        unreachable!("this stub only prepares approvals: {request:?}")
+    }
+
+    fn complete_custody(
+        &self,
+        request: bloom_signer_api::CustodyCompleteRequest,
+        _now_ms: u64,
+    ) -> Result<bloom_signer_api::CustodyResult, bloom_signer_api::ProtocolError> {
+        unreachable!("this stub only prepares approvals: {request:?}")
+    }
+
+    fn bind_custody_output_recipient(
+        &self,
+        operation_id: &OperationId,
+        _recipient_key: Base64UrlBytes,
+        _now_ms: u64,
+    ) -> Result<bloom_signer_api::SignerPreparedCustody, bloom_signer_api::ProtocolError> {
+        unreachable!("this stub only prepares approvals: {operation_id}")
+    }
+
+    fn cancel(&self, operation_id: &OperationId) -> Result<(), bloom_signer_api::ProtocolError> {
+        unreachable!("this stub only prepares approvals: {operation_id}")
+    }
+
+    fn status(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<bloom_signer_api::SignerCeremonyStatus, bloom_signer_api::ProtocolError> {
+        unreachable!("this stub only prepares approvals: {operation_id}")
+    }
+}
+
+fn ceremony_prepare_request_for(
+    terms: &SealedApprovalTerms,
+    operation_id: OperationId,
+) -> bloom_signer_api::CeremonyPrepareRequest {
+    // The two terms types serialize to the same canonical shape and both
+    // reject unknown fields, so this round trip either translates exactly
+    // or fails loudly.
+    let translated: bloom_signer_api::SealedApprovalTerms =
+        serde_json::from_value(serde_json::to_value(terms).unwrap()).unwrap();
+    bloom_signer_api::CeremonyPrepareRequest {
+        activation_operation_id: operation_id,
+        terms: translated,
+        review_manifest_digest: digest(62),
+        exact_ordered_payload_digests: Vec::new(),
+        exact_ordered_hashes: Vec::new(),
+        replacement_approval_id: None,
+    }
+}
+
+fn system_claim_context(claim: &SystemUseClaim) -> bloom_broker::ceremony::ReviewManifestContext {
+    bloom_broker::ceremony::ReviewManifestContext {
+        petal_use_claim: None,
+        system_use_claim: Some(claim.clone()),
+        claim_assurance: Some(claim.claim_assurance.clone()),
+        attributed_advisory_items: Vec::new(),
+    }
+}
+
+#[test]
+fn a_system_claim_review_must_name_the_approved_intent() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    // The owner reviews transfer A (1 SOL to X)...
+    let (_, reviewed) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    // ...while the immutable terms bind the intent digest of transfer B
+    // (5 SOL to Y): different destination, different amount.
+    let (_, bound) = solana_transfer([0x01; 32], [0x03; 32], 5_000_000, [0x08; 32]);
+    let broker = bloom_broker::ceremony::CeremonyBroker::new_with_manifest_signer(
+        Arc::new(StubCeremonySigner::default()),
+        token("broker-app-1"),
+        SigningKey::from_bytes(&[7; 32]),
+    );
+
+    // A reviewed claim that is not the bound intent is refused before any
+    // Signer round trip.
+    let mismatched = broker
+        .prepare_approval(
+            ceremony_prepare_request_for(
+                &system_intent_terms(&harness, &provenance, &bound, 95),
+                operation(96),
+            ),
+            system_claim_context(&reviewed),
+            1_200,
+        )
+        .unwrap_err();
+    assert_eq!(mismatched.code.as_str(), "CLAIM_INVALID");
+    assert!(
+        mismatched.message.contains("SYSTEM_CLAIM_MISMATCH"),
+        "{mismatched}"
+    );
+
+    // A System selector with no reviewed claim at all is the same mismatch.
+    let claimless = broker
+        .prepare_approval(
+            ceremony_prepare_request_for(
+                &system_intent_terms(&harness, &provenance, &bound, 95),
+                operation(99),
+            ),
+            bloom_broker::ceremony::ReviewManifestContext {
+                petal_use_claim: None,
+                system_use_claim: None,
+                claim_assurance: None,
+                attributed_advisory_items: Vec::new(),
+            },
+            1_200,
+        )
+        .unwrap_err();
+    assert!(
+        claimless.message.contains("SYSTEM_CLAIM_MISMATCH"),
+        "{claimless}"
+    );
+
+    // A system claim cannot ride an Exact selector either.
+    let exact = solana_terms(&harness, &provenance, b"exact-payload", 100);
+    let riding = broker
+        .prepare_approval(
+            ceremony_prepare_request_for(&exact, operation(101)),
+            system_claim_context(&reviewed),
+            1_200,
+        )
+        .unwrap_err();
+    assert!(riding.message.contains("SYSTEM_CLAIM_MISMATCH"), "{riding}");
+
+    // The claim the terms actually bind prepares normally: the review the
+    // owner saw and the intent the passkey authorizes are the same transfer.
+    let stub = Arc::new(StubCeremonySigner::default());
+    let broker = bloom_broker::ceremony::CeremonyBroker::new_with_manifest_signer(
+        stub.clone(),
+        token("broker-app-1"),
+        SigningKey::from_bytes(&[7; 32]),
+    );
+    let prepared = broker
+        .prepare_approval(
+            ceremony_prepare_request_for(
+                &system_intent_terms(&harness, &provenance, &reviewed, 102),
+                operation(103),
+            ),
+            system_claim_context(&reviewed),
+            1_200,
+        )
+        .unwrap();
+    assert_eq!(
+        prepared.state,
+        bloom_broker_api::ApprovalPrepareState::AwaitingCeremony
+    );
+    assert!(
+        stub.prepared.load(std::sync::atomic::Ordering::SeqCst),
+        "a matching claim reaches the Signer"
+    );
+}
+
 #[test]
 fn an_exact_approval_cannot_cover_a_refreshed_blockhash() {
     let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
