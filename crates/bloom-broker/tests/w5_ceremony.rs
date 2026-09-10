@@ -2976,6 +2976,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         )
         .unwrap(),
     );
+    let replay_authority = restarted_authority.clone();
     let restarted_scoped_broker = BrokerRpcService::new(
         restarted_authority,
         restarted_journal.clone(),
@@ -3049,7 +3050,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let revoked_for_key = MachineBrokerService::dispatch(
         &restarted_scoped_broker,
         MachineBrokerRequest::SealedApprovalRevokeForKey(bloom_broker_api::RevokeForKeyRequest {
-            operation_id: operation("d9"),
+            operation_id: operation("e0"),
             wallet_id: wallet_id.clone(),
             key_ref: approval_terms.key_ref.clone(),
             reason: "fixture session stop".into(),
@@ -3067,7 +3068,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let repeated = MachineBrokerService::dispatch(
         &restarted_scoped_broker,
         MachineBrokerRequest::SealedApprovalRevokeForKey(bloom_broker_api::RevokeForKeyRequest {
-            operation_id: operation("d9"),
+            operation_id: operation("e0"),
             wallet_id: wallet_id.clone(),
             key_ref: approval_terms.key_ref.clone(),
             reason: "fixture session stop".into(),
@@ -3079,6 +3080,71 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         repeated,
         MachineBrokerResponse::SealedApprovalRevokeForKey(again) if again == statuses
     ));
+    // The outer operation id owns the whole stop. An approval that reaches
+    // the journal after the first execution enumerated its target set —
+    // the race the durable stop marker closes at the service edge — must
+    // not be swept by the replay: it acts only on the stored targets.
+    let mut raced_terms = approval_terms.clone();
+    raced_terms.request_nonce = RequestNonce::from_bytes([0xed; 16]);
+    let raced_approval_id = raced_terms.approval_id().unwrap();
+    let raced_terms_jcs = serde_jcs::to_string(&raced_terms).unwrap();
+    restarted_journal
+        .create_approval_record(
+            &raced_approval_id,
+            &raced_terms_jcs,
+            &digest("ee"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(
+        replay_authority
+            .approvals_for_key(&wallet_id, &approval_terms.key_ref)
+            .unwrap()
+            .iter()
+            .any(|(id, _)| *id == raced_approval_id),
+        "fixture: the raced approval is journalled on the stopped key"
+    );
+    let replayed = MachineBrokerService::dispatch(
+        &restarted_scoped_broker,
+        MachineBrokerRequest::SealedApprovalRevokeForKey(bloom_broker_api::RevokeForKeyRequest {
+            operation_id: operation("e0"),
+            wallet_id: wallet_id.clone(),
+            key_ref: approval_terms.key_ref.clone(),
+            reason: "fixture session stop".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&replayed, MachineBrokerResponse::SealedApprovalRevokeForKey(again) if again == &statuses),
+        "a replay returns the stored target statuses"
+    );
+    assert_eq!(
+        restarted_journal
+            .approval_state(&raced_approval_id)
+            .unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony),
+        "a replay must not revoke an approval created after the first call"
+    );
+    // Reuse of the outer id for a different stop is refused outright.
+    let mismatched = MachineBrokerService::dispatch(
+        &restarted_scoped_broker,
+        MachineBrokerRequest::SealedApprovalRevokeForKey(bloom_broker_api::RevokeForKeyRequest {
+            operation_id: operation("e0"),
+            wallet_id: wallet_id.clone(),
+            key_ref: approval_terms.key_ref.clone(),
+            reason: "a different reason".into(),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        mismatched.code.as_str(),
+        "OPERATION_ID_CONFLICT",
+        "reusing the outer id with different parameters must be refused"
+    );
     let revoked = MachineBrokerService::dispatch(
         &restarted_scoped_broker,
         MachineBrokerRequest::SealedApprovalRevoke(RevokeRequest {

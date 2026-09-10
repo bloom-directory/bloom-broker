@@ -1100,6 +1100,153 @@ impl BrokerJournal {
         Ok(snapshot)
     }
 
+    /// The target set a by-key revocation recorded for `operation_id`,
+    /// when that id was already used for one with the same
+    /// `parameters_digest`. `None` means the id is fresh; reuse for
+    /// different parameters is refused.
+    pub fn key_revocation_targets(
+        &self,
+        operation_id: &OperationId,
+        parameters_digest: &Digest32,
+    ) -> Result<Option<Vec<(Digest32, OperationId)>>, JournalError> {
+        let connection = self.lock()?;
+        let stored: Option<String> = connection
+            .query_row(
+                "SELECT operation_digest FROM operations WHERE operation_id = ?1",
+                [operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        if stored != parameters_digest.as_str() {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "by-key revocation operation ID was reused with a different wallet, key, or reason",
+            )
+            .into());
+        }
+        let mut statement = connection.prepare(
+            "SELECT attempt_id, attempt_digest FROM operation_attempts
+             WHERE operation_id = ?1 ORDER BY attempt_id",
+        )?;
+        let stored: Vec<(String, String)> = statement
+            .query_map([operation_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut targets = Vec::with_capacity(stored.len());
+        for (approval_id, revocation_id) in stored {
+            targets.push((
+                Digest32::new(approval_id)?,
+                OperationId::new(revocation_id)?,
+            ));
+        }
+        Ok(Some(targets))
+    }
+
+    /// Bind a by-key revocation to the caller's outer operation id and
+    /// persist the enumerated target set. One operation id may only ever
+    /// name one `(wallet_id, key_ref, reason)` triple: `parameters_digest`
+    /// refuses reuse for different parameters, and the returned target set
+    /// is exactly the approvals recorded by the first execution, so a
+    /// delayed replay can never sweep an approval created later. The
+    /// per-target revocation id is deterministic over
+    /// `(outer operation id, approval id)`.
+    pub fn begin_key_revocation(
+        &self,
+        operation_id: &OperationId,
+        parameters_digest: &Digest32,
+        targets: &[(Digest32, OperationId)],
+    ) -> Result<(), JournalError> {
+        let mut connection = self.lock_for_mutation()?;
+        let transaction = connection.transaction()?;
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT operation_digest FROM operations WHERE operation_id = ?1",
+                [operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(stored) = existing {
+            if stored != parameters_digest.as_str() {
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "by-key revocation operation ID was reused with a different wallet, key, or reason",
+                )
+                .into());
+            }
+            return Ok(());
+        }
+        transaction.execute(
+            "INSERT INTO operations(
+                operation_id, operation_digest, retry_binding_digest, state, is_batch,
+                validation_receipt_jcs
+             ) VALUES (?1, ?2, ?2, 'RECEIVED', 0, NULL)",
+            params![operation_id.as_str(), parameters_digest.as_str()],
+        )?;
+        for (approval_id, revocation_id) in targets {
+            transaction.execute(
+                "INSERT INTO operation_attempts(operation_id, attempt_id, attempt_digest)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    operation_id.as_str(),
+                    approval_id.as_str(),
+                    revocation_id.as_str()
+                ],
+            )?;
+        }
+        self.append_audit_transaction(
+            &transaction,
+            "key.revocation.received",
+            &serde_json::json!({
+                "operation_id": operation_id,
+                "parameters_digest": parameters_digest,
+                "targets": targets.iter().map(|(approval_id, revocation_id)| {
+                    serde_json::json!({
+                        "approval_id": approval_id,
+                        "revocation_id": revocation_id
+                    })
+                }).collect::<Vec<_>>()
+            }),
+            self.audit_signer.as_ref(),
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
+        self.after_durable(DurablePoint::OperationReceived)?;
+        Ok(())
+    }
+
+    /// Mark a by-key revocation complete. Idempotent: completing an
+    /// already-completed stop succeeds without touching durable state.
+    pub fn complete_key_revocation(&self, operation_id: &OperationId) -> Result<(), JournalError> {
+        let mut connection = self.lock_for_mutation()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE operations SET state = 'SUCCEEDED'
+             WHERE operation_id = ?1 AND state = 'RECEIVED'",
+            [operation_id.as_str()],
+        )?;
+        if changed > 0 {
+            self.append_audit_transaction(
+                &transaction,
+                "key.revocation.succeeded",
+                &serde_json::json!({"operation_id": operation_id}),
+                self.audit_signer.as_ref(),
+            )?;
+            transaction.commit()?;
+            drop(connection);
+            self.checkpoint_committed_head()?;
+            self.after_durable(DurablePoint::OperationTransition)?;
+        } else {
+            transaction.commit()?;
+            drop(connection);
+        }
+        Ok(())
+    }
+
     pub fn operation(
         &self,
         operation_id: &OperationId,

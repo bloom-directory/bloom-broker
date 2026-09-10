@@ -2917,6 +2917,85 @@ fn ac_by_key_revocation_fails_a_pending_ceremony_so_it_cannot_complete_afterward
 }
 
 #[test]
+fn ac_a_key_stop_refuses_approvals_prepared_after_it() {
+    let (harness, provenance, _scope, child) = scoped_petal_child();
+    // The stop marker is durable before any enumeration happens; an
+    // approval prepared afterwards must be refused at the Broker's single
+    // preparation chokepoint, so the stop cannot be outrun.
+    harness
+        .authority
+        .stop_key(&harness.wallet, &child, operation(41).as_str(), 2_000)
+        .unwrap();
+    let mut terms = petal_terms(&harness, &provenance);
+    terms.key_ref = child.clone();
+    terms.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Sha256Recoverable];
+    if let ApprovalSelector::Petal {
+        allowed_operation_classes,
+        ..
+    } = &mut terms.selector
+    {
+        *allowed_operation_classes = vec![token("transfer")];
+    }
+    let error = harness
+        .authority
+        .prepare_approval(&terms, &digest(8))
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            bloom_broker::authority::AuthorityError::Denied { code, .. } if *code == "KEY_STOPPED"
+        ),
+        "preparation after the stop must be refused with KEY_STOPPED, got {error:?}"
+    );
+}
+
+#[test]
+fn ac_a_key_stop_refuses_activation_of_a_ceremony_prepared_before_it() {
+    let (harness, provenance, _scope, child) = scoped_petal_child();
+    let mut terms = petal_terms(&harness, &provenance);
+    terms.key_ref = child.clone();
+    terms.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Sha256Recoverable];
+    if let ApprovalSelector::Petal {
+        allowed_operation_classes,
+        ..
+    } = &mut terms.selector
+    {
+        *allowed_operation_classes = vec![token("transfer")];
+    }
+    let approval_id = harness
+        .authority
+        .prepare_approval(&terms, &digest(7))
+        .unwrap();
+    // The grant was issued while the key was live; the stop happens after
+    // the ceremony was prepared but before it completes.
+    let grant = harness.signed_grant(&terms, approval_id.clone(), operation(3));
+    harness
+        .authority
+        .stop_key(&harness.wallet, &child, operation(42).as_str(), 1_500)
+        .unwrap();
+    let error = harness
+        .authority
+        .activate_approval(&grant, 1_600)
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            bloom_broker::authority::AuthorityError::Denied { code, .. } if *code == "KEY_STOPPED"
+        ),
+        "activation after the stop must be refused with KEY_STOPPED, got {error:?}"
+    );
+    // The approval is untouched by the refusal: still pre-activation, and
+    // never active.
+    assert!(matches!(
+        harness.journal.approval_state(&approval_id).unwrap(),
+        Some(
+            bloom_broker_api::ApprovalLifecycleState::Prepared
+                | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
+        )
+    ));
+}
+
+#[test]
 fn ac_ceremony_completion_racing_by_key_revocation_ends_unusable() {
     let (harness, provenance, _scope, child) = scoped_petal_child();
     let mut terms = petal_terms(&harness, &provenance);

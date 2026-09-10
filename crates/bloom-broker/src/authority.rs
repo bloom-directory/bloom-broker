@@ -522,6 +522,13 @@ impl BrokerAuthority {
                 epoch TEXT NOT NULL,
                 reconciled INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS key_stops (
+                wallet_id TEXT NOT NULL,
+                key_ref TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                stopped_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (wallet_id, key_ref)
+            );
             CREATE TABLE IF NOT EXISTS provenance_catalog (
                 subject_jcs TEXT PRIMARY KEY,
                 record_digest TEXT NOT NULL,
@@ -1538,6 +1545,7 @@ impl BrokerAuthority {
             .validate()
             .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?;
         self.validate_scoped_key_terms(terms)?;
+        self.ensure_key_not_stopped(terms)?;
         let approval_id = terms
             .approval_id()
             .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?;
@@ -1802,6 +1810,7 @@ impl BrokerAuthority {
         }
         let terms: SealedApprovalTerms =
             serde_json::from_str(&record.terms_jcs).map_err(storage)?;
+        self.ensure_key_not_stopped(&terms)?;
         let review_digest = Digest32::new(record.review_manifest_digest)
             .map_err(|error| denied("STORAGE_CORRUPTION", error.to_string()))?;
         let (current_epoch, reconciled) = self.epoch_state(&terms.wallet_id)?;
@@ -1986,6 +1995,72 @@ impl BrokerAuthority {
             bound.push((approval_id, state));
         }
         Ok(bound)
+    }
+
+    /// Durably stop a key. The marker is written and the bound approval set
+    /// enumerated under one hold of the authorization barrier, so a prepare
+    /// racing this stop either completes before the marker is durable — and
+    /// is inside the returned set — or observes the marker and is refused;
+    /// nothing on the key can be prepared or activated afterwards. A
+    /// stopped key is a dead key: session stop revokes every approval on
+    /// it, so the marker is never cleared.
+    pub fn stop_key(
+        &self,
+        wallet_id: &Token,
+        key_ref: &KeyRef,
+        operation_id: &str,
+        stopped_at_ms: u64,
+    ) -> Result<Vec<(Digest32, ApprovalLifecycleState)>, AuthorityError> {
+        let _barrier = self.lock_authorization_barrier()?;
+        let key_ref_jcs = serde_jcs::to_string(key_ref).map_err(storage)?;
+        let stopped_at = i64::try_from(stopped_at_ms)
+            .map_err(|_| storage("key stop timestamp is out of range"))?;
+        let mut connection = self.lock_for_mutation()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO key_stops(wallet_id, key_ref, operation_id, stopped_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(wallet_id, key_ref) DO UPDATE SET
+                operation_id=excluded.operation_id,
+                stopped_at_ms=excluded.stopped_at_ms",
+            params![wallet_id.as_str(), &key_ref_jcs, operation_id, stopped_at],
+        )?;
+        self.journal.append_external_audit(
+            &transaction,
+            "approval.key_stopped",
+            &serde_json::json!({
+                "wallet_id": wallet_id,
+                "key_ref_jcs": key_ref_jcs,
+                "operation_id": operation_id,
+                "stopped_at_ms": stopped_at_ms
+            }),
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.journal.checkpoint_committed_head()?;
+        self.approvals_for_key(wallet_id, key_ref)
+    }
+
+    /// A key that was stopped admits no new approval preparation and no
+    /// activation of an earlier one; both Broker chokepoints call this
+    /// while holding the authorization barrier.
+    fn ensure_key_not_stopped(&self, terms: &SealedApprovalTerms) -> Result<(), AuthorityError> {
+        let key_ref_jcs = serde_jcs::to_string(&terms.key_ref).map_err(storage)?;
+        let connection = self.lock()?;
+        let stopped = connection
+            .query_row(
+                "SELECT operation_id FROM key_stops WHERE wallet_id = ?1 AND key_ref = ?2",
+                params![terms.wallet_id.as_str(), &key_ref_jcs],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if stopped.is_some() {
+            return Err(denied(
+                "KEY_STOPPED",
+                "key was durably stopped and admits no approval preparation or activation",
+            ));
+        }
+        Ok(())
     }
 
     pub fn approval_public_list(

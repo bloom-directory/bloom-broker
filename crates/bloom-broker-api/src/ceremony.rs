@@ -321,7 +321,7 @@ impl CustodyPrepareRequest {
         }
         let single = self.derivation_request.clone();
         let several = self.derivation_requests.clone();
-        if single.is_some() == (!several.is_empty()) {
+        if single.is_some() != several.is_empty() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
                 "AccountAllocate carries exactly one of derivation_request or derivation_requests",
