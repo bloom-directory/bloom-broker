@@ -118,7 +118,7 @@ fn custody_prepare() -> CustodyPrepareRequest {
         petal_key_scope: None,
         legacy_passkey_migration: None,
         wallet_seed_profile: None,
-        derivation_request: None,
+        derivation_requests: Vec::new(),
         account_terms: None,
     }
 }
@@ -277,6 +277,12 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
             wallet_id: token("wallet"),
             reason: "reviewed".into(),
         }),
+        MachineBrokerRequest::SealedApprovalRevokeForKey(RevokeForKeyRequest {
+            operation_id: operation(63),
+            wallet_id: token("wallet"),
+            key_ref: key_ref(),
+            reason: "session stopped".into(),
+        }),
         MachineBrokerRequest::SealedApprovalRevokeAll(WalletOperationRequest {
             operation_id: operation(61),
             wallet_id: token("wallet"),
@@ -342,7 +348,6 @@ fn key_public() -> KeyPublic {
         canonical_public_key: Base64UrlBytes::from_bytes(&[63; 33]),
         addresses: vec!["0x1".into()],
         supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
-        petal_scope_expires_at_ms: None,
     }
 }
 
@@ -360,11 +365,11 @@ fn account_allocate_terms() -> AccountTerms {
         schema: token("bloom.account_terms.v1"),
         wallet_id: token("wallet"),
         seed_profile: WalletSeedProfile::Bip39MulticurveV1,
-        derivation: Some(DerivedAccountRequest {
+        derivations: vec![DerivedAccountRequest {
             derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
             requested_role: token("primary-evm"),
-            account: Some(0),
-        }),
+            account: None,
+        }],
         retire_key_fingerprint: None,
         path_template: DerivationProfile::Bip44EvmSecp256k1V1
             .path_template()
@@ -394,14 +399,14 @@ fn account_allocate_prepare() -> CustodyPrepareRequest {
         petal_key_scope: None,
         legacy_passkey_migration: None,
         wallet_seed_profile: None,
-        derivation_request: terms.derivation.clone(),
+        derivation_requests: terms.derivations.clone(),
         account_terms: Some(terms),
     }
 }
 
 fn account_retire_prepare() -> CustodyPrepareRequest {
     let mut terms = account_allocate_terms();
-    terms.derivation = None;
+    terms.derivations.clear();
     terms.retire_key_fingerprint = Some(digest(74));
     CustodyPrepareRequest {
         ceremony_kind: CeremonyKind::AccountRetire,
@@ -414,7 +419,7 @@ fn account_retire_prepare() -> CustodyPrepareRequest {
         petal_key_scope: None,
         legacy_passkey_migration: None,
         wallet_seed_profile: None,
-        derivation_request: None,
+        derivation_requests: Vec::new(),
         account_terms: Some(terms),
     }
 }
@@ -467,6 +472,7 @@ fn machine_responses() -> Vec<MachineBrokerResponse> {
             quarantined_signatures: DecimalU64::new(0),
         }),
         MachineBrokerResponse::SealedApprovalRevoke(approval_status()),
+        MachineBrokerResponse::SealedApprovalRevokeForKey(vec![approval_status()]),
         MachineBrokerResponse::SealedApprovalRevokeAll(revocation_state()),
         MachineBrokerResponse::SealedApprovalRenew(SealedApprovalPrepareResponse {
             approval_id: digest(35),
@@ -530,16 +536,16 @@ where
 
 #[test]
 fn every_machine_broker_variant_matches_frozen_v1_frames() {
-    assert_eq!(MachineBrokerMethod::ALL.len(), 42);
+    assert_eq!(MachineBrokerMethod::ALL.len(), 43);
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "bcb648dce4e11c5f38bc8555fd325299a2bdeb0f256345696ecb76b6c9d15030",
+        "abbf7bd16412516c7744d5b62f9533e42b8d5c5797a8b358de4f3de9276ee760",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "6c4ef3a304d6e2d493a6cf3c6ca45fcfc971f519a6b0cbaed1523aaf1c9701c9",
+        "78b67e7d3c1ad1604e0b6662fe2320df503dbd007918d93540727d220130cc39",
     );
 }
 
