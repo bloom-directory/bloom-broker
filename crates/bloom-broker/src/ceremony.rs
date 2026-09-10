@@ -1445,7 +1445,7 @@ impl CeremonyBroker {
             return Err(protocol(
                 ProtocolErrorCode::ServiceUnavailable,
                 format!(
-                    "inherited ceremony listener is bound to {observed}; expected one of                      {CEREMONY_LOOPBACK_ADDRS:?} but no other address will be served"
+                    "inherited ceremony listener is bound to {observed}; expected one of {CEREMONY_LOOPBACK_ADDRS:?} but no other address will be served"
                 ),
             ));
         }
@@ -1453,7 +1453,7 @@ impl CeremonyBroker {
             return Err(protocol(
                 ProtocolErrorCode::ServiceUnavailable,
                 format!(
-                    "inherited ceremony listener for {expected_family} is bound to {observed};                      addresses cannot be cross-paired across loopback families"
+                    "inherited ceremony listener for {expected_family} is bound to {observed}; addresses cannot be cross-paired across loopback families"
                 ),
             ));
         }
