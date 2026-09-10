@@ -2809,15 +2809,14 @@ fn digest(value: &impl Serialize) -> Result<Digest32, ProtocolError> {
 }
 
 /// The browser-visible review of one account ceremony: every requested
-/// family with its role, pinned account (single-family only; Signer chooses
-/// the number for a multi-family request), frozen path template and key
-/// material shape.
+/// family with its role, frozen path template, and key material shape. Signer
+/// chooses the account number.
 pub(crate) fn account_terms_review(
     kind: &bloom_broker_api::CeremonyKind,
     terms: &bloom_broker_api::AccountTerms,
 ) -> serde_json::Value {
     let families: Vec<serde_json::Value> = terms
-        .effective_derivations()
+        .derivations
         .iter()
         .map(|request| {
             let profile = request.derivation_profile;

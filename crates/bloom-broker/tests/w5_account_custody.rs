@@ -629,7 +629,6 @@ fn custody_request(
         petal_key_scope: None,
         legacy_passkey_migration: None,
         wallet_seed_profile: None,
-        derivation_request: None,
         derivation_requests: Vec::new(),
         account_terms: None,
     }
@@ -729,7 +728,7 @@ fn solana_derivation_request() -> DerivedAccountRequest {
     DerivedAccountRequest {
         derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
         requested_role: Token::new("solana-account").unwrap(),
-        account: Some(0),
+        account: None,
     }
 }
 
@@ -745,7 +744,7 @@ fn allocation_terms(
         schema: Token::new("bloom.account_terms.v1").unwrap(),
         wallet_id: wallet.wallet_id.clone(),
         seed_profile: WalletSeedProfile::Bip39MulticurveV1,
-        derivation: Some(derivation),
+        derivations: vec![derivation],
         retire_key_fingerprint: None,
         path_template: profile.path_template().to_owned(),
         key_spec: profile.key_spec(),
@@ -755,7 +754,6 @@ fn allocation_terms(
         replay_id,
         expires_at_ms: DecimalU64::new(now_plus(600)),
         audit_purpose: Token::new("allocate-derived-account").unwrap(),
-        derivations: Vec::new(),
     }
 }
 
@@ -771,7 +769,6 @@ fn allocate_request(
         terms.request_digest().unwrap(),
         Token::new("generic-custody-v1").unwrap(),
     );
-    request.derivation_request = terms.derivation.clone();
     request.derivation_requests = terms.derivations.clone();
     request.account_terms = Some(terms);
     request
@@ -793,7 +790,6 @@ fn multi_family_terms(
         schema: Token::new("bloom.account_terms.v1").unwrap(),
         wallet_id: wallet.wallet_id.clone(),
         seed_profile: WalletSeedProfile::Bip39MulticurveV1,
-        derivation: None,
         derivations: requests,
         retire_key_fingerprint: None,
         path_template: profile.path_template().to_owned(),
@@ -830,21 +826,25 @@ async fn account_allocate_retire_replay_cancel_restart_over_real_transport() {
     let authenticator = VirtualAuthenticator::generate();
     let wallet_id = Token::new("quiet-lilac").unwrap();
 
-    // Registration with no explicit seed profile selects bip39 and
-    // allocates the canonical initial EVM account m/44'/60'/0'/0/0.
+    // Registration with no explicit seed profile selects bip39 and allocates
+    // both canonical account-number-zero children.
     let (registration, _) =
         register_bip39_wallet(&mut stack, &wallet_id, &authenticator, None).await;
-    assert_eq!(registration.public_key_refs.len(), 1);
-    assert!(matches!(
-        registration.public_key_refs[0].derivation,
+    assert_eq!(registration.public_key_refs.len(), 2);
+    assert!(registration.public_key_refs.iter().all(|key_ref| matches!(
+        key_ref.derivation,
         Some(bloom_broker_api::DerivationRef::Bip39Multicurve { .. })
-    ));
+    )));
 
     let public = wallet_public(&stack, &wallet_id).await;
     let accounts = wallet_accounts(&stack, &wallet_id).await;
     assert_eq!(accounts.seed_profile, WalletSeedProfile::Bip39MulticurveV1);
-    assert_eq!(accounts.accounts.len(), 1);
-    let initial = &accounts.accounts[0];
+    assert_eq!(accounts.accounts.len(), 2);
+    let initial = accounts
+        .accounts
+        .iter()
+        .find(|account| account.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1)
+        .unwrap();
     assert_eq!(initial.path, "m/44'/60'/0'/0/0");
     assert_eq!(initial.chain_projections.len(), 1);
     let evm_projection = &initial.chain_projections[0];
@@ -856,6 +856,19 @@ async fn account_allocate_retire_replay_cancel_restart_over_real_transport() {
         format!("eip155:1:{}", evm_projection.address)
     );
     assert_eq!(evm_projection.address.len(), 42);
+    let initial_solana = accounts
+        .accounts
+        .iter()
+        .find(|account| account.derivation_profile == DerivationProfile::Bip44SolanaSlip10Ed25519V1)
+        .unwrap();
+    assert_eq!(initial_solana.path, "m/44'/501'/0'/0'");
+    let initial_solana_projection = &initial_solana.chain_projections[0];
+    assert_eq!(initial_solana_projection.chain_family.as_str(), "solana");
+    assert_eq!(
+        initial_solana_projection.address_encoding,
+        AddressEncoding::Base58
+    );
+    assert!(initial_solana_projection.caip2.starts_with("solana:"));
 
     // Allocate the Solana sibling with full exact terms.
     let allocate_operation = stack.next_operation();
@@ -898,13 +911,18 @@ async fn account_allocate_retire_replay_cancel_restart_over_real_transport() {
     );
 
     let accounts_after = wallet_accounts(&stack, &wallet_id).await;
-    assert_eq!(accounts_after.accounts.len(), 2);
+    assert_eq!(accounts_after.accounts.len(), 3);
+    let allocated_solana_ref = allocate_result
+        .public_key_refs
+        .iter()
+        .find(|key_ref| key_ref.key_spec == KeySpec::Ed25519)
+        .unwrap();
     let solana_account = accounts_after
         .accounts
         .iter()
-        .find(|account| account.derivation_profile == DerivationProfile::Bip44SolanaSlip10Ed25519V1)
+        .find(|account| &account.key_ref == allocated_solana_ref)
         .expect("solana account is projected");
-    assert_eq!(solana_account.path, "m/44'/501'/0'/0'");
+    assert_eq!(solana_account.path, "m/44'/501'/1'/0'");
     assert_eq!(solana_account.key_ref, allocate_result.public_key_refs[0]);
     let solana_projection = &solana_account.chain_projections[0];
     assert_eq!(solana_projection.chain_family.as_str(), "solana");
@@ -928,7 +946,7 @@ async fn account_allocate_retire_replay_cancel_restart_over_real_transport() {
         DerivedAccountRequest {
             derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
             requested_role: Token::new("secondary-evm").unwrap(),
-            account: Some(0),
+            account: None,
         },
         cancel_operation.clone(),
     );
@@ -957,7 +975,7 @@ async fn account_allocate_retire_replay_cancel_restart_over_real_transport() {
     assert_ne!(cancelled.state, CeremonyState::Succeeded);
     assert_eq!(
         wallet_accounts(&stack, &wallet_id).await.accounts.len(),
-        2,
+        3,
         "a cancelled allocation must not add an account"
     );
 
@@ -977,7 +995,6 @@ async fn account_allocate_retire_replay_cancel_restart_over_real_transport() {
         schema: Token::new("bloom.account_terms.v1").unwrap(),
         wallet_id: wallet_id.clone(),
         seed_profile: WalletSeedProfile::Bip39MulticurveV1,
-        derivation: None,
         retire_key_fingerprint: Some(fingerprint),
         path_template: DerivationProfile::Bip44SolanaSlip10Ed25519V1
             .path_template()
@@ -1024,12 +1041,19 @@ async fn account_allocate_retire_replay_cancel_restart_over_real_transport() {
     let accounts_after_retire = wallet_accounts(&restarted, &wallet_id).await;
     assert_eq!(
         accounts_after_retire.accounts.len(),
-        1,
+        2,
         "retired accounts leave the projection"
     );
-    assert_eq!(
-        accounts_after_retire.accounts[0].derivation_profile,
-        DerivationProfile::Bip44EvmSecp256k1V1
+    assert!(
+        accounts_after_retire.accounts.iter().any(|account| {
+            account.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1
+        })
+    );
+    assert!(
+        accounts_after_retire
+            .accounts
+            .iter()
+            .all(|account| account.key_ref != solana_account.key_ref)
     );
 
     // Retiring the same child twice fails closed: it is no longer active.
@@ -1102,7 +1126,10 @@ async fn automatic_solana_allocation_adopts_successive_accounts_over_real_transp
         .map(|account| account.path.as_str())
         .collect::<Vec<_>>();
     solana_paths.sort_unstable();
-    assert_eq!(solana_paths, ["m/44'/501'/0'/0'", "m/44'/501'/1'/0'"]);
+    assert_eq!(
+        solana_paths,
+        ["m/44'/501'/0'/0'", "m/44'/501'/1'/0'", "m/44'/501'/2'/0'"]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1165,7 +1192,7 @@ async fn two_family_allocation_shares_one_number_over_real_transport() {
         })
         .map(|account| account.path.as_str())
         .unwrap();
-    let solana_paths: Vec<&str> = accounts
+    let mut solana_paths: Vec<&str> = accounts
         .accounts
         .iter()
         .filter(|account| {
@@ -1173,8 +1200,9 @@ async fn two_family_allocation_shares_one_number_over_real_transport() {
         })
         .map(|account| account.path.as_str())
         .collect();
+    solana_paths.sort_unstable();
     assert_eq!(evm_path, "m/44'/60'/0'/0/1");
-    assert_eq!(solana_paths, ["m/44'/501'/1'/0'"]);
+    assert_eq!(solana_paths, ["m/44'/501'/0'/0'", "m/44'/501'/1'/0'"]);
 
     // A retry after completion reads the same terminal receipt: the same
     // two children, with nothing allocated further. (Machine layers its own
@@ -1203,8 +1231,13 @@ async fn two_passkeys_and_recovery_unlock_the_same_bip39_root_over_real_transpor
     let (registration, registration_contribution) =
         register_bip39_wallet(&mut stack, &wallet_id, &passkey_a, Some(&output_recipient)).await;
     let initial_accounts = wallet_accounts(&stack, &wallet_id).await;
-    assert_eq!(initial_accounts.accounts.len(), 1);
-    let initial_evm = initial_accounts.accounts[0].clone();
+    assert_eq!(initial_accounts.accounts.len(), 2);
+    let initial_evm = initial_accounts
+        .accounts
+        .iter()
+        .find(|account| account.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1)
+        .unwrap()
+        .clone();
 
     let recovery_plaintext = output_recipient
         .open(
@@ -1433,7 +1466,7 @@ async fn two_passkeys_and_recovery_unlock_the_same_bip39_root_over_real_transpor
         DerivedAccountRequest {
             derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
             requested_role: Token::new("primary-evm").unwrap(),
-            account: Some(0),
+            account: None,
         },
         evm_two_operation.clone(),
     );
@@ -1462,7 +1495,7 @@ async fn two_passkeys_and_recovery_unlock_the_same_bip39_root_over_real_transpor
     // profile, and the passkey-A-registered EVM child is untouched.
     let accounts = wallet_accounts(&stack, &wallet_id).await;
     assert_eq!(accounts.seed_profile, WalletSeedProfile::Bip39MulticurveV1);
-    assert_eq!(accounts.accounts.len(), 3);
+    assert_eq!(accounts.accounts.len(), 4);
     assert!(accounts.accounts.contains(&initial_evm));
 
     // Restart both services from disk: byte-identical projection.
@@ -1569,7 +1602,6 @@ async fn account_allocation_fails_closed_on_stale_and_foreign_terms() {
         schema: Token::new("bloom.account_terms.v1").unwrap(),
         wallet_id: wallet_id.clone(),
         seed_profile: WalletSeedProfile::Bip39MulticurveV1,
-        derivation: None,
         retire_key_fingerprint: Some(digest("ee")),
         path_template: DerivationProfile::Bip44SolanaSlip10Ed25519V1
             .path_template()
@@ -2018,7 +2050,7 @@ async fn restored_wallet_signs_from_restored_derived_account_over_real_transport
     fs::remove_file(directory.path().join("signer.sqlite")).unwrap();
     let mut restored = account_stack_with_backup(directory.path(), "s2", Some(&backup)).await;
     let accounts = wallet_accounts(&restored, &wallet_id).await;
-    assert_eq!(accounts.accounts.len(), 2);
+    assert_eq!(accounts.accounts.len(), 3);
     let evm_projection = accounts
         .accounts
         .iter()

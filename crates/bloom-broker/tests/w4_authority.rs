@@ -2584,7 +2584,6 @@ fn multi_family_terms(
         schema: token("bloom.account_terms.v1"),
         wallet_id: token("wallet-1"),
         seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
-        derivation: None,
         derivations: requests,
         retire_key_fingerprint: None,
         path_template: profile.path_template().to_owned(),

@@ -986,7 +986,7 @@ impl BrokerAuthority {
         if state == "ADOPTED" {
             return Ok(());
         }
-        let requests = terms.effective_derivations();
+        let requests = &terms.derivations;
         if requests.is_empty() {
             return Err(denied(
                 "CUSTODY_RECEIPT_INVALID",
@@ -1031,7 +1031,7 @@ impl BrokerAuthority {
             }
         }
         let mut adopted: Vec<(&bloom_broker_api::KeyRef, u32)> = Vec::new();
-        for request in &requests {
+        for request in requests {
             let profile = request.derivation_profile;
             let Some((child, path)) = by_profile.get(&profile) else {
                 return Err(denied(

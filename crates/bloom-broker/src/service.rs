@@ -943,7 +943,6 @@ impl BrokerRpcService {
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
                     wallet_seed_profile: None,
-                    derivation_request: None,
                     derivation_requests: Vec::new(),
                 },
                 update: signer_update,
