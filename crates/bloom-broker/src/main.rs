@@ -23,7 +23,7 @@ use bloom_broker::{
     clock::BrokerClock,
     journal::{AuditSigner, BrokerJournal},
     service::BrokerRpcService,
-    signer_client::{BrokerSignerClient, checkpoint_failure_requires_degradation},
+    signer_client::BrokerSignerClient,
 };
 use bloom_broker_api::{
     Base64UrlBytes, Digest32, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
@@ -1119,7 +1119,14 @@ impl BrokerMachineJournals {
             }
             Err(failure) => {
                 let decision = &failure.decision;
-                if !checkpoint_failure_requires_degradation(decision.outcome) {
+                // Machine requests are served concurrently, so a request carrying
+                // head N can arrive after another request has retained N+1. That
+                // reordering is not evidence that Machine's live state rolled
+                // back; retaining N+1 already preserves the stronger checkpoint.
+                if matches!(
+                    decision.outcome,
+                    CheckpointDecisionOutcome::SequenceRollback
+                ) {
                     log_checkpoint_decision(decision, method, operation_id, false);
                     return Ok(());
                 }
@@ -1876,7 +1883,7 @@ mod startup_failure_tests {
     }
 
     #[test]
-    fn unchanged_and_older_machine_heads_remain_admissible_without_degradation() {
+    fn reordered_machine_heads_remain_admissible_without_degradation() {
         let temporary = tempfile::tempdir().unwrap();
         let journal = Arc::new(
             open_operational_audit_journal(

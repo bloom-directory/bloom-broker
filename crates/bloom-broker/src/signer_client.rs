@@ -302,7 +302,15 @@ fn persist_checkpoint_diagnosed(
         }
         Err(failure) => {
             let decision = &failure.decision;
-            if !checkpoint_failure_requires_degradation(decision.outcome) {
+            // Broker heads are sampled before dispatch while Machine RPCs can
+            // commit concurrently. A valid older Broker head can therefore be
+            // ordinary checkpoint reordering. Signer responses, by contrast,
+            // pass through this worker serially and must fail closed.
+            if matches!(
+                decision.outcome,
+                CheckpointDecisionOutcome::SequenceRollback
+            ) && edge != "broker_signer_response"
+            {
                 log_checkpoint_decision(decision, method, operation_id, edge, false);
                 return Ok(());
             }
@@ -329,13 +337,6 @@ fn persist_checkpoint_diagnosed(
             }))
         }
     }
-}
-
-/// A validly signed older head is not an integrity failure: the checkpoint
-/// store already retains a newer head for that peer. Bad signatures and
-/// same-sequence forks are classified separately and must still fail closed.
-pub fn checkpoint_failure_requires_degradation(outcome: CheckpointDecisionOutcome) -> bool {
-    !matches!(outcome, CheckpointDecisionOutcome::SequenceRollback)
 }
 
 fn log_checkpoint_decision(
@@ -574,21 +575,6 @@ mod tests {
 
     static CHECKPOINT_TRACING_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    #[test]
-    fn only_a_valid_older_checkpoint_is_a_benign_append_failure() {
-        assert!(!checkpoint_failure_requires_degradation(
-            CheckpointDecisionOutcome::SequenceRollback
-        ));
-        for fatal in [
-            CheckpointDecisionOutcome::SequenceConflict,
-            CheckpointDecisionOutcome::InvalidSignature,
-            CheckpointDecisionOutcome::UnpinnedPeer,
-            CheckpointDecisionOutcome::StorageOrConfigurationFailure,
-        ] {
-            assert!(checkpoint_failure_requires_degradation(fatal));
-        }
-    }
-
     struct TestAuditSigner;
 
     impl AuditSigner for TestAuditSigner {
@@ -613,6 +599,8 @@ mod tests {
     }
 
     struct FailingCheckpointSink;
+
+    struct RollbackCheckpointSink;
 
     #[derive(Default)]
     struct RetainingCheckpointSink(Mutex<BTreeMap<Token, SignedJournalHead>>);
@@ -694,6 +682,15 @@ mod tests {
         }
     }
 
+    impl CheckpointSink for RollbackCheckpointSink {
+        fn append_peer_head(
+            &self,
+            _peer_head: &SignedJournalHead,
+        ) -> Result<AppendOutcome, CheckpointError> {
+            Err(CheckpointError::SequenceRollback)
+        }
+    }
+
     fn peer_head() -> SignedJournalHead {
         SignedJournalHead {
             service_id: Token::new("bloom-signer").unwrap(),
@@ -732,6 +729,38 @@ mod tests {
             .code,
             ProtocolErrorCode::ServiceUnavailable
         );
+    }
+
+    #[test]
+    fn signer_sequence_rollback_latches_degradation_and_rejects_mutation() {
+        let journal = BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).unwrap();
+        let error = persist_response_checkpoint(
+            &journal,
+            &RollbackCheckpointSink,
+            &Token::new("signer.sign").unwrap(),
+            Some("11"),
+            &peer_head(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+        assert!(journal.audit_degraded());
+    }
+
+    #[test]
+    fn broker_pre_dispatch_sequence_rollback_does_not_degrade() {
+        let journal = BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).unwrap();
+        let result = persist_checkpoint_diagnosed(
+            &journal,
+            &RollbackCheckpointSink,
+            Some(&Token::new("signer.sign").unwrap()),
+            Some("11"),
+            &peer_head(),
+            "broker_signer_pre_dispatch",
+        );
+
+        assert!(result.is_ok());
+        assert!(!journal.audit_degraded());
     }
 
     #[test]
