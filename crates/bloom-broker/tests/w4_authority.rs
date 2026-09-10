@@ -203,30 +203,75 @@ impl Harness {
     }
 
     fn new_with_verifiers(verifiers: Vec<Arc<dyn AssuranceVerifier>>) -> Self {
+        Self::build(None, verifiers)
+    }
+
+    /// A file-backed harness at `directory`, so a test can drop it and open
+    /// the same stores again. The policy is installed only on the first
+    /// open; a reopen finds it persisted.
+    fn open_at(directory: &std::path::Path) -> Self {
+        Self::build(Some(directory), vec![])
+    }
+
+    fn build(
+        directory: Option<&std::path::Path>,
+        verifiers: Vec<Arc<dyn AssuranceVerifier>>,
+    ) -> Self {
         let policy_key = SigningKey::from_bytes(&[1; 32]);
         let installer_key = SigningKey::from_bytes(&[2; 32]);
         let ceremony_key = SigningKey::from_bytes(&[3; 32]);
         let revocation_key = SigningKey::from_bytes(&[4; 32]);
         let wallet = token("wallet-1");
-        let journal =
-            Arc::new(BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).expect("journal"));
+        let journal = Arc::new(match directory {
+            None => BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).expect("journal"),
+            Some(directory) => {
+                BrokerJournal::open(directory.join("journal.sqlite"), Arc::new(TestAuditSigner))
+                    .expect("journal")
+            }
+        });
         let mut policy_keys = BTreeMap::new();
         policy_keys.insert(
             wallet.as_str().to_owned(),
             (token("policy-key"), policy_key.verifying_key()),
         );
-        let authority = BrokerAuthority::open_in_memory(
-            journal.clone(),
-            policy_keys,
-            token("installer-key"),
-            installer_key.verifying_key(),
-            token("ceremony-key"),
-            ceremony_key.verifying_key(),
-            token("revocation-key"),
-            revocation_key.verifying_key(),
-            AssuranceRegistry::compiled(verifiers).unwrap(),
-        )
-        .unwrap();
+        let registry = AssuranceRegistry::compiled(verifiers).unwrap();
+        let (authority, first_open) = match directory {
+            None => (
+                BrokerAuthority::open_in_memory(
+                    journal.clone(),
+                    policy_keys,
+                    token("installer-key"),
+                    installer_key.verifying_key(),
+                    token("ceremony-key"),
+                    ceremony_key.verifying_key(),
+                    token("revocation-key"),
+                    revocation_key.verifying_key(),
+                    registry,
+                )
+                .unwrap(),
+                true,
+            ),
+            Some(directory) => {
+                let path = directory.join("authority.sqlite");
+                let first_open = !path.exists();
+                (
+                    BrokerAuthority::open(
+                        &path,
+                        journal.clone(),
+                        policy_keys,
+                        token("installer-key"),
+                        installer_key.verifying_key(),
+                        token("ceremony-key"),
+                        ceremony_key.verifying_key(),
+                        token("revocation-key"),
+                        revocation_key.verifying_key(),
+                        registry,
+                    )
+                    .unwrap(),
+                    first_open,
+                )
+            }
+        };
         let harness = Self {
             authority,
             journal,
@@ -236,10 +281,12 @@ impl Harness {
             revocation_key,
             wallet,
         };
-        harness
-            .authority
-            .install_policy(&harness.policy_snapshot(1))
-            .unwrap();
+        if first_open {
+            harness
+                .authority
+                .install_policy(&harness.policy_snapshot(1))
+                .unwrap();
+        }
         harness
     }
 
@@ -2813,6 +2860,53 @@ fn ac_single_family_allocation_receipt_still_adopts_one_child() {
 /// provenance, an adopted derived child, and terms binding that child.
 fn scoped_petal_child() -> (Harness, ProvenanceRecord, PetalKeyScope, KeyRef) {
     let harness = Harness::new();
+    let (provenance, scope, child) = scoped_petal_child_on(&harness);
+    (harness, provenance, scope, child)
+}
+
+/// A reusable Petal approval on the scoped child: the automation a stop
+/// must end.
+fn scoped_petal_terms(
+    harness: &Harness,
+    provenance: &ProvenanceRecord,
+    child: &KeyRef,
+) -> SealedApprovalTerms {
+    let mut terms = petal_terms(harness, provenance);
+    terms.key_ref = child.clone();
+    terms.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Sha256Recoverable];
+    if let ApprovalSelector::Petal {
+        allowed_operation_classes,
+        ..
+    } = &mut terms.selector
+    {
+        *allowed_operation_classes = vec![token("transfer")];
+    }
+    terms
+}
+
+/// An owner-reviewed Exact approval on the scoped child: the recovery
+/// sweep a stop must leave possible.
+fn scoped_exact_terms(
+    harness: &Harness,
+    provenance: &ProvenanceRecord,
+    child: &KeyRef,
+    payload: &[u8],
+    nonce_byte: u8,
+) -> SealedApprovalTerms {
+    let mut terms = scoped_petal_terms(harness, provenance, child);
+    let hash = Digest32::from_bytes(Sha256::digest(payload).into());
+    terms.selector = ApprovalSelector::Exact {
+        ordered_payload_digests: vec![hash.clone()],
+        ordered_hashes: vec![hash],
+    };
+    terms.limits.max_operations = DecimalU64::new(1);
+    terms.limits.max_signatures = DecimalU64::new(1);
+    terms.limits.value_limits = vec![];
+    terms.request_nonce = nonce(nonce_byte);
+    terms
+}
+
+fn scoped_petal_child_on(harness: &Harness) -> (ProvenanceRecord, PetalKeyScope, KeyRef) {
     let provenance = harness.provenance();
     harness.authority.install_provenance(&provenance).unwrap();
     let scope = PetalKeyScope {
@@ -2850,7 +2944,7 @@ fn scoped_petal_child() -> (Harness, ProvenanceRecord, PetalKeyScope, KeyRef) {
         .authority
         .adopt_custody_receipt(&receipt, 1_000)
         .unwrap();
-    (harness, provenance, scope, child)
+    (provenance, scope, child)
 }
 
 #[test]
@@ -2946,6 +3040,124 @@ fn ac_a_key_stop_refuses_approvals_prepared_after_it() {
         ),
         "preparation after the stop must be refused with KEY_STOPPED, got {error:?}"
     );
+    // The owner is not automation. A fresh Exact approval, reviewed payload
+    // by payload in a new ceremony, prepares and activates on the stopped
+    // key so the funds behind it stay recoverable; every other scope check
+    // still applies to it.
+    let recovery = scoped_exact_terms(&harness, &provenance, &child, b"sweep after stop", 7);
+    let recovery_id = harness
+        .authority
+        .prepare_approval(&recovery, &digest(7))
+        .unwrap();
+    let grant = harness.signed_grant(&recovery, recovery_id.clone(), operation(43));
+    harness.authority.activate_approval(&grant, 1_600).unwrap();
+    assert_eq!(
+        harness.journal.approval_state(&recovery_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::Active)
+    );
+    let mut off_scope = scoped_exact_terms(&harness, &provenance, &child, b"other route", 8);
+    off_scope.subject = ApprovalSubject::Petal {
+        package_hash: digest(9),
+        route: "/elsewhere".into(),
+        agent_id: Some("advisory".into()),
+    };
+    assert!(
+        harness
+            .authority
+            .prepare_approval(&off_scope, &digest(8))
+            .is_err(),
+        "the stop exemption does not relax the scope's own checks"
+    );
+}
+
+#[test]
+fn ac_a_key_stop_fences_a_pending_exact_ceremony_but_not_a_fresh_one() {
+    let (harness, provenance, _scope, child) = scoped_petal_child();
+    // An Exact ceremony opened before the stop is not fresh: the stop
+    // fences it under the barrier, so an owner proof produced for it later
+    // cannot activate it, even though a fresh Exact approval on the same
+    // stopped key can.
+    let pending = scoped_exact_terms(&harness, &provenance, &child, b"pre-stop sweep", 7);
+    let pending_id = harness
+        .authority
+        .prepare_approval(&pending, &digest(7))
+        .unwrap();
+    let pending_grant = harness.signed_grant(&pending, pending_id.clone(), operation(3));
+    let targets = harness
+        .authority
+        .stop_key(&harness.wallet, &child, operation(42).as_str(), 1_500)
+        .unwrap();
+    assert!(targets.iter().any(|(id, _)| *id == pending_id));
+    assert_eq!(
+        harness.journal.approval_state(&pending_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::Failed),
+        "the stop fences the pending ceremony durably"
+    );
+    assert!(
+        harness
+            .authority
+            .activate_approval(&pending_grant, 1_600)
+            .is_err(),
+        "a ceremony opened before the stop cannot activate after it"
+    );
+    assert_eq!(
+        harness.journal.approval_state(&pending_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::Failed)
+    );
+    let fresh = scoped_exact_terms(&harness, &provenance, &child, b"post-stop sweep", 8);
+    let fresh_id = harness
+        .authority
+        .prepare_approval(&fresh, &digest(7))
+        .unwrap();
+    let fresh_grant = harness.signed_grant(&fresh, fresh_id.clone(), operation(44));
+    harness
+        .authority
+        .activate_approval(&fresh_grant, 1_700)
+        .unwrap();
+    assert_eq!(
+        harness.journal.approval_state(&fresh_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::Active)
+    );
+}
+
+#[test]
+fn ac_a_key_stop_survives_restart_and_still_admits_fresh_exact_recovery() {
+    let directory = tempfile::tempdir().unwrap();
+    let child = {
+        let harness = Harness::open_at(directory.path());
+        let (_provenance, _scope, child) = scoped_petal_child_on(&harness);
+        harness
+            .authority
+            .stop_key(&harness.wallet, &child, operation(41).as_str(), 1_200)
+            .unwrap();
+        child
+    };
+    // Reopened from disk: the marker still ends automation on the key and
+    // still admits owner recovery.
+    let harness = Harness::open_at(directory.path());
+    let provenance = harness.provenance();
+    let error = harness
+        .authority
+        .prepare_approval(
+            &scoped_petal_terms(&harness, &provenance, &child),
+            &digest(8),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        bloom_broker::authority::AuthorityError::Denied { code, .. } if *code == "KEY_STOPPED"
+    ));
+    let recovery = scoped_exact_terms(&harness, &provenance, &child, b"sweep after restart", 7);
+    let recovery_id = harness
+        .authority
+        .prepare_approval(&recovery, &digest(7))
+        .unwrap();
+    let grant = harness.signed_grant(&recovery, recovery_id.clone(), operation(45));
+    harness.authority.activate_approval(&grant, 1_500).unwrap();
+    assert_eq!(
+        harness.journal.approval_state(&recovery_id).unwrap(),
+        Some(bloom_broker_api::ApprovalLifecycleState::Active)
+    );
 }
 
 #[test]
@@ -2983,15 +3195,12 @@ fn ac_a_key_stop_refuses_activation_of_a_ceremony_prepared_before_it() {
         ),
         "activation after the stop must be refused with KEY_STOPPED, got {error:?}"
     );
-    // The approval is untouched by the refusal: still pre-activation, and
-    // never active.
-    assert!(matches!(
+    // The stop fenced the pending ceremony when it recorded the marker, so
+    // the approval is durably dead, never active.
+    assert_eq!(
         harness.journal.approval_state(&approval_id).unwrap(),
-        Some(
-            bloom_broker_api::ApprovalLifecycleState::Prepared
-                | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
-        )
-    ));
+        Some(bloom_broker_api::ApprovalLifecycleState::Failed)
+    );
 }
 
 #[test]

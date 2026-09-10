@@ -2044,13 +2044,42 @@ impl BrokerAuthority {
         transaction.commit()?;
         drop(connection);
         self.journal.checkpoint_committed_head()?;
-        self.approvals_for_key(wallet_id, key_ref)
+        let bound = self.approvals_for_key(wallet_id, key_ref)?;
+        // Fence every ceremony that was still pending when the stop was
+        // recorded, under the same barrier hold as the marker: it can never
+        // activate now, whatever its selector, and no owner proof produced
+        // for it later can revive it. Active approvals are left to the
+        // caller, which revokes them at Signer first and locally after.
+        for (approval_id, state) in &bound {
+            if matches!(
+                state,
+                ApprovalLifecycleState::Prepared | ApprovalLifecycleState::AwaitingCeremony
+            ) {
+                self.journal
+                    .transition_approval(approval_id, ApprovalLifecycleState::Failed)?;
+            }
+        }
+        Ok(bound)
     }
 
-    /// A key that was stopped admits no new approval preparation and no
-    /// activation of an earlier one; both Broker chokepoints call this
-    /// while holding the authorization barrier.
+    /// A stopped key admits no more automation: no reusable Petal approval
+    /// is prepared or activated on it again. The owner is not automation:
+    /// a fresh Exact approval, reviewed payload by payload in a new
+    /// ceremony, still proceeds so the funds behind the key stay
+    /// recoverable. Approvals that existed when the stop was recorded are
+    /// not "fresh": `stop_key` fenced the pending ones locally under the
+    /// same barrier hold, so they cannot activate whatever their selector.
+    /// Both Broker chokepoints call this while holding the barrier.
     fn ensure_key_not_stopped(&self, terms: &SealedApprovalTerms) -> Result<(), AuthorityError> {
+        // Exhaustive on purpose: only Exact is exempt, so a selector added
+        // later stays stopped until this check is changed to say otherwise.
+        let automation = match terms.selector {
+            ApprovalSelector::Exact { .. } => false,
+            ApprovalSelector::Petal { .. } => true,
+        };
+        if !automation {
+            return Ok(());
+        }
         let key_ref_jcs = serde_jcs::to_string(&terms.key_ref).map_err(storage)?;
         let connection = self.lock()?;
         let stopped = connection
@@ -3210,8 +3239,8 @@ fn petal_payload_batch_digest(payloads: &[Vec<u8>]) -> Digest32 {
 // left untouched as a rollback artifact; all subsequent reads and writes use
 // the consolidated database.
 /// Decode account terms as this Broker committed them. Rows written before
-/// API 1.7 carry the allocation as a singular `derivation`; the wire shape is
-/// list-only now, so fold that one request into `derivations` and decode the
+/// allocation went list-only carry it as a singular `derivation`; the wire
+/// shape is list-only now, so fold that one request into `derivations` and decode the
 /// current struct. The stored `terms_digest` is left as recorded: it is the
 /// digest of the JCS the peer sent, and adoption compares against that.
 fn decode_stored_account_terms(
@@ -3924,11 +3953,11 @@ mod stored_account_terms_tests {
         }
     }
 
-    /// A row committed by a Broker before API 1.7 carries the allocation
-    /// as a singular `derivation`. It must still load after an upgrade, as
+    /// A row committed by a Broker before allocation went list-only carries
+    /// it as a singular `derivation`. It must still load after an upgrade, as
     /// the same terms in list form.
     #[test]
-    fn a_pre_1_7_singular_row_decodes_as_the_list_form() {
+    fn a_singular_row_from_before_list_only_terms_decodes_as_the_list_form() {
         let expected = list_form();
         let mut stored: serde_json::Value = serde_json::to_value(&expected).unwrap();
         let object = stored.as_object_mut().unwrap();

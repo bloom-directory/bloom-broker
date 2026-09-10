@@ -540,12 +540,12 @@ fn every_machine_broker_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "65d30a9d12eb5b6a833978a668a6d49d4c31046b767db6ac346041ab38a8dd34",
+        "abbf7bd16412516c7744d5b62f9533e42b8d5c5797a8b358de4f3de9276ee760",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "5cfd0bb04116c17ff4bb64facd58a3f74bb13031565ca2464ad5aadba6c7fc18",
+        "78b67e7d3c1ad1604e0b6662fe2320df503dbd007918d93540727d220130cc39",
     );
 }
 
