@@ -9,6 +9,28 @@ use crate::{
 
 const APPROVAL_DOMAIN: &[u8] = b"bloom-sealed-approval-terms/v1";
 
+/// Petal operation class whose owner signature is only reviewable through a
+/// Safe review envelope.
+///
+/// The exact EIP-712 preimage a Safe owner signs is `0x1901 || domainSeparator
+/// || structHash`, which is not invertible, so an approval for this class means
+/// nothing to a reviewer without the envelope Broker rebuilds that preimage
+/// from. Machine requires the envelope for this class on the single-payload
+/// exact path and refuses the class on every batch path, and the daemon host
+/// call forwards an envelope only for it. The literal lives beside the claim
+/// type those three all speak so they cannot drift apart.
+///
+/// Broker cannot make the same check. `ApprovalPrepareRequest` carries no
+/// operation class for a Petal subject, and it cannot simply gain one:
+/// `SealedApprovalTerms` is mirrored field for field in `bloom-signer-api`, and
+/// both sides derive the approval ID from the JCS bytes of their own copy, so a
+/// field added here alone would split approval identity between Broker and
+/// Signer the first time a Petal approval carried it. Closing this properly
+/// means adding the class to both crates in one change; until then the
+/// requirement is Machine-enforced and Broker fails closed only on an envelope
+/// it was actually given.
+pub const SAFE_CONFIRM_OPERATION_CLASS: &str = "safe.transaction.confirm";
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApprovalSubject {

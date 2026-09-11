@@ -1862,6 +1862,7 @@ async fn approve_and_sign(
             terms: terms.clone(),
             canonical_plan_facts_digest: terms.approval_digest().unwrap(),
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
             petal_use_claim: None,
             system_use_claim: None,
         }),

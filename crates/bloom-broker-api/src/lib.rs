@@ -52,12 +52,15 @@ pub const RATE_LIMIT_DETAILS_MINOR: u16 = 4;
 /// native system assurance claims and is the first minor supporting full
 /// native EVM preimages during exact approval review.
 pub const EVM_REVIEW_PAYLOADS_MINOR: u16 = 6;
+/// Minor 6 also carries the canonical Safe review envelopes, so all three
+/// review surfaces share one negotiated minor.
+pub const SAFE_REVIEW_PAYLOADS_MINOR: u16 = 6;
 /// The negotiated range moves as a unit, so there is no accepted minor that
 /// predates any field the Broker may emit. Older peers are refused at the
 /// hello before a response can carry a field their strict decoder rejects.
-/// Machine and Broker must be upgraded together for native EVM review.
-pub const BROKER_API_MINOR_MIN: u16 = EVM_REVIEW_PAYLOADS_MINOR;
-pub const BROKER_API_MINOR_MAX: u16 = EVM_REVIEW_PAYLOADS_MINOR;
+/// Machine and Broker must be upgraded together for native EVM and Safe review.
+pub const BROKER_API_MINOR_MIN: u16 = SAFE_REVIEW_PAYLOADS_MINOR;
+pub const BROKER_API_MINOR_MAX: u16 = SAFE_REVIEW_PAYLOADS_MINOR;
 pub const BROKER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(BROKER_API_MAJOR, BROKER_API_MINOR_MAX);
 pub const BROKER_API_RANGE: ProtocolVersionRange =
