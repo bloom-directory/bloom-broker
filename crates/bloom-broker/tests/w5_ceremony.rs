@@ -356,7 +356,7 @@ renderReview({{
 const primary = allText({{textContent: "", innerHTML: "", children:
   nodes.review.children.filter(child => child?.name !== "details")}});
 const technical = allText(nodes.review.children.find(child => child?.name === "details"));
-for (const phrase of ["Pump.fun", "No funds move", "buy tokens", "sell tokens",
+for (const phrase of ["this Petal", scope.package_hash, "No funds move", "buy tokens", "sell tokens",
                       "return unused SOL", "main wallet key stays inside Bloom", "Up to 1h 0m"]) {{
   if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
 }}
@@ -366,7 +366,7 @@ for (const internal of ["allowed_routes", "custody_operation_id", "package_hash"
 if (!technical.includes(scope.package_hash) || !technical.includes("allowed_routes")) {{
   throw new Error(`technical details omitted the exact signed scope: ${{technical}}`);
 }}
-if (nodes.approve.textContent !== "Create Pump.fun session key") {{
+if (nodes.approve.textContent !== "Create temporary key") {{
   throw new Error(`unexpected approval label: ${{nodes.approve.textContent}}`);
 }}
 "#
@@ -417,6 +417,7 @@ const plan = {{
   security_disclosures: ["The displayed limits are asserted by the named Petal."],
   terms: {{
     wallet_id: "main",
+    subject: {{kind: "petal", package_hash: packageHash, route: "r000007", agent_id: null}},
     limits: {{max_operations: "256", max_signatures: "256", value_limits: [
       {{asset: {{chain: "solana", asset: "native"}}, lifetime: "500000000", rolling_windows: []}}
     ]}},
@@ -445,21 +446,21 @@ renderReview({{
 const primary = allText({{textContent: "", innerHTML: "", children:
   nodes.review.children.filter(child => child?.name !== "details")}});
 const technical = allText(nodes.review.children.find(child => child?.name === "details"));
-for (const phrase of ["Finish setting up", "Pump.fun", "buy tokens", "sell tokens",
+for (const phrase of ["Finish setting up", "this Petal", packageHash, "buy tokens", "sell tokens",
                       "return unused SOL", "Up to 256 signed actions",
                       "Up to 0.5 SOL in total across the whole session",
                       "main wallet key stays inside Bloom"]) {{
   if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
 }}
-for (const internal of [packageHash, "route_grants", "machine_asserted", "r000010",
+for (const internal of ["route_grants", "machine_asserted", "r000010",
                         "limits are asserted by the named Petal"]) {{
   if (primary.includes(internal)) throw new Error(`primary review exposed ${{internal}}: ${{primary}}`);
 }}
 if (!technical.includes(packageHash) || !technical.includes("route_grants")) {{
   throw new Error(`technical details omitted the exact signed plan: ${{technical}}`);
 }}
-if (nodes["page-title"].textContent !== "Finish Pump.fun session setup" ||
-    nodes.approve.textContent !== "Finish Pump.fun setup") {{
+if (nodes["page-title"].textContent !== "Finish temporary session setup" ||
+    nodes.approve.textContent !== "Finish session setup") {{
   throw new Error(`unexpected title or button: ${{nodes["page-title"].textContent}} / ${{nodes.approve.textContent}}`);
 }}
 // No value limits: the Broker refuses every debit and fee, and the owner is
@@ -4402,18 +4403,10 @@ async fn cancelling_a_ceremony_that_already_died_succeeds_instead_of_stranding_t
         .unwrap();
     let operation_id = operation("17");
 
-    broker.expire_sessions(now_ms + 10_001).unwrap();
-    assert_eq!(
-        broker.status(&operation_id),
-        Some(CeremonyState::Expired),
-        "the ceremony lapsed without ever reaching the wallet"
-    );
-
-    // Regression: this returned OPERATION_ID_CONFLICT. The operation could then
-    // be neither completed nor abandoned, and the only way out was editing
-    // durable state by hand.
+    // No status/browser read sweeps the session first: cancel itself must
+    // recognize that the deadline has elapsed.
     broker
-        .cancel(&operation_id, now_ms + 10_002)
+        .cancel(&operation_id, now_ms + 10_001)
         .expect("cancelling an already-dead ceremony is what the caller asked for");
 
     assert_eq!(
@@ -5988,7 +5981,13 @@ fn automatic_expiry_does_not_impose_cancellation_backoff() {
     let wallet = Token::new("wallet-expired-review").unwrap();
     prepare(&broker, operation("e1"), Some(wallet.clone()), 10_000);
 
-    broker.expire_sessions(20_001).unwrap();
+    // A direct cancellation must sweep expiry itself, without treating the
+    // elapsed review as an owner cancellation that throttles the next one.
+    broker.cancel(&operation("e1"), 20_001).unwrap();
+    assert_eq!(
+        broker.status(&operation("e1")),
+        Some(CeremonyState::Expired)
+    );
 
     prepare(&broker, operation("e2"), Some(wallet), 20_002);
 }
