@@ -224,10 +224,7 @@ function describePetalScope(scope) {
   if (!scope || typeof scope !== "object") return null;
   const classes = Array.isArray(scope.allowed_operation_classes)
     ? scope.allowed_operation_classes.map(String) : [];
-  const prefixes = [...new Set(classes.map(value => value.split(".")[0]).filter(Boolean))];
-  const app = prefixes.length === 1 && prefixes[0] === "pumpfun"
-    ? "Pump.fun"
-    : "this Petal";
+  const app = "this Petal";
   const actions = [...new Set(classes.map(value => {
     const action = value.includes(".") ? value.slice(value.indexOf(".") + 1) : value;
     return PETAL_ACTIONS[action] || action.replace(/[_-]/g, " ");
@@ -238,11 +235,12 @@ function describePetalScope(scope) {
     sentence: `Allow <strong>${app}</strong> to use a temporary Solana session key for up to <strong>${duration}</strong>. No funds move in this step, and your main wallet key stays inside Bloom.`,
     facts: [
       ["App", app],
+      ["Package", scope.package_hash, true],
       ["Can", naturalList(actions)],
       ["Session lasts", `Up to ${duration}`],
       ["Main wallet key", "Stays inside Bloom"]
     ],
-    button: app === "Pump.fun" ? "Create Pump.fun session key" : "Create temporary key"
+    button: "Create temporary key"
   };
 }
 function describePetalApproval(manifest) {
@@ -253,8 +251,8 @@ function describePetalApproval(manifest) {
   if (selector?.kind !== "petal") return null;
   const classes = Array.isArray(selector.allowed_operation_classes)
     ? selector.allowed_operation_classes.map(String) : [];
-  const prefixes = [...new Set(classes.map(value => value.split(".")[0]).filter(Boolean))];
-  const app = prefixes.length === 1 && prefixes[0] === "pumpfun" ? "Pump.fun" : "this Petal";
+  const app = "this Petal";
+  const packageHash = terms?.subject?.package_hash || selector.package_hash || "";
   const actions = [...new Set(classes.map(value => {
     const action = value.includes(".") ? value.slice(value.indexOf(".") + 1) : value;
     return PETAL_ACTIONS[action] || action.replace(/[_-]/g, " ");
@@ -274,13 +272,14 @@ function describePetalApproval(manifest) {
     sentence: `Finish setting up a temporary <strong>${app}</strong> session. It can sign only the actions listed below until the timer expires. No funds move in this step, and your main wallet key stays inside Bloom.`,
     facts: [
       ["App", app],
+      ["Package", packageHash, true],
       ["Can", naturalList(actions)],
       ["Limit", operationLimit],
       ["Spending ceiling", spending],
       ["Main wallet key", "Stays inside Bloom"]
     ],
-    title: app === "Pump.fun" ? "Finish Pump.fun session setup" : "Finish temporary session setup",
-    button: app === "Pump.fun" ? "Finish Pump.fun setup" : "Finish session setup",
+    title: "Finish temporary session setup",
+    button: "Finish session setup",
     warning: `${app} creates transactions within these permissions. If the app is compromised, it could use the remaining session capacity before the timer expires.`
   };
 }

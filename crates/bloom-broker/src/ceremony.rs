@@ -1161,6 +1161,7 @@ impl CeremonyBroker {
         now_ms: u64,
         backoff_clock: BackoffClock,
     ) -> Result<(), ProtocolError> {
+        self.expire_sessions(now_ms)?;
         let ceremony_id = self
             .inner
             .operations
