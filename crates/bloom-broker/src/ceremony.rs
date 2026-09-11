@@ -1107,6 +1107,7 @@ impl CeremonyBroker {
     }
 
     pub fn cancel(&self, operation_id: &OperationId, now_ms: u64) -> Result<(), ProtocolError> {
+        self.expire_sessions(now_ms)?;
         let ceremony_id = self
             .inner
             .operations
