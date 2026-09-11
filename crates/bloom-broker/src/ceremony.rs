@@ -34,19 +34,28 @@ use bloom_signer_api::{
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use parking_lot::Mutex;
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng as _, rngs::SysRng};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::HashMap,
-    future::Future,
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener},
+    future::{Future, IntoFuture},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
     path::Path as FsPath,
     sync::Arc,
 };
 
-pub const CEREMONY_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_734);
+/// Canonical IPv4 loopback ceremony listener address.
+pub const CEREMONY_ADDR_V4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_734);
+/// Canonical IPv6 loopback ceremony listener address. Chromium and many
+/// other modern browsers resolve `localhost` to `::1` before `127.0.0.1`,
+/// so the canonical ceremony origin is reachable only when the Broker also
+/// binds the IPv6 loopback family explicitly.
+pub const CEREMONY_ADDR_V6: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 18_734);
+/// Every address on which the canonical ceremony listener may be reached.
+/// A listener on any address outside this set is refused at acquisition.
+pub const CEREMONY_LOOPBACK_ADDRS: [SocketAddr; 2] = [CEREMONY_ADDR_V4, CEREMONY_ADDR_V6];
 pub const CEREMONY_ORIGIN: &str = "http://localhost:18734";
 pub const MAX_CEREMONY_BODY_BYTES: usize = 16 * 1024;
 pub const CEREMONY_OWNER_HEADER: &str = "x-bloom-ceremony-owner";
@@ -435,6 +444,34 @@ pub struct CeremonyBroker {
     inner: Arc<BrokerInner>,
 }
 
+#[derive(Clone, Copy)]
+enum BackoffClock {
+    Trusted,
+    Monotonic,
+}
+
+#[derive(Clone, Copy)]
+enum BackoffDeadline {
+    Trusted(u64),
+    Monotonic(std::time::Instant),
+}
+
+impl BackoffDeadline {
+    fn remaining_ms(self, trusted_now_ms: u64) -> u64 {
+        match self {
+            Self::Trusted(until_ms) => until_ms.saturating_sub(trusted_now_ms),
+            Self::Monotonic(until) => until
+                .checked_duration_since(std::time::Instant::now())
+                .map(|remaining| {
+                    u64::try_from(remaining.as_millis())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(u64::from(remaining.subsec_nanos() % 1_000_000 != 0))
+                })
+                .unwrap_or(0),
+        }
+    }
+}
+
 struct BrokerInner {
     signer: Arc<dyn CeremonySigner>,
     limits: CeremonyLimits,
@@ -443,7 +480,7 @@ struct BrokerInner {
     creation_admission: Mutex<()>,
     sessions: Mutex<HashMap<String, BrowserSession>>,
     operations: Mutex<HashMap<OperationId, String>>,
-    cancellation_backoff: Mutex<HashMap<Token, (u32, u64)>>,
+    cancellation_backoff: Mutex<HashMap<Token, (u32, BackoffDeadline)>>,
     invalid_attempts: Mutex<HashMap<IpAddr, u32>>,
     database: Option<Arc<std::sync::Mutex<Connection>>>,
     journal: Option<Arc<BrokerJournal>>,
@@ -743,6 +780,18 @@ impl CeremonyBroker {
         request: CustodyPrepareRequest,
         now_ms: u64,
     ) -> Result<CustodyPrepareResponse, ProtocolError> {
+        self.prepare_custody_reviewed(request, None, now_ms)
+    }
+
+    /// [`Self::prepare_custody`] with a broker-authored review JSON the
+    /// browser shows for account ceremonies: the owner approves the exact
+    /// families, roles and frozen path templates before any key exists.
+    pub fn prepare_custody_reviewed(
+        &self,
+        request: CustodyPrepareRequest,
+        account_review: Option<serde_json::Value>,
+        now_ms: u64,
+    ) -> Result<CustodyPrepareResponse, ProtocolError> {
         self.expire_sessions(now_ms)?;
         request
             .validate_legacy_passkey_migration_binding()
@@ -809,29 +858,12 @@ impl CeremonyBroker {
             anonymous_registration,
             ceremony_kind: request.ceremony_kind,
             ceremony_id: ceremony_id.clone(),
-            review_manifest: if let Some(migration) = &request.legacy_passkey_migration {
-                Some(serde_json::json!({
-                    "schema": "bloom.legacy_passkey_migration_review.v1",
-                    "title": "Import existing passkey wallet into Triad custody",
-                    "wallet_name": migration.wallet_name,
-                    "address": migration.address,
-                    "public_key_fingerprint": migration.public_key_fingerprint,
-                    "credential_id_fingerprint": migration.credential_id_fingerprint,
-                    "legacy_format_version": migration.legacy_format_version,
-                    "bundle_digest": migration.bundle_digest,
-                    "policy_mode": migration.policy_mode,
-                    "existing_passkey_remains_authority": true,
-                    "creates_current_wkek_custody": true,
-                    "legacy_policy_is_not_imported": true
-                }))
-            } else {
-                request
-                    .petal_key_scope
-                    .as_ref()
-                    .map(serde_json::to_value)
-                    .transpose()
-                    .map_err(malformed)?
-            },
+            review_manifest: custody_review_manifest(
+                &request,
+                prepared.contribution.wallet_id.as_ref(),
+                anonymous_registration,
+                account_review,
+            )?,
             challenges: prepared.challenges,
             signer_contribution: serde_json::to_value(prepared.contribution).map_err(malformed)?,
             webauthn_options: prepared.webauthn_options,
@@ -1014,8 +1046,13 @@ impl CeremonyBroker {
     pub fn pending_approval_ceremony(
         &self,
         approval_id: &Digest32,
-    ) -> Option<(String, DecimalU64)> {
-        self.inner.sessions.lock().values().find_map(|session| {
+        now_ms: u64,
+    ) -> Result<Option<(String, DecimalU64)>, ProtocolError> {
+        // Status/list requests are a lifecycle boundary just like opening the
+        // browser. Sweep first so an owner who never opened the page cannot
+        // leave an expired AwaitingUser row masquerading as a live URL.
+        self.expire_sessions(now_ms)?;
+        Ok(self.inner.sessions.lock().values().find_map(|session| {
             if session.ceremony_kind != CeremonyKind::SealedApproval
                 || session.state != CeremonyState::AwaitingUser
             {
@@ -1034,7 +1071,40 @@ impl CeremonyBroker {
                 .token
                 .as_ref()
                 .map(|token| (session_url(token), DecimalU64::new(session.expires_at_ms)))
-        })
+        }))
+    }
+
+    /// True when every owner ceremony minted for this approval died without
+    /// activating it. No URL exists for the owner and none can appear, so a
+    /// caller waiting on this approval is waiting on nothing.
+    ///
+    /// A completed ceremony is deliberately not counted: that approval is on
+    /// its way to `Active`, and reporting it dead would strand a signature the
+    /// owner already authorised.
+    pub fn approval_ceremony_unreachable(&self, approval_id: &Digest32) -> bool {
+        let mut saw_ceremony = false;
+        for session in self.inner.sessions.lock().values() {
+            if session.ceremony_kind != CeremonyKind::SealedApproval {
+                continue;
+            }
+            let manifest_approval_id = session
+                .projection
+                .review_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.get("approval_id"))
+                .and_then(|value| value.as_str());
+            if manifest_approval_id != Some(approval_id.as_str()) {
+                continue;
+            }
+            if !matches!(
+                session.state,
+                CeremonyState::Cancelled | CeremonyState::Expired | CeremonyState::Failed
+            ) {
+                return false;
+            }
+            saw_ceremony = true;
+        }
+        saw_ceremony
     }
 
     pub fn completed_policy_update(
@@ -1074,6 +1144,24 @@ impl CeremonyBroker {
     }
 
     pub fn cancel(&self, operation_id: &OperationId, now_ms: u64) -> Result<(), ProtocolError> {
+        self.cancel_with_backoff(operation_id, now_ms, BackoffClock::Trusted)
+    }
+
+    fn cancel_from_browser(
+        &self,
+        operation_id: &OperationId,
+        now_ms: u64,
+    ) -> Result<(), ProtocolError> {
+        self.cancel_with_backoff(operation_id, now_ms, BackoffClock::Monotonic)
+    }
+
+    fn cancel_with_backoff(
+        &self,
+        operation_id: &OperationId,
+        now_ms: u64,
+        backoff_clock: BackoffClock,
+    ) -> Result<(), ProtocolError> {
+        self.expire_sessions(now_ms)?;
         let ceremony_id = self
             .inner
             .operations
@@ -1084,10 +1172,25 @@ impl CeremonyBroker {
         let (wallet_id, snapshot) = {
             let sessions = self.inner.sessions.lock();
             let session = sessions.get(&ceremony_id).ok_or_else(not_found)?;
+            // A ceremony that died without ever committing is already what a
+            // caller asking to cancel wants it to be, so report success rather
+            // than an error it cannot act on. Refusing here strands the caller:
+            // the operation can no longer be completed *or* abandoned, and the
+            // only way out is editing durable state by hand.
+            if matches!(
+                session.state,
+                CeremonyState::Cancelled | CeremonyState::Expired | CeremonyState::Failed
+            ) && session.terminal_result.is_none()
+            {
+                return Ok(());
+            }
+            // Anything that reached the wallet is a different matter: it may
+            // have taken effect, and reporting it cancelled would misdescribe
+            // what happened.
             if session.state != CeremonyState::AwaitingUser {
                 return Err(protocol(
                     ProtocolErrorCode::OperationIdConflict,
-                    "terminal ceremony cannot be cancelled",
+                    "ceremony is past the point where it can be cancelled",
                 ));
             }
             let mut snapshot = session.clone();
@@ -1102,7 +1205,7 @@ impl CeremonyBroker {
         self.persist_session(&snapshot)?;
         self.inner.sessions.lock().insert(ceremony_id, snapshot);
         if let Some(wallet_id) = &wallet_id {
-            self.record_backoff(wallet_id, now_ms);
+            self.record_backoff(wallet_id, now_ms, backoff_clock);
         }
         Ok(())
     }
@@ -1118,16 +1221,9 @@ impl CeremonyBroker {
             .lock()
             .iter()
             .filter(|(_, session)| !is_terminal(session.state))
-            .map(|(id, session)| {
-                (
-                    id.clone(),
-                    session.operation_id.clone(),
-                    session.state,
-                    session.wallet_id.clone(),
-                )
-            })
+            .map(|(id, session)| (id.clone(), session.operation_id.clone(), session.state))
             .collect::<Vec<_>>();
-        for (ceremony_id, operation_id, state, wallet_id) in live {
+        for (ceremony_id, operation_id, state) in live {
             if state == CeremonyState::WalletCommitted {
                 self.sweep_committed_session(&ceremony_id, now_ms)?;
                 continue;
@@ -1157,11 +1253,9 @@ impl CeremonyBroker {
             };
             self.persist_session(&snapshot)?;
             self.inner.sessions.lock().insert(ceremony_id, snapshot);
-            if state == CeremonyState::AwaitingUser
-                && let Some(wallet_id) = &wallet_id
-            {
-                self.record_backoff(wallet_id, now_ms);
-            }
+            // Losing the authenticated Machine session is infrastructure
+            // cleanup, not an owner cancellation. Counting it as one lets
+            // routine restarts exponentially lock a wallet out of ceremonies.
         }
         Ok(())
     }
@@ -1269,11 +1363,7 @@ impl CeremonyBroker {
                 }
                 snapshot
             };
-            if state == CeremonyState::Expired {
-                if let Some(wallet_id) = &snapshot.wallet_id {
-                    self.record_backoff(wallet_id, now_ms);
-                }
-            } else if state == CeremonyState::WalletCommitted {
+            if state == CeremonyState::WalletCommitted {
                 validate_completion_identity(
                     snapshot.ceremony_kind,
                     &snapshot.operation_id,
@@ -1293,49 +1383,71 @@ impl CeremonyBroker {
         Ok(())
     }
 
-    /// Acquire the canonical ceremony listener for this platform.
+    /// Acquire the canonical ceremony listener pair for this platform.
     ///
-    /// macOS binds it directly. Linux always consumes the listener its launch
-    /// manager inherited, including under `triad-dev-harness`: that feature
-    /// selects which identity and manifest are loaded, not how a Linux service
-    /// acquires its socket. This lives in the library rather than the binary
-    /// so the inherited-listener path is directly testable.
+    /// The canonical ceremony origin is `http://localhost:18734`, and Chromium
+    /// resolves `localhost` to `::1` before `127.0.0.1`, so the Broker must
+    /// own both the IPv4 and the IPv6 loopback socket on the canonical port.
+    /// macOS binds them directly. Linux always consumes the listeners its
+    /// launch manager inherited, including under `triad-dev-harness`: that
+    /// feature selects which identity and manifest are loaded, not how a
+    /// Linux service acquires its sockets. This lives in the library rather
+    /// than the binary so the inherited-listener path is directly testable.
+    ///
+    /// The pair is returned in canonical order: IPv4 first, IPv6 second.
+    /// Callers must serve both listeners concurrently; the ceremony origin
+    /// resolves to whichever family the browser chose.
     #[cfg(target_os = "macos")]
-    pub fn acquire_canonical_listener(
-        _activation_name: &str,
-    ) -> Result<StdTcpListener, ProtocolError> {
-        Self::bind_canonical()
+    pub fn acquire_canonical_loopback_listeners(
+        _v4_activation_name: &str,
+        _v6_activation_name: &str,
+    ) -> Result<(StdTcpListener, StdTcpListener), ProtocolError> {
+        Self::bind_canonical_loopback()
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub fn acquire_canonical_listener(
-        activation_name: &str,
-    ) -> Result<StdTcpListener, ProtocolError> {
-        let listener =
-            bloom_service_activation::take_tcp_listener(activation_name).map_err(|error| {
+    pub fn acquire_canonical_loopback_listeners(
+        v4_activation_name: &str,
+        v6_activation_name: &str,
+    ) -> Result<(StdTcpListener, StdTcpListener), ProtocolError> {
+        let v4 = bloom_service_activation::take_tcp_listener(v4_activation_name).map_err(
+            |error| {
                 protocol(
                     ProtocolErrorCode::ServiceUnavailable,
                     format!(
-                        "no inherited ceremony listener named {activation_name:?}; this service \
-                         is socket-activated and will not bind a listener itself: {error}"
+                        "no inherited IPv4 ceremony listener named {v4_activation_name:?}; this service is socket-activated and will not bind a listener itself: {error}"
                     ),
                 )
-            })?;
-        Self::require_canonical_listener(listener)
+            },
+        )?;
+        let v6 = bloom_service_activation::take_tcp_listener(v6_activation_name).map_err(
+            |error| {
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!(
+                        "no inherited IPv6 ceremony listener named {v6_activation_name:?}; this service is socket-activated and will not bind a listener itself: {error}"
+                    ),
+                )
+            },
+        )?;
+        let v4 = Self::require_canonical_loopback_listener(v4, CEREMONY_ADDR_V4)?;
+        let v6 = Self::require_canonical_loopback_listener(v6, CEREMONY_ADDR_V6)?;
+        Ok((v4, v6))
     }
 
     /// Verify that an already-acquired listener is the canonical ceremony
-    /// socket.
+    /// socket for `expected_family`.
     ///
     /// An inherited listener is supplied by the launch manager rather than
     /// chosen by this process, so its address is an input to be checked, not
-    /// an invariant to be assumed. A descriptor bound to any other address is
-    /// refused outright: the ceremony origin, the `Host` header check, and the
-    /// browser's same-origin expectations are all pinned to
-    /// [`CEREMONY_ADDR`], so serving on a different address would silently
-    /// break them rather than fail closed.
-    pub fn require_canonical_listener(
+    /// an invariant to be assumed. A descriptor bound to any other address
+    /// is refused outright: the ceremony origin, the `Host` header check,
+    /// and the browser's same-origin expectations are all pinned to
+    /// [`CEREMONY_LOOPBACK_ADDRS`], so serving on a different address would
+    /// silently break them rather than fail closed.
+    pub fn require_canonical_loopback_listener(
         listener: StdTcpListener,
+        expected_family: SocketAddr,
     ) -> Result<StdTcpListener, ProtocolError> {
         let observed = listener.local_addr().map_err(|error| {
             protocol(
@@ -1343,12 +1455,19 @@ impl CeremonyBroker {
                 format!("inherited ceremony listener has no readable address: {error}"),
             )
         })?;
-        if observed != CEREMONY_ADDR {
+        if !CEREMONY_LOOPBACK_ADDRS.contains(&observed) {
             return Err(protocol(
                 ProtocolErrorCode::ServiceUnavailable,
                 format!(
-                    "inherited ceremony listener is bound to {observed}, not the canonical \
-                     {CEREMONY_ADDR}; no other address will be served"
+                    "inherited ceremony listener is bound to {observed}; expected one of {CEREMONY_LOOPBACK_ADDRS:?} but no other address will be served"
+                ),
+            ));
+        }
+        if observed != expected_family {
+            return Err(protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                format!(
+                    "inherited ceremony listener for {expected_family} is bound to {observed}; addresses cannot be cross-paired across loopback families"
                 ),
             ));
         }
@@ -1361,14 +1480,20 @@ impl CeremonyBroker {
         Ok(listener)
     }
 
-    /// Exclusively acquire the canonical socket. There is deliberately no
-    /// fallback address or port.
-    pub fn bind_canonical() -> Result<StdTcpListener, ProtocolError> {
-        let listener = StdTcpListener::bind(CEREMONY_ADDR).map_err(|error| {
+    /// Exclusively acquire both canonical loopback sockets. There is
+    /// deliberately no fallback address or port.
+    pub fn bind_canonical_loopback() -> Result<(StdTcpListener, StdTcpListener), ProtocolError> {
+        let v4 = Self::bind_loopback_one(CEREMONY_ADDR_V4)?;
+        let v6 = Self::bind_loopback_one(CEREMONY_ADDR_V6)?;
+        Ok((v4, v6))
+    }
+
+    fn bind_loopback_one(addr: SocketAddr) -> Result<StdTcpListener, ProtocolError> {
+        let listener = StdTcpListener::bind(addr).map_err(|error| {
             protocol(
                 ProtocolErrorCode::ServiceUnavailable,
                 format!(
-                    "fatal canonical ceremony listener ownership conflict at {CEREMONY_ADDR}; no fallback port will be used: {error}"
+                    "cannot bind canonical ceremony listener at {addr}; no fallback port will be used: {error}"
                 ),
             )
         })?;
@@ -1381,62 +1506,83 @@ impl CeremonyBroker {
         Ok(listener)
     }
 
-    pub async fn serve_canonical(self) -> Result<(), ProtocolError> {
-        let listener = Self::bind_canonical()?;
-        self.serve_listener(listener).await
-    }
-
-    pub async fn serve_canonical_until<F>(self, shutdown: F) -> Result<(), ProtocolError>
+    /// Bind and serve both canonical loopback listeners until `shutdown`
+    /// resolves. macOS-only.
+    pub async fn serve_canonical_loopback_until<F>(self, shutdown: F) -> Result<(), ProtocolError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let listener = Self::bind_canonical()?;
-        self.serve_listener_until(listener, shutdown).await
+        let (v4, v6) = Self::bind_canonical_loopback()?;
+        self.serve_loopback_listeners_until(v4, v6, shutdown).await
     }
 
-    /// Accept a canonical listener inherited from a launch/socket activation
-    /// manager. A listener for any other address is rejected.
-    pub async fn serve_listener(self, listener: StdTcpListener) -> Result<(), ProtocolError> {
-        self.serve_listener_until(listener, std::future::pending())
-            .await
-    }
-
-    pub async fn serve_listener_until<F>(
+    /// Serve an already-acquired pair of canonical loopback listeners until
+    /// `shutdown` resolves. Linux uses this with descriptors inherited from
+    /// the launch manager; tests use it with synthesized listeners. Both
+    /// listeners run under one graceful shutdown. If either server exits,
+    /// its peer is also asked to stop so the pair cannot strand shutdown.
+    pub async fn serve_loopback_listeners_until<F>(
         self,
-        listener: StdTcpListener,
+        v4: StdTcpListener,
+        v6: StdTcpListener,
         shutdown: F,
     ) -> Result<(), ProtocolError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        if listener
-            .local_addr()
-            .map_err(|error| protocol(ProtocolErrorCode::ServiceUnavailable, error.to_string()))?
-            != CEREMONY_ADDR
-        {
-            return Err(protocol(
-                ProtocolErrorCode::ServiceUnavailable,
-                "inherited ceremony listener is not the canonical listener",
-            ));
-        }
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| protocol(ProtocolErrorCode::ServiceUnavailable, error.to_string()))?;
-        let listener = tokio::net::TcpListener::from_std(listener).map_err(|error| {
+        let v4 = Self::require_canonical_loopback_listener(v4, CEREMONY_ADDR_V4)?;
+        let v6 = Self::require_canonical_loopback_listener(v6, CEREMONY_ADDR_V6)?;
+        let router = self.router();
+        let v4 = tokio::net::TcpListener::from_std(v4).map_err(|error| {
             protocol(
                 ProtocolErrorCode::ServiceUnavailable,
-                format!("canonical ceremony listener handoff failed: {error}"),
+                format!("canonical IPv4 ceremony listener handoff failed: {error}"),
             )
         })?;
-        axum::serve(listener, self.router())
-            .with_graceful_shutdown(shutdown)
-            .await
+        let v6 = tokio::net::TcpListener::from_std(v6).map_err(|error| {
+            protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                format!("canonical IPv6 ceremony listener handoff failed: {error}"),
+            )
+        })?;
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let wait_for_stop = |mut stop: tokio::sync::watch::Receiver<bool>| async move {
+            while !*stop.borrow() && stop.changed().await.is_ok() {}
+        };
+        let v4_router = router.clone();
+        let v6_router = router;
+        let v4_server = axum::serve(v4, v4_router)
+            .with_graceful_shutdown(wait_for_stop(stop_rx.clone()))
+            .into_future();
+        let v6_server = axum::serve(v6, v6_router)
+            .with_graceful_shutdown(wait_for_stop(stop_rx))
+            .into_future();
+        tokio::pin!(v4_server, v6_server, shutdown);
+
+        let (v4_result, v6_result) = tokio::select! {
+            () = &mut shutdown => {
+                let _ = stop_tx.send(true);
+                tokio::join!(&mut v4_server, &mut v6_server)
+            }
+            result = &mut v4_server => {
+                let _ = stop_tx.send(true);
+                (result, v6_server.await)
+            }
+            result = &mut v6_server => {
+                let _ = stop_tx.send(true);
+                (v4_server.await, result)
+            }
+        };
+        v4_result
+            .and(v6_result)
             .map_err(|error| protocol(ProtocolErrorCode::ServiceUnavailable, error.to_string()))
     }
 
     fn new_session(&self, new: NewBrowserSession) -> Result<BrowserSession, ProtocolError> {
         let mut token_bytes = [0_u8; 32];
-        OsRng.fill_bytes(&mut token_bytes);
+        SysRng
+            .try_fill_bytes(&mut token_bytes)
+            .expect("OS randomness unavailable");
         Ok(BrowserSession {
             operation_id: new.operation_id.clone(),
             request_digest: new.request_digest,
@@ -1552,23 +1698,23 @@ impl CeremonyBroker {
             let mut backoffs = self.inner.cancellation_backoff.lock();
             if backoffs
                 .get(wallet_id)
-                .is_some_and(|(_, until)| *until <= now_ms)
+                .is_some_and(|(_, deadline)| deadline.remaining_ms(now_ms) == 0)
             {
                 // Backoff is a cooldown, not durable strike history.  Leaving
                 // the old count here made every later cancellation escalate
                 // forever until the Broker process restarted.
                 backoffs.remove(wallet_id);
             }
-            if let Some((strikes, until)) = backoffs
+            if let Some((strikes, deadline)) = backoffs
                 .get(wallet_id)
                 .copied()
-                .filter(|(_, until)| *until > now_ms)
+                .filter(|(_, deadline)| deadline.remaining_ms(now_ms) > 0)
             {
                 // Same code, same structured contract as the rolling quotas: a
                 // caller acts on the metadata, never on the message. The
                 // cooldown admits one creation once it elapses, so its limit
                 // is 1 over a window of the current backoff.
-                let remaining_ms = until.saturating_sub(now_ms);
+                let remaining_ms = deadline.remaining_ms(now_ms);
                 let message = format!(
                     "wallet ceremony is in cancellation backoff; retry after {remaining_ms} ms"
                 );
@@ -1677,17 +1823,21 @@ impl CeremonyBroker {
         }))
     }
 
-    fn record_backoff(&self, wallet_id: &Token, now_ms: u64) {
+    fn record_backoff(&self, wallet_id: &Token, now_ms: u64, clock: BackoffClock) {
         let mut backoffs = self.inner.cancellation_backoff.lock();
-        let (count, _) = backoffs.get(wallet_id).copied().unwrap_or((0, 0));
+        let (count, _) = backoffs
+            .get(wallet_id)
+            .copied()
+            .unwrap_or((0, BackoffDeadline::Trusted(0)));
         let next_count = count.saturating_add(1);
-        backoffs.insert(
-            wallet_id.clone(),
-            (
-                next_count,
-                now_ms.saturating_add(backoff_window_ms(next_count)),
+        let window_ms = backoff_window_ms(next_count);
+        let deadline = match clock {
+            BackoffClock::Trusted => BackoffDeadline::Trusted(now_ms.saturating_add(window_ms)),
+            BackoffClock::Monotonic => BackoffDeadline::Monotonic(
+                std::time::Instant::now() + std::time::Duration::from_millis(window_ms),
             ),
-        );
+        };
+        backoffs.insert(wallet_id.clone(), (next_count, deadline));
     }
 
     fn reload_and_reconcile_nonterminal(&self) -> Result<(), ProtocolError> {
@@ -1840,8 +1990,12 @@ impl CeremonyBroker {
             manifest.petal_use_claim.as_ref(),
             manifest.system_use_claim.as_ref(),
         );
-        let mut canonical_plan =
-            canonical_review_plan(request, &disclosures, manifest.petal_use_claim.as_ref())?;
+        let mut canonical_plan = canonical_review_plan(
+            request,
+            &disclosures,
+            manifest.petal_use_claim.as_ref(),
+            manifest.system_use_claim.as_ref(),
+        )?;
         if !manifest.attributed_advisory_items.is_empty() {
             canonical_plan.push('\n');
             canonical_plan.push_str(&manifest.attributed_advisory_items.join("\n"));
@@ -1884,8 +2038,12 @@ impl CeremonyBroker {
             context.petal_use_claim.as_ref(),
             context.system_use_claim.as_ref(),
         );
-        let mut canonical_plan =
-            canonical_review_plan(request, &disclosures, context.petal_use_claim.as_ref())?;
+        let mut canonical_plan = canonical_review_plan(
+            request,
+            &disclosures,
+            context.petal_use_claim.as_ref(),
+            context.system_use_claim.as_ref(),
+        )?;
         if !context.attributed_advisory_items.is_empty() {
             canonical_plan.push('\n');
             canonical_plan.push_str(&context.attributed_advisory_items.join("\n"));
@@ -2533,7 +2691,15 @@ async fn cancel_session(
         .get(&ceremony_id)
         .map(|session| session.operation_id.clone());
     match operation {
-        Some(operation) if broker.cancel(&operation, unix_time_ms()).is_ok() => {
+        // Browser wall time and the Broker's trusted clock can diverge while
+        // the latter is being repaired. The in-memory cancellation throttle
+        // therefore uses elapsed monotonic time; the terminal audit timestamp
+        // remains ordinary wall time like the other browser transitions.
+        Some(operation)
+            if broker
+                .cancel_from_browser(&operation, unix_time_ms())
+                .is_ok() =>
+        {
             StatusCode::NO_CONTENT.into_response()
         }
         Some(_) => StatusCode::CONFLICT.into_response(),
@@ -2586,7 +2752,7 @@ impl CeremonyBroker {
         self.expire_sessions(unix_time_ms())?;
         validate_host(headers)?;
         if mutation {
-            require_exact_header(headers, header::ORIGIN, CEREMONY_ORIGIN)?;
+            validate_origin(headers)?;
             require_exact_header(headers, header::CONTENT_TYPE, "application/json")?;
             require_exact_header_name(headers, "sec-fetch-site", "same-origin")?;
         }
@@ -2663,6 +2829,10 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
 
 fn validate_host(headers: &HeaderMap) -> Result<(), ProtocolError> {
     require_exact_header(headers, header::HOST, "localhost:18734")
+}
+
+fn validate_origin(headers: &HeaderMap) -> Result<(), ProtocolError> {
+    require_exact_header(headers, header::ORIGIN, CEREMONY_ORIGIN)
 }
 
 fn require_exact_header(
@@ -2797,10 +2967,49 @@ fn digest(value: &impl Serialize) -> Result<Digest32, ProtocolError> {
     ))
 }
 
+/// The browser-visible review of one account ceremony: every requested
+/// family with its role, frozen path template, and key material shape. Signer
+/// chooses the account number.
+pub(crate) fn account_terms_review(
+    kind: &bloom_broker_api::CeremonyKind,
+    terms: &bloom_broker_api::AccountTerms,
+) -> serde_json::Value {
+    let families: Vec<serde_json::Value> = terms
+        .derivations
+        .iter()
+        .map(|request| {
+            let profile = request.derivation_profile;
+            serde_json::json!({
+                "derivation_profile": profile,
+                "requested_role": request.requested_role,
+                "pinned_account": request.account,
+                "path_template": profile.path_template(),
+                "key_spec": profile.key_spec(),
+                "allowed_crypto_suites": profile.frozen_crypto_suites(),
+            })
+        })
+        .collect();
+    let title = match kind {
+        bloom_broker_api::CeremonyKind::AccountRetire => "Retire one derived account key",
+        _ => "Allocate account key(s)",
+    };
+    serde_json::json!({
+        "schema": "bloom.account_terms_review.v1",
+        "title": title,
+        "wallet_id": terms.wallet_id,
+        "seed_profile": terms.seed_profile,
+        "families": families,
+        "retire_key_fingerprint": terms.retire_key_fingerprint,
+        "policy_version": terms.policy_version,
+        "revocation_epoch": terms.revocation_epoch,
+    })
+}
+
 fn canonical_review_plan(
     request: &CeremonyPrepareRequest,
     security_disclosures: &[String],
     claim: Option<&PetalUseClaim>,
+    system_claim: Option<&SystemUseClaim>,
 ) -> Result<String, ProtocolError> {
     #[derive(Serialize)]
     struct AssetAmountReview {
@@ -2823,6 +3032,34 @@ fn canonical_review_plan(
         security_disclosures: &'a [String],
     }
     let mut asset_amounts = Vec::new();
+    // A system claim declares the same amounts a Petal claim does. Reading
+    // only the Petal claim left system operations — an ordinary transaction
+    // confirmation among them — rendering as bare digests, so the owner was
+    // asked to approve a transfer without being shown its value or
+    // destination.
+    if let Some(system) = system_claim {
+        asset_amounts.extend(system.declared_debits.iter().map(|debit| {
+            review_asset_amount(
+                "declared_debit",
+                debit.asset.chain.as_str(),
+                &debit.asset.asset,
+                debit.amount.as_str(),
+            )
+        }));
+        if let bloom_broker_api::DeclaredFee::Fee {
+            chain,
+            asset,
+            amount,
+        } = &system.declared_fee
+        {
+            asset_amounts.push(review_asset_amount(
+                "declared_fee",
+                chain.as_str(),
+                asset,
+                amount.as_str(),
+            ));
+        }
+    }
     if let Some(claim) = claim {
         asset_amounts.extend(claim.declared_debits.iter().map(|debit| {
             review_asset_amount(
@@ -2846,6 +3083,17 @@ fn canonical_review_plan(
             ));
         }
     }
+    // A reusable approval's value limits are its spending ceiling: the Broker
+    // sums every debit and fee per asset against them and refuses any asset
+    // without one. The owner must see that ceiling, not only the raw terms.
+    asset_amounts.extend(request.terms.limits.value_limits.iter().map(|limit| {
+        review_asset_amount(
+            "value_limit",
+            limit.asset.chain.as_str(),
+            &limit.asset.asset,
+            limit.lifetime.as_str(),
+        )
+    }));
 
     fn review_asset_amount(
         kind: &'static str,
@@ -3194,4 +3442,172 @@ fn rolling_quota_exhausted(
         Some(details) => ProtocolError::rate_limited(message, details),
         None => protocol(ProtocolErrorCode::CeremonyRateLimited, message),
     }
+}
+
+/// One line naming the operation, and one line stating its consequence.
+///
+/// Deliberately plain: the owner is being asked to authorize custody with a
+/// hardware credential, and the only honest basis for that is a sentence they
+/// can actually read.
+fn custody_review_text(kind: CeremonyKind) -> (&'static str, &'static str) {
+    match kind {
+        CeremonyKind::WalletRegistration => (
+            "Create a new wallet",
+            "Signer creates custody for a new wallet and binds the passkey you are about to \
+             use as its authority. No existing wallet is changed.",
+        ),
+        CeremonyKind::WalletImport => (
+            "Import an existing wallet",
+            "Signer takes custody of a private key you supply in this browser. The key is \
+             entered here and never passes through the Machine process.",
+        ),
+        CeremonyKind::WalletExport => (
+            "Export wallet secret material",
+            "Signer releases this wallet's secret material to this browser. Anyone who \
+             obtains it controls the wallet.",
+        ),
+        CeremonyKind::WalletDelete => (
+            "Permanently delete a wallet",
+            "Signer destroys this wallet's custody. This cannot be undone, and Bloom cannot \
+             recover the wallet or anything it holds afterwards.",
+        ),
+        CeremonyKind::WalletRecovery => (
+            "Recover a wallet",
+            "Signer restores custody for this wallet from recovery material you supply in \
+             this browser.",
+        ),
+        CeremonyKind::CredentialAdd => (
+            "Add a passkey to a wallet",
+            "The passkey you are about to use becomes an additional authority for this \
+             wallet. Existing credentials keep working.",
+        ),
+        CeremonyKind::CredentialReplace => (
+            "Replace a wallet's passkey",
+            "The passkey you are about to use replaces the current credential for this \
+             wallet. The wallet address does not change.",
+        ),
+        CeremonyKind::CredentialRemove => (
+            "Remove a passkey from a wallet",
+            "This credential stops being an authority for this wallet. Removing your only \
+             credential leaves the wallet unusable.",
+        ),
+        CeremonyKind::BackendEnrollment => (
+            "Enroll a signing backend",
+            "Signer enrolls a signing backend for this wallet.",
+        ),
+        CeremonyKind::AccountAllocate => (
+            "Allocate a derived account",
+            "Signer derives a new account under this wallet's root and publishes its public \
+             key. The wallet's existing accounts are unaffected.",
+        ),
+        CeremonyKind::AccountRetire => (
+            "Retire a derived account",
+            "Signer retires the account named below. Bloom stops projecting it and will not \
+             select it for signing.",
+        ),
+        CeremonyKind::KeyDerive => (
+            "Create a temporary Petal key",
+            "Allow an installed Petal to use a temporary child key for only the listed actions \
+             and time. No funds move now, and the wallet's main key remains in Signer.",
+        ),
+        // Rejected earlier in custody preparation and reviewed by their own
+        // paths; named so this match stays exhaustive.
+        CeremonyKind::SealedApproval => (
+            "Approve an action",
+            "Authorize the exact action described below.",
+        ),
+        CeremonyKind::PolicyUpdate => (
+            "Update wallet policy",
+            "Replace this wallet's spending policy with the one described below.",
+        ),
+    }
+}
+
+/// Build the human-readable review a custody ceremony page renders.
+///
+/// The browser shows `review_manifest` when the session carries one and
+/// otherwise falls back to dumping the raw Signer contribution. Returning
+/// `None` therefore asks an owner to authorize custody against a page of
+/// base64, which is not consent in any meaningful sense, so every kind gets a
+/// manifest. Legacy passkey migration keeps its more specific review.
+///
+/// This is what the page displays. The value the passkey binds is the Signer
+/// contribution's own `review_manifest_digest`, so this text must describe
+/// that operation faithfully rather than stand in for it.
+fn custody_review_manifest(
+    request: &CustodyPrepareRequest,
+    wallet_id: Option<&Token>,
+    anonymous_registration: bool,
+    account_review: Option<serde_json::Value>,
+) -> Result<Option<serde_json::Value>, ProtocolError> {
+    if let Some(migration) = &request.legacy_passkey_migration {
+        return Ok(Some(serde_json::json!({
+            "schema": "bloom.legacy_passkey_migration_review.v1",
+            "title": "Import existing passkey wallet into Triad custody",
+            "wallet_name": migration.wallet_name,
+            "address": migration.address,
+            "public_key_fingerprint": migration.public_key_fingerprint,
+            "credential_id_fingerprint": migration.credential_id_fingerprint,
+            "legacy_format_version": migration.legacy_format_version,
+            "bundle_digest": migration.bundle_digest,
+            "policy_mode": migration.policy_mode,
+            "existing_passkey_remains_authority": true,
+            "creates_current_wkek_custody": true,
+            "legacy_policy_is_not_imported": true
+        })));
+    }
+
+    // An account ceremony already has a review the Broker authored from the
+    // frozen account terms: every requested family with its role and path
+    // template. That is a more exact description than anything derivable from
+    // the custody request here, so it stands as written.
+    if account_review.is_some()
+        && matches!(
+            request.ceremony_kind,
+            CeremonyKind::AccountAllocate | CeremonyKind::AccountRetire
+        )
+    {
+        return Ok(account_review);
+    }
+
+    let (title, summary) = custody_review_text(request.ceremony_kind);
+
+    // The page renders `canonical_plan` as plain text and only falls back to
+    // dumping this object as JSON, so the prose form is what an owner
+    // actually reads. Identifiers are shown in full so they can be compared
+    // against what the CLI printed before the browser was opened.
+    let mut plan = format!("{title}\n\n{summary}\n\n");
+    if let Some(wallet) = wallet_id {
+        plan.push_str(&format!("Wallet name   {}\n", wallet.as_str()));
+    }
+    plan.push_str(&format!(
+        "Operation     {}\nCredential    {}\n",
+        request.custody_operation_id,
+        request.expected_input_class.as_str(),
+    ));
+    if request.key_ref.is_some() {
+        plan.push_str("Key           shown in full below\n");
+    }
+    if request.petal_key_scope.is_some() {
+        plan.push_str("Petal scope   shown in full below\n");
+    }
+
+    let mut manifest = serde_json::json!({
+        "schema": "bloom.custody_ceremony_review.v1",
+        "canonical_plan": plan,
+        "title": title,
+        "summary": summary,
+        "ceremony_kind": kind_to_machine(request.ceremony_kind),
+        "wallet_name": wallet_id.map(Token::as_str),
+        "operation_id": serde_json::to_value(&request.custody_operation_id).map_err(malformed)?,
+        "credential_input": request.expected_input_class.as_str(),
+        "creates_new_wallet": anonymous_registration,
+    });
+    if let Some(scope) = &request.petal_key_scope {
+        manifest["petal_key_scope"] = serde_json::to_value(scope).map_err(malformed)?;
+    }
+    if let Some(key_ref) = &request.key_ref {
+        manifest["key_ref"] = serde_json::to_value(key_ref).map_err(malformed)?;
+    }
+    Ok(Some(manifest))
 }

@@ -15,8 +15,8 @@ license = "MIT"
 
 [workspace.dependencies]
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "d72d038cff514c3b81de0514b6ad07c134359b4b" }
-bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "d72d038cff514c3b81de0514b6ad07c134359b4b" }
+bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "941dd376568b52ccd269ecf495bcff7dcd9af504" }
+bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "941dd376568b52ccd269ecf495bcff7dcd9af504" }
 bloom-solana-verify = { path = "crates/bloom-solana-verify" }
 bs58 = "0.5"
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
@@ -34,17 +34,17 @@ sha3 = "0.12"
 hex = "0.4"
 ed25519-dalek = "2"
 rusqlite = { version = "0.38", features = ["bundled"] }
-num-bigint = "0.4"
+num-bigint = "0.5"
 parking_lot = "0.12"
-p256 = { version = "0.13", features = ["ecdsa"] }
-rand = "0.8"
+p256 = { version = "0.14", features = ["ecdsa"] }
+rand = "0.10"
 thiserror = "2"
 tracing = "0.1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 zeroize = "1"
 ciborium = "0.2"
 config = { version = "0.15", default-features = false, features = ["json"] }
-hpke = { version = "0.11", features = ["x25519"] }
+hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
 chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 bip32 = { version = "0.5", features = ["secp256k1"] }
 k256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
