@@ -1813,6 +1813,52 @@ fn system_intent_approval_denies_a_changed_intent() {
 }
 
 #[test]
+fn system_intent_approval_denies_a_refresh_that_changes_only_the_fee() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (_, claim_one) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    let terms = system_intent_terms(&harness, &provenance, &claim_one, 110);
+    harness.activate_with_system_claim(&terms, &provenance, &claim_one);
+
+    // Same payer, destination and amount under a fresh blockhash; only the
+    // declared fee moves. The fee is part of the reviewed intent.
+    let (refreshed, mut refreshed_claim) =
+        solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x08; 32]);
+    refreshed_claim.declared_fee = DeclaredFee::Fee {
+        chain: token("solana"),
+        asset: "native".into(),
+        amount: DecimalU256::parse("10000").unwrap(),
+    };
+    assert_eq!(refreshed_claim.declared_debits, claim_one.declared_debits);
+    assert_eq!(
+        refreshed_claim.declared_destinations,
+        claim_one.declared_destinations
+    );
+    assert_ne!(
+        refreshed_claim.approval_intent_digest().unwrap(),
+        claim_one.approval_intent_digest().unwrap()
+    );
+    let refused = error_code(
+        harness
+            .authority
+            .authorize(&solana_input(
+                &terms,
+                &provenance,
+                operation(110),
+                &refreshed,
+                refreshed_claim,
+                &refreshed,
+                Some([0x01; 32]),
+            ))
+            .unwrap_err(),
+    );
+    assert!(
+        refused.contains("SYSTEM_CLAIM_MISMATCH"),
+        "a refreshed payload that changes only the declared fee must be denied: {refused}"
+    );
+}
+
+#[test]
 fn system_intent_terms_must_be_single_use_and_single_signature() {
     let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
     let provenance = harness.solana_provenance();
