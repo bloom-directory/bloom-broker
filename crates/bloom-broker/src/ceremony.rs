@@ -34,7 +34,7 @@ use bloom_signer_api::{
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use parking_lot::Mutex;
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng as _, rngs::SysRng};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1488,11 +1488,7 @@ impl CeremonyBroker {
     }
 
     fn bind_loopback_one(addr: SocketAddr) -> Result<StdTcpListener, ProtocolError> {
-        #[cfg(unix)]
-        let bound = Self::bind_loopback_reuse(addr);
-        #[cfg(not(unix))]
-        let bound = StdTcpListener::bind(addr);
-        let listener = bound.map_err(|error| {
+        let listener = StdTcpListener::bind(addr).map_err(|error| {
             protocol(
                 ProtocolErrorCode::ServiceUnavailable,
                 format!(
@@ -1507,27 +1503,6 @@ impl CeremonyBroker {
             )
         })?;
         Ok(listener)
-    }
-
-    /// Bind one loopback listener with `SO_REUSEADDR` set.
-    ///
-    /// Connections a previous lifecycle served can hold the port in
-    /// `TIME_WAIT` for up to a minute after every party closes, and a Broker
-    /// restarted inside that window must still acquire its canonical
-    /// listener — restart-after-serving is exactly when it is needed. The
-    /// flag only relaxes conflicts against sockets that are no longer
-    /// listening: a second live Broker still fails with `EADDRINUSE`, which
-    /// the W0 ownership test pins.
-    #[cfg(unix)]
-    fn bind_loopback_reuse(addr: SocketAddr) -> std::io::Result<StdTcpListener> {
-        use socket2::{Domain, Protocol, Socket, Type};
-
-        let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_reuse_address(true)?;
-        socket.bind(&addr.into())?;
-        // Matches std::net::TcpListener::bind's backlog.
-        socket.listen(128)?;
-        Ok(socket.into())
     }
 
     /// Bind and serve both canonical loopback listeners until `shutdown`
@@ -1604,7 +1579,9 @@ impl CeremonyBroker {
 
     fn new_session(&self, new: NewBrowserSession) -> Result<BrowserSession, ProtocolError> {
         let mut token_bytes = [0_u8; 32];
-        OsRng.fill_bytes(&mut token_bytes);
+        SysRng
+            .try_fill_bytes(&mut token_bytes)
+            .expect("OS randomness unavailable");
         Ok(BrowserSession {
             operation_id: new.operation_id.clone(),
             request_digest: new.request_digest,
@@ -3127,6 +3104,17 @@ fn canonical_review_plan(
             ));
         }
     }
+    // A reusable approval's value limits are its spending ceiling: the Broker
+    // sums every debit and fee per asset against them and refuses any asset
+    // without one. The owner must see that ceiling, not only the raw terms.
+    asset_amounts.extend(request.terms.limits.value_limits.iter().map(|limit| {
+        review_asset_amount(
+            "value_limit",
+            limit.asset.chain.as_str(),
+            &limit.asset.asset,
+            limit.lifetime.as_str(),
+        )
+    }));
 
     fn review_asset_amount(
         kind: &'static str,
