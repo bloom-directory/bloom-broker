@@ -307,25 +307,7 @@ impl Harness {
             ],
             required_verifiers: vec![],
         };
-        let canonical = serde_jcs::to_vec(&policy).unwrap();
-        let mut snapshot = SignedPolicySnapshot {
-            wallet_id: self.wallet.clone(),
-            version: DecimalU64::new(version),
-            canonical_policy: Base64UrlBytes::from_bytes(&canonical),
-            policy_digest: Digest32::from_bytes(Sha256::digest(&canonical).into()),
-            policy_signing_key_id: token("policy-key"),
-            policy_verifying_key: Base64UrlBytes::from_bytes(
-                &self.policy_key.verifying_key().to_bytes(),
-            ),
-            signer_signature: Base64UrlBytes::from_bytes(&[]),
-        };
-        sign_zeroed(
-            &mut snapshot,
-            |value| &mut value.signer_signature,
-            POLICY_DOMAIN,
-            &self.policy_key,
-        );
-        snapshot
+        signed_policy_snapshot(self, version, &policy)
     }
 
     fn provenance(&self) -> ProvenanceRecord {
@@ -1660,10 +1642,64 @@ fn native_solana_destination_outside_policy_is_denied() {
         Some([0x01; 32]),
     );
 
-    assert!(
-        error_code(harness.authority.authorize(&input).unwrap_err())
-            .contains("DESTINATION_NOT_ALLOWED")
+    let error = error_code(harness.authority.authorize(&input).unwrap_err());
+    assert!(error.contains("DESTINATION_NOT_ALLOWED"));
+    assert!(error.contains(&destination.to_string()));
+    assert!(error.contains("chain \"solana\""));
+}
+
+#[test]
+fn native_solana_destination_refusal_names_the_conflicting_policy_chain() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let destination = bloom_solana_verify::Pubkey::from_bytes([0x44; 32]);
+    let blockhash = [0x07; 32];
+    let message = bloom_solana_verify::system_transfer::transfer_message(
+        bloom_solana_verify::Pubkey::from_bytes([0x01; 32]),
+        destination,
+        1_000_000,
+        blockhash,
+    )
+    .unwrap()
+    .serialize();
+    let mut policy: CanonicalWalletPolicy =
+        serde_json::from_slice(&harness.policy_snapshot(1).canonical_policy.decode()).unwrap();
+    policy.allowed_destinations.push(PolicyDestination {
+        chain: token("localnet"),
+        destination: destination.to_string(),
+    });
+    let snapshot = signed_policy_snapshot(&harness, 2, &policy);
+    harness.authority.install_policy(&snapshot).unwrap();
+    let claim = solana_claim_for(
+        &message,
+        &destination.to_string(),
+        blockhash,
+        ClaimAssurance::ProofVerified {
+            verifier_id: token(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID),
+            verifier_digest: Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES),
+            proof_digest: Digest32::from_bytes(Sha256::digest(&message).into()),
+        },
     );
+    let mut terms = solana_terms(&harness, &provenance, &message, 85);
+    terms.policy_version = snapshot.version;
+    terms.policy_digest = snapshot.policy_digest;
+    harness.activate_with_system_claim(&terms, &provenance, &claim);
+    let input = solana_input(
+        &terms,
+        &provenance,
+        operation(85),
+        &message,
+        claim,
+        &message,
+        // The account the approval pins is the message's payer.
+        Some([0x01; 32]),
+    );
+
+    let error = error_code(harness.authority.authorize(&input).unwrap_err());
+    assert!(error.contains("DESTINATION_NOT_ALLOWED"));
+    assert!(error.contains(&destination.to_string()));
+    assert!(error.contains("chain \"localnet\""));
+    assert!(error.contains("only matches the declared chain \"solana\""));
 }
 
 #[test]
@@ -2046,6 +2082,32 @@ fn exact_terms(harness: &Harness, payload: &[u8]) -> SealedApprovalTerms {
 
 fn solana_destination() -> String {
     bloom_solana_verify::Pubkey::from_bytes([0x02; 32]).to_string()
+}
+
+fn signed_policy_snapshot(
+    harness: &Harness,
+    version: u64,
+    policy: &CanonicalWalletPolicy,
+) -> SignedPolicySnapshot {
+    let canonical = serde_jcs::to_vec(policy).unwrap();
+    let mut snapshot = SignedPolicySnapshot {
+        wallet_id: harness.wallet.clone(),
+        version: DecimalU64::new(version),
+        canonical_policy: Base64UrlBytes::from_bytes(&canonical),
+        policy_digest: Digest32::from_bytes(Sha256::digest(&canonical).into()),
+        policy_signing_key_id: token("policy-key"),
+        policy_verifying_key: Base64UrlBytes::from_bytes(
+            &harness.policy_key.verifying_key().to_bytes(),
+        ),
+        signer_signature: Base64UrlBytes::from_bytes(&[]),
+    };
+    sign_zeroed(
+        &mut snapshot,
+        |value| &mut value.signer_signature,
+        POLICY_DOMAIN,
+        &harness.policy_key,
+    );
+    snapshot
 }
 
 fn solana_message_and_claim(assurance: ClaimAssurance) -> (Vec<u8>, SystemUseClaim) {

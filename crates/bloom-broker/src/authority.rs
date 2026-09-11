@@ -5,10 +5,10 @@ use crate::journal::{
 use bloom_broker_api::{
     ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
     ApprovalTombstone, Base64UrlBytes, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite,
-    CustodyResult, DeclaredFee, Digest32, KeyRef, MachineSignRequest, OperationId,
-    PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope, PetalUseClaim, PolicyUpdateRequest,
-    ProtocolErrorCode, RevocationState, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
-    SystemUseClaim, Token,
+    CustodyResult, DeclaredDestination, DeclaredFee, Digest32, KeyRef, MachineSignRequest,
+    OperationId, PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope, PetalUseClaim,
+    PolicyUpdateRequest, ProtocolErrorCode, RevocationState, SealedApprovalTerms,
+    SignedPolicySnapshot, SigningPayloads, SystemUseClaim, Token,
 };
 pub use bloom_broker_api::{CanonicalWalletPolicy, PolicyDestination, RequiredVerifier};
 pub use bloom_broker_api::{
@@ -2750,7 +2750,7 @@ impl BrokerAuthority {
         }
         let allowed_destinations: BTreeSet<_> =
             policy.allowed_destinations.iter().cloned().collect();
-        if claim.declared_destinations.iter().any(|destination| {
+        if let Some(declared) = claim.declared_destinations.iter().find(|destination| {
             !allowed_destinations.contains(&PolicyDestination {
                 chain: destination.chain.clone(),
                 destination: destination.destination.clone(),
@@ -2758,7 +2758,7 @@ impl BrokerAuthority {
         }) {
             return Err(denied(
                 "DESTINATION_NOT_ALLOWED",
-                "claim names a destination outside wallet policy",
+                destination_policy_violation("claim", declared, &allowed_destinations),
             ));
         }
         Ok(())
@@ -2841,7 +2841,7 @@ impl BrokerAuthority {
         }
         let allowed_destinations: BTreeSet<_> =
             policy.allowed_destinations.iter().cloned().collect();
-        if claim.declared_destinations.iter().any(|destination| {
+        if let Some(declared) = claim.declared_destinations.iter().find(|destination| {
             !allowed_destinations.contains(&PolicyDestination {
                 chain: destination.chain.clone(),
                 destination: destination.destination.clone(),
@@ -2849,7 +2849,7 @@ impl BrokerAuthority {
         }) {
             return Err(denied(
                 "DESTINATION_NOT_ALLOWED",
-                "system claim names a destination outside wallet policy",
+                destination_policy_violation("system claim", declared, &allowed_destinations),
             ));
         }
         Ok(())
@@ -3978,6 +3978,35 @@ fn budget_limits(terms: &SealedApprovalTerms) -> BudgetLimits {
 
 fn asset_id(chain: &str, asset: &str) -> String {
     format!("{chain}:{asset}")
+}
+
+fn destination_policy_violation(
+    subject: &str,
+    declared: &DeclaredDestination,
+    allowed: &BTreeSet<PolicyDestination>,
+) -> String {
+    let mut message = format!(
+        "{subject} names destination {} for chain \"{}\" outside wallet policy",
+        declared.destination,
+        declared.chain.as_str()
+    );
+    let conflicting: Vec<&str> = allowed
+        .iter()
+        .filter(|entry| entry.destination == declared.destination && entry.chain != declared.chain)
+        .map(|entry| entry.chain.as_str())
+        .collect();
+    if !conflicting.is_empty() {
+        let chains = conflicting
+            .iter()
+            .map(|chain| format!("\"{chain}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        message.push_str(&format!(
+            "; policy carries this destination under chain {chains}, but a destination entry only matches the declared chain \"{}\"",
+            declared.chain.as_str()
+        ));
+    }
+    message
 }
 
 fn denied(code: &'static str, message: impl Into<String>) -> AuthorityError {
