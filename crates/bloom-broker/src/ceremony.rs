@@ -34,7 +34,7 @@ use bloom_signer_api::{
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use parking_lot::Mutex;
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng as _, rngs::SysRng};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1604,7 +1604,9 @@ impl CeremonyBroker {
 
     fn new_session(&self, new: NewBrowserSession) -> Result<BrowserSession, ProtocolError> {
         let mut token_bytes = [0_u8; 32];
-        OsRng.fill_bytes(&mut token_bytes);
+        SysRng
+            .try_fill_bytes(&mut token_bytes)
+            .expect("OS randomness unavailable");
         Ok(BrowserSession {
             operation_id: new.operation_id.clone(),
             request_digest: new.request_digest,
@@ -3097,6 +3099,17 @@ fn canonical_review_plan(
             ));
         }
     }
+    // A reusable approval's value limits are its spending ceiling: the Broker
+    // sums every debit and fee per asset against them and refuses any asset
+    // without one. The owner must see that ceiling, not only the raw terms.
+    asset_amounts.extend(request.terms.limits.value_limits.iter().map(|limit| {
+        review_asset_amount(
+            "value_limit",
+            limit.asset.chain.as_str(),
+            &limit.asset.asset,
+            limit.lifetime.as_str(),
+        )
+    }));
 
     fn review_asset_amount(
         kind: &'static str,
