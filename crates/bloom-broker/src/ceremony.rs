@@ -2950,6 +2950,17 @@ fn canonical_review_plan(
             ));
         }
     }
+    // A reusable approval's value limits are its spending ceiling: the Broker
+    // sums every debit and fee per asset against them and refuses any asset
+    // without one. The owner must see that ceiling, not only the raw terms.
+    asset_amounts.extend(request.terms.limits.value_limits.iter().map(|limit| {
+        review_asset_amount(
+            "value_limit",
+            limit.asset.chain.as_str(),
+            &limit.asset.asset,
+            limit.lifetime.as_str(),
+        )
+    }));
 
     fn review_asset_amount(
         kind: &'static str,

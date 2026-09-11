@@ -262,12 +262,21 @@ function describePetalApproval(manifest) {
   const operations = Number(terms?.limits?.max_operations);
   const operationLimit = Number.isSafeInteger(operations) && operations > 0
     ? `Up to ${operations} signed actions` : "Limited by the session rules";
+  // The Broker sums every debit and fee per asset against these ceilings and
+  // refuses any asset without one, so "none" means nothing can be spent.
+  const ceilings = (Array.isArray(plan.asset_amounts) ? plan.asset_amounts : [])
+    .filter(amount => amount.kind === "value_limit")
+    .map(amount => amount.display);
+  const spending = ceilings.length
+    ? `Up to ${naturalList(ceilings)} in total across the whole session, counting fees and any funds sent back to your wallet`
+    : "None — Bloom will refuse any action that spends funds or pays a fee";
   return {
     sentence: `Finish setting up a temporary <strong>${app}</strong> session. It can sign only the actions listed below until the timer expires. No funds move in this step, and your main wallet key stays inside Bloom.`,
     facts: [
       ["App", app],
       ["Can", naturalList(actions)],
       ["Limit", operationLimit],
+      ["Spending ceiling", spending],
       ["Main wallet key", "Stays inside Bloom"]
     ],
     title: app === "Pump.fun" ? "Finish Pump.fun session setup" : "Finish temporary session setup",

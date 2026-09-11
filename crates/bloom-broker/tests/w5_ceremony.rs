@@ -415,7 +415,9 @@ const plan = {{
   security_disclosures: ["The displayed limits are asserted by the named Petal."],
   terms: {{
     wallet_id: "main",
-    limits: {{max_operations: "256", max_signatures: "256"}},
+    limits: {{max_operations: "256", max_signatures: "256", value_limits: [
+      {{asset: {{chain: "solana", asset: "native"}}, lifetime: "500000000", rolling_windows: []}}
+    ]}},
     selector: {{
       kind: "petal",
       package_hash: packageHash,
@@ -424,7 +426,9 @@ const plan = {{
       required_claim_assurance: "machine_asserted",
       route_grants: [{{route: "r000010", allowed_operation_classes: ["pumpfun.buy"]}}]
     }}
-  }}
+  }},
+  asset_amounts: [{{kind: "value_limit", chain: "solana", asset: "native", display: "0.5 SOL",
+                    base_units: "500000000", decimals: 9}}]
 }};
 renderReview({{
   ceremony_kind: "sealed_approval",
@@ -441,6 +445,7 @@ const primary = allText({{textContent: "", innerHTML: "", children:
 const technical = allText(nodes.review.children.find(child => child?.name === "details"));
 for (const phrase of ["Finish setting up", "Pump.fun", "buy tokens", "sell tokens",
                       "return unused SOL", "Up to 256 signed actions",
+                      "Up to 0.5 SOL in total across the whole session",
                       "main wallet key stays inside Bloom"]) {{
   if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
 }}
@@ -454,6 +459,25 @@ if (!technical.includes(packageHash) || !technical.includes("route_grants")) {{
 if (nodes["page-title"].textContent !== "Finish Pump.fun session setup" ||
     nodes.approve.textContent !== "Finish Pump.fun setup") {{
   throw new Error(`unexpected title or button: ${{nodes["page-title"].textContent}} / ${{nodes.approve.textContent}}`);
+}}
+// No value limits: the Broker refuses every debit and fee, and the owner is
+// told so rather than shown nothing.
+plan.terms.limits.value_limits = [];
+plan.asset_amounts = [];
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 300000,
+  signer_contribution: {{wallet_id: "main"}},
+  review_manifest: {{
+    wallet_id: "main",
+    canonical_plan: JSON.stringify(plan),
+    approval_id: "internal-approval-id"
+  }}
+}});
+const unbudgeted = allText({{textContent: "", innerHTML: "", children:
+  nodes.review.children.filter(child => child?.name !== "details")}});
+if (!unbudgeted.includes("refuse any action that spends funds") || unbudgeted.includes("0.5 SOL")) {{
+  throw new Error(`an empty spending ceiling was not stated: ${{unbudgeted}}`);
 }}
 "#
     );
@@ -4538,6 +4562,58 @@ async fn review_plan_formats_known_asset_base_units_without_hiding_raw_authority
     assert_eq!(plan["asset_amounts"][0]["display"], "0.01 USDC");
     assert_eq!(plan["asset_amounts"][0]["base_units"], "10000");
     assert_eq!(plan["asset_amounts"][0]["decimals"], 6);
+}
+
+#[tokio::test]
+async fn review_plan_formats_an_approvals_spending_ceiling() {
+    let signer = Arc::new(MockSigner::new());
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        signer,
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[32; 32]),
+    );
+    let mut request = approval_request();
+    request.terms.limits.value_limits = vec![bloom_signer_api::ValueLimit {
+        asset: bloom_signer_api::AssetId {
+            chain: Token::new("solana").unwrap(),
+            asset: "native".into(),
+        },
+        lifetime: DecimalU256::parse("500000000").unwrap(),
+        rolling_windows: Vec::new(),
+    }];
+    let response = broker
+        .prepare_approval(request, ReviewManifestContext::default(), now_ms)
+        .unwrap();
+    let session = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let projection: serde_json::Value =
+        serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let plan: serde_json::Value = serde_json::from_str(
+        projection["review_manifest"]["canonical_plan"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(plan["asset_amounts"][0]["kind"], "value_limit");
+    assert_eq!(plan["asset_amounts"][0]["display"], "0.5 SOL");
+    assert_eq!(plan["asset_amounts"][0]["base_units"], "500000000");
+    assert_eq!(plan["asset_amounts"][0]["decimals"], 9);
 }
 
 #[tokio::test]
