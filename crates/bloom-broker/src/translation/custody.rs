@@ -59,7 +59,11 @@ pub(crate) fn prepare_to_signer(
             .wallet_seed_profile
             .as_ref()
             .map(seed_profile_to_signer),
-        derivation_request: value.derivation_request.map(derived_request_to_signer),
+        derivation_requests: value
+            .derivation_requests
+            .into_iter()
+            .map(derived_request_to_signer)
+            .collect(),
     }
 }
 
@@ -197,7 +201,7 @@ mod tests {
             petal_key_scope: None,
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
-            derivation_request: None,
+            derivation_requests: Vec::new(),
             account_terms: None,
         }
     }
@@ -247,7 +251,7 @@ mod tests {
             petal_key_scope: Some(scope),
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
-            derivation_request: None,
+            derivation_requests: Vec::new(),
             account_terms: None,
         };
         request.validate_petal_key_scope_binding().unwrap();
@@ -324,7 +328,7 @@ mod tests {
             petal_key_scope: None,
             legacy_passkey_migration: Some(migration.clone()),
             wallet_seed_profile: None,
-            derivation_request: None,
+            derivation_requests: Vec::new(),
             account_terms: None,
         };
         request.validate_legacy_passkey_migration_binding().unwrap();

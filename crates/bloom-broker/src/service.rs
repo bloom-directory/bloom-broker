@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use bloom_broker_api::{
-    ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector, Base64UrlBytes, BootEpoch,
-    DecimalU64, Digest32, MachineBrokerMethod, MachineBrokerRequest, MachineBrokerResponse,
-    MachineBrokerService, MachineSignRequest, OperationId, OperationPublicStatus, OperationState,
-    PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, RPC_ENVELOPE_SCHEMA_V1, Readiness,
-    ReadinessState, SealedApprovalPrepareResponse, ServiceCapabilities, ServiceFuture,
-    SigningPayloads, Token, VerifierPublicCapability, WalletAccountsPublic, WalletPublic,
-    WalletRequest, WalletSeedProfile,
+    ApprovalLifecycleState, ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector,
+    Base64UrlBytes, BootEpoch, DecimalU64, Digest32, MachineBrokerMethod, MachineBrokerRequest,
+    MachineBrokerResponse, MachineBrokerService, MachineSignRequest, OperationId,
+    OperationPublicStatus, OperationState, PolicyUpdateRequest, ProtocolError, ProtocolErrorCode,
+    RPC_ENVELOPE_SCHEMA_V1, Readiness, ReadinessState, RevokeRequest,
+    SealedApprovalPrepareResponse, ServiceCapabilities, ServiceFuture, SigningPayloads, Token,
+    VerifierPublicCapability, WalletAccountsPublic, WalletPublic, WalletRequest, WalletSeedProfile,
 };
 use bloom_platform_containment::NetworkContainmentGuard;
 use bloom_signer_api::{
@@ -18,7 +18,7 @@ use bloom_signer_api::{
     PolicyValidationReceipt, RevocationControlService, SignRequest, UnsignedSignRequest,
 };
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _};
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng as _, rngs::SysRng};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
@@ -198,7 +198,7 @@ impl BrokerRpcService {
                     .approval_public_list(&request.wallet_id)
                     .map_err(authority_error)?;
                 for status in &mut statuses {
-                    self.attach_pending_approval_ceremony(status);
+                    self.attach_pending_approval_ceremony(status)?;
                 }
                 Ok(Response::SealedApprovalList(statuses))
             }
@@ -219,6 +219,80 @@ impl BrokerRpcService {
                 Ok(Response::SealedApprovalRevoke(
                     self.approval_public_status(&request.approval_id)?,
                 ))
+            }
+            Request::SealedApprovalRevokeForKey(request) => {
+                let stopped_at_ms = u64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|_| {
+                            ProtocolError::new(
+                                ProtocolErrorCode::ServiceUnavailable,
+                                "host clock precedes the Unix epoch",
+                            )
+                        })?
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX);
+                let (targets, first_execution) = self
+                    .authority
+                    .admit_key_revocation(&request, stopped_at_ms)
+                    .map_err(authority_error)?;
+                let mut statuses = Vec::with_capacity(targets.len());
+                for (approval_id, revocation_id) in targets {
+                    // Every bound approval is revoked at Signer, whatever its
+                    // local state reads at listing time: a ceremony can be
+                    // completing concurrently, so any snapshot can be stale
+                    // and an approval Signer never learned of simply answers
+                    // ApprovalNotFound. Signer first, so a failure here
+                    // leaves nothing half done locally. A prepared or
+                    // awaiting approval also fails locally, which keeps its
+                    // ceremony from completing after this. The first
+                    // execution sends the derived per-target id recorded in
+                    // the journal; a replay sends a fresh one, because Signer
+                    // stamps revocation time into its per-operation request
+                    // digest and treats an already revoked approval as
+                    // success either way.
+                    let signer_operation_id = if first_execution {
+                        revocation_id
+                    } else {
+                        let mut operation_bytes = [0_u8; 32];
+                        SysRng
+                            .try_fill_bytes(&mut operation_bytes)
+                            .expect("OS randomness unavailable");
+                        OperationId::from_bytes(operation_bytes)
+                    };
+                    let revoke = RevokeRequest {
+                        operation_id: signer_operation_id,
+                        approval_id: approval_id.clone(),
+                        wallet_id: request.wallet_id.clone(),
+                        reason: request.reason.clone(),
+                    };
+                    match self
+                        .signer
+                        .request_for_machine(BrokerSignerRequest::SealedApprovalRevoke(
+                            translate_revocation::revoke_request_to_signer(revoke),
+                        ))
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(error) if error.code == ProtocolErrorCode::ApprovalNotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                    self.authority
+                        .revoke_local_approval(&approval_id)
+                        .map_err(authority_error)?;
+                    statuses.push(self.approval_public_status(&approval_id)?);
+                }
+                // Every pass that revoked all of its targets completes the
+                // durable operation, not only the first: an execution that
+                // crashed or hit a transient Signer error after
+                // `begin_key_revocation` leaves the row RECEIVED, and the
+                // retry that finishes the job is the one that gets here.
+                // Completion is idempotent.
+                self.journal
+                    .complete_key_revocation(&request.operation_id)
+                    .map_err(journal_error)?;
+                Ok(Response::SealedApprovalRevokeForKey(statuses))
             }
             Request::SealedApprovalRevokeAll(request) => {
                 let current = self
@@ -457,6 +531,9 @@ impl BrokerRpcService {
                 request.validate_account_allocation_binding()?;
                 self.verify_account_terms_baseline(&request).await?;
                 self.verify_wallet_supports_allocation(&request).await?;
+                let review = request.account_terms.as_ref().map(|terms| {
+                    crate::ceremony::account_terms_review(&request.ceremony_kind, terms)
+                });
                 self.authority
                     .record_account_terms(
                         request.account_terms.as_ref().expect("validated terms"),
@@ -464,8 +541,9 @@ impl BrokerRpcService {
                     )
                     .map_err(authority_error)?;
                 Ok(Response::AccountAllocatePrepare(
-                    self.ceremony.prepare_custody(
+                    self.ceremony.prepare_custody_reviewed(
                         translate_custody::prepare_to_signer(request),
+                        review,
                         self.clock.now_ms(false)?,
                     )?,
                 ))
@@ -478,6 +556,9 @@ impl BrokerRpcService {
                 request.validate_account_retire_binding()?;
                 self.verify_account_terms_baseline(&request).await?;
                 self.verify_retire_target_matches_terms(&request).await?;
+                let review = request.account_terms.as_ref().map(|terms| {
+                    crate::ceremony::account_terms_review(&request.ceremony_kind, terms)
+                });
                 self.authority
                     .record_account_terms(
                         request.account_terms.as_ref().expect("validated terms"),
@@ -485,8 +566,9 @@ impl BrokerRpcService {
                     )
                     .map_err(authority_error)?;
                 Ok(Response::AccountRetirePrepare(
-                    self.ceremony.prepare_custody(
+                    self.ceremony.prepare_custody_reviewed(
                         translate_custody::prepare_to_signer(request),
+                        review,
                         self.clock.now_ms(false)?,
                     )?,
                 ))
@@ -797,20 +879,37 @@ impl BrokerRpcService {
             .authority
             .approval_public_status(approval_id)
             .map_err(authority_error)?;
-        self.attach_pending_approval_ceremony(&mut status);
+        self.attach_pending_approval_ceremony(&mut status)?;
         Ok(status)
     }
 
     fn attach_pending_approval_ceremony(
         &self,
         status: &mut bloom_broker_api::ApprovalPublicStatus,
-    ) {
-        if let Some((url, expires_at_ms)) =
-            self.ceremony.pending_approval_ceremony(&status.approval_id)
+    ) -> Result<(), ProtocolError> {
+        if let Some((url, expires_at_ms)) = self
+            .ceremony
+            .pending_approval_ceremony(&status.approval_id, self.clock.now_ms(false)?)?
         {
             status.ceremony_url = Some(url);
             status.ceremony_expires_at_ms = Some(expires_at_ms);
+            return Ok(());
         }
+        // An approval whose ceremony died still reports `AwaitingCeremony`,
+        // but with no URL to await — a state the caller can neither act on
+        // nor escape, because cancelling also needs a ceremony. Report the
+        // terminal truth so it starts a fresh approval instead of polling a
+        // ceremony that no longer exists.
+        if matches!(
+            status.state,
+            ApprovalLifecycleState::Prepared | ApprovalLifecycleState::AwaitingCeremony
+        ) && self
+            .ceremony
+            .approval_ceremony_unreachable(&status.approval_id)
+        {
+            status.state = ApprovalLifecycleState::Expired;
+        }
+        Ok(())
     }
 
     async fn prepare_policy_update(
@@ -883,7 +982,7 @@ impl BrokerRpcService {
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
                     wallet_seed_profile: None,
-                    derivation_request: None,
+                    derivation_requests: Vec::new(),
                 },
                 update: signer_update,
                 broker_validation_receipt: validation,
@@ -985,7 +1084,9 @@ impl BrokerRpcService {
             )
             .map_err(authority_error)?;
         let mut attempt_bytes = [0_u8; 32];
-        OsRng.fill_bytes(&mut attempt_bytes);
+        SysRng
+            .try_fill_bytes(&mut attempt_bytes)
+            .expect("OS randomness unavailable");
         let claim_digest = request
             .petal_use_claim
             .as_ref()
@@ -1518,7 +1619,9 @@ impl BrokerRpcService {
                         ));
                     }
                     let mut operation_bytes = [0_u8; 32];
-                    OsRng.fill_bytes(&mut operation_bytes);
+                    SysRng
+                        .try_fill_bytes(&mut operation_bytes)
+                        .expect("OS randomness unavailable");
                     let operation_id = OperationId::from_bytes(operation_bytes);
                     match self
                         .signer
@@ -2298,6 +2401,7 @@ fn authority_error(error: AuthorityError) -> ProtocolError {
                 "ASSURANCE_UNAVAILABLE" => ProtocolErrorCode::AssuranceUnavailable,
                 "POLICY_BASELINE_STALE" => ProtocolErrorCode::PolicyBaselineStale,
                 "OPERATION_ID_CONFLICT" => ProtocolErrorCode::OperationIdConflict,
+                "KEY_STOPPED" => ProtocolErrorCode::ApprovalRevoked,
                 _ => ProtocolErrorCode::ClaimInvalid,
             };
             ProtocolError::new(protocol_code, message)
@@ -2365,6 +2469,7 @@ mod tests {
                 bloom_signer_api::CryptoSuite::Secp256k1Keccak256Recoverable,
             ],
             derived_account: None,
+            petal_scope_expires_at_ms: None,
         }
     }
 
@@ -2551,6 +2656,7 @@ mod tests {
                 is_batch: signature_count > 1,
                 retry_binding_digest: Digest32::from_bytes([0x53; 32]),
                 result: None,
+                kind: crate::journal::OPERATION_KIND.to_owned(),
             },
             SigningResult {
                 operation_id,

@@ -345,16 +345,17 @@ async fn run_with_paths(
         // Own the canonical origin before opening or mutating any durable Broker
         // authority state. A losing AC-31 contender must die without racing the
         // owning Broker's journal or checkpoint store.
-        let ceremony_listener = match acquire_ceremony_listener() {
-            Ok(listener) => {
+        let (ceremony_listener_v4, ceremony_listener_v6) = match acquire_ceremony_listeners() {
+            Ok(listeners) => {
                 if let Some(path) = startup_status_path.as_deref() {
                     clear_startup_failure(path, broker_effective_uid)?;
                 }
-                listener
+                listeners
             }
             Err(error) => {
+                tracing::error!(%error, "cannot acquire ceremony listener pair");
                 if let Some(path) = startup_status_path.as_deref() {
-                    write_listener_conflict(path, broker_effective_uid, containment.as_ref())?;
+                    write_listener_failure(path, broker_effective_uid)?;
                 }
                 return Err(error);
             }
@@ -632,9 +633,13 @@ async fn run_with_paths(
             periodically_exchange_signer_head(signer_head_exchange, &mut head_exchange_shutdown),
             async move {
                 ceremony_for_shutdown
-                    .serve_listener_until(ceremony_listener, async move {
-                        wait_for_shutdown(&mut ceremony_shutdown).await;
-                    })
+                    .serve_loopback_listeners_until(
+                        ceremony_listener_v4,
+                        ceremony_listener_v6,
+                        async move {
+                            wait_for_shutdown(&mut ceremony_shutdown).await;
+                        },
+                    )
                     .await
                     .map_err(std::io::Error::other)
             },
@@ -783,53 +788,19 @@ fn is_session_disconnect(error: &std::io::Error) -> bool {
     )
 }
 
-fn write_listener_conflict(
-    path: &Path,
-    broker_uid: u32,
-    containment: Option<&NetworkContainmentGuard>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let bloom_shaped = canonical_listener_is_bloom_shaped(containment);
-    let (incident, message) = if bloom_shaped {
-        (
-            "another_login_session",
-            "another login session owns the Bloom ceremony listener",
-        )
-    } else {
-        (
-            "foreign_or_unverifiable_process",
-            "a foreign or unverifiable process owns the Bloom ceremony listener",
-        )
-    };
+fn write_listener_failure(path: &Path, broker_uid: u32) -> Result<(), Box<dyn std::error::Error>> {
     write_startup_failure(
         path,
         broker_uid,
         &StartupFailure {
             schema: "bloom.broker-startup.1",
             state: "fatal",
-            incident,
-            address: "127.0.0.1:18734",
-            message,
+            incident: "ceremony_listeners_unavailable",
+            address: "localhost:18734",
+            message: "could not acquire both ceremony loopback listeners; see Broker service logs",
             observed_at_ms: unix_time_ms()?,
         },
     )
-}
-
-fn canonical_listener_is_bloom_shaped(containment: Option<&NetworkContainmentGuard>) -> bool {
-    let Some(containment) = containment else {
-        return false;
-    };
-    for attempt in 0..4 {
-        if matches!(
-            containment.boolean_claim("ceremony_listener_bloom_shaped"),
-            Ok(Some(true))
-        ) {
-            return true;
-        }
-        if attempt != 3 {
-            std::thread::sleep(Duration::from_millis(750));
-        }
-    }
-    false
 }
 
 fn write_startup_failure(
@@ -939,15 +910,23 @@ fn acquire_unix_listener(
     Ok(bloom_service_activation::bind_owned_unix_listener(&path)?)
 }
 
-/// Acquire the canonical ceremony listener.
+/// Acquire both canonical loopback ceremony listeners (IPv4 + IPv6).
 ///
-/// The platform logic lives in `CeremonyBroker::acquire_canonical_listener`
-/// so that the Linux inherited-listener path is covered by a regression rather
-/// than only by running the service.
-fn acquire_ceremony_listener() -> Result<std::net::TcpListener, Box<dyn std::error::Error>> {
-    let name = std::env::var("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME")
-        .unwrap_or_else(|_| "broker-ceremony".to_string());
-    Ok(CeremonyBroker::acquire_canonical_listener(&name)?)
+/// The platform logic lives in `CeremonyBroker::acquire_canonical_loopback_listeners`
+/// so the Linux inherited-listener path is covered by a regression rather than
+/// only by running the service. Two activation names are read: one for the
+/// IPv4 socket and one for the IPv6 socket. The systemd `.socket` unit must
+/// publish exactly one descriptor under each name. macOS ignores the names
+/// and binds both loopback families directly.
+fn acquire_ceremony_listeners()
+-> Result<(std::net::TcpListener, std::net::TcpListener), Box<dyn std::error::Error>> {
+    let v4_name = std::env::var("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV4")
+        .unwrap_or_else(|_| "broker-ceremony-ipv4".to_string());
+    let v6_name = std::env::var("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV6")
+        .unwrap_or_else(|_| "broker-ceremony-ipv6".to_string());
+    Ok(CeremonyBroker::acquire_canonical_loopback_listeners(
+        &v4_name, &v6_name,
+    )?)
 }
 
 #[cfg(not(target_os = "macos"))]

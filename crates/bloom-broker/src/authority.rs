@@ -5,10 +5,10 @@ use crate::journal::{
 use bloom_broker_api::{
     ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
     ApprovalTombstone, Base64UrlBytes, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite,
-    CustodyResult, DeclaredFee, Digest32, KeyRef, MachineSignRequest, OperationId,
-    PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope, PetalUseClaim, PolicyUpdateRequest,
-    ProtocolErrorCode, RevocationState, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
-    SystemUseClaim, Token,
+    CustodyResult, DeclaredDestination, DeclaredFee, Digest32, KeyRef, MachineSignRequest,
+    OperationId, PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope, PetalUseClaim,
+    PolicyUpdateRequest, ProtocolErrorCode, RevocationState, SealedApprovalTerms,
+    SignedPolicySnapshot, SigningPayloads, SystemUseClaim, Token,
 };
 pub use bloom_broker_api::{CanonicalWalletPolicy, PolicyDestination, RequiredVerifier};
 pub use bloom_broker_api::{
@@ -522,6 +522,13 @@ impl BrokerAuthority {
                 epoch TEXT NOT NULL,
                 reconciled INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS key_stops (
+                wallet_id TEXT NOT NULL,
+                key_ref TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                stopped_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (wallet_id, key_ref)
+            );
             CREATE TABLE IF NOT EXISTS provenance_catalog (
                 subject_jcs TEXT PRIMARY KEY,
                 record_digest TEXT NOT NULL,
@@ -963,10 +970,13 @@ impl BrokerAuthority {
         Ok(())
     }
 
-    /// Fail-closed adoption of an allocation receipt: the returned child
-    /// must be exactly the child the committed terms asked for — same
-    /// wallet, same derivation profile, same committed account index, and a
-    /// path shape matching the profile's frozen template.
+    /// Fail-closed adoption of an allocation receipt: the returned children
+    /// must be exactly the children the committed terms asked for — one per
+    /// committed request, same wallet, same derivation profile, a path shape
+    /// matching the profile's frozen template, and, for a multi-family
+    /// request, one shared account number across the families. The requested
+    /// roles are reviewed by the owner through the terms, which the digest
+    /// binds; the receipt itself carries no role to check here.
     fn adopt_account_allocation(
         &self,
         receipt: &CustodyResult,
@@ -976,40 +986,79 @@ impl BrokerAuthority {
         if state == "ADOPTED" {
             return Ok(());
         }
-        let derivation = terms.derivation.clone().ok_or_else(|| {
-            denied(
+        let requests = &terms.derivations;
+        if requests.is_empty() {
+            return Err(denied(
                 "CUSTODY_RECEIPT_INVALID",
                 "committed allocation terms carry no derivation request",
-            )
-        })?;
+            ));
+        }
         if receipt.wallet_id.as_ref() != Some(&terms.wallet_id)
-            || receipt.public_key_refs.len() != 1
+            || receipt.public_key_refs.len() != requests.len()
         {
             return Err(denied(
                 "CUSTODY_RECEIPT_INVALID",
                 "allocation receipt wallet or child count contradicts the committed terms",
             ));
         }
-        let child = &receipt.public_key_refs[0];
-        let Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
-            wallet_seed_ref,
-            profile,
-            path,
-        }) = child.derivation.clone()
-        else {
+        let mut by_profile: std::collections::HashMap<
+            bloom_broker_api::DerivationProfile,
+            (&bloom_broker_api::KeyRef, String),
+        > = std::collections::HashMap::new();
+        for child in &receipt.public_key_refs {
+            let Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                wallet_seed_ref,
+                profile,
+                path,
+            }) = child.derivation.clone()
+            else {
+                return Err(denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "allocated child is not a bip39 derived account",
+                ));
+            };
+            if wallet_seed_ref != terms.wallet_id {
+                return Err(denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "allocated child belongs to a different wallet",
+                ));
+            }
+            if by_profile.insert(profile, (child, path)).is_some() {
+                return Err(denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "allocation receipt repeats a derivation profile",
+                ));
+            }
+        }
+        let mut adopted: Vec<(&bloom_broker_api::KeyRef, u32)> = Vec::new();
+        for request in requests {
+            let profile = request.derivation_profile;
+            let Some((child, path)) = by_profile.get(&profile) else {
+                return Err(denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "allocation receipt is missing a requested derivation profile",
+                ));
+            };
+            if child.key_spec != profile.key_spec()
+                || !path_matches_committed_account(profile, path, request.account)
+            {
+                return Err(denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "allocated child does not match the committed derivation request",
+                ));
+            }
+            let number = committed_path_number(profile, path).ok_or_else(|| {
+                denied(
+                    "CUSTODY_RECEIPT_INVALID",
+                    "allocated child path carries no account number",
+                )
+            })?;
+            adopted.push((child, number));
+        }
+        if adopted.len() > 1 && !adopted.iter().all(|(_, number)| *number == adopted[0].1) {
             return Err(denied(
                 "CUSTODY_RECEIPT_INVALID",
-                "allocated child is not a bip39 derived account",
-            ));
-        };
-        if wallet_seed_ref != terms.wallet_id
-            || profile != derivation.derivation_profile
-            || child.key_spec != derivation.derivation_profile.key_spec()
-            || !path_matches_committed_account(profile, &path, derivation.account)
-        {
-            return Err(denied(
-                "CUSTODY_RECEIPT_INVALID",
-                "allocated child does not match the committed derivation request",
+                "multi-family allocation children disagree on the account number",
             ));
         }
         let mut connection = self.journal.lock_for_mutation()?;
@@ -1036,8 +1085,10 @@ impl BrokerAuthority {
             &serde_json::json!({
                 "custody_operation_id": receipt.custody_operation_id,
                 "wallet_id": terms.wallet_id,
-                "child_fingerprint": child.public_key_fingerprint,
-                "derivation_profile": derivation.derivation_profile,
+                "children": adopted.iter().map(|(child, number)| serde_json::json!({
+                    "child_fingerprint": child.public_key_fingerprint,
+                    "account_number": number,
+                })).collect::<Vec<_>>(),
                 "observed_at_ms": now_ms.to_string()
             }),
         )?;
@@ -1375,9 +1426,23 @@ impl BrokerAuthority {
                 if scope.allowed_routes.contains(route)
                     && agent_id.as_deref().is_none_or(|agent| agent == scope.key_slot.as_str())
         );
+        // The scope's expiry caps automation: a reusable Petal approval may
+        // not outlast it. An Exact approval is reviewed by the owner payload by
+        // payload and stays available after the scope expires, so the funds
+        // behind a delegated key remain recoverable. Signer applies the same
+        // rule in its own validator.
+        //
+        // Exhaustive on purpose: only Exact is exempt, so a selector added
+        // later stays scope-bound until this validator is changed to say
+        // otherwise.
+        let scope_bound = match terms.selector {
+            ApprovalSelector::Exact { .. } => false,
+            ApprovalSelector::Petal { .. } => true,
+        };
+        let outlives_scope = scope_bound && terms.expires_at_ms.get() > expires_at_ms;
         if !identity_matches
             || terms.wallet_id != scope.wallet_id
-            || terms.expires_at_ms.get() > expires_at_ms
+            || outlives_scope
             || terms
                 .allowed_crypto_suites
                 .iter()
@@ -1487,6 +1552,7 @@ impl BrokerAuthority {
             .validate()
             .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?;
         self.validate_scoped_key_terms(terms)?;
+        self.ensure_key_not_stopped(terms)?;
         let approval_id = terms
             .approval_id()
             .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?;
@@ -1751,6 +1817,7 @@ impl BrokerAuthority {
         }
         let terms: SealedApprovalTerms =
             serde_json::from_str(&record.terms_jcs).map_err(storage)?;
+        self.ensure_key_not_stopped(&terms)?;
         let review_digest = Digest32::new(record.review_manifest_digest)
             .map_err(|error| denied("STORAGE_CORRUPTION", error.to_string()))?;
         let (current_epoch, reconciled) = self.epoch_state(&terms.wallet_id)?;
@@ -1911,6 +1978,222 @@ impl BrokerAuthority {
             ceremony_url: None,
             ceremony_expires_at_ms: None,
         })
+    }
+
+    /// Every approval in the journal whose terms bind `key_ref` under
+    /// `wallet_id`, with its current lifecycle state. This is the set a
+    /// by-key revocation acts on; it comes from Broker's journal, never from a
+    /// caller's list of approval ids.
+    pub fn approvals_for_key(
+        &self,
+        wallet_id: &Token,
+        key_ref: &KeyRef,
+    ) -> Result<Vec<(Digest32, ApprovalLifecycleState)>, AuthorityError> {
+        let mut bound = Vec::new();
+        for (approval_id, record) in self.journal.approval_records()? {
+            let terms: SealedApprovalTerms =
+                serde_json::from_str(&record.terms_jcs).map_err(storage)?;
+            if &terms.wallet_id != wallet_id || &terms.key_ref != key_ref {
+                continue;
+            }
+            let Some(state) = self.journal.approval_state(&approval_id)? else {
+                continue;
+            };
+            bound.push((approval_id, state));
+        }
+        Ok(bound)
+    }
+
+    /// Admit a stop while excluding approval preparation/activation. Identity,
+    /// targets, the stop marker and pending-ceremony fences commit atomically.
+    /// Replays return the original targets without stopping fresh Exact recovery.
+    pub fn admit_key_revocation(
+        &self,
+        request: &bloom_broker_api::RevokeForKeyRequest,
+        stopped_at_ms: u64,
+    ) -> Result<(Vec<(Digest32, OperationId)>, bool), AuthorityError> {
+        let _barrier = self.lock_authorization_barrier()?;
+        let parameters_digest = Digest32::from_bytes(
+            Sha256::digest(
+                serde_jcs::to_vec(&serde_json::json!({
+                    "wallet_id": request.wallet_id,
+                    "key_ref": request.key_ref,
+                    "reason": request.reason,
+                }))
+                .map_err(storage)?,
+            )
+            .into(),
+        );
+        if let Some(targets) = self
+            .journal
+            .key_revocation_targets(&request.operation_id, &parameters_digest)?
+        {
+            return Ok((targets, false));
+        }
+        let bound = self.approvals_for_key(&request.wallet_id, &request.key_ref)?;
+        let mut targets: Vec<_> = bound
+            .iter()
+            .map(|(id, _)| {
+                let mut hasher = Sha256::new();
+                hasher.update(b"bloom.broker.key-revocation.v1");
+                hasher.update(request.operation_id.to_bytes());
+                hasher.update(id.to_bytes());
+                (
+                    id.clone(),
+                    OperationId::from_bytes(hasher.finalize().into()),
+                )
+            })
+            .collect();
+        targets.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        let key_ref_jcs = serde_jcs::to_string(&request.key_ref).map_err(storage)?;
+        let stopped_at = i64::try_from(stopped_at_ms)
+            .map_err(|_| storage("key stop timestamp is out of range"))?;
+        let first = self.journal.begin_key_revocation_with_effects(
+            &request.operation_id,
+            &parameters_digest,
+            &targets,
+            |transaction| {
+                transaction.execute(
+                    "INSERT INTO key_stops(wallet_id, key_ref, operation_id, stopped_at_ms)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(wallet_id, key_ref) DO UPDATE SET
+                     operation_id=excluded.operation_id, stopped_at_ms=excluded.stopped_at_ms",
+                    params![
+                        request.wallet_id.as_str(),
+                        key_ref_jcs,
+                        request.operation_id.as_str(),
+                        stopped_at
+                    ],
+                )?;
+                self.journal.append_external_audit(
+                    transaction,
+                    "approval.key_stopped",
+                    &serde_json::json!({"wallet_id": request.wallet_id,
+                        "key_ref_jcs": key_ref_jcs, "operation_id": request.operation_id,
+                        "stopped_at_ms": stopped_at_ms}),
+                )?;
+                for (id, _) in &bound {
+                    let state: String = transaction.query_row(
+                        "SELECT state FROM approvals WHERE approval_id = ?1",
+                        [id.as_str()],
+                        |row| row.get(0),
+                    )?;
+                    if state == "PREPARED" || state == "AWAITING_CEREMONY" {
+                        transaction.execute(
+                            "UPDATE approvals SET state = 'FAILED' WHERE approval_id = ?1",
+                            [id.as_str()],
+                        )?;
+                        self.journal.append_external_audit(
+                            transaction,
+                            "approval.transition",
+                            &serde_json::json!({"approval_id": id, "from": state, "to": "FAILED"}),
+                        )?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        if first {
+            Ok((targets, true))
+        } else {
+            Ok((
+                self.journal
+                    .key_revocation_targets(&request.operation_id, &parameters_digest)?
+                    .ok_or_else(|| storage("admitted key stop is missing"))?,
+                false,
+            ))
+        }
+    }
+
+    /// Apply a local stop without RPC operation admission. Production by-key
+    /// requests use `admit_key_revocation` to bind their identity atomically.
+    /// Reusable automation stays stopped; fresh Exact recovery remains allowed.
+    pub fn stop_key(
+        &self,
+        wallet_id: &Token,
+        key_ref: &KeyRef,
+        operation_id: &str,
+        stopped_at_ms: u64,
+    ) -> Result<Vec<(Digest32, ApprovalLifecycleState)>, AuthorityError> {
+        let _barrier = self.lock_authorization_barrier()?;
+        let key_ref_jcs = serde_jcs::to_string(key_ref).map_err(storage)?;
+        let stopped_at = i64::try_from(stopped_at_ms)
+            .map_err(|_| storage("key stop timestamp is out of range"))?;
+        let mut connection = self.lock_for_mutation()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO key_stops(wallet_id, key_ref, operation_id, stopped_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(wallet_id, key_ref) DO UPDATE SET
+                operation_id=excluded.operation_id,
+                stopped_at_ms=excluded.stopped_at_ms",
+            params![wallet_id.as_str(), &key_ref_jcs, operation_id, stopped_at],
+        )?;
+        self.journal.append_external_audit(
+            &transaction,
+            "approval.key_stopped",
+            &serde_json::json!({
+                "wallet_id": wallet_id,
+                "key_ref_jcs": key_ref_jcs,
+                "operation_id": operation_id,
+                "stopped_at_ms": stopped_at_ms
+            }),
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.journal.checkpoint_committed_head()?;
+        let bound = self.approvals_for_key(wallet_id, key_ref)?;
+        // Fence every ceremony that was still pending when the stop was
+        // recorded, under the same barrier hold as the marker: it can never
+        // activate now, whatever its selector, and no owner proof produced
+        // for it later can revive it. Active approvals are left to the
+        // caller, which revokes them at Signer first and locally after.
+        for (approval_id, state) in &bound {
+            if matches!(
+                state,
+                ApprovalLifecycleState::Prepared | ApprovalLifecycleState::AwaitingCeremony
+            ) {
+                self.journal
+                    .transition_approval(approval_id, ApprovalLifecycleState::Failed)?;
+            }
+        }
+        Ok(bound)
+    }
+
+    /// A stopped key admits no more automation: no reusable Petal approval
+    /// is prepared or activated on it again. The owner is not automation:
+    /// a fresh Exact approval, reviewed payload by payload in a new
+    /// ceremony, still proceeds so the funds behind the key stay
+    /// recoverable. Approvals that existed when the stop was recorded are
+    /// not "fresh": `stop_key` fenced the pending ones locally under the
+    /// same barrier hold, so they cannot activate whatever their selector.
+    /// Both Broker chokepoints call this while holding the barrier.
+    fn ensure_key_not_stopped(&self, terms: &SealedApprovalTerms) -> Result<(), AuthorityError> {
+        // Exhaustive on purpose: only Exact is exempt, so a selector added
+        // later stays stopped until this check is changed to say otherwise.
+        let automation = match terms.selector {
+            ApprovalSelector::Exact { .. } => false,
+            ApprovalSelector::Petal { .. } => true,
+        };
+        if !automation {
+            return Ok(());
+        }
+        let key_ref_jcs = serde_jcs::to_string(&terms.key_ref).map_err(storage)?;
+        let connection = self.lock()?;
+        let stopped = connection
+            .query_row(
+                "SELECT operation_id FROM key_stops WHERE wallet_id = ?1 AND key_ref = ?2",
+                params![terms.wallet_id.as_str(), &key_ref_jcs],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if stopped.is_some() {
+            return Err(denied(
+                "KEY_STOPPED",
+                "key was durably stopped and admits no approval preparation or activation",
+            ));
+        }
+        Ok(())
     }
 
     pub fn approval_public_list(
@@ -2467,7 +2750,7 @@ impl BrokerAuthority {
         }
         let allowed_destinations: BTreeSet<_> =
             policy.allowed_destinations.iter().cloned().collect();
-        if claim.declared_destinations.iter().any(|destination| {
+        if let Some(declared) = claim.declared_destinations.iter().find(|destination| {
             !allowed_destinations.contains(&PolicyDestination {
                 chain: destination.chain.clone(),
                 destination: destination.destination.clone(),
@@ -2475,7 +2758,7 @@ impl BrokerAuthority {
         }) {
             return Err(denied(
                 "DESTINATION_NOT_ALLOWED",
-                "claim names a destination outside wallet policy",
+                destination_policy_violation("claim", declared, &allowed_destinations),
             ));
         }
         Ok(())
@@ -2558,7 +2841,7 @@ impl BrokerAuthority {
         }
         let allowed_destinations: BTreeSet<_> =
             policy.allowed_destinations.iter().cloned().collect();
-        if claim.declared_destinations.iter().any(|destination| {
+        if let Some(declared) = claim.declared_destinations.iter().find(|destination| {
             !allowed_destinations.contains(&PolicyDestination {
                 chain: destination.chain.clone(),
                 destination: destination.destination.clone(),
@@ -2566,7 +2849,7 @@ impl BrokerAuthority {
         }) {
             return Err(denied(
                 "DESTINATION_NOT_ALLOWED",
-                "system claim names a destination outside wallet policy",
+                destination_policy_violation("system claim", declared, &allowed_destinations),
             ));
         }
         Ok(())
@@ -3135,6 +3418,21 @@ fn migrate_legacy_authority(
 /// account is pinned exactly. An omitted EVM account means account zero, while
 /// an omitted Solana account delegates selection of the next canonical account
 /// to Signer's authoritative derivation registry.
+/// The account number a committed derived-account path encodes: the EVM
+/// address index under hardened account zero, or the Solana hardened
+/// account. Callers run the frozen-template shape check first.
+fn committed_path_number(profile: bloom_broker_api::DerivationProfile, path: &str) -> Option<u32> {
+    let digits = match profile {
+        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
+            path.strip_prefix("m/44'/60'/0'/0/")?
+        }
+        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+            path.strip_prefix("m/44'/501'/")?.strip_suffix("'/0'")?
+        }
+    };
+    digits.parse::<u32>().ok()
+}
+
 fn path_matches_committed_account(
     profile: bloom_broker_api::DerivationProfile,
     path: &str,
@@ -3680,6 +3978,35 @@ fn budget_limits(terms: &SealedApprovalTerms) -> BudgetLimits {
 
 fn asset_id(chain: &str, asset: &str) -> String {
     format!("{chain}:{asset}")
+}
+
+fn destination_policy_violation(
+    subject: &str,
+    declared: &DeclaredDestination,
+    allowed: &BTreeSet<PolicyDestination>,
+) -> String {
+    let mut message = format!(
+        "{subject} names destination {} for chain \"{}\" outside wallet policy",
+        declared.destination,
+        declared.chain.as_str()
+    );
+    let conflicting: Vec<&str> = allowed
+        .iter()
+        .filter(|entry| entry.destination == declared.destination && entry.chain != declared.chain)
+        .map(|entry| entry.chain.as_str())
+        .collect();
+    if !conflicting.is_empty() {
+        let chains = conflicting
+            .iter()
+            .map(|chain| format!("\"{chain}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        message.push_str(&format!(
+            "; policy carries this destination under chain {chains}, but a destination entry only matches the declared chain \"{}\"",
+            declared.chain.as_str()
+        ));
+    }
+    message
 }
 
 fn denied(code: &'static str, message: impl Into<String>) -> AuthorityError {
