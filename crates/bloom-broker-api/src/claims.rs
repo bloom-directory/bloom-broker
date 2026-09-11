@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::{
-    AssetId, ClaimAssuranceLevel, CryptoSuite, DecimalU64, DecimalU256, Digest32, RequestNonce,
-    Token,
+    AssetId, ClaimAssuranceLevel, CryptoSuite, DecimalU64, DecimalU256, Digest32, ProtocolError,
+    ProtocolErrorCode, RequestNonce, Token,
 };
 
 pub const SOLANA_SYSTEM_TRANSFER_VERIFIER_ID: &str = "solana-system-transfer-v1";
@@ -108,4 +109,43 @@ pub struct SystemUseClaim {
     pub nonce: RequestNonce,
     pub chain_context: SystemChainContext,
     pub claim_assurance: ClaimAssurance,
+}
+
+impl SystemUseClaim {
+    /// Digest of the reviewed economic and chain identity, excluding only
+    /// payload freshness fields that a semantic verifier re-establishes.
+    pub fn approval_intent_digest(&self) -> Result<Digest32, ProtocolError> {
+        #[derive(Serialize)]
+        struct Intent<'a> {
+            component_id: &'a Token,
+            action_class: &'a Token,
+            operation_class: &'a Token,
+            crypto_suite: CryptoSuite,
+            declared_debits: &'a [DeclaredDebit],
+            declared_destinations: &'a [DeclaredDestination],
+            declared_fee: &'a DeclaredFee,
+            chain_family: &'a Token,
+            genesis_hash: &'a str,
+        }
+        let intent = Intent {
+            component_id: &self.component_id,
+            action_class: &self.action_class,
+            operation_class: &self.operation_class,
+            crypto_suite: self.crypto_suite,
+            declared_debits: &self.declared_debits,
+            declared_destinations: &self.declared_destinations,
+            declared_fee: &self.declared_fee,
+            chain_family: &self.chain_context.chain_family,
+            genesis_hash: &self.chain_context.genesis_hash,
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"bloom-system-approval-intent/v1");
+        hasher.update(serde_jcs::to_vec(&intent).map_err(|error| {
+            ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                format!("system approval intent encoding failed: {error}"),
+            )
+        })?);
+        Ok(Digest32::from_bytes(hasher.finalize().into()))
+    }
 }

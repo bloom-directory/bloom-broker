@@ -1438,6 +1438,12 @@ impl BrokerAuthority {
         let scope_bound = match terms.selector {
             ApprovalSelector::Exact { .. } => false,
             ApprovalSelector::Petal { .. } => true,
+            // Unreachable, and fail-closed if that ever changes: `validate`
+            // pairs a System selector only with a System subject, and the
+            // identity check above refuses any subject that is not this
+            // scope's Petal. A System approval on a Petal-derived key is
+            // therefore already denied before this value is read.
+            ApprovalSelector::System { .. } => true,
         };
         let outlives_scope = scope_bound && terms.expires_at_ms.get() > expires_at_ms;
         if !identity_matches
@@ -1496,6 +1502,12 @@ impl BrokerAuthority {
                         &grant.allowed_operation_classes,
                     )?;
                 }
+            }
+            ApprovalSelector::System { .. } => {
+                return Err(denied(
+                    "PETAL_KEY_SCOPE_MISMATCH",
+                    "a Petal-scoped key cannot use a system selector",
+                ));
             }
         }
         Ok(())
@@ -1973,6 +1985,10 @@ impl BrokerAuthority {
                     required_claim_assurance,
                     ..
                 } => Some(required_claim_assurance),
+                ApprovalSelector::System {
+                    required_claim_assurance,
+                    ..
+                } => Some(required_claim_assurance),
                 ApprovalSelector::Exact { .. } => None,
             },
             ceremony_url: None,
@@ -2174,6 +2190,10 @@ impl BrokerAuthority {
         let automation = match terms.selector {
             ApprovalSelector::Exact { .. } => false,
             ApprovalSelector::Petal { .. } => true,
+            // Reviewed once, then used against a payload refreshed later: a
+            // stopped key must not admit a new one. An owner who still needs
+            // to move the funds takes a fresh Exact approval.
+            ApprovalSelector::System { .. } => true,
         };
         if !automation {
             return Ok(());
@@ -2572,10 +2592,53 @@ impl BrokerAuthority {
                     declared_fee_asset(claim),
                 )
             }
+            (
+                ApprovalSelector::System {
+                    component_id,
+                    action_class,
+                    allowed_operation_classes,
+                    required_claim_assurance,
+                    intent_digest,
+                },
+                None,
+                Some(claim),
+            ) => {
+                if assurance_rank(claim.claim_assurance.level())
+                    < assurance_rank(*required_claim_assurance)
+                {
+                    return Err(denied(
+                        "ASSURANCE_TOO_WEAK",
+                        "system claim assurance is below the approved requirement",
+                    ));
+                }
+                if claim.approval_intent_digest().map_err(storage)? != *intent_digest {
+                    return Err(denied(
+                        "SYSTEM_CLAIM_MISMATCH",
+                        "system claim changes the approved economic intent",
+                    ));
+                }
+                self.validate_system_claim(
+                    &terms,
+                    &policy,
+                    input,
+                    claim,
+                    component_id,
+                    action_class,
+                    allowed_operation_classes,
+                    &payloads,
+                    &ordered_hashes,
+                    &payload_digests,
+                )?;
+                (
+                    account_system_claim_values(&terms, claim, &current_provenance)?,
+                    Some(claim.claim_assurance.clone()),
+                    declared_system_fee_asset(claim),
+                )
+            }
             _ => {
                 return Err(denied(
                     "SELECTOR_MISMATCH",
-                    "Petal selectors require a Petal claim",
+                    "scoped selectors require their matching claim",
                 ));
             }
         };
@@ -2610,6 +2673,11 @@ impl BrokerAuthority {
             .approval_record(&input.request.approval_id)?
             .ok_or_else(|| denied("APPROVAL_NOT_FOUND", "approval metadata is missing"))?
             .approved_claim_digest;
+        // Exact approvals bind the literal reviewed bytes, so the signing
+        // claim must equal the reviewed one byte for byte. System approvals
+        // deliberately admit a freshness-updated claim: their binding is
+        // the selector's intent digest, compared against the claim above,
+        // so the reviewed claim's JCS is not the sign-time authority there.
         if matches!(terms.selector, ApprovalSelector::Exact { .. })
             && approved_claim_digest.as_deref() != claim_digest.as_ref().map(Digest32::as_str)
         {

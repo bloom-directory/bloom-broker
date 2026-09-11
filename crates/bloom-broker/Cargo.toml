@@ -42,7 +42,7 @@ bloom-broker-debug-driver = { path = "../bloom-broker-debug-driver" }
 # The socket-activation regression hands a real descriptor to a child process
 # between fork and exec, which needs dup2/fcntl directly.
 libc = "0.2"
-bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "941dd376568b52ccd269ecf495bcff7dcd9af504" }
+bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "efb48d0437bb6e5d1e58c10b3873f4729f4e6045" }
 bloom-signer-vectors.workspace = true
 futures = "0.3"
 http-body-util = "0.1"

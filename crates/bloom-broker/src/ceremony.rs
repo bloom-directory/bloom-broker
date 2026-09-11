@@ -2012,6 +2012,36 @@ impl CeremonyBroker {
                 "review manifest is inconsistent with immutable approval terms",
             ));
         }
+        // The reviewed system claim must be the exact claim the immutable
+        // terms bind. The owner consents to the human-reviewed claim on the
+        // ceremony page while the passkey signature authorizes the
+        // selector's opaque `intent_digest`, so prepare is the one place
+        // that can prove the two name the same transfer. A System selector
+        // without a claim, or a claim under an Exact or Petal selector, is
+        // the same mismatch and fails closed.
+        match (&request.terms.selector, manifest.system_use_claim.as_ref()) {
+            (bloom_signer_api::ApprovalSelector::System { intent_digest, .. }, Some(claim)) => {
+                if claim.approval_intent_digest()? != *intent_digest {
+                    return Err(protocol(
+                        ProtocolErrorCode::ClaimInvalid,
+                        "SYSTEM_CLAIM_MISMATCH: the reviewed system claim differs from the intent digest the approval terms bind",
+                    ));
+                }
+            }
+            (bloom_signer_api::ApprovalSelector::System { .. }, None) => {
+                return Err(protocol(
+                    ProtocolErrorCode::ClaimInvalid,
+                    "SYSTEM_CLAIM_MISMATCH: a System selector approval must review exactly one system use claim",
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(protocol(
+                    ProtocolErrorCode::ClaimInvalid,
+                    "SYSTEM_CLAIM_MISMATCH: a system use claim cannot ride an Exact or Petal selector",
+                ));
+            }
+            _ => {}
+        }
         Ok(())
     }
 

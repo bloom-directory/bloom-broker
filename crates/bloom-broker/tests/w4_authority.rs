@@ -1702,6 +1702,517 @@ fn native_solana_destination_refusal_names_the_conflicting_policy_chain() {
     assert!(error.contains("only matches the declared chain \"solana\""));
 }
 
+/// Terms whose selector binds the reviewed system intent rather than literal
+/// payload bytes. The intent digest is computed from the same claim the owner
+/// reviewed; only chain-freshness fields may later differ.
+fn system_intent_terms(
+    harness: &Harness,
+    provenance: &ProvenanceRecord,
+    claim: &SystemUseClaim,
+    nonce_byte: u8,
+) -> SealedApprovalTerms {
+    let mut terms = solana_terms(harness, provenance, b"unused-for-intent", nonce_byte);
+    terms.selector = ApprovalSelector::System {
+        component_id: token("bloom-machine"),
+        action_class: token("solana.transfer.confirm"),
+        allowed_operation_classes: vec![token("solana.native-transfer")],
+        required_claim_assurance: ClaimAssuranceLevel::ProofVerified,
+        intent_digest: claim.approval_intent_digest().unwrap(),
+    };
+    terms
+}
+
+fn solana_transfer(
+    payer: [u8; 32],
+    destination: [u8; 32],
+    lamports: u64,
+    blockhash: [u8; 32],
+) -> (Vec<u8>, SystemUseClaim) {
+    let message = bloom_solana_verify::system_transfer::transfer_message(
+        bloom_solana_verify::Pubkey::from_bytes(payer),
+        bloom_solana_verify::Pubkey::from_bytes(destination),
+        lamports,
+        blockhash,
+    )
+    .unwrap()
+    .serialize();
+    let mut claim = solana_claim_for(
+        &message,
+        &bloom_solana_verify::Pubkey::from_bytes(destination).to_string(),
+        blockhash,
+        ClaimAssurance::ProofVerified {
+            verifier_id: token(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID),
+            verifier_digest: Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES),
+            proof_digest: digest(0),
+        },
+    );
+    claim.declared_debits[0].amount = DecimalU256::parse(lamports.to_string()).unwrap();
+    // Each fetched blockhash arrives with its own validity height; vary both
+    // so the refreshed claim differs from the reviewed one exactly on the
+    // freshness pair.
+    claim.chain_context.last_valid_block_height = DecimalU64::new(100 + u64::from(blockhash[0]));
+    claim = with_evidence_digest(claim, &message);
+    (message, claim)
+}
+
+#[test]
+fn system_intent_approval_covers_a_refreshed_blockhash() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (_, claim_one) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    let terms = system_intent_terms(&harness, &provenance, &claim_one, 91);
+    harness.activate_with_system_claim(&terms, &provenance, &claim_one);
+
+    // The owner reviewed message one. By the time the ceremony completed, the
+    // cluster had moved on, so the caller rebuilt the identical economic
+    // transfer with a fresh blockhash and its matching validity height.
+    let (message_two, claim_two) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x08; 32]);
+    assert_ne!(
+        claim_one.chain_context.recent_blockhash,
+        claim_two.chain_context.recent_blockhash
+    );
+    assert_ne!(
+        claim_one.chain_context.last_valid_block_height,
+        claim_two.chain_context.last_valid_block_height
+    );
+    assert_eq!(
+        claim_one.approval_intent_digest().unwrap(),
+        claim_two.approval_intent_digest().unwrap(),
+        "a blockhash refresh alone must not change the reviewed intent"
+    );
+
+    let input = solana_input(
+        &terms,
+        &provenance,
+        operation(91),
+        &message_two,
+        claim_two.clone(),
+        &message_two,
+        Some([0x01; 32]),
+    );
+    let decision = harness.authority.authorize(&input).unwrap();
+    assert_eq!(
+        decision.effective_assurance,
+        Some(claim_two.claim_assurance)
+    );
+}
+
+#[test]
+fn system_intent_approval_denies_a_changed_intent() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (_, claim_one) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    let terms = system_intent_terms(&harness, &provenance, &claim_one, 92);
+    harness.activate_with_system_claim(&terms, &provenance, &claim_one);
+
+    let (inflated, inflated_claim) = solana_transfer([0x01; 32], [0x02; 32], 2_000_000, [0x08; 32]);
+    assert!(
+        error_code(
+            harness
+                .authority
+                .authorize(&solana_input(
+                    &terms,
+                    &provenance,
+                    operation(92),
+                    &inflated,
+                    inflated_claim,
+                    &inflated,
+                    Some([0x01; 32]),
+                ))
+                .unwrap_err()
+        )
+        .contains("SYSTEM_CLAIM_MISMATCH"),
+        "a refreshed payload that changes the reviewed amount must be denied"
+    );
+
+    let (redirected, redirected_claim) =
+        solana_transfer([0x01; 32], [0x45; 32], 1_000_000, [0x08; 32]);
+    let redirected_error = error_code(
+        harness
+            .authority
+            .authorize(&solana_input(
+                &terms,
+                &provenance,
+                operation(93),
+                &redirected,
+                redirected_claim,
+                &redirected,
+                Some([0x01; 32]),
+            ))
+            .unwrap_err(),
+    );
+    assert!(
+        redirected_error.contains("SYSTEM_CLAIM_MISMATCH")
+            || redirected_error.contains("DESTINATION_NOT_ALLOWED"),
+        "a refreshed payload that changes the reviewed destination must be denied: {redirected_error}"
+    );
+}
+
+#[test]
+fn system_intent_approval_denies_a_refresh_that_changes_only_the_fee() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (_, claim_one) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    let terms = system_intent_terms(&harness, &provenance, &claim_one, 110);
+    harness.activate_with_system_claim(&terms, &provenance, &claim_one);
+
+    // Same payer, destination and amount under a fresh blockhash; only the
+    // declared fee moves. The fee is part of the reviewed intent.
+    let (refreshed, mut refreshed_claim) =
+        solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x08; 32]);
+    refreshed_claim.declared_fee = DeclaredFee::Fee {
+        chain: token("solana"),
+        asset: "native".into(),
+        amount: DecimalU256::parse("10000").unwrap(),
+    };
+    assert_eq!(refreshed_claim.declared_debits, claim_one.declared_debits);
+    assert_eq!(
+        refreshed_claim.declared_destinations,
+        claim_one.declared_destinations
+    );
+    assert_ne!(
+        refreshed_claim.approval_intent_digest().unwrap(),
+        claim_one.approval_intent_digest().unwrap()
+    );
+    let refused = error_code(
+        harness
+            .authority
+            .authorize(&solana_input(
+                &terms,
+                &provenance,
+                operation(110),
+                &refreshed,
+                refreshed_claim,
+                &refreshed,
+                Some([0x01; 32]),
+            ))
+            .unwrap_err(),
+    );
+    assert!(
+        refused.contains("SYSTEM_CLAIM_MISMATCH"),
+        "a refreshed payload that changes only the declared fee must be denied: {refused}"
+    );
+}
+
+#[test]
+fn system_intent_terms_must_be_single_use_and_single_signature() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (_, claim) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+
+    let mut widened = system_intent_terms(&harness, &provenance, &claim, 94);
+    widened.limits.max_operations = DecimalU64::new(2);
+    assert!(
+        error_code(
+            harness
+                .authority
+                .prepare_approval(&widened, &digest(7))
+                .unwrap_err()
+        )
+        .contains("SELECTOR_MISMATCH"),
+        "a system approval that could cover two operations must be rejected at preparation"
+    );
+
+    let mut multi_signature = system_intent_terms(&harness, &provenance, &claim, 95);
+    multi_signature.limits.max_signatures = DecimalU64::new(2);
+    assert!(
+        error_code(
+            harness
+                .authority
+                .prepare_approval(&multi_signature, &digest(7))
+                .unwrap_err()
+        )
+        .contains("SELECTOR_MISMATCH"),
+        "a system approval that could produce two signatures must be rejected at preparation"
+    );
+}
+
+#[test]
+fn system_intent_approval_cannot_authorize_a_second_transfer() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (_, claim_one) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    let terms = system_intent_terms(&harness, &provenance, &claim_one, 96);
+    harness.activate_with_system_claim(&terms, &provenance, &claim_one);
+
+    let (message_two, claim_two) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x08; 32]);
+    harness
+        .authority
+        .authorize(&solana_input(
+            &terms,
+            &provenance,
+            operation(96),
+            &message_two,
+            claim_two,
+            &message_two,
+            Some([0x01; 32]),
+        ))
+        .unwrap();
+
+    let (message_three, claim_three) =
+        solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x09; 32]);
+    assert!(
+        error_code(
+            harness
+                .authority
+                .authorize(&solana_input(
+                    &terms,
+                    &provenance,
+                    operation(97),
+                    &message_three,
+                    claim_three,
+                    &message_three,
+                    Some([0x01; 32]),
+                ))
+                .unwrap_err()
+        )
+        .contains("LIMIT_EXCEEDED_OPERATIONS"),
+        "one system approval must not pay twice, even for the same reviewed intent"
+    );
+}
+
+/// A Signer seam that answers approval preparation locally. The reviewed
+/// binding is enforced before any Signer round trip, so a stub that records
+/// whether it was reached distinguishes a refused prepare from a prepared
+/// one without a live Signer.
+#[derive(Default)]
+struct StubCeremonySigner {
+    prepared: std::sync::atomic::AtomicBool,
+}
+
+impl bloom_broker::ceremony::CeremonySigner for StubCeremonySigner {
+    fn prepare_approval(
+        &self,
+        request: bloom_signer_api::CeremonyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<bloom_signer_api::SignerPreparedApproval, bloom_signer_api::ProtocolError> {
+        self.prepared
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ceremony_id =
+            Digest32::from_bytes(Sha256::digest(request.activation_operation_id.to_bytes()).into());
+        Ok(bloom_signer_api::SignerPreparedApproval {
+            contribution: bloom_signer_api::SignerCeremonyContribution {
+                ceremony_id,
+                signer_nonce: digest(61),
+                approval_digest: request.terms.approval_digest()?,
+                review_manifest_digest: request.review_manifest_digest.clone(),
+                key_ref: request.terms.key_ref.clone(),
+                allowed_crypto_suites: Vec::new(),
+                activation_mode: request.terms.activation_mode.clone(),
+                wallet_revocation_epoch: request.terms.wallet_revocation_epoch.clone(),
+                required_user_verification: true,
+                ephemeral_encryption_public_key: None,
+                expires_at_ms: bloom_signer_api::DecimalU64::new(now_ms + 60_000),
+                signer_key_id: token("stub-signer-key"),
+                signer_signature: Base64UrlBytes::from_bytes(&[]),
+            },
+            challenges: Vec::new(),
+            webauthn_options: bloom_signer_api::CeremonyWebAuthnOptions {
+                allowed_credentials: Vec::new(),
+                registration_user_handle: None,
+                registration_prf_salt: None,
+            },
+            verification_credentials: Vec::new(),
+        })
+    }
+
+    fn complete_approval(
+        &self,
+        request: bloom_signer_api::CeremonyCompleteRequest,
+        _now_ms: u64,
+    ) -> Result<bloom_signer_api::SignerActivationReceipt, bloom_signer_api::ProtocolError> {
+        unreachable!("this stub only prepares approvals: {request:?}")
+    }
+
+    fn prepare_custody(
+        &self,
+        request: bloom_signer_api::CustodyPrepareRequest,
+        _now_ms: u64,
+    ) -> Result<bloom_signer_api::SignerPreparedCustody, bloom_signer_api::ProtocolError> {
+        unreachable!("this stub only prepares approvals: {request:?}")
+    }
+
+    fn complete_custody(
+        &self,
+        request: bloom_signer_api::CustodyCompleteRequest,
+        _now_ms: u64,
+    ) -> Result<bloom_signer_api::CustodyResult, bloom_signer_api::ProtocolError> {
+        unreachable!("this stub only prepares approvals: {request:?}")
+    }
+
+    fn bind_custody_output_recipient(
+        &self,
+        operation_id: &OperationId,
+        _recipient_key: Base64UrlBytes,
+        _now_ms: u64,
+    ) -> Result<bloom_signer_api::SignerPreparedCustody, bloom_signer_api::ProtocolError> {
+        unreachable!("this stub only prepares approvals: {operation_id}")
+    }
+
+    fn cancel(&self, operation_id: &OperationId) -> Result<(), bloom_signer_api::ProtocolError> {
+        unreachable!("this stub only prepares approvals: {operation_id}")
+    }
+
+    fn status(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<bloom_signer_api::SignerCeremonyStatus, bloom_signer_api::ProtocolError> {
+        unreachable!("this stub only prepares approvals: {operation_id}")
+    }
+}
+
+fn ceremony_prepare_request_for(
+    terms: &SealedApprovalTerms,
+    operation_id: OperationId,
+) -> bloom_signer_api::CeremonyPrepareRequest {
+    // The two terms types serialize to the same canonical shape and both
+    // reject unknown fields, so this round trip either translates exactly
+    // or fails loudly.
+    let translated: bloom_signer_api::SealedApprovalTerms =
+        serde_json::from_value(serde_json::to_value(terms).unwrap()).unwrap();
+    bloom_signer_api::CeremonyPrepareRequest {
+        activation_operation_id: operation_id,
+        terms: translated,
+        review_manifest_digest: digest(62),
+        exact_ordered_payload_digests: Vec::new(),
+        exact_ordered_hashes: Vec::new(),
+        replacement_approval_id: None,
+    }
+}
+
+fn system_claim_context(claim: &SystemUseClaim) -> bloom_broker::ceremony::ReviewManifestContext {
+    bloom_broker::ceremony::ReviewManifestContext {
+        petal_use_claim: None,
+        system_use_claim: Some(claim.clone()),
+        claim_assurance: Some(claim.claim_assurance.clone()),
+        attributed_advisory_items: Vec::new(),
+    }
+}
+
+#[test]
+fn a_system_claim_review_must_name_the_approved_intent() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    // The owner reviews transfer A (1 SOL to X)...
+    let (_, reviewed) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    // ...while the immutable terms bind the intent digest of transfer B
+    // (5 SOL to Y): different destination, different amount.
+    let (_, bound) = solana_transfer([0x01; 32], [0x03; 32], 5_000_000, [0x08; 32]);
+    let broker = bloom_broker::ceremony::CeremonyBroker::new_with_manifest_signer(
+        Arc::new(StubCeremonySigner::default()),
+        token("broker-app-1"),
+        SigningKey::from_bytes(&[7; 32]),
+    );
+
+    // A reviewed claim that is not the bound intent is refused before any
+    // Signer round trip.
+    let mismatched = broker
+        .prepare_approval(
+            ceremony_prepare_request_for(
+                &system_intent_terms(&harness, &provenance, &bound, 95),
+                operation(96),
+            ),
+            system_claim_context(&reviewed),
+            1_200,
+        )
+        .unwrap_err();
+    assert_eq!(mismatched.code.as_str(), "CLAIM_INVALID");
+    assert!(
+        mismatched.message.contains("SYSTEM_CLAIM_MISMATCH"),
+        "{mismatched}"
+    );
+
+    // A System selector with no reviewed claim at all is the same mismatch.
+    let claimless = broker
+        .prepare_approval(
+            ceremony_prepare_request_for(
+                &system_intent_terms(&harness, &provenance, &bound, 95),
+                operation(99),
+            ),
+            bloom_broker::ceremony::ReviewManifestContext {
+                petal_use_claim: None,
+                system_use_claim: None,
+                claim_assurance: None,
+                attributed_advisory_items: Vec::new(),
+            },
+            1_200,
+        )
+        .unwrap_err();
+    assert!(
+        claimless.message.contains("SYSTEM_CLAIM_MISMATCH"),
+        "{claimless}"
+    );
+
+    // A system claim cannot ride an Exact selector either.
+    let exact = solana_terms(&harness, &provenance, b"exact-payload", 100);
+    let riding = broker
+        .prepare_approval(
+            ceremony_prepare_request_for(&exact, operation(101)),
+            system_claim_context(&reviewed),
+            1_200,
+        )
+        .unwrap_err();
+    assert!(riding.message.contains("SYSTEM_CLAIM_MISMATCH"), "{riding}");
+
+    // The claim the terms actually bind prepares normally: the review the
+    // owner saw and the intent the passkey authorizes are the same transfer.
+    let stub = Arc::new(StubCeremonySigner::default());
+    let broker = bloom_broker::ceremony::CeremonyBroker::new_with_manifest_signer(
+        stub.clone(),
+        token("broker-app-1"),
+        SigningKey::from_bytes(&[7; 32]),
+    );
+    let prepared = broker
+        .prepare_approval(
+            ceremony_prepare_request_for(
+                &system_intent_terms(&harness, &provenance, &reviewed, 102),
+                operation(103),
+            ),
+            system_claim_context(&reviewed),
+            1_200,
+        )
+        .unwrap();
+    assert_eq!(
+        prepared.state,
+        bloom_broker_api::ApprovalPrepareState::AwaitingCeremony
+    );
+    assert!(
+        stub.prepared.load(std::sync::atomic::Ordering::SeqCst),
+        "a matching claim reaches the Signer"
+    );
+}
+
+#[test]
+fn an_exact_approval_cannot_cover_a_refreshed_blockhash() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (message_one, claim_one) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    // Exact terms pin the literal reviewed bytes; the intent selector above is
+    // what makes a refresh possible, so the exact path must refuse it.
+    let terms = solana_terms(&harness, &provenance, &message_one, 98);
+    harness.activate_with_system_claim(&terms, &provenance, &claim_one);
+
+    let (message_two, claim_two) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x08; 32]);
+    assert!(
+        error_code(
+            harness
+                .authority
+                .authorize(&solana_input(
+                    &terms,
+                    &provenance,
+                    operation(98),
+                    &message_two,
+                    claim_two,
+                    &message_two,
+                    Some([0x01; 32]),
+                ))
+                .unwrap_err()
+        )
+        .contains("SELECTOR_MISMATCH"),
+        "an exact approval must never cover a rebuilt payload, refreshed blockhash included"
+    );
+}
+
 #[test]
 fn concurrent_renewal_has_one_atomic_winner_and_never_reactivates_predecessor() {
     let harness = Harness::new();
@@ -3130,6 +3641,55 @@ fn ac_a_key_stop_refuses_approvals_prepared_after_it() {
             .is_err(),
         "the stop exemption does not relax the scope's own checks"
     );
+}
+
+/// A System approval is reviewed once against one intent and then signs a
+/// payload refreshed after that review, so it is automation in the sense the
+/// stop cares about: the owner is not at the keyboard when it is used. A
+/// stopped key must not admit a new one.
+///
+/// This pins the `System` arm of `ensure_key_not_stopped`, which is the only
+/// selector arm added for System that is reachable — the scope-bound check
+/// refuses a System subject before its own arm is read.
+#[test]
+fn ac_a_key_stop_refuses_a_system_approval_but_not_a_fresh_exact_one() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (_, claim) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    let terms = system_intent_terms(&harness, &provenance, &claim, 95);
+    harness.authority.install_provenance(&provenance).unwrap();
+
+    harness
+        .authority
+        .stop_key(
+            &harness.wallet,
+            &terms.key_ref,
+            operation(45).as_str(),
+            2_000,
+        )
+        .unwrap();
+
+    let error = harness
+        .authority
+        .prepare_approval(&terms, &digest(9))
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            bloom_broker::authority::AuthorityError::Denied { code, .. } if *code == "KEY_STOPPED"
+        ),
+        "a System approval prepared after the stop must be refused with KEY_STOPPED, got {error:?}"
+    );
+
+    // The owner is still not automation. An Exact approval on the same
+    // stopped key, reviewed payload by payload, prepares as before, so the
+    // funds behind the key stay recoverable.
+    let recovery = solana_terms(&harness, &provenance, b"sweep after stop", 7);
+    assert_eq!(recovery.key_ref, terms.key_ref);
+    harness
+        .authority
+        .prepare_approval(&recovery, &digest(7))
+        .expect("a fresh Exact approval on the stopped key must still prepare");
 }
 
 #[test]
