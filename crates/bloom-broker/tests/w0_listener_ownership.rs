@@ -1,8 +1,9 @@
 #[cfg(target_os = "linux")]
 mod linux {
-    use bloom_broker::ceremony::CeremonyBroker;
+    use bloom_broker::ceremony::{CEREMONY_LOOPBACK_ADDRS, CeremonyBroker};
     use std::{
         io::{BufRead as _, Read as _, Write as _},
+        net::TcpListener,
         os::unix::process::CommandExt as _,
         process::{Command, Stdio},
     };
@@ -15,9 +16,8 @@ mod linux {
     fn two_cross_uid_brokers_fail_closed_on_the_canonical_listener() {
         match std::env::var(CHILD_MODE).as_deref() {
             Ok("hold") => {
-                let _listener = CeremonyBroker::bind_canonical_loopback()
-                    .map(|(v4, _)| v4)
-                    .expect("first Broker must acquire the canonical listener");
+                let _listeners = CeremonyBroker::bind_canonical_loopback()
+                    .expect("first Broker must acquire both canonical listeners");
                 println!("BLOOM_W0_READY");
                 std::io::stdout().flush().unwrap();
                 let mut release = [0_u8; 1];
@@ -25,6 +25,15 @@ mod linux {
                 return;
             }
             Ok("conflict") => {
+                // Probe each family independently: the Broker binds IPv4
+                // first, so its pair acquisition alone cannot prove that
+                // another principal is also excluded from IPv6.
+                for address in CEREMONY_LOOPBACK_ADDRS {
+                    let error = TcpListener::bind(address)
+                        .expect_err("second principal must not share either canonical listener");
+                    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse, "{address}");
+                    eprintln!("EXCLUSIVE {address}");
+                }
                 let error = CeremonyBroker::bind_canonical_loopback()
                     .expect_err("second Broker must not share the canonical listener");
                 eprintln!("{error}");
@@ -95,6 +104,12 @@ mod linux {
             String::from_utf8_lossy(&second.stderr)
         );
         let second_stderr = String::from_utf8_lossy(&second.stderr);
+        for address in CEREMONY_LOOPBACK_ADDRS {
+            assert!(
+                second_stderr.contains(&format!("EXCLUSIVE {address}")),
+                "second principal did not verify exclusivity for {address}: {second_stderr}"
+            );
+        }
         assert!(second_stderr.contains("cannot bind canonical ceremony listener"));
         assert!(second_stderr.contains("no fallback port"));
 
