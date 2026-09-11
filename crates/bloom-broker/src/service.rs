@@ -2400,6 +2400,7 @@ mod tests {
                 bloom_signer_api::CryptoSuite::Secp256k1Keccak256Recoverable,
             ],
             derived_account: None,
+            petal_scope_expires_at_ms: None,
         }
     }
 
