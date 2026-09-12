@@ -30,10 +30,13 @@ pub(crate) fn review(
     else {
         return Err(invalid("EVM review requires an exact selector"));
     };
+    // One exact approval covers a whole transaction batch; the cap matches
+    // Machine's documented batch maximum (32 children) so no approvable batch
+    // is rejected here.
     if request.terms.allowed_crypto_suites != [CryptoSuite::Secp256k1Keccak256Recoverable]
         || request.evm_review_payloads.len() != ordered_payload_digests.len()
         || ordered_hashes.len() != ordered_payload_digests.len()
-        || request.evm_review_payloads.len() > 16
+        || request.evm_review_payloads.len() > 32
     {
         return Err(invalid(
             "EVM review payload count or cryptographic suite mismatch",
@@ -256,5 +259,47 @@ mod tests {
         .join("\n");
         assert!(!plan.contains("Predicted address"));
         assert!(plan.contains("Contract call"));
+    }
+
+    #[test]
+    fn reviews_a_full_maximum_batch_and_rejects_more() {
+        let tx = TxEip1559 {
+            chain_id: 31337,
+            nonce: 0,
+            gas_limit: 21000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::ZERO),
+            value: alloy::primitives::U256::ZERO,
+            input: Vec::new().into(),
+            access_list: Default::default(),
+        };
+        let payload = tx.encoded_for_signing();
+        for count in [32usize, 33] {
+            let mut req = request(&payload);
+            req.evm_review_payloads = vec![Base64UrlBytes::from_bytes(&payload); count];
+            let ApprovalSelector::Exact {
+                ordered_payload_digests,
+                ordered_hashes,
+            } = &mut req.terms.selector
+            else {
+                unreachable!()
+            };
+            *ordered_payload_digests = req
+                .evm_review_payloads
+                .iter()
+                .map(|p| Digest32::from_bytes(Sha256::digest(p.decode()).into()))
+                .collect();
+            *ordered_hashes = req
+                .evm_review_payloads
+                .iter()
+                .map(|p| Digest32::from_bytes(keccak256(p.decode()).0))
+                .collect();
+            assert_eq!(
+                review(&req, &policy(), Address::ZERO).is_ok(),
+                count <= 32,
+                "{count}"
+            );
+        }
     }
 }
