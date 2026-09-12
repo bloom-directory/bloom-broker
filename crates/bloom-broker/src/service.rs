@@ -108,6 +108,41 @@ fn seed_profile_from_key_projection(
     }
 }
 
+/// Whether this approval subject is a native exact EVM transaction class
+/// whose owner review is the Broker-decoded signing preimage.
+fn native_evm_transaction_class(subject: &bloom_broker_api::ApprovalSubject) -> bool {
+    use bloom_broker_api::ApprovalSubject;
+    match subject {
+        ApprovalSubject::Cli { command_class, .. } => matches!(
+            command_class.as_str(),
+            "transaction.confirm" | "transaction.replace" | "transaction.cancel"
+        ),
+        ApprovalSubject::System {
+            operation_class, ..
+        } => matches!(
+            operation_class.as_str(),
+            "transaction.confirm" | "transaction.replace" | "transaction.cancel"
+        ),
+        _ => false,
+    }
+}
+
+/// Renewals pass no review payloads, and a real Broker never re-reviews on
+/// renewal. A native transaction approval's owner review *is* the decoded
+/// preimage, so it has no valid renewal shape: refuse it by name instead of
+/// as a generic missing-payload error.
+fn renewal_of_native_transaction_is_refused(
+    terms: &bloom_broker_api::SealedApprovalTerms,
+) -> Option<ProtocolError> {
+    if native_evm_transaction_class(&terms.subject) {
+        return Some(ProtocolError::new(
+            ProtocolErrorCode::SelectorMismatch,
+            "native transaction approvals are single-use and cannot be renewed",
+        ));
+    }
+    None
+}
+
 impl BrokerRpcService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -742,6 +777,53 @@ impl BrokerRpcService {
             ));
         }
         self.reconcile_wallet(&request.terms.wallet_id).await?;
+        let mut context = ReviewManifestContext::default();
+        let native_evm = native_evm_transaction_class(&request.terms.subject);
+        if native_evm && request.evm_review_payloads.is_empty() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::SelectorMismatch,
+                "native EVM approval requires full review payloads; upgrade Bloom Machine",
+            ));
+        }
+        if !request.evm_review_payloads.is_empty() {
+            use k256::elliptic_curve::sec1::ToEncodedPoint as _;
+            let response = self
+                .signer
+                .request_for_machine(BrokerSignerRequest::KeyGetPublic(
+                    translate_service::key_request_to_signer(bloom_broker_api::KeyRequest {
+                        key_ref: request.terms.key_ref.clone(),
+                    }),
+                ))
+                .await?;
+            let BrokerSignerResponse::KeyGetPublic(key) = response else {
+                return Err(response_mismatch("key.get_public"));
+            };
+            let key = translate_service::key_to_machine(key);
+            if key.key_ref != request.terms.key_ref {
+                return Err(response_mismatch("EVM review key identity"));
+            }
+            let public = k256::PublicKey::from_sec1_bytes(&key.canonical_public_key.decode())
+                .map_err(|_| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "invalid EVM public key",
+                    )
+                })?;
+            let encoded = public.to_encoded_point(false);
+            let from = alloy::primitives::Address::from_raw_public_key(&encoded.as_bytes()[1..]);
+            let snapshot = self
+                .authority
+                .policy_snapshot(&request.terms.wallet_id)
+                .map_err(authority_error)?;
+            let policy =
+                serde_json::from_slice(&snapshot.canonical_policy.decode()).map_err(|_| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "invalid canonical policy",
+                    )
+                })?;
+            context.attributed_advisory_items = crate::evm_review::review(&request, &policy, from)?;
+        }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
             ApprovalSelector::Exact {
                 ordered_payload_digests,
@@ -777,16 +859,12 @@ impl BrokerRpcService {
                 .as_ref()
                 .map(jcs_digest)
                 .transpose()?);
-        let response = self.ceremony.prepare_approval(
-            ceremony_request,
-            ReviewManifestContext {
-                petal_use_claim: request.petal_use_claim,
-                system_use_claim: request.system_use_claim,
-                claim_assurance,
-                attributed_advisory_items: Vec::new(),
-            },
-            self.clock.now_ms(true)?,
-        )?;
+        context.petal_use_claim = request.petal_use_claim;
+        context.system_use_claim = request.system_use_claim;
+        context.claim_assurance = claim_assurance;
+        let response =
+            self.ceremony
+                .prepare_approval(ceremony_request, context, self.clock.now_ms(true)?)?;
         if let Err(error) = self
             .authority
             .prepare_approval_with_claim(
@@ -942,7 +1020,11 @@ impl BrokerRpcService {
                 "renewal terms do not name the requested predecessor",
             ));
         }
+        if let Some(error) = renewal_of_native_transaction_is_refused(&request.replacement_terms) {
+            return Err(error);
+        }
         self.prepare_approval(ApprovalPrepareRequest {
+            evm_review_payloads: Vec::new(),
             operation_id: request.operation_id,
             canonical_plan_facts_digest: request.replacement_terms.approval_digest()?,
             terms: request.replacement_terms,
@@ -2363,6 +2445,77 @@ fn malformed(error: impl std::fmt::Display) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_native_transaction_renewal_is_refused_by_name_and_other_subjects_are_not() {
+        use bloom_broker_api::{
+            ActivationMode, ApprovalLimits, ApprovalSubject, CryptoSuite, KeyRef, KeySpec,
+            RequestNonce, SealedApprovalTerms,
+        };
+        let terms = |subject| SealedApprovalTerms {
+            subject,
+            wallet_id: Token::new("wallet").unwrap(),
+            key_ref: KeyRef {
+                backend: Token::new("local").unwrap(),
+                backend_instance: Token::new("default").unwrap(),
+                locator: "wallet/root".into(),
+                key_spec: KeySpec::Secp256k1,
+                public_key_fingerprint: Digest32::from_bytes([1; 32]),
+                derivation: None,
+            },
+            allowed_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+            selector: ApprovalSelector::Exact {
+                ordered_payload_digests: vec![Digest32::from_bytes([2; 32])],
+                ordered_hashes: vec![Digest32::from_bytes([3; 32])],
+            },
+            limits: ApprovalLimits {
+                max_operations: DecimalU64::new(1),
+                max_signatures: DecimalU64::new(1),
+                operation_rate_limits: Vec::new(),
+                signature_rate_limits: Vec::new(),
+                value_limits: Vec::new(),
+            },
+            activation_mode: ActivationMode::BootBound,
+            wallet_revocation_epoch: DecimalU64::new(0),
+            policy_version: DecimalU64::new(1),
+            policy_digest: Digest32::from_bytes([4; 32]),
+            provenance_digest: Digest32::from_bytes([5; 32]),
+            request_nonce: RequestNonce::from_bytes([6; 16]),
+            issued_at_ms: DecimalU64::new(10),
+            not_before_ms: DecimalU64::new(10),
+            expires_at_ms: DecimalU64::new(20),
+            renewal_of: None,
+        };
+        for class in [
+            "transaction.confirm",
+            "transaction.replace",
+            "transaction.cancel",
+        ] {
+            let error = renewal_of_native_transaction_is_refused(&terms(ApprovalSubject::Cli {
+                client_id: Token::new("machine").unwrap(),
+                command_class: Token::new(class).unwrap(),
+            }))
+            .expect(class);
+            assert_eq!(error.code, ProtocolErrorCode::SelectorMismatch);
+            assert!(error.message.contains("single-use"), "{error:?}");
+        }
+        for subject in [
+            ApprovalSubject::Cli {
+                client_id: Token::new("machine").unwrap(),
+                command_class: Token::new("vfs.test").unwrap(),
+            },
+            ApprovalSubject::Petal {
+                package_hash: Digest32::from_bytes([7; 32]),
+                route: "orders/place".into(),
+                agent_id: None,
+            },
+        ] {
+            assert!(
+                renewal_of_native_transaction_is_refused(&terms(subject)).is_none(),
+                "non-transaction renewals keep the existing path"
+            );
+        }
+    }
     use crate::journal::OperationSnapshot;
     use bloom_broker_api::OperationState;
     use bloom_signer_api::{CryptoSuite, NormalizedSignature, SignerClaimAssurance, SigningResult};
