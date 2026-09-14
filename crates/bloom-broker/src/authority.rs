@@ -2865,6 +2865,14 @@ impl BrokerAuthority {
                 "system claim identity, class, payload, hashes, or chain context changed",
             ));
         }
+        if assurance_rank(claim.claim_assurance.level())
+            < assurance_rank(ClaimAssuranceLevel::ProofVerified)
+        {
+            return Err(denied(
+                "ASSURANCE_TOO_WEAK",
+                "native Solana system operations require proof-verified assurance",
+            ));
+        }
         if !matches!(
             &claim.claim_assurance,
             ClaimAssurance::ProofVerified {
@@ -2877,14 +2885,6 @@ impl BrokerAuthority {
             return Err(denied(
                 "SYSTEM_VERIFIER_MISMATCH",
                 "native Solana refresh requires the pinned system-transfer verifier",
-            ));
-        }
-        if assurance_rank(claim.claim_assurance.level())
-            < assurance_rank(ClaimAssuranceLevel::ProofVerified)
-        {
-            return Err(denied(
-                "ASSURANCE_TOO_WEAK",
-                "native Solana system operations require proof-verified assurance",
             ));
         }
         if !policy.required_verifiers.is_empty()
