@@ -7,8 +7,9 @@ use bloom_broker_api::{
     ApprovalTombstone, Base64UrlBytes, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite,
     CustodyResult, DeclaredDestination, DeclaredFee, Digest32, KeyRef, MachineSignRequest,
     OperationId, PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope, PetalUseClaim,
-    PolicyUpdateRequest, ProtocolErrorCode, RevocationState, SealedApprovalTerms,
-    SignedPolicySnapshot, SigningPayloads, SystemUseClaim, Token,
+    PolicyUpdateRequest, ProtocolErrorCode, RevocationState,
+    SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES, SOLANA_SYSTEM_TRANSFER_VERIFIER_ID,
+    SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads, SystemUseClaim, Token,
 };
 pub use bloom_broker_api::{CanonicalWalletPolicy, PolicyDestination, RequiredVerifier};
 pub use bloom_broker_api::{
@@ -2862,6 +2863,20 @@ impl BrokerAuthority {
             return Err(denied(
                 "SYSTEM_CLAIM_MISMATCH",
                 "system claim identity, class, payload, hashes, or chain context changed",
+            ));
+        }
+        if !matches!(
+            &claim.claim_assurance,
+            ClaimAssurance::ProofVerified {
+                verifier_id,
+                verifier_digest,
+                ..
+            } if verifier_id.as_str() == SOLANA_SYSTEM_TRANSFER_VERIFIER_ID
+                && verifier_digest.to_bytes() == SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES
+        ) {
+            return Err(denied(
+                "SYSTEM_VERIFIER_MISMATCH",
+                "native Solana refresh requires the pinned system-transfer verifier",
             ));
         }
         if assurance_rank(claim.claim_assurance.level())

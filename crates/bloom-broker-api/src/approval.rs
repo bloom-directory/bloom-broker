@@ -8,6 +8,9 @@ use crate::{
 };
 
 const APPROVAL_DOMAIN: &[u8] = b"bloom-sealed-approval-terms/v1";
+const SOLANA_SYSTEM_COMPONENT_ID: &str = "bloom-machine";
+const SOLANA_TRANSFER_ACTION_CLASS: &str = "solana.transfer.confirm";
+const SOLANA_NATIVE_TRANSFER_OPERATION_CLASS: &str = "solana.native-transfer";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -21,6 +24,8 @@ pub enum ApprovalSubject {
         client_id: Token,
         command_class: Token,
     },
+    /// Refreshable authority reserved by validation for one proof-verified,
+    /// single-use native Solana transfer. This is not a generic system escape.
     System {
         component_id: Token,
         operation_class: Token,
@@ -54,6 +59,8 @@ pub enum ApprovalSelector {
         route_grants: Vec<PetalRouteGrant>,
         required_claim_assurance: ClaimAssuranceLevel,
     },
+    /// Refreshable selector reserved by validation for one proof-verified,
+    /// single-use native Solana transfer. This is not a generic system escape.
     System {
         component_id: Token,
         action_class: Token,
@@ -171,9 +178,29 @@ impl SealedApprovalTerms {
                 },
             ) if component_id == selector_component
                 && operation_class == action_class
-                && classes_are_canonical(allowed_operation_classes)
+                && component_id.as_str() == SOLANA_SYSTEM_COMPONENT_ID
+                && operation_class.as_str() == SOLANA_TRANSFER_ACTION_CLASS
+                && allowed_operation_classes.len() == 1
+                && allowed_operation_classes[0].as_str()
+                    == SOLANA_NATIVE_TRANSFER_OPERATION_CLASS
+                && self.allowed_crypto_suites.as_slice() == [CryptoSuite::Ed25519Message]
+                && self.key_ref.key_spec == crate::KeySpec::Ed25519
+                && matches!(
+                    &self.selector,
+                    ApprovalSelector::System {
+                        required_claim_assurance: ClaimAssuranceLevel::ProofVerified,
+                        ..
+                    }
+                )
                 && self.limits.max_operations.get() == 1
-                && self.limits.max_signatures.get() == 1 => {}
+                && self.limits.max_signatures.get() == 1
+                && self.limits.operation_rate_limits.is_empty()
+                && self.limits.signature_rate_limits.is_empty()
+                && self.limits.value_limits.len() == 1
+                && self.limits.value_limits[0].asset.chain.as_str() == "solana"
+                && self.limits.value_limits[0].asset.asset == "native"
+                && self.limits.value_limits[0].lifetime.as_str() != "0"
+                && self.limits.value_limits[0].rolling_windows.is_empty() => {}
             (
                 ApprovalSubject::Petal {
                     package_hash,

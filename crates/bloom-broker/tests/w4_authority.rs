@@ -17,7 +17,7 @@ use bloom_broker_api::{
     PetalKeyScope, PetalLineageMembership, PetalRouteGrant, PetalUseClaim, PolicyUpdateRequest,
     ProvenanceCatalog, RequestNonce, RevocationState, SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES,
     SOLANA_SYSTEM_TRANSFER_VERIFIER_ID, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
-    SystemChainContext, SystemUseClaim, Token, ValueLimit,
+    SlidingWindow, SystemChainContext, SystemUseClaim, Token, ValueLimit,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
@@ -1895,6 +1895,39 @@ fn system_intent_approval_denies_a_refresh_that_changes_only_the_fee() {
 }
 
 #[test]
+fn system_intent_approval_denies_a_different_verifier() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (_, reviewed_claim) = solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x07; 32]);
+    let terms = system_intent_terms(&harness, &provenance, &reviewed_claim, 111);
+    harness.activate_with_system_claim(&terms, &provenance, &reviewed_claim);
+
+    let (message, mut changed_claim) =
+        solana_transfer([0x01; 32], [0x02; 32], 1_000_000, [0x08; 32]);
+    let ClaimAssurance::ProofVerified { verifier_id, .. } = &mut changed_claim.claim_assurance
+    else {
+        unreachable!()
+    };
+    *verifier_id = token("another-solana-verifier");
+    let error = harness
+        .authority
+        .authorize(&solana_input(
+            &terms,
+            &provenance,
+            operation(111),
+            &message,
+            changed_claim,
+            &message,
+            Some([0x01; 32]),
+        ))
+        .unwrap_err();
+    assert!(
+        error_code(error).contains("SYSTEM_VERIFIER_MISMATCH"),
+        "a refresh cannot substitute another verifier identity"
+    );
+}
+
+#[test]
 fn system_intent_terms_must_be_single_use_and_single_signature() {
     let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
     let provenance = harness.solana_provenance();
@@ -1925,6 +1958,81 @@ fn system_intent_terms_must_be_single_use_and_single_signature() {
         .contains("SELECTOR_MISMATCH"),
         "a system approval that could produce two signatures must be rejected at preparation"
     );
+
+    let mut wrong_component = system_intent_terms(&harness, &provenance, &claim, 96);
+    let ApprovalSubject::System { component_id, .. } = &mut wrong_component.subject else {
+        unreachable!()
+    };
+    *component_id = token("other-machine");
+    let ApprovalSelector::System { component_id, .. } = &mut wrong_component.selector else {
+        unreachable!()
+    };
+    *component_id = token("other-machine");
+
+    let mut wrong_action = system_intent_terms(&harness, &provenance, &claim, 97);
+    let ApprovalSubject::System {
+        operation_class, ..
+    } = &mut wrong_action.subject
+    else {
+        unreachable!()
+    };
+    *operation_class = token("solana.other.confirm");
+    let ApprovalSelector::System { action_class, .. } = &mut wrong_action.selector else {
+        unreachable!()
+    };
+    *action_class = token("solana.other.confirm");
+
+    let mut wrong_operation = system_intent_terms(&harness, &provenance, &claim, 98);
+    let ApprovalSelector::System {
+        allowed_operation_classes,
+        ..
+    } = &mut wrong_operation.selector
+    else {
+        unreachable!()
+    };
+    *allowed_operation_classes = vec![token("solana.token-transfer")];
+
+    let mut wrong_assurance = system_intent_terms(&harness, &provenance, &claim, 99);
+    let ApprovalSelector::System {
+        required_claim_assurance,
+        ..
+    } = &mut wrong_assurance.selector
+    else {
+        unreachable!()
+    };
+    *required_claim_assurance = ClaimAssuranceLevel::MachineAsserted;
+
+    let mut wrong_suite = system_intent_terms(&harness, &provenance, &claim, 100);
+    wrong_suite.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Sha256Recoverable];
+    wrong_suite.key_ref.key_spec = KeySpec::Secp256k1;
+
+    let mut rate_limited = system_intent_terms(&harness, &provenance, &claim, 101);
+    rate_limited.limits.operation_rate_limits = vec![SlidingWindow {
+        maximum: DecimalU64::new(1),
+        duration_ms: DecimalU64::new(1_000),
+    }];
+
+    let mut wrong_asset = system_intent_terms(&harness, &provenance, &claim, 102);
+    wrong_asset.limits.value_limits[0].asset.asset = "usdc".into();
+
+    for (description, invalid) in [
+        ("another system component", wrong_component),
+        ("another system action", wrong_action),
+        ("another operation class", wrong_operation),
+        ("weaker claim assurance", wrong_assurance),
+        ("another signing suite", wrong_suite),
+        ("an operation rate window", rate_limited),
+        ("a non-native asset", wrong_asset),
+    ] {
+        let error = harness
+            .authority
+            .prepare_approval(&invalid, &digest(7))
+            .unwrap_err();
+        assert!(
+            error_code(error).contains("SELECTOR_MISMATCH"),
+            "a system approval with {description} must be rejected at preparation"
+        );
+    }
 }
 
 #[test]
