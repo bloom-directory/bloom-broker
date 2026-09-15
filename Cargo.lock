@@ -4,22 +4,12 @@ version = 4
 
 [[package]]
 name = "aead"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d122413f284cf2d62fb1b7db97e02edb8cda96d769b16e443a4f6195e35662b0"
-dependencies = [
- "crypto-common 0.1.7",
- "generic-array",
-]
-
-[[package]]
-name = "aead"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1973cfbc1a2daf9cf550e74e1f088c28e7f7d8c1e1418fb6c9dc5184b7e84c99"
 dependencies = [
  "crypto-common 0.2.2",
- "inout 0.2.2",
+ "inout",
 ]
 
 [[package]]
@@ -144,13 +134,29 @@ checksum = "db40d3dfbeab4e031d78c844642fa0caa0b0db11ce1607ac9d2986dff1405c69"
 dependencies = [
  "bs58",
  "hmac 0.12.1",
- "k256",
+ "k256 0.13.4",
  "once_cell",
  "pbkdf2",
  "rand_core 0.6.4",
- "ripemd",
- "secp256k1",
+ "ripemd 0.1.3",
+ "secp256k1 0.27.0",
  "sha2 0.10.9",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "bip32"
+version = "0.6.0-rc.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7576e4d45e861ecbf1f5c3d64a174ddcd21cb75995d6e3e82bd3c96e6979485"
+dependencies = [
+ "bs58",
+ "hmac 0.13.0",
+ "k256 0.14.0",
+ "ripemd 0.2.0",
+ "secp256k1 0.33.1",
+ "sha2 0.11.0",
  "subtle",
  "zeroize",
 ]
@@ -217,9 +223,9 @@ dependencies = [
 [[package]]
 name = "bloom-audit-checkpoint"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=bc88cc6760b00bbff0c6a6e5f56d42bb03004436#bc88cc6760b00bbff0c6a6e5f56d42bb03004436"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91#5db670e1b7507deabfdcf451be8b5d315c1c9d91"
 dependencies = [
- "bloom-rpc-wire",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
  "ed25519-dalek",
  "hex",
  "rustix",
@@ -231,29 +237,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-audit-checkpoint"
+version = "0.1.3"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=90cb0882e44608dfb8c804946ab509b186dfb0f8#90cb0882e44608dfb8c804946ab509b186dfb0f8"
+replace = "bloom-audit-checkpoint 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)"
+
+[[package]]
 name = "bloom-broker"
 version = "0.1.0"
 dependencies = [
  "axum",
- "bloom-audit-checkpoint",
+ "bloom-audit-checkpoint 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
  "bloom-broker-api",
  "bloom-broker-debug-driver",
- "bloom-platform-containment",
- "bloom-service-activation",
- "bloom-service-observability",
+ "bloom-platform-containment 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
+ "bloom-service-activation 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
+ "bloom-service-observability 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
  "bloom-signer",
  "bloom-signer-api",
  "bloom-signer-vectors",
  "bloom-solana-verify",
- "bloom-triad-local-transport",
- "bloom-trusted-time",
+ "bloom-triad-local-transport 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
+ "bloom-trusted-time 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
  "bs58",
  "config",
  "ed25519-dalek",
  "futures",
  "hex",
  "http-body-util",
- "k256",
+ "k256 0.13.4",
  "libc",
  "num-bigint",
  "parking_lot",
@@ -263,7 +275,7 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2 0.11.0",
- "sha3 0.12.0",
+ "sha3",
  "tempfile",
  "thiserror",
  "tokio",
@@ -277,7 +289,7 @@ dependencies = [
 name = "bloom-broker-api"
 version = "0.1.0"
 dependencies = [
- "bloom-rpc-wire",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
  "hex",
  "serde",
  "serde_jcs",
@@ -289,15 +301,15 @@ dependencies = [
 name = "bloom-broker-debug-driver"
 version = "0.1.0"
 dependencies = [
- "bip32",
+ "bip32 0.5.3",
  "bloom-broker-api",
  "bloom-signer-api",
- "chacha20poly1305 0.11.0",
+ "chacha20poly1305",
  "ciborium",
  "hex",
  "hkdf",
  "hpke",
- "k256",
+ "k256 0.13.4",
  "memchr",
  "p256",
  "rand 0.10.2",
@@ -312,17 +324,23 @@ dependencies = [
 [[package]]
 name = "bloom-platform-containment"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=bc88cc6760b00bbff0c6a6e5f56d42bb03004436#bc88cc6760b00bbff0c6a6e5f56d42bb03004436"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91#5db670e1b7507deabfdcf451be8b5d315c1c9d91"
 dependencies = [
- "bloom-rpc-wire",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
  "serde",
  "serde_json",
 ]
 
 [[package]]
+name = "bloom-platform-containment"
+version = "0.1.3"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=90cb0882e44608dfb8c804946ab509b186dfb0f8#90cb0882e44608dfb8c804946ab509b186dfb0f8"
+replace = "bloom-platform-containment 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)"
+
+[[package]]
 name = "bloom-rpc-wire"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=bc88cc6760b00bbff0c6a6e5f56d42bb03004436#bc88cc6760b00bbff0c6a6e5f56d42bb03004436"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91#5db670e1b7507deabfdcf451be8b5d315c1c9d91"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -335,19 +353,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-rpc-wire"
+version = "0.1.3"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=90cb0882e44608dfb8c804946ab509b186dfb0f8#90cb0882e44608dfb8c804946ab509b186dfb0f8"
+replace = "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)"
+
+[[package]]
 name = "bloom-service-activation"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=bc88cc6760b00bbff0c6a6e5f56d42bb03004436#bc88cc6760b00bbff0c6a6e5f56d42bb03004436"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91#5db670e1b7507deabfdcf451be8b5d315c1c9d91"
 dependencies = [
- "bloom-rpc-wire",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
  "libc",
  "thiserror",
 ]
 
 [[package]]
+name = "bloom-service-activation"
+version = "0.1.3"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=90cb0882e44608dfb8c804946ab509b186dfb0f8#90cb0882e44608dfb8c804946ab509b186dfb0f8"
+replace = "bloom-service-activation 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)"
+
+[[package]]
 name = "bloom-service-observability"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=bc88cc6760b00bbff0c6a6e5f56d42bb03004436#bc88cc6760b00bbff0c6a6e5f56d42bb03004436"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91#5db670e1b7507deabfdcf451be8b5d315c1c9d91"
 dependencies = [
  "libc",
  "rustix",
@@ -356,31 +386,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-service-observability"
+version = "0.1.3"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=90cb0882e44608dfb8c804946ab509b186dfb0f8#90cb0882e44608dfb8c804946ab509b186dfb0f8"
+replace = "bloom-service-observability 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)"
+
+[[package]]
 name = "bloom-signer"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=941dd376568b52ccd269ecf495bcff7dcd9af504#941dd376568b52ccd269ecf495bcff7dcd9af504"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=683c6f9c9b069bf24125230cd7615d44474aa8ae#683c6f9c9b069bf24125230cd7615d44474aa8ae"
 dependencies = [
  "blake3",
- "bloom-audit-checkpoint",
- "bloom-platform-containment",
- "bloom-service-activation",
- "bloom-service-observability",
+ "bloom-audit-checkpoint 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=90cb0882e44608dfb8c804946ab509b186dfb0f8)",
+ "bloom-platform-containment 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=90cb0882e44608dfb8c804946ab509b186dfb0f8)",
+ "bloom-service-activation 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=90cb0882e44608dfb8c804946ab509b186dfb0f8)",
+ "bloom-service-observability 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=90cb0882e44608dfb8c804946ab509b186dfb0f8)",
  "bloom-signer-api",
  "bloom-signer-backend-api",
  "bloom-signer-backend-local",
  "bloom-signer-derive",
  "bloom-signer-process-hardening",
- "bloom-triad-local-transport",
- "bloom-trusted-time",
+ "bloom-triad-local-transport 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=90cb0882e44608dfb8c804946ab509b186dfb0f8)",
+ "bloom-trusted-time 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=90cb0882e44608dfb8c804946ab509b186dfb0f8)",
  "bs58",
- "chacha20poly1305 0.10.1",
+ "chacha20poly1305",
  "ciborium",
  "ed25519-dalek",
  "futures",
  "hex",
  "hkdf",
  "hpke",
- "k256",
+ "k256 0.14.0",
  "libc",
  "p256",
  "parking_lot",
@@ -390,7 +426,7 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2 0.11.0",
- "sha3 0.10.9",
+ "sha3",
  "thiserror",
  "tokio",
  "tracing",
@@ -400,9 +436,9 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=941dd376568b52ccd269ecf495bcff7dcd9af504#941dd376568b52ccd269ecf495bcff7dcd9af504"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=683c6f9c9b069bf24125230cd7615d44474aa8ae#683c6f9c9b069bf24125230cd7615d44474aa8ae"
 dependencies = [
- "bloom-rpc-wire",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=90cb0882e44608dfb8c804946ab509b186dfb0f8)",
  "ed25519-dalek",
  "hex",
  "serde",
@@ -415,7 +451,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-backend-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=941dd376568b52ccd269ecf495bcff7dcd9af504#941dd376568b52ccd269ecf495bcff7dcd9af504"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=683c6f9c9b069bf24125230cd7615d44474aa8ae#683c6f9c9b069bf24125230cd7615d44474aa8ae"
 dependencies = [
  "bloom-signer-api",
  "serde",
@@ -426,36 +462,36 @@ dependencies = [
 [[package]]
 name = "bloom-signer-backend-local"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=941dd376568b52ccd269ecf495bcff7dcd9af504#941dd376568b52ccd269ecf495bcff7dcd9af504"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=683c6f9c9b069bf24125230cd7615d44474aa8ae#683c6f9c9b069bf24125230cd7615d44474aa8ae"
 dependencies = [
- "bip32",
+ "bip32 0.6.0-rc.0",
  "bloom-signer-api",
  "bloom-signer-backend-api",
  "bloom-signer-derive",
- "chacha20poly1305 0.10.1",
+ "chacha20poly1305",
  "ed25519-dalek",
  "hex",
- "k256",
+ "k256 0.14.0",
  "parking_lot",
  "rand 0.10.2",
  "serde",
  "serde_jcs",
  "serde_json",
  "sha2 0.11.0",
- "sha3 0.10.9",
+ "sha3",
  "zeroize",
 ]
 
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=941dd376568b52ccd269ecf495bcff7dcd9af504#941dd376568b52ccd269ecf495bcff7dcd9af504"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=683c6f9c9b069bf24125230cd7615d44474aa8ae#683c6f9c9b069bf24125230cd7615d44474aa8ae"
 dependencies = [
  "bip39",
  "ed25519-dalek",
  "hex",
  "hmac 0.13.0",
- "k256",
+ "k256 0.14.0",
  "rand 0.10.2",
  "sha2 0.11.0",
  "thiserror",
@@ -466,7 +502,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-process-hardening"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=941dd376568b52ccd269ecf495bcff7dcd9af504#941dd376568b52ccd269ecf495bcff7dcd9af504"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=683c6f9c9b069bf24125230cd7615d44474aa8ae#683c6f9c9b069bf24125230cd7615d44474aa8ae"
 dependencies = [
  "libc",
 ]
@@ -474,7 +510,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-vectors"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=941dd376568b52ccd269ecf495bcff7dcd9af504#941dd376568b52ccd269ecf495bcff7dcd9af504"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=683c6f9c9b069bf24125230cd7615d44474aa8ae#683c6f9c9b069bf24125230cd7615d44474aa8ae"
 
 [[package]]
 name = "bloom-solana-verify"
@@ -496,10 +532,10 @@ dependencies = [
 [[package]]
 name = "bloom-triad-local-transport"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=bc88cc6760b00bbff0c6a6e5f56d42bb03004436#bc88cc6760b00bbff0c6a6e5f56d42bb03004436"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91#5db670e1b7507deabfdcf451be8b5d315c1c9d91"
 dependencies = [
- "bloom-rpc-wire",
- "bloom-trusted-time",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
+ "bloom-trusted-time 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
  "ed25519-dalek",
  "hex",
  "rand 0.8.8",
@@ -513,13 +549,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-triad-local-transport"
+version = "0.1.3"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=90cb0882e44608dfb8c804946ab509b186dfb0f8#90cb0882e44608dfb8c804946ab509b186dfb0f8"
+replace = "bloom-triad-local-transport 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)"
+
+[[package]]
 name = "bloom-trusted-time"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=bc88cc6760b00bbff0c6a6e5f56d42bb03004436#bc88cc6760b00bbff0c6a6e5f56d42bb03004436"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91#5db670e1b7507deabfdcf451be8b5d315c1c9d91"
 dependencies = [
  "libc",
  "thiserror",
 ]
+
+[[package]]
+name = "bloom-trusted-time"
+version = "0.1.3"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=90cb0882e44608dfb8c804946ab509b186dfb0f8#90cb0882e44608dfb8c804946ab509b186dfb0f8"
+replace = "bloom-trusted-time 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)"
 
 [[package]]
 name = "bs58"
@@ -561,38 +609,14 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "chacha20"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
-dependencies = [
- "cfg-if",
- "cipher 0.4.4",
- "cpufeatures 0.2.17",
-]
-
-[[package]]
-name = "chacha20"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
- "cipher 0.5.2",
+ "cipher",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
- "zeroize",
-]
-
-[[package]]
-name = "chacha20poly1305"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
-dependencies = [
- "aead 0.5.2",
- "chacha20 0.9.1",
- "cipher 0.4.4",
- "poly1305 0.8.0",
  "zeroize",
 ]
 
@@ -602,10 +626,10 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb"
 dependencies = [
- "aead 0.6.1",
- "chacha20 0.10.2",
- "cipher 0.5.2",
- "poly1305 0.9.1",
+ "aead",
+ "chacha20",
+ "cipher",
+ "poly1305",
  "zeroize",
 ]
 
@@ -638,24 +662,13 @@ dependencies = [
 
 [[package]]
 name = "cipher"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
-dependencies = [
- "crypto-common 0.1.7",
- "inout 0.1.4",
- "zeroize",
-]
-
-[[package]]
-name = "cipher"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c"
 dependencies = [
  "block-buffer 0.12.1",
  "crypto-common 0.2.2",
- "inout 0.2.2",
+ "inout",
 ]
 
 [[package]]
@@ -759,7 +772,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
- "rand_core 0.6.4",
  "typenum",
 ]
 
@@ -786,22 +798,6 @@ dependencies = [
 
 [[package]]
 name = "curve25519-dalek"
-version = "4.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "curve25519-dalek-derive",
- "digest 0.10.7",
- "fiat-crypto 0.2.9",
- "rustc_version",
- "subtle",
- "zeroize",
-]
-
-[[package]]
-name = "curve25519-dalek"
 version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5eed333089e2e1c1ac8c6c0398e5e2497b4c9926ca6d0365ed1e099afa5bc23"
@@ -809,7 +805,9 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
  "curve25519-dalek-derive",
- "fiat-crypto 0.3.0",
+ "digest 0.11.3",
+ "fiat-crypto",
+ "rand_core 0.10.1",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -940,21 +938,29 @@ version = "2.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
 dependencies = [
- "pkcs8 0.10.2",
  "signature 2.2.0",
 ]
 
 [[package]]
-name = "ed25519-dalek"
-version = "2.2.0"
+name = "ed25519"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
+checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
 dependencies = [
- "curve25519-dalek 4.1.3",
- "ed25519",
- "rand_core 0.6.4",
- "serde",
- "sha2 0.10.9",
+ "signature 3.0.0",
+]
+
+[[package]]
+name = "ed25519-dalek"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ebaa1a2bf1290ab3bfe5a7b771d050ebffab2711c19a81691c683a5144a25de"
+dependencies = [
+ "curve25519-dalek",
+ "ed25519 3.0.0",
+ "rand_core 0.10.1",
+ "sha2 0.11.0",
+ "signature 3.0.0",
  "subtle",
  "zeroize",
 ]
@@ -1052,12 +1058,6 @@ dependencies = [
  "rand_core 0.10.1",
  "subtle",
 ]
-
-[[package]]
-name = "fiat-crypto"
-version = "0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "fiat-crypto"
@@ -1283,12 +1283,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "hashlink"
-version = "0.11.1"
+name = "hashbrown"
+version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "824e001ac4f3012dd16a264bec811403a67ca9deb6c102fc5049b32c4574b35f"
+checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
- "hashbrown 0.16.1",
+ "foldhash 0.2.0",
+]
+
+[[package]]
+name = "hashlink"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
+dependencies = [
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -1339,8 +1348,8 @@ version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5324110b02044183df000f0bd7d2d7e61f1000631508627e77f63983b6fdffb"
 dependencies = [
- "aead 0.6.1",
- "chacha20poly1305 0.11.0",
+ "aead",
+ "chacha20poly1305",
  "getrandom 0.4.3",
  "hkdf",
  "hybrid-array",
@@ -1450,15 +1459,6 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "inout"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
-dependencies = [
- "generic-array",
-]
-
-[[package]]
-name = "inout"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
@@ -1497,12 +1497,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "keccak"
-version = "0.1.6"
+name = "k256"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"
+checksum = "93f50113171a713f4a4231ef82eb26703607139b35dcb56241f0ceab2ae1f7d8"
 dependencies = [
- "cpufeatures 0.2.17",
+ "cpubits",
+ "ecdsa 0.17.0",
+ "elliptic-curve 0.14.1",
+ "primeorder",
+ "sha2 0.11.0",
+ "signature 3.0.0",
+ "wnaf",
 ]
 
 [[package]]
@@ -1529,9 +1535,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.36.0"
+version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95b4103cffefa72eb8428cb6b47d6627161e51c2739fc5e3b734584157bc642a"
+checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
 dependencies = [
  "cc",
  "pkg-config",
@@ -1641,12 +1647,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "opaque-debug"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
-
-[[package]]
 name = "p256"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1753,23 +1753,12 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "poly1305"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
-dependencies = [
- "cpufeatures 0.2.17",
- "opaque-debug",
- "universal-hash 0.5.1",
-]
-
-[[package]]
-name = "poly1305"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e2d0073b297041425c7c3df6eb4792d598a15323fe63346852b092eca02904c"
 dependencies = [
  "cpufeatures 0.3.1",
- "universal-hash 0.6.1",
+ "universal-hash",
 ]
 
 [[package]]
@@ -1849,7 +1838,7 @@ version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
- "chacha20 0.10.2",
+ "chacha20",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
 ]
@@ -1935,6 +1924,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ripemd"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4dd4211456b4172d7e44261920c25acf07367c4f04bb5f5d54fc21b090d9b159"
+dependencies = [
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "rsqlite-vfs"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1946,9 +1944,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.38.0"
+version = "0.40.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1c93dd1c9683b438c392c492109cb702b8090b2bfc8fed6f6e4eb4523f17af3"
+checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
 dependencies = [
  "bitflags",
  "fallible-iterator",
@@ -2033,7 +2031,16 @@ version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25996b82292a7a57ed3508f052cfff8640d38d32018784acd714758b43da9c8f"
 dependencies = [
- "secp256k1-sys",
+ "secp256k1-sys 0.8.2",
+]
+
+[[package]]
+name = "secp256k1"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7f404a8dab7a7a5a631e741d8699aa9c8e1d689fc26ccf897c7187565490b69"
+dependencies = [
+ "secp256k1-sys 0.14.1",
 ]
 
 [[package]]
@@ -2041,6 +2048,15 @@ name = "secp256k1-sys"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4473013577ec77b4ee3668179ef1186df3146e2cf2d927bd200974c6fe60fd99"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "secp256k1-sys"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b2992d4a3cd244539a7d5d0966aadbe5ca7fb868a5d7e38c29499b9e709bbd"
 dependencies = [
  "cc",
 ]
@@ -2150,22 +2166,12 @@ dependencies = [
 
 [[package]]
 name = "sha3"
-version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77fd7028345d415a4034cf8777cd4f8ab1851274233b45f84e3d955502d93874"
-dependencies = [
- "digest 0.10.7",
- "keccak 0.1.6",
-]
-
-[[package]]
-name = "sha3"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc9bad02c26382724b2d2692c6f179285e4b54eeecd7968f52a50059c3c11759"
 dependencies = [
  "digest 0.11.3",
- "keccak 0.2.2",
+ "keccak",
  "sponge-cursor",
 ]
 
@@ -2268,7 +2274,7 @@ dependencies = [
  "cpufeatures 0.3.1",
  "curve25519-dalek-derive",
  "digest 0.11.3",
- "ed25519",
+ "ed25519 2.2.3",
  "hashbrown 0.15.5",
  "rand 0.10.2",
  "rand_core 0.10.1",
@@ -2731,16 +2737,6 @@ dependencies = [
 
 [[package]]
 name = "universal-hash"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
-dependencies = [
- "crypto-common 0.1.7",
- "subtle",
-]
-
-[[package]]
-name = "universal-hash"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f4987bdc12753382e0bec4a65c50738ffaabc998b9cdd1f952fb5f39b0048a96"
@@ -2885,7 +2881,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
 dependencies = [
- "curve25519-dalek 5.0.0",
+ "curve25519-dalek",
  "rand_core 0.10.1",
  "zeroize",
 ]
