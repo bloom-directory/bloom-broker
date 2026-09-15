@@ -15,8 +15,8 @@ license = "MIT"
 
 [workspace.dependencies]
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "683c6f9c9b069bf24125230cd7615d44474aa8ae" }
-bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "683c6f9c9b069bf24125230cd7615d44474aa8ae" }
+bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "ccc9adb3866b17b87d2774018dcfa015184b1918" }
+bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "ccc9adb3866b17b87d2774018dcfa015184b1918" }
 bloom-solana-verify = { path = "crates/bloom-solana-verify" }
 bs58 = "0.5"
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
@@ -50,14 +50,3 @@ bip32 = { version = "0.5", features = ["secp256k1"] }
 k256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 memchr = "2"
 hkdf = "0.13"
-
-# Signer pins an older runtime revision. Replace all seven packages so shared types
-# come from the workspace revision. Cargo forbids same-source git [patch] entries.
-[replace]
-"https://github.com/bloom-directory/bloom-service-runtime.git#bloom-rpc-wire:0.1.3" = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
-"https://github.com/bloom-directory/bloom-service-runtime.git#bloom-triad-local-transport:0.1.3" = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
-"https://github.com/bloom-directory/bloom-service-runtime.git#bloom-audit-checkpoint:0.1.3" = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
-"https://github.com/bloom-directory/bloom-service-runtime.git#bloom-service-activation:0.1.3" = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
-"https://github.com/bloom-directory/bloom-service-runtime.git#bloom-service-observability:0.1.3" = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
-"https://github.com/bloom-directory/bloom-service-runtime.git#bloom-trusted-time:0.1.3" = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
-"https://github.com/bloom-directory/bloom-service-runtime.git#bloom-platform-containment:0.1.3" = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
