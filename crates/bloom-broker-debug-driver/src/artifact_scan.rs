@@ -237,48 +237,94 @@ fn verified_decryptable_record_needles(
             continue;
         };
         let plaintext = Zeroizing::new(plaintext);
-        // Local root material is either a BIP-32 seed (16..=64 bytes) or a
-        // secp256k1 scalar (32 bytes).  Authentication plus this structural
-        // check makes the negative scan depend on a real decryptable key blob,
-        // not an arbitrary ciphertext-shaped fixture.
-        if !(16..=64).contains(&plaintext.len()) {
-            continue;
-        }
-        if backup.root_material_kind != "bip32_seed" {
-            if backup.derivation_registry.iter().any(|key_ref| {
-                scoped_fingerprints.contains(key_ref.public_key_fingerprint.as_str())
-            }) {
-                return Err(
-                    "persisted Petal child is bound to a non-derivable scalar root record".into(),
-                );
+        // BIP-39 backups contain entropy, not the transient BIP-32/SLIP-10 seed.
+        let derivation_seed = match backup.root_material_kind.as_str() {
+            "bip32_seed" if (16..=64).contains(&plaintext.len()) => {
+                Zeroizing::new(plaintext.to_vec())
             }
-            continue;
-        }
+            "bip39_entropy" => {
+                let mnemonic = bloom_signer_derive::mnemonic_from_entropy(&plaintext)?;
+                Zeroizing::new(bloom_signer_derive::seed_from_mnemonic(&mnemonic)?.to_vec())
+            }
+            _ => {
+                if backup.derivation_registry.iter().any(|key_ref| {
+                    scoped_fingerprints.contains(key_ref.public_key_fingerprint.as_str())
+                }) {
+                    return Err(
+                        "persisted Petal child is bound to an unsupported or invalid root record"
+                            .into(),
+                    );
+                }
+                continue;
+            }
+        };
         for key_ref in &backup.derivation_registry {
             if !scoped_fingerprints.contains(key_ref.public_key_fingerprint.as_str()) {
                 continue;
             }
-            let Some(DerivationRef::Bip32Secp256k1 { path, .. }) = &key_ref.derivation else {
-                return Err("persisted Petal child lacks a BIP-32 derivation binding".into());
+            let (path, solana) = match (&key_ref.derivation, backup.root_material_kind.as_str()) {
+                (Some(DerivationRef::Bip32Secp256k1 { root_key_id, path }), "bip32_seed")
+                    if root_key_id.as_str() == backup.root_key_id =>
+                {
+                    (path, false)
+                }
+                (
+                    Some(DerivationRef::Bip39Multicurve {
+                        wallet_seed_ref,
+                        profile,
+                        path,
+                    }),
+                    "bip39_entropy",
+                ) if wallet_seed_ref.as_str() == backup.root_key_id => (
+                    path,
+                    *profile == bloom_signer_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                ),
+                _ => {
+                    return Err(
+                        "persisted Petal child has an incompatible root derivation binding".into(),
+                    );
+                }
             };
             let path = DerivationPath::from_str(path)?;
-            let child = XPrv::derive_from_path(plaintext.as_slice(), &path)?;
-            let signing_key = k256::ecdsa::SigningKey::from(child);
-            let public_key = k256::PublicKey::from_sec1_bytes(
-                signing_key
-                    .verifying_key()
-                    .to_encoded_point(false)
-                    .as_bytes(),
-            )?;
-            let spki = k256::pkcs8::EncodePublicKey::to_public_key_der(&public_key)?;
-            let derived_fingerprint = hex::encode(Sha256::digest(spki.as_bytes()));
+            let (child_secret, derived_fingerprint) = if solana {
+                let (mut key, mut code) =
+                    bloom_signer_derive::slip10::master_ed25519(&derivation_seed);
+                for component in path.iter() {
+                    if !component.is_hardened() {
+                        return Err("persisted Solana Petal child has a non-hardened path".into());
+                    }
+                    (key, code) = bloom_signer_derive::slip10::hardened_child(
+                        &key,
+                        &code,
+                        component.index(),
+                    )?;
+                }
+                let derived = bloom_signer_derive::slip10::describe_ed25519(&key);
+                (
+                    Zeroizing::new(key.to_vec()),
+                    hex::encode(derived.fingerprint),
+                )
+            } else {
+                let child = XPrv::derive_from_path(derivation_seed.as_slice(), &path)?;
+                let signing_key = k256::ecdsa::SigningKey::from(child);
+                let public_key = k256::PublicKey::from_sec1_bytes(
+                    signing_key
+                        .verifying_key()
+                        .to_encoded_point(false)
+                        .as_bytes(),
+                )?;
+                let spki = k256::pkcs8::EncodePublicKey::to_public_key_der(&public_key)?;
+                (
+                    Zeroizing::new(signing_key.to_bytes().to_vec()),
+                    hex::encode(Sha256::digest(spki.as_bytes())),
+                )
+            };
             if derived_fingerprint != key_ref.public_key_fingerprint.as_str() {
                 return Err(
                     "derived Petal child public fingerprint does not match its persisted KeyRef"
                         .into(),
                 );
             }
-            let child_secret = Zeroizing::new(signing_key.to_bytes().to_vec());
             decryptable.extend(secret_needles(
                 "actual persisted Petal scoped-child private key",
                 child_secret.as_slice(),
@@ -521,7 +567,7 @@ mod tests {
         );
     }
 
-    fn fixture() -> (PathBuf, PathBuf, Vec<u8>, Vec<u8>, Vec<u8>, String) {
+    fn fixture(kind: &str, solana: bool) -> (PathBuf, PathBuf, Vec<u8>, Vec<u8>, Vec<u8>, String) {
         let root = std::env::temp_dir().join(format!(
             "bloom-ma08-scanner-{}-{}",
             std::process::id(),
@@ -566,10 +612,26 @@ mod tests {
             )
             .unwrap();
         let backend_key = local_backend_key(&wkek, backend_instance).unwrap();
-        let root_seed = [0x42; 32];
-        let child_path = "m/2147483647'/0'";
+        let root_material = [0x42; 32];
+        let root_seed = if kind == "bip39_entropy" {
+            let mnemonic = bloom_signer_derive::mnemonic_from_entropy(&root_material).unwrap();
+            bloom_signer_derive::seed_from_mnemonic(&mnemonic)
+                .unwrap()
+                .to_vec()
+        } else {
+            root_material.to_vec()
+        };
+        let child_path = if kind == "bip39_entropy" {
+            if solana {
+                "m/44'/501'/0'/0'/18735'/1'"
+            } else {
+                "m/44'/60'/0'/0/1"
+            }
+        } else {
+            "m/2147483647'/0'"
+        };
         let child_signing_key = k256::ecdsa::SigningKey::from(
-            XPrv::derive_from_path(root_seed, &DerivationPath::from_str(child_path).unwrap())
+            XPrv::derive_from_path(&root_seed, &DerivationPath::from_str(child_path).unwrap())
                 .unwrap(),
         );
         let child_secret = child_signing_key.to_bytes().to_vec();
@@ -582,7 +644,7 @@ mod tests {
         .unwrap();
         let child_spki = k256::pkcs8::EncodePublicKey::to_public_key_der(&child_public).unwrap();
         let child_fingerprint = hex::encode(Sha256::digest(child_spki.as_bytes()));
-        let child_ref = serde_json::json!({
+        let mut child_ref = serde_json::json!({
             "backend": "local",
             "backend_instance": backend_instance,
             "locator": child_path,
@@ -594,6 +656,32 @@ mod tests {
                 "path": child_path
             }
         });
+        let child_secret = if solana {
+            let derived = bloom_signer_derive::derive_solana_petal_key(
+                &root_seed.clone().try_into().unwrap(),
+                0,
+                1,
+            )
+            .unwrap();
+            child_ref["key_spec"] = serde_json::json!("ed25519");
+            child_ref["public_key_fingerprint"] =
+                serde_json::json!(hex::encode(derived.fingerprint));
+            derived.private_key.to_vec()
+        } else {
+            child_secret
+        };
+        if kind == "bip39_entropy" {
+            child_ref["derivation"] = serde_json::json!({
+                "scheme": "bip39-multicurve",
+                "wallet_seed_ref": root_key_id,
+                "profile": if solana { "bip44-solana-slip10-ed25519-v1" } else { "bip44-evm-secp256k1-v1" },
+                "path": child_path
+            });
+        }
+        let child_fingerprint = child_ref["public_key_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let mut aad = ROOT_AAD_DOMAIN.to_vec();
         aad.extend_from_slice(backend_instance.as_bytes());
         aad.extend_from_slice(root_key_id.as_bytes());
@@ -602,14 +690,14 @@ mod tests {
             .encrypt(
                 <&XNonce>::from(&nonce),
                 Payload {
-                    msg: &root_seed,
+                    msg: &root_material,
                     aad: &aad,
                 },
             )
             .unwrap();
         let record = serde_json::json!({
             "root_key_id": root_key_id,
-            "root_material_kind": "bip32_seed",
+            "root_material_kind": kind,
             "pinned_root": null,
             "wrap_format_version": 1,
             "nonce": Base64UrlBytes::from_bytes(&nonce),
@@ -707,8 +795,92 @@ mod tests {
     }
 
     #[test]
+    fn scanner_checks_bip39_children_and_detects_leaks() {
+        for solana in [false, true] {
+            let (database, artifact, _, child_secret, _, seed) = fixture("bip39_entropy", solana);
+            assert_machine_secret_confinement(
+                &database,
+                seed.as_bytes(),
+                std::slice::from_ref(&artifact),
+            )
+            .unwrap();
+            fs::write(&artifact, child_secret).unwrap();
+            let error = assert_machine_secret_confinement(
+                &database,
+                seed.as_bytes(),
+                std::slice::from_ref(&artifact),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("actual persisted Petal scoped-child private key")
+            );
+            fs::remove_dir_all(database.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn scanner_rejects_bip39_binding_and_path_tampering() {
+        for (field, value, expected) in [
+            (
+                "wallet_seed_ref",
+                "wrong-root",
+                "incompatible root derivation binding",
+            ),
+            (
+                "path",
+                "m/44'/501'/0'/0'/18735'/2'",
+                "public fingerprint does not match",
+            ),
+            ("path", "m/44'/501'/0'/0'/18735'/1", "non-hardened path"),
+        ] {
+            let (database, artifact, _, _, _, seed) = fixture("bip39_entropy", true);
+            let connection = Connection::open(&database).unwrap();
+            let enrollment: String = connection.query_row(
+                "SELECT enrollment_jcs FROM ceremony_backend_enrollments WHERE backend_instance = 'wallet-ma08'",
+                [], |row| row.get(0),
+            ).unwrap();
+            let mut enrollment: serde_json::Value = serde_json::from_str(&enrollment).unwrap();
+            let record: Base64UrlBytes =
+                serde_json::from_value(enrollment["encrypted_record"].clone()).unwrap();
+            let mut record: serde_json::Value = serde_json::from_slice(&record.decode()).unwrap();
+            record["derivation_registry"][0]["derivation"][field] = serde_json::json!(value);
+            enrollment["encrypted_record"] = serde_json::to_value(Base64UrlBytes::from_bytes(
+                &serde_jcs::to_vec(&record).unwrap(),
+            ))
+            .unwrap();
+            connection.execute(
+                "UPDATE ceremony_backend_enrollments SET enrollment_jcs = ?1 WHERE backend_instance = 'wallet-ma08'",
+                [serde_jcs::to_string(&enrollment).unwrap()],
+            ).unwrap();
+            drop(connection);
+            let error = assert_machine_secret_confinement(&database, seed.as_bytes(), &[artifact])
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            fs::remove_dir_all(database.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn scanner_rejects_scalar_and_unknown_scoped_roots() {
+        for kind in ["imported_secp256k1_scalar", "unknown"] {
+            let (database, artifact, _, _, _, seed) = fixture(kind, false);
+            let error = assert_machine_secret_confinement(&database, seed.as_bytes(), &[artifact])
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported or invalid root record")
+            );
+            fs::remove_dir_all(database.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
     fn scanner_has_positive_controls_for_prf_and_decryptable_record() {
-        let (database, artifact, record, child_secret, wrapped_wkek, seed) = fixture();
+        let (database, artifact, record, child_secret, wrapped_wkek, seed) =
+            fixture("bip32_seed", false);
         assert_machine_secret_confinement(
             &database,
             seed.as_bytes(),
