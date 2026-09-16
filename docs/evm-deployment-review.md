@@ -12,10 +12,13 @@ and Keccak signing hashes against the exact selector, decodes canonical legacy
 or EIP-1559 signing preimages, and re-encodes them to reject signed, malformed,
 trailing, or noncanonical data. The sender comes from Signer's public key for
 the exact approval key. Broker includes decoded chain ID, sender, destination,
-nonce, value, gas, fees, and payload commitments in its signed owner review.
-Creation shows an initcode commitment and conditional CREATE address prediction;
-constructor behavior and resulting ownership remain unverified. Factory calls
-remain calls, with no invented created address.
+nonce, value, gas, fees, payload commitments, and the calldata size with its
+keccak (or an explicit statement that a plain transfer carries no calldata) in
+its signed owner review. Creation shows the initcode size and keccak; the
+created address, constructor behavior, and resulting ownership remain
+unverified. Transactions with a non-empty access list are rejected outright:
+only access-list-free preimages review. Factory calls remain calls, with no
+invented created address.
 
 Direct creation requires the owner to add this explicit numeric-chain entry to
 the canonical wallet policy through its existing policy-update ceremony:

@@ -351,12 +351,14 @@ renderReview(session({{
   fee: {{kind: "eip1559", max_fee_per_gas: "1500000000",
     max_fee_per_gas_display: "1.5 Gwei", max_priority_fee_per_gas: "1000000000",
     max_priority_fee_per_gas_display: "1 Gwei"}},
-  payload_keccak: "0xabc"
+  payload_keccak: "0xabc",
+  calldata_bytes: "0"
 }}));
 let rendered = allText(nodes.review);
 for (const expected of ["0x2222222222222222222222222222222222222222", "0.0003 ETH",
   "Base", "Gas limit", "Maximum fee rate", "1.5 Gwei", "Priority fee cap",
-  "Exact envelope checked", "Contract execution effects are not verified"]) {{
+  "Exact envelope checked", "Contract execution effects are not verified",
+  "Calldata", "None — plain transfer"]) {{
   if (!rendered.includes(expected)) throw new Error(`missing ${{expected}}: ${{rendered}}`);
 }}
 for (const stale of ["Native value (wei)", "per gas (wei)", "Some("]) {{
@@ -377,6 +379,59 @@ rendered = allText(nodes.review);
 if (!rendered.includes("300000000000000 raw native units on evm-999999") ||
     rendered.includes("0.0003 ETH") || rendered.includes("0.0003 POL")) {{
   throw new Error(`unknown chain invented asset metadata: ${{rendered}}`);
+}}
+
+// A contract call must not render like a dust transfer: the sentence names
+// it a call and the facts disclose the calldata size and commitment.
+renderReview(session({{
+  chain_id: "1", chain: "ethereum",
+  sender: "0x1111111111111111111111111111111111111111",
+  destination: "0x0909090909090909090909090909090909090909",
+  value: "1", value_display: "0.000000000000000001 ETH",
+  nonce: "3", gas_limit: "21000",
+  fee: {{kind: "legacy", gas_price: "1000000000", gas_price_display: "1 Gwei"}},
+  payload_keccak: "0x47e9",
+  calldata_bytes: "1234", calldata_keccak: "0x1234"
+}}));
+rendered = allText(nodes.review);
+for (const expected of ["Approve one contract call", "1,234 bytes", "0x1234"]) {{
+  if (!rendered.includes(expected)) throw new Error(`contract call not disclosed ${{expected}}: ${{rendered}}`);
+}}
+
+// Creation carries initcode: the page shows the deploy action with the
+// initcode size, never a blank recipient.
+renderReview(session({{
+  chain_id: "31337", chain: "anvil",
+  sender: "0x1111111111111111111111111111111111111111",
+  value: "123", value_display: "0.000000000000000123 ETH",
+  nonce: "3", gas_limit: "100000",
+  fee: {{kind: "eip1559", max_fee_per_gas: "10000000000",
+    max_fee_per_gas_display: "10 Gwei", max_priority_fee_per_gas: "1000000000",
+    max_priority_fee_per_gas_display: "1 Gwei"}},
+  payload_keccak: "0xbeef",
+  calldata_bytes: "5", calldata_keccak: "0xcafe"
+}}));
+rendered = allText(nodes.review);
+for (const expected of ["Deploy one contract", "Deploy contract (CREATE)", "5 bytes", "0xcafe"]) {{
+  if (!rendered.includes(expected)) throw new Error(`creation not disclosed ${{expected}}: ${{rendered}}`);
+}}
+
+// A pre-disclosure payload (no calldata fields) renders as before: no
+// Calldata row at all, never a "none" claim about unknown input.
+renderReview(session({{
+  chain_id: "8453", chain: "base",
+  sender: "0x1111111111111111111111111111111111111111",
+  destination: "0x2222222222222222222222222222222222222222",
+  value: "300000000000000", value_display: "0.0003 ETH",
+  nonce: "7", gas_limit: "21000",
+  fee: {{kind: "eip1559", max_fee_per_gas: "1500000000",
+    max_fee_per_gas_display: "1.5 Gwei", max_priority_fee_per_gas: "1000000000",
+    max_priority_fee_per_gas_display: "1 Gwei"}},
+  payload_keccak: "0xabc"
+}}));
+rendered = allText(nodes.review);
+if (rendered.includes("Calldata") || !rendered.includes("0.0003 ETH")) {{
+  throw new Error(`pre-disclosure payload misstated: ${{rendered}}`);
 }}
 "#
     );
@@ -4438,7 +4493,15 @@ async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
     assert!(canonical_plan.contains("max_operations"));
     assert!(canonical_plan.contains("root-key"));
     assert!(canonical_plan.contains("Bloom has not established the execution effects"));
-    assert!(canonical_plan.contains("machine supplied descriptions are advisory"));
+    // Advisory items ride in the signed manifest field, never appended to the
+    // plan: canonical_plan must stay parseable JSON for the approval page.
+    assert!(!canonical_plan.contains("machine supplied descriptions are advisory"));
+    serde_json::from_str::<serde_json::Value>(canonical_plan)
+        .expect("canonical_plan stays JSON with advisory items present");
+    assert_eq!(
+        manifest["attributed_advisory_items"],
+        serde_json::json!(["machine supplied descriptions are advisory"])
+    );
     let broker_signature: Base64UrlBytes =
         serde_json::from_value(manifest["broker_signature"].clone()).unwrap();
     assert_eq!(broker_signature.decode().len(), 64);

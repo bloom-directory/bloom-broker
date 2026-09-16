@@ -1997,17 +1997,13 @@ impl CeremonyBroker {
             manifest.system_use_claim.as_ref(),
             manifest.evm_review.is_some(),
         );
-        let mut canonical_plan = canonical_review_plan(
+        let canonical_plan = canonical_review_plan(
             request,
             &disclosures,
             manifest.petal_use_claim.as_ref(),
             manifest.system_use_claim.as_ref(),
             manifest.evm_review.as_ref(),
         )?;
-        if !manifest.attributed_advisory_items.is_empty() {
-            canonical_plan.push('\n');
-            canonical_plan.push_str(&manifest.attributed_advisory_items.join("\n"));
-        }
         if manifest.approval_id != approval_id
             || manifest.approval_digest != approval_digest
             || manifest.exact_payload_digests != request.exact_ordered_payload_digests
@@ -2047,17 +2043,17 @@ impl CeremonyBroker {
             context.system_use_claim.as_ref(),
             context.evm_review.is_some(),
         );
-        let mut canonical_plan = canonical_review_plan(
+        // Advisory items are NOT appended here: canonical_plan is parsed as
+        // JSON by the approval page, and raw text after the object would
+        // silently erase the whole review. The items stay in the signed
+        // manifest field, where the page already renders them from.
+        let canonical_plan = canonical_review_plan(
             request,
             &disclosures,
             context.petal_use_claim.as_ref(),
             context.system_use_claim.as_ref(),
             context.evm_review.as_ref(),
         )?;
-        if !context.attributed_advisory_items.is_empty() {
-            canonical_plan.push('\n');
-            canonical_plan.push_str(&context.attributed_advisory_items.join("\n"));
-        }
         let mut manifest = ReviewManifest {
             schema: Token::new("bloom.review-manifest.v1")?,
             approval_id: request
@@ -3194,6 +3190,16 @@ fn review_disclosures(
     {
         disclosures.push(
             "Bloom has not established the execution effects of these opaque payload digests and hashes."
+                .to_owned(),
+        );
+    }
+    if has_evm_review {
+        // The decoded destination and value come from the exact transaction
+        // bytes, but anything the input data would execute is still
+        // unverified. This lives in the signed disclosures (not just the
+        // page) so the honesty statement carries the manifest signature.
+        disclosures.push(
+            "Bloom decoded the destination and value from the exact transaction bytes. Bloom has not established the execution effects of any contract input data."
                 .to_owned(),
         );
     }

@@ -110,6 +110,11 @@ fn seed_profile_from_key_projection(
 
 /// Whether this approval subject is a native exact EVM transaction class
 /// whose owner review is the Broker-decoded signing preimage.
+///
+/// This list is mirrored as `native_evm_review` in Bloom's machine client:
+/// drift means Machine sends payloads Broker will not require, or vice
+/// versa. Keep the two in step; the coupling is a shared constant, not a
+/// shared crate, because nothing else crosses the service boundary here.
 fn native_evm_transaction_class(subject: &bloom_broker_api::ApprovalSubject) -> bool {
     use bloom_broker_api::ApprovalSubject;
     match subject {
@@ -828,7 +833,7 @@ impl BrokerRpcService {
                         "invalid canonical policy",
                     )
                 })?;
-            context.evm_review = Some(crate::evm_review::review(&request, &policy, from)?);
+            context.evm_review = crate::evm_review::review(&request, &policy, from)?;
         }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
             ApprovalSelector::Exact {

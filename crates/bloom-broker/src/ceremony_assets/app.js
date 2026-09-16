@@ -166,6 +166,22 @@ function describeTransfer(manifest) {
     }
     facts.push([label("Nonce"), payload.nonce]);
     facts.push([label("Gas limit"), payload.gas_limit]);
+    // The one field that tells a transfer from a contract call: disclose the
+    // input size and commitment, or state plainly that there is none.
+    // Execution effects remain unverified either way (see Bloom verification).
+    // An absent field means a pre-disclosure payload: say nothing rather
+    // than claim "none".
+    if (payload.calldata_bytes !== undefined) {
+      const calldataSize = Number(payload.calldata_bytes);
+      const calldataBytes = Number.isFinite(calldataSize)
+        ? calldataSize.toLocaleString("en-US")
+        : payload.calldata_bytes;
+      if (payload.calldata_keccak) {
+        facts.push([label("Calldata"), `${calldataBytes} bytes, keccak ${payload.calldata_keccak}`, true]);
+      } else {
+        facts.push([label("Calldata"), "None — plain transfer"]);
+      }
+    }
     if (payload.fee?.kind === "legacy") {
       facts.push([label("Gas price"), payload.fee.gas_price_display]);
     } else if (payload.fee?.kind === "eip1559") {
@@ -185,7 +201,9 @@ function describeTransfer(manifest) {
     const network = chainLabel(first.chain);
     const sentence = evmPayloads.length === 1
       ? (first.destination
-        ? `Approve one transaction on <strong>${escapeHtml(network)}</strong> to the address below.`
+        ? (first.calldata_keccak
+          ? `Approve one contract call on <strong>${escapeHtml(network)}</strong> to the address below.`
+          : `Approve one transaction on <strong>${escapeHtml(network)}</strong> to the address below.`)
         : `Deploy one contract on <strong>${escapeHtml(network)}</strong>.`)
       : `Approve <strong>${evmPayloads.length} EVM transactions</strong>. Check each envelope below.`;
     return {sentence, facts, willVerify: true};
@@ -332,8 +350,17 @@ function describePolicy(manifest) {
   if (!diff) return null;
   const lines = [];
   const dest = d => `${d.destination || d.address || canonicalJson(d)} (${chainLabel(d.chain)})`;
-  for (const d of diff.added_destinations || []) lines.push(["Allow sending to", dest(d), true]);
-  for (const d of diff.removed_destinations || []) lines.push(["Stop allowing sending to", dest(d), true]);
+  // The "exact" sentinel on a numeric EVM chain is a contract-deployment
+  // opt-in, not a destination: saying "sending to" inverts what is granted.
+  const isDeployGrant = d => d.destination === "exact" && String(d.chain || "").startsWith("evm-");
+  for (const d of diff.added_destinations || []) {
+    if (isDeployGrant(d)) lines.push(["Allow deploying contracts on", chainLabel(d.chain), false]);
+    else lines.push(["Allow sending to", dest(d), true]);
+  }
+  for (const d of diff.removed_destinations || []) {
+    if (isDeployGrant(d)) lines.push(["Stop allowing contract deployment on", chainLabel(d.chain), false]);
+    else lines.push(["Stop allowing sending to", dest(d), true]);
+  }
   for (const p of diff.added_petal_packages || []) lines.push(["Allow app (petal)", shortDigest(p), true]);
   for (const p of diff.removed_petal_packages || []) lines.push(["Remove app (petal)", shortDigest(p), true]);
   for (const v of diff.added_required_verifiers || []) lines.push(["Require verifier", v.verifier_id || canonicalJson(v), true]);
