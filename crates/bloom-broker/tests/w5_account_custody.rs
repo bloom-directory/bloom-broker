@@ -287,7 +287,12 @@ async fn account_stack_with_backup(
             SigningKey::from_bytes(&[9; 32]).verifying_key(),
             Token::new("signer-revocation-key").unwrap(),
             SigningKey::from_bytes(&[4; 32]).verifying_key(),
-            AssuranceRegistry::compiled(Vec::new()).unwrap(),
+            // The production registry, so a proof-verified native-transfer
+            // claim reaches the same compiled verifier it would in a release.
+            AssuranceRegistry::compiled(vec![
+                bloom_broker::assurance_verifiers::SolanaSystemTransferVerifier::compiled(),
+            ])
+            .unwrap(),
         )
         .unwrap(),
     );
@@ -1846,32 +1851,60 @@ fn sign_terms(
     }
 }
 
-/// Complete the browser SealedApproval ceremony that activates the backend and
-/// installs the approval, then dispatch `signing.sign` and return the result.
-async fn approve_and_sign(
+/// Ask the Broker to prepare a sealed approval. The operation id is returned
+/// alongside the outcome so a caller can assert what the refusal left behind,
+/// and the outcome is a `Result` so a refusal is as assertable as a success.
+async fn try_prepare_approval(
     stack: &mut AccountStack,
-    authenticator: &VirtualAuthenticator,
     terms: &SealedApprovalTerms,
-    payload: &[u8],
-    sign_count: u32,
-) -> bloom_broker_api::SigningResult {
+    system_use_claim: Option<bloom_broker_api::SystemUseClaim>,
+) -> (
+    OperationId,
+    Result<bloom_broker_api::SealedApprovalPrepareResponse, bloom_broker_api::ProtocolError>,
+) {
+    try_prepare_approval_with_claims(stack, terms, None, system_use_claim).await
+}
+
+async fn try_prepare_approval_with_claims(
+    stack: &mut AccountStack,
+    terms: &SealedApprovalTerms,
+    petal_use_claim: Option<bloom_broker_api::PetalUseClaim>,
+    system_use_claim: Option<bloom_broker_api::SystemUseClaim>,
+) -> (
+    OperationId,
+    Result<bloom_broker_api::SealedApprovalPrepareResponse, bloom_broker_api::ProtocolError>,
+) {
     let approval_operation = stack.next_operation();
-    let approve_prepared = match MachineBrokerService::dispatch(
+    let outcome = MachineBrokerService::dispatch(
         stack.broker.as_ref(),
         MachineBrokerRequest::SealedApprovalPrepare(bloom_broker_api::ApprovalPrepareRequest {
             operation_id: approval_operation.clone(),
             terms: terms.clone(),
             canonical_plan_facts_digest: terms.approval_digest().unwrap(),
-            petal_use_claim: None,
-            system_use_claim: None,
+            petal_use_claim,
+            system_use_claim,
         }),
     )
     .await
-    .unwrap()
-    {
+    .map(|response| match response {
         MachineBrokerResponse::SealedApprovalPrepare(prepared) => prepared,
         response => panic!("unexpected approval prepare response: {response:?}"),
-    };
+    });
+    (approval_operation, outcome)
+}
+
+/// Drive a prepared approval's real browser ceremony to completion with the
+/// owner's authenticator, through the Broker's ceremony router and the real
+/// Signer behind it.
+async fn complete_approval_ceremony(
+    stack: &AccountStack,
+    authenticator: &VirtualAuthenticator,
+    terms: &SealedApprovalTerms,
+    approval_operation: &OperationId,
+    approve_prepared: &bloom_broker_api::SealedApprovalPrepareResponse,
+    sign_count: u32,
+) {
+    let approval_operation = approval_operation.clone();
     let ceremony_id = stack
         .broker
         .ceremony()
@@ -1925,9 +1958,38 @@ async fn approve_and_sign(
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
 
+/// Build and dispatch one `signing.sign` through the real Broker to the real
+/// Signer. `payload` is the exact bytes submitted, which for a
+/// blockhash-normalized approval is deliberately not the message the terms
+/// were sealed over.
+#[allow(clippy::too_many_arguments)]
+async fn try_sign(
+    stack: &mut AccountStack,
+    terms: &SealedApprovalTerms,
+    crypto_suite: CryptoSuite,
+    payload: &[u8],
+    system_use_claim: Option<bloom_broker_api::SystemUseClaim>,
+    claim_assurance_evidence: Option<&[u8]>,
+    provenance: ProvenanceSubject,
+) -> Result<bloom_broker_api::SigningResult, bloom_broker_api::ProtocolError> {
     let sign_operation = stack.next_operation();
     let payload_hash = Digest32::from_bytes(Sha256::digest(payload).into());
+    let ordered_hash = match crypto_suite {
+        CryptoSuite::Secp256k1Keccak256Recoverable => {
+            Digest32::from_bytes(sha3::Keccak256::digest(payload).into())
+        }
+        _ => payload_hash.clone(),
+    };
+    let claim_digest = system_use_claim.as_ref().map(|claim| {
+        Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(claim).unwrap()).into())
+    });
+    let assurance_digest = system_use_claim.as_ref().map(|claim| {
+        Digest32::from_bytes(
+            Sha256::digest(serde_jcs::to_vec(&claim.claim_assurance).unwrap()).into(),
+        )
+    });
     let identity = bloom_signer_api::SignOperationIdentity {
         operation_id: sign_operation.clone(),
         approval_id: terms.approval_id().unwrap(),
@@ -1935,7 +1997,10 @@ async fn approve_and_sign(
             backend: terms.key_ref.backend.clone(),
             backend_instance: terms.key_ref.backend_instance.clone(),
             locator: terms.key_ref.locator.clone(),
-            key_spec: bloom_signer_api::KeySpec::Secp256k1,
+            key_spec: match terms.key_ref.key_spec {
+                KeySpec::Secp256k1 => bloom_signer_api::KeySpec::Secp256k1,
+                KeySpec::Ed25519 => bloom_signer_api::KeySpec::Ed25519,
+            },
             public_key_fingerprint: terms.key_ref.public_key_fingerprint.clone(),
             derivation: match &terms.key_ref.derivation {
                 Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
@@ -1963,11 +2028,19 @@ async fn approve_and_sign(
                 None => None,
             },
         },
-        crypto_suite: bloom_signer_api::CryptoSuite::Secp256k1Sha256Recoverable,
-        ordered_payload_digests: vec![payload_hash.clone()],
-        ordered_hashes: vec![payload_hash],
-        petal_use_claim_digest: None,
-        claim_assurance_digest: None,
+        crypto_suite: match crypto_suite {
+            CryptoSuite::Secp256k1Sha256Recoverable => {
+                bloom_signer_api::CryptoSuite::Secp256k1Sha256Recoverable
+            }
+            CryptoSuite::Secp256k1Keccak256Recoverable => {
+                bloom_signer_api::CryptoSuite::Secp256k1Keccak256Recoverable
+            }
+            CryptoSuite::Ed25519Message => bloom_signer_api::CryptoSuite::Ed25519Message,
+        },
+        ordered_payload_digests: vec![payload_hash],
+        ordered_hashes: vec![ordered_hash],
+        petal_use_claim_digest: claim_digest,
+        claim_assurance_digest: assurance_digest,
         policy_version: terms.policy_version.clone(),
         policy_digest: terms.policy_digest.clone(),
     };
@@ -1976,28 +2049,60 @@ async fn approve_and_sign(
         operation_digest: identity.digest().unwrap(),
         approval_id: terms.approval_id().unwrap(),
         key_ref: terms.key_ref.clone(),
-        crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+        crypto_suite,
         payloads: SigningPayloads::Single {
             payload: Base64UrlBytes::from_bytes(payload),
         },
         petal_use_claim: None,
-        system_use_claim: None,
-        claim_assurance_evidence: None,
-        provenance: ProvenanceSubject::System {
-            component_id: Token::new("cli").unwrap(),
-            operation_class: Token::new("sign").unwrap(),
-        },
+        system_use_claim,
+        claim_assurance_evidence: claim_assurance_evidence.map(Base64UrlBytes::from_bytes),
+        provenance,
     };
-    match MachineBrokerService::dispatch(
+    MachineBrokerService::dispatch(
         stack.broker.as_ref(),
         MachineBrokerRequest::SigningSign(sign_request),
     )
     .await
-    .unwrap()
-    {
+    .map(|response| match response {
         MachineBrokerResponse::SigningSign(result) => result,
         response => panic!("unexpected signing response: {response:?}"),
-    }
+    })
+}
+
+/// Complete the browser SealedApproval ceremony that activates the backend and
+/// installs the approval, then dispatch `signing.sign` and return the result.
+async fn approve_and_sign(
+    stack: &mut AccountStack,
+    authenticator: &VirtualAuthenticator,
+    terms: &SealedApprovalTerms,
+    payload: &[u8],
+    sign_count: u32,
+) -> bloom_broker_api::SigningResult {
+    let (approval_operation, prepared) = try_prepare_approval(stack, terms, None).await;
+    let prepared = prepared.unwrap();
+    complete_approval_ceremony(
+        stack,
+        authenticator,
+        terms,
+        &approval_operation,
+        &prepared,
+        sign_count,
+    )
+    .await;
+    try_sign(
+        stack,
+        terms,
+        CryptoSuite::Secp256k1Sha256Recoverable,
+        payload,
+        None,
+        None,
+        ProvenanceSubject::System {
+            component_id: Token::new("cli").unwrap(),
+            operation_class: Token::new("sign").unwrap(),
+        },
+    )
+    .await
+    .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2128,4 +2233,628 @@ async fn restored_wallet_signs_from_restored_derived_account_over_real_transport
         .to_public_key_der()
         .unwrap();
     assert_eq!(descriptor.canonical_public_key.decode(), spki.as_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// Blockhash-normalized native SOL approvals over the real Broker↔Signer
+// transport.
+//
+// A native transfer's recent blockhash dies inside a normal passkey ceremony.
+// Under `solana_native_transfer_blockhash_v1` the approval commits to the
+// message with those 32 bytes zeroed, so the owner may finish late and the
+// Machine may restamp the transfer once. These cases drive that through both
+// production services: a real Signer behind the authenticated unix transport,
+// a real browser ceremony, the compiled semantic verifier, and a real Ed25519
+// signature from the local backend.
+// ---------------------------------------------------------------------------
+
+/// Installer-signed provenance for the Machine's native transfer confirm.
+fn native_transfer_provenance() -> ProvenanceRecord {
+    use ed25519_dalek::Signer as _;
+    let mut record = ProvenanceRecord {
+        subject: ProvenanceSubject::System {
+            component_id: Token::new("bloom-machine").unwrap(),
+            operation_class: Token::new("solana.transfer.confirm").unwrap(),
+        },
+        publisher: Token::new("installer").unwrap(),
+        petal_lineage: None,
+        operation_classes: vec![ProvenanceOperationClass {
+            operation_class: Token::new("solana.native-transfer").unwrap(),
+            fee_asset: Some(bloom_broker::authority::PolicyAsset {
+                chain: Token::new("solana").unwrap(),
+                asset: "native".into(),
+            }),
+        }],
+        installer_key_id: Token::new("installer-key").unwrap(),
+        installer_signature: Base64UrlBytes::from_bytes(&[]),
+    };
+    let mut message = PROVENANCE_RECORD_SIGNATURE_DOMAIN.to_vec();
+    message.extend_from_slice(&serde_jcs::to_vec(&record).unwrap());
+    record.installer_signature =
+        Base64UrlBytes::from_bytes(&SigningKey::from_bytes(&[5; 32]).sign(&message).to_bytes());
+    record
+}
+
+const TRANSFER_LAMPORTS: u64 = 1_000_000;
+const TRANSFER_FEE_LAMPORTS: u64 = 5_000;
+
+fn transfer_destination() -> bloom_solana_verify::Pubkey {
+    bloom_solana_verify::Pubkey::from_bytes([0x02; 32])
+}
+
+fn native_message(payer: [u8; 32], lamports: u64, blockhash: [u8; 32]) -> Vec<u8> {
+    bloom_solana_verify::system_transfer::transfer_message(
+        bloom_solana_verify::Pubkey::from_bytes(payer),
+        transfer_destination(),
+        lamports,
+        blockhash,
+    )
+    .unwrap()
+    .serialize()
+}
+
+fn native_claim(
+    message: &[u8],
+    lamports: u64,
+    blockhash: [u8; 32],
+) -> bloom_broker_api::SystemUseClaim {
+    let payload_digest = Digest32::from_bytes(Sha256::digest(message).into());
+    bloom_broker_api::SystemUseClaim {
+        component_id: Token::new("bloom-machine").unwrap(),
+        action_class: Token::new("solana.transfer.confirm").unwrap(),
+        operation_class: Token::new("solana.native-transfer").unwrap(),
+        crypto_suite: CryptoSuite::Ed25519Message,
+        payload_digest: payload_digest.clone(),
+        ordered_hashes: vec![payload_digest.clone()],
+        declared_debits: vec![bloom_broker_api::DeclaredDebit {
+            asset: bloom_broker_api::AssetId {
+                chain: Token::new("solana").unwrap(),
+                asset: "native".into(),
+            },
+            amount: bloom_broker_api::DecimalU256::parse(lamports.to_string()).unwrap(),
+        }],
+        declared_destinations: vec![bloom_broker_api::DeclaredDestination {
+            chain: Token::new("solana").unwrap(),
+            destination: transfer_destination().to_string(),
+        }],
+        declared_fee: bloom_broker_api::DeclaredFee::Fee {
+            chain: Token::new("solana").unwrap(),
+            asset: "native".into(),
+            amount: bloom_broker_api::DecimalU256::parse(TRANSFER_FEE_LAMPORTS.to_string())
+                .unwrap(),
+        },
+        nonce: RequestNonce::new("d5".repeat(16)).unwrap(),
+        chain_context: bloom_broker_api::SystemChainContext {
+            chain_family: Token::new("solana").unwrap(),
+            genesis_hash: "local-validator-genesis".into(),
+            recent_blockhash: bs58::encode(blockhash).into_string(),
+            last_valid_block_height: DecimalU64::new(123),
+        },
+        claim_assurance: bloom_broker_api::ClaimAssurance::ProofVerified {
+            verifier_id: Token::new(bloom_broker_api::SOLANA_SYSTEM_TRANSFER_VERIFIER_ID).unwrap(),
+            verifier_digest: Digest32::from_bytes(
+                bloom_broker_api::SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES,
+            ),
+            proof_digest: payload_digest,
+        },
+    }
+}
+
+/// Approval terms over the normalized digest of `message`, bound to the
+/// wallet's live policy and the installed native-transfer provenance.
+fn normalized_native_terms(
+    wallet: &WalletPublic,
+    key_ref: KeyRef,
+    message: &[u8],
+    nonce: &str,
+) -> SealedApprovalTerms {
+    let normalized = bloom_broker_api::solana_native_transfer_approval_digest(message).unwrap();
+    SealedApprovalTerms {
+        subject: ApprovalSubject::System {
+            component_id: Token::new("bloom-machine").unwrap(),
+            operation_class: Token::new("solana.transfer.confirm").unwrap(),
+        },
+        wallet_id: wallet.wallet_id.clone(),
+        key_ref,
+        allowed_crypto_suites: vec![CryptoSuite::Ed25519Message],
+        selector: ApprovalSelector::Exact {
+            ordered_payload_digests: vec![normalized.clone()],
+            ordered_hashes: vec![normalized],
+            message_normalization: Some(
+                bloom_broker_api::ExactMessageNormalization::SolanaNativeTransferBlockhashV1,
+            ),
+        },
+        limits: ApprovalLimits {
+            max_operations: DecimalU64::new(1),
+            max_signatures: DecimalU64::new(1),
+            operation_rate_limits: vec![],
+            signature_rate_limits: vec![],
+            value_limits: vec![bloom_broker_api::ValueLimit {
+                asset: bloom_broker_api::AssetId {
+                    chain: Token::new("solana").unwrap(),
+                    asset: "native".into(),
+                },
+                lifetime: bloom_broker_api::DecimalU256::parse(
+                    (TRANSFER_LAMPORTS + TRANSFER_FEE_LAMPORTS).to_string(),
+                )
+                .unwrap(),
+                rolling_windows: vec![],
+            }],
+        },
+        activation_mode: ActivationMode::BootBound,
+        wallet_revocation_epoch: wallet.wallet_revocation_epoch.clone(),
+        policy_version: wallet.policy_version.clone(),
+        policy_digest: wallet.policy_digest.clone(),
+        provenance_digest: native_transfer_provenance().digest().unwrap(),
+        request_nonce: RequestNonce::new(nonce.repeat(16)).unwrap(),
+        issued_at_ms: DecimalU64::new(now_plus(0) - 1_000),
+        not_before_ms: DecimalU64::new(now_plus(0) - 1_000),
+        // Five minutes, the whole point of the mode.
+        expires_at_ms: DecimalU64::new(now_plus(0) + 299_000),
+        renewal_of: None,
+    }
+}
+
+/// Register a BIP-39 wallet, allocate its Solana account, install the native
+/// transfer provenance, and return that account's KeyRef with the raw Ed25519
+/// public key the transfer must pay from.
+async fn solana_signing_account(
+    stack: &mut AccountStack,
+    wallet_id: &Token,
+    authenticator: &VirtualAuthenticator,
+) -> (KeyRef, [u8; 32]) {
+    register_bip39_wallet(stack, wallet_id, authenticator, None).await;
+    let allocate_operation = stack.next_operation();
+    let public = wallet_public(stack, wallet_id).await;
+    let terms = allocation_terms(
+        &public,
+        solana_derivation_request(),
+        allocate_operation.clone(),
+    );
+    let request = allocate_request(wallet_id, terms);
+    let prepared = match MachineBrokerService::dispatch(
+        stack.broker.as_ref(),
+        MachineBrokerRequest::AccountAllocatePrepare(request.clone()),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::AccountAllocatePrepare(prepared) => prepared,
+        response => panic!("unexpected allocate response: {response:?}"),
+    };
+    let result = complete_generic_ceremony(stack, &request, &prepared, authenticator, 2).await;
+    let key_ref = result.public_key_refs[0].clone();
+    stack
+        .authority
+        .install_provenance(&native_transfer_provenance())
+        .unwrap();
+    let descriptor = stack
+        .signer_engine
+        .derived_account_descriptor(&south_key(&key_ref))
+        .unwrap()
+        .unwrap();
+    let spki = descriptor.canonical_public_key.decode();
+    assert_eq!(spki.len(), 44, "Ed25519 SPKI DER is 44 bytes");
+    (key_ref, spki[12..].try_into().unwrap())
+}
+
+fn south_key(value: &KeyRef) -> bloom_signer_api::KeyRef {
+    bloom_signer_api::KeyRef {
+        backend: value.backend.clone(),
+        backend_instance: value.backend_instance.clone(),
+        locator: value.locator.clone(),
+        key_spec: match value.key_spec {
+            KeySpec::Secp256k1 => bloom_signer_api::KeySpec::Secp256k1,
+            KeySpec::Ed25519 => bloom_signer_api::KeySpec::Ed25519,
+        },
+        public_key_fingerprint: value.public_key_fingerprint.clone(),
+        derivation: match &value.derivation {
+            Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                wallet_seed_ref,
+                profile,
+                path,
+            }) => Some(bloom_signer_api::DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: wallet_seed_ref.clone(),
+                profile: match profile {
+                    DerivationProfile::Bip44EvmSecp256k1V1 => {
+                        bloom_signer_api::DerivationProfile::Bip44EvmSecp256k1V1
+                    }
+                    DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+                        bloom_signer_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1
+                    }
+                },
+                path: path.clone(),
+            }),
+            Some(bloom_broker_api::DerivationRef::Bip32Secp256k1 { root_key_id, path }) => {
+                Some(bloom_signer_api::DerivationRef::Bip32Secp256k1 {
+                    root_key_id: root_key_id.clone(),
+                    path: path.clone(),
+                })
+            }
+            None => None,
+        },
+    }
+}
+
+fn native_provenance_subject() -> ProvenanceSubject {
+    ProvenanceSubject::System {
+        component_id: Token::new("bloom-machine").unwrap(),
+        operation_class: Token::new("solana.transfer.confirm").unwrap(),
+    }
+}
+
+/// The failure this mode exists to fix, end to end across the custody
+/// boundary: the owner approves a transfer, the staged blockhash dies, the
+/// Machine restamps the same transfer once, and the real Signer still returns
+/// one Ed25519 signature — over the refreshed raw bytes, never over anything
+/// normalized. Then the approval is spent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refreshed_native_transfer_signs_once_over_the_real_transport() {
+    let directory = tempfile::tempdir().unwrap();
+    let authenticator = VirtualAuthenticator::generate();
+    let wallet_id = Token::new("normalized-sign").unwrap();
+    let mut stack = account_stack(directory.path(), "n1").await;
+    let (solana_child, payer) =
+        solana_signing_account(&mut stack, &wallet_id, &authenticator).await;
+    allow_transfer_destination(&mut stack, &wallet_id, &authenticator, 3).await;
+
+    let staged = native_message(payer, TRANSFER_LAMPORTS, [0x07; 32]);
+    let public = wallet_public(&stack, &wallet_id).await;
+    let terms = normalized_native_terms(&public, solana_child.clone(), &staged, "71");
+
+    let (approval_operation, prepared) = try_prepare_approval(
+        &mut stack,
+        &terms,
+        Some(native_claim(&staged, TRANSFER_LAMPORTS, [0x07; 32])),
+    )
+    .await;
+    let prepared = prepared.expect("an honest marked native approval prepares");
+    complete_approval_ceremony(
+        &stack,
+        &authenticator,
+        &terms,
+        &approval_operation,
+        &prepared,
+        4,
+    )
+    .await;
+
+    // The staged blockhash is now stale. The Machine keeps the entry and the
+    // approval and restamps the transfer.
+    let refreshed = native_message(payer, TRANSFER_LAMPORTS, [0x5a; 32]);
+    assert_ne!(refreshed, staged);
+    let refreshed_claim = native_claim(&refreshed, TRANSFER_LAMPORTS, [0x5a; 32]);
+
+    let result = try_sign(
+        &mut stack,
+        &terms,
+        CryptoSuite::Ed25519Message,
+        &refreshed,
+        Some(refreshed_claim),
+        Some(&refreshed),
+        native_provenance_subject(),
+    )
+    .await
+    .expect("a refreshed blockhash must still be signable under the approval");
+    assert_eq!(result.signatures.len(), 1);
+    assert_eq!(
+        result.signatures[0].crypto_suite,
+        CryptoSuite::Ed25519Message
+    );
+
+    // The signature is over the bytes actually submitted, and over nothing
+    // else. Nothing normalized reached the backend.
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(&payer).unwrap();
+    let signature = ed25519_dalek::Signature::from_bytes(
+        &result.signatures[0].bytes.decode().try_into().unwrap(),
+    );
+    use ed25519_dalek::Verifier as _;
+    verifying.verify(&refreshed, &signature).unwrap();
+    let mut zeroed = refreshed.clone();
+    zeroed[100..132].fill(0);
+    assert!(verifying.verify(&zeroed, &signature).is_err());
+    assert!(verifying.verify(&staged, &signature).is_err());
+    assert!(
+        verifying
+            .verify(&Sha256::digest(&refreshed), &signature)
+            .is_err()
+    );
+
+    // Single use: a second blockhash under the same approval is a second
+    // operation, and the approval authorized one.
+    let again = native_message(payer, TRANSFER_LAMPORTS, [0x6b; 32]);
+    let error = try_sign(
+        &mut stack,
+        &terms,
+        CryptoSuite::Ed25519Message,
+        &again,
+        Some(native_claim(&again, TRANSFER_LAMPORTS, [0x6b; 32])),
+        Some(&again),
+        native_provenance_subject(),
+    )
+    .await
+    .expect_err("a normalized approval yields at most one signature");
+    assert!(error.has_valid_contract(), "{error}");
+}
+
+/// Normalization covers the blockhash and nothing else. A transfer whose
+/// amount changed still normalizes to a well-formed digest, and the real
+/// Signer refuses it under an approval sealed over a different one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_native_transfer_is_refused_over_the_real_transport() {
+    let directory = tempfile::tempdir().unwrap();
+    let authenticator = VirtualAuthenticator::generate();
+    let wallet_id = Token::new("normalized-refuse").unwrap();
+    let mut stack = account_stack(directory.path(), "n2").await;
+    let (solana_child, payer) =
+        solana_signing_account(&mut stack, &wallet_id, &authenticator).await;
+    allow_transfer_destination(&mut stack, &wallet_id, &authenticator, 3).await;
+
+    let staged = native_message(payer, TRANSFER_LAMPORTS, [0x07; 32]);
+    let public = wallet_public(&stack, &wallet_id).await;
+    let terms = normalized_native_terms(&public, solana_child.clone(), &staged, "72");
+    let (approval_operation, prepared) = try_prepare_approval(
+        &mut stack,
+        &terms,
+        Some(native_claim(&staged, TRANSFER_LAMPORTS, [0x07; 32])),
+    )
+    .await;
+    let prepared = prepared.expect("an honest marked native approval prepares");
+    complete_approval_ceremony(
+        &stack,
+        &authenticator,
+        &terms,
+        &approval_operation,
+        &prepared,
+        4,
+    )
+    .await;
+
+    // A refreshed blockhash *and* a different amount. The approval covers the
+    // first and not the second.
+    let tampered = native_message(payer, TRANSFER_LAMPORTS + 1, [0x5a; 32]);
+    let error = try_sign(
+        &mut stack,
+        &terms,
+        CryptoSuite::Ed25519Message,
+        &tampered,
+        Some(native_claim(&tampered, TRANSFER_LAMPORTS + 1, [0x5a; 32])),
+        Some(&tampered),
+        native_provenance_subject(),
+    )
+    .await
+    .expect_err("a changed amount must not be signable under the approval");
+    assert!(error.has_valid_contract(), "{error}");
+
+    // The approval survives the refusal: the honest refreshed transfer still
+    // signs, so the rejection consumed no authority.
+    let refreshed = native_message(payer, TRANSFER_LAMPORTS, [0x5a; 32]);
+    let result = try_sign(
+        &mut stack,
+        &terms,
+        CryptoSuite::Ed25519Message,
+        &refreshed,
+        Some(native_claim(&refreshed, TRANSFER_LAMPORTS, [0x5a; 32])),
+        Some(&refreshed),
+        native_provenance_subject(),
+    )
+    .await
+    .expect("a refused tamper must not spend the approval");
+    assert_eq!(result.signatures.len(), 1);
+}
+
+/// Run the real owner policy-update ceremony so the wallet permits the
+/// transfer destination. The native-transfer verifier rightly refuses a
+/// destination the wallet policy does not list, and that gate is not what
+/// these cases are testing, so it is satisfied the production way rather than
+/// bypassed.
+async fn allow_transfer_destination(
+    stack: &mut AccountStack,
+    wallet_id: &Token,
+    authenticator: &VirtualAuthenticator,
+    sign_count: u32,
+) {
+    let baseline = stack.authority.policy_snapshot(wallet_id).unwrap();
+    let baseline_policy: bloom_broker_api::CanonicalWalletPolicy =
+        serde_json::from_slice(&baseline.canonical_policy.decode()).unwrap();
+    let mut proposed_policy = baseline_policy.clone();
+    proposed_policy
+        .allowed_destinations
+        .push(bloom_broker_api::PolicyDestination {
+            chain: Token::new("solana").unwrap(),
+            destination: transfer_destination().to_string(),
+        });
+    let proposed_bytes = serde_jcs::to_vec(&proposed_policy).unwrap();
+    let authority_diff = bloom_broker::authority::canonical_policy_authority_diff(
+        &baseline_policy,
+        &proposed_policy,
+    );
+    let update = bloom_broker_api::PolicyUpdateRequest {
+        operation_id: stack.next_operation(),
+        wallet_id: wallet_id.clone(),
+        baseline_version: baseline.version.clone(),
+        baseline_digest: baseline.policy_digest.clone(),
+        proposed_canonical_policy: Base64UrlBytes::from_bytes(&proposed_bytes),
+        proposed_policy_digest: Digest32::from_bytes(Sha256::digest(&proposed_bytes).into()),
+        authority_diff_digest: authority_diff.digest().unwrap(),
+        assurance_level: Token::new("user_verified").unwrap(),
+    };
+    let prepared = match MachineBrokerService::dispatch(
+        stack.broker.as_ref(),
+        MachineBrokerRequest::PolicyValidateUpdate(update.clone()),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::PolicyValidateUpdate(prepared) => prepared,
+        response => panic!("unexpected policy validate response: {response:?}"),
+    };
+    let ceremony_id = stack
+        .broker
+        .ceremony()
+        .public_status(&update.operation_id)
+        .unwrap()
+        .ceremony_id
+        .to_string();
+    let token = url_token(&prepared.ceremony_url);
+    let session = get_session(stack.broker.as_ref(), &ceremony_id, &token).await;
+    let challenge: CeremonyChallenge =
+        serde_json::from_value(session["challenges"][0]["binding"].clone()).unwrap();
+    let contribution: CustodySignerContribution =
+        serde_json::from_value(session["signer_contribution"].clone()).unwrap();
+    let assertion = authenticator.assertion(&challenge.canonical_bytes().unwrap(), sign_count);
+    let aad = CustodyHpkeAad {
+        ceremony_id: contribution.ceremony_id.clone(),
+        ceremony_kind: bloom_signer_api::CeremonyKind::PolicyUpdate,
+        custody_operation_id: update.operation_id.clone(),
+        signer_nonce: contribution.signer_nonce.clone(),
+        signer_contribution_digest: contribution.digest().unwrap(),
+        wallet_id: Some(wallet_id.clone()),
+        key_ref: None,
+        credential_id: Some(assertion.credential_id.clone()),
+        expected_input_class: Token::new("policy_update_credential_prf").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+        "effect": {"kind": "policy_update"},
+    }))
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )
+    .unwrap();
+    let completed = stack
+        .signer_ceremony
+        .complete_policy_update(
+            bloom_signer_api::PolicyUpdateCeremonyCompleteRequest {
+                custody: bloom_signer_api::CustodyCompleteRequest {
+                    ceremony_kind: bloom_signer_api::CeremonyKind::PolicyUpdate,
+                    custody_operation_id: update.operation_id.clone(),
+                    ceremony_id: contribution.ceremony_id.clone(),
+                    proof: bloom_signer_api::WebAuthnCeremonyProof::Assertion { assertion },
+                    encrypted_input: Some(encrypted_input),
+                    public_binding_digest: update.terms_digest().unwrap(),
+                },
+            },
+            now_plus(1),
+        )
+        .unwrap();
+    stack
+        .broker
+        .ceremony()
+        .expire_sessions(contribution.expires_at_ms.get() + 1)
+        .unwrap();
+    // The Broker's own projection of the completed ceremony is the receipt it
+    // will accept; hand-building one only proves the commit check works.
+    let receipt = custody_result(stack, &update.operation_id).await;
+    assert_eq!(receipt.receipt_digest, completed.receipt_digest);
+    match MachineBrokerService::dispatch(
+        stack.broker.as_ref(),
+        MachineBrokerRequest::PolicyCommitUpdate(bloom_broker_api::PolicyCommitUpdateRequest {
+            operation_id: update.operation_id,
+            ceremony_receipt: receipt,
+        }),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::PolicyCommitUpdate(receipt) => {
+            assert_eq!(receipt.committed.version.get(), 2);
+        }
+        response => panic!("unexpected policy commit response: {response:?}"),
+    }
+}
+
+/// A blockhash-normalized approval leaves 32 message bytes uncommitted, and
+/// the Signer never sees the claim that pins the facts the message does not
+/// encode — the fee quote, the genesis hash, the declared destination, the
+/// verifier identity. The Broker therefore owns that half of the marker's
+/// meaning, and it has to refuse an unsupportable marked request *before* a
+/// ceremony exists. A ceremony that exists at all is a URL an owner can be
+/// walked through, and a prepare that fails only after creating one has
+/// already put the decision in front of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unsupportable_marked_prepare_creates_no_ceremony() {
+    let directory = tempfile::tempdir().unwrap();
+    let authenticator = VirtualAuthenticator::generate();
+    let wallet_id = Token::new("normalized-prepare").unwrap();
+    let mut stack = account_stack(directory.path(), "n3").await;
+    let (solana_child, payer) =
+        solana_signing_account(&mut stack, &wallet_id, &authenticator).await;
+    allow_transfer_destination(&mut stack, &wallet_id, &authenticator, 3).await;
+
+    let message = native_message(payer, TRANSFER_LAMPORTS, [0x07; 32]);
+    let public = wallet_public(&stack, &wallet_id).await;
+    let terms = normalized_native_terms(&public, solana_child, &message, "73");
+    let honest = native_claim(&message, TRANSFER_LAMPORTS, [0x07; 32]);
+
+    let petal_claim = bloom_broker_api::PetalUseClaim {
+        package_hash: digest("c3"),
+        route: "/petals/exchange/sign".into(),
+        operation_class: Token::new("transfer").unwrap(),
+        crypto_suite: CryptoSuite::Ed25519Message,
+        payload_digest: honest.payload_digest.clone(),
+        ordered_hashes: honest.ordered_hashes.clone(),
+        declared_debits: honest.declared_debits.clone(),
+        declared_destinations: honest.declared_destinations.clone(),
+        declared_fee: honest.declared_fee.clone(),
+        nonce: honest.nonce.clone(),
+        claim_assurance: honest.claim_assurance.clone(),
+    };
+    let mut machine_asserted = honest.clone();
+    machine_asserted.claim_assurance = bloom_broker_api::ClaimAssurance::MachineAsserted;
+    let mut other_class = honest.clone();
+    other_class.operation_class = Token::new("solana.token-transfer").unwrap();
+    let mut impostor_verifier = honest.clone();
+    impostor_verifier.claim_assurance = bloom_broker_api::ClaimAssurance::ProofVerified {
+        verifier_id: Token::new(bloom_broker_api::SOLANA_SYSTEM_TRANSFER_VERIFIER_ID).unwrap(),
+        verifier_digest: digest("33"),
+        proof_digest: honest.payload_digest.clone(),
+    };
+
+    let refusals: Vec<(
+        &str,
+        Option<bloom_broker_api::PetalUseClaim>,
+        Option<bloom_broker_api::SystemUseClaim>,
+    )> = vec![
+        ("no claim at all", None, None),
+        ("a Petal claim", Some(petal_claim), None),
+        ("machine-asserted assurance", None, Some(machine_asserted)),
+        ("another operation class", None, Some(other_class)),
+        ("an impostor verifier digest", None, Some(impostor_verifier)),
+    ];
+    for (label, petal_use_claim, system_use_claim) in refusals {
+        let (operation_id, outcome) =
+            try_prepare_approval_with_claims(&mut stack, &terms, petal_use_claim, system_use_claim)
+                .await;
+        let error = outcome.expect_err(&format!("prepare must refuse {label}"));
+        assert!(error.has_valid_contract(), "{label}: {error}");
+        assert!(
+            stack
+                .broker
+                .ceremony()
+                .public_status(&operation_id)
+                .is_err(),
+            "{label} created a ceremony before failing"
+        );
+    }
+
+    // Control: the identical request with its honest claim does prepare and
+    // does produce a live ceremony, so the refusals above are the marked
+    // native-claim gate and not some unrelated setup failure.
+    let (honest_operation, outcome) = try_prepare_approval(&mut stack, &terms, Some(honest)).await;
+    outcome.expect("an honest marked native approval prepares");
+    assert!(
+        stack
+            .broker
+            .ceremony()
+            .public_status(&honest_operation)
+            .is_ok(),
+        "an honest marked request must reach ceremony creation"
+    );
 }
