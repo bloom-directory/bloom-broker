@@ -238,6 +238,7 @@ pub struct ReviewManifestContext {
     pub petal_use_claim: Option<PetalUseClaim>,
     pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance: Option<ClaimAssurance>,
+    pub evm_review: Option<crate::evm_review::EvmReview>,
     pub attributed_advisory_items: Vec<String>,
 }
 
@@ -254,6 +255,8 @@ pub(crate) struct ReviewManifest {
     pub petal_use_claim: Option<PetalUseClaim>,
     pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance: Option<ClaimAssurance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm_review: Option<crate::evm_review::EvmReview>,
     pub attributed_advisory_items: Vec<String>,
     pub issued_at_ms: DecimalU64,
     pub expires_at_ms: DecimalU64,
@@ -275,6 +278,8 @@ impl ReviewManifest {
             petal_use_claim: &'a Option<PetalUseClaim>,
             system_use_claim: &'a Option<SystemUseClaim>,
             claim_assurance: &'a Option<ClaimAssurance>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            evm_review: &'a Option<crate::evm_review::EvmReview>,
             attributed_advisory_items: &'a [String],
             issued_at_ms: &'a DecimalU64,
             expires_at_ms: &'a DecimalU64,
@@ -291,6 +296,7 @@ impl ReviewManifest {
             petal_use_claim: &self.petal_use_claim,
             system_use_claim: &self.system_use_claim,
             claim_assurance: &self.claim_assurance,
+            evm_review: &self.evm_review,
             attributed_advisory_items: &self.attributed_advisory_items,
             issued_at_ms: &self.issued_at_ms,
             expires_at_ms: &self.expires_at_ms,
@@ -1989,12 +1995,14 @@ impl CeremonyBroker {
             manifest.claim_assurance.as_ref(),
             manifest.petal_use_claim.as_ref(),
             manifest.system_use_claim.as_ref(),
+            manifest.evm_review.is_some(),
         );
         let mut canonical_plan = canonical_review_plan(
             request,
             &disclosures,
             manifest.petal_use_claim.as_ref(),
             manifest.system_use_claim.as_ref(),
+            manifest.evm_review.as_ref(),
         )?;
         if !manifest.attributed_advisory_items.is_empty() {
             canonical_plan.push('\n');
@@ -2037,12 +2045,14 @@ impl CeremonyBroker {
             context.claim_assurance.as_ref(),
             context.petal_use_claim.as_ref(),
             context.system_use_claim.as_ref(),
+            context.evm_review.is_some(),
         );
         let mut canonical_plan = canonical_review_plan(
             request,
             &disclosures,
             context.petal_use_claim.as_ref(),
             context.system_use_claim.as_ref(),
+            context.evm_review.as_ref(),
         )?;
         if !context.attributed_advisory_items.is_empty() {
             canonical_plan.push('\n');
@@ -2067,6 +2077,7 @@ impl CeremonyBroker {
             petal_use_claim: context.petal_use_claim,
             system_use_claim: context.system_use_claim,
             claim_assurance: context.claim_assurance,
+            evm_review: context.evm_review,
             attributed_advisory_items: context.attributed_advisory_items,
             issued_at_ms: DecimalU64::new(now_ms),
             expires_at_ms: request.terms.expires_at_ms.clone(),
@@ -3010,6 +3021,7 @@ fn canonical_review_plan(
     security_disclosures: &[String],
     claim: Option<&PetalUseClaim>,
     system_claim: Option<&SystemUseClaim>,
+    evm_review: Option<&crate::evm_review::EvmReview>,
 ) -> Result<String, ProtocolError> {
     #[derive(Serialize)]
     struct AssetAmountReview {
@@ -3030,6 +3042,8 @@ fn canonical_review_plan(
         exact_ordered_hashes: &'a [Digest32],
         replacement_approval_id: &'a Option<Digest32>,
         security_disclosures: &'a [String],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        evm_review: Option<&'a crate::evm_review::EvmReview>,
     }
     let mut asset_amounts = Vec::new();
     // A system claim declares the same amounts a Petal claim does. Reading
@@ -3104,9 +3118,11 @@ fn canonical_review_plan(
         let metadata = match (chain, asset) {
             ("hyperliquid", "usdc") => Some((6, "USDC")),
             ("solana", "native") | ("solana-mainnet", "native") => Some((9, "SOL")),
-            ("ethereum", "native") | ("base", "native") | ("arbitrum", "native") => {
-                Some((18, "ETH"))
-            }
+            ("ethereum", "native")
+            | ("optimism", "native")
+            | ("base", "native")
+            | ("arbitrum", "native")
+            | ("anvil", "native") => Some((18, "ETH")),
             ("polygon", "native") => Some((18, "POL")),
             _ => None,
         };
@@ -3159,6 +3175,7 @@ fn canonical_review_plan(
         exact_ordered_hashes: &request.exact_ordered_hashes,
         replacement_approval_id: &request.replacement_approval_id,
         security_disclosures,
+        evm_review,
     })
     .map_err(malformed)
 }
@@ -3168,9 +3185,12 @@ fn review_disclosures(
     assurance: Option<&ClaimAssurance>,
     claim: Option<&PetalUseClaim>,
     system_claim: Option<&SystemUseClaim>,
+    has_evm_review: bool,
 ) -> Vec<String> {
     let mut disclosures = Vec::new();
-    if !request.exact_ordered_payload_digests.is_empty() || !request.exact_ordered_hashes.is_empty()
+    if !has_evm_review
+        && (!request.exact_ordered_payload_digests.is_empty()
+            || !request.exact_ordered_hashes.is_empty())
     {
         disclosures.push(
             "Bloom has not established the execution effects of these opaque payload digests and hashes."
@@ -3610,4 +3630,109 @@ fn custody_review_manifest(
         manifest["key_ref"] = serde_json::to_value(key_ref).map_err(malformed)?;
     }
     Ok(Some(manifest))
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn absent_evm_review_preserves_legacy_manifest_bytes() {
+        let manifest = ReviewManifest {
+            schema: Token::new("bloom.review-manifest.v1").unwrap(),
+            approval_id: Digest32::from_bytes([1; 32]),
+            approval_digest: Digest32::from_bytes([2; 32]),
+            canonical_plan: "legacy canonical plan".into(),
+            canonical_plan_digest: Digest32::from_bytes([3; 32]),
+            exact_payload_digests: vec![Digest32::from_bytes([4; 32])],
+            exact_hashes: vec![Digest32::from_bytes([5; 32])],
+            petal_use_claim: None,
+            system_use_claim: None,
+            claim_assurance: None,
+            evm_review: None,
+            attributed_advisory_items: vec!["Petal route advisory".into()],
+            issued_at_ms: DecimalU64::new(6),
+            expires_at_ms: DecimalU64::new(7),
+            broker_key_id: Token::new("broker").unwrap(),
+            broker_signature: Base64UrlBytes::from_bytes(&[8; 64]),
+        };
+
+        #[derive(Serialize)]
+        struct LegacyManifest<'a> {
+            schema: &'a Token,
+            approval_id: &'a Digest32,
+            approval_digest: &'a Digest32,
+            canonical_plan: &'a str,
+            canonical_plan_digest: &'a Digest32,
+            exact_payload_digests: &'a [Digest32],
+            exact_hashes: &'a [Digest32],
+            petal_use_claim: &'a Option<PetalUseClaim>,
+            system_use_claim: &'a Option<SystemUseClaim>,
+            claim_assurance: &'a Option<ClaimAssurance>,
+            attributed_advisory_items: &'a [String],
+            issued_at_ms: &'a DecimalU64,
+            expires_at_ms: &'a DecimalU64,
+            broker_key_id: &'a Token,
+            broker_signature: &'a Base64UrlBytes,
+        }
+        let legacy = LegacyManifest {
+            schema: &manifest.schema,
+            approval_id: &manifest.approval_id,
+            approval_digest: &manifest.approval_digest,
+            canonical_plan: &manifest.canonical_plan,
+            canonical_plan_digest: &manifest.canonical_plan_digest,
+            exact_payload_digests: &manifest.exact_payload_digests,
+            exact_hashes: &manifest.exact_hashes,
+            petal_use_claim: &manifest.petal_use_claim,
+            system_use_claim: &manifest.system_use_claim,
+            claim_assurance: &manifest.claim_assurance,
+            attributed_advisory_items: &manifest.attributed_advisory_items,
+            issued_at_ms: &manifest.issued_at_ms,
+            expires_at_ms: &manifest.expires_at_ms,
+            broker_key_id: &manifest.broker_key_id,
+            broker_signature: &manifest.broker_signature,
+        };
+        assert_eq!(
+            serde_jcs::to_vec(&manifest).unwrap(),
+            serde_jcs::to_vec(&legacy).unwrap()
+        );
+
+        #[derive(Serialize)]
+        struct LegacyUnsigned<'a> {
+            schema: &'a Token,
+            approval_id: &'a Digest32,
+            approval_digest: &'a Digest32,
+            canonical_plan: &'a str,
+            canonical_plan_digest: &'a Digest32,
+            exact_payload_digests: &'a [Digest32],
+            exact_hashes: &'a [Digest32],
+            petal_use_claim: &'a Option<PetalUseClaim>,
+            system_use_claim: &'a Option<SystemUseClaim>,
+            claim_assurance: &'a Option<ClaimAssurance>,
+            attributed_advisory_items: &'a [String],
+            issued_at_ms: &'a DecimalU64,
+            expires_at_ms: &'a DecimalU64,
+            broker_key_id: &'a Token,
+        }
+        let legacy_unsigned = LegacyUnsigned {
+            schema: &manifest.schema,
+            approval_id: &manifest.approval_id,
+            approval_digest: &manifest.approval_digest,
+            canonical_plan: &manifest.canonical_plan,
+            canonical_plan_digest: &manifest.canonical_plan_digest,
+            exact_payload_digests: &manifest.exact_payload_digests,
+            exact_hashes: &manifest.exact_hashes,
+            petal_use_claim: &manifest.petal_use_claim,
+            system_use_claim: &manifest.system_use_claim,
+            claim_assurance: &manifest.claim_assurance,
+            attributed_advisory_items: &manifest.attributed_advisory_items,
+            issued_at_ms: &manifest.issued_at_ms,
+            expires_at_ms: &manifest.expires_at_ms,
+            broker_key_id: &manifest.broker_key_id,
+        };
+        assert_eq!(
+            manifest.unsigned_canonical_bytes().unwrap(),
+            serde_jcs::to_vec(&legacy_unsigned).unwrap()
+        );
+    }
 }

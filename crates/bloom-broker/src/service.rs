@@ -822,7 +822,7 @@ impl BrokerRpcService {
                         "invalid canonical policy",
                     )
                 })?;
-            context.attributed_advisory_items = crate::evm_review::review(&request, &policy, from)?;
+            context.evm_review = Some(crate::evm_review::review(&request, &policy, from)?);
         }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
             ApprovalSelector::Exact {

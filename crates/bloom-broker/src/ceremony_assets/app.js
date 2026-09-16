@@ -150,7 +150,46 @@ function chainLabel(chain, ctx) {
 }
 function describeTransfer(manifest) {
   const claim = manifest?.system_use_claim || manifest?.petal_use_claim;
-  if (!claim) return null;
+  let plan = {};
+  try { plan = JSON.parse(manifest?.canonical_plan || "{}"); } catch (_) {}
+  const evmPayloads = Array.isArray(plan.evm_review?.payloads) ? plan.evm_review.payloads : [];
+  if (!claim && !evmPayloads.length) return null;
+  const verification = "Exact envelope checked — destination and value come from the transaction bytes. Contract execution effects are not verified.";
+  const appendEnvelopeFacts = (facts, payload, prefix, includeTransferFacts) => {
+    const label = name => prefix ? `${prefix} ${name.toLowerCase()}` : name;
+    if (includeTransferFacts) {
+      facts.push([label(payload.destination ? "To" : "Action"),
+        payload.destination || "Deploy contract (CREATE)", Boolean(payload.destination)]);
+      facts.push([label("Amount"), payload.value_display]);
+      facts.push([label("Network"), chainLabel(payload.chain)]);
+      facts.push([label("Sender"), payload.sender, true]);
+    }
+    facts.push([label("Nonce"), payload.nonce]);
+    facts.push([label("Gas limit"), payload.gas_limit]);
+    if (payload.fee?.kind === "legacy") {
+      facts.push([label("Gas price"), payload.fee.gas_price_display]);
+    } else if (payload.fee?.kind === "eip1559") {
+      facts.push([label("Maximum fee rate"), payload.fee.max_fee_per_gas_display]);
+      facts.push([label("Priority fee cap"), payload.fee.max_priority_fee_per_gas_display]);
+    }
+    facts.push([label("Payload commitment"), payload.payload_keccak, true]);
+  };
+  if (!claim) {
+    const facts = [];
+    for (const [index, payload] of evmPayloads.entries()) {
+      appendEnvelopeFacts(facts, payload,
+        evmPayloads.length > 1 ? `Transaction ${index + 1}` : "", true);
+    }
+    facts.push(["Bloom verification", verification]);
+    const first = evmPayloads[0];
+    const network = chainLabel(first.chain);
+    const sentence = evmPayloads.length === 1
+      ? (first.destination
+        ? `Approve one transaction on <strong>${escapeHtml(network)}</strong> to the address below.`
+        : `Deploy one contract on <strong>${escapeHtml(network)}</strong>.`)
+      : `Approve <strong>${evmPayloads.length} EVM transactions</strong>. Check each envelope below.`;
+    return {sentence, facts, willVerify: true};
+  }
   const debits = claim.declared_debits || [];
   const dests = claim.declared_destinations || [];
   const fee = claim.declared_fee;
@@ -160,8 +199,6 @@ function describeTransfer(manifest) {
   // Amounts come from the server's signed review plan, never from a page-side
   // table, so the page cannot promise a unit or decimals the plan lacks. The
   // server already renders unknown assets as raw units.
-  let plan = {};
-  try { plan = JSON.parse(manifest?.canonical_plan || "{}"); } catch (_) {}
   const reviewed = plan.asset_amounts || [];
   const reviewedDebits = reviewed.filter(a => a.kind === "declared_debit");
   const amounts = debits.map((d, i) => reviewedDebits[i]?.display || `${d.amount} ${d.asset.asset}`);
@@ -185,8 +222,14 @@ function describeTransfer(manifest) {
   facts.push(["Network", network]);
   if (claim.route) facts.push(["Requested by", `Petal ${claim.route}`]);
   const assurance = claim.claim_assurance?.kind || manifest?.claim_assurance?.kind;
-  const willVerify = assurance === "proof_verified";
-  if (assurance) {
+  const willVerify = evmPayloads.length > 0 || assurance === "proof_verified";
+  if (evmPayloads.length) {
+    for (const [index, payload] of evmPayloads.entries()) {
+      appendEnvelopeFacts(facts, payload,
+        evmPayloads.length > 1 ? `Transaction ${index + 1}` : "", false);
+    }
+    facts.push(["Bloom verification", verification]);
+  } else if (assurance) {
     facts.push(["Bloom verification", willVerify
       ? "Required before signing — Bloom will decode the transaction and require it to match this summary"
       : "No — these figures are claimed, not verified"]);

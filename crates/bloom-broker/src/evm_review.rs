@@ -7,9 +7,46 @@ use alloy::{
 };
 use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalSelector, CanonicalWalletPolicy, CryptoSuite, Digest32,
-    ProtocolError, ProtocolErrorCode,
+    ProtocolError, ProtocolErrorCode, SystemUseClaim,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvmReview {
+    pub payloads: Vec<EvmReviewPayload>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvmReviewPayload {
+    pub chain_id: String,
+    pub chain: String,
+    pub sender: String,
+    pub destination: Option<String>,
+    pub value: String,
+    pub value_display: String,
+    pub nonce: String,
+    pub gas_limit: String,
+    pub fee: EvmFeeReview,
+    pub payload_keccak: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EvmFeeReview {
+    Legacy {
+        gas_price: String,
+        gas_price_display: String,
+    },
+    Eip1559 {
+        max_fee_per_gas: String,
+        max_fee_per_gas_display: String,
+        max_priority_fee_per_gas: String,
+        max_priority_fee_per_gas_display: String,
+    },
+}
 
 fn invalid(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::SelectorMismatch, message)
@@ -19,9 +56,16 @@ pub(crate) fn review(
     request: &ApprovalPrepareRequest,
     policy: &CanonicalWalletPolicy,
     from: Address,
-) -> Result<Vec<String>, ProtocolError> {
+) -> Result<EvmReview, ProtocolError> {
     if request.evm_review_payloads.is_empty() {
-        return Ok(Vec::new());
+        return Ok(EvmReview {
+            payloads: Vec::new(),
+        });
+    }
+    if request.system_use_claim.is_some() && request.evm_review_payloads.len() != 1 {
+        return Err(invalid(
+            "an EVM system claim is ambiguous for multiple review payloads",
+        ));
     }
     let ApprovalSelector::Exact {
         ordered_payload_digests,
@@ -42,7 +86,7 @@ pub(crate) fn review(
             "EVM review payload count or cryptographic suite mismatch",
         ));
     }
-    request
+    let payloads = request
         .evm_review_payloads
         .iter()
         .enumerate()
@@ -57,14 +101,14 @@ pub(crate) fn review(
                     "EVM review payload differs from the approved selector",
                 ));
             }
-            let summary = if bytes.first() == Some(&2) {
+            let reviewed = if bytes.first() == Some(&2) {
                 let mut input = &bytes[1..];
                 let tx = TxEip1559::decode(&mut input)
                     .map_err(|_| invalid("invalid EIP-1559 signing preimage"))?;
                 if !input.is_empty() || !tx.access_list.0.is_empty() {
                     return Err(invalid("unsupported EVM review encoding or access list"));
                 }
-                render(&tx, &bytes, policy, from)?
+                render_eip1559(&tx, &bytes, policy, from, request.system_use_claim.as_ref())?
             } else {
                 let mut input = bytes.as_slice();
                 let tx = TxLegacy::decode(&mut input)
@@ -72,21 +116,52 @@ pub(crate) fn review(
                 if !input.is_empty() {
                     return Err(invalid("trailing EVM signing preimage bytes"));
                 }
-                render(&tx, &bytes, policy, from)?
+                render_legacy(&tx, &bytes, policy, from, request.system_use_claim.as_ref())?
             };
-            Ok(format!(
-                "Broker-decoded EVM transaction {}\n{summary}",
-                index + 1
-            ))
+            Ok(reviewed)
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(EvmReview { payloads })
 }
+
+fn render_eip1559(
+    tx: &TxEip1559,
+    bytes: &[u8],
+    policy: &CanonicalWalletPolicy,
+    from: Address,
+    claim: Option<&SystemUseClaim>,
+) -> Result<EvmReviewPayload, ProtocolError> {
+    let fee = EvmFeeReview::Eip1559 {
+        max_fee_per_gas: tx.max_fee_per_gas.to_string(),
+        max_fee_per_gas_display: format_gwei(tx.max_fee_per_gas),
+        max_priority_fee_per_gas: tx.max_priority_fee_per_gas.to_string(),
+        max_priority_fee_per_gas_display: format_gwei(tx.max_priority_fee_per_gas),
+    };
+    render(tx, bytes, policy, from, claim, fee)
+}
+
+fn render_legacy(
+    tx: &TxLegacy,
+    bytes: &[u8],
+    policy: &CanonicalWalletPolicy,
+    from: Address,
+    claim: Option<&SystemUseClaim>,
+) -> Result<EvmReviewPayload, ProtocolError> {
+    let fee = EvmFeeReview::Legacy {
+        gas_price: tx.gas_price.to_string(),
+        gas_price_display: format_gwei(tx.gas_price),
+    };
+    render(tx, bytes, policy, from, claim, fee)
+}
+
 fn render<T: Transaction + SignableTransaction<Signature>>(
     tx: &T,
     bytes: &[u8],
     policy: &CanonicalWalletPolicy,
     from: Address,
-) -> Result<String, ProtocolError> {
+    claim: Option<&SystemUseClaim>,
+    fee: EvmFeeReview,
+) -> Result<EvmReviewPayload, ProtocolError> {
     if tx.encoded_for_signing() != bytes {
         return Err(invalid(
             "noncanonical or signed EVM payload cannot be reviewed as an unsigned transaction",
@@ -97,9 +172,10 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
         .filter(|id| *id != 0)
         .ok_or_else(|| invalid("EVM approval requires a replay-protected chain ID"))?;
     let chain_policy = format!("evm-{chain}");
+    let chain_name = chain_name(chain);
     let destination = match tx.kind() {
-        TxKind::Call(to) => to.to_string(),
-        TxKind::Create => "CREATE".into(),
+        TxKind::Call(to) => Some(to.to_string()),
+        TxKind::Create => None,
     };
     // Creation has no destination in the existing policy model and needs an
     // explicit numeric-chain opt-in. Ordinary call policy enforcement retains
@@ -114,24 +190,100 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
             "wallet policy must allow destination exact on {chain_policy} for contract creation"
         )));
     }
-    let mut s = format!(
-        "Sender: {from}\nChain ID: {chain}\nNonce: {}\nDestination: {destination}\nNative value (wei): {}\nGas limit: {}\nMaximum fee per gas (wei): {}\nPriority fee per gas (wei): {:?}\nPayload keccak256: {:#x}\n",
-        tx.nonce(),
-        tx.value(),
-        tx.gas_limit(),
-        tx.max_fee_per_gas(),
-        tx.max_priority_fee_per_gas(),
-        keccak256(bytes)
-    );
-    if tx.kind() == TxKind::Create {
-        if tx.input().is_empty() {
-            return Err(invalid("creation requires initcode"));
-        }
-        s.push_str(&format!("Action: Deploy contract (CREATE)\nInitcode keccak256: {:#x}\nPredicted address: {} (sender/nonce prediction; verify mined receipt)\nConstructor effects and resulting ownership are not verified.\n",keccak256(tx.input()),from.create(tx.nonce())));
-    } else {
-        s.push_str(&format!("Action: Contract call / native transfer\nCalldata keccak256: {:#x}\nCall effects, factory-created addresses, and ownership are not verified.\n",keccak256(tx.input())));
+    if let Some(claim) = claim {
+        compare_claim(claim, chain_name.as_str(), tx.kind(), tx.value())?;
     }
-    Ok(s)
+    if tx.kind() == TxKind::Create && tx.input().is_empty() {
+        return Err(invalid("creation requires initcode"));
+    }
+    let value = tx.value().to_string();
+    Ok(EvmReviewPayload {
+        chain_id: chain.to_string(),
+        chain: chain_name.clone(),
+        sender: from.to_string(),
+        destination,
+        value_display: native_value_display(&value, &chain_name),
+        value,
+        nonce: tx.nonce().to_string(),
+        gas_limit: tx.gas_limit().to_string(),
+        fee,
+        payload_keccak: format!("{:#x}", keccak256(bytes)),
+    })
+}
+
+pub(crate) fn chain_name(chain_id: u64) -> String {
+    match chain_id {
+        1 => "ethereum".into(),
+        10 => "optimism".into(),
+        137 => "polygon".into(),
+        8453 => "base".into(),
+        31337 => "anvil".into(),
+        42161 => "arbitrum".into(),
+        id => format!("evm-{id}"),
+    }
+}
+
+fn native_value_display(value: &str, chain: &str) -> String {
+    match chain {
+        "ethereum" | "optimism" | "base" | "arbitrum" | "anvil" => {
+            format!("{} ETH", format_base_units(value, 18))
+        }
+        "polygon" => format!("{} POL", format_base_units(value, 18)),
+        _ => format!("{value} raw native units on {chain} (token decimals unknown)"),
+    }
+}
+
+fn format_gwei(value: u128) -> String {
+    format!("{} Gwei", format_base_units(&value.to_string(), 9))
+}
+
+fn format_base_units(base_units: &str, decimals: usize) -> String {
+    let padded = format!("{:0>width$}", base_units, width = decimals + 1);
+    let split = padded.len() - decimals;
+    let fractional = padded[split..].trim_end_matches('0');
+    if fractional.is_empty() {
+        padded[..split].to_owned()
+    } else {
+        format!("{}.{}", &padded[..split], fractional)
+    }
+}
+
+fn compare_claim(
+    claim: &SystemUseClaim,
+    chain: &str,
+    kind: TxKind,
+    value: alloy::primitives::U256,
+) -> Result<(), ProtocolError> {
+    let [destination] = claim.declared_destinations.as_slice() else {
+        return Err(invalid(
+            "an EVM system claim must declare exactly one destination",
+        ));
+    };
+    let [debit] = claim.declared_debits.as_slice() else {
+        return Err(invalid(
+            "an EVM system claim must declare exactly one native debit",
+        ));
+    };
+    let TxKind::Call(decoded_destination) = kind else {
+        return Err(invalid(
+            "an EVM contract creation cannot carry a system claim",
+        ));
+    };
+    let claimed_destination = destination
+        .destination
+        .parse::<Address>()
+        .map_err(|_| invalid("EVM system claim destination is not an address"))?;
+    if destination.chain.as_str() != chain
+        || debit.asset.chain.as_str() != chain
+        || debit.asset.asset != "native"
+        || claimed_destination != decoded_destination
+        || debit.amount.as_str() != value.to_string()
+    {
+        return Err(invalid(
+            "EVM system claim does not match the decoded destination, native value, or chain",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -200,6 +352,36 @@ mod tests {
             required_verifiers: vec![],
         }
     }
+    fn system_claim(destination: Address, value: u64) -> SystemUseClaim {
+        SystemUseClaim {
+            component_id: Token::new("machine").unwrap(),
+            action_class: Token::new("transaction.confirm").unwrap(),
+            operation_class: Token::new("transaction.confirm").unwrap(),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: Digest32::from_bytes([4; 32]),
+            ordered_hashes: vec![Digest32::from_bytes([5; 32])],
+            declared_debits: vec![DeclaredDebit {
+                asset: AssetId {
+                    chain: Token::new("anvil").unwrap(),
+                    asset: "native".into(),
+                },
+                amount: DecimalU256::parse(value.to_string()).unwrap(),
+            }],
+            declared_destinations: vec![DeclaredDestination {
+                chain: Token::new("anvil").unwrap(),
+                destination: destination.to_string(),
+            }],
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([6; 16]),
+            chain_context: SystemChainContext {
+                chain_family: Token::new("ethereum").unwrap(),
+                genesis_hash: "not-expressible-for-evm".into(),
+                recent_blockhash: "not-expressible-for-evm".into(),
+                last_valid_block_height: DecimalU64::new(0),
+            },
+            claim_assurance: ClaimAssurance::MachineAsserted,
+        }
+    }
     #[test]
     fn verifies_both_preimages_and_renders_creation_without_claiming_ownership() {
         let modern = TxEip1559 {
@@ -222,19 +404,31 @@ mod tests {
             value: modern.value,
             input: modern.input.clone(),
         };
+        let modern_review = review(
+            &request(&modern.encoded_for_signing()),
+            &policy(),
+            Address::ZERO,
+        )
+        .unwrap();
+        assert!(matches!(
+            &modern_review.payloads[0].fee,
+            EvmFeeReview::Eip1559 {
+                max_fee_per_gas_display,
+                max_priority_fee_per_gas_display,
+                ..
+            } if max_fee_per_gas_display == "0.00000001 Gwei"
+                && max_priority_fee_per_gas_display == "0.000000001 Gwei"
+        ));
         for bytes in [modern.encoded_for_signing(), legacy.encoded_for_signing()] {
             let req = request(&bytes);
-            let plan = review(&req, &policy(), Address::ZERO).unwrap().join("\n");
-            for expected in [
-                "Deploy contract (CREATE)",
-                "Native value (wei): 123",
-                "Chain ID: 31337",
-                "Nonce: 3",
-                "Initcode keccak256",
-                "ownership are not verified",
-            ] {
-                assert!(plan.contains(expected), "{plan}");
-            }
+            let plan = review(&req, &policy(), Address::ZERO).unwrap();
+            let reviewed = &plan.payloads[0];
+            assert_eq!(reviewed.destination, None);
+            assert_eq!(reviewed.value, "123");
+            assert_eq!(reviewed.value_display, "0.000000000000000123 ETH");
+            assert_eq!(reviewed.chain_id, "31337");
+            assert_eq!(reviewed.chain, "anvil");
+            assert_eq!(reviewed.nonce, "3");
             let mut altered = req.clone();
             altered.evm_review_payloads[0] = Base64UrlBytes::from_bytes(&[0]);
             assert!(review(&altered, &policy(), Address::ZERO).is_err());
@@ -255,10 +449,11 @@ mod tests {
             &policy(),
             Address::ZERO,
         )
-        .unwrap()
-        .join("\n");
-        assert!(!plan.contains("Predicted address"));
-        assert!(plan.contains("Contract call"));
+        .unwrap();
+        assert_eq!(
+            plan.payloads[0].destination,
+            Some(Address::ZERO.to_string())
+        );
     }
 
     #[test]
@@ -301,5 +496,103 @@ mod tests {
                 "{count}"
             );
         }
+    }
+
+    #[test]
+    fn compares_only_an_unambiguous_single_evm_claim() {
+        let destination = Address::repeat_byte(7);
+        let tx = TxEip1559 {
+            chain_id: 31337,
+            nonce: 0,
+            gas_limit: 21000,
+            max_fee_per_gas: 1_500_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(destination),
+            value: alloy::primitives::U256::from(300_000_u64),
+            input: Vec::new().into(),
+            access_list: Default::default(),
+        };
+        let mut req = request(&tx.encoded_for_signing());
+        req.system_use_claim = Some(system_claim(destination, 300_000));
+        let reviewed = review(&req, &policy(), Address::ZERO).unwrap();
+        assert_eq!(reviewed.payloads[0].value, "300000");
+
+        req.system_use_claim.as_mut().unwrap().declared_destinations[0].destination =
+            Address::repeat_byte(8).to_string();
+        assert_eq!(
+            review(&req, &policy(), Address::ZERO).unwrap_err().code,
+            ProtocolErrorCode::SelectorMismatch
+        );
+    }
+
+    #[test]
+    fn rejects_a_multi_payload_evm_claim_as_ambiguous() {
+        let tx = TxEip1559 {
+            chain_id: 31337,
+            nonce: 0,
+            gas_limit: 21000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::ZERO),
+            value: alloy::primitives::U256::ZERO,
+            input: Vec::new().into(),
+            access_list: Default::default(),
+        };
+        let payload = tx.encoded_for_signing();
+        let mut req = request(&payload);
+        req.evm_review_payloads
+            .push(Base64UrlBytes::from_bytes(&payload));
+        let ApprovalSelector::Exact {
+            ordered_payload_digests,
+            ordered_hashes,
+        } = &mut req.terms.selector
+        else {
+            unreachable!()
+        };
+        ordered_payload_digests.push(ordered_payload_digests[0].clone());
+        ordered_hashes.push(ordered_hashes[0].clone());
+        req.system_use_claim = Some(system_claim(Address::ZERO, 0));
+        let error = review(&req, &policy(), Address::ZERO).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::SelectorMismatch);
+        assert!(error.message.contains("ambiguous"));
+    }
+
+    #[test]
+    fn formats_known_and_unknown_chains_without_inventing_unknown_units() {
+        let legacy = TxLegacy {
+            chain_id: Some(8453),
+            nonce: 7,
+            gas_limit: 21000,
+            gas_price: 1_500_000_000,
+            to: TxKind::Call(Address::ZERO),
+            value: alloy::primitives::U256::from(300_000_000_000_000_u64),
+            input: Vec::new().into(),
+        };
+        let known = review(
+            &request(&legacy.encoded_for_signing()),
+            &policy(),
+            Address::ZERO,
+        )
+        .unwrap();
+        assert_eq!(known.payloads[0].chain, "base");
+        assert_eq!(known.payloads[0].value_display, "0.0003 ETH");
+        assert!(matches!(
+            &known.payloads[0].fee,
+            EvmFeeReview::Legacy { gas_price_display, .. } if gas_price_display == "1.5 Gwei"
+        ));
+
+        let mut unknown = legacy;
+        unknown.chain_id = Some(999_999);
+        let unknown = review(
+            &request(&unknown.encoded_for_signing()),
+            &policy(),
+            Address::ZERO,
+        )
+        .unwrap();
+        assert_eq!(unknown.payloads[0].chain, "evm-999999");
+        assert_eq!(
+            unknown.payloads[0].value_display,
+            "300000000000000 raw native units on evm-999999 (token decimals unknown)"
+        );
     }
 }

@@ -301,6 +301,97 @@ if (nodes["page-title"].textContent !== "Remove a passkey from a wallet" ||
 }
 
 #[test]
+fn evm_manifest_is_rendered_as_primary_review_facts() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  setAttribute() {{}}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+function session(payload) {{
+  return {{
+    ceremony_kind: "sealed_approval",
+    expires_at_ms: Date.now() + 60000,
+    signer_contribution: {{wallet_id: "wallet-primary"}},
+    review_manifest: {{
+      schema: "bloom.review-manifest.v1",
+      canonical_plan: JSON.stringify({{evm_review: {{payloads: [payload]}}}}),
+      attributed_advisory_items: []
+    }}
+  }};
+}}
+renderReview(session({{
+  chain_id: "8453", chain: "base",
+  sender: "0x1111111111111111111111111111111111111111",
+  destination: "0x2222222222222222222222222222222222222222",
+  value: "300000000000000", value_display: "0.0003 ETH",
+  nonce: "7", gas_limit: "21000",
+  fee: {{kind: "eip1559", max_fee_per_gas: "1500000000",
+    max_fee_per_gas_display: "1.5 Gwei", max_priority_fee_per_gas: "1000000000",
+    max_priority_fee_per_gas_display: "1 Gwei"}},
+  payload_keccak: "0xabc"
+}}));
+let rendered = allText(nodes.review);
+for (const expected of ["0x2222222222222222222222222222222222222222", "0.0003 ETH",
+  "Base", "Gas limit", "Maximum fee rate", "1.5 Gwei", "Priority fee cap",
+  "Exact envelope checked", "Contract execution effects are not verified"]) {{
+  if (!rendered.includes(expected)) throw new Error(`missing ${{expected}}: ${{rendered}}`);
+}}
+for (const stale of ["Native value (wei)", "per gas (wei)", "Some("]) {{
+  if (rendered.includes(stale)) throw new Error(`stale EVM rendering ${{stale}}: ${{rendered}}`);
+}}
+
+renderReview(session({{
+  chain_id: "999999", chain: "evm-999999",
+  sender: "0x1111111111111111111111111111111111111111",
+  destination: "0x2222222222222222222222222222222222222222",
+  value: "300000000000000",
+  value_display: "300000000000000 raw native units on evm-999999 (token decimals unknown)",
+  nonce: "8", gas_limit: "22000",
+  fee: {{kind: "legacy", gas_price: "2000000000", gas_price_display: "2 Gwei"}},
+  payload_keccak: "0xdef"
+}}));
+rendered = allText(nodes.review);
+if (!rendered.includes("300000000000000 raw native units on evm-999999") ||
+    rendered.includes("0.0003 ETH") || rendered.includes("0.0003 POL")) {{
+  throw new Error(`unknown chain invented asset metadata: ${{rendered}}`);
+}}
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn key_derive_primary_review_explains_the_session_without_internal_scope_json() {
     let asset = include_str!("../src/ceremony_assets/app.js");
     let executable = asset
@@ -4341,6 +4432,8 @@ async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
         serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let manifest = projection["review_manifest"].clone();
     let canonical_plan = manifest["canonical_plan"].as_str().unwrap();
+    assert!(manifest.get("evm_review").is_none());
+    assert!(!canonical_plan.contains("evm_review"));
     assert!(canonical_plan.to_lowercase().contains("sha256"));
     assert!(canonical_plan.contains("max_operations"));
     assert!(canonical_plan.contains("root-key"));
