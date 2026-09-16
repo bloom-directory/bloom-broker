@@ -165,10 +165,10 @@ pub(crate) fn review(
                 }
                 render_eip1559(&tx, &bytes, policy, from, request.system_use_claim.as_ref())?
             } else {
-                // Typed envelopes other than EIP-1559 (EIP-2930, EIP-4844,
-                // EIP-7702, ...) are not legacy preimages: name them instead
-                // of failing with a misleading decode error.
-                if matches!(bytes.first(), Some(0x01) | Some(0x03) | Some(0x04)) {
+                // Any other EIP-2718 type byte (0x00..=0x7f) is a typed
+                // envelope, not a legacy RLP list: name it instead of failing
+                // with a misleading decode error.
+                if matches!(bytes.first(), Some(b) if *b < 0x80) {
                     return Err(invalid(format!(
                         "unsupported EVM transaction type {:#04x}; only legacy and EIP-1559 preimages review",
                         bytes[0],
@@ -812,7 +812,7 @@ mod tests {
             input: Vec::new().into(),
         };
         let preimage = legacy.encoded_for_signing();
-        for envelope in [0x01u8, 0x03, 0x04] {
+        for envelope in [0x00u8, 0x01, 0x03, 0x04, 0x05, 0x7f] {
             let mut typed = vec![envelope];
             typed.extend_from_slice(&preimage);
             let error = review(&request(&typed), &policy(), Address::ZERO).unwrap_err();
