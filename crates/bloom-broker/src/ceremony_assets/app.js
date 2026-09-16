@@ -169,18 +169,11 @@ function describeTransfer(manifest) {
     // The one field that tells a transfer from a contract call: disclose the
     // input size and commitment, or state plainly that there is none.
     // Execution effects remain unverified either way (see Bloom verification).
-    // An absent field means a pre-disclosure payload: say nothing rather
-    // than claim "none".
-    if (payload.calldata_bytes !== undefined) {
-      const calldataSize = Number(payload.calldata_bytes);
-      const calldataBytes = Number.isFinite(calldataSize)
-        ? calldataSize.toLocaleString("en-US")
-        : payload.calldata_bytes;
-      if (payload.calldata_keccak) {
-        facts.push([label("Calldata"), `${calldataBytes} bytes, keccak ${payload.calldata_keccak}`, true]);
-      } else {
-        facts.push([label("Calldata"), "None — plain transfer"]);
-      }
+    if (payload.calldata_keccak) {
+      const calldataBytes = Number(payload.calldata_bytes).toLocaleString("en-US");
+      facts.push([label("Calldata"), `${calldataBytes} bytes, keccak ${payload.calldata_keccak}`, true]);
+    } else {
+      facts.push([label("Calldata"), "None — plain transfer"]);
     }
     if (payload.fee?.kind === "legacy") {
       facts.push([label("Gas price"), payload.fee.gas_price_display]);

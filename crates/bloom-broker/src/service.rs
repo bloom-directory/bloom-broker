@@ -108,11 +108,6 @@ fn seed_profile_from_key_projection(
     }
 }
 
-// The native-transaction subject list lives with the EVM review code that
-// enforces it (crate::evm_review::subject_is_native_evm_transaction): one
-// definition for the prepare gate, the renewal refusal, and the review
-// itself, so the three can never disagree.
-
 fn evm_address_from_public_key(bytes: &[u8]) -> Result<alloy::primitives::Address, ProtocolError> {
     // Strict canonical SPKI via the shared parser: it rejects compressed
     // points and non-canonical DER that a general-purpose parser tolerates.

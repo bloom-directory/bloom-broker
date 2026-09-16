@@ -2043,10 +2043,6 @@ impl CeremonyBroker {
             context.system_use_claim.as_ref(),
             context.evm_review.is_some(),
         );
-        // Advisory items are NOT appended here: canonical_plan is parsed as
-        // JSON by the approval page, and raw text after the object would
-        // silently erase the whole review. The items stay in the signed
-        // manifest field, where the page already renders them from.
         let canonical_plan = canonical_review_plan(
             request,
             &disclosures,

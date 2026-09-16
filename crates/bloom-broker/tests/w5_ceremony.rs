@@ -373,7 +373,8 @@ renderReview(session({{
   value_display: "300000000000000 raw native units on evm-999999 (token decimals unknown)",
   nonce: "8", gas_limit: "22000",
   fee: {{kind: "legacy", gas_price: "2000000000", gas_price_display: "2 Gwei"}},
-  payload_keccak: "0xdef"
+  payload_keccak: "0xdef",
+  calldata_bytes: "0"
 }}));
 rendered = allText(nodes.review);
 if (!rendered.includes("300000000000000 raw native units on evm-999999") ||
@@ -414,24 +415,6 @@ renderReview(session({{
 rendered = allText(nodes.review);
 for (const expected of ["Deploy one contract", "Deploy contract (CREATE)", "5 bytes", "0xcafe"]) {{
   if (!rendered.includes(expected)) throw new Error(`creation not disclosed ${{expected}}: ${{rendered}}`);
-}}
-
-// A pre-disclosure payload (no calldata fields) renders as before: no
-// Calldata row at all, never a "none" claim about unknown input.
-renderReview(session({{
-  chain_id: "8453", chain: "base",
-  sender: "0x1111111111111111111111111111111111111111",
-  destination: "0x2222222222222222222222222222222222222222",
-  value: "300000000000000", value_display: "0.0003 ETH",
-  nonce: "7", gas_limit: "21000",
-  fee: {{kind: "eip1559", max_fee_per_gas: "1500000000",
-    max_fee_per_gas_display: "1.5 Gwei", max_priority_fee_per_gas: "1000000000",
-    max_priority_fee_per_gas_display: "1 Gwei"}},
-  payload_keccak: "0xabc"
-}}));
-rendered = allText(nodes.review);
-if (rendered.includes("Calldata") || !rendered.includes("0.0003 ETH")) {{
-  throw new Error(`pre-disclosure payload misstated: ${{rendered}}`);
 }}
 "#
     );
