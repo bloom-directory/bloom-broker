@@ -1,41 +1,45 @@
-# Exact EVM deployment review
+# Exact EVM transaction review
 
 Machine/Broker protocol 1.6 adds `evm_review_payloads` to
-`sealed_approval.prepare` (1.5 introduced BIP-39 account custody). Upgrade both
-services together: strict 1.5 and earlier decoders cannot accept this field,
-and 1.6 refuses native `transaction.confirm`,
-`transaction.replace`, and `transaction.cancel` preparations without payloads.
-Signer protocol and the Sealed Approval selector remain unchanged.
+`sealed_approval.prepare`. Upgrade Machine and Broker together: older strict
+decoders reject the field, and Broker 1.6 refuses `transaction.confirm`,
+`transaction.replace`, and `transaction.cancel` preparations without it.
+Signer protocol and the Sealed Approval selector are unchanged.
 
-For native EVM preparations Broker checks the supplied SHA-256 payload digests
-and Keccak signing hashes against the exact selector, decodes canonical legacy
-or EIP-1559 signing preimages, and re-encodes them to reject signed, malformed,
-trailing, or noncanonical data. The sender comes from Signer's public key for
-the exact approval key. Broker includes decoded chain ID, sender, destination,
-nonce, value, gas, fees, payload commitments, and the calldata size with its
-keccak (or an explicit statement that a plain transfer carries no calldata) in
-its signed owner review. Creation shows the initcode size and keccak; the
-created address, constructor behavior, and resulting ownership remain
-unverified. Transactions with a non-empty access list are rejected outright:
-only access-list-free preimages review. Factory calls remain calls, with no
-invented created address.
+## What Broker checks
 
-Direct creation requires the owner to add this explicit numeric-chain entry to
-the canonical wallet policy through its existing policy-update ceremony:
+- Each payload matches the exact selector's SHA-256 digest and Keccak hash, in
+  order. One payload obeys the single signing-payload limit; several obey the
+  batch limits (1–32 children, 64 KiB each, 512 KiB total).
+- Each payload is a canonical unsigned legacy or EIP-1559 signing preimage with
+  a nonzero chain ID and no access list. Signed, trailing, or noncanonical bytes
+  are rejected.
+- The request carries no Petal or system claim. Nothing compares a claim to the
+  decoded transaction, and authorization accepts system claims only for Solana.
+- The sender is derived from Signer's public key for the approval key.
+
+The signed owner review shows chain, sender, destination, value, nonce, gas
+limit, fees, payload keccak, and calldata size and keccak. It states that
+contract execution effects are not verified. Native transaction approvals are
+single-use and cannot be renewed.
+
+## Direct contract creation
+
+A transaction with no recipient (direct CREATE) is refused unless the wallet
+policy contains an entry for its numeric chain, added through the policy-update
+ceremony:
 
 ```json
 {"chain":"evm-31337","destination":"exact"}
 ```
 
-This entry permits preparation of exact native EVM deployment approvals on
-chain ID 31337; every transaction still requires its own exact owner approval.
-It is not a reusable Petal allowance or a general signing capability. Machine's
-deployment workflow also uses this opt-in for dependent initialization/factory
-calls. Ordinary call policy enforcement retains its existing authority path and
-Machine's chain-scoped advisory destination checks. Chain aliases supplied by
-Machine cannot substitute for the numeric creation scope.
+The entry is read from the policy version the approval terms are bound to.
+Chain aliases such as `anvil` do not match it. It does not cover contracts
+deployed by factory calls: those are ordinary calls, and Broker does not infer
+their effects.
 
-The full preimages are verification inputs; Machine's prose is not the source
-of these transaction facts. The signed review manifest includes the decoded
-section through its existing attributed-item and canonical-plan commitments.
-Payload omission on non-native approval classes preserves their existing flow.
+## Rollback
+
+A manifest without an EVM review serializes to the same bytes as before this
+field existed. A rollback while a ceremony that carries an EVM review is
+pending cannot read that ceremony; ceremonies expire after ten minutes.

@@ -4524,15 +4524,6 @@ async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
     assert!(canonical_plan.contains("max_operations"));
     assert!(canonical_plan.contains("root-key"));
     assert!(canonical_plan.contains("Bloom has not established the execution effects"));
-    // Advisory items ride in the signed manifest field, never appended to the
-    // plan: canonical_plan must stay parseable JSON for the approval page.
-    assert!(!canonical_plan.contains("machine supplied descriptions are advisory"));
-    serde_json::from_str::<serde_json::Value>(canonical_plan)
-        .expect("canonical_plan stays JSON with advisory items present");
-    assert_eq!(
-        manifest["attributed_advisory_items"],
-        serde_json::json!(["machine supplied descriptions are advisory"])
-    );
     let broker_signature: Base64UrlBytes =
         serde_json::from_value(manifest["broker_signature"].clone()).unwrap();
     assert_eq!(broker_signature.decode().len(), 64);

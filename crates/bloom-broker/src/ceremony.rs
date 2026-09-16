@@ -3667,83 +3667,18 @@ mod compatibility_tests {
             broker_key_id: Token::new("broker").unwrap(),
             broker_signature: Base64UrlBytes::from_bytes(&[8; 64]),
         };
-
-        #[derive(Serialize)]
-        struct LegacyManifest<'a> {
-            schema: &'a Token,
-            approval_id: &'a Digest32,
-            approval_digest: &'a Digest32,
-            canonical_plan: &'a str,
-            canonical_plan_digest: &'a Digest32,
-            exact_payload_digests: &'a [Digest32],
-            exact_hashes: &'a [Digest32],
-            petal_use_claim: &'a Option<PetalUseClaim>,
-            system_use_claim: &'a Option<SystemUseClaim>,
-            claim_assurance: &'a Option<ClaimAssurance>,
-            attributed_advisory_items: &'a [String],
-            issued_at_ms: &'a DecimalU64,
-            expires_at_ms: &'a DecimalU64,
-            broker_key_id: &'a Token,
-            broker_signature: &'a Base64UrlBytes,
-        }
-        let legacy = LegacyManifest {
-            schema: &manifest.schema,
-            approval_id: &manifest.approval_id,
-            approval_digest: &manifest.approval_digest,
-            canonical_plan: &manifest.canonical_plan,
-            canonical_plan_digest: &manifest.canonical_plan_digest,
-            exact_payload_digests: &manifest.exact_payload_digests,
-            exact_hashes: &manifest.exact_hashes,
-            petal_use_claim: &manifest.petal_use_claim,
-            system_use_claim: &manifest.system_use_claim,
-            claim_assurance: &manifest.claim_assurance,
-            attributed_advisory_items: &manifest.attributed_advisory_items,
-            issued_at_ms: &manifest.issued_at_ms,
-            expires_at_ms: &manifest.expires_at_ms,
-            broker_key_id: &manifest.broker_key_id,
-            broker_signature: &manifest.broker_signature,
-        };
-        assert_eq!(
-            serde_jcs::to_vec(&manifest).unwrap(),
-            serde_jcs::to_vec(&legacy).unwrap()
+        // Bytes a Broker without `evm_review` produces and verifies. Rolling
+        // back must still read and verify manifests signed after this change.
+        let digest = |byte: u8| format!("{byte:02x}").repeat(32);
+        let (d1, d2, d3, d4, d5) = (digest(1), digest(2), digest(3), digest(4), digest(5));
+        let signature = format!(r#""broker_signature":"{}","#, "CAgI".repeat(21) + "CA");
+        let legacy = format!(
+            r#"{{"approval_digest":"{d2}","approval_id":"{d1}","attributed_advisory_items":["Petal route advisory"],"broker_key_id":"broker",{signature}"canonical_plan":"legacy canonical plan","canonical_plan_digest":"{d3}","claim_assurance":null,"exact_hashes":["{d5}"],"exact_payload_digests":["{d4}"],"expires_at_ms":"7","issued_at_ms":"6","petal_use_claim":null,"schema":"bloom.review-manifest.v1","system_use_claim":null}}"#
         );
-
-        #[derive(Serialize)]
-        struct LegacyUnsigned<'a> {
-            schema: &'a Token,
-            approval_id: &'a Digest32,
-            approval_digest: &'a Digest32,
-            canonical_plan: &'a str,
-            canonical_plan_digest: &'a Digest32,
-            exact_payload_digests: &'a [Digest32],
-            exact_hashes: &'a [Digest32],
-            petal_use_claim: &'a Option<PetalUseClaim>,
-            system_use_claim: &'a Option<SystemUseClaim>,
-            claim_assurance: &'a Option<ClaimAssurance>,
-            attributed_advisory_items: &'a [String],
-            issued_at_ms: &'a DecimalU64,
-            expires_at_ms: &'a DecimalU64,
-            broker_key_id: &'a Token,
-        }
-        let legacy_unsigned = LegacyUnsigned {
-            schema: &manifest.schema,
-            approval_id: &manifest.approval_id,
-            approval_digest: &manifest.approval_digest,
-            canonical_plan: &manifest.canonical_plan,
-            canonical_plan_digest: &manifest.canonical_plan_digest,
-            exact_payload_digests: &manifest.exact_payload_digests,
-            exact_hashes: &manifest.exact_hashes,
-            petal_use_claim: &manifest.petal_use_claim,
-            system_use_claim: &manifest.system_use_claim,
-            claim_assurance: &manifest.claim_assurance,
-            attributed_advisory_items: &manifest.attributed_advisory_items,
-            issued_at_ms: &manifest.issued_at_ms,
-            expires_at_ms: &manifest.expires_at_ms,
-            broker_key_id: &manifest.broker_key_id,
-        };
+        assert_eq!(serde_jcs::to_string(&manifest).unwrap(), legacy);
         assert_eq!(
             manifest.unsigned_canonical_bytes().unwrap(),
-            serde_jcs::to_vec(&legacy_unsigned).unwrap()
+            legacy.replace(&signature, "").into_bytes()
         );
     }
 }

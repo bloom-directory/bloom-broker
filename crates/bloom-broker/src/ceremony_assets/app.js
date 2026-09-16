@@ -153,17 +153,13 @@ function describeTransfer(manifest) {
   let plan = {};
   try { plan = JSON.parse(manifest?.canonical_plan || "{}"); } catch (_) {}
   const evmPayloads = Array.isArray(plan.evm_review?.payloads) ? plan.evm_review.payloads : [];
-  if (!claim && !evmPayloads.length) return null;
-  const verification = "Exact envelope checked — destination and value come from the transaction bytes. Contract execution effects are not verified.";
-  const appendEnvelopeFacts = (facts, payload, prefix, includeTransferFacts) => {
+  const appendEnvelopeFacts = (facts, payload, prefix) => {
     const label = name => prefix ? `${prefix} ${name.toLowerCase()}` : name;
-    if (includeTransferFacts) {
-      facts.push([label(payload.destination ? "To" : "Action"),
-        payload.destination || "Deploy contract (CREATE)", Boolean(payload.destination)]);
-      facts.push([label("Amount"), payload.value_display]);
-      facts.push([label("Network"), chainLabel(payload.chain)]);
-      facts.push([label("Sender"), payload.sender, true]);
-    }
+    facts.push([label(payload.destination ? "To" : "Action"),
+      payload.destination || "Deploy contract (CREATE)", Boolean(payload.destination)]);
+    facts.push([label("Amount"), payload.value_display]);
+    facts.push([label("Network"), chainLabel(payload.chain)]);
+    facts.push([label("Sender"), payload.sender, true]);
     facts.push([label("Nonce"), payload.nonce]);
     facts.push([label("Gas limit"), payload.gas_limit]);
     // The one field that tells a transfer from a contract call: disclose the
@@ -183,13 +179,15 @@ function describeTransfer(manifest) {
     }
     facts.push([label("Payload commitment"), payload.payload_keccak, true]);
   };
-  if (!claim) {
+  // Broker refuses claims alongside EVM review payloads, so the envelope is
+  // the whole review.
+  if (evmPayloads.length) {
     const facts = [];
     for (const [index, payload] of evmPayloads.entries()) {
       appendEnvelopeFacts(facts, payload,
-        evmPayloads.length > 1 ? `Transaction ${index + 1}` : "", true);
+        evmPayloads.length > 1 ? `Transaction ${index + 1}` : "");
     }
-    facts.push(["Bloom verification", verification]);
+    facts.push(["Bloom verification", "Exact envelope checked — destination and value come from the transaction bytes. Contract execution effects are not verified."]);
     const first = evmPayloads[0];
     const network = chainLabel(first.chain);
     const sentence = evmPayloads.length === 1
@@ -201,6 +199,7 @@ function describeTransfer(manifest) {
       : `Approve <strong>${evmPayloads.length} EVM transactions</strong>. Check each envelope below.`;
     return {sentence, facts, willVerify: true};
   }
+  if (!claim) return null;
   const debits = claim.declared_debits || [];
   const dests = claim.declared_destinations || [];
   const fee = claim.declared_fee;
@@ -233,14 +232,8 @@ function describeTransfer(manifest) {
   facts.push(["Network", network]);
   if (claim.route) facts.push(["Requested by", `Petal ${claim.route}`]);
   const assurance = claim.claim_assurance?.kind || manifest?.claim_assurance?.kind;
-  const willVerify = evmPayloads.length > 0 || assurance === "proof_verified";
-  if (evmPayloads.length) {
-    for (const [index, payload] of evmPayloads.entries()) {
-      appendEnvelopeFacts(facts, payload,
-        evmPayloads.length > 1 ? `Transaction ${index + 1}` : "", false);
-    }
-    facts.push(["Bloom verification", verification]);
-  } else if (assurance) {
+  const willVerify = assurance === "proof_verified";
+  if (assurance) {
     facts.push(["Bloom verification", willVerify
       ? "Required before signing — Bloom will decode the transaction and require it to match this summary"
       : "No — these figures are claimed, not verified"]);

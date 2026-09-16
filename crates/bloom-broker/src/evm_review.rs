@@ -7,7 +7,7 @@ use alloy::{
 };
 use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalSelector, ApprovalSubject, CanonicalWalletPolicy, CryptoSuite,
-    Digest32, ProtocolError, ProtocolErrorCode, SystemUseClaim,
+    Digest32, ProtocolError, ProtocolErrorCode, SigningPayloads,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -98,16 +98,11 @@ pub(crate) fn review(
         // suppressing it while showing nothing.
         return Ok(None);
     }
-    if request.petal_use_claim.is_some() {
-        // Only a system claim is cross-checked against the decoded bytes
-        // (compare_claim below). A Petal claim would otherwise render under
-        // the verified framing with nothing comparing it to the transaction,
-        // so refuse it at the boundary instead of displaying it as verified.
-        // Malformed, like the adjacent both-claims rejection: the request
-        // shape itself is invalid, not the payloads.
-        return Err(malformed(
-            "EVM review payloads cannot carry a Petal claim; use a system claim",
-        ));
+    if request.petal_use_claim.is_some() || request.system_use_claim.is_some() {
+        // A claim would render beside the decoded facts with nothing
+        // comparing the two, and authorization accepts system claims only for
+        // Solana, so an EVM approval carrying one could never sign.
+        return Err(malformed("EVM review payloads cannot carry a claim"));
     }
     if !subject_is_native_evm_transaction(&request.terms.subject) {
         // The service gate refuses native subjects without payloads; this is
@@ -117,11 +112,6 @@ pub(crate) fn review(
             "EVM review payloads require a native transaction subject",
         ));
     }
-    if request.system_use_claim.is_some() && request.evm_review_payloads.len() != 1 {
-        return Err(invalid(
-            "an EVM system claim is ambiguous for multiple review payloads",
-        ));
-    }
     let ApprovalSelector::Exact {
         ordered_payload_digests,
         ordered_hashes,
@@ -129,26 +119,33 @@ pub(crate) fn review(
     else {
         return Err(invalid("EVM review requires an exact selector"));
     };
-    // One exact approval covers a whole transaction batch; the cap matches
-    // Machine's documented batch maximum (32 children) so no approvable batch
-    // is rejected here.
     if request.terms.allowed_crypto_suites != [CryptoSuite::Secp256k1Keccak256Recoverable]
         || request.evm_review_payloads.len() != ordered_payload_digests.len()
         || ordered_hashes.len() != ordered_payload_digests.len()
-        || request.evm_review_payloads.len() > 32
     {
         return Err(invalid(
             "EVM review payload count or cryptographic suite mismatch",
         ));
     }
+    // Refuse before the owner is asked what signing would refuse anyway. One
+    // payload is checked as a single signing payload; Machine applies the
+    // stricter batch limits to a one-child batch before it prepares.
+    match request.evm_review_payloads.as_slice() {
+        [payload] => SigningPayloads::Single {
+            payload: payload.clone(),
+        },
+        children => SigningPayloads::Batch {
+            children: children.to_vec(),
+        },
+    }
+    .validate()?;
     let payloads = request
         .evm_review_payloads
         .iter()
         .enumerate()
         .map(|(index, payload)| {
             let bytes = payload.decode();
-            if bytes.len() > 128 * 1024
-                || Digest32::from_bytes(Sha256::digest(&bytes).into())
+            if Digest32::from_bytes(Sha256::digest(&bytes).into())
                     != ordered_payload_digests[index]
                 || Digest32::from_bytes(keccak256(&bytes).0) != ordered_hashes[index]
             {
@@ -163,7 +160,7 @@ pub(crate) fn review(
                 if !input.is_empty() || !tx.access_list.0.is_empty() {
                     return Err(invalid("unsupported EVM review encoding or access list"));
                 }
-                render_eip1559(&tx, &bytes, policy, from, request.system_use_claim.as_ref())?
+                render_eip1559(&tx, &bytes, policy, from)?
             } else {
                 // Any other EIP-2718 type byte (0x00..=0x7f) is a typed
                 // envelope, not a legacy RLP list: name it instead of failing
@@ -180,7 +177,7 @@ pub(crate) fn review(
                 if !input.is_empty() {
                     return Err(invalid("trailing EVM signing preimage bytes"));
                 }
-                render_legacy(&tx, &bytes, policy, from, request.system_use_claim.as_ref())?
+                render_legacy(&tx, &bytes, policy, from)?
             };
             Ok(reviewed)
         })
@@ -193,7 +190,6 @@ fn render_eip1559(
     bytes: &[u8],
     policy: &CanonicalWalletPolicy,
     from: Address,
-    claim: Option<&SystemUseClaim>,
 ) -> Result<EvmReviewPayload, ProtocolError> {
     let fee = EvmFeeReview::Eip1559 {
         max_fee_per_gas: tx.max_fee_per_gas.to_string(),
@@ -201,7 +197,7 @@ fn render_eip1559(
         max_priority_fee_per_gas: tx.max_priority_fee_per_gas.to_string(),
         max_priority_fee_per_gas_display: format_gwei(tx.max_priority_fee_per_gas),
     };
-    render(tx, bytes, policy, from, claim, fee)
+    render(tx, bytes, policy, from, fee)
 }
 
 fn render_legacy(
@@ -209,13 +205,12 @@ fn render_legacy(
     bytes: &[u8],
     policy: &CanonicalWalletPolicy,
     from: Address,
-    claim: Option<&SystemUseClaim>,
 ) -> Result<EvmReviewPayload, ProtocolError> {
     let fee = EvmFeeReview::Legacy {
         gas_price: tx.gas_price.to_string(),
         gas_price_display: format_gwei(tx.gas_price),
     };
-    render(tx, bytes, policy, from, claim, fee)
+    render(tx, bytes, policy, from, fee)
 }
 
 fn render<T: Transaction + SignableTransaction<Signature>>(
@@ -223,7 +218,6 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
     bytes: &[u8],
     policy: &CanonicalWalletPolicy,
     from: Address,
-    claim: Option<&SystemUseClaim>,
     fee: EvmFeeReview,
 ) -> Result<EvmReviewPayload, ProtocolError> {
     if tx.encoded_for_signing() != bytes {
@@ -254,9 +248,6 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
             "wallet policy must allow destination exact on {chain_policy} for contract creation"
         )));
     }
-    if let Some(claim) = claim {
-        compare_claim(claim, chain_name.as_str(), tx.kind(), tx.value())?;
-    }
     let input = tx.input();
     if tx.kind() == TxKind::Create && input.is_empty() {
         return Err(invalid("creation requires initcode"));
@@ -278,7 +269,7 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
     })
 }
 
-pub(crate) fn chain_name(chain_id: u64) -> String {
+fn chain_name(chain_id: u64) -> String {
     match chain_id {
         1 => "ethereum".into(),
         10 => "optimism".into(),
@@ -307,61 +298,6 @@ fn format_gwei(value: u128) -> String {
         "{} Gwei",
         crate::ceremony::format_base_units(&value.to_string(), 9)
     )
-}
-
-fn compare_claim(
-    claim: &SystemUseClaim,
-    chain: &str,
-    kind: TxKind,
-    value: alloy::primitives::U256,
-) -> Result<(), ProtocolError> {
-    let [destination] = claim.declared_destinations.as_slice() else {
-        return Err(invalid(
-            "an EVM system claim must declare exactly one destination",
-        ));
-    };
-    let [debit] = claim.declared_debits.as_slice() else {
-        return Err(invalid(
-            "an EVM system claim must declare exactly one native debit",
-        ));
-    };
-    let TxKind::Call(decoded_destination) = kind else {
-        return Err(invalid(
-            "an EVM contract creation cannot carry a system claim",
-        ));
-    };
-    let claimed_destination = destination
-        .destination
-        .parse::<Address>()
-        .map_err(|_| invalid("EVM system claim destination is not an address"))?;
-    // One error per field so a mismatch tells Machine which fact diverged.
-    // The decoded chain here is the canonical alias (anvil, base, ...), not
-    // the numeric creation scope (evm-31337): a mismatch usually means
-    // Machine supplied one where the other belongs.
-    if destination.chain.as_str() != chain {
-        return Err(invalid(format!(
-            "EVM system claim destination chain does not match the decoded chain alias: {chain}",
-        )));
-    }
-    if debit.asset.chain.as_str() != chain {
-        return Err(invalid(format!(
-            "EVM system claim debit chain does not match the decoded chain alias: {chain}",
-        )));
-    }
-    if debit.asset.asset != "native" {
-        return Err(invalid("EVM system claim debit must be the native asset"));
-    }
-    if claimed_destination != decoded_destination {
-        return Err(invalid(
-            "EVM system claim destination does not match the decoded recipient",
-        ));
-    }
-    if debit.amount.as_str() != value.to_string() {
-        return Err(invalid(
-            "EVM system claim amount does not match the decoded native value",
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -428,36 +364,6 @@ mod tests {
                 destination: "exact".into(),
             }],
             required_verifiers: vec![],
-        }
-    }
-    fn system_claim(destination: Address, value: u64) -> SystemUseClaim {
-        SystemUseClaim {
-            component_id: Token::new("machine").unwrap(),
-            action_class: Token::new("transaction.confirm").unwrap(),
-            operation_class: Token::new("transaction.confirm").unwrap(),
-            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
-            payload_digest: Digest32::from_bytes([4; 32]),
-            ordered_hashes: vec![Digest32::from_bytes([5; 32])],
-            declared_debits: vec![DeclaredDebit {
-                asset: AssetId {
-                    chain: Token::new("anvil").unwrap(),
-                    asset: "native".into(),
-                },
-                amount: DecimalU256::parse(value.to_string()).unwrap(),
-            }],
-            declared_destinations: vec![DeclaredDestination {
-                chain: Token::new("anvil").unwrap(),
-                destination: destination.to_string(),
-            }],
-            declared_fee: DeclaredFee::None,
-            nonce: RequestNonce::from_bytes([6; 16]),
-            chain_context: SystemChainContext {
-                chain_family: Token::new("ethereum").unwrap(),
-                genesis_hash: "not-expressible-for-evm".into(),
-                recent_blockhash: "not-expressible-for-evm".into(),
-                last_valid_block_height: DecimalU64::new(0),
-            },
-            claim_assurance: ClaimAssurance::MachineAsserted,
         }
     }
     fn review_ok(req: &ApprovalPrepareRequest) -> EvmReview {
@@ -541,105 +447,53 @@ mod tests {
         );
     }
 
+    /// A call carrying `calldata` bytes of input, repeated `count` times with
+    /// a selector that matches every copy.
+    fn call_batch(calldata: usize, count: usize) -> ApprovalPrepareRequest {
+        let payload = TxEip1559 {
+            chain_id: 31337,
+            nonce: 0,
+            gas_limit: 21000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::ZERO),
+            value: alloy::primitives::U256::ZERO,
+            input: vec![1; calldata].into(),
+            access_list: Default::default(),
+        }
+        .encoded_for_signing();
+        let mut req = request(&payload);
+        req.evm_review_payloads = vec![Base64UrlBytes::from_bytes(&payload); count];
+        req.terms.selector = ApprovalSelector::Exact {
+            ordered_payload_digests: vec![
+                Digest32::from_bytes(Sha256::digest(&payload).into());
+                count
+            ],
+            ordered_hashes: vec![Digest32::from_bytes(keccak256(&payload).0); count],
+        };
+        req
+    }
+
     #[test]
     fn reviews_a_full_maximum_batch_and_rejects_more() {
-        let tx = TxEip1559 {
-            chain_id: 31337,
-            nonce: 0,
-            gas_limit: 21000,
-            max_fee_per_gas: 1,
-            max_priority_fee_per_gas: 1,
-            to: TxKind::Call(Address::ZERO),
-            value: alloy::primitives::U256::ZERO,
-            input: Vec::new().into(),
-            access_list: Default::default(),
-        };
-        let payload = tx.encoded_for_signing();
-        for count in [32usize, 33] {
-            let mut req = request(&payload);
-            req.evm_review_payloads = vec![Base64UrlBytes::from_bytes(&payload); count];
-            let ApprovalSelector::Exact {
-                ordered_payload_digests,
-                ordered_hashes,
-            } = &mut req.terms.selector
-            else {
-                unreachable!()
-            };
-            *ordered_payload_digests = req
-                .evm_review_payloads
-                .iter()
-                .map(|p| Digest32::from_bytes(Sha256::digest(p.decode()).into()))
-                .collect();
-            *ordered_hashes = req
-                .evm_review_payloads
-                .iter()
-                .map(|p| Digest32::from_bytes(keccak256(p.decode()).0))
-                .collect();
-            assert_eq!(
-                review(&req, &policy(), Address::ZERO).is_ok(),
-                count <= 32,
-                "{count}"
-            );
-        }
+        assert!(review(&call_batch(0, 32), &policy(), Address::ZERO).is_ok());
+        let error = review(&call_batch(0, 33), &policy(), Address::ZERO).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::LimitExceededFrame);
     }
 
     #[test]
-    fn compares_only_an_unambiguous_single_evm_claim() {
-        let destination = Address::repeat_byte(7);
-        let tx = TxEip1559 {
-            chain_id: 31337,
-            nonce: 0,
-            gas_limit: 21000,
-            max_fee_per_gas: 1_500_000_000,
-            max_priority_fee_per_gas: 1_000_000_000,
-            to: TxKind::Call(destination),
-            value: alloy::primitives::U256::from(300_000_u64),
-            input: Vec::new().into(),
-            access_list: Default::default(),
-        };
-        let mut req = request(&tx.encoded_for_signing());
-        req.system_use_claim = Some(system_claim(destination, 300_000));
-        let reviewed = review_ok(&req);
-        assert_eq!(reviewed.payloads[0].value, "300000");
-
-        req.system_use_claim.as_mut().unwrap().declared_destinations[0].destination =
-            Address::repeat_byte(8).to_string();
-        assert_eq!(
-            review(&req, &policy(), Address::ZERO).unwrap_err().code,
-            ProtocolErrorCode::SelectorMismatch
-        );
-    }
-
-    #[test]
-    fn rejects_a_multi_payload_evm_claim_as_ambiguous() {
-        let tx = TxEip1559 {
-            chain_id: 31337,
-            nonce: 0,
-            gas_limit: 21000,
-            max_fee_per_gas: 1,
-            max_priority_fee_per_gas: 1,
-            to: TxKind::Call(Address::ZERO),
-            value: alloy::primitives::U256::ZERO,
-            input: Vec::new().into(),
-            access_list: Default::default(),
-        };
-        let payload = tx.encoded_for_signing();
-        let mut req = request(&payload);
-        req.evm_review_payloads
-            .push(Base64UrlBytes::from_bytes(&payload));
-        let ApprovalSelector::Exact {
-            ordered_payload_digests,
-            ordered_hashes,
-        } = &mut req.terms.selector
-        else {
-            unreachable!()
-        };
-        ordered_payload_digests.push(ordered_payload_digests[0].clone());
-        ordered_hashes.push(ordered_hashes[0].clone());
-        req.system_use_claim = Some(system_claim(Address::ZERO, 0));
-        let error = review(&req, &policy(), Address::ZERO).unwrap_err();
-        assert_eq!(error.code, ProtocolErrorCode::SelectorMismatch);
-        assert!(error.message.contains("ambiguous"));
+    fn applies_signing_payload_size_limits_by_payload_count() {
+        let kib = 1024;
+        // One payload is a single signing payload: up to 256 KiB.
+        assert!(review(&call_batch(200 * kib, 1), &policy(), Address::ZERO).is_ok());
+        let error = review(&call_batch(256 * kib, 1), &policy(), Address::ZERO).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::LimitExceededFrame);
+        // Several payloads are batch children: 64 KiB each, 512 KiB in total.
+        assert!(review(&call_batch(60 * kib, 2), &policy(), Address::ZERO).is_ok());
+        let error = review(&call_batch(65 * kib, 2), &policy(), Address::ZERO).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::LimitExceededFrame);
+        let error = review(&call_batch(60 * kib, 9), &policy(), Address::ZERO).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::LimitExceededFrame);
     }
 
     #[test]
@@ -829,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_petal_claim_alongside_evm_payloads() {
+    fn refuses_any_claim_alongside_evm_payloads() {
         let tx = TxEip1559 {
             chain_id: 31337,
             nonce: 0,
@@ -855,11 +709,33 @@ mod tests {
             nonce: RequestNonce::from_bytes([11; 16]),
             claim_assurance: ClaimAssurance::MachineAsserted,
         });
-        // Nothing compares a Petal claim to the decoded bytes, so carrying
-        // one must fail rather than render under the verified framing.
         let error = review(&req, &policy(), Address::ZERO).unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::MalformedFrame);
-        assert!(error.message.contains("Petal"), "{error:?}");
+        assert!(error.message.contains("cannot carry a claim"), "{error:?}");
+
+        req.petal_use_claim = None;
+        req.system_use_claim = Some(SystemUseClaim {
+            component_id: Token::new("bloom-machine").unwrap(),
+            action_class: Token::new("transaction.confirm").unwrap(),
+            operation_class: Token::new("transaction.confirm").unwrap(),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: Digest32::from_bytes([10; 32]),
+            ordered_hashes: vec![],
+            declared_debits: vec![],
+            declared_destinations: vec![],
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([11; 16]),
+            chain_context: SystemChainContext {
+                chain_family: Token::new("ethereum").unwrap(),
+                genesis_hash: String::new(),
+                recent_blockhash: String::new(),
+                last_valid_block_height: DecimalU64::new(0),
+            },
+            claim_assurance: ClaimAssurance::MachineAsserted,
+        });
+        let error = review(&req, &policy(), Address::ZERO).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::MalformedFrame);
+        assert!(error.message.contains("cannot carry a claim"), "{error:?}");
     }
 
     #[test]
