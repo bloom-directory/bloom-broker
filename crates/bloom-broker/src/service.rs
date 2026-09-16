@@ -806,6 +806,16 @@ impl BrokerRpcService {
                 .authority
                 .policy_snapshot(&request.terms.wallet_id)
                 .map_err(authority_error)?;
+            // Review against the policy these terms are bound to, so the
+            // creation opt-in is never read from a different version.
+            if snapshot.version != request.terms.policy_version
+                || snapshot.policy_digest != request.terms.policy_digest
+            {
+                return Err(authority_error(AuthorityError::Denied {
+                    code: "POLICY_SNAPSHOT_MISMATCH",
+                    message: "approval is not bound to Broker's verified current policy".into(),
+                }));
+            }
             let policy =
                 serde_json::from_slice(&snapshot.canonical_policy.decode()).map_err(|_| {
                     ProtocolError::new(

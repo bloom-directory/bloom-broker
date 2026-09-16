@@ -2925,6 +2925,54 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         expires_at_ms: DecimalU64::new(approval_expires_at_ms),
         renewal_of: None,
     };
+    // A native EVM review reads the creation opt-in from the policy the terms
+    // are bound to: terms naming another policy are refused before review.
+    let creation = alloy::consensus::TxEip1559 {
+        chain_id: 31337,
+        to: alloy::primitives::TxKind::Create,
+        input: vec![0x60, 0, 0x60, 0, 0xf3].into(),
+        ..Default::default()
+    };
+    let creation =
+        alloy::consensus::SignableTransaction::<alloy::primitives::Signature>::encoded_for_signing(
+            &creation,
+        );
+    let stale_policy_error = MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_review_payloads: vec![Base64UrlBytes::from_bytes(&creation)],
+            operation_id: operation("d9"),
+            terms: SealedApprovalTerms {
+                subject: ApprovalSubject::Cli {
+                    client_id: Token::new("machine").unwrap(),
+                    command_class: Token::new("transaction.confirm").unwrap(),
+                },
+                allowed_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+                selector: ApprovalSelector::Exact {
+                    ordered_payload_digests: vec![Digest32::from_bytes(
+                        sha2::Sha256::digest(&creation).into(),
+                    )],
+                    ordered_hashes: vec![Digest32::from_bytes(
+                        alloy::primitives::keccak256(&creation).0,
+                    )],
+                },
+                policy_version: DecimalU64::new(1),
+                request_nonce: RequestNonce::from_bytes([0xd9; 16]),
+                ..approval_terms.clone()
+            },
+            canonical_plan_facts_digest: digest("d9"),
+            petal_use_claim: None,
+            system_use_claim: None,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        stale_policy_error
+            .message
+            .contains("not bound to Broker's verified current policy"),
+        "{stale_policy_error:?}"
+    );
     let approval_operation = operation("d3");
     let approval_prepared = match MachineBrokerService::dispatch(
         &broker,
