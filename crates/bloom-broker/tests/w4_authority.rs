@@ -3702,10 +3702,16 @@ fn a_normalized_approval_still_binds_every_reviewed_non_message_fact() {
         mutate(&mut claim);
         claim
     };
-    let mutations: Vec<(&str, SystemUseClaim)> = vec![
+    // Each case names the gate that must catch it. Three of them — fee,
+    // genesis and nonce — are facts the signed message does not encode and the
+    // semantic verifier therefore cannot check, so only the approval's claim
+    // commitment stands between them and a changed transfer. That is the whole
+    // reason this second binding exists.
+    let mutations: Vec<(&str, SystemUseClaim, &str)> = vec![
         (
             "amount",
             with(&|claim| claim.declared_debits[0].amount = DecimalU256::parse("999999").unwrap()),
+            "ASSURANCE_VERIFICATION_FAILED",
         ),
         (
             "destination",
@@ -3713,6 +3719,7 @@ fn a_normalized_approval_still_binds_every_reviewed_non_message_fact() {
                 claim.declared_destinations[0].destination =
                     bloom_solana_verify::Pubkey::from_bytes([0x44; 32]).to_string()
             }),
+            "ASSURANCE_VERIFICATION_FAILED",
         ),
         (
             "fee",
@@ -3723,15 +3730,25 @@ fn a_normalized_approval_still_binds_every_reviewed_non_message_fact() {
                     amount: DecimalU256::parse("6000").unwrap(),
                 }
             }),
+            // Not in the message; only the claim commitment can catch it.
+            "SYSTEM_CLAIM_MISMATCH",
         ),
         (
             "genesis",
             with(&|claim| claim.chain_context.genesis_hash = "other-cluster".into()),
+            // Not in the message; only the claim commitment can catch it.
+            "SYSTEM_CLAIM_MISMATCH",
         ),
-        ("nonce", with(&|claim| claim.nonce = nonce(94))),
+        (
+            "nonce",
+            with(&|claim| claim.nonce = nonce(94)),
+            // Not in the message; only the claim commitment can catch it.
+            "SYSTEM_CLAIM_MISMATCH",
+        ),
         (
             "operation class",
             with(&|claim| claim.operation_class = token("solana.token-transfer")),
+            "SYSTEM_CLAIM_MISMATCH",
         ),
         (
             "verifier digest",
@@ -3742,13 +3759,15 @@ fn a_normalized_approval_still_binds_every_reviewed_non_message_fact() {
                     proof_digest: digest(0),
                 }
             }),
+            "ASSURANCE_EVIDENCE_MISMATCH",
         ),
         (
             "assurance level",
             with(&|claim| claim.claim_assurance = ClaimAssurance::MachineAsserted),
+            "ASSURANCE_TOO_WEAK",
         ),
     ];
-    for (label, claim) in mutations {
+    for (label, claim, expected_gate) in mutations {
         match approval_claim_commitment(&terms, None, Some(&claim)) {
             // Either the projection refuses the claim outright, or it produces
             // a different commitment than the approval stored. Both mean the
@@ -3766,9 +3785,17 @@ fn a_normalized_approval_still_binds_every_reviewed_non_message_fact() {
             &refreshed,
             Some([0x01; 32]),
         );
+        let error = harness
+            .authority
+            .authorize(&input)
+            .expect_err(&format!("a changed {label} must be refused"));
+        // Name the gate, not just the failure: a claim that changed an
+        // approved fact must be caught by the approval's claim commitment or
+        // by the semantic verifier, never by some unrelated shape check.
+        let reason = error.to_string();
         assert!(
-            harness.authority.authorize(&input).is_err(),
-            "a changed {label} must be refused"
+            reason.contains(expected_gate),
+            "a changed {label} must be refused by {expected_gate}, got: {reason}"
         );
     }
 }

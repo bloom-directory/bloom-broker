@@ -2239,13 +2239,22 @@ async fn restored_wallet_signs_from_restored_derived_account_over_real_transport
 // Blockhash-normalized native SOL approvals over the real Broker↔Signer
 // transport.
 //
-// A native transfer's recent blockhash dies inside a normal passkey ceremony.
+// What these establish, and what they deliberately do not.
+//
 // Under `solana_native_transfer_blockhash_v1` the approval commits to the
-// message with those 32 bytes zeroed, so the owner may finish late and the
-// Machine may restamp the transfer once. These cases drive that through both
-// production services: a real Signer behind the authenticated unix transport,
-// a real browser ceremony, the compiled semantic verifier, and a real Ed25519
-// signature from the local backend.
+// message with its 32 recent-blockhash bytes zeroed. These cases drive that
+// through both production services — a real Signer behind the authenticated
+// unix transport, a real browser ceremony, the compiled semantic verifier and
+// a real Ed25519 signature from the local backend — and establish that the
+// approval no longer binds those 32 bytes while it still binds every other
+// byte, the reviewed claim, and the one-signature ceiling.
+//
+// They do NOT establish that a slow ceremony succeeds after a real blockhash
+// expiry. Neither service has any notion of blockhash freshness: the bytes are
+// simply restamped here, with no elapsed time and no cluster. Whether an
+// expired blockhash is detected, refreshed and re-quoted, and whether the
+// resulting transaction settles, is Machine behaviour and needs the validator
+// workflow in that slice.
 // ---------------------------------------------------------------------------
 
 /// Installer-signed provenance for the Machine's native transfer confirm.
@@ -2483,13 +2492,15 @@ fn native_provenance_subject() -> ProvenanceSubject {
     }
 }
 
-/// The failure this mode exists to fix, end to end across the custody
-/// boundary: the owner approves a transfer, the staged blockhash dies, the
-/// Machine restamps the same transfer once, and the real Signer still returns
-/// one Ed25519 signature — over the refreshed raw bytes, never over anything
-/// normalized. Then the approval is spent.
+/// A transfer restamped with a different blockhash is signable exactly once
+/// under a normalized approval, across the custody boundary. The signature
+/// comes back over the restamped raw bytes and over nothing else, so nothing
+/// normalized reaches the backend.
+///
+/// The restamp here is a byte substitution, not an expiry: no time passes and
+/// no cluster is consulted. This is the matching property only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refreshed_native_transfer_signs_once_over_the_real_transport() {
+async fn a_restamped_blockhash_signs_once_over_the_real_transport() {
     let directory = tempfile::tempdir().unwrap();
     let authenticator = VirtualAuthenticator::generate();
     let wallet_id = Token::new("normalized-sign").unwrap();
@@ -2519,8 +2530,10 @@ async fn a_refreshed_native_transfer_signs_once_over_the_real_transport() {
     )
     .await;
 
-    // The staged blockhash is now stale. The Machine keeps the entry and the
-    // approval and restamps the transfer.
+    // Restamp the same transfer with different blockhash bytes. On the wire a
+    // Machine would do this because the staged blockhash had expired; here it
+    // is a substitution, because expiry is a cluster fact neither service can
+    // see.
     let refreshed = native_message(payer, TRANSFER_LAMPORTS, [0x5a; 32]);
     assert_ne!(refreshed, staged);
     let refreshed_claim = native_claim(&refreshed, TRANSFER_LAMPORTS, [0x5a; 32]);
@@ -2560,8 +2573,9 @@ async fn a_refreshed_native_transfer_signs_once_over_the_real_transport() {
             .is_err()
     );
 
-    // Single use: a second blockhash under the same approval is a second
-    // operation, and the approval authorized one.
+    // Single use: a third blockhash under the same approval is a second
+    // operation, and the approval authorized one. The reason matters as much
+    // as the refusal — an unrelated failure must not satisfy this.
     let again = native_message(payer, TRANSFER_LAMPORTS, [0x6b; 32]);
     let error = try_sign(
         &mut stack,
@@ -2574,7 +2588,15 @@ async fn a_refreshed_native_transfer_signs_once_over_the_real_transport() {
     )
     .await
     .expect_err("a normalized approval yields at most one signature");
-    assert!(error.has_valid_contract(), "{error}");
+    assert_eq!(
+        error.code,
+        bloom_broker_api::ProtocolErrorCode::LimitExceededOperations,
+        "expected the single-use ceiling, got: {error:?}"
+    );
+    assert!(
+        error.message.contains("operation lifetime limit exceeded"),
+        "{error:?}"
+    );
 }
 
 /// Normalization covers the blockhash and nothing else. A transfer whose
@@ -2624,7 +2646,17 @@ async fn a_changed_native_transfer_is_refused_over_the_real_transport() {
     )
     .await
     .expect_err("a changed amount must not be signable under the approval");
-    assert!(error.has_valid_contract(), "{error}");
+    assert_eq!(
+        error.code,
+        bloom_broker_api::ProtocolErrorCode::SelectorMismatch,
+        "expected the normalized-digest comparison to reject this, got: {error:?}"
+    );
+    assert!(
+        error
+            .message
+            .contains("normalized message digest differs from the approved transfer"),
+        "{error:?}"
+    );
 
     // The approval survives the refusal: the honest refreshed transfer still
     // signs, so the rejection consumed no authority.
@@ -2770,6 +2802,17 @@ async fn allow_transfer_destination(
     }
 }
 
+/// One rejected prepare, with the refusal it must produce. A test that accepts
+/// any well-formed error can be satisfied by an unrelated failure, which is
+/// exactly how a gate silently stops gating.
+struct MarkedPrepareRefusal {
+    label: &'static str,
+    petal_use_claim: Option<bloom_broker_api::PetalUseClaim>,
+    system_use_claim: Option<bloom_broker_api::SystemUseClaim>,
+    expected_code: bloom_broker_api::ProtocolErrorCode,
+    expected_reason: &'static str,
+}
+
 /// A blockhash-normalized approval leaves 32 message bytes uncommitted, and
 /// the Signer never sees the claim that pins the facts the message does not
 /// encode — the fee quote, the genesis hash, the declared destination, the
@@ -2817,23 +2860,60 @@ async fn an_unsupportable_marked_prepare_creates_no_ceremony() {
         proof_digest: honest.payload_digest.clone(),
     };
 
-    let refusals: Vec<(
-        &str,
-        Option<bloom_broker_api::PetalUseClaim>,
-        Option<bloom_broker_api::SystemUseClaim>,
-    )> = vec![
-        ("no claim at all", None, None),
-        ("a Petal claim", Some(petal_claim), None),
-        ("machine-asserted assurance", None, Some(machine_asserted)),
-        ("another operation class", None, Some(other_class)),
-        ("an impostor verifier digest", None, Some(impostor_verifier)),
+    let refusals = vec![
+        MarkedPrepareRefusal {
+            label: "no claim at all",
+            petal_use_claim: None,
+            system_use_claim: None,
+            expected_code: bloom_broker_api::ProtocolErrorCode::ClaimInvalid,
+            expected_reason: "requires its reviewed native-transfer claim",
+        },
+        MarkedPrepareRefusal {
+            label: "a Petal claim",
+            petal_use_claim: Some(petal_claim),
+            system_use_claim: None,
+            expected_code: bloom_broker_api::ProtocolErrorCode::SelectorMismatch,
+            expected_reason: "native system operation, not a Petal one",
+        },
+        MarkedPrepareRefusal {
+            label: "machine-asserted assurance",
+            petal_use_claim: None,
+            system_use_claim: Some(machine_asserted),
+            expected_code: bloom_broker_api::ProtocolErrorCode::ClaimInvalid,
+            expected_reason: "requires proof-verified assurance",
+        },
+        MarkedPrepareRefusal {
+            label: "another operation class",
+            petal_use_claim: None,
+            system_use_claim: Some(other_class),
+            expected_code: bloom_broker_api::ProtocolErrorCode::ClaimInvalid,
+            expected_reason: "only the native-transfer operation class",
+        },
+        MarkedPrepareRefusal {
+            label: "an impostor verifier digest",
+            petal_use_claim: None,
+            system_use_claim: Some(impostor_verifier),
+            expected_code: bloom_broker_api::ProtocolErrorCode::ClaimInvalid,
+            expected_reason: "requires the pinned native-transfer verifier",
+        },
     ];
-    for (label, petal_use_claim, system_use_claim) in refusals {
+    for refusal in refusals {
+        let MarkedPrepareRefusal {
+            label,
+            petal_use_claim,
+            system_use_claim,
+            expected_code,
+            expected_reason,
+        } = refusal;
         let (operation_id, outcome) =
             try_prepare_approval_with_claims(&mut stack, &terms, petal_use_claim, system_use_claim)
                 .await;
         let error = outcome.expect_err(&format!("prepare must refuse {label}"));
-        assert!(error.has_valid_contract(), "{label}: {error}");
+        assert_eq!(error.code, expected_code, "{label}: {error:?}");
+        assert!(
+            error.message.contains(expected_reason),
+            "{label} was refused for the wrong reason: {error:?}"
+        );
         assert!(
             stack
                 .broker
