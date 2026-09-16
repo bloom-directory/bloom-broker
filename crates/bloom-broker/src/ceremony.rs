@@ -3012,6 +3012,38 @@ pub(crate) fn account_terms_review(
     })
 }
 
+/// Native asset metadata shared by every display path: (chain, asset) gives
+/// (decimals, symbol). This is the single source for which chains have known
+/// units — the EVM review display and the claim amount display both read it,
+/// so adding a chain in one place cannot silently leave the other raw.
+pub(crate) fn native_asset_metadata(chain: &str, asset: &str) -> Option<(u8, &'static str)> {
+    match (chain, asset) {
+        ("hyperliquid", "usdc") => Some((6, "USDC")),
+        ("solana", "native") | ("solana-mainnet", "native") => Some((9, "SOL")),
+        ("ethereum", "native")
+        | ("optimism", "native")
+        | ("base", "native")
+        | ("arbitrum", "native")
+        | ("anvil", "native") => Some((18, "ETH")),
+        ("polygon", "native") => Some((18, "POL")),
+        _ => None,
+    }
+}
+
+/// Format base units with an explicit decimal count (`300000` at 18 decimals
+/// renders `0.0000000000000003`). Shared by the EVM review and claim amount
+/// displays so the same value can never render two ways.
+pub(crate) fn format_base_units(base_units: &str, decimals: usize) -> String {
+    let padded = format!("{:0>width$}", base_units, width = decimals + 1);
+    let split = padded.len() - decimals;
+    let fractional = padded[split..].trim_end_matches('0');
+    if fractional.is_empty() {
+        padded[..split].to_owned()
+    } else {
+        format!("{}.{}", &padded[..split], fractional)
+    }
+}
+
 fn canonical_review_plan(
     request: &CeremonyPrepareRequest,
     security_disclosures: &[String],
@@ -3111,18 +3143,7 @@ fn canonical_review_plan(
         asset: &str,
         base_units: &str,
     ) -> AssetAmountReview {
-        let metadata = match (chain, asset) {
-            ("hyperliquid", "usdc") => Some((6, "USDC")),
-            ("solana", "native") | ("solana-mainnet", "native") => Some((9, "SOL")),
-            ("ethereum", "native")
-            | ("optimism", "native")
-            | ("base", "native")
-            | ("arbitrum", "native")
-            | ("anvil", "native") => Some((18, "ETH")),
-            ("polygon", "native") => Some((18, "POL")),
-            _ => None,
-        };
-        let (display, decimals) = metadata.map_or_else(
+        let (display, decimals) = native_asset_metadata(chain, asset).map_or_else(
             || {
                 (
                     format!(
@@ -3133,7 +3154,10 @@ fn canonical_review_plan(
             },
             |(decimals, symbol)| {
                 (
-                    format!("{} {symbol}", format_base_units(base_units, decimals)),
+                    format!(
+                        "{} {symbol}",
+                        format_base_units(base_units, usize::from(decimals))
+                    ),
                     Some(decimals),
                 )
             },
@@ -3145,21 +3169,6 @@ fn canonical_review_plan(
             display,
             base_units: base_units.to_owned(),
             decimals,
-        }
-    }
-
-    fn format_base_units(base_units: &str, decimals: u8) -> String {
-        if decimals == 0 {
-            return base_units.to_owned();
-        }
-        let decimals = usize::from(decimals);
-        let padded = format!("{:0>width$}", base_units, width = decimals + 1);
-        let split = padded.len() - decimals;
-        let fractional = padded[split..].trim_end_matches('0');
-        if fractional.is_empty() {
-            padded[..split].to_owned()
-        } else {
-            format!("{}.{}", &padded[..split], fractional)
         }
     }
 

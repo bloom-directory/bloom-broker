@@ -6,8 +6,8 @@ use alloy::{
     rlp::Decodable,
 };
 use bloom_broker_api::{
-    ApprovalPrepareRequest, ApprovalSelector, CanonicalWalletPolicy, CryptoSuite, Digest32,
-    ProtocolError, ProtocolErrorCode, SystemUseClaim,
+    ApprovalPrepareRequest, ApprovalSelector, ApprovalSubject, CanonicalWalletPolicy, CryptoSuite,
+    Digest32, ProtocolError, ProtocolErrorCode, SystemUseClaim,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -60,6 +60,33 @@ fn invalid(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::SelectorMismatch, message)
 }
 
+fn malformed(message: impl Into<String>) -> ProtocolError {
+    ProtocolError::new(ProtocolErrorCode::MalformedFrame, message)
+}
+
+/// Whether this approval subject is a native exact EVM transaction class
+/// whose owner review is the Broker-decoded signing preimage.
+///
+/// This list is mirrored as `native_evm_review` in Bloom's machine client:
+/// drift means Machine sends payloads Broker will not require, or vice
+/// versa. Keep the two in step; the coupling is a shared constant, not a
+/// shared crate, because nothing else crosses the service boundary here.
+pub(crate) fn subject_is_native_evm_transaction(subject: &ApprovalSubject) -> bool {
+    match subject {
+        ApprovalSubject::Cli { command_class, .. } => matches!(
+            command_class.as_str(),
+            "transaction.confirm" | "transaction.replace" | "transaction.cancel"
+        ),
+        ApprovalSubject::System {
+            operation_class, ..
+        } => matches!(
+            operation_class.as_str(),
+            "transaction.confirm" | "transaction.replace" | "transaction.cancel"
+        ),
+        _ => false,
+    }
+}
+
 pub(crate) fn review(
     request: &ApprovalPrepareRequest,
     policy: &CanonicalWalletPolicy,
@@ -76,8 +103,18 @@ pub(crate) fn review(
         // (compare_claim below). A Petal claim would otherwise render under
         // the verified framing with nothing comparing it to the transaction,
         // so refuse it at the boundary instead of displaying it as verified.
-        return Err(invalid(
+        // Malformed, like the adjacent both-claims rejection: the request
+        // shape itself is invalid, not the payloads.
+        return Err(malformed(
             "EVM review payloads cannot carry a Petal claim; use a system claim",
+        ));
+    }
+    if !subject_is_native_evm_transaction(&request.terms.subject) {
+        // The service gate refuses native subjects without payloads; this is
+        // the mirror: payloads on any other subject (Petal, VFS, ...) would
+        // render EVM facts while hiding the subject class they ride on.
+        return Err(malformed(
+            "EVM review payloads require a native transaction subject",
         ));
     }
     if request.system_use_claim.is_some() && request.evm_review_payloads.len() != 1 {
@@ -128,6 +165,15 @@ pub(crate) fn review(
                 }
                 render_eip1559(&tx, &bytes, policy, from, request.system_use_claim.as_ref())?
             } else {
+                // Typed envelopes other than EIP-1559 (EIP-2930, EIP-4844,
+                // EIP-7702, ...) are not legacy preimages: name them instead
+                // of failing with a misleading decode error.
+                if matches!(bytes.first(), Some(0x01) | Some(0x03) | Some(0x04)) {
+                    return Err(invalid(format!(
+                        "unsupported EVM transaction type {:#04x}; only legacy and EIP-1559 preimages review",
+                        bytes[0],
+                    )));
+                }
                 let mut input = bytes.as_slice();
                 let tx = TxLegacy::decode(&mut input)
                     .map_err(|_| invalid("invalid legacy signing preimage"))?;
@@ -245,28 +291,22 @@ pub(crate) fn chain_name(chain_id: u64) -> String {
 }
 
 fn native_value_display(value: &str, chain: &str) -> String {
-    match chain {
-        "ethereum" | "optimism" | "base" | "arbitrum" | "anvil" => {
-            format!("{} ETH", format_base_units(value, 18))
-        }
-        "polygon" => format!("{} POL", format_base_units(value, 18)),
-        _ => format!("{value} raw native units on {chain} (token decimals unknown)"),
+    // Decimals and symbols come from the shared asset table so the EVM
+    // review can never disagree with the claim amount display.
+    match crate::ceremony::native_asset_metadata(chain, "native") {
+        Some((decimals, symbol)) => format!(
+            "{} {symbol}",
+            crate::ceremony::format_base_units(value, usize::from(decimals))
+        ),
+        None => format!("{value} raw native units on {chain} (token decimals unknown)"),
     }
 }
 
 fn format_gwei(value: u128) -> String {
-    format!("{} Gwei", format_base_units(&value.to_string(), 9))
-}
-
-fn format_base_units(base_units: &str, decimals: usize) -> String {
-    let padded = format!("{:0>width$}", base_units, width = decimals + 1);
-    let split = padded.len() - decimals;
-    let fractional = padded[split..].trim_end_matches('0');
-    if fractional.is_empty() {
-        padded[..split].to_owned()
-    } else {
-        format!("{}.{}", &padded[..split], fractional)
-    }
+    format!(
+        "{} Gwei",
+        crate::ceremony::format_base_units(&value.to_string(), 9)
+    )
 }
 
 fn compare_claim(
@@ -294,18 +334,32 @@ fn compare_claim(
         .destination
         .parse::<Address>()
         .map_err(|_| invalid("EVM system claim destination is not an address"))?;
-    if destination.chain.as_str() != chain
-        || debit.asset.chain.as_str() != chain
-        || debit.asset.asset != "native"
-        || claimed_destination != decoded_destination
-        || debit.amount.as_str() != value.to_string()
-    {
-        // The decoded chain here is the canonical alias (anvil, base, ...),
-        // not the numeric creation scope (evm-31337): a mismatch usually
-        // means Machine supplied one where the other belongs.
+    // One error per field so a mismatch tells Machine which fact diverged.
+    // The decoded chain here is the canonical alias (anvil, base, ...), not
+    // the numeric creation scope (evm-31337): a mismatch usually means
+    // Machine supplied one where the other belongs.
+    if destination.chain.as_str() != chain {
         return Err(invalid(format!(
-            "EVM system claim does not match the decoded destination, native value, or chain (decoded chain alias: {chain})",
+            "EVM system claim destination chain does not match the decoded chain alias: {chain}",
         )));
+    }
+    if debit.asset.chain.as_str() != chain {
+        return Err(invalid(format!(
+            "EVM system claim debit chain does not match the decoded chain alias: {chain}",
+        )));
+    }
+    if debit.asset.asset != "native" {
+        return Err(invalid("EVM system claim debit must be the native asset"));
+    }
+    if claimed_destination != decoded_destination {
+        return Err(invalid(
+            "EVM system claim destination does not match the decoded recipient",
+        ));
+    }
+    if debit.amount.as_str() != value.to_string() {
+        return Err(invalid(
+            "EVM system claim amount does not match the decoded native value",
+        ));
     }
     Ok(())
 }
@@ -767,6 +821,10 @@ mod tests {
                 ProtocolErrorCode::SelectorMismatch,
                 "{envelope:#x}"
             );
+            assert!(
+                error.message.contains("unsupported EVM transaction type"),
+                "{envelope:#x}: {error:?}"
+            );
         }
     }
 
@@ -800,8 +858,47 @@ mod tests {
         // Nothing compares a Petal claim to the decoded bytes, so carrying
         // one must fail rather than render under the verified framing.
         let error = review(&req, &policy(), Address::ZERO).unwrap_err();
-        assert_eq!(error.code, ProtocolErrorCode::SelectorMismatch);
+        assert_eq!(error.code, ProtocolErrorCode::MalformedFrame);
         assert!(error.message.contains("Petal"), "{error:?}");
+    }
+
+    #[test]
+    fn payloads_on_a_non_native_subject_are_refused() {
+        let tx = TxEip1559 {
+            chain_id: 31337,
+            nonce: 0,
+            gas_limit: 21000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::ZERO),
+            value: alloy::primitives::U256::ZERO,
+            input: Vec::new().into(),
+            access_list: Default::default(),
+        };
+        let bytes = tx.encoded_for_signing();
+        // Payloads on a Petal subject would render EVM facts while hiding
+        // the subject class they ride on; the same holds for any non-native
+        // command class.
+        for subject in [
+            ApprovalSubject::Petal {
+                package_hash: Digest32::from_bytes([12; 32]),
+                route: "orders/place".into(),
+                agent_id: None,
+            },
+            ApprovalSubject::Cli {
+                client_id: Token::new("machine").unwrap(),
+                command_class: Token::new("vfs.test").unwrap(),
+            },
+        ] {
+            let mut req = request(&bytes);
+            req.terms.subject = subject;
+            let error = review(&req, &policy(), Address::ZERO).unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::MalformedFrame);
+            assert!(
+                error.message.contains("native transaction subject"),
+                "{error:?}"
+            );
+        }
     }
 
     #[test]

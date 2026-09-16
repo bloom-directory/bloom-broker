@@ -108,43 +108,22 @@ fn seed_profile_from_key_projection(
     }
 }
 
-/// Whether this approval subject is a native exact EVM transaction class
-/// whose owner review is the Broker-decoded signing preimage.
-///
-/// This list is mirrored as `native_evm_review` in Bloom's machine client:
-/// drift means Machine sends payloads Broker will not require, or vice
-/// versa. Keep the two in step; the coupling is a shared constant, not a
-/// shared crate, because nothing else crosses the service boundary here.
-fn native_evm_transaction_class(subject: &bloom_broker_api::ApprovalSubject) -> bool {
-    use bloom_broker_api::ApprovalSubject;
-    match subject {
-        ApprovalSubject::Cli { command_class, .. } => matches!(
-            command_class.as_str(),
-            "transaction.confirm" | "transaction.replace" | "transaction.cancel"
-        ),
-        ApprovalSubject::System {
-            operation_class, ..
-        } => matches!(
-            operation_class.as_str(),
-            "transaction.confirm" | "transaction.replace" | "transaction.cancel"
-        ),
-        _ => false,
-    }
-}
+// The native-transaction subject list lives with the EVM review code that
+// enforces it (crate::evm_review::subject_is_native_evm_transaction): one
+// definition for the prepare gate, the renewal refusal, and the review
+// itself, so the three can never disagree.
 
 fn evm_address_from_public_key(bytes: &[u8]) -> Result<alloy::primitives::Address, ProtocolError> {
-    use k256::{elliptic_curve::sec1::ToEncodedPoint as _, pkcs8::DecodePublicKey as _};
-
-    let public = k256::PublicKey::from_public_key_der(bytes).map_err(|_| {
-        ProtocolError::new(
-            ProtocolErrorCode::SelectorMismatch,
-            "invalid EVM public key",
-        )
-    })?;
-    let encoded = public.to_encoded_point(false);
-    Ok(alloy::primitives::Address::from_raw_public_key(
-        &encoded.as_bytes()[1..],
-    ))
+    // Strict canonical SPKI via the shared parser: it rejects compressed
+    // points and non-canonical DER that a general-purpose parser tolerates.
+    let point =
+        crate::translation::wallet_account::secp256k1_uncompressed_point(bytes).map_err(|_| {
+            ProtocolError::new(
+                ProtocolErrorCode::SelectorMismatch,
+                "invalid EVM public key",
+            )
+        })?;
+    Ok(alloy::primitives::Address::from_raw_public_key(&point[1..]))
 }
 
 /// Renewals pass no review payloads, and a real Broker never re-reviews on
@@ -154,7 +133,7 @@ fn evm_address_from_public_key(bytes: &[u8]) -> Result<alloy::primitives::Addres
 fn renewal_of_native_transaction_is_refused(
     terms: &bloom_broker_api::SealedApprovalTerms,
 ) -> Option<ProtocolError> {
-    if native_evm_transaction_class(&terms.subject) {
+    if crate::evm_review::subject_is_native_evm_transaction(&terms.subject) {
         return Some(ProtocolError::new(
             ProtocolErrorCode::SelectorMismatch,
             "native transaction approvals are single-use and cannot be renewed",
@@ -798,7 +777,8 @@ impl BrokerRpcService {
         }
         self.reconcile_wallet(&request.terms.wallet_id).await?;
         let mut context = ReviewManifestContext::default();
-        let native_evm = native_evm_transaction_class(&request.terms.subject);
+        let native_evm =
+            crate::evm_review::subject_is_native_evm_transaction(&request.terms.subject);
         if native_evm && request.evm_review_payloads.is_empty() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::SelectorMismatch,
