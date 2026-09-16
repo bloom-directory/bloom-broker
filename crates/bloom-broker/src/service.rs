@@ -127,6 +127,21 @@ fn native_evm_transaction_class(subject: &bloom_broker_api::ApprovalSubject) -> 
     }
 }
 
+fn evm_address_from_public_key(bytes: &[u8]) -> Result<alloy::primitives::Address, ProtocolError> {
+    use k256::{elliptic_curve::sec1::ToEncodedPoint as _, pkcs8::DecodePublicKey as _};
+
+    let public = k256::PublicKey::from_public_key_der(bytes).map_err(|_| {
+        ProtocolError::new(
+            ProtocolErrorCode::SelectorMismatch,
+            "invalid EVM public key",
+        )
+    })?;
+    let encoded = public.to_encoded_point(false);
+    Ok(alloy::primitives::Address::from_raw_public_key(
+        &encoded.as_bytes()[1..],
+    ))
+}
+
 /// Renewals pass no review payloads, and a real Broker never re-reviews on
 /// renewal. A native transaction approval's owner review *is* the decoded
 /// preimage, so it has no valid renewal shape: refuse it by name instead of
@@ -786,7 +801,6 @@ impl BrokerRpcService {
             ));
         }
         if !request.evm_review_payloads.is_empty() {
-            use k256::elliptic_curve::sec1::ToEncodedPoint as _;
             let response = self
                 .signer
                 .request_for_machine(BrokerSignerRequest::KeyGetPublic(
@@ -802,15 +816,7 @@ impl BrokerRpcService {
             if key.key_ref != request.terms.key_ref {
                 return Err(response_mismatch("EVM review key identity"));
             }
-            let public = k256::PublicKey::from_sec1_bytes(&key.canonical_public_key.decode())
-                .map_err(|_| {
-                    ProtocolError::new(
-                        ProtocolErrorCode::SelectorMismatch,
-                        "invalid EVM public key",
-                    )
-                })?;
-            let encoded = public.to_encoded_point(false);
-            let from = alloy::primitives::Address::from_raw_public_key(&encoded.as_bytes()[1..]);
+            let from = evm_address_from_public_key(&key.canonical_public_key.decode())?;
             let snapshot = self
                 .authority
                 .policy_snapshot(&request.terms.wallet_id)
@@ -2445,6 +2451,25 @@ fn malformed(error: impl std::fmt::Display) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evm_review_accepts_the_signers_spki_public_key() {
+        use k256::{elliptic_curve::sec1::ToEncodedPoint as _, pkcs8::EncodePublicKey as _};
+
+        let signing_key = k256::ecdsa::SigningKey::from_bytes((&[7_u8; 32]).into()).unwrap();
+        let public = signing_key.verifying_key().as_affine();
+        let der = k256::PublicKey::from_affine(*public)
+            .unwrap()
+            .to_public_key_der()
+            .unwrap();
+        let encoded = public.to_encoded_point(false);
+        let expected = alloy::primitives::Address::from_raw_public_key(&encoded.as_bytes()[1..]);
+
+        assert_eq!(
+            evm_address_from_public_key(der.as_bytes()).unwrap(),
+            expected
+        );
+    }
 
     #[test]
     fn a_native_transaction_renewal_is_refused_by_name_and_other_subjects_are_not() {
