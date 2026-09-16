@@ -43,14 +43,28 @@ fn assurance_to_signer(value: north::ClaimAssuranceLevel) -> south::ClaimAssuran
     }
 }
 
+fn normalization_to_signer(
+    value: north::ExactMessageNormalization,
+) -> south::ExactMessageNormalization {
+    match value {
+        north::ExactMessageNormalization::SolanaNativeTransferBlockhashV1 => {
+            south::ExactMessageNormalization::SolanaNativeTransferBlockhashV1
+        }
+    }
+}
+
 fn selector_to_signer(value: north::ApprovalSelector) -> south::ApprovalSelector {
     match value {
         north::ApprovalSelector::Exact {
             ordered_payload_digests,
             ordered_hashes,
+            message_normalization,
         } => south::ApprovalSelector::Exact {
             ordered_payload_digests,
             ordered_hashes,
+            // Exhaustive both ways: the Signer must enforce the same matching
+            // mode the owner approved, so this may never silently drop.
+            message_normalization: message_normalization.map(normalization_to_signer),
         },
         north::ApprovalSelector::Petal {
             package_hash,
@@ -167,6 +181,42 @@ mod tests {
         north::Digest32::from_bytes([byte; 32])
     }
 
+    /// The Signer enforces the matching mode, so the mode has to survive
+    /// translation. Dropping it here would silently downgrade a normalized
+    /// approval to raw Exact, which the Signer would then refuse to match
+    /// against any refreshed message.
+    #[test]
+    fn the_message_normalization_mode_survives_translation() {
+        let marked = north::ApprovalSelector::Exact {
+            ordered_payload_digests: vec![digest(8)],
+            ordered_hashes: vec![digest(8)],
+            message_normalization: Some(
+                north::ExactMessageNormalization::SolanaNativeTransferBlockhashV1,
+            ),
+        };
+        assert!(matches!(
+            selector_to_signer(marked),
+            south::ApprovalSelector::Exact {
+                message_normalization: Some(
+                    south::ExactMessageNormalization::SolanaNativeTransferBlockhashV1
+                ),
+                ..
+            }
+        ));
+        let unmarked = north::ApprovalSelector::Exact {
+            ordered_payload_digests: vec![digest(8)],
+            ordered_hashes: vec![digest(9)],
+            message_normalization: None,
+        };
+        assert!(matches!(
+            selector_to_signer(unmarked),
+            south::ApprovalSelector::Exact {
+                message_normalization: None,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn approval_security_fields_are_preserved() {
         let terms = north::SealedApprovalTerms {
@@ -187,6 +237,7 @@ mod tests {
             selector: north::ApprovalSelector::Exact {
                 ordered_payload_digests: vec![digest(8)],
                 ordered_hashes: vec![digest(9)],
+                message_normalization: None,
             },
             limits: north::ApprovalLimits {
                 max_operations: north::DecimalU64::new(1),
@@ -241,7 +292,7 @@ mod tests {
             [south::CryptoSuite::Secp256k1Keccak256Recoverable]
         );
         assert!(
-            matches!(mapped.selector, south::ApprovalSelector::Exact { ref ordered_payload_digests, ref ordered_hashes } if ordered_payload_digests == &[digest(8)] && ordered_hashes == &[digest(9)])
+            matches!(mapped.selector, south::ApprovalSelector::Exact { ref ordered_payload_digests, ref ordered_hashes, .. } if ordered_payload_digests == &[digest(8)] && ordered_hashes == &[digest(9)])
         );
         assert_eq!(mapped.limits.max_operations.get(), 1);
         assert_eq!(mapped.limits.max_signatures.get(), 1);
@@ -305,6 +356,7 @@ mod tests {
                 selector: north::ApprovalSelector::Exact {
                     ordered_payload_digests: vec![digest(2)],
                     ordered_hashes: vec![digest(3)],
+                    message_normalization: None,
                 },
                 limits: north::ApprovalLimits {
                     max_operations: north::DecimalU64::new(1),

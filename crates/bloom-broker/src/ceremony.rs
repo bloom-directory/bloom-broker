@@ -3188,6 +3188,23 @@ fn review_disclosures(
             "The displayed limits are asserted by {source}. Bloom does not verify them against the payload, and a compromised Petal or Machine can consume the full remaining capacity."
         ));
     }
+    // A normalized approval leaves the recent blockhash uncommitted, so the
+    // owner is told so in the plan their passkey signs. The canonical review
+    // plan already carries the terms, and therefore the marker itself.
+    if matches!(
+        request.terms.selector,
+        bloom_signer_api::ApprovalSelector::Exact {
+            message_normalization: Some(
+                bloom_signer_api::ExactMessageNormalization::SolanaNativeTransferBlockhashV1
+            ),
+            ..
+        }
+    ) {
+        disclosures.push(
+            "Approve one SOL transfer. Its recent blockhash may be refreshed before signing; the amount, recipient, account and approved fee remain fixed."
+                .to_owned(),
+        );
+    }
     disclosures
 }
 
@@ -3602,4 +3619,105 @@ fn custody_review_manifest(
         manifest["key_ref"] = serde_json::to_value(key_ref).map_err(malformed)?;
     }
     Ok(Some(manifest))
+}
+
+#[cfg(test)]
+mod normalized_review_tests {
+    use super::*;
+
+    fn digest(byte: u8) -> Digest32 {
+        Digest32::from_bytes([byte; 32])
+    }
+
+    fn native_transfer_request(
+        message_normalization: Option<bloom_signer_api::ExactMessageNormalization>,
+    ) -> CeremonyPrepareRequest {
+        let committed = digest(0x12);
+        let terms = bloom_signer_api::SealedApprovalTerms {
+            subject: bloom_signer_api::ApprovalSubject::System {
+                component_id: Token::new("bloom-machine").unwrap(),
+                operation_class: Token::new("solana.transfer.confirm").unwrap(),
+            },
+            wallet_id: Token::new("wallet-review").unwrap(),
+            key_ref: bloom_signer_api::KeyRef {
+                backend: Token::new("local").unwrap(),
+                backend_instance: Token::new("local-default").unwrap(),
+                key_spec: bloom_signer_api::KeySpec::Ed25519,
+                locator: "wallet/derived/solana-0".into(),
+                derivation: None,
+                public_key_fingerprint: digest(0x11),
+            },
+            allowed_crypto_suites: vec![bloom_signer_api::CryptoSuite::Ed25519Message],
+            selector: bloom_signer_api::ApprovalSelector::Exact {
+                ordered_payload_digests: vec![committed.clone()],
+                ordered_hashes: vec![committed.clone()],
+                message_normalization,
+            },
+            limits: bloom_signer_api::ApprovalLimits {
+                max_operations: DecimalU64::new(1),
+                max_signatures: DecimalU64::new(1),
+                operation_rate_limits: vec![],
+                signature_rate_limits: vec![],
+                value_limits: vec![bloom_signer_api::ValueLimit {
+                    asset: bloom_signer_api::AssetId {
+                        chain: Token::new("solana").unwrap(),
+                        asset: "native".into(),
+                    },
+                    lifetime: bloom_broker_api::DecimalU256::parse("1005000").unwrap(),
+                    rolling_windows: vec![],
+                }],
+            },
+            activation_mode: bloom_signer_api::ActivationMode::BootBound,
+            wallet_revocation_epoch: DecimalU64::new(1),
+            policy_version: DecimalU64::new(1),
+            policy_digest: digest(0x14),
+            provenance_digest: digest(0x15),
+            request_nonce: bloom_broker_api::RequestNonce::new("16".repeat(16)).unwrap(),
+            issued_at_ms: DecimalU64::new(1_000),
+            not_before_ms: DecimalU64::new(1_000),
+            expires_at_ms: DecimalU64::new(301_000),
+            renewal_of: None,
+        };
+        CeremonyPrepareRequest {
+            activation_operation_id: OperationId::from_bytes([0x17; 32]),
+            terms,
+            review_manifest_digest: digest(0x00),
+            exact_ordered_payload_digests: vec![committed.clone()],
+            exact_ordered_hashes: vec![committed],
+            replacement_approval_id: None,
+        }
+    }
+
+    /// The owner's passkey signs the canonical review plan, so the fact that
+    /// the blockhash may be refreshed has to be stated there, alongside the
+    /// facts that may not change.
+    #[test]
+    fn a_normalized_transfer_discloses_its_refreshable_blockhash() {
+        let marked = native_transfer_request(Some(
+            bloom_signer_api::ExactMessageNormalization::SolanaNativeTransferBlockhashV1,
+        ));
+        let disclosures = review_disclosures(&marked, None, None, None);
+        let refresh = disclosures
+            .iter()
+            .find(|line| line.contains("recent blockhash"))
+            .expect("a normalized approval must disclose its refreshable blockhash");
+        assert!(refresh.contains("Approve one SOL transfer"));
+        assert!(refresh.contains("amount, recipient, account and approved fee remain fixed"));
+
+        let plan = canonical_review_plan(&marked, &disclosures, None, None).unwrap();
+        assert!(plan.contains("recent blockhash may be refreshed"));
+        // The plan carries the terms, so it already binds the marker itself;
+        // no second manifest field restates it.
+        assert!(plan.contains("solana_native_transfer_blockhash_v1"));
+
+        // Ordinary Exact terms say nothing new, and their plan is unchanged.
+        let unmarked = native_transfer_request(None);
+        let plain = review_disclosures(&unmarked, None, None, None);
+        assert!(plain.iter().all(|line| !line.contains("recent blockhash")));
+        assert!(
+            !canonical_review_plan(&unmarked, &plain, None, None)
+                .unwrap()
+                .contains("message_normalization")
+        );
+    }
 }

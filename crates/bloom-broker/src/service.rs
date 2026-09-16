@@ -24,7 +24,7 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     authority::{
         AuthorityError, AuthorizationInput, BrokerAuthority, EpochReconciliation,
-        PolicyInstallCorrelation,
+        PolicyInstallCorrelation, approval_claim_commitment,
     },
     ceremony::{
         CeremonyBroker, CeremonyCompletionObserver, PolicyUpdateReviewManifest,
@@ -746,6 +746,7 @@ impl BrokerRpcService {
             ApprovalSelector::Exact {
                 ordered_payload_digests,
                 ordered_hashes,
+                ..
             } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
             ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
         };
@@ -767,16 +768,15 @@ impl BrokerRpcService {
                     .as_ref()
                     .map(|claim| claim.claim_assurance.clone())
             });
-        let approved_claim_digest = request
-            .petal_use_claim
-            .as_ref()
-            .map(jcs_digest)
-            .transpose()?
-            .or(request
-                .system_use_claim
-                .as_ref()
-                .map(jcs_digest)
-                .transpose()?);
+        // Also the point at which a blockhash-normalized approval's native
+        // claim requirements are enforced, before any ceremony exists to
+        // cancel. For ordinary terms this is the raw claim digest as before.
+        let approved_claim_digest = approval_claim_commitment(
+            &request.terms,
+            request.petal_use_claim.as_ref(),
+            request.system_use_claim.as_ref(),
+        )
+        .map_err(authority_error)?;
         let response = self.ceremony.prepare_approval(
             ceremony_request,
             ReviewManifestContext {

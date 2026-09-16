@@ -4,7 +4,7 @@ use bloom_broker::{
         AssuranceRegistry, AssuranceVerifier, AuthorizationInput, BrokerAuthority,
         CanonicalWalletPolicy, CeremonyApprovalGrant, EpochReconciliation, PolicyAsset,
         PolicyDestination, ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject,
-        VerifierCapability, canonical_policy_authority_diff,
+        VerifierCapability, approval_claim_commitment, canonical_policy_authority_diff,
     },
     journal::{AuditSigner, BrokerJournal},
 };
@@ -13,11 +13,12 @@ use bloom_broker_api::{
     ApprovalTombstone, AssetId, Base64UrlBytes, BootEpoch, CeremonyKind, CeremonyState,
     ClaimAssurance, ClaimAssuranceLevel, CryptoSuite, CustodyResult, DecimalU64, DecimalU256,
     DeclaredDebit, DeclaredDestination, DeclaredFee, DerivationProfile, DerivedAccountRequest,
-    Digest32, KeyRef, KeySpec, MachineSignRequest, OperationId, PROVENANCE_CATALOG_SCHEMA,
-    PetalKeyScope, PetalLineageMembership, PetalRouteGrant, PetalUseClaim, PolicyUpdateRequest,
-    ProvenanceCatalog, RequestNonce, RevocationState, SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES,
-    SOLANA_SYSTEM_TRANSFER_VERIFIER_ID, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
-    SystemChainContext, SystemUseClaim, Token, ValueLimit,
+    Digest32, ExactMessageNormalization, KeyRef, KeySpec, MachineSignRequest, OperationId,
+    PROVENANCE_CATALOG_SCHEMA, PetalKeyScope, PetalLineageMembership, PetalRouteGrant,
+    PetalUseClaim, PolicyUpdateRequest, ProvenanceCatalog, RequestNonce, RevocationState,
+    SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES, SOLANA_SYSTEM_TRANSFER_VERIFIER_ID,
+    SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads, SystemChainContext, SystemUseClaim,
+    Token, ValueLimit, solana_native_transfer_approval_digest,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
@@ -1056,6 +1057,7 @@ fn petal_scoped_key_is_frozen_to_installer_provenance_and_petal_approvals() {
     late_exact.selector = ApprovalSelector::Exact {
         ordered_payload_digests: vec![recovery_hash.clone()],
         ordered_hashes: vec![recovery_hash],
+        message_normalization: None,
     };
     late_exact.limits.max_operations = DecimalU64::new(1);
     late_exact.limits.max_signatures = DecimalU64::new(1);
@@ -1197,6 +1199,7 @@ fn ac08_exact_selector_rejects_payload_hash_order_count_key_and_suite_changes() 
     batch_terms.selector = ApprovalSelector::Exact {
         ordered_payload_digests: vec![first.clone(), second.clone()],
         ordered_hashes: vec![first, second],
+        message_normalization: None,
     };
     batch_terms.limits.max_signatures = DecimalU64::new(2);
     batch_harness.activate(&batch_terms, Some(&provenance));
@@ -2057,6 +2060,7 @@ fn exact_terms(harness: &Harness, payload: &[u8]) -> SealedApprovalTerms {
         selector: ApprovalSelector::Exact {
             ordered_payload_digests: vec![hash.clone()],
             ordered_hashes: vec![hash],
+            message_normalization: None,
         },
         limits: ApprovalLimits {
             max_operations: DecimalU64::new(1),
@@ -2195,6 +2199,7 @@ fn solana_terms(
         selector: ApprovalSelector::Exact {
             ordered_payload_digests: vec![payload_digest.clone()],
             ordered_hashes: vec![payload_digest],
+            message_normalization: None,
         },
         limits: ApprovalLimits {
             max_operations: DecimalU64::new(1),
@@ -2960,6 +2965,7 @@ fn scoped_exact_terms(
     terms.selector = ApprovalSelector::Exact {
         ordered_payload_digests: vec![hash.clone()],
         ordered_hashes: vec![hash],
+        message_normalization: None,
     };
     terms.limits.max_operations = DecimalU64::new(1);
     terms.limits.max_signatures = DecimalU64::new(1);
@@ -3455,5 +3461,392 @@ fn key_stop_admission_rolls_back_and_replay_preserves_fresh_exact() {
     assert_eq!(
         reopened.journal.approval_state(&fresh_id).unwrap(),
         Some(bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Blockhash-normalized native SOL approvals
+//
+// A native transfer's recent blockhash expires inside a normal ceremony, so
+// these approvals commit to the message with those 32 bytes zeroed. The Broker
+// has two bindings to keep honest: the normalized message digest, and the
+// reviewed claim, whose raw digest would otherwise move with the blockhash.
+// ---------------------------------------------------------------------------
+
+/// The same native transfer, stamped with one blockhash, with a claim that
+/// describes it. `nonce_byte` keeps distinct approvals distinct.
+fn normalized_message_and_claim(blockhash: [u8; 32]) -> (Vec<u8>, SystemUseClaim) {
+    let destination = bloom_solana_verify::Pubkey::from_bytes([0x02; 32]);
+    let message = bloom_solana_verify::system_transfer::transfer_message(
+        bloom_solana_verify::Pubkey::from_bytes([0x01; 32]),
+        destination,
+        1_000_000,
+        blockhash,
+    )
+    .unwrap()
+    .serialize();
+    let claim = solana_claim_for(
+        &message,
+        &destination.to_string(),
+        blockhash,
+        ClaimAssurance::ProofVerified {
+            verifier_id: token(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID),
+            verifier_digest: Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES),
+            proof_digest: digest(0),
+        },
+    );
+    let claim = with_evidence_digest(claim, &message);
+    (message, claim)
+}
+
+fn normalized_terms(
+    harness: &Harness,
+    provenance: &ProvenanceRecord,
+    message: &[u8],
+    nonce_byte: u8,
+) -> SealedApprovalTerms {
+    let normalized = solana_native_transfer_approval_digest(message).unwrap();
+    let mut terms = solana_terms(harness, provenance, message, nonce_byte);
+    terms.selector = ApprovalSelector::Exact {
+        ordered_payload_digests: vec![normalized.clone()],
+        ordered_hashes: vec![normalized],
+        message_normalization: Some(ExactMessageNormalization::SolanaNativeTransferBlockhashV1),
+    };
+    terms
+}
+
+/// Activate through the production commitment helper, exactly as
+/// `BrokerService::prepare_approval` does.
+fn activate_normalized(
+    harness: &Harness,
+    terms: &SealedApprovalTerms,
+    provenance: &ProvenanceRecord,
+    claim: &SystemUseClaim,
+) {
+    harness.authority.install_provenance(provenance).unwrap();
+    let commitment = approval_claim_commitment(terms, None, Some(claim))
+        .unwrap()
+        .expect("a native claim commits");
+    let approval_id = harness
+        .authority
+        .prepare_approval_with_claim(terms, &digest(7), Some(&commitment))
+        .unwrap();
+    let grant = harness.signed_grant(terms, approval_id, operation(3));
+    harness.authority.activate_approval(&grant, 1_500).unwrap();
+}
+
+/// The pinned Anza-differential constructor and the fixed-layout normalizer
+/// must agree on what a canonical native transfer looks like, or the Machine
+/// would stage messages the approval can never match.
+#[test]
+fn the_normalizer_accepts_the_pinned_transfer_constructor() {
+    let (message, _) = normalized_message_and_claim([0x07; 32]);
+    assert_eq!(message.len(), 150);
+    let first = solana_native_transfer_approval_digest(&message).unwrap();
+    let (refreshed, _) = normalized_message_and_claim([0x5a; 32]);
+    assert_ne!(message, refreshed);
+    assert_eq!(
+        first,
+        solana_native_transfer_approval_digest(&refreshed).unwrap(),
+        "only the blockhash differs, so the normalized digest must not"
+    );
+    // A different amount is a different transfer.
+    let other = bloom_solana_verify::system_transfer::transfer_message(
+        bloom_solana_verify::Pubkey::from_bytes([0x01; 32]),
+        bloom_solana_verify::Pubkey::from_bytes([0x02; 32]),
+        1_000_001,
+        [0x07; 32],
+    )
+    .unwrap()
+    .serialize();
+    assert_ne!(
+        first,
+        solana_native_transfer_approval_digest(&other).unwrap()
+    );
+}
+
+/// The failure this change fixes, at the Broker boundary: the staged blockhash
+/// lapses, the Machine restamps the transfer and re-quotes the same claim, and
+/// the approval still authorizes it. The compiled semantic verifier runs on the
+/// refreshed raw bytes as before.
+#[test]
+fn a_normalized_approval_authorizes_a_refreshed_blockhash() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (staged, staged_claim) = normalized_message_and_claim([0x07; 32]);
+    let terms = normalized_terms(&harness, &provenance, &staged, 91);
+    activate_normalized(&harness, &terms, &provenance, &staged_claim);
+
+    let (refreshed, refreshed_claim) = normalized_message_and_claim([0x5a; 32]);
+    assert_ne!(refreshed, staged);
+    assert_ne!(refreshed_claim, staged_claim);
+    let input = solana_input(
+        &terms,
+        &provenance,
+        operation(91),
+        &refreshed,
+        refreshed_claim.clone(),
+        &refreshed,
+        Some([0x01; 32]),
+    );
+    let decision = harness.authority.authorize(&input).unwrap();
+    assert_eq!(
+        decision.effective_assurance,
+        Some(refreshed_claim.claim_assurance)
+    );
+    // Unchanged economics: the same debit plus the same reviewed fee.
+    assert_eq!(
+        decision.reserved_values["solana:native"].as_str(),
+        "1005000"
+    );
+}
+
+/// Normalization covers the blockhash and nothing else. A message whose
+/// amount, recipient or payer changed still normalizes, and is refused.
+#[test]
+fn a_normalized_approval_refuses_any_other_changed_message_byte() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (staged, staged_claim) = normalized_message_and_claim([0x07; 32]);
+    let terms = normalized_terms(&harness, &provenance, &staged, 92);
+    activate_normalized(&harness, &terms, &provenance, &staged_claim);
+
+    let destination = bloom_solana_verify::Pubkey::from_bytes([0x02; 32]);
+    let other_amount = bloom_solana_verify::system_transfer::transfer_message(
+        bloom_solana_verify::Pubkey::from_bytes([0x01; 32]),
+        destination,
+        1_000_001,
+        [0x5a; 32],
+    )
+    .unwrap()
+    .serialize();
+    let other_destination = bloom_solana_verify::system_transfer::transfer_message(
+        bloom_solana_verify::Pubkey::from_bytes([0x01; 32]),
+        bloom_solana_verify::Pubkey::from_bytes([0x44; 32]),
+        1_000_000,
+        [0x5a; 32],
+    )
+    .unwrap()
+    .serialize();
+    let mut not_canonical = staged.clone();
+    not_canonical.push(0);
+
+    for (label, message) in [
+        ("amount", other_amount),
+        ("destination", other_destination),
+        ("layout", not_canonical),
+    ] {
+        let claim = with_evidence_digest(
+            solana_claim_for(
+                &message,
+                &destination.to_string(),
+                [0x5a; 32],
+                ClaimAssurance::ProofVerified {
+                    verifier_id: token(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID),
+                    verifier_digest: Digest32::from_bytes(
+                        SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES,
+                    ),
+                    proof_digest: digest(0),
+                },
+            ),
+            &message,
+        );
+        let input = solana_input(
+            &terms,
+            &provenance,
+            operation(92),
+            &message,
+            claim,
+            &message,
+            Some([0x01; 32]),
+        );
+        let error = harness
+            .authority
+            .authorize(&input)
+            .expect_err(&format!("a changed {label} must be refused"));
+        assert!(
+            error.to_string().contains("SELECTOR_MISMATCH"),
+            "{label}: {error}"
+        );
+    }
+}
+
+/// The reviewed claim carries facts the message does not encode: the fee
+/// quote, the genesis hash, the declared destination and the verifier
+/// identity. Normalized matching cannot preserve those, so the approval keeps
+/// a second binding over a projection of the claim in which only the five
+/// freshness-dependent fields may move.
+#[test]
+fn a_normalized_approval_still_binds_every_reviewed_non_message_fact() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (staged, staged_claim) = normalized_message_and_claim([0x07; 32]);
+    let terms = normalized_terms(&harness, &provenance, &staged, 93);
+    activate_normalized(&harness, &terms, &provenance, &staged_claim);
+
+    let (refreshed, refreshed_claim) = normalized_message_and_claim([0x5a; 32]);
+    // The honest refresh is accepted, so each rejection below isolates one field.
+    let baseline = approval_claim_commitment(&terms, None, Some(&refreshed_claim))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        baseline,
+        approval_claim_commitment(&terms, None, Some(&staged_claim))
+            .unwrap()
+            .unwrap(),
+        "refreshing the blockhash must not move the approval's claim commitment"
+    );
+
+    let with = |mutate: &dyn Fn(&mut SystemUseClaim)| {
+        let mut claim = refreshed_claim.clone();
+        mutate(&mut claim);
+        claim
+    };
+    let mutations: Vec<(&str, SystemUseClaim)> = vec![
+        (
+            "amount",
+            with(&|claim| claim.declared_debits[0].amount = DecimalU256::parse("999999").unwrap()),
+        ),
+        (
+            "destination",
+            with(&|claim| {
+                claim.declared_destinations[0].destination =
+                    bloom_solana_verify::Pubkey::from_bytes([0x44; 32]).to_string()
+            }),
+        ),
+        (
+            "fee",
+            with(&|claim| {
+                claim.declared_fee = DeclaredFee::Fee {
+                    chain: token("solana"),
+                    asset: "native".into(),
+                    amount: DecimalU256::parse("6000").unwrap(),
+                }
+            }),
+        ),
+        (
+            "genesis",
+            with(&|claim| claim.chain_context.genesis_hash = "other-cluster".into()),
+        ),
+        ("nonce", with(&|claim| claim.nonce = nonce(94))),
+        (
+            "operation class",
+            with(&|claim| claim.operation_class = token("solana.token-transfer")),
+        ),
+        (
+            "verifier digest",
+            with(&|claim| {
+                claim.claim_assurance = ClaimAssurance::ProofVerified {
+                    verifier_id: token(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID),
+                    verifier_digest: digest(0x33),
+                    proof_digest: digest(0),
+                }
+            }),
+        ),
+        (
+            "assurance level",
+            with(&|claim| claim.claim_assurance = ClaimAssurance::MachineAsserted),
+        ),
+    ];
+    for (label, claim) in mutations {
+        match approval_claim_commitment(&terms, None, Some(&claim)) {
+            // Either the projection refuses the claim outright, or it produces
+            // a different commitment than the approval stored. Both mean the
+            // owner must approve again.
+            Ok(Some(commitment)) => assert_ne!(commitment, baseline, "{label}"),
+            Ok(None) => panic!("{label}: a native claim must commit"),
+            Err(_) => {}
+        }
+        let input = solana_input(
+            &terms,
+            &provenance,
+            operation(93),
+            &refreshed,
+            claim,
+            &refreshed,
+            Some([0x01; 32]),
+        );
+        assert!(
+            harness.authority.authorize(&input).is_err(),
+            "a changed {label} must be refused"
+        );
+    }
+}
+
+/// The marker means "one proof-verified native transfer". A missing claim, a
+/// Petal claim or a weaker verifier cannot reach the projection, so they
+/// cannot be prepared or authorized either.
+#[test]
+fn a_normalized_approval_requires_its_proof_verified_native_claim() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (staged, staged_claim) = normalized_message_and_claim([0x07; 32]);
+    let terms = normalized_terms(&harness, &provenance, &staged, 95);
+
+    assert!(
+        approval_claim_commitment(&terms, None, None).is_err(),
+        "a normalized approval cannot be prepared without its claim"
+    );
+    let mut machine_asserted = staged_claim.clone();
+    machine_asserted.claim_assurance = ClaimAssurance::MachineAsserted;
+    assert!(approval_claim_commitment(&terms, None, Some(&machine_asserted)).is_err());
+    let mut wrong_class = staged_claim;
+    wrong_class.operation_class = token("solana.token-transfer");
+    assert!(approval_claim_commitment(&terms, None, Some(&wrong_class)).is_err());
+
+    // Ordinary Exact terms keep the raw claim digest exactly, including the
+    // no-claim case, so nothing about existing approvals changes.
+    let raw_terms = solana_terms(&harness, &provenance, &staged, 96);
+    assert_eq!(
+        approval_claim_commitment(&raw_terms, None, None).unwrap(),
+        None
+    );
+    let (_, claim) = normalized_message_and_claim([0x07; 32]);
+    assert_eq!(
+        approval_claim_commitment(&raw_terms, None, Some(&claim))
+            .unwrap()
+            .unwrap(),
+        Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(&claim).unwrap()).into())
+    );
+}
+
+/// The claim projection is load-bearing, and is the part of this change most
+/// easily dropped. An approval that stored the raw claim digest, as ordinary
+/// Exact terms do, cannot authorize a refreshed transfer at all: the refreshed
+/// claim names a new blockhash and block height. Without the projection the
+/// normalized message match would succeed and this second binding would still
+/// refuse, so a normalized approval would be useless rather than unsafe.
+#[test]
+fn a_raw_claim_digest_cannot_back_a_normalized_approval() {
+    let harness = Harness::new_with_verifiers(vec![SolanaSystemTransferVerifier::compiled()]);
+    let provenance = harness.solana_provenance();
+    let (staged, staged_claim) = normalized_message_and_claim([0x07; 32]);
+    let terms = normalized_terms(&harness, &provenance, &staged, 97);
+
+    // Exactly what `activate_with_system_claim` does for ordinary terms.
+    harness.authority.install_provenance(&provenance).unwrap();
+    let raw_digest =
+        Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(&staged_claim).unwrap()).into());
+    let approval_id = harness
+        .authority
+        .prepare_approval_with_claim(&terms, &digest(7), Some(&raw_digest))
+        .unwrap();
+    let grant = harness.signed_grant(&terms, approval_id, operation(3));
+    harness.authority.activate_approval(&grant, 1_500).unwrap();
+
+    let (refreshed, refreshed_claim) = normalized_message_and_claim([0x5a; 32]);
+    let input = solana_input(
+        &terms,
+        &provenance,
+        operation(97),
+        &refreshed,
+        refreshed_claim,
+        &refreshed,
+        Some([0x01; 32]),
+    );
+    let error = harness.authority.authorize(&input).unwrap_err();
+    assert!(
+        error.to_string().contains("SYSTEM_CLAIM_MISMATCH"),
+        "{error}"
     );
 }

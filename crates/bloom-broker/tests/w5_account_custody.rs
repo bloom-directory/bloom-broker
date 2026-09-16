@@ -1824,6 +1824,7 @@ fn sign_terms(
         selector: ApprovalSelector::Exact {
             ordered_payload_digests: vec![payload_hash.clone()],
             ordered_hashes: vec![payload_hash],
+            message_normalization: None,
         },
         limits: ApprovalLimits {
             max_operations: DecimalU64::new(1),

@@ -5,10 +5,12 @@ use crate::journal::{
 use bloom_broker_api::{
     ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
     ApprovalTombstone, Base64UrlBytes, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite,
-    CustodyResult, DeclaredDestination, DeclaredFee, Digest32, KeyRef, MachineSignRequest,
-    OperationId, PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope, PetalUseClaim,
-    PolicyUpdateRequest, ProtocolErrorCode, RevocationState, SealedApprovalTerms,
-    SignedPolicySnapshot, SigningPayloads, SystemUseClaim, Token,
+    CustodyResult, DecimalU64, DeclaredDestination, DeclaredFee, Digest32,
+    ExactMessageNormalization, KeyRef, MachineSignRequest, OperationId,
+    PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope, PetalUseClaim, PolicyUpdateRequest,
+    ProtocolErrorCode, RevocationState, SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES,
+    SOLANA_SYSTEM_TRANSFER_VERIFIER_ID, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
+    SystemUseClaim, Token, solana_native_transfer_approval_digest,
 };
 pub use bloom_broker_api::{CanonicalWalletPolicy, PolicyDestination, RequiredVerifier};
 pub use bloom_broker_api::{
@@ -2433,16 +2435,46 @@ impl BrokerAuthority {
                 ApprovalSelector::Exact {
                     ordered_payload_digests,
                     ordered_hashes: approved_hashes,
+                    message_normalization,
                 },
                 petal_claim,
                 system_claim,
             ) => {
-                if ordered_payload_digests != &payload_digests || approved_hashes != &ordered_hashes
-                {
-                    return Err(denied(
-                        "SELECTOR_MISMATCH",
-                        "payload bytes, digest, hash, order, count, or algorithm changed",
-                    ));
+                match message_normalization {
+                    Some(ExactMessageNormalization::SolanaNativeTransferBlockhashV1) => {
+                        // The owner approved this transfer with its recent
+                        // blockhash left uncommitted, so compare the digest of
+                        // the normalized message. Recompute it here from the
+                        // bytes actually submitted; the raw digests below are
+                        // untouched and still drive claim, operation identity,
+                        // reservation and the semantic verifier.
+                        let [payload] = payloads.as_slice() else {
+                            return Err(denied(
+                                "SELECTOR_MISMATCH",
+                                "a blockhash-normalized approval covers exactly one message",
+                            ));
+                        };
+                        let normalized = solana_native_transfer_approval_digest(payload)
+                            .map_err(|error| denied("SELECTOR_MISMATCH", error.to_string()))?;
+                        if ordered_payload_digests.as_slice() != [normalized.clone()]
+                            || approved_hashes.as_slice() != [normalized]
+                        {
+                            return Err(denied(
+                                "SELECTOR_MISMATCH",
+                                "normalized message digest differs from the approved transfer",
+                            ));
+                        }
+                    }
+                    None => {
+                        if ordered_payload_digests != &payload_digests
+                            || approved_hashes != &ordered_hashes
+                        {
+                            return Err(denied(
+                                "SELECTOR_MISMATCH",
+                                "payload bytes, digest, hash, order, count, or algorithm changed",
+                            ));
+                        }
+                    }
                 }
                 match (petal_claim, system_claim) {
                     (None, None) => (BTreeMap::new(), None, None),
@@ -2610,8 +2642,16 @@ impl BrokerAuthority {
             .approval_record(&input.request.approval_id)?
             .ok_or_else(|| denied("APPROVAL_NOT_FOUND", "approval metadata is missing"))?
             .approved_claim_digest;
+        // What the approval committed to, which for a blockhash-normalized
+        // approval is a projection of the reviewed claim rather than its raw
+        // digest. The raw digest keeps its existing role below.
+        let claim_commitment = approval_claim_commitment(
+            &terms,
+            input.request.petal_use_claim.as_ref(),
+            input.request.system_use_claim.as_ref(),
+        )?;
         if matches!(terms.selector, ApprovalSelector::Exact { .. })
-            && approved_claim_digest.as_deref() != claim_digest.as_ref().map(Digest32::as_str)
+            && approved_claim_digest.as_deref() != claim_commitment.as_ref().map(Digest32::as_str)
         {
             return Err(denied(
                 "SYSTEM_CLAIM_MISMATCH",
@@ -3892,6 +3932,117 @@ fn declared_system_fee_asset(claim: &SystemUseClaim) -> Option<String> {
         DeclaredFee::Fee { chain, asset, .. } => Some(asset_id(chain.as_str(), asset)),
         DeclaredFee::None => None,
     }
+}
+
+/// Domain separating an approval-claim projection from any raw claim digest.
+const NORMALIZED_APPROVAL_CLAIM_DOMAIN: &[u8] = b"bloom-solana-native-approval-claim/v1";
+/// The one operation class a blockhash-normalized approval may carry.
+const NORMALIZED_TRANSFER_OPERATION_CLASS: &str = "solana.native-transfer";
+/// Base58 of the 32-byte zero hash, the fixed stand-in for a blockhash that
+/// the approval deliberately does not pin.
+const ZERO_BLOCKHASH_BASE58: &str = "11111111111111111111111111111111";
+
+/// What an approval commits its reviewed claim to.
+///
+/// For ordinary terms this is the raw JCS claim digest, unchanged. That cannot
+/// work for a blockhash-normalized approval: refreshing the blockhash moves
+/// `recent_blockhash`, `last_valid_block_height` and every digest taken over
+/// the message, so the raw value would differ even though the approved
+/// transfer did not change at all.
+///
+/// For marked terms this projects the claim, replacing exactly those five
+/// freshness-dependent facts with fixed values and preserving every other
+/// field. Amount, destination, declared fee, genesis hash, nonce,
+/// component/action/operation classes, suite and verifier identity therefore
+/// still cannot move without a new ceremony — normalized message matching
+/// alone would not preserve them, because the message encodes neither the fee
+/// quote nor the genesis hash.
+///
+/// The raw claim keeps its existing roles: operation and request identities,
+/// the signed review manifest, and the independent semantic verifier.
+pub fn approval_claim_commitment(
+    terms: &SealedApprovalTerms,
+    petal_claim: Option<&PetalUseClaim>,
+    system_claim: Option<&SystemUseClaim>,
+) -> Result<Option<Digest32>, AuthorityError> {
+    let raw_commitment = || match (petal_claim, system_claim) {
+        (Some(claim), None) => Ok(Some(jcs_digest(claim)?)),
+        (None, Some(claim)) => Ok(Some(jcs_digest(claim)?)),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => Err(denied(
+            "SELECTOR_MISMATCH",
+            "one approval cannot carry both Petal and system claims",
+        )),
+    };
+    let ApprovalSelector::Exact {
+        ordered_hashes,
+        message_normalization: Some(ExactMessageNormalization::SolanaNativeTransferBlockhashV1),
+        ..
+    } = &terms.selector
+    else {
+        return raw_commitment();
+    };
+    let [normalized] = ordered_hashes.as_slice() else {
+        return Err(denied(
+            "SELECTOR_MISMATCH",
+            "a blockhash-normalized approval commits to exactly one digest",
+        ));
+    };
+    // Signer cannot check these; it sees no claim. They are the Broker's half
+    // of the marker's meaning and are enforced at prepare and at signing.
+    if petal_claim.is_some() {
+        return Err(denied(
+            "SELECTOR_MISMATCH",
+            "a blockhash-normalized approval is a native system operation, not a Petal one",
+        ));
+    }
+    let claim = system_claim.ok_or_else(|| {
+        denied(
+            "SYSTEM_CLAIM_MISMATCH",
+            "a blockhash-normalized approval requires its reviewed native-transfer claim",
+        )
+    })?;
+    if claim.operation_class.as_str() != NORMALIZED_TRANSFER_OPERATION_CLASS {
+        return Err(denied(
+            "SYSTEM_CLAIM_MISMATCH",
+            "a blockhash-normalized approval covers only the native-transfer operation class",
+        ));
+    }
+    let ClaimAssurance::ProofVerified {
+        verifier_id,
+        verifier_digest,
+        ..
+    } = &claim.claim_assurance
+    else {
+        return Err(denied(
+            "ASSURANCE_TOO_WEAK",
+            "a blockhash-normalized approval requires proof-verified assurance",
+        ));
+    };
+    if verifier_id.as_str() != SOLANA_SYSTEM_TRANSFER_VERIFIER_ID
+        || verifier_digest != &Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES)
+    {
+        return Err(denied(
+            "SYSTEM_CLAIM_MISMATCH",
+            "a blockhash-normalized approval requires the pinned native-transfer verifier",
+        ));
+    }
+
+    // Clone everything, then replace only the facts a refresh legitimately
+    // changes. Anything added to SystemUseClaim later is preserved by default
+    // and therefore stays bound by the approval.
+    let mut projected = claim.clone();
+    projected.payload_digest = normalized.clone();
+    projected.ordered_hashes = vec![normalized.clone()];
+    projected.chain_context.recent_blockhash = ZERO_BLOCKHASH_BASE58.to_owned();
+    projected.chain_context.last_valid_block_height = DecimalU64::new(0);
+    if let ClaimAssurance::ProofVerified { proof_digest, .. } = &mut projected.claim_assurance {
+        *proof_digest = normalized.clone();
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(NORMALIZED_APPROVAL_CLAIM_DOMAIN);
+    hasher.update(serde_jcs::to_vec(&projected).map_err(storage)?);
+    Ok(Some(Digest32::from_bytes(hasher.finalize().into())))
 }
 
 fn jcs_digest(value: &impl Serialize) -> Result<Digest32, AuthorityError> {

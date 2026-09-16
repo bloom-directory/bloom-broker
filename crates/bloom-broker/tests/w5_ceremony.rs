@@ -1007,6 +1007,7 @@ fn approval_request() -> CeremonyPrepareRequest {
         selector: bloom_signer_api::ApprovalSelector::Exact {
             ordered_payload_digests: vec![digest("12")],
             ordered_hashes: vec![digest("13")],
+            message_normalization: None,
         },
         limits: bloom_signer_api::ApprovalLimits {
             max_operations: DecimalU64::new(1),
@@ -2905,6 +2906,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     exact_terms.selector = ApprovalSelector::Exact {
         ordered_payload_digests: vec![exact_payload_digest.clone()],
         ordered_hashes: vec![exact_payload_digest],
+        message_normalization: None,
     };
     exact_terms.limits.max_operations = DecimalU64::new(1);
     exact_terms.limits.max_signatures = DecimalU64::new(1);
@@ -3114,6 +3116,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             terms.selector = ApprovalSelector::Exact {
                 ordered_payload_digests: vec![digest("c2")],
                 ordered_hashes: vec![digest("c3")],
+                message_normalization: None,
             };
             terms.limits.max_operations = DecimalU64::new(1);
             terms.limits.max_signatures = DecimalU64::new(1);
@@ -3128,6 +3131,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             terms.selector = ApprovalSelector::Exact {
                 ordered_payload_digests: vec![digest("c4")],
                 ordered_hashes: vec![digest("c5")],
+                message_normalization: None,
             };
             terms.limits.max_operations = DecimalU64::new(1);
             terms.limits.max_signatures = DecimalU64::new(1);
@@ -3729,6 +3733,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         terms.selector = ApprovalSelector::Exact {
             ordered_payload_digests: vec![payload_digest.clone()],
             ordered_hashes: vec![payload_digest],
+            message_normalization: None,
         };
         terms.limits.max_operations = DecimalU64::new(1);
         terms.limits.max_signatures = DecimalU64::new(1);

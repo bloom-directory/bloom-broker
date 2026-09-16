@@ -60,6 +60,7 @@ mod tests {
         let exact = north::ApprovalSelector::Exact {
             ordered_payload_digests: vec![],
             ordered_hashes: vec![],
+            message_normalization: None,
         };
         let petal = north::ApprovalSelector::Petal {
             package_hash: north::Digest32::from_bytes([1; 32]),
