@@ -5130,6 +5130,36 @@ async fn browser_recovery_bootstrap_is_non_enumerating_and_uses_active_origin() 
     let broker = CeremonyBroker::new(Arc::new(MockSigner::with_remote_surface()));
     let remote = "https://abcdefghijklmnopqrstuv2345.relay.bloom.directory";
     let host = remote.strip_prefix("https://").unwrap();
+    // A real wallet can already have an owner ceremony. That private state
+    // must not change the public recovery bootstrap response or page shape.
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let surface = broker
+        .select_surface(bloom_broker_api::CeremonySurfaceSelection::Remote)
+        .unwrap();
+    broker
+        .prepare_custody(
+            CustodyPrepareRequest {
+                surface: surface.reference(),
+                ceremony_kind: CeremonyKind::WalletDelete,
+                custody_operation_id: operation("c8"),
+                wallet_id: Some(Token::new("known-wallet").unwrap()),
+                key_ref: None,
+                exact_terms_digest: digest("c9"),
+                expected_input_class: Token::new("policy-document").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_requests: Vec::new(),
+            },
+            now_ms,
+        )
+        .unwrap();
     let app = broker.for_remote_origin(remote).unwrap().router();
     let request = |wallet: &str, recovery_id: &str| {
         Request::builder()
@@ -5173,6 +5203,95 @@ async fn browser_recovery_bootstrap_is_non_enumerating_and_uses_active_origin() 
         assert!(!url.contains("wallet"));
         assert!(!url.contains("recovery-"));
     }
+    let mut projections = Vec::new();
+    for (body, wallet) in [
+        (&first_body, "known-wallet"),
+        (&second_body, "unknown-wallet"),
+    ] {
+        let capability = body["ceremony_url"]
+            .as_str()
+            .unwrap()
+            .split("#cap=")
+            .nth(1)
+            .unwrap();
+        let exchange = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/session/exchange")
+                    .header(header::HOST, host)
+                    .header(header::ORIGIN, remote)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::from(
+                        serde_json::json!({"capability": capability}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exchange.status(), StatusCode::OK);
+        let cookie = exchange.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let exchange_body: serde_json::Value =
+            serde_json::from_slice(&exchange.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let read = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/session/{}",
+                        exchange_body["ceremony_id"].as_str().unwrap()
+                    ))
+                    .header(header::HOST, host)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+        let projection: serde_json::Value =
+            serde_json::from_slice(&read.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(projection["review_manifest"]["title"], "Recover a wallet");
+        assert_eq!(projection["review_manifest"]["wallet_name"], wallet);
+        assert_eq!(projection["signer_contribution"]["wallet_id"], wallet);
+        assert_eq!(
+            projection["signer_contribution"]["credential_authority_generation"],
+            serde_json::to_value(DecimalU64::new(0)).unwrap()
+        );
+        assert!(projection["signer_contribution"]["key_ref"].is_null());
+        assert!(projection["signer_contribution"]["wallet_seed_profile"].is_null());
+        assert_eq!(
+            projection["webauthn_options"]["allowed_credentials"],
+            serde_json::json!([])
+        );
+        projections.push(projection);
+    }
+    fn public_shape(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.iter().map(public_shape).collect())
+            }
+            serde_json::Value::Object(values) => serde_json::Value::Object(
+                values
+                    .iter()
+                    .map(|(key, value)| (key.clone(), public_shape(value)))
+                    .collect(),
+            ),
+            serde_json::Value::String(_) => serde_json::json!("<string>"),
+            serde_json::Value::Number(_) => serde_json::json!(0),
+            other => other.clone(),
+        }
+    }
+    assert_eq!(public_shape(&projections[0]), public_shape(&projections[1]));
     let forged = app
         .oneshot(
             Request::builder()

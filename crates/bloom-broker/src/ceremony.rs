@@ -735,6 +735,12 @@ struct NewBrowserSession {
     origin: String,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CustodyAdmission {
+    Standard,
+    PublicRecoveryBootstrap,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct BrowserProjection {
@@ -1631,6 +1637,26 @@ impl CeremonyBroker {
         account_review: Option<serde_json::Value>,
         now_ms: u64,
     ) -> Result<CustodyPrepareResponse, ProtocolError> {
+        self.prepare_custody_with_admission(
+            request,
+            account_review,
+            now_ms,
+            CustodyAdmission::Standard,
+        )
+    }
+
+    fn prepare_custody_with_admission(
+        &self,
+        request: CustodyPrepareRequest,
+        account_review: Option<serde_json::Value>,
+        now_ms: u64,
+        admission: CustodyAdmission,
+    ) -> Result<CustodyPrepareResponse, ProtocolError> {
+        if admission == CustodyAdmission::PublicRecoveryBootstrap
+            && request.ceremony_kind != CeremonyKind::WalletRecovery
+        {
+            return Err(kind_mismatch());
+        }
         self.expire_sessions(now_ms)?;
         request
             .validate_legacy_passkey_migration_binding()
@@ -1655,7 +1681,15 @@ impl CeremonyBroker {
         // now supplies its authoritative ID, but it is still unauthenticated
         // by an existing wallet credential and must retain the global bound.
         let anonymous_registration = request.ceremony_kind == CeremonyKind::WalletRegistration;
-        self.enforce_creation_bounds(request.wallet_id.as_ref(), anonymous_registration, now_ms)?;
+        // Public recovery must not reveal prior activity for a guessed wallet
+        // ID. Its own identifier, installation and global bounds are checked
+        // at the bootstrap endpoint; this still enforces global concurrency.
+        let wallet_for_admission = if admission == CustodyAdmission::PublicRecoveryBootstrap {
+            None
+        } else {
+            request.wallet_id.as_ref()
+        };
+        self.enforce_creation_bounds(wallet_for_admission, anonymous_registration, now_ms)?;
         let prepared = self
             .inner
             .signer
@@ -3433,7 +3467,12 @@ async fn bootstrap_recovery(
         wallet_seed_profile: None,
         derivation_requests: Vec::new(),
     };
-    match broker.prepare_custody(request, now_ms) {
+    match broker.prepare_custody_with_admission(
+        request,
+        None,
+        now_ms,
+        CustodyAdmission::PublicRecoveryBootstrap,
+    ) {
         Ok(prepared) => {
             tracing::info!(
                 event = "broker.recovery_bootstrap_admitted",
