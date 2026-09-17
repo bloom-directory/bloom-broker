@@ -77,6 +77,7 @@ impl VirtualAuthenticator {
 
     pub fn credential(&self, sign_count: u32) -> WebAuthnCredential {
         WebAuthnCredential {
+            surface: bloom_signer_api::legacy_local_surface(),
             credential_id: self.credential_id.clone(),
             cose_public_key: Base64UrlBytes::from_bytes(
                 &self.cose_public_key().expect("generated key encodes"),

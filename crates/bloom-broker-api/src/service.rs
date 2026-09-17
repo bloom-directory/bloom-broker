@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Base64UrlBytes, BootEpoch, CeremonyKind, CustodyPrepareRequest, CustodyPrepareResponse,
-    CustodyResult, DecimalU64, Digest32, HelloChallenge, KeyRef, MachineSignRequest, OperationId,
-    PetalUseClaim, PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
-    PolicyUpdateRequest, ProtocolError, RevocationState, SealedApprovalPrepareResponse,
-    SealedApprovalTerms, ServiceFuture, SignedPolicySnapshot, SigningResult, SystemUseClaim, Token,
-    WalletAccountsPublic,
+    Base64UrlBytes, BootEpoch, CeremonyCrossSurfacePrepareRequest,
+    CeremonyCrossSurfacePrepareResponse, CeremonyKind, CustodyPrepareRequest,
+    CustodyPrepareResponse, CustodyResult, DecimalU64, Digest32, HelloChallenge, KeyRef,
+    MachineSignRequest, OperationId, PetalUseClaim, PolicyCommitReceipt, PolicyCommitUpdateRequest,
+    PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError, RevocationState,
+    SealedApprovalPrepareResponse, SealedApprovalTerms, ServiceFuture, SignedPolicySnapshot,
+    SigningResult, SystemUseClaim, Token, WalletAccountsPublic,
 };
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -94,6 +95,11 @@ pub struct KeyRequest {
 #[serde(deny_unknown_fields)]
 pub struct ApprovalPrepareRequest {
     pub operation_id: OperationId,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::CeremonySurfaceSelection::is_default"
+    )]
+    pub surface_selection: crate::CeremonySurfaceSelection,
     pub terms: SealedApprovalTerms,
     pub canonical_plan_facts_digest: Digest32,
     #[serde(default)]
@@ -266,6 +272,8 @@ pub enum CredentialState {
 pub struct CredentialPublic {
     pub credential_id: Base64UrlBytes,
     pub wallet_id: Token,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<crate::CeremonySurfaceRef>,
     pub created_at_ms: DecimalU64,
     pub state: CredentialState,
 }
@@ -327,6 +335,8 @@ pub enum MachineBrokerRequest {
     BrokerReadiness(Empty),
     #[serde(rename = "broker.capabilities")]
     BrokerCapabilities(Empty),
+    #[serde(rename = "ceremony.surface_status")]
+    CeremonySurfaceStatus(Empty),
     #[serde(rename = "action.validate")]
     ActionValidate(Digest32),
     #[serde(rename = "sealed_approval.prepare")]
@@ -395,6 +405,8 @@ pub enum MachineBrokerRequest {
     CredentialListPublic(WalletRequest),
     #[serde(rename = "credential.add_prepare")]
     CredentialAddPrepare(CustodyPrepareRequest),
+    #[serde(rename = "credential.cross_surface_prepare")]
+    CredentialCrossSurfacePrepare(CeremonyCrossSurfacePrepareRequest),
     #[serde(rename = "credential.replace_prepare")]
     CredentialReplacePrepare(CustodyPrepareRequest),
     #[serde(rename = "credential.remove_prepare")]
@@ -418,6 +430,8 @@ pub enum MachineBrokerResponse {
     BrokerReadiness(Readiness),
     #[serde(rename = "broker.capabilities")]
     BrokerCapabilities(ServiceCapabilities),
+    #[serde(rename = "ceremony.surface_status")]
+    CeremonySurfaceStatus(crate::CeremonyExposureStatus),
     #[serde(rename = "action.validate")]
     ActionValidate(Digest32),
     #[serde(rename = "sealed_approval.prepare")]
@@ -486,6 +500,8 @@ pub enum MachineBrokerResponse {
     CredentialListPublic(Vec<CredentialPublic>),
     #[serde(rename = "credential.add_prepare")]
     CredentialAddPrepare(CustodyPrepareResponse),
+    #[serde(rename = "credential.cross_surface_prepare")]
+    CredentialCrossSurfacePrepare(CeremonyCrossSurfacePrepareResponse),
     #[serde(rename = "credential.replace_prepare")]
     CredentialReplacePrepare(CustodyPrepareResponse),
     #[serde(rename = "credential.remove_prepare")]
@@ -555,6 +571,7 @@ impl crate::TypedRequestMethod for MachineBrokerRequest {
             | Request::CredentialReplacePrepare(request)
             | Request::CredentialRemovePrepare(request)
             | Request::RecoveryPrepare(request) => Some(request.custody_operation_id.clone()),
+            Request::CredentialCrossSurfacePrepare(request) => Some(request.operation_id.clone()),
             _ => None,
         })
     }

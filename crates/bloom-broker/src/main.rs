@@ -31,10 +31,11 @@ use bloom_broker_api::{
     is_read_only_method,
 };
 use bloom_platform_containment::NetworkContainmentGuard;
+use bloom_relay_client::{TunnelClient, TunnelConfig, probe_public_health};
 use bloom_signer_api::{
     BrokerSignerRequest, BrokerSignerResponse, ControlRequest, ControlResponse,
-    Empty as SignerEmpty, ProtocolError as SignerProtocolError,
-    ProtocolErrorCode as SignerProtocolErrorCode, RevocationControlService,
+    Empty as SignerEmpty, ExposureMode, ProtocolError as SignerProtocolError,
+    ProtocolErrorCode as SignerProtocolErrorCode, RevocationControlService, SurfaceEffectiveReport,
 };
 #[cfg(feature = "triad-dev-harness")]
 use bloom_triad_local_transport::load_developer_identity_and_manifest;
@@ -43,6 +44,10 @@ use bloom_triad_local_transport::{
     load_identity_and_manifest,
 };
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
+use rustls::{
+    ClientConfig as RustlsClientConfig, RootCertStore,
+    pki_types::{CertificateDer, pem::PemObject},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::{
@@ -53,12 +58,16 @@ use tokio::{
 use tracing::Instrument as _;
 use zeroize::Zeroize;
 
+mod remote_material;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BrokerConfig {
     journal_path: PathBuf,
     authority_path: PathBuf,
     ceremony_path: PathBuf,
+    #[serde(default)]
+    remote_tls: Option<RemoteTlsConfig>,
     signer_socket_path: PathBuf,
     broker_signing_key_id: String,
     broker_signing_seed_hex: String,
@@ -97,6 +106,56 @@ struct BrokerConfig {
     control_request_window_ms: u64,
     control_maximum_journal_admissions_per_window: usize,
     control_journal_window_ms: u64,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteTlsConfig {
+    bundle_path: PathBuf,
+    #[serde(default)]
+    gateway: Option<std::net::SocketAddr>,
+    control_ca_path: PathBuf,
+    tunnel_credential_path: PathBuf,
+    #[serde(default)]
+    dns_credential_path: Option<PathBuf>,
+}
+
+impl RemoteTlsConfig {
+    fn defaults(config_dir: &Path) -> Self {
+        Self {
+            bundle_path: config_dir.join("relay-tls-bundle.json"),
+            gateway: None,
+            control_ca_path: config_dir.join("relay-control-ca.pem"),
+            tunnel_credential_path: config_dir.join("relay-tunnel.credential"),
+            dns_credential_path: Some(config_dir.join("relay-dns.credential")),
+        }
+    }
+
+    fn dns_credential_path(&self) -> PathBuf {
+        self.dns_credential_path.clone().unwrap_or_else(|| {
+            self.tunnel_credential_path
+                .parent()
+                .unwrap_or(Path::new("/etc/bloom/broker"))
+                .join("relay-dns.credential")
+        })
+    }
+
+    fn resolve(mut self, config_dir: &Path) -> Self {
+        fn path(base: &Path, candidate: PathBuf) -> PathBuf {
+            if candidate.is_absolute() {
+                candidate
+            } else {
+                base.join(candidate)
+            }
+        }
+        self.bundle_path = path(config_dir, self.bundle_path);
+        self.control_ca_path = path(config_dir, self.control_ca_path);
+        self.tunnel_credential_path = path(config_dir, self.tunnel_credential_path);
+        self.dns_credential_path = self
+            .dns_credential_path
+            .map(|candidate| path(config_dir, candidate));
+        self
+    }
 }
 
 #[derive(Deserialize)]
@@ -595,7 +654,17 @@ async fn run_with_paths(
         let mut control_shutdown = shutdown_rx.clone();
         let mut head_exchange_shutdown = shutdown_rx.clone();
         let mut ceremony_shutdown = shutdown_rx;
+        let mut remote_shutdown = ceremony_shutdown.clone();
         let ceremony_for_shutdown = ceremony.clone();
+        let ceremony_for_remote = ceremony.clone();
+        let config_dir = config_path
+            .parent()
+            .unwrap_or(Path::new("/etc/bloom/broker"));
+        let remote_tls = config
+            .remote_tls
+            .clone()
+            .unwrap_or_else(|| RemoteTlsConfig::defaults(config_dir))
+            .resolve(config_dir);
         let machine_journals = Arc::new(BrokerMachineJournals {
             journal: machine_journal,
             checkpoints: signer_checkpoints.clone(),
@@ -644,6 +713,15 @@ async fn run_with_paths(
                     .map_err(std::io::Error::other)
             },
             async move {
+                serve_remote_tls_reconciled(
+                    ceremony_for_remote,
+                    remote_tls,
+                    broker_effective_uid,
+                    &mut remote_shutdown,
+                )
+                .await
+            },
+            async move {
                 let mut unexpected = [0_u8; 1];
                 match session_stream.read(&mut unexpected).await {
                     Ok(0) => shutdown_tx.send(true).map_err(|_| {
@@ -670,6 +748,288 @@ async fn run_with_paths(
     .instrument(service_span)
     .await;
     complete_trusted_service_run(&terminal_span, result)
+}
+
+async fn serve_remote_tls_reconciled(
+    ceremony: CeremonyBroker,
+    config: RemoteTlsConfig,
+    broker_uid: u32,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<(), std::io::Error> {
+    let mut active: Option<RemoteRuntime> = None;
+    let mut material_worker: Option<(String, tokio::task::JoinHandle<()>)> = None;
+    loop {
+        if *shutdown.borrow() {
+            if let Some(runtime) = active.take() {
+                runtime.stop().await;
+            }
+            if let Some((_, worker)) = material_worker.take() {
+                worker.abort();
+            }
+            return Ok(());
+        }
+        match ceremony.signer_surface_status() {
+            Ok(status) => {
+                let assigned = status
+                    .surfaces
+                    .iter()
+                    .find(|surface| surface.identity.surface_id.as_str() == "remote");
+                let desired_remote = status.desired_mode == ExposureMode::RemoteEnabled;
+                let hostname = assigned.and_then(|surface| {
+                    surface.validate().ok()?;
+                    Some(surface.identity.rp_id.as_str().to_owned())
+                });
+                let installation_id = status
+                    .installation_id
+                    .as_deref()
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok());
+                let worker_key = hostname
+                    .as_ref()
+                    .zip(installation_id)
+                    .map(|(name, id)| format!("{name}/{id}/{desired_remote}"));
+                if material_worker.as_ref().is_some_and(|(key, worker)| {
+                    Some(key) != worker_key.as_ref() || worker.is_finished()
+                }) {
+                    material_worker.take().unwrap().1.abort();
+                }
+                if material_worker.is_none() {
+                    if let (Some(key), Some(name), Some(id)) =
+                        (worker_key, hostname.clone(), installation_id)
+                    {
+                        let material_config = config.clone();
+                        let worker = tokio::spawn(async move {
+                            loop {
+                                if let Err(error) = remote_material::ensure_acme_account(
+                                    &material_config,
+                                    broker_uid,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(event = "broker.acme_account_pending", %error);
+                                }
+                                if desired_remote {
+                                    if let Err(error) =
+                                        remote_material::maintain_scoped_credentials(
+                                            &material_config,
+                                            id,
+                                            broker_uid,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(event = "broker.remote_credential_maintenance_pending", %error);
+                                    }
+                                    if let Err(error) = remote_material::maintain_certificate(
+                                        &material_config,
+                                        &name,
+                                        id,
+                                        broker_uid,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(event = "broker.remote_certificate_pending", %error);
+                                    }
+                                }
+                                tokio::time::sleep(Duration::from_secs(60)).await;
+                            }
+                        });
+                        material_worker = Some((key, worker));
+                    }
+                }
+                let material_ready = hostname.as_deref().is_some_and(|name| {
+                    remote_material::load_published_bundle(&config.bundle_path, name, broker_uid)
+                        .is_ok()
+                });
+                let material_digest = remote_material_digest(&config).ok();
+                let can_run = desired_remote
+                    && hostname.is_some()
+                    && installation_id.is_some()
+                    && material_ready
+                    && material_digest.is_some();
+                if active.as_ref().is_some_and(|runtime| {
+                    !can_run
+                        || Some(runtime.hostname.as_str()) != hostname.as_deref()
+                        || runtime.tls.is_finished()
+                        || runtime.tunnel.is_finished()
+                        || Some(runtime.material_digest) != material_digest
+                }) {
+                    active.take().unwrap().stop().await;
+                }
+                if can_run && active.is_none() {
+                    match RemoteRuntime::start(
+                        ceremony.clone(),
+                        &config,
+                        hostname.as_deref().unwrap(),
+                        installation_id.unwrap(),
+                        broker_uid,
+                    )
+                    .await
+                    {
+                        Ok(runtime) => active = Some(runtime),
+                        Err(error) => tracing::warn!(event = "broker.remote_unavailable", %error),
+                    }
+                }
+                let tunnel_ready = active
+                    .as_ref()
+                    .is_some_and(|runtime| *runtime.ready.borrow());
+                let externally_ready = if tunnel_ready {
+                    probe_public_health(hostname.as_deref().unwrap(), None)
+                        .await
+                        .is_ok()
+                } else {
+                    false
+                };
+                let tls_ready = active.is_some() && material_ready && externally_ready;
+                let routing_ready = tunnel_ready && externally_ready;
+                let remote_closed = active.is_none();
+                if status.desired_revision != status.effective_revision
+                    || status.remote_tls_ready != tls_ready
+                    || status.remote_routing_ready != routing_ready
+                    || (desired_remote
+                        && status.effective_mode != ExposureMode::RemoteEnabled
+                        && externally_ready)
+                    || (!desired_remote && status.effective_mode != ExposureMode::LocalhostOnly)
+                {
+                    if let Err(error) = ceremony.report_surface_effective(SurfaceEffectiveReport {
+                        desired_revision: status.desired_revision,
+                        remote_tls_ready: tls_ready,
+                        remote_routing_ready: routing_ready,
+                        remote_closed,
+                    }) {
+                        tracing::warn!(event = "broker.remote_readiness_report_failed", %error);
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(event = "broker.remote_surface_unavailable", %error),
+        }
+        tokio::select! {
+            () = wait_for_shutdown(shutdown) => {
+                if let Some(runtime) = active.take() { runtime.stop().await; }
+                if let Some((_, worker)) = material_worker.take() { worker.abort(); }
+                return Ok(());
+            },
+            () = tokio::time::sleep(Duration::from_secs(5)) => {},
+        }
+    }
+}
+
+struct RemoteRuntime {
+    hostname: String,
+    material_digest: [u8; 32],
+    stop: watch::Sender<bool>,
+    ready: watch::Receiver<bool>,
+    tls: tokio::task::JoinHandle<()>,
+    tunnel: tokio::task::JoinHandle<()>,
+}
+
+impl RemoteRuntime {
+    async fn start(
+        ceremony: CeremonyBroker,
+        config: &RemoteTlsConfig,
+        hostname: &str,
+        installation_id: uuid::Uuid,
+        broker_uid: u32,
+    ) -> Result<Self, std::io::Error> {
+        let before = remote_material_digest(config)?;
+        let bundle =
+            remote_material::load_published_bundle(&config.bundle_path, hostname, broker_uid)
+                .map_err(std::io::Error::other)?;
+        let material_digest = remote_material_digest(config)?;
+        if before != material_digest {
+            return Err(std::io::Error::other(
+                "remote TLS material rotated during listener startup",
+            ));
+        }
+        let control_ca = remote_material::read_control_ca(&config.control_ca_path, broker_uid)
+            .map_err(std::io::Error::other)?;
+        let certificate =
+            CertificateDer::from_pem_slice(&control_ca).map_err(std::io::Error::other)?;
+        let mut roots = RootCertStore::empty();
+        roots.add(certificate).map_err(std::io::Error::other)?;
+        let mut tls_config = RustlsClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls_config.alpn_protocols.push(b"h2".to_vec());
+        let gateway = match config.gateway {
+            Some(gateway) => gateway,
+            None => tokio::net::lookup_host("relay-control.bloom.directory:443")
+                .await?
+                .next()
+                .ok_or_else(|| std::io::Error::other("relay control DNS has no address"))?,
+        };
+        let tunnel = TunnelClient::new(
+            TunnelConfig {
+                gateway,
+                control_server_name: "relay-control.bloom.directory".to_owned(),
+                hostname: hostname.to_owned(),
+                installation_id,
+                credential_path: config.tunnel_credential_path.clone(),
+                tls: Arc::new(tls_config),
+            },
+            bloom_broker::ceremony::REMOTE_CEREMONY_UPSTREAM,
+        )
+        .map_err(std::io::Error::other)?;
+        let (stop, stop_rx) = watch::channel(false);
+        let (ready_tx, ready) = watch::channel(false);
+        let origin = format!("https://{hostname}");
+        let cert = bundle.cert_pem.as_bytes().to_vec();
+        let key = bundle.key_pem.as_bytes().to_vec();
+        let tls_stop = stop_rx.clone();
+        let tls = tokio::spawn(async move {
+            let mut stop = tls_stop;
+            if let Err(error) = ceremony
+                .serve_remote_tls_until(&origin, cert, key, async move {
+                    wait_for_shutdown(&mut stop).await
+                })
+                .await
+            {
+                tracing::warn!(event = "broker.remote_tls_unavailable", %error);
+            }
+        });
+        let tunnel = tokio::spawn(async move {
+            let mut stop = stop_rx;
+            if let Err(error) = tunnel
+                .run_until_ready(async move { wait_for_shutdown(&mut stop).await }, ready_tx)
+                .await
+            {
+                tracing::warn!(event = "broker.remote_tunnel_unavailable", %error);
+            }
+        });
+        Ok(Self {
+            hostname: hostname.to_owned(),
+            material_digest,
+            stop,
+            ready,
+            tls,
+            tunnel,
+        })
+    }
+
+    async fn stop(self) {
+        self.stop.send_replace(true);
+        let mut tls = self.tls;
+        let mut tunnel = self.tunnel;
+        if tokio::time::timeout(Duration::from_secs(12), &mut tls)
+            .await
+            .is_err()
+        {
+            tls.abort();
+        }
+        if tokio::time::timeout(Duration::from_secs(12), &mut tunnel)
+            .await
+            .is_err()
+        {
+            tunnel.abort();
+        }
+    }
+}
+
+fn remote_material_digest(config: &RemoteTlsConfig) -> Result<[u8; 32], std::io::Error> {
+    let mut digest = Sha256::new();
+    let mut bundle = fs::read(&config.bundle_path)?;
+    digest.update(&bundle);
+    bundle.zeroize();
+    digest.update(fs::read(&config.tunnel_credential_path)?);
+    Ok(digest.finalize().into())
 }
 
 fn complete_trusted_service_run(

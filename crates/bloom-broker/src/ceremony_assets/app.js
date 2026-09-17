@@ -23,7 +23,7 @@ const MNEMONIC_WORD_COUNTS = [12, 15, 18, 21, 24];
 const KINDS = {
   wallet_registration: {
     title: "Create a new wallet",
-    summary: "A new wallet will be created on this computer. You will set up a <strong>new passkey</strong> for it now — that passkey is what approves anything this wallet does.",
+    summary: "A new wallet will be created on your Bloom host. You will set up a <strong>new passkey</strong> for it now — that passkey is what approves anything this wallet does.",
     button: "Create wallet with passkey"
   },
   wallet_import: {
@@ -39,7 +39,7 @@ const KINDS = {
   },
   wallet_delete: {
     title: "Delete wallet",
-    summary: "Remove wallet <strong>{wallet}</strong> from this computer. Funds are not moved; if you have no backup, they become unreachable.",
+    summary: "Remove wallet <strong>{wallet}</strong> from your Bloom host. Funds are not moved; if you have no backup, they become unreachable.",
     button: "Delete with passkey",
     warn: "This cannot be undone."
   },
@@ -479,12 +479,16 @@ function renderDone(session, result) {
 }
 const tokenFromPath = location.pathname.startsWith("/ceremony/")
   ? location.pathname.slice("/ceremony/".length) : "";
+const remoteCeremony = location.protocol === "https:";
+const remoteFragment = remoteCeremony && location.hash.startsWith("#cap=")
+  ? location.hash.slice("#cap=".length) : "";
 const sessionTokenKey = "bloom.ceremony.token.v1";
-const token = tokenFromPath || readSessionToken();
+let token = remoteCeremony ? remoteFragment : (tokenFromPath || readSessionToken());
 let ceremonyId = null;
-if (tokenFromPath) writeSessionToken(tokenFromPath);
-if (token) history.replaceState(null, "", "/");
-const authHeaders = {"x-bloom-ceremony-token": token};
+if (!remoteCeremony && tokenFromPath) writeSessionToken(tokenFromPath);
+if (remoteCeremony || token) history.replaceState(null, "", "/");
+const authHeaders = remoteCeremony ? {} : {"x-bloom-ceremony-token": token};
+const ceremonyRpId = remoteCeremony ? location.hostname : "localhost";
 const te = new TextEncoder();
 let outputRecipient = null;
 
@@ -500,7 +504,10 @@ function writeSessionToken(value) {
   catch (_) {}
 }
 function clearSessionToken() {
-  try { browserSessionStorage()?.removeItem(sessionTokenKey); }
+  try {
+    browserSessionStorage()?.removeItem(sessionTokenKey);
+    browserSessionStorage()?.removeItem("bloom.ceremony.remote-session.v1");
+  }
   catch (_) {}
 }
 
@@ -510,7 +517,11 @@ function reportCeremonyError(error, fallback = "Ceremony failed") {
 }
 
 function reportApprovalFailure(error) {
-  reportCeremonyError(error, "Passkey verification failed. Please try again.");
+  const missingPrf = error?.name === "NotSupportedError" ||
+    (typeof error?.message === "string" && error.message.includes("required PRF output"));
+  reportCeremonyError(error, missingPrf
+    ? "This browser or passkey does not support the required PRF extension. Use a supported browser and passkey."
+    : "Passkey verification failed. Please try again.");
   approve.disabled = false;
 }
 
@@ -573,7 +584,7 @@ async function purgeExpiredBrowserState() {
     database?.close();
   }
 }
-async function outputRecipientFor(session) {
+async function outputRecipientFor(session, existingOnly = false) {
   const keyPair = await crypto.subtle.generateKey(
     {name: "X25519"}, false, ["deriveBits"]
   );
@@ -582,7 +593,7 @@ async function outputRecipientFor(session) {
   );
   const candidate = {
     ceremonyId: session.ceremony_id,
-    expiresAtMs: Number(session.expires_at_ms),
+    expiresAtMs: Number(session.expires_at_ms) + 15 * 60 * 1000,
     privateKey: keyPair.privateKey,
     publicKey: publicKey.buffer
   };
@@ -594,6 +605,7 @@ async function outputRecipientFor(session) {
     let stored = await requestResult(store.get(session.ceremony_id));
     if (!stored || !Number.isFinite(stored.expiresAtMs) ||
         stored.expiresAtMs <= Date.now()) {
+      if (existingOnly) throw new Error("The original result recipient is unavailable in this browser");
       await requestResult(store.put(candidate));
       stored = candidate;
     }
@@ -691,7 +703,7 @@ function requestOptions(session, phase, restrictTo) {
   }
   return {
     challenge: decodeUrl(session.challenges[phase].challenge),
-    rpId: "localhost",
+    rpId: ceremonyRpId,
     userVerification: "required",
     allowCredentials: allowed.map(item => ({
       type: "public-key", id: decodeUrl(item.credential_id)
@@ -708,7 +720,7 @@ async function createCredential(session, phase) {
   const options = session.webauthn_options;
   const credential = await navigator.credentials.create({publicKey: {
     challenge: decodeUrl(session.challenges[phase].challenge),
-    rp: {id: "localhost", name: "Bloom"},
+    rp: {id: ceremonyRpId, name: "Bloom"},
     user: {
       id: decodeUrl(options.registration_user_handle),
       name: `bloom-${session.operation_id.slice(0, 12)}`,
@@ -729,12 +741,13 @@ async function createCredential(session, phase) {
   }});
   return credential;
 }
-async function ensureNewCredentialPrf(session, credential, confirmPhase) {
+async function ensureNewCredentialPrf(session, credential, confirmPhase, forceAssertion = false) {
   const creationPrf = prfResult(credential);
-  if (creationPrf) return {prf: creationPrf, assertion: null};
+  if (creationPrf && !forceAssertion) return {prf: creationPrf, assertion: null};
+  if (forceAssertion) creationPrf?.fill(0);
   const confirmation = await navigator.credentials.get({publicKey: {
     challenge: decodeUrl(session.challenges[confirmPhase].challenge),
-    rpId: "localhost",
+    rpId: ceremonyRpId,
     userVerification: "required",
     allowCredentials: [{type: "public-key", id: credential.rawId}],
     extensions: {prf: {eval: {
@@ -746,16 +759,355 @@ async function ensureNewCredentialPrf(session, credential, confirmPhase) {
   return {prf: result, assertion: assertionJson(confirmation)};
 }
 
+// Pairing retains its recipient only in this tab. Refresh/expiry/cancel loses it;
+// neither origin stores an intermediate wallet secret or a reusable handoff.
+let crossSurfaceState = null;
+globalThis.addEventListener?.("pagehide", () => {
+  if (!crossSurfaceState) return;
+  stopCrossSurface();
+  void mutate(`/api/session/${ceremonyId}/cancel`, {}).catch(() => {});
+});
+function crossSurfaceAad(prepared, phase) {
+  return {
+    pairing_id: prepared.pairing.pairing_id,
+    operation_id: prepared.pairing.operation_id,
+    wallet_id: prepared.wallet_id,
+    source_surface: prepared.source_surface,
+    destination_surface: prepared.pairing.destination_surface,
+    exact_terms_digest: prepared.pairing.exact_terms_digest,
+    destination_challenge: prepared.pairing.destination_challenge,
+    phase
+  };
+}
+function crossSurfaceOptions(prepared, destination) {
+  return {
+    operation_id: prepared.pairing.operation_id,
+    challenges: (destination ? prepared.destination_challenges : [prepared.source_challenge])
+      .map(binding => ({binding, challenge: encodeUrl(te.encode(canonicalJson(binding)))})),
+    webauthn_options: {
+      allowed_credentials: destination ? [] : prepared.source_prf_inputs,
+      registration_user_handle: prepared.destination_user_handle,
+      registration_prf_salt: prepared.destination_prf_salt
+    }
+  };
+}
+function stopCrossSurface() {
+  if (!crossSurfaceState) return;
+  clearTimeout(crossSurfaceState.poll);
+  clearTimeout(crossSurfaceState.expiry);
+  crossSurfaceState.capability?.fill(0);
+  crossSurfaceState.recipient = null;
+  crossSurfaceState = null;
+}
+function requireCrossSurface(state) {
+  if (crossSurfaceState !== state || Date.now() >= state.expiresAt) {
+    throw new Error("Paired enrollment expired. Start again from Bloom.");
+  }
+}
+function validateCrossPrepared(session, prepared, pairingId) {
+  const cross = session.cross_surface;
+  if (!prepared || prepared.wallet_id !== cross.wallet_id ||
+      prepared.pairing?.operation_id !== session.operation_id ||
+      (pairingId && prepared.pairing.pairing_id !== pairingId) ||
+      !/^[0-9a-f]{64}$/.test(prepared.pairing?.pairing_id || "") ||
+      !/^[0-9]{6}$/.test(prepared.pairing?.confirmation_code || "") ||
+      !Number.isFinite(Number(prepared.pairing.expires_at_ms)) ||
+      Number(prepared.pairing.expires_at_ms) <= Date.now()) {
+    throw new Error("Paired enrollment binding changed");
+  }
+}
+async function loadCrossSurface(session) {
+  const cross = session.cross_surface;
+  if (!["source", "destination"].includes(cross.role) ||
+      (cross.role === "source" ? cross.source_origin : cross.destination_origin) !== location.origin) {
+    throw new Error("Paired enrollment has the wrong origin");
+  }
+  stopCrossSurface();
+  const state = {expiresAt: Number(session.expires_at_ms), recipient: null,
+    capability: null, poll: null, expiry: null};
+  if (!Number.isFinite(state.expiresAt) || state.expiresAt <= Date.now()) {
+    throw new Error("Paired enrollment expired");
+  }
+  crossSurfaceState = state;
+  const terminate = message => {
+    if (crossSurfaceState !== state) return;
+    stopCrossSurface();
+    approve.disabled = true;
+    cancel.disabled = true;
+    clearInterval(expiryTimer);
+    statusNode.textContent = message;
+  };
+  state.expiry = setTimeout(() => terminate("Paired enrollment expired. Start again from Bloom."),
+    Math.min(state.expiresAt - Date.now(), 10 * 60 * 1000));
+  for (const fields of [recoveryFields, exportFields, importFields, genericFields]) fields.hidden = true;
+  document.getElementById("page-title").textContent = "Add a wallet passkey";
+  document.getElementById("page-lede").textContent = "Approve with an existing passkey, then enroll one on the destination.";
+  panelTitle.textContent = cross.role === "source" ? "Authorize the destination" : "Prepare the destination";
+  panelKicker.textContent = "Paired enrollment";
+  const facts = el("dl", {class: "facts"},
+    el("dt", {}, "Wallet"), el("dd", {}, cross.wallet_id),
+    el("dt", {}, "Existing passkey"), el("dd", {}, cross.source_origin),
+    el("dt", {}, "New passkey"), el("dd", {}, cross.destination_origin));
+  const instructions = el("p", {class: "summary"});
+  const step = el("div");
+  const expiry = el("p", {class: "expiry"});
+  reviewNode.replaceChildren(facts, instructions, step, expiry);
+  startExpiry(session, expiry);
+  cancel.onclick = async () => {
+    // Discard the local recipient immediately even if cancellation cannot reach Broker.
+    terminate("Cancelled. You may close this tab.");
+    try { await mutate(`/api/session/${ceremonyId}/cancel`, {}); }
+    catch (_) { statusNode.textContent = "This tab is cancelled. The server will also expire the request."; }
+  };
+  const fail = error => {
+    terminate("Paired enrollment could not finish. Start again from Bloom.");
+    // Never log request bodies, capabilities or passkey extension output.
+    if (error?.name === "NotSupportedError") {
+      statusNode.textContent = "This browser or passkey does not support the required PRF extension. Use a supported browser and passkey.";
+    }
+    void mutate(`/api/session/${ceremonyId}/cancel`, {}).catch(() => {});
+  };
+  if (cross.role === "source") {
+    const prepared = cross.source_prepared;
+    validateCrossPrepared(session, prepared);
+    instructions.textContent = "Compare this code with the destination tab. Continue only if you opened that tab and both origins and codes match.";
+    step.append(el("p", {}, el("strong", {}, prepared.pairing.confirmation_code)));
+    const confirmed = el("input", {type: "checkbox"});
+    step.append(el("label", {}, confirmed, " I opened the destination and the code matches"));
+    approve.textContent = "Authorize with existing passkey";
+    approve.disabled = true;
+    confirmed.onchange = () => { approve.disabled = !confirmed.checked || crossSurfaceState !== state; };
+    statusNode.textContent = "Check the destination before authorizing.";
+    approve.onclick = async () => {
+      if (!confirmed.checked) return;
+      approve.disabled = true;
+      let prf;
+      try {
+        requireCrossSurface(state);
+        const credential = await getCredential(crossSurfaceOptions(prepared, false), 0);
+        prf = prfResult(credential);
+        if (!prf || prf.length !== 32) {
+          throw new DOMException("Passkey PRF is required", "NotSupportedError");
+        }
+        const encrypted = await hpkeSeal(decodeUrl(prepared.source_hpke_recipient_key),
+          te.encode("bloom-cross-surface-source-prf/v1"),
+          te.encode(canonicalJson(crossSurfaceAad(prepared, "source_prf"))), prf);
+        requireCrossSurface(state);
+        await mutate(`/api/cross/${ceremonyId}/authorize`, {
+          authority_assertion: assertionJson(credential), encrypted_authority_prf: encrypted
+        });
+        terminate("Authorized. Return to the destination tab to create the new passkey. It is not active yet.");
+      } catch (error) { fail(error); }
+      finally { prf?.fill(0); }
+    };
+    return;
+  }
+  instructions.textContent = "Keep this tab open. Bloom will give you a link for the existing passkey's origin.";
+  statusNode.textContent = "Prepare this tab to receive the authorization.";
+  approve.textContent = "Prepare enrollment";
+  approve.disabled = false;
+  approve.onclick = async () => {
+    approve.disabled = true;
+    try {
+      requireCrossSurface(state);
+      const pair = await crypto.subtle.generateKey({name: "X25519"}, false, ["deriveBits"]);
+      state.recipient = {privateKey: pair.privateKey,
+        publicKey: new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey))};
+      const started = await mutate(`/api/cross/${ceremonyId}/pair`, {
+        destination_hpke_public_key: encodeUrl(state.recipient.publicKey)
+      });
+      requireCrossSurface(state);
+      const sourceUrl = new URL(started.source_url);
+      if (sourceUrl.origin !== cross.source_origin || sourceUrl.username || sourceUrl.password ||
+          !/^[0-9]{6}$/.test(started.confirmation_code) ||
+          !/^[0-9a-f]{64}$/.test(started.pairing_id)) {
+        throw new Error("Invalid pairing response");
+      }
+      state.expiresAt = Math.min(state.expiresAt, Number(started.expires_at_ms));
+      if (!Number.isFinite(state.expiresAt)) throw new Error("Invalid pairing expiry");
+      step.replaceChildren(el("p", {}, el("strong", {}, started.confirmation_code)),
+        el("a", {href: sourceUrl.href, target: "_blank", rel: "noopener noreferrer"}, "Open existing-passkey approval"),
+        el("p", {}, cross.source_origin.startsWith("http://localhost:")
+          ? "Open this link in a browser on your Bloom host. Compare the code before approving."
+          : "Open this link where your existing passkey is available. Compare the code before approving."));
+      statusNode.textContent = "Waiting for your existing passkey approval…";
+      const poll = async () => {
+        try {
+          requireCrossSurface(state);
+          const response = await fetch(`/api/cross/${ceremonyId}/handoff`, {
+            headers: authHeaders, credentials: "same-origin", cache: "no-store"
+          });
+          if (!response.ok) throw new Error("Pairing is unavailable");
+          const handoff = await response.json();
+          requireCrossSurface(state);
+          if (handoff.state === "waiting") {
+            state.poll = setTimeout(poll, 2000);
+            return;
+          }
+          if (handoff.state !== "ready") throw new Error("Pairing is terminal");
+          const prepared = handoff.source_prepared;
+          validateCrossPrepared(session, prepared, started.pairing_id);
+          if (prepared.pairing.destination_hpke_public_key !== encodeUrl(state.recipient.publicKey) ||
+              prepared.pairing.confirmation_code !== started.confirmation_code) {
+            throw new Error("Destination recipient changed");
+          }
+          state.capability = await hpkeOpen(state.recipient,
+            te.encode("bloom-cross-surface-handoff/v1"),
+            te.encode(canonicalJson(crossSurfaceAad(prepared, "handoff"))), handoff.encrypted_capability);
+          requireCrossSurface(state);
+          if (state.capability.length !== 32) throw new Error("Invalid handoff");
+          step.replaceChildren(el("p", {}, "The existing passkey authorized this destination. Create the new passkey here to finish."));
+          statusNode.textContent = "Ready to enroll. Your wallet's addresses stay the same.";
+          approve.textContent = "Create destination passkey";
+          approve.disabled = false;
+          approve.onclick = async () => {
+            approve.disabled = true;
+            let newPrf;
+            try {
+              requireCrossSurface(state);
+              const options = crossSurfaceOptions(prepared, true);
+              const created = await createCredential(options, 0);
+              // Both attestation and a fresh assertion are mandatory on this leg.
+              newPrf = await ensureNewCredentialPrf(options, created, 1, true);
+              if (newPrf.prf.length !== 32) throw new Error("Invalid passkey PRF");
+              const encrypted = await hpkeSeal(decodeUrl(prepared.destination_hpke_recipient_key),
+                te.encode("bloom-cross-surface-destination-prf/v1"),
+                te.encode(canonicalJson(crossSurfaceAad(prepared, "destination_prf"))), newPrf.prf);
+              requireCrossSurface(state);
+              let result;
+              try {
+                result = await mutate(`/api/cross/${ceremonyId}/finish`, {
+                  capability: encodeUrl(state.capability), attestation: attestationJson(created),
+                  prf_assertion: newPrf.assertion, encrypted_new_prf: encrypted
+                });
+              } catch (error) {
+                // A lost response does not mean the atomic enrollment failed.
+                const recovered = await fetch(`/api/session/${ceremonyId}/result`, {
+                  headers: authHeaders, credentials: "same-origin", cache: "no-store"
+                });
+                if (!recovered.ok) throw error;
+                result = await recovered.json();
+              }
+              terminate("New passkey enrolled.");
+              renderDone(session, result);
+              clearSessionToken();
+              approve.hidden = true;
+              cancel.hidden = true;
+            } catch (error) { fail(error); }
+            finally { newPrf?.prf.fill(0); }
+          };
+        } catch (error) { fail(error); }
+      };
+      await poll();
+    } catch (error) { fail(error); }
+  };
+}
+
+function renderRecoveryBootstrap(message = "Have your recovery record ready to continue.") {
+  stopCrossSurface();
+  clearInterval(expiryTimer);
+  for (const fields of [recoveryFields, exportFields, importFields, genericFields]) fields.hidden = true;
+  document.getElementById("recovery-bootstrap").hidden = false;
+  document.getElementById("page-title").textContent = "Recover wallet access";
+  document.getElementById("page-lede").textContent = "Use a recovery record to enroll a new passkey. Successful recovery replaces all previous passkeys and issues a new recovery record.";
+  panelKicker.textContent = "Recovery";
+  panelTitle.textContent = "Identify your recovery record";
+  reviewNode.replaceChildren();
+  statusNode.textContent = message;
+  cancel.hidden = true;
+  approve.hidden = false;
+  approve.disabled = false;
+  approve.textContent = "Start recovery";
+  approve.onclick = async () => {
+    const walletId = document.getElementById("recovery-wallet-id").value.trim();
+    const recoveryId = document.getElementById("recovery-bootstrap-id").value.trim();
+    if (!walletId || !recoveryId) {
+      statusNode.textContent = "Enter the wallet ID and recovery record ID.";
+      return;
+    }
+    approve.disabled = true;
+    try {
+      const response = await fetch("/api/recovery/bootstrap", {
+        method: "POST", credentials: "same-origin", cache: "no-store",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({wallet_id: walletId, recovery_id: recoveryId})
+      });
+      if (!response.ok) throw new Error("Recovery is temporarily unavailable");
+      const started = await response.json();
+      const url = new URL(started.ceremony_url);
+      if (url.origin !== location.origin || url.username || url.password ||
+          (remoteCeremony ? !/^#cap=[A-Za-z0-9_-]{43}$/.test(url.hash)
+            : !/^\/ceremony\/[A-Za-z0-9_-]{43}$/.test(url.pathname))) {
+        throw new Error("Invalid recovery destination");
+      }
+      // Forward the opaque launch URL without adding identifiers or secrets.
+      location.assign(url.href);
+    } catch (_) {
+      statusNode.textContent = "Recovery could not start. Wait a moment and try again.";
+      approve.disabled = false;
+    }
+  };
+}
+
 async function load() {
   await cryptoSelfTest();
   await purgeExpiredBrowserState();
-  if (token.length !== 43) {
+  let sessionPath = "/api/session";
+  if (remoteCeremony) {
+    let exchanged;
+    if (token) {
+      if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error("Invalid ceremony URL");
+      const exchange = await fetch("/api/session/exchange", {
+        method: "POST", credentials: "same-origin",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({capability: token})
+      });
+      token = "";
+      if (!exchange.ok) throw new Error("Ceremony is unavailable");
+      exchanged = await exchange.json();
+      exchanged.expires_at = Date.now() + 25 * 60 * 1000;
+    } else {
+      try { exchanged = JSON.parse(browserSessionStorage()?.getItem("bloom.ceremony.remote-session.v1") || "null"); }
+      catch (_) {}
+    }
+    if (!exchanged) return renderRecoveryBootstrap();
+    if (!/^[0-9a-f]{64}$/.test(exchanged.ceremony_id) ||
+        !/^[A-Za-z0-9_-]{43}$/.test(exchanged.csrf) ||
+        !Number.isFinite(exchanged.expires_at) || exchanged.expires_at <= Date.now()) {
+      clearSessionToken();
+      return renderRecoveryBootstrap("This ceremony session expired. Start a new request in Bloom, or recover access with your recovery record.");
+    }
+    ceremonyId = exchanged.ceremony_id;
+    authHeaders["x-bloom-csrf"] = exchanged.csrf;
+    // This reference grants nothing without the scoped HttpOnly cookie. Never
+    // persist the launch capability or an exported private key.
+    try { browserSessionStorage()?.setItem("bloom.ceremony.remote-session.v1", JSON.stringify({
+      ceremony_id: ceremonyId, csrf: exchanged.csrf, expires_at: exchanged.expires_at
+    })); } catch (_) {}
+    sessionPath = `/api/session/${ceremonyId}`;
+  } else if (!token) {
+    return renderRecoveryBootstrap();
+  } else if (token.length !== 43) {
     throw new Error("Invalid ceremony URL");
   }
-  const response = await fetch("/api/session", {headers: authHeaders});
+  const response = await fetch(sessionPath, {headers: authHeaders, credentials: "same-origin"});
   if (!response.ok) throw new Error("Ceremony is unavailable");
   let session = await response.json();
+  if (ceremonyId && ceremonyId !== session.ceremony_id) {
+    throw new Error("Ceremony identity changed");
+  }
   ceremonyId = session.ceremony_id;
+  if (!/^[0-9a-f]{64}$/.test(ceremonyId)) throw new Error("Invalid ceremony identity");
+  const priorResult = await fetch(`/api/session/${ceremonyId}/result`, {
+    headers: authHeaders, credentials: "same-origin", cache: "no-store"
+  });
+  if (priorResult.ok) {
+    const result = await priorResult.json();
+    if (result.encrypted_browser_result) outputRecipient = await outputRecipientFor(session, true);
+    return finishBrowserResult(session, result);
+  }
+  if (priorResult.status !== 409) throw new Error("Ceremony is unavailable");
+  if (session.cross_surface) return loadCrossSurface(session);
   const legacyPasskeyImport = session.ceremony_kind === "wallet_import" &&
     session.signer_contribution?.expected_input_class === "legacy_passkey_v1_prf";
   const bip39Import = session.ceremony_kind === "wallet_import" &&
@@ -766,7 +1118,7 @@ async function load() {
   const scopedPetalKey = session.ceremony_kind === "key_derive" &&
     session.signer_contribution?.petal_key_scope;
   if ([
-    "wallet_registration", "wallet_import", "wallet_export",
+    "wallet_registration", "wallet_import", "wallet_export", "wallet_recovery",
     "key_derive"
   ].includes(
     session.ceremony_kind
@@ -995,6 +1347,11 @@ async function run(session) {
     if (!recovered.ok) throw error;
     result = await recovered.json();
   }
+  return finishBrowserResult(session, result);
+}
+
+async function finishBrowserResult(session, result) {
+  const contribution = session.signer_contribution;
   statusNode.textContent = "Completed.";
   clearInterval(expiryTimer);
   for (const fields of [recoveryFields, exportFields, importFields, genericFields]) fields.hidden = true;
@@ -1003,6 +1360,8 @@ async function run(session) {
   if (result.encrypted_browser_result) {
     if (!outputRecipient) throw new Error("Browser output key is unavailable");
     const outputAad = canonicalJson({
+      // Completed pre-surface receipts retain their original encrypted AAD.
+      ...(contribution.surface ? {surface: contribution.surface} : {}),
       ceremony_id: contribution.ceremony_id,
       ceremony_kind: contribution.ceremony_kind,
       custody_operation_id: contribution.custody_operation_id,
@@ -1035,6 +1394,7 @@ function canonicalJson(value) {
 function hpkeAad(session, contribution, credentialId) {
   if (session.ceremony_kind === "sealed_approval") {
     return {
+      surface: contribution.surface,
       activation_mode: contribution.activation_mode,
       allowed_crypto_suites: contribution.allowed_crypto_suites,
       approval_digest: contribution.approval_digest,
@@ -1048,6 +1408,7 @@ function hpkeAad(session, contribution, credentialId) {
     };
   }
   return {
+    surface: contribution.surface,
     ceremony_id: contribution.ceremony_id,
     ceremony_kind: contribution.ceremony_kind,
     credential_id: credentialId,
