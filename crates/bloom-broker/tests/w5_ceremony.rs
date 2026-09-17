@@ -3049,13 +3049,118 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         exact_result,
         MachineBrokerResponse::SigningSign(_)
     ));
-    assert!(
+    // The same operation again returns the signature it already produced: a
+    // caller that lost the first response must be able to learn it, and the
+    // single-operation approval is not charged twice.
+    assert_eq!(
         MachineBrokerService::dispatch(
             &broker,
             MachineBrokerRequest::SigningSign(exact_sign.clone()),
         )
         .await
-        .is_err()
+        .unwrap(),
+        exact_result
+    );
+    // Only the identical operation gets the stored result. The same id with a
+    // copied digest but anything else changed is refused and never answered
+    // with the stored signature.
+    let MachineBrokerResponse::SigningSign(stored) = &exact_result else {
+        unreachable!("matched above")
+    };
+    let tampered = |edit: &dyn Fn(&mut MachineSignRequest)| {
+        let mut request = exact_sign.clone();
+        edit(&mut request);
+        request.operation_digest = exact_sign.operation_digest.clone();
+        request
+    };
+    let another_wallet_approval = {
+        let mut terms = exact_terms.clone();
+        terms.wallet_id = Token::new("another-wallet").unwrap();
+        terms.approval_id().unwrap()
+    };
+    let attempts: [(&str, MachineSignRequest); 6] = [
+        (
+            "changed payload",
+            tampered(&|request| {
+                request.payloads = SigningPayloads::Single {
+                    payload: Base64UrlBytes::from_bytes(b"changed-exact-payload"),
+                }
+            }),
+        ),
+        (
+            "the wallet's account key",
+            tampered(&|request| request.key_ref = parent_key.clone()),
+        ),
+        (
+            "another wallet's approval",
+            tampered(&|request| request.approval_id = another_wallet_approval.clone()),
+        ),
+        (
+            "another Petal package",
+            tampered(&|request| {
+                request.provenance = ProvenanceSubject::Petal {
+                    package_hash: digest("c1"),
+                    route: petal_route.into(),
+                }
+            }),
+        ),
+        (
+            "another suite",
+            tampered(&|request| request.crypto_suite = CryptoSuite::Secp256k1Keccak256Recoverable),
+        ),
+        ("batch shape", tampered(&|_| {})),
+    ];
+    for (label, attempt) in attempts {
+        let response = if label == "batch shape" {
+            MachineBrokerService::dispatch(&broker, MachineBrokerRequest::SigningSignBatch(attempt))
+                .await
+        } else {
+            MachineBrokerService::dispatch(&broker, MachineBrokerRequest::SigningSign(attempt))
+                .await
+        };
+        assert!(
+            !matches!(
+                &response,
+                Ok(MachineBrokerResponse::SigningSign(result) | MachineBrokerResponse::SigningSignBatch(result))
+                    if result.signatures == stored.signatures
+            ),
+            "{label} must not receive the stored signature: {response:?}"
+        );
+    }
+    // The replay above shares a journal handle with the request that produced
+    // the signature, so on its own it does not show the result outlives the
+    // Broker. Reopen the journal from its file and read the operation back:
+    // the case this recovers from is a Broker that died before its caller saw
+    // the response, and a result held only in memory would be gone.
+    {
+        let reopened =
+            BrokerJournal::open(&broker_journal_path, Arc::new(ServiceTestAuditSigner)).unwrap();
+        let snapshot = reopened
+            .operation(&exact_sign.operation_id)
+            .unwrap()
+            .expect("the signed operation must still be in the reopened journal");
+        let recovered = snapshot
+            .result
+            .expect("a reopened journal must still carry the signing result");
+        assert_eq!(
+            recovered.signatures, stored.signatures,
+            "the reopened journal must hold the signature the Broker produced"
+        );
+        assert_eq!(
+            recovered.operation_digest, snapshot.operation_digest,
+            "the recovered result must stay bound to the operation's digest"
+        );
+    }
+    let mut second_operation = exact_sign.clone();
+    second_operation.operation_id = operation("e9");
+    assert!(
+        MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::SigningSign(second_operation),
+        )
+        .await
+        .is_err(),
+        "a second operation under a used single-operation approval is refused"
     );
     let changed_exact = exact_petal_sign_request(
         &exact_terms,
@@ -3197,15 +3302,17 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         )
         .unwrap();
 
-    // A consumed operation cannot issue another signature; a changed replay,
-    // cross-Petal provenance, and first-party provenance fail closed too.
-    assert!(
+    // A consumed operation issues no new signature: retrying it returns the
+    // one it already produced. A changed replay, cross-Petal provenance, and
+    // first-party provenance fail closed.
+    assert_eq!(
         MachineBrokerService::dispatch(
             &broker,
             MachineBrokerRequest::SigningSign(first_sign.clone()),
         )
         .await
-        .is_err()
+        .unwrap(),
+        MachineBrokerResponse::SigningSign(first_result.clone())
     );
     let mut changed_replay = petal_sign_request(
         &approval_terms,
