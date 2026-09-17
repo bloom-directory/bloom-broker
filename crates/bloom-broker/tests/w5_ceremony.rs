@@ -4390,6 +4390,46 @@ async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
 }
 
 #[tokio::test]
+async fn ending_a_failed_approvals_ceremony_frees_the_wallet_at_once() {
+    let signer = Arc::new(MockSigner::new());
+    let now_ms: u64 = 1_700_000_000_000;
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        signer.clone(),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[35; 32]),
+    );
+    let first = broker
+        .prepare_approval(approval_request(), ReviewManifestContext::default(), now_ms)
+        .unwrap();
+    let mut next = approval_request();
+    next.activation_operation_id = operation("27");
+    next.terms.request_nonce = RequestNonce::new("26".repeat(16)).unwrap();
+    assert_eq!(
+        broker
+            .prepare_approval(next.clone(), ReviewManifestContext::default(), now_ms)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::QuotaExceeded,
+        "fixture: the first approval's live ceremony blocks the wallet"
+    );
+
+    broker
+        .end_approval_ceremonies(&first.approval_id, now_ms + 1)
+        .unwrap();
+    assert!(
+        broker
+            .pending_approval_ceremony(&first.approval_id, now_ms + 1)
+            .unwrap()
+            .is_none(),
+        "the ended ceremony offers no URL"
+    );
+    assert_eq!(signer.cancellations.load(Ordering::SeqCst), 1);
+    broker
+        .prepare_approval(next, ReviewManifestContext::default(), now_ms + 2)
+        .expect("the owner's next approval opens immediately, with no cancellation backoff");
+}
+
+#[tokio::test]
 async fn cancelling_a_ceremony_that_already_died_succeeds_instead_of_stranding_the_caller() {
     let signer = Arc::new(MockSigner::new());
     let now_ms: u64 = 1_700_000_000_000;
