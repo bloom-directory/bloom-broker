@@ -281,6 +281,10 @@ impl BrokerRpcService {
                     self.authority
                         .revoke_local_approval(&approval_id)
                         .map_err(authority_error)?;
+                    // Its ceremony can no longer complete; release the
+                    // wallet's one live ceremony for the owner's next step.
+                    self.ceremony
+                        .end_approval_ceremonies(&approval_id, self.clock.now_ms(false)?)?;
                     statuses.push(self.approval_public_status(&approval_id)?);
                 }
                 // Every pass that revoked all of its targets completes the
