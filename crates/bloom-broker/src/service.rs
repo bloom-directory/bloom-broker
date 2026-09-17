@@ -985,6 +985,21 @@ impl BrokerRpcService {
             .ok_or_else(|| {
                 ProtocolError::new(ProtocolErrorCode::ApprovalNotFound, "approval not found")
             })?;
+        // A retry of an operation Broker already signed returns its recorded
+        // result. Authorizing it again would charge the approval a second
+        // time, so a caller that lost the first response to an approval with
+        // one operation could never learn the signature that exists.
+        if let Some(snapshot) = self
+            .journal
+            .operation(&request.operation_id)
+            .map_err(journal_error)?
+            && snapshot.kind == crate::journal::OPERATION_KIND
+            && snapshot.operation_digest == request.operation_digest
+            && snapshot.is_batch == is_batch
+            && let Some(result) = snapshot.result
+        {
+            return Ok(result);
+        }
         let trusted_time_required = !terms.limits.operation_rate_limits.is_empty()
             || !terms.limits.signature_rate_limits.is_empty()
             || terms

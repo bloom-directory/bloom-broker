@@ -3049,13 +3049,28 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         exact_result,
         MachineBrokerResponse::SigningSign(_)
     ));
-    assert!(
+    // The same operation again returns the signature it already produced: a
+    // caller that lost the first response must be able to learn it, and the
+    // single-operation approval is not charged twice.
+    assert_eq!(
         MachineBrokerService::dispatch(
             &broker,
             MachineBrokerRequest::SigningSign(exact_sign.clone()),
         )
         .await
-        .is_err()
+        .unwrap(),
+        exact_result
+    );
+    let mut second_operation = exact_sign.clone();
+    second_operation.operation_id = operation("e9");
+    assert!(
+        MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::SigningSign(second_operation),
+        )
+        .await
+        .is_err(),
+        "a second operation under a used single-operation approval is refused"
     );
     let changed_exact = exact_petal_sign_request(
         &exact_terms,
@@ -3197,15 +3212,17 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         )
         .unwrap();
 
-    // A consumed operation cannot issue another signature; a changed replay,
-    // cross-Petal provenance, and first-party provenance fail closed too.
-    assert!(
+    // A consumed operation issues no new signature: retrying it returns the
+    // one it already produced. A changed replay, cross-Petal provenance, and
+    // first-party provenance fail closed.
+    assert_eq!(
         MachineBrokerService::dispatch(
             &broker,
             MachineBrokerRequest::SigningSign(first_sign.clone()),
         )
         .await
-        .is_err()
+        .unwrap(),
+        MachineBrokerResponse::SigningSign(first_result.clone())
     );
     let mut changed_replay = petal_sign_request(
         &approval_terms,
