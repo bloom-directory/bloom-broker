@@ -3061,6 +3061,72 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .unwrap(),
         exact_result
     );
+    // Only the identical operation gets the stored result. The same id with a
+    // copied digest but anything else changed is refused and never answered
+    // with the stored signature.
+    let MachineBrokerResponse::SigningSign(stored) = &exact_result else {
+        unreachable!("matched above")
+    };
+    let tampered = |edit: &dyn Fn(&mut MachineSignRequest)| {
+        let mut request = exact_sign.clone();
+        edit(&mut request);
+        request.operation_digest = exact_sign.operation_digest.clone();
+        request
+    };
+    let another_wallet_approval = {
+        let mut terms = exact_terms.clone();
+        terms.wallet_id = Token::new("another-wallet").unwrap();
+        terms.approval_id().unwrap()
+    };
+    let attempts: [(&str, MachineSignRequest); 6] = [
+        (
+            "changed payload",
+            tampered(&|request| {
+                request.payloads = SigningPayloads::Single {
+                    payload: Base64UrlBytes::from_bytes(b"changed-exact-payload"),
+                }
+            }),
+        ),
+        (
+            "the wallet's account key",
+            tampered(&|request| request.key_ref = parent_key.clone()),
+        ),
+        (
+            "another wallet's approval",
+            tampered(&|request| request.approval_id = another_wallet_approval.clone()),
+        ),
+        (
+            "another Petal package",
+            tampered(&|request| {
+                request.provenance = ProvenanceSubject::Petal {
+                    package_hash: digest("c1"),
+                    route: petal_route.into(),
+                }
+            }),
+        ),
+        (
+            "another suite",
+            tampered(&|request| request.crypto_suite = CryptoSuite::Secp256k1Keccak256Recoverable),
+        ),
+        ("batch shape", tampered(&|_| {})),
+    ];
+    for (label, attempt) in attempts {
+        let response = if label == "batch shape" {
+            MachineBrokerService::dispatch(&broker, MachineBrokerRequest::SigningSignBatch(attempt))
+                .await
+        } else {
+            MachineBrokerService::dispatch(&broker, MachineBrokerRequest::SigningSign(attempt))
+                .await
+        };
+        assert!(
+            !matches!(
+                &response,
+                Ok(MachineBrokerResponse::SigningSign(result) | MachineBrokerResponse::SigningSignBatch(result))
+                    if result.signatures == stored.signatures
+            ),
+            "{label} must not receive the stored signature: {response:?}"
+        );
+    }
     let mut second_operation = exact_sign.clone();
     second_operation.operation_id = operation("e9");
     assert!(
