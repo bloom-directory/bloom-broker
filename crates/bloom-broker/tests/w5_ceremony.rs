@@ -3127,6 +3127,30 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             "{label} must not receive the stored signature: {response:?}"
         );
     }
+    // The replay above shares a journal handle with the request that produced
+    // the signature, so on its own it does not show the result outlives the
+    // Broker. Reopen the journal from its file and read the operation back:
+    // the case this recovers from is a Broker that died before its caller saw
+    // the response, and a result held only in memory would be gone.
+    {
+        let reopened =
+            BrokerJournal::open(&broker_journal_path, Arc::new(ServiceTestAuditSigner)).unwrap();
+        let snapshot = reopened
+            .operation(&exact_sign.operation_id)
+            .unwrap()
+            .expect("the signed operation must still be in the reopened journal");
+        let recovered = snapshot
+            .result
+            .expect("a reopened journal must still carry the signing result");
+        assert_eq!(
+            recovered.signatures, stored.signatures,
+            "the reopened journal must hold the signature the Broker produced"
+        );
+        assert_eq!(
+            recovered.operation_digest, snapshot.operation_digest,
+            "the recovered result must stay bound to the operation's digest"
+        );
+    }
     let mut second_operation = exact_sign.clone();
     second_operation.operation_id = operation("e9");
     assert!(
