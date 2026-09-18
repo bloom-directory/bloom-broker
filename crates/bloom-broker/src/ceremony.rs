@@ -238,6 +238,7 @@ pub struct ReviewManifestContext {
     pub petal_use_claim: Option<PetalUseClaim>,
     pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance: Option<ClaimAssurance>,
+    pub evm_review: Option<crate::evm_review::EvmReview>,
     pub attributed_advisory_items: Vec<String>,
 }
 
@@ -254,6 +255,8 @@ pub(crate) struct ReviewManifest {
     pub petal_use_claim: Option<PetalUseClaim>,
     pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance: Option<ClaimAssurance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm_review: Option<crate::evm_review::EvmReview>,
     pub attributed_advisory_items: Vec<String>,
     pub issued_at_ms: DecimalU64,
     pub expires_at_ms: DecimalU64,
@@ -275,6 +278,8 @@ impl ReviewManifest {
             petal_use_claim: &'a Option<PetalUseClaim>,
             system_use_claim: &'a Option<SystemUseClaim>,
             claim_assurance: &'a Option<ClaimAssurance>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            evm_review: &'a Option<crate::evm_review::EvmReview>,
             attributed_advisory_items: &'a [String],
             issued_at_ms: &'a DecimalU64,
             expires_at_ms: &'a DecimalU64,
@@ -291,6 +296,7 @@ impl ReviewManifest {
             petal_use_claim: &self.petal_use_claim,
             system_use_claim: &self.system_use_claim,
             claim_assurance: &self.claim_assurance,
+            evm_review: &self.evm_review,
             attributed_advisory_items: &self.attributed_advisory_items,
             issued_at_ms: &self.issued_at_ms,
             expires_at_ms: &self.expires_at_ms,
@@ -1989,12 +1995,14 @@ impl CeremonyBroker {
             manifest.claim_assurance.as_ref(),
             manifest.petal_use_claim.as_ref(),
             manifest.system_use_claim.as_ref(),
+            manifest.evm_review.is_some(),
         );
         let canonical_plan = canonical_review_plan(
             request,
             &disclosures,
             manifest.petal_use_claim.as_ref(),
             manifest.system_use_claim.as_ref(),
+            manifest.evm_review.as_ref(),
         )?;
         if manifest.approval_id != approval_id
             || manifest.approval_digest != approval_digest
@@ -2033,12 +2041,14 @@ impl CeremonyBroker {
             context.claim_assurance.as_ref(),
             context.petal_use_claim.as_ref(),
             context.system_use_claim.as_ref(),
+            context.evm_review.is_some(),
         );
         let canonical_plan = canonical_review_plan(
             request,
             &disclosures,
             context.petal_use_claim.as_ref(),
             context.system_use_claim.as_ref(),
+            context.evm_review.as_ref(),
         )?;
         let mut manifest = ReviewManifest {
             schema: Token::new("bloom.review-manifest.v1")?,
@@ -2059,6 +2069,7 @@ impl CeremonyBroker {
             petal_use_claim: context.petal_use_claim,
             system_use_claim: context.system_use_claim,
             claim_assurance: context.claim_assurance,
+            evm_review: context.evm_review,
             attributed_advisory_items: context.attributed_advisory_items,
             issued_at_ms: DecimalU64::new(now_ms),
             expires_at_ms: request.terms.expires_at_ms.clone(),
@@ -2997,11 +3008,44 @@ pub(crate) fn account_terms_review(
     })
 }
 
+/// Native asset metadata shared by every display path: (chain, asset) gives
+/// (decimals, symbol). This is the single source for which chains have known
+/// units — the EVM review display and the claim amount display both read it,
+/// so adding a chain in one place cannot silently leave the other raw.
+pub(crate) fn native_asset_metadata(chain: &str, asset: &str) -> Option<(u8, &'static str)> {
+    match (chain, asset) {
+        ("hyperliquid", "usdc") => Some((6, "USDC")),
+        ("solana", "native") | ("solana-mainnet", "native") => Some((9, "SOL")),
+        ("ethereum", "native")
+        | ("optimism", "native")
+        | ("base", "native")
+        | ("arbitrum", "native")
+        | ("anvil", "native") => Some((18, "ETH")),
+        ("polygon", "native") => Some((18, "POL")),
+        _ => None,
+    }
+}
+
+/// Format base units with an explicit decimal count (`300000` at 18 decimals
+/// renders `0.0000000000003`). Shared by the EVM review and claim amount
+/// displays so the same value can never render two ways.
+pub(crate) fn format_base_units(base_units: &str, decimals: usize) -> String {
+    let padded = format!("{:0>width$}", base_units, width = decimals + 1);
+    let split = padded.len() - decimals;
+    let fractional = padded[split..].trim_end_matches('0');
+    if fractional.is_empty() {
+        padded[..split].to_owned()
+    } else {
+        format!("{}.{}", &padded[..split], fractional)
+    }
+}
+
 fn canonical_review_plan(
     request: &CeremonyPrepareRequest,
     security_disclosures: &[String],
     claim: Option<&PetalUseClaim>,
     system_claim: Option<&SystemUseClaim>,
+    evm_review: Option<&crate::evm_review::EvmReview>,
 ) -> Result<String, ProtocolError> {
     #[derive(Serialize)]
     struct AssetAmountReview {
@@ -3022,6 +3066,8 @@ fn canonical_review_plan(
         exact_ordered_hashes: &'a [Digest32],
         replacement_approval_id: &'a Option<Digest32>,
         security_disclosures: &'a [String],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        evm_review: Option<&'a crate::evm_review::EvmReview>,
     }
     let mut asset_amounts = Vec::new();
     // A system claim declares the same amounts a Petal claim does. Reading
@@ -3093,16 +3139,7 @@ fn canonical_review_plan(
         asset: &str,
         base_units: &str,
     ) -> AssetAmountReview {
-        let metadata = match (chain, asset) {
-            ("hyperliquid", "usdc") => Some((6, "USDC")),
-            ("solana", "native") | ("solana-mainnet", "native") => Some((9, "SOL")),
-            ("ethereum", "native") | ("base", "native") | ("arbitrum", "native") => {
-                Some((18, "ETH"))
-            }
-            ("polygon", "native") => Some((18, "POL")),
-            _ => None,
-        };
-        let (display, decimals) = metadata.map_or_else(
+        let (display, decimals) = native_asset_metadata(chain, asset).map_or_else(
             || {
                 (
                     format!(
@@ -3113,7 +3150,10 @@ fn canonical_review_plan(
             },
             |(decimals, symbol)| {
                 (
-                    format!("{} {symbol}", format_base_units(base_units, decimals)),
+                    format!(
+                        "{} {symbol}",
+                        format_base_units(base_units, usize::from(decimals))
+                    ),
                     Some(decimals),
                 )
             },
@@ -3128,21 +3168,6 @@ fn canonical_review_plan(
         }
     }
 
-    fn format_base_units(base_units: &str, decimals: u8) -> String {
-        if decimals == 0 {
-            return base_units.to_owned();
-        }
-        let decimals = usize::from(decimals);
-        let padded = format!("{:0>width$}", base_units, width = decimals + 1);
-        let split = padded.len() - decimals;
-        let fractional = padded[split..].trim_end_matches('0');
-        if fractional.is_empty() {
-            padded[..split].to_owned()
-        } else {
-            format!("{}.{}", &padded[..split], fractional)
-        }
-    }
-
     serde_jcs::to_string(&Plan {
         schema: "bloom-review-plan/v1",
         asset_amounts,
@@ -3151,6 +3176,7 @@ fn canonical_review_plan(
         exact_ordered_hashes: &request.exact_ordered_hashes,
         replacement_approval_id: &request.replacement_approval_id,
         security_disclosures,
+        evm_review,
     })
     .map_err(malformed)
 }
@@ -3160,12 +3186,25 @@ fn review_disclosures(
     assurance: Option<&ClaimAssurance>,
     claim: Option<&PetalUseClaim>,
     system_claim: Option<&SystemUseClaim>,
+    has_evm_review: bool,
 ) -> Vec<String> {
     let mut disclosures = Vec::new();
-    if !request.exact_ordered_payload_digests.is_empty() || !request.exact_ordered_hashes.is_empty()
+    if !has_evm_review
+        && (!request.exact_ordered_payload_digests.is_empty()
+            || !request.exact_ordered_hashes.is_empty())
     {
         disclosures.push(
             "Bloom has not established the execution effects of these opaque payload digests and hashes."
+                .to_owned(),
+        );
+    }
+    if has_evm_review {
+        // The decoded destination and value come from the exact transaction
+        // bytes, but anything the input data would execute is still
+        // unverified. This lives in the signed disclosures (not just the
+        // page) so the honesty statement carries the manifest signature.
+        disclosures.push(
+            "Bloom decoded the destination and value from the exact transaction bytes. Bloom has not established the execution effects of any contract input data."
                 .to_owned(),
         );
     }
@@ -3602,4 +3641,44 @@ fn custody_review_manifest(
         manifest["key_ref"] = serde_json::to_value(key_ref).map_err(malformed)?;
     }
     Ok(Some(manifest))
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn absent_evm_review_preserves_legacy_manifest_bytes() {
+        let manifest = ReviewManifest {
+            schema: Token::new("bloom.review-manifest.v1").unwrap(),
+            approval_id: Digest32::from_bytes([1; 32]),
+            approval_digest: Digest32::from_bytes([2; 32]),
+            canonical_plan: "legacy canonical plan".into(),
+            canonical_plan_digest: Digest32::from_bytes([3; 32]),
+            exact_payload_digests: vec![Digest32::from_bytes([4; 32])],
+            exact_hashes: vec![Digest32::from_bytes([5; 32])],
+            petal_use_claim: None,
+            system_use_claim: None,
+            claim_assurance: None,
+            evm_review: None,
+            attributed_advisory_items: vec!["Petal route advisory".into()],
+            issued_at_ms: DecimalU64::new(6),
+            expires_at_ms: DecimalU64::new(7),
+            broker_key_id: Token::new("broker").unwrap(),
+            broker_signature: Base64UrlBytes::from_bytes(&[8; 64]),
+        };
+        // Bytes a Broker without `evm_review` produces and verifies. Rolling
+        // back must still read and verify manifests signed after this change.
+        let digest = |byte: u8| format!("{byte:02x}").repeat(32);
+        let (d1, d2, d3, d4, d5) = (digest(1), digest(2), digest(3), digest(4), digest(5));
+        let signature = format!(r#""broker_signature":"{}","#, "CAgI".repeat(21) + "CA");
+        let legacy = format!(
+            r#"{{"approval_digest":"{d2}","approval_id":"{d1}","attributed_advisory_items":["Petal route advisory"],"broker_key_id":"broker",{signature}"canonical_plan":"legacy canonical plan","canonical_plan_digest":"{d3}","claim_assurance":null,"exact_hashes":["{d5}"],"exact_payload_digests":["{d4}"],"expires_at_ms":"7","issued_at_ms":"6","petal_use_claim":null,"schema":"bloom.review-manifest.v1","system_use_claim":null}}"#
+        );
+        assert_eq!(serde_jcs::to_string(&manifest).unwrap(), legacy);
+        assert_eq!(
+            manifest.unsigned_canonical_bytes().unwrap(),
+            legacy.replace(&signature, "").into_bytes()
+        );
+    }
 }
