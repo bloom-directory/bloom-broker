@@ -3027,7 +3027,7 @@ pub(crate) fn native_asset_metadata(chain: &str, asset: &str) -> Option<(u8, &'s
 }
 
 /// Format base units with an explicit decimal count (`300000` at 18 decimals
-/// renders `0.0000000000000003`). Shared by the EVM review and claim amount
+/// renders `0.0000000000003`). Shared by the EVM review and claim amount
 /// displays so the same value can never render two ways.
 pub(crate) fn format_base_units(base_units: &str, decimals: usize) -> String {
     let padded = format!("{:0>width$}", base_units, width = decimals + 1);
