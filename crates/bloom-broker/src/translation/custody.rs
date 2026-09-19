@@ -42,8 +42,10 @@ fn legacy_migration_to_signer(
 
 pub(crate) fn prepare_to_signer(
     value: north::CustodyPrepareRequest,
+    surface: south::SurfaceRef,
 ) -> south::CustodyPrepareRequest {
     south::CustodyPrepareRequest {
+        surface,
         ceremony_kind: ceremony::kind_to_signer(value.ceremony_kind),
         custody_operation_id: value.custody_operation_id,
         wallet_id: value.wallet_id,
@@ -104,6 +106,11 @@ fn derived_request_to_signer(value: north::DerivedAccountRequest) -> south::Deri
 
 pub(crate) fn result_to_machine(value: south::CustodyResult) -> north::CustodyResult {
     north::CustodyResult {
+        surface: value.surface.map(|surface| north::CeremonySurfaceRef {
+            surface_id: surface.surface_id,
+            identity_digest: surface.identity_digest,
+        }),
+        credential_authority_generation: value.credential_authority_generation,
         ceremony_kind: ceremony::kind_to_machine(value.ceremony_kind),
         custody_operation_id: value.custody_operation_id,
         public_status: ceremony::state_to_machine(value.public_status),
@@ -118,6 +125,10 @@ pub(crate) fn result_to_machine(value: south::CustodyResult) -> north::CustodyRe
             .into_iter()
             .map(|credential| north::CredentialSummary {
                 credential_id: credential.credential_id,
+                surface: credential.surface.map(|surface| north::CeremonySurfaceRef {
+                    surface_id: surface.surface_id,
+                    identity_digest: surface.identity_digest,
+                }),
                 rp_id: credential.rp_id,
                 active: credential.active,
             })
@@ -156,13 +167,13 @@ mod tests {
             Some(north::WalletSeedProfile::ImportedSecp256k1Scalar)
         );
         assert_eq!(
-            prepare_to_signer(imported).wallet_seed_profile,
+            prepare_to_signer(imported, south::legacy_local_surface()).wallet_seed_profile,
             Some(south::WalletSeedProfile::ImportedSecp256k1Scalar)
         );
         registration.wallet_seed_profile = Some(north::WalletSeedProfile::Bip39MulticurveV1);
         let explicit = apply_seed_profile_selection(&registration);
         assert_eq!(
-            prepare_to_signer(explicit).wallet_seed_profile,
+            prepare_to_signer(explicit, south::legacy_local_surface()).wallet_seed_profile,
             Some(south::WalletSeedProfile::Bip39MulticurveV1)
         );
     }
@@ -192,6 +203,7 @@ mod tests {
     fn registration_request() -> north::CustodyPrepareRequest {
         north::CustodyPrepareRequest {
             ceremony_kind: north::CeremonyKind::WalletRegistration,
+            surface_selection: north::CeremonySurfaceSelection::Default,
             custody_operation_id: north::OperationId::from_bytes([1; 32]),
             wallet_id: Some(north::Token::new("quiet-lilac").unwrap()),
             key_ref: None,
@@ -242,6 +254,7 @@ mod tests {
         };
         let request = north::CustodyPrepareRequest {
             ceremony_kind: north::CeremonyKind::KeyDerive,
+            surface_selection: north::CeremonySurfaceSelection::Default,
             custody_operation_id: operation(9),
             wallet_id: Some(north::Token::new("wallet-1").unwrap()),
             key_ref: Some(north_key("parent-2", 3)),
@@ -268,7 +281,7 @@ mod tests {
                 .code,
             north::ProtocolErrorCode::OperationIdConflict
         );
-        let mapped = prepare_to_signer(request);
+        let mapped = prepare_to_signer(request, south::legacy_local_surface());
         mapped.validate_petal_key_scope_binding().unwrap();
         let mapped_scope = mapped.petal_key_scope.unwrap();
         assert_eq!(mapped.ceremony_kind, south::CeremonyKind::KeyDerive);
@@ -319,6 +332,7 @@ mod tests {
         };
         let request = north::CustodyPrepareRequest {
             ceremony_kind: north::CeremonyKind::WalletImport,
+            surface_selection: north::CeremonySurfaceSelection::Default,
             custody_operation_id: operation_id.clone(),
             wallet_id: None,
             key_ref: None,
@@ -332,7 +346,7 @@ mod tests {
             account_terms: None,
         };
         request.validate_legacy_passkey_migration_binding().unwrap();
-        let mapped = prepare_to_signer(request);
+        let mapped = prepare_to_signer(request, south::legacy_local_surface());
         mapped.validate_legacy_passkey_migration_binding().unwrap();
         let mapped_migration = mapped.legacy_passkey_migration.unwrap();
         assert_eq!(mapped_migration.wallet_name, migration.wallet_name);
@@ -352,6 +366,8 @@ mod tests {
     #[test]
     fn custody_result_preserves_receipt_signature_and_encrypted_output() {
         let result = south::CustodyResult {
+            surface: Some(south::legacy_local_surface()),
+            credential_authority_generation: Some(south::DecimalU64::new(0)),
             ceremony_kind: south::CeremonyKind::WalletExport,
             custody_operation_id: operation(12),
             public_status: south::CeremonyState::Succeeded,
@@ -366,6 +382,7 @@ mod tests {
             }],
             credential_summaries: vec![south::CredentialSummary {
                 credential_id: south::Base64UrlBytes::from_bytes(&[18]),
+                surface: Some(south::legacy_local_surface()),
                 rp_id: south::Token::new("rp-19").unwrap(),
                 active: true,
             }],

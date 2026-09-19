@@ -10,9 +10,12 @@ triad-dev-harness = ["bloom-triad-local-transport/triad-dev-harness"]
 
 [dependencies]
 axum.workspace = true
+axum-server.workspace = true
 bloom-broker-api = { path = "../bloom-broker-api" }
 bloom-signer-api.workspace = true
 bloom-solana-verify.workspace = true
+bloom-relay-client.workspace = true
+bloom-relay-protocol.workspace = true
 bloom-platform-containment.workspace = true
 bloom-triad-local-transport.workspace = true
 bloom-audit-checkpoint.workspace = true
@@ -26,6 +29,12 @@ hex.workspace = true
 num-bigint.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
+rustls.workspace = true
+uuid.workspace = true
+instant-acme.workspace = true
+libc = "0.2"
+futures-util.workspace = true
+x509-parser.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_jcs.workspace = true
@@ -39,10 +48,8 @@ zeroize.workspace = true
 
 [dev-dependencies]
 bloom-broker-debug-driver = { path = "../bloom-broker-debug-driver" }
-# The socket-activation regression hands a real descriptor to a child process
-# between fork and exec, which needs dup2/fcntl directly.
-libc = "0.2"
-bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "ccc9adb3866b17b87d2774018dcfa015184b1918" }
+bloom-relay-admin-client.workspace = true
+bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "7dddac2985bf00810589f02b4081062ef576a63b" }
 bloom-signer-vectors.workspace = true
 futures = "0.3"
 http-body-util = "0.1"
@@ -50,5 +57,6 @@ k256.workspace = true
 tempfile = "3"
 tracing = "0.1"
 tower = { version = "0.5", features = ["util"] }
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["signal", "test-util"] }
+rcgen = "0.14"
 tracing-subscriber = { version = "0.3", features = ["fmt", "json"] }

@@ -544,6 +544,7 @@ async fn register_bip39_wallet(
     let attestation = authenticator.attestation(&first.canonical_bytes().unwrap());
     let assertion = authenticator.assertion(&second.canonical_bytes().unwrap(), 1);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: contribution.ceremony_id.clone(),
         ceremony_kind: bloom_signer_api::CeremonyKind::WalletRegistration,
         custody_operation_id: operation_id.clone(),
@@ -617,6 +618,7 @@ fn custody_request(
     input_class: Token,
 ) -> bloom_broker_api::CustodyPrepareRequest {
     bloom_broker_api::CustodyPrepareRequest {
+        surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
         ceremony_kind: kind,
         custody_operation_id: operation_id,
         wallet_id,
@@ -656,6 +658,7 @@ async fn complete_generic_ceremony(
         serde_json::from_value(session["signer_contribution"].clone()).unwrap();
     let assertion = authenticator.assertion(&challenge.canonical_bytes().unwrap(), sign_count);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: contribution.ceremony_id.clone(),
         ceremony_kind: south_ceremony_kind(request.ceremony_kind),
         custody_operation_id: request.custody_operation_id.clone(),
@@ -1242,6 +1245,7 @@ async fn two_passkeys_and_recovery_unlock_the_same_bip39_root_over_real_transpor
             &south_envelope(registration.encrypted_browser_result.as_ref().unwrap()),
             CUSTODY_OUTPUT_INFO,
             &CustodyOutputHpkeAad {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_id: registration_contribution.ceremony_id.clone(),
                 ceremony_kind: bloom_signer_api::CeremonyKind::WalletRegistration,
                 custody_operation_id: registration.custody_operation_id.clone(),
@@ -1299,6 +1303,7 @@ async fn two_passkeys_and_recovery_unlock_the_same_bip39_root_over_real_transpor
     let new_attestation = passkey_b.attestation(&attestation_challenge.canonical_bytes().unwrap());
     let new_prf_assertion = passkey_b.assertion(&prf_challenge.canonical_bytes().unwrap(), 1);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: contribution.ceremony_id.clone(),
         ceremony_kind: bloom_signer_api::CeremonyKind::CredentialAdd,
         custody_operation_id: add_operation.clone(),
@@ -1395,12 +1400,41 @@ async fn two_passkeys_and_recovery_unlock_the_same_bip39_root_over_real_transpor
         .ceremony_id
         .to_string();
     let recovery_token = url_token(&recovery_prepared.ceremony_url);
-    let recovery_session = get_session(
+    let _recovery_session = get_session(
         stack.broker.as_ref(),
         &recovery_ceremony_id,
         &recovery_token,
     )
     .await;
+    // Recovery can return sensitive wallet material. The browser must bind a
+    // fresh result recipient before the Signer contribution is completed.
+    let recovery_recipient = HpkeRecipient::generate();
+    let bound = stack
+        .broker
+        .ceremony()
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/session/{recovery_ceremony_id}/output-key"))
+                .header(header::HOST, "localhost:18734")
+                .header(header::ORIGIN, "http://localhost:18734")
+                .header("x-bloom-ceremony-token", &recovery_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "recipient_key": recovery_recipient.public_key()
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound.status(), StatusCode::OK);
+    let recovery_session: serde_json::Value =
+        serde_json::from_slice(&bound.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let recovery_attestation_challenge: CeremonyChallenge =
         serde_json::from_value(recovery_session["challenges"][0]["binding"].clone()).unwrap();
     let recovery_prf_challenge: CeremonyChallenge =
@@ -1412,6 +1446,7 @@ async fn two_passkeys_and_recovery_unlock_the_same_bip39_root_over_real_transpor
     let recovery_prf_assertion =
         recovery_credential.assertion(&recovery_prf_challenge.canonical_bytes().unwrap(), 1);
     let recovery_aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: recovery_contribution.ceremony_id.clone(),
         ceremony_kind: bloom_signer_api::CeremonyKind::WalletRecovery,
         custody_operation_id: recovery_operation.clone(),
@@ -1455,6 +1490,27 @@ async fn two_passkeys_and_recovery_unlock_the_same_bip39_root_over_real_transpor
     )
     .await;
     assert_eq!(recovery_status, StatusCode::OK);
+    let recovery_result = custody_result(&stack, &recovery_operation).await;
+    assert!(recovery_result.encrypted_browser_result.is_some());
+    let ack = stack
+        .broker
+        .ceremony()
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/session/{recovery_ceremony_id}/ack"))
+                .header(header::HOST, "localhost:18734")
+                .header(header::ORIGIN, "http://localhost:18734")
+                .header("x-bloom-ceremony-token", &recovery_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ack.status(), StatusCode::NO_CONTENT);
 
     // The recovery credential now allocates from the same root.
     let public_after_recovery = wallet_public(&stack, &wallet_id).await;
@@ -1706,6 +1762,7 @@ async fn broker_bip39_secret_scan_is_empty_across_sqlite_logs_and_responses() {
             &south_envelope(registration.encrypted_browser_result.as_ref().unwrap()),
             CUSTODY_OUTPUT_INFO,
             &CustodyOutputHpkeAad {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_id: registration_contribution.ceremony_id.clone(),
                 ceremony_kind: bloom_signer_api::CeremonyKind::WalletRegistration,
                 custody_operation_id: registration.custody_operation_id.clone(),
@@ -1858,6 +1915,7 @@ async fn approve_and_sign(
     let approve_prepared = match MachineBrokerService::dispatch(
         stack.broker.as_ref(),
         MachineBrokerRequest::SealedApprovalPrepare(bloom_broker_api::ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: approval_operation.clone(),
             terms: terms.clone(),
             canonical_plan_facts_digest: terms.approval_digest().unwrap(),
@@ -1886,6 +1944,7 @@ async fn approve_and_sign(
         serde_json::from_value(session["signer_contribution"].clone()).unwrap();
     let assertion = authenticator.assertion(&challenge.canonical_bytes().unwrap(), sign_count);
     let aad = LocalPrfHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: contribution.ceremony_id.clone(),
         signer_nonce: contribution.signer_nonce.clone(),
         approval_id: terms.approval_id().unwrap(),

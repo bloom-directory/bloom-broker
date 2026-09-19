@@ -14,18 +14,22 @@ rust-version = "1.85"
 license = "MIT"
 
 [workspace.dependencies]
-bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "ccc9adb3866b17b87d2774018dcfa015184b1918" }
-bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "ccc9adb3866b17b87d2774018dcfa015184b1918" }
+bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }
+bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "7dddac2985bf00810589f02b4081062ef576a63b" }
+bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "7dddac2985bf00810589f02b4081062ef576a63b" }
 bloom-solana-verify = { path = "crates/bloom-solana-verify" }
+bloom-relay-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "329b955454db23813e24b0947142c0398bed4b00" }
+bloom-relay-protocol = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "329b955454db23813e24b0947142c0398bed4b00" }
+bloom-relay-admin-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "329b955454db23813e24b0947142c0398bed4b00" }
 bs58 = "0.5"
-bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
-bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
-bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
-bloom-service-observability = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
-bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
-bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
+bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }
+bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }
+bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }
+bloom-service-observability = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }
+bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }
+bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_jcs = "0.2"
@@ -38,6 +42,8 @@ num-bigint = "0.5"
 parking_lot = "0.12"
 p256 = { version = "0.14", features = ["ecdsa"] }
 rand = "0.10"
+rustls = "0.23"
+uuid = "1"
 thiserror = "2"
 tracing = "0.1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
@@ -50,3 +56,6 @@ bip32 = { version = "0.5", features = ["secp256k1"] }
 k256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 memchr = "2"
 hkdf = "0.13"
+instant-acme = { version = "0.8.5", features = ["rcgen"] }
+futures-util = "0.3"
+x509-parser = "0.18"

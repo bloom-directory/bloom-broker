@@ -84,6 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             serde_json::from_value(session["signer_contribution"].clone())?;
         let assertion = authenticator.assertion(&challenges[0].canonical_bytes()?, sign_count);
         let aad = LocalPrfHpkeAad {
+            surface: contribution.surface.clone(),
             ceremony_id: contribution.ceremony_id.clone(),
             signer_nonce: contribution.signer_nonce.clone(),
             approval_id: serde_json::from_value(session["review_manifest"]["approval_id"].clone())?,
@@ -219,6 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let aad = CustodyHpkeAad {
+        surface: contribution.surface.clone(),
         ceremony_id: contribution.ceremony_id.clone(),
         ceremony_kind: contribution.ceremony_kind,
         custody_operation_id: contribution.custody_operation_id.clone(),
