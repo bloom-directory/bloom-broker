@@ -301,6 +301,135 @@ if (nodes["page-title"].textContent !== "Remove a passkey from a wallet" ||
 }
 
 #[test]
+fn evm_manifest_is_rendered_as_primary_review_facts() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  setAttribute() {{}}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+function session(payload) {{
+  return {{
+    ceremony_kind: "sealed_approval",
+    expires_at_ms: Date.now() + 60000,
+    signer_contribution: {{wallet_id: "wallet-primary"}},
+    review_manifest: {{
+      schema: "bloom.review-manifest.v1",
+      canonical_plan: JSON.stringify({{evm_review: {{payloads: [payload]}}}}),
+      attributed_advisory_items: []
+    }}
+  }};
+}}
+renderReview(session({{
+  chain_id: "8453", chain: "base",
+  sender: "0x1111111111111111111111111111111111111111",
+  destination: "0x2222222222222222222222222222222222222222",
+  value: "300000000000000", value_display: "0.0003 ETH",
+  nonce: "7", gas_limit: "21000",
+  fee: {{kind: "eip1559", max_fee_per_gas: "1500000000",
+    max_fee_per_gas_display: "1.5 Gwei", max_priority_fee_per_gas: "1000000000",
+    max_priority_fee_per_gas_display: "1 Gwei"}},
+  payload_keccak: "0xabc",
+  calldata_bytes: "0"
+}}));
+let rendered = allText(nodes.review);
+for (const expected of ["0x2222222222222222222222222222222222222222", "0.0003 ETH",
+  "Base", "Gas limit", "Maximum fee rate", "1.5 Gwei", "Priority fee cap",
+  "Exact envelope checked", "Contract execution effects are not verified",
+  "Calldata", "None — plain transfer"]) {{
+  if (!rendered.includes(expected)) throw new Error(`missing ${{expected}}: ${{rendered}}`);
+}}
+for (const stale of ["Native value (wei)", "per gas (wei)", "Some("]) {{
+  if (rendered.includes(stale)) throw new Error(`stale EVM rendering ${{stale}}: ${{rendered}}`);
+}}
+
+renderReview(session({{
+  chain_id: "999999", chain: "evm-999999",
+  sender: "0x1111111111111111111111111111111111111111",
+  destination: "0x2222222222222222222222222222222222222222",
+  value: "300000000000000",
+  value_display: "300000000000000 raw native units on evm-999999 (token decimals unknown)",
+  nonce: "8", gas_limit: "22000",
+  fee: {{kind: "legacy", gas_price: "2000000000", gas_price_display: "2 Gwei"}},
+  payload_keccak: "0xdef",
+  calldata_bytes: "0"
+}}));
+rendered = allText(nodes.review);
+if (!rendered.includes("300000000000000 raw native units on evm-999999") ||
+    rendered.includes("0.0003 ETH") || rendered.includes("0.0003 POL")) {{
+  throw new Error(`unknown chain invented asset metadata: ${{rendered}}`);
+}}
+
+// A contract call must not render like a dust transfer: the sentence names
+// it a call and the facts disclose the calldata size and commitment.
+renderReview(session({{
+  chain_id: "1", chain: "ethereum",
+  sender: "0x1111111111111111111111111111111111111111",
+  destination: "0x0909090909090909090909090909090909090909",
+  value: "1", value_display: "0.000000000000000001 ETH",
+  nonce: "3", gas_limit: "21000",
+  fee: {{kind: "legacy", gas_price: "1000000000", gas_price_display: "1 Gwei"}},
+  payload_keccak: "0x47e9",
+  calldata_bytes: "1234", calldata_keccak: "0x1234"
+}}));
+rendered = allText(nodes.review);
+for (const expected of ["Approve one contract call", "1,234 bytes", "0x1234"]) {{
+  if (!rendered.includes(expected)) throw new Error(`contract call not disclosed ${{expected}}: ${{rendered}}`);
+}}
+
+// Creation carries initcode: the page shows the deploy action with the
+// initcode size, never a blank recipient.
+renderReview(session({{
+  chain_id: "31337", chain: "anvil",
+  sender: "0x1111111111111111111111111111111111111111",
+  value: "123", value_display: "0.000000000000000123 ETH",
+  nonce: "3", gas_limit: "100000",
+  fee: {{kind: "eip1559", max_fee_per_gas: "10000000000",
+    max_fee_per_gas_display: "10 Gwei", max_priority_fee_per_gas: "1000000000",
+    max_priority_fee_per_gas_display: "1 Gwei"}},
+  payload_keccak: "0xbeef",
+  calldata_bytes: "5", calldata_keccak: "0xcafe"
+}}));
+rendered = allText(nodes.review);
+for (const expected of ["Deploy one contract", "Deploy contract (CREATE)", "5 bytes", "0xcafe"]) {{
+  if (!rendered.includes(expected)) throw new Error(`creation not disclosed ${{expected}}: ${{rendered}}`);
+}}
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn key_derive_primary_review_explains_the_session_without_internal_scope_json() {
     let asset = include_str!("../src/ceremony_assets/app.js");
     let executable = asset
@@ -2780,6 +2909,55 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         expires_at_ms: DecimalU64::new(approval_expires_at_ms),
         renewal_of: None,
     };
+    // A native EVM review reads the creation opt-in from the policy the terms
+    // are bound to: terms naming another policy are refused before review.
+    let creation = alloy::consensus::TxEip1559 {
+        chain_id: 31337,
+        to: alloy::primitives::TxKind::Create,
+        input: vec![0x60, 0, 0x60, 0, 0xf3].into(),
+        ..Default::default()
+    };
+    let creation =
+        alloy::consensus::SignableTransaction::<alloy::primitives::Signature>::encoded_for_signing(
+            &creation,
+        );
+    let stale_policy_error = MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_review_payloads: vec![Base64UrlBytes::from_bytes(&creation)],
+            safe_review_payloads: Vec::new(),
+            operation_id: operation("d9"),
+            terms: SealedApprovalTerms {
+                subject: ApprovalSubject::Cli {
+                    client_id: Token::new("machine").unwrap(),
+                    command_class: Token::new("transaction.confirm").unwrap(),
+                },
+                allowed_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+                selector: ApprovalSelector::Exact {
+                    ordered_payload_digests: vec![Digest32::from_bytes(
+                        sha2::Sha256::digest(&creation).into(),
+                    )],
+                    ordered_hashes: vec![Digest32::from_bytes(
+                        alloy::primitives::keccak256(&creation).0,
+                    )],
+                },
+                policy_version: DecimalU64::new(1),
+                request_nonce: RequestNonce::from_bytes([0xd9; 16]),
+                ..approval_terms.clone()
+            },
+            canonical_plan_facts_digest: digest("d9"),
+            petal_use_claim: None,
+            system_use_claim: None,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        stale_policy_error
+            .message
+            .contains("not bound to Broker's verified current policy"),
+        "{stale_policy_error:?}"
+    );
     let approval_operation = operation("d3");
     let approval_prepared = match MachineBrokerService::dispatch(
         &broker,
@@ -4346,11 +4524,12 @@ async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
         serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let manifest = projection["review_manifest"].clone();
     let canonical_plan = manifest["canonical_plan"].as_str().unwrap();
+    assert!(manifest.get("evm_review").is_none());
+    assert!(!canonical_plan.contains("evm_review"));
     assert!(canonical_plan.to_lowercase().contains("sha256"));
     assert!(canonical_plan.contains("max_operations"));
     assert!(canonical_plan.contains("root-key"));
     assert!(canonical_plan.contains("Bloom has not established the execution effects"));
-    assert!(canonical_plan.contains("machine supplied descriptions are advisory"));
     let broker_signature: Base64UrlBytes =
         serde_json::from_value(manifest["broker_signature"].clone()).unwrap();
     assert_eq!(broker_signature.decode().len(), 64);
