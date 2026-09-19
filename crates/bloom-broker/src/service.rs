@@ -819,7 +819,8 @@ impl BrokerRpcService {
                     )
                 })?;
             context.evm_review = crate::evm_review::review(&request, &policy, from)?;
-            context.attributed_advisory_items = crate::safe_review::review(&request, &policy, from)?;
+            context.attributed_advisory_items =
+                crate::safe_review::review(&request, &policy, from)?;
             // Each reviewer answers only for its own payload list, and this
             // branch is only entered when one of them is non-empty. Nothing to
             // show the owner means review payloads were accepted without a
