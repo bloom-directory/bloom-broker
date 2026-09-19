@@ -35,8 +35,41 @@ type Failure = Box<dyn std::error::Error + Send + Sync>;
 const RENEW_BEFORE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const SCOPED_RENEW_BEFORE_MS: u64 = 6 * 60 * 60 * 1000;
 
-fn certificate_renewal_due(not_after_ms: u64, now_ms: u64) -> bool {
-    not_after_ms <= now_ms.saturating_add(RENEW_BEFORE_MS)
+#[derive(Clone, Copy)]
+enum AcmeDirectory {
+    Production,
+    #[cfg(test)]
+    Staging,
+}
+
+impl AcmeDirectory {
+    fn url(self) -> &'static str {
+        match self {
+            Self::Production => LetsEncrypt::Production.url(),
+            #[cfg(test)]
+            Self::Staging => LetsEncrypt::Staging.url(),
+        }
+    }
+
+    fn account_prefix(self) -> &'static str {
+        match self {
+            Self::Production => "https://acme-v02.api.letsencrypt.org/acme/acct/",
+            #[cfg(test)]
+            Self::Staging => "https://acme-staging-v02.api.letsencrypt.org/acme/acct/",
+        }
+    }
+
+    fn accepts_account_id(self, account_id: &str) -> bool {
+        account_id
+            .strip_prefix(self.account_prefix())
+            .is_some_and(|identifier| {
+                !identifier.is_empty() && identifier.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    }
+}
+
+fn certificate_renewal_due(not_after_ms: u64, now_ms: u64, renew_before_ms: u64) -> bool {
+    not_after_ms <= now_ms.saturating_add(renew_before_ms)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -282,11 +315,30 @@ pub(super) async fn maintain_certificate(
     installation_id: Uuid,
     uid: u32,
 ) -> Result<(), Failure> {
+    maintain_certificate_with_policy(
+        config,
+        hostname,
+        installation_id,
+        uid,
+        AcmeDirectory::Production,
+        RENEW_BEFORE_MS,
+    )
+    .await
+}
+
+async fn maintain_certificate_with_policy(
+    config: &RemoteTlsConfig,
+    hostname: &str,
+    installation_id: Uuid,
+    uid: u32,
+    directory: AcmeDirectory,
+    renew_before_ms: u64,
+) -> Result<(), Failure> {
     bloom_relay_protocol::validate_hostname(hostname)?;
-    let account = ensure_acme_account(config, uid).await?;
+    let account = ensure_acme_account_at(config, uid, directory).await?;
     if let Ok(bundle) = load_published_bundle(&config.bundle_path, hostname, uid) {
         if let Ok(info) = validate_bundle(&bundle, hostname, now_ms()?) {
-            if !certificate_renewal_due(info.not_after_ms, now_ms()?) {
+            if !certificate_renewal_due(info.not_after_ms, now_ms()?, renew_before_ms) {
                 return Ok(());
             }
         }
@@ -385,6 +437,14 @@ pub(super) async fn ensure_acme_account(
     config: &RemoteTlsConfig,
     uid: u32,
 ) -> Result<Account, Failure> {
+    ensure_acme_account_at(config, uid, AcmeDirectory::Production).await
+}
+
+async fn ensure_acme_account_at(
+    config: &RemoteTlsConfig,
+    uid: u32,
+    directory: AcmeDirectory,
+) -> Result<Account, Failure> {
     let parent = config
         .bundle_path
         .parent()
@@ -397,8 +457,9 @@ pub(super) async fn ensure_acme_account(
         );
     }
     let account = if account_path.exists() {
-        let credentials: AccountCredentials =
-            serde_json::from_slice(&read_protected(&account_path, uid)?)?;
+        let encoded = Zeroizing::new(read_protected(&account_path, uid)?);
+        validate_persisted_account_credentials(&encoded, directory)?;
+        let credentials: AccountCredentials = serde_json::from_slice(&encoded)?;
         Account::builder()?.from_credentials(credentials).await?
     } else {
         let (account, credentials) = Account::builder()?
@@ -408,13 +469,19 @@ pub(super) async fn ensure_acme_account(
                     terms_of_service_agreed: true,
                     only_return_existing: false,
                 },
-                LetsEncrypt::Production.url().to_owned(),
+                directory.url().to_owned(),
                 None,
             )
             .await?;
+        if !directory.accepts_account_id(account.id()) {
+            return Err("ACME server returned an account outside its directory".into());
+        }
         atomic_private(&account_path, &serde_json::to_vec(&credentials)?)?;
         account
     };
+    if !directory.accepts_account_id(account.id()) {
+        return Err("persisted ACME account belongs to a different directory".into());
+    }
     if account_uri_path.exists() {
         if read_protected(&account_uri_path, uid)? != account.id().as_bytes() {
             return Err("ACME account URI differs from published binding".into());
@@ -423,6 +490,22 @@ pub(super) async fn ensure_acme_account(
         atomic_private(&account_uri_path, account.id().as_bytes())?;
     }
     Ok(account)
+}
+
+fn validate_persisted_account_credentials(
+    encoded: &[u8],
+    directory: AcmeDirectory,
+) -> Result<(), Failure> {
+    let value: serde_json::Value = serde_json::from_slice(encoded)?;
+    if value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|id| !directory.accepts_account_id(id))
+        || value.get("directory").and_then(serde_json::Value::as_str) != Some(directory.url())
+    {
+        return Err("persisted ACME credentials belong to a different directory".into());
+    }
+    Ok(())
 }
 
 struct CertificateInfo {
@@ -464,7 +547,341 @@ fn validate_key_match(cert_pem: &[u8], key_pem: &[u8]) -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use bloom_relay_admin_client::{
+        EnrollmentConfig, EnrollmentError, SecretToken, enroll, installation_status,
+        issue_credential, register_acme_account, retire_installation,
+    };
+    use bloom_relay_protocol::{Allocation, AllocationState};
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use std::{env, os::unix::fs::PermissionsExt};
+
+    const STAGING_SMOKE_TIMEOUT: Duration = Duration::from_secs(300);
+    const STAGING_SMOKE_TOTAL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+    struct StagingInputs {
+        control_ca: Vec<u8>,
+        receipt_public_key: [u8; 32],
+    }
+
+    impl StagingInputs {
+        fn read(uid: u32) -> Result<Self, Failure> {
+            if env::var("BLOOM_BROKER_ACME_STAGING_SMOKE").as_deref() != Ok("1") {
+                return Err(
+                    "set BLOOM_BROKER_ACME_STAGING_SMOKE=1 for this destructive opt-in test".into(),
+                );
+            }
+            let control_ca_path = env::var_os("BLOOM_RELAY_SMOKE_CONTROL_CA_FILE")
+                .ok_or("BLOOM_RELAY_SMOKE_CONTROL_CA_FILE is required")?;
+            let receipt_key_path = env::var_os("BLOOM_RELAY_SMOKE_RECEIPT_PUBLIC_KEY_FILE")
+                .ok_or("BLOOM_RELAY_SMOKE_RECEIPT_PUBLIC_KEY_FILE is required")?;
+            let control_ca = read_control_ca(Path::new(&control_ca_path), uid)?;
+            let encoded = read_protected(Path::new(&receipt_key_path), uid)?;
+            let encoded = std::str::from_utf8(&encoded)?.trim();
+            if encoded.len() != 64
+                || !encoded
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err("relay receipt public key must be 64 lowercase hex characters".into());
+            }
+            let decoded = hex::decode(encoded)?;
+            let receipt_public_key = decoded
+                .try_into()
+                .map_err(|_| "relay receipt public key must be exactly 32 bytes")?;
+            Ok(Self {
+                control_ca,
+                receipt_public_key,
+            })
+        }
+
+        fn enrollment(&self) -> EnrollmentConfig {
+            EnrollmentConfig {
+                control_ca_pem: self.control_ca.clone(),
+            }
+        }
+    }
+
+    fn admin_signer(key: &SigningKey) -> impl Fn(&[u8]) -> Result<[u8; 64], EnrollmentError> + '_ {
+        move |message| Ok(key.sign(message).to_bytes())
+    }
+
+    async fn await_dns_ready(
+        inputs: &StagingInputs,
+        admin_key: &SigningKey,
+        allocation: &Allocation,
+    ) -> Result<(), Failure> {
+        let deadline = tokio::time::Instant::now() + STAGING_SMOKE_TIMEOUT;
+        loop {
+            let status = installation_status(
+                inputs.enrollment(),
+                allocation.installation_id,
+                Uuid::new_v4(),
+                admin_signer(admin_key),
+            )?;
+            match status.state {
+                AllocationState::DnsReady => return Ok(()),
+                AllocationState::PendingDns if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                AllocationState::PendingDns => return Err("relay DNS readiness timed out".into()),
+                AllocationState::Retired => {
+                    return Err("relay installation retired before DNS readiness".into());
+                }
+            }
+        }
+    }
+
+    fn certificate_identity(
+        bundle: &PublishedTlsBundle,
+        hostname: &str,
+    ) -> Result<(String, String, String), Failure> {
+        let info = validate_bundle(bundle, hostname, now_ms()?)?;
+        let first = CertificateDer::from_pem_slice(bundle.cert_pem.as_bytes())?;
+        let (_, certificate) = X509Certificate::from_der(first.as_ref())?;
+        Ok((
+            certificate.tbs_certificate.raw_serial_as_string(),
+            info.spki_sha256,
+            certificate.issuer().to_string(),
+        ))
+    }
+
+    async fn staging_shutdown_signal() -> Result<(), Failure> {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map_err(Into::into),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+
+    async fn run_staging_issuance_and_renewal(
+        inputs: &StagingInputs,
+        admin_key: &SigningKey,
+        allocation: &Allocation,
+        config: &RemoteTlsConfig,
+        uid: u32,
+    ) -> Result<(), Failure> {
+        let account = ensure_acme_account_at(config, uid, AcmeDirectory::Staging).await?;
+        if !AcmeDirectory::Staging.accepts_account_id(account.id()) {
+            return Err("ACME account was not created by Let's Encrypt staging".into());
+        }
+        register_acme_account(
+            inputs.enrollment(),
+            allocation.installation_id,
+            account.id().to_owned(),
+            Uuid::new_v4(),
+            admin_signer(admin_key),
+        )?;
+        println!(
+            "PASS acme-account {} {}",
+            allocation.installation_id, allocation.hostname
+        );
+
+        let dns_token = SecretToken::generate();
+        let dns_receipt = issue_credential(
+            inputs.enrollment(),
+            allocation.installation_id,
+            Scope::DnsChallenge,
+            &dns_token,
+            Uuid::new_v4(),
+            admin_signer(admin_key),
+        )?;
+        let dns_path = config.dns_credential_path();
+        atomic_private(&dns_path, dns_token.expose().as_bytes())?;
+        atomic_private(
+            &metadata_path(&dns_path)?,
+            &serde_json::to_vec(&ScopedMetadata {
+                version: 1,
+                installation_id: allocation.installation_id,
+                scope: Scope::DnsChallenge,
+                generation: dns_receipt.generation,
+                expires_at_ms: dns_receipt.expires_at_ms,
+                operation_id: dns_receipt.operation_id,
+            })?,
+        )?;
+        await_dns_ready(inputs, admin_key, allocation).await?;
+        println!(
+            "PASS dns-ready {} {}",
+            allocation.installation_id, allocation.hostname
+        );
+
+        maintain_certificate_with_policy(
+            config,
+            &allocation.hostname,
+            allocation.installation_id,
+            uid,
+            AcmeDirectory::Staging,
+            RENEW_BEFORE_MS,
+        )
+        .await?;
+        let first = load_published_bundle(&config.bundle_path, &allocation.hostname, uid)?;
+        let (first_serial, first_spki, first_issuer) =
+            certificate_identity(&first, &allocation.hostname)?;
+        if !first_issuer.contains("(STAGING)") {
+            return Err(
+                "issued certificate does not identify a Let's Encrypt staging issuer".into(),
+            );
+        }
+        println!(
+            "PASS certificate-issued {} {} serial={} spki_sha256={}",
+            allocation.installation_id, allocation.hostname, first_serial, first_spki
+        );
+        let metadata = fs::symlink_metadata(&config.bundle_path)?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != uid
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+        {
+            return Err("published TLS bundle is not a protected owner-only file".into());
+        }
+        // Staging certificates are long-lived enough that the production 30-day
+        // threshold cannot exercise renewal in one run. Saturation marks the
+        // still-valid certificate due without changing production policy.
+        maintain_certificate_with_policy(
+            config,
+            &allocation.hostname,
+            allocation.installation_id,
+            uid,
+            AcmeDirectory::Staging,
+            u64::MAX,
+        )
+        .await?;
+        let renewed = load_published_bundle(&config.bundle_path, &allocation.hostname, uid)?;
+        let (renewed_serial, renewed_spki, renewed_issuer) =
+            certificate_identity(&renewed, &allocation.hostname)?;
+        if renewed_serial == first_serial || renewed_spki == first_spki {
+            return Err("staging renewal did not rotate certificate serial and SPKI".into());
+        }
+        if !renewed_issuer.contains("(STAGING)") {
+            return Err("renewed certificate does not identify a staging issuer".into());
+        }
+        println!(
+            "PASS certificate-renewed {} {} serial={} spki_sha256={}",
+            allocation.installation_id, allocation.hostname, renewed_serial, renewed_spki
+        );
+        let published_account = read_protected(
+            &config
+                .bundle_path
+                .parent()
+                .ok_or("TLS bundle has no parent")?
+                .join("acme-account-uri"),
+            uid,
+        )?;
+        if published_account != account.id().as_bytes() {
+            return Err("renewal changed the registered staging ACME account".into());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "destructive opt-in test against disposable public Relay and Let's Encrypt staging"]
+    async fn letsencrypt_staging_issuance_and_renewal() -> Result<(), Failure> {
+        aws_lc_rs::default_provider()
+            .install_default()
+            .map_err(|_| "a process-wide rustls provider is already installed")?;
+        let directory = tempfile::tempdir()?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+        let uid = fs::symlink_metadata(directory.path())?.uid();
+        let inputs = StagingInputs::read(uid)?;
+        let config = RemoteTlsConfig::defaults(directory.path());
+        atomic_private(&config.control_ca_path, &inputs.control_ca)?;
+        let mut seed = Zeroizing::new([0_u8; 32]);
+        rand::fill(seed.as_mut());
+        let admin_key = SigningKey::from_bytes(&seed);
+        let receipt = enroll(
+            inputs.enrollment(),
+            admin_key.verifying_key().as_bytes(),
+            &inputs.receipt_public_key,
+            Uuid::new_v4(),
+            admin_signer(&admin_key),
+        )?;
+        let allocation = receipt.allocation;
+        println!(
+            "PASS enroll {} {}",
+            allocation.installation_id, allocation.hostname
+        );
+
+        let operation = tokio::time::timeout(
+            STAGING_SMOKE_TOTAL_TIMEOUT,
+            run_staging_issuance_and_renewal(&inputs, &admin_key, &allocation, &config, uid),
+        );
+        let result = tokio::select! {
+            result = operation => match result {
+                Ok(result) => result,
+                Err(_) => Err("ACME staging smoke exceeded its 15-minute bound".into()),
+            },
+            signal = staging_shutdown_signal() => match signal {
+                Ok(()) => Err("ACME staging smoke interrupted; retiring allocation".into()),
+                Err(error) => Err(error),
+            },
+        };
+        let retirement = retire_installation(
+            inputs.enrollment(),
+            allocation.installation_id,
+            Uuid::new_v4(),
+            admin_signer(&admin_key),
+        );
+        if retirement.is_ok() {
+            println!(
+                "PASS retire {} {}",
+                allocation.installation_id, allocation.hostname
+            );
+        }
+        match (result, retirement) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(Box::new(error) as Failure),
+            (Err(operation), Err(retirement)) => Err(format!(
+                "staging operation failed ({operation}); retirement also failed ({retirement})"
+            )
+            .into()),
+        }
+    }
+
+    #[test]
+    fn acme_directory_accepts_only_its_exact_account_namespace() {
+        assert!(
+            AcmeDirectory::Production
+                .accepts_account_id("https://acme-v02.api.letsencrypt.org/acme/acct/42")
+        );
+        assert!(
+            !AcmeDirectory::Production
+                .accepts_account_id("https://acme-staging-v02.api.letsencrypt.org/acme/acct/42")
+        );
+        assert!(
+            AcmeDirectory::Staging
+                .accepts_account_id("https://acme-staging-v02.api.letsencrypt.org/acme/acct/42")
+        );
+        assert!(
+            !AcmeDirectory::Staging
+                .accepts_account_id("https://acme-v02.api.letsencrypt.org/acme/acct/42")
+        );
+        assert!(
+            !AcmeDirectory::Production
+                .accepts_account_id("https://acme-v02.api.letsencrypt.org/acme/acct/")
+        );
+        assert!(
+            !AcmeDirectory::Production
+                .accepts_account_id("https://acme-v02.api.letsencrypt.org/acme/acct/42/path")
+        );
+
+        let production = br#"{
+            "id":"https://acme-v02.api.letsencrypt.org/acme/acct/42",
+            "directory":"https://acme-v02.api.letsencrypt.org/directory"
+        }"#;
+        let staging = br#"{
+            "id":"https://acme-staging-v02.api.letsencrypt.org/acme/acct/42",
+            "directory":"https://acme-staging-v02.api.letsencrypt.org/directory"
+        }"#;
+        validate_persisted_account_credentials(production, AcmeDirectory::Production).unwrap();
+        validate_persisted_account_credentials(staging, AcmeDirectory::Staging).unwrap();
+        assert!(
+            validate_persisted_account_credentials(production, AcmeDirectory::Staging).is_err()
+        );
+        assert!(
+            validate_persisted_account_credentials(staging, AcmeDirectory::Production).is_err()
+        );
+    }
 
     #[test]
     fn certificate_validation_requires_exact_san_and_matching_key() {
@@ -590,8 +1007,16 @@ mod tests {
         );
         assert!(validate_bundle(&expired, host, now).is_err());
         assert!(validate_bundle(&future, host, now).is_err());
-        assert!(certificate_renewal_due(now + RENEW_BEFORE_MS, now));
-        assert!(!certificate_renewal_due(now + RENEW_BEFORE_MS + 1, now));
+        assert!(certificate_renewal_due(
+            now + RENEW_BEFORE_MS,
+            now,
+            RENEW_BEFORE_MS
+        ));
+        assert!(!certificate_renewal_due(
+            now + RENEW_BEFORE_MS + 1,
+            now,
+            RENEW_BEFORE_MS
+        ));
     }
 
     #[tokio::test]

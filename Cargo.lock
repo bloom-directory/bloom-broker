@@ -366,6 +366,7 @@ dependencies = [
  "bloom-broker-api",
  "bloom-broker-debug-driver",
  "bloom-platform-containment",
+ "bloom-relay-admin-client",
  "bloom-relay-client",
  "bloom-relay-protocol",
  "bloom-service-activation",
