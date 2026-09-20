@@ -4,11 +4,45 @@ use std::str::FromStr;
 
 use alloy::primitives::{Address, B256, U256, keccak256};
 use bloom_broker_api::{
-    ApprovalPrepareRequest, ApprovalSelector, CanonicalWalletPolicy, CryptoSuite, Digest32,
-    ProtocolError, ProtocolErrorCode,
+    ApprovalPrepareRequest, ApprovalSelector, CanonicalWalletPolicy, CryptoSuite, DeclaredFee,
+    Digest32, ProtocolError, ProtocolErrorCode,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+
+/// Facts Broker rebuilt from the exact Safe signing bytes, plus what the
+/// Petal reported about the Safe and Broker could not check.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeReview {
+    pub chain_id: String,
+    pub chain: String,
+    pub safe: String,
+    pub owner: String,
+    pub nonce: String,
+    pub operation: String,
+    pub destination: String,
+    pub value: String,
+    pub value_display: String,
+    pub action: Vec<String>,
+    pub safe_tx_hash: String,
+    pub reported: SafeReported,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeReported {
+    pub version: String,
+    pub singleton: String,
+    pub singleton_code_hash: String,
+    pub owners: Vec<String>,
+    pub threshold: String,
+    pub guard: String,
+    pub modules: Vec<String>,
+    pub fallback_handler: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_code_hash: Option<String>,
+}
 
 const MAX_REVIEW_BYTES: usize = 256 * 1024;
 const MAX_CALLDATA_BYTES: usize = 128 * 1024;
@@ -170,17 +204,9 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
     if envelope.schema != "bloom.safe.review.v1" {
         return Err(invalid("unsupported Safe review schema"));
     }
-    // Every field in this block is Petal-reported and absent from the EIP-712
-    // preimage, so it is parsed and bounded for rendering only. None of it is
-    // matched against a pinned table: both operands of such a check would come
-    // from the same Petal message, so it could refuse an honest Petal reporting
-    // a Safe the table has not heard of and could not refuse a dishonest one,
-    // which simply reports a row that passes. The values reach the owner under
-    // an explicit "not verified" heading instead.
-    //
-    // The Safe version is not gated either. A Safe below 1.3.0 uses a domain
-    // separator without `chainId`, so its reconstruction fails the selector
-    // comparison below on its own — the encoding is verified, not asserted.
+    // Petal-reported fields outside the EIP-712 preimage are bounded for
+    // display only: a pinned table could refuse an honest Petal and not a
+    // dishonest one. A pre-1.3.0 domain separator fails the selector check.
     address(&envelope.singleton, "singleton")?;
     address(&envelope.guard, "guard")?;
     address(&envelope.fallback_handler, "fallback_handler")?;
@@ -197,9 +223,8 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
     }
     uint(&envelope.threshold, "threshold")?;
 
-    // The one fact about the Safe's configuration Broker can establish on its
-    // own: `from` is derived from the Signer-held public key for this approval,
-    // so an envelope naming a different owner is not describing this signature.
+    // `from` comes from the Signer-held key, so this is the one configuration
+    // fact Broker can establish itself.
     if address(&envelope.owner, "owner")? != from {
         return Err(invalid(
             "Safe review owner differs from the Bloom signing key",
@@ -220,17 +245,9 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
     Ok(())
 }
 
-/// Pinned official Safe deployments.
-///
-/// `safe_tx.to` is an EIP-712 member, so the selector comparison binds it and
-/// this list is a real constraint: a delegatecall from an approved Safe
-/// transaction can only enter one of these official Safe libraries.
-///
-/// Only the address is pinned. A runtime-code-hash column would be matched
-/// against a Petal-reported hash rather than against chain state — Broker holds
-/// no chain client — and a version column would gate a real check on a
-/// Petal-reported string. Either could refuse an honest Petal and neither could
-/// refuse a dishonest one.
+/// Official Safe libraries a delegatecall may enter. `safe_tx.to` is bound by
+/// the selector, so this is a real constraint. Only addresses are pinned:
+/// code hashes and versions would be checked against Petal-reported values.
 struct Library {
     kind: &'static str,
     address: &'static str,
@@ -406,9 +423,7 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
                         .checked_add(call_value)
                         .ok_or_else(|| invalid("MultiSend native value overflow"))?;
                     calls += 1;
-                    // Disclose each entry. Without this a batch is the cheapest
-                    // way to hide an arbitrary call behind an opaque hash: the
-                    // same transfer sent directly is fully decoded.
+                    // Every entry is disclosed; a batch must not hide a call.
                     entries.push(entry_summary(
                         calls,
                         destination,
@@ -474,13 +489,25 @@ pub(crate) fn review(
     request: &ApprovalPrepareRequest,
     policy: &CanonicalWalletPolicy,
     from: Address,
-) -> Result<Vec<String>, ProtocolError> {
+) -> Result<Option<SafeReview>, ProtocolError> {
     if request.safe_review_payloads.is_empty() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     if !request.evm_review_payloads.is_empty() {
         return Err(invalid(
             "Safe and native EVM review payloads cannot be mixed",
+        ));
+    }
+    // The rebuilt transaction is the review; a claim may not tell another story.
+    if request.system_use_claim.is_some()
+        || request.petal_use_claim.as_ref().is_some_and(|claim| {
+            !claim.declared_debits.is_empty()
+                || !claim.declared_destinations.is_empty()
+                || !matches!(claim.declared_fee, DeclaredFee::None)
+        })
+    {
+        return Err(invalid(
+            "Safe review claims must not declare amounts, destinations, or fees",
         ));
     }
     let (digests, hashes) = exact_bytes(request)?;
@@ -513,43 +540,41 @@ pub(crate) fn review(
             "wallet policy must allow destination exact on {chain_policy} for Safe signing"
         )));
     }
-    let action = classify(&envelope)?;
-    let safe = address(&envelope.safe_address, "safe_address")?;
-    let to = address(&envelope.safe_tx.to, "safe_tx.to")?;
-    // Only the EIP-712 members are constrained by the digest comparison above.
-    // Everything else in the envelope is a Petal assertion that Broker has no
-    // way to corroborate — it holds no chain client — so the two groups are
-    // reported separately rather than under one heading that implies Broker
-    // established all of it.
-    Ok(vec![
-        format!(
-            "Broker-verified Safe transaction (rebuilt from the signed payload)\nSafe: {safe}\nChain ID: {chain}\nSigning owner: {from}\nSafe nonce: {}\nOperation: {}\nDestination: {to}\nNative value (wei): {}\nSafe transaction hash: {:#x}\n{action}\nSafe gas reimbursement: disabled",
-            envelope.safe_tx.nonce,
-            envelope.safe_tx.operation,
-            envelope.safe_tx.value,
-            keccak256(&preimage),
+    let action = classify(&envelope)?.lines().map(str::to_owned).collect();
+    let chain_name = u64::try_from(chain)
+        .map(crate::evm_review::chain_name)
+        .unwrap_or(chain_policy);
+    Ok(Some(SafeReview {
+        chain_id: chain.to_string(),
+        value_display: crate::evm_review::native_value_display(
+            &envelope.safe_tx.value,
+            &chain_name,
         ),
-        format!(
-            "Reported by the Petal, NOT verified by Broker\nSafe version: {}\nSingleton: {}\nSingleton code hash: {}\nOwners: {}\nThreshold: {}\nGuard: {}\nEnabled modules: {}\nFallback handler: {}{}\nThese describe the Safe's configuration and what the Petal observed on chain. Broker cannot read chain state, so it cannot confirm any of them; in particular the threshold shown may not be the number of signatures the Safe actually requires.",
-            envelope.safe_version,
-            envelope.singleton,
-            envelope.singleton_code_hash,
-            envelope.owners.join(", "),
-            envelope.threshold,
-            envelope.guard,
-            if envelope.modules.is_empty() {
-                "none".into()
-            } else {
-                envelope.modules.join(", ")
-            },
-            envelope.fallback_handler,
-            envelope
-                .library_code_hash
-                .as_deref()
-                .map(|hash| format!("\nDelegatecall library code hash: {hash}"))
-                .unwrap_or_default(),
-        ),
-    ])
+        chain: chain_name,
+        safe: address(&envelope.safe_address, "safe_address")?.to_string(),
+        owner: from.to_string(),
+        nonce: envelope.safe_tx.nonce,
+        operation: if envelope.safe_tx.operation == 0 {
+            "call".into()
+        } else {
+            "delegatecall".into()
+        },
+        destination: address(&envelope.safe_tx.to, "safe_tx.to")?.to_string(),
+        value: envelope.safe_tx.value,
+        action,
+        safe_tx_hash: format!("{:#x}", keccak256(&preimage)),
+        reported: SafeReported {
+            version: envelope.safe_version,
+            singleton: envelope.singleton,
+            singleton_code_hash: envelope.singleton_code_hash,
+            owners: envelope.owners,
+            threshold: envelope.threshold,
+            guard: envelope.guard,
+            modules: envelope.modules,
+            fallback_handler: envelope.fallback_handler,
+            library_code_hash: envelope.library_code_hash,
+        },
+    }))
 }
 
 #[cfg(test)]
@@ -658,18 +683,9 @@ mod tests {
         }
     }
 
-    /// Known-answer vectors produced by Safe's own SDK, not by this file.
-    ///
-    /// Every other test here builds the approval selector by calling
-    /// `safe_preimage`, so they all agree with whatever this module encodes and
-    /// none of them would notice it encoding the wrong thing. `safe_preimage`
-    /// is hand-rolled EIP-712 and it is the only thing standing between a Safe
-    /// owner and a blind signature, so it needs at least one check against an
-    /// implementation that is not ours.
-    ///
-    /// Regenerate with `@safe-global/protocol-kit` (matching the pinned
-    /// version's `preimageSafeTransactionHash` / `calculateSafeTransactionHash`
-    /// for `safeAddress, safeTx, safeVersion, chainId`).
+    /// Vectors from `@safe-global/protocol-kit` (`preimageSafeTransactionHash`
+    /// and `calculateSafeTransactionHash`): the other tests derive selectors
+    /// from `safe_preimage` itself and cannot catch it encoding the wrong thing.
     #[test]
     fn safe_sdk_vectors_reproduce_the_preimage_hash_and_digest() {
         struct Vector {
@@ -801,9 +817,16 @@ mod tests {
         let bytes = envelope();
         let request = request(bytes.clone());
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-        let plan = review(&request, &policy(), from).unwrap().join("\n");
-        assert!(plan.contains("Native transfer"));
-        assert!(plan.contains("Safe nonce: 4"));
+        let plan = review(&request, &policy(), from).unwrap().unwrap();
+        assert_eq!(
+            plan.action,
+            [
+                "Action: Native transfer",
+                "Recipient: 0x4000000000000000000000000000000000000000"
+            ]
+        );
+        assert_eq!(plan.nonce, "4");
+        assert_eq!(plan.value_display, "0.000000000000000007 ETH");
         let mut changed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         changed["safe_tx"]["value"] = serde_json::json!("8");
         let changed = serde_jcs::to_vec(&changed).unwrap();
@@ -927,20 +950,16 @@ mod tests {
             "0xbbbb000000000000000000000000000000000000"
         ]);
         let canonical = serde_jcs::to_vec(&value).unwrap();
-        let items = review(&request(canonical), &policy(), from).unwrap();
-        assert_eq!(items.len(), 2);
-
-        let verified = &items[0];
-        assert!(verified.starts_with("Broker-verified Safe transaction"));
-        assert!(verified.contains("Safe nonce: 4"));
-        assert!(verified.contains("Native transfer"));
-        assert!(!verified.contains("Threshold"));
-        assert!(!verified.contains("Guard"));
-
-        let reported = &items[1];
-        assert!(reported.starts_with("Reported by the Petal, NOT verified by Broker"));
-        assert!(reported.contains("Threshold: 3"));
-        assert!(reported.contains("Fallback handler"));
+        let plan = review(&request(canonical), &policy(), from)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.reported.threshold, "3");
+        assert_eq!(plan.reported.owners.len(), 3);
+        assert!(
+            !serde_json::to_string(&plan)
+                .unwrap()
+                .contains("Broker-verified")
+        );
     }
 
     #[test]
@@ -974,11 +993,8 @@ mod tests {
 
     #[test]
     fn an_unrecognized_safe_deployment_is_disclosed_rather_than_refused() {
-        // `singleton`, `singleton_code_hash` and `safe_version` are all
-        // Petal-reported and none of them appear in the EIP-712 preimage, so
-        // matching them against a pinned table could only refuse an honest
-        // Petal reporting a Safe the table has not heard of — a dishonest one
-        // simply reports a row that passes. They are disclosed as unverified.
+        // Deployment fields are outside the preimage: a pinned table could only
+        // refuse an honest Petal, so they are disclosed as unverified instead.
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
         let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
         value["singleton"] = serde_json::json!("0x4000000000000000000000000000000000000000");
@@ -986,11 +1002,46 @@ mod tests {
         value["safe_version"] = serde_json::json!("1.4.2");
         let canonical = serde_jcs::to_vec(&value).unwrap();
 
-        let items = review(&request(canonical), &policy(), from).unwrap();
-        assert!(items[0].starts_with("Broker-verified Safe transaction"));
-        assert!(!items[0].contains("Singleton"));
-        assert!(items[1].contains("Singleton: 0x4000000000000000000000000000000000000000"));
-        assert!(items[1].contains(&("Singleton code hash: 0x".to_owned() + &"ab".repeat(32))));
-        assert!(items[1].contains("Safe version: 1.4.2"));
+        let plan = review(&request(canonical), &policy(), from)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan.reported.singleton,
+            "0x4000000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            plan.reported.singleton_code_hash,
+            "0x".to_owned() + &"ab".repeat(32)
+        );
+        assert_eq!(plan.reported.version, "1.4.2");
+    }
+
+    #[test]
+    fn a_claim_may_not_describe_the_transaction() {
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+        let mut request = request(envelope());
+        let claim = PetalUseClaim {
+            package_hash: Digest32::from_bytes([1; 32]),
+            route: "transactions/a/b/confirm.json".into(),
+            operation_class: token(SAFE_CONFIRM_OPERATION_CLASS),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: Digest32::from_bytes([1; 32]),
+            ordered_hashes: vec![],
+            declared_debits: vec![],
+            declared_destinations: vec![],
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([3; 16]),
+            claim_assurance: ClaimAssurance::MachineAsserted,
+        };
+        request.petal_use_claim = Some(claim.clone());
+        assert!(review(&request, &policy(), from).unwrap().is_some());
+        request.petal_use_claim = Some(PetalUseClaim {
+            declared_destinations: vec![DeclaredDestination {
+                chain: token("evm-31337"),
+                destination: "0x4000000000000000000000000000000000000000".into(),
+            }],
+            ..claim
+        });
+        assert!(review(&request, &policy(), from).is_err());
     }
 }

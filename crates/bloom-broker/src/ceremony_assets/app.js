@@ -199,6 +199,32 @@ function describeTransfer(manifest) {
       : `Approve <strong>${evmPayloads.length} EVM transactions</strong>. Check each envelope below.`;
     return {sentence, facts, willVerify: true};
   }
+  const safe = plan.safe_review;
+  if (safe) {
+    const network = chainLabel(safe.chain);
+    const facts = [
+      ["Safe", safe.safe, true],
+      ["Action", safe.action.join("\n")],
+      ["Destination", safe.destination, true],
+      ["Value", safe.value_display],
+      ["Network", network],
+      ["Signing owner", safe.owner, true],
+      ["Safe nonce", safe.nonce],
+      ["Operation", safe.operation],
+      ["Safe transaction hash", safe.safe_tx_hash, true],
+      ["Bloom verification", "Safe transaction rebuilt from the exact signing bytes. Safe configuration and call execution effects are not verified."],
+      ["Reported by the Petal, not verified", [
+        `Safe version ${safe.reported.version}`,
+        `Threshold ${safe.reported.threshold} of ${safe.reported.owners.length} owners`,
+        `Singleton ${safe.reported.singleton}`,
+        `Guard ${safe.reported.guard}`,
+        `Modules ${safe.reported.modules.join(", ") || "none"}`,
+        `Fallback handler ${safe.reported.fallback_handler}`,
+      ].join("\n")],
+    ];
+    const sentence = `Approve one Safe transaction on <strong>${escapeHtml(network)}</strong>: ${escapeHtml(safe.action[0].replace(/^Action: /, ""))}.`;
+    return {sentence, facts, willVerify: true};
+  }
   if (!claim) return null;
   const debits = claim.declared_debits || [];
   const dests = claim.declared_destinations || [];

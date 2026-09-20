@@ -3244,6 +3244,18 @@ impl BrokerAuthority {
             .and_then(|value| serde_json::from_str(&value).map_err(storage))
     }
 
+    pub(crate) fn subject_declares_operation_class(
+        &self,
+        subject: &ApprovalSubject,
+        class: &str,
+    ) -> Result<bool, AuthorityError> {
+        Ok(self
+            .catalog_provenance(&subject_for(subject))?
+            .operation_classes
+            .iter()
+            .any(|entry| entry.operation_class.as_str() == class))
+    }
+
     fn catalog_provenance(
         &self,
         subject: &ProvenanceSubject,

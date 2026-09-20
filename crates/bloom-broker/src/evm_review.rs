@@ -269,7 +269,7 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
     })
 }
 
-fn chain_name(chain_id: u64) -> String {
+pub(crate) fn chain_name(chain_id: u64) -> String {
     match chain_id {
         1 => "ethereum".into(),
         10 => "optimism".into(),
@@ -281,7 +281,7 @@ fn chain_name(chain_id: u64) -> String {
     }
 }
 
-fn native_value_display(value: &str, chain: &str) -> String {
+pub(crate) fn native_value_display(value: &str, chain: &str) -> String {
     // Decimals and symbols come from the shared asset table so the EVM
     // review can never disagree with the claim amount display.
     match crate::ceremony::native_asset_metadata(chain, "native") {
