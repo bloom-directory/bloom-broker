@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    http::{Request, StatusCode, header},
+    http::{Request, StatusCode, Version, header},
 };
 use bloom_audit_checkpoint::{AppendOutcome, CheckpointError, CheckpointSink};
 use bloom_broker::{
@@ -4955,6 +4955,100 @@ async fn remote_fragment_is_single_use_and_cookie_is_ceremony_scoped() {
     let capability = prepared.ceremony_url.split("#cap=").nth(1).unwrap();
     let host = origin.strip_prefix("https://").unwrap();
     let app = broker.for_remote_origin(&origin).unwrap().router();
+    let root = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(root.status(), StatusCode::OK);
+    let asset = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/assets/style.css"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asset.status(), StatusCode::OK);
+    let conflicting_authority = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/"))
+                .header(header::HOST, "sibling.relay.bloom.directory")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conflicting_authority.status(), StatusCode::FORBIDDEN);
+    let matching_authority = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/"))
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(matching_authority.status(), StatusCode::OK);
+    let duplicate_host = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/"))
+                .header(header::HOST, host)
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_host.status(), StatusCode::FORBIDDEN);
+    let missing_authority = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri("/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_authority.status(), StatusCode::FORBIDDEN);
+    let wrong_authority = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri("https://sibling.relay.bloom.directory/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_authority.status(), StatusCode::FORBIDDEN);
+    let http1_missing_host = app
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(http1_missing_host.status(), StatusCode::FORBIDDEN);
     let health = app
         .clone()
         .oneshot(
@@ -4981,9 +5075,9 @@ async fn remote_fragment_is_single_use_and_cookie_is_ceremony_scoped() {
     assert_eq!(wrong_host_health.status(), StatusCode::NOT_FOUND);
     let exchange_request = || {
         Request::builder()
+            .version(Version::HTTP_2)
             .method("POST")
-            .uri("/api/session/exchange")
-            .header(header::HOST, host)
+            .uri(format!("{origin}/api/session/exchange"))
             .header(header::ORIGIN, &origin)
             .header(header::CONTENT_TYPE, "application/json")
             .header("sec-fetch-site", "same-origin")

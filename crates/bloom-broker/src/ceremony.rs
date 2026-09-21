@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Version, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -4267,8 +4267,41 @@ impl CeremonyBroker {
     }
 }
 
-async fn security_headers(request: Request<Body>, next: Next) -> Response {
-    let mut response = next.run(request).await;
+async fn security_headers(mut request: Request<Body>, next: Next) -> Response {
+    let mut response = if normalize_http2_authority(&mut request).is_ok() {
+        next.run(request).await
+    } else {
+        StatusCode::FORBIDDEN.into_response()
+    };
+    apply_security_headers(&mut response);
+    response
+}
+
+/// Hyper exposes HTTP/2 `:authority` through the request URI, while the
+/// ceremony handlers deliberately consume one strict `Host` value. Normalize
+/// that transport representation once for every route. HTTP/1 remains
+/// unchanged, and a client cannot override the authority with a conflicting or
+/// duplicate Host header.
+fn normalize_http2_authority(request: &mut Request<Body>) -> Result<(), ()> {
+    if request.version() != Version::HTTP_2 {
+        return Ok(());
+    }
+
+    let authority = request.uri().authority().ok_or(())?.as_str();
+    let mut hosts = request.headers().get_all(header::HOST).iter();
+    if let Some(host) = hosts.next() {
+        if hosts.next().is_some() || host.as_bytes() != authority.as_bytes() {
+            return Err(());
+        }
+        return Ok(());
+    }
+
+    let host = HeaderValue::from_str(authority).map_err(|_| ())?;
+    request.headers_mut().insert(header::HOST, host);
+    Ok(())
+}
+
+fn apply_security_headers(response: &mut Response) {
     let headers = response.headers_mut();
     // This marker is diagnostic only. It lets a Machine whose authenticated
     // Unix edge is unavailable report that a Bloom-shaped listener appears to
@@ -4298,7 +4331,6 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
         HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
     );
-    response
 }
 
 fn require_exact_header(
