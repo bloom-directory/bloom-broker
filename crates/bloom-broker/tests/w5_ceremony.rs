@@ -5117,8 +5117,9 @@ async fn remote_fragment_is_single_use_and_cookie_is_ceremony_scoped() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/api/session/{ceremony_id}"))
-                .header(header::HOST, host)
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/api/session/{ceremony_id}"))
+                .header(header::COOKIE, "__Host-bloom-ceremony-old=unrelated")
                 .header(header::COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -5126,6 +5127,67 @@ async fn remote_fragment_is_single_use_and_cookie_is_ceremony_scoped() {
         .await
         .unwrap();
     assert_eq!(read.status(), StatusCode::OK);
+    let pending_result = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/api/session/{ceremony_id}/result"))
+                .header(header::COOKIE, "__Host-bloom-ceremony-old=unrelated")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending_result.status(), StatusCode::CONFLICT);
+    let duplicate_current_cookie = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/api/session/{ceremony_id}"))
+                .header(header::COOKIE, &cookie)
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_current_cookie.status(), StatusCode::FORBIDDEN);
+    let duplicate_different_cookie = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/api/session/{ceremony_id}"))
+                .header(header::COOKIE, &cookie)
+                .header(
+                    header::COOKIE,
+                    format!("__Host-bloom-ceremony-{ceremony_id}={}", "a".repeat(43)),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_different_cookie.status(), StatusCode::FORBIDDEN);
+    let duplicate_current_cookie_joined = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/api/session/{ceremony_id}"))
+                .header(header::COOKIE, format!("{cookie}; {cookie}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        duplicate_current_cookie_joined.status(),
+        StatusCode::FORBIDDEN
+    );
     let cross_host = broker
         .router()
         .oneshot(
@@ -5141,12 +5203,13 @@ async fn remote_fragment_is_single_use_and_cookie_is_ceremony_scoped() {
     assert_eq!(cross_host.status(), StatusCode::FORBIDDEN);
     let mutation = |proof: Option<&str>| {
         let mut request = Request::builder()
+            .version(Version::HTTP_2)
             .method("POST")
-            .uri(format!("/api/session/{ceremony_id}/cancel"))
-            .header(header::HOST, host)
+            .uri(format!("{origin}/api/session/{ceremony_id}/cancel"))
             .header(header::ORIGIN, &origin)
             .header(header::CONTENT_TYPE, "application/json")
             .header("sec-fetch-site", "same-origin")
+            .header(header::COOKIE, "__Host-bloom-ceremony-old=unrelated")
             .header(header::COOKIE, &cookie);
         if let Some(proof) = proof {
             request = request.header("x-bloom-csrf", proof);

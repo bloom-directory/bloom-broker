@@ -1621,6 +1621,9 @@ function chacha20Poly1305Open(key, nonce, aad, sealed) {
   return chachaXor(key, nonce, ciphertext);
 }
 
-load().catch(error => reportCeremonyError(
-  error, "Ceremony failed to load. Please refresh and try again."
-));
+function reportLoadFailure(error) {
+  document.getElementById("page-title").textContent = "Ceremony could not load";
+  reportCeremonyError(error, "Ceremony failed to load. Please refresh and try again.");
+}
+
+load().catch(reportLoadFailure);

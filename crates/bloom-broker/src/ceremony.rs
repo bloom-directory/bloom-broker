@@ -4162,15 +4162,30 @@ impl CeremonyBroker {
         mutation: bool,
     ) -> Result<(), ProtocolError> {
         let cookie_name = format!("__Host-bloom-ceremony-{ceremony_id}=");
-        let cookie = headers
-            .get(header::COOKIE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| {
-                value
-                    .split(';')
-                    .map(str::trim)
-                    .find_map(|part| part.strip_prefix(&cookie_name))
-            })
+        // HTTP/2 permits a browser to split its Cookie header into multiple
+        // fields. Earlier ceremonies leave other scoped cookies behind, so
+        // the requested ceremony's cookie may not be in the first field.
+        // Ambiguous duplicates of this exact name are never accepted.
+        let mut cookie_value = None;
+        for field in headers.get_all(header::COOKIE) {
+            let field = field.to_str().map_err(|_| {
+                protocol(
+                    ProtocolErrorCode::UnauthenticatedPeer,
+                    "invalid remote ceremony cookie header",
+                )
+            })?;
+            for part in field.split(';').map(str::trim) {
+                if let Some(value) = part.strip_prefix(&cookie_name) {
+                    if cookie_value.replace(value).is_some() {
+                        return Err(protocol(
+                            ProtocolErrorCode::UnauthenticatedPeer,
+                            "duplicate remote ceremony cookie",
+                        ));
+                    }
+                }
+            }
+        }
+        let cookie = cookie_value
             .and_then(|value| Base64UrlBytes::parse(value.to_owned()).ok())
             .filter(|value| value.decode().len() == 32);
         let hash = cookie

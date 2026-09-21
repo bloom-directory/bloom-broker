@@ -214,3 +214,19 @@ process.stdout.write(JSON.stringify({ok:true}));
     );
     assert_eq!(output, json!({"ok": true}));
 }
+
+#[test]
+fn boot_failure_replaces_initial_loading_heading() {
+    let output = run_browser(
+        r#"
+const assert = require("node:assert/strict");
+const heading = {textContent: "One moment…"};
+globalThis.document = {getElementById: id => id === "page-title" ? heading : {}};
+reportLoadFailure(new Error("unavailable"));
+assert.equal(heading.textContent, "Ceremony could not load");
+assert.match(statusNode.textContent, /Ceremony failed to load/);
+process.stdout.write(JSON.stringify({ok:true}));
+"#,
+    );
+    assert_eq!(output, json!({"ok": true}));
+}
