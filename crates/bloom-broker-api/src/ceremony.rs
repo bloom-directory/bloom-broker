@@ -731,8 +731,65 @@ pub struct CredentialSummary {
     pub credential_id: Base64UrlBytes,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<CeremonySurfaceRef>,
-    pub rp_id: Token,
+    pub rp_id: RpId,
     pub active: bool,
+}
+
+/// A WebAuthn relying-party identifier encoded as a lowercase DNS name.
+///
+/// DNS labels may begin with a digit, unlike the generic protocol [`Token`].
+/// Signer remains the authority for which validated RP ID belongs to a
+/// credential; this type preserves that value in the public Machine receipt.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct RpId(String);
+
+impl RpId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 253
+            || value.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || !label.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+                    || !label
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    || !label
+                        .as_bytes()
+                        .last()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+            })
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "WebAuthn RP ID must be a lowercase DNS name",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for RpId {
+    type Error = ProtocolError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<RpId> for String {
+    fn from(value: RpId) -> Self {
+        value.0
+    }
 }
 
 impl CustodyResult {
@@ -779,6 +836,30 @@ fn canonical_error(error: impl std::fmt::Display) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rp_id_accepts_digit_leading_dns_labels_and_round_trips_as_a_string() {
+        let hostname = "5ixwab6amyu7e42fjobm3myxqe.relay.bloom.directory";
+        let rp_id = RpId::new(hostname).unwrap();
+        assert_eq!(rp_id.as_str(), hostname);
+        assert_eq!(
+            serde_json::to_string(&rp_id).unwrap(),
+            format!("\"{hostname}\"")
+        );
+        assert_eq!(
+            serde_json::from_str::<RpId>(&format!("\"{hostname}\"")).unwrap(),
+            rp_id
+        );
+
+        for invalid in [
+            "Relay.example",
+            "-relay.example",
+            "relay-.example",
+            "relay..example",
+        ] {
+            assert!(RpId::new(invalid).is_err(), "accepted {invalid}");
+        }
+    }
 
     fn registration_prepare(wallet_id: Option<Token>) -> CustodyPrepareRequest {
         CustodyPrepareRequest {

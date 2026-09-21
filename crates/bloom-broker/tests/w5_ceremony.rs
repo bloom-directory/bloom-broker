@@ -1193,7 +1193,7 @@ fn custody_result_to_machine(value: &CustodyResult) -> bloom_broker_api::Custody
                         identity_digest: surface.identity_digest.clone(),
                     }
                 }),
-                rp_id: credential.rp_id.clone(),
+                rp_id: bloom_broker_api::RpId::new(credential.rp_id.as_str()).unwrap(),
                 active: credential.active,
             })
             .collect(),

@@ -3,6 +3,7 @@ use std::{
     io::{Read as _, Write as _},
     net::TcpStream,
     path::PathBuf,
+    time::Duration,
 };
 
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
@@ -66,8 +67,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let token = ceremony_token(&url)?;
-    let session = request("GET", "/api/session", token, None)?;
+    let client = CeremonyClient::connect(&url)?;
+    let session = client.read_session()?;
+    let origin = client.origin();
+    let rp_id = client.rp_id();
     let kind: CeremonyKind = serde_json::from_value(session["ceremony_kind"].clone())?;
     let challenges = session["challenges"]
         .as_array()
@@ -82,7 +85,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if kind == CeremonyKind::SealedApproval {
         let contribution: SignerCeremonyContribution =
             serde_json::from_value(session["signer_contribution"].clone())?;
-        let assertion = authenticator.assertion(&challenges[0].canonical_bytes()?, sign_count);
+        let assertion = authenticator.assertion_for(
+            &challenges[0].canonical_bytes()?,
+            sign_count,
+            origin,
+            rp_id,
+        );
         let aad = LocalPrfHpkeAad {
             surface: contribution.surface.clone(),
             ceremony_id: contribution.ceremony_id.clone(),
@@ -112,12 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "encrypted_input": encrypted_input,
             "public_binding_digest": public_binding_digest,
         }))?;
-        let result = request(
-            "POST",
-            &format!("/api/session/{}/complete", contribution.ceremony_id),
-            token,
-            Some(&body),
-        )?;
+        let result = client.complete(&contribution.ceremony_id, &body)?;
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
@@ -130,8 +133,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if challenges.len() < 2 {
                 return Err("registration ceremony omitted a proof phase".into());
             }
-            let attestation = authenticator.attestation(&challenges[0].canonical_bytes()?);
-            let assertion = authenticator.assertion(&challenges[1].canonical_bytes()?, sign_count);
+            let attestation =
+                authenticator.attestation_for(&challenges[0].canonical_bytes()?, origin, rp_id);
+            let assertion = authenticator.assertion_for(
+                &challenges[1].canonical_bytes()?,
+                sign_count,
+                origin,
+                rp_id,
+            );
             let credential_id = attestation.credential_id.clone();
             let plaintext = if kind == CeremonyKind::WalletImport {
                 match (raw_private_key, mnemonic) {
@@ -173,12 +182,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let new_seed = new_seed.ok_or("credential change requires --new-authenticator-seed")?;
             let replacement = VirtualAuthenticator::from_seed(new_seed.as_bytes());
-            let authority_assertion =
-                authenticator.assertion(&challenges[0].canonical_bytes()?, sign_count);
+            let authority_assertion = authenticator.assertion_for(
+                &challenges[0].canonical_bytes()?,
+                sign_count,
+                origin,
+                rp_id,
+            );
             let new_credential_attestation =
-                replacement.attestation(&challenges[1].canonical_bytes()?);
+                replacement.attestation_for(&challenges[1].canonical_bytes()?, origin, rp_id);
             let new_credential_prf_assertion =
-                replacement.assertion(&challenges[2].canonical_bytes()?, 1);
+                replacement.assertion_for(&challenges[2].canonical_bytes()?, 1, origin, rp_id);
             let credential_id = new_credential_attestation.credential_id.clone();
             let plaintext = serde_jcs::to_vec(&serde_json::json!({
                 "authority_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
@@ -201,7 +214,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         | CeremonyKind::PolicyUpdate
         | CeremonyKind::WalletExport
         | CeremonyKind::BackendEnrollment => {
-            let assertion = authenticator.assertion(&challenges[0].canonical_bytes()?, sign_count);
+            let assertion = authenticator.assertion_for(
+                &challenges[0].canonical_bytes()?,
+                sign_count,
+                origin,
+                rp_id,
+            );
             let credential_id = assertion.credential_id.clone();
             let effect_kind = custody_effect_kind(kind)?;
             let plaintext = serde_jcs::to_vec(&serde_json::json!({
@@ -243,12 +261,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "encrypted_input": encrypted_input,
         "public_binding_digest": public_binding_digest,
     }))?;
-    let result = request(
-        "POST",
-        &format!("/api/session/{}/complete", contribution.ceremony_id),
-        token,
-        Some(&body),
-    )?;
+    let result = client.complete(&contribution.ceremony_id, &body)?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
@@ -323,18 +336,270 @@ fn assert_machine_secret_confinement_command(
     Ok(())
 }
 
-fn ceremony_token(url: &str) -> Result<&str, Box<dyn std::error::Error>> {
-    let prefix = "http://localhost:18734/ceremony/";
-    let token = url
-        .strip_prefix(prefix)
-        .ok_or("ceremony URL is not the canonical Broker origin")?;
-    if token.len() != 43 || token.contains('/') {
-        return Err("ceremony URL has an invalid session token".into());
-    }
-    Ok(token)
+#[derive(Debug, Eq, PartialEq)]
+enum CeremonyLaunch {
+    Local { token: String },
+    Remote { origin: String, capability: String },
 }
 
-fn request(
+fn parse_ceremony_url(value: &str) -> Result<CeremonyLaunch, Box<dyn std::error::Error>> {
+    let parsed = url::Url::parse(value)?;
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.query().is_some() {
+        return Err("ceremony URL contains unsupported authority or query data".into());
+    }
+    if parsed.scheme() == "http"
+        && parsed.host_str() == Some("localhost")
+        && parsed.port() == Some(18734)
+        && parsed.fragment().is_none()
+    {
+        let token = parsed
+            .path()
+            .strip_prefix("/ceremony/")
+            .ok_or("local ceremony URL has an invalid path")?;
+        validate_capability(token)?;
+        return Ok(CeremonyLaunch::Local {
+            token: token.to_owned(),
+        });
+    }
+    if parsed.scheme() != "https"
+        || parsed.port_or_known_default() != Some(443)
+        || parsed.path() != "/"
+    {
+        return Err("ceremony URL is not an approved Broker origin".into());
+    }
+    let hostname = parsed.host_str().ok_or("remote ceremony URL has no host")?;
+    bloom_signer_api::SurfaceIdentity::remote(hostname, 0)?;
+    let capability = parsed
+        .fragment()
+        .and_then(|fragment| fragment.strip_prefix("cap="))
+        .ok_or("remote ceremony URL has no launch capability")?;
+    validate_capability(capability)?;
+    Ok(CeremonyLaunch::Remote {
+        origin: format!("https://{hostname}"),
+        capability: capability.to_owned(),
+    })
+}
+
+fn validate_capability(value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let capability = Base64UrlBytes::parse(value.to_owned())?;
+    if value.len() != 43 || capability.decode().len() != 32 {
+        return Err("ceremony URL has an invalid launch capability".into());
+    }
+    Ok(())
+}
+
+struct RemoteSession {
+    agent: ureq::Agent,
+    origin: String,
+    hostname: String,
+    ceremony_id: Digest32,
+    cookie: String,
+    csrf: String,
+}
+
+enum CeremonyClient {
+    Local { token: String },
+    Remote(RemoteSession),
+}
+
+impl CeremonyClient {
+    fn connect(url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        match parse_ceremony_url(url)? {
+            CeremonyLaunch::Local { token } => Ok(Self::Local { token }),
+            CeremonyLaunch::Remote { origin, capability } => {
+                let hostname = origin
+                    .strip_prefix("https://")
+                    .ok_or("remote ceremony origin is malformed")?
+                    .to_owned();
+                let agent = ureq::Agent::config_builder()
+                    .https_only(true)
+                    .max_redirects(0)
+                    .proxy(None)
+                    .timeout_global(Some(Duration::from_secs(20)))
+                    .http_status_as_error(false)
+                    .tls_config(
+                        ureq::tls::TlsConfig::builder()
+                            .provider(ureq::tls::TlsProvider::Rustls)
+                            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                            .build(),
+                    )
+                    .build()
+                    .new_agent();
+                let encoded = serde_json::to_vec(&serde_json::json!({
+                    "capability": capability,
+                }))?;
+                let mut response = agent
+                    .post(format!("{origin}/api/session/exchange"))
+                    .header("origin", &origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("content-type", "application/json")
+                    .send(encoded.as_slice())?;
+                let status = response.status().as_u16();
+                let set_cookie = response.headers().get("set-cookie").cloned();
+                let body = read_remote_body(&mut response)?;
+                if status != 200 {
+                    return Err(format!(
+                        "Broker ceremony exchange failed with HTTP {status}: {}",
+                        String::from_utf8_lossy(&body)
+                    )
+                    .into());
+                }
+                let set_cookie = set_cookie
+                    .as_ref()
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or("remote fragment exchange omitted its scoped cookie")?;
+                let exchange: serde_json::Value = serde_json::from_slice(&body)?;
+                let ceremony_id: Digest32 =
+                    serde_json::from_value(exchange["ceremony_id"].clone())?;
+                let csrf = exchange["csrf"]
+                    .as_str()
+                    .ok_or("remote fragment exchange omitted CSRF proof")?;
+                validate_capability(csrf)?;
+                let cookie = validate_remote_cookie(set_cookie, &ceremony_id)?;
+                Ok(Self::Remote(RemoteSession {
+                    agent,
+                    origin,
+                    hostname,
+                    ceremony_id,
+                    cookie,
+                    csrf: csrf.to_owned(),
+                }))
+            }
+        }
+    }
+
+    fn origin(&self) -> &str {
+        match self {
+            Self::Local { .. } => "http://localhost:18734",
+            Self::Remote(session) => &session.origin,
+        }
+    }
+
+    fn rp_id(&self) -> &str {
+        match self {
+            Self::Local { .. } => "localhost",
+            Self::Remote(session) => &session.hostname,
+        }
+    }
+
+    fn read_session(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        match self {
+            Self::Local { token } => request_local("GET", "/api/session", token, None),
+            Self::Remote(session) => session.request(
+                "GET",
+                &format!("/api/session/{}", session.ceremony_id),
+                None,
+            ),
+        }
+    }
+
+    fn complete(
+        &self,
+        ceremony_id: &Digest32,
+        body: &[u8],
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        match self {
+            Self::Local { token } => request_local(
+                "POST",
+                &format!("/api/session/{ceremony_id}/complete"),
+                token,
+                Some(body),
+            ),
+            Self::Remote(session) => {
+                if &session.ceremony_id != ceremony_id {
+                    return Err("remote session identity differs from Signer contribution".into());
+                }
+                session.request(
+                    "POST",
+                    &format!("/api/session/{ceremony_id}/complete"),
+                    Some(body),
+                )
+            }
+        }
+    }
+}
+
+impl RemoteSession {
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let url = format!("{}{path}", self.origin);
+        let mut response = match (method, body) {
+            ("GET", None) => self.agent.get(url).header("cookie", &self.cookie).call()?,
+            ("POST", Some(body)) => self
+                .agent
+                .post(url)
+                .header("cookie", &self.cookie)
+                .header("origin", &self.origin)
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/json")
+                .header("x-bloom-csrf", &self.csrf)
+                .send(body)?,
+            _ => return Err("unsupported remote ceremony request".into()),
+        };
+        let status = response.status().as_u16();
+        let response_body = read_remote_body(&mut response)?;
+        if status != 200 {
+            return Err(format!(
+                "Broker ceremony request failed with HTTP {status}: {}",
+                String::from_utf8_lossy(&response_body)
+            )
+            .into());
+        }
+        Ok(serde_json::from_slice(&response_body)?)
+    }
+}
+
+fn read_remote_body(
+    response: &mut ureq::http::Response<ureq::Body>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut body = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut body)?;
+    if body.len() > 1024 * 1024 {
+        return Err("Broker ceremony response exceeded 1 MiB".into());
+    }
+    Ok(body)
+}
+
+fn validate_remote_cookie(
+    set_cookie: &str,
+    ceremony_id: &Digest32,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let pair = set_cookie
+        .split(';')
+        .next()
+        .ok_or("remote ceremony cookie is malformed")?;
+    let expected = format!("__Host-bloom-ceremony-{ceremony_id}=");
+    let value = pair
+        .strip_prefix(&expected)
+        .ok_or("remote ceremony cookie has the wrong scope")?;
+    validate_capability(value)?;
+    for required in [
+        "Secure",
+        "HttpOnly",
+        "SameSite=Strict",
+        "Path=/",
+        "Max-Age=1500",
+    ] {
+        if !set_cookie
+            .split(';')
+            .map(str::trim)
+            .any(|part| part == required)
+        {
+            return Err("remote ceremony cookie omitted a required security attribute".into());
+        }
+    }
+    Ok(pair.to_owned())
+}
+
+fn request_local(
     method: &str,
     path: &str,
     token: &str,
@@ -381,7 +646,10 @@ fn request(
 
 #[cfg(test)]
 mod tests {
-    use super::{CeremonyKind, custody_effect_kind, read_protected_seed_file};
+    use super::{
+        CeremonyKind, CeremonyLaunch, Digest32, custody_effect_kind, parse_ceremony_url,
+        read_protected_seed_file, validate_remote_cookie,
+    };
     use std::{fs, path::PathBuf};
 
     fn temp_path(name: &str) -> PathBuf {
@@ -427,5 +695,55 @@ mod tests {
             custody_effect_kind(CeremonyKind::AccountRetire).unwrap(),
             serde_json::json!("account_retire")
         );
+    }
+
+    #[test]
+    fn ceremony_urls_accept_only_canonical_local_or_assigned_remote_launches() {
+        let capability = "A".repeat(43);
+        assert_eq!(
+            parse_ceremony_url(&format!("http://localhost:18734/ceremony/{capability}")).unwrap(),
+            CeremonyLaunch::Local {
+                token: capability.clone()
+            }
+        );
+        let hostname = "5ixwab6amyu7e42fjobm3myxqe.relay.bloom.directory";
+        assert_eq!(
+            parse_ceremony_url(&format!("https://{hostname}/#cap={capability}")).unwrap(),
+            CeremonyLaunch::Remote {
+                origin: format!("https://{hostname}"),
+                capability: capability.clone(),
+            }
+        );
+        for invalid in [
+            format!("http://{hostname}/#cap={capability}"),
+            format!("https://other.example/#cap={capability}"),
+            format!("https://{hostname}/ceremony/{capability}"),
+            format!("https://{hostname}/#cap={capability}&extra=1"),
+            format!("https://user@{hostname}/#cap={capability}"),
+        ] {
+            assert!(parse_ceremony_url(&invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn remote_cookie_must_be_exactly_scoped_and_hardened() {
+        let ceremony_id = Digest32::from_bytes([0x42; 32]);
+        let value = "A".repeat(43);
+        let valid = format!(
+            "__Host-bloom-ceremony-{ceremony_id}={value}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=1500"
+        );
+        assert_eq!(
+            validate_remote_cookie(&valid, &ceremony_id).unwrap(),
+            format!("__Host-bloom-ceremony-{ceremony_id}={value}")
+        );
+
+        for invalid in [
+            valid.replace("__Host-bloom-ceremony-", "bloom-ceremony-"),
+            valid.replace("; Secure", ""),
+            valid.replace("SameSite=Strict", "SameSite=Lax"),
+            valid.replace("Max-Age=1500", "Max-Age=1501"),
+        ] {
+            assert!(validate_remote_cookie(&invalid, &ceremony_id).is_err());
+        }
     }
 }

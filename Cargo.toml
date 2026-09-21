@@ -15,12 +15,12 @@ license = "MIT"
 
 [workspace.dependencies]
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "7dddac2985bf00810589f02b4081062ef576a63b" }
-bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "7dddac2985bf00810589f02b4081062ef576a63b" }
+bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "61dbbf14211d54c728e910eb30129a82c2d7a90b" }
+bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "61dbbf14211d54c728e910eb30129a82c2d7a90b" }
 bloom-solana-verify = { path = "crates/bloom-solana-verify" }
-bloom-relay-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "329b955454db23813e24b0947142c0398bed4b00" }
-bloom-relay-protocol = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "329b955454db23813e24b0947142c0398bed4b00" }
-bloom-relay-admin-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "329b955454db23813e24b0947142c0398bed4b00" }
+bloom-relay-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "6c8771b66b618cd13b7cad3e0cd850af2982b5aa" }
+bloom-relay-protocol = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "6c8771b66b618cd13b7cad3e0cd850af2982b5aa" }
+bloom-relay-admin-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "6c8771b66b618cd13b7cad3e0cd850af2982b5aa" }
 bs58 = "0.5"
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }
 bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }
@@ -59,3 +59,5 @@ hkdf = "0.13"
 instant-acme = { version = "0.8.5", features = ["rcgen"] }
 futures-util = "0.3"
 x509-parser = "0.18"
+ureq = { version = "3.4.2", default-features = false, features = ["platform-verifier", "rustls"] }
+url = "2.5"

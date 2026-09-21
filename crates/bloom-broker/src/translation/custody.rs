@@ -129,7 +129,8 @@ pub(crate) fn result_to_machine(value: south::CustodyResult) -> north::CustodyRe
                     surface_id: surface.surface_id,
                     identity_digest: surface.identity_digest,
                 }),
-                rp_id: credential.rp_id,
+                rp_id: north::RpId::new(credential.rp_id.as_str())
+                    .expect("Signer RP ID satisfies the same DNS validation"),
                 active: credential.active,
             })
             .collect(),
@@ -383,7 +384,7 @@ mod tests {
             credential_summaries: vec![south::CredentialSummary {
                 credential_id: south::Base64UrlBytes::from_bytes(&[18]),
                 surface: Some(south::legacy_local_surface()),
-                rp_id: south::Token::new("rp-19").unwrap(),
+                rp_id: south::RpId::new("rp-19").unwrap(),
                 active: true,
             }],
             initial_policy: Some(south::SignedPolicySnapshot {

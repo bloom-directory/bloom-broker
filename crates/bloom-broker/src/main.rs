@@ -235,6 +235,15 @@ async fn main() {
         println!("bloom-broker {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    // Broker uses AWS-LC for browser TLS and ACME. Relay dependencies also
+    // enable ring, so rustls cannot infer a process-wide provider from features.
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_err()
+    {
+        eprintln!("Bloom Broker TLS provider initialization failed");
+        std::process::exit(1);
+    }
     if init_observability().is_err() {
         eprintln!("{OBSERVABILITY_INIT_FAILURE_MESSAGE}");
         std::process::exit(1);

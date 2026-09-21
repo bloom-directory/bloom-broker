@@ -154,7 +154,7 @@ fn custody_result() -> CustodyResult {
                 surface_id: token("local"),
                 identity_digest: digest(75),
             }),
-            rp_id: token("localhost"),
+            rp_id: RpId::new("localhost").unwrap(),
             active: true,
         }],
         initial_policy: Some(policy_snapshot()),
