@@ -760,6 +760,38 @@ impl BrokerRpcService {
         }
     }
 
+    /// Resolve what this wallet's authenticated policy says about clear
+    /// signing, and load the catalog under exactly that trust. A stored
+    /// snapshot the policy no longer trusts reads as no catalog at all.
+    fn clear_signing_context(
+        &self,
+        policy: &bloom_broker_api::CanonicalWalletPolicy,
+    ) -> Result<crate::evm_review::ClearSigningContext, ProtocolError> {
+        let verifier_digest =
+            Digest32::from_bytes(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES);
+        // The same authority clock the rest of preparation uses. This read is
+        // not a mutation, so it does not consume the caller's mutation
+        // allowance a second time; `prepare_approval` already takes one.
+        let now_ms = self.clock.now_ms(false)?;
+        let Some(settings) = &policy.clear_signing else {
+            return Ok(crate::evm_review::ClearSigningContext {
+                catalog: None,
+                verifier_digest,
+                now_ms,
+            });
+        };
+        let trusted = crate::authority::trusted_catalog_keys(settings).map_err(authority_error)?;
+        let catalog = self
+            .authority
+            .clear_signing_catalog(&trusted, usize::from(settings.signature_threshold))
+            .map_err(authority_error)?;
+        Ok(crate::evm_review::ClearSigningContext {
+            catalog,
+            verifier_digest,
+            now_ms,
+        })
+    }
+
     async fn prepare_approval(
         &self,
         request: ApprovalPrepareRequest,
@@ -780,6 +812,9 @@ impl BrokerRpcService {
                 "native EVM approval requires full review payloads; upgrade Bloom Machine",
             ));
         }
+        // The policy the review was produced against, kept so the frozen
+        // review kind is read from the same document the reading used.
+        let mut review_policy: Option<bloom_broker_api::CanonicalWalletPolicy> = None;
         if !request.evm_review_payloads.is_empty() {
             let response = self
                 .signer
@@ -818,7 +853,28 @@ impl BrokerRpcService {
                         "invalid canonical policy",
                     )
                 })?;
-            context.evm_review = crate::evm_review::review(&request, &policy, from)?;
+            let clear_signing = self.clear_signing_context(&policy)?;
+            context.evm_review =
+                crate::evm_review::review(&request, &policy, from, &clear_signing)?;
+            review_policy = Some(policy.clone());
+            if let Some(review) = &context.evm_review
+                && let Some(evidence) = &review.clear_signing
+                && let Some(settings) = &policy.clear_signing
+            {
+                // Cap the approval before a ceremony exists. Returning the
+                // permitted instant lets Machine regenerate terms under the
+                // existing operation-conflict rules instead of guessing.
+                let permitted = evidence.permitted_expiry_ms(settings.maximum_observation_age_ms);
+                if request.terms.expires_at_ms.get() > permitted {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ClaimInvalid,
+                        format!(
+                            "POLICY_DENIED: clear-signing evidence permits approval only until                              {permitted}; regenerate the terms with an expiry at or before that.                              {}",
+                            bloom_evm_clear_signing::ReviewReason::PolicyDenied.owner_action()
+                        ),
+                    ));
+                }
+            }
         }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
             ApprovalSelector::Exact {
@@ -858,6 +914,23 @@ impl BrokerRpcService {
         context.petal_use_claim = request.petal_use_claim;
         context.system_use_claim = request.system_use_claim;
         context.claim_assurance = claim_assurance;
+        // Freeze what Broker itself concluded, alongside the record that
+        // authorizes signing. There is no second write to lose: an approval
+        // record either exists with its review, or does not exist at all.
+        let review_kind = review_policy
+            .as_ref()
+            .map_or(crate::journal::ReviewKind::Legacy, |policy| {
+                crate::evm_review::review_kind(context.evm_review.as_ref(), policy)
+            });
+        let frozen_review = match context
+            .evm_review
+            .as_ref()
+            .and_then(|review| review.clear_signing.as_ref())
+        {
+            Some(evidence) => crate::authority::FrozenReview::with_evidence(review_kind, evidence),
+            None => crate::authority::FrozenReview::without_evidence(review_kind),
+        }
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::ClaimInvalid, error))?;
         let response =
             self.ceremony
                 .prepare_approval(ceremony_request, context, self.clock.now_ms(true)?)?;
@@ -867,6 +940,7 @@ impl BrokerRpcService {
                 &request.terms,
                 &response.review_manifest_digest,
                 approved_claim_digest.as_ref(),
+                &frozen_review,
             )
             .map_err(authority_error)
         {
@@ -1020,6 +1094,7 @@ impl BrokerRpcService {
             return Err(error);
         }
         self.prepare_approval(ApprovalPrepareRequest {
+            requested_review_mode: None,
             evm_review_payloads: Vec::new(),
             operation_id: request.operation_id,
             canonical_plan_facts_digest: request.replacement_terms.approval_digest()?,
@@ -2090,6 +2165,10 @@ impl BrokerRpcService {
                     verifier_digest: capability.artifact_digest,
                 })
                 .collect(),
+            clear_signing: self
+                .authority
+                .clear_signing_status()
+                .map_err(authority_error)?,
             frame_max_bytes: DecimalU64::new(bloom_broker_api::FRAME_MAX_BYTES as u64),
         })
     }

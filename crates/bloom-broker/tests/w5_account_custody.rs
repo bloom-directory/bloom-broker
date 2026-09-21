@@ -1858,6 +1858,7 @@ async fn approve_and_sign(
     let approve_prepared = match MachineBrokerService::dispatch(
         stack.broker.as_ref(),
         MachineBrokerRequest::SealedApprovalPrepare(bloom_broker_api::ApprovalPrepareRequest {
+            requested_review_mode: None,
             operation_id: approval_operation.clone(),
             terms: terms.clone(),
             canonical_plan_facts_digest: terms.approval_digest().unwrap(),

@@ -148,6 +148,17 @@ function chainLabel(chain, ctx) {
   return {ethereum: "Ethereum", mainnet: "Ethereum", base: "Base", arbitrum: "Arbitrum",
     optimism: "Optimism", polygon: "Polygon", anvil: "local test chain"}[chain] || chain;
 }
+// Bloom's heading, never the descriptor's. A publisher can describe an
+// argument; it cannot decide what the owner is told they are approving.
+function callHeading(call) {
+  if (call.action === "transfer") return "Send tokens";
+  if (call.action === "allowance") return "Grant a spending allowance";
+  return `Call ${call.function_signature.split("(")[0]}`;
+}
+function formatObserved(milliseconds) {
+  const value = Number(milliseconds);
+  return Number.isFinite(value) ? new Date(value).toISOString().replace("T", " ").slice(0, 19) + " UTC" : "an unknown time";
+}
 function describeTransfer(manifest) {
   const claim = manifest?.system_use_claim || manifest?.petal_use_claim;
   let plan = {};
@@ -179,23 +190,63 @@ function describeTransfer(manifest) {
     }
     facts.push([label("Payload commitment"), payload.payload_keccak, true]);
   };
-  // Broker refuses claims alongside EVM review payloads, so the envelope is
-  // the whole review.
+  // A clear-signed call puts the contract's own reading first: what moves,
+  // to whom, in which token. The envelope facts stay underneath — they are
+  // what was actually signed, and the description never replaces them.
+  const appendCallFacts = (facts, payload, prefix) => {
+    const call = payload.contract_call;
+    const label = name => prefix ? `${prefix} ${name.toLowerCase()}` : name;
+    facts.push([label("Action"), callHeading(call)]);
+    for (const field of call.fields || []) {
+      // Bloom owns the heading; the publisher's label names the argument.
+      facts.push([label(field.label), field.value, field.format === "addressName"]);
+    }
+    if (call.token) {
+      facts.push([label("Token"), `${call.token.symbol} — ${call.token.name}`]);
+      facts.push([label("Token contract"), call.token.address, true]);
+    }
+    facts.push([label("Contract"),
+      call.contract_name ? `${call.contract_name} (${call.contract})` : call.contract, true]);
+    if (call.intent) facts.push([label("Publisher description"), call.intent]);
+  };
   if (evmPayloads.length) {
     const facts = [];
+    const clear = plan.evm_review?.clear_signing;
+    const calls = evmPayloads.filter(payload => payload.contract_call);
     for (const [index, payload] of evmPayloads.entries()) {
-      appendEnvelopeFacts(facts, payload,
-        evmPayloads.length > 1 ? `Transaction ${index + 1}` : "");
+      const prefix = evmPayloads.length > 1 ? `Transaction ${index + 1}` : "";
+      if (payload.contract_call) appendCallFacts(facts, payload, prefix);
+      appendEnvelopeFacts(facts, payload, prefix);
     }
-    facts.push(["Bloom verification", "Exact envelope checked — destination and value come from the transaction bytes. Contract execution effects are not verified."]);
+    // Every mandatory warning, in the order the verifier produced it.
+    for (const payload of calls) {
+      for (const warning of payload.contract_call.warnings || []) {
+        facts.push(["Warning", warning]);
+      }
+    }
+    if (clear) {
+      facts.push(["Description source",
+        `Catalog ${clear.catalog_id}, sequence ${clear.catalog_sequence} — a trusted description, not proof of execution.`]);
+      facts.push(["Description commitment", clear.catalog_digest, true]);
+      for (const entry of clear.entries || []) {
+        if (!entry.upgradeable) continue;
+        facts.push(["Upgradeable contract",
+          `${entry.contract_address} was observed at ${formatObserved(entry.observed_at_ms)} and may have been upgraded since.`, true]);
+      }
+    }
+    facts.push(["Bloom verification", clear
+      ? "Exact envelope checked, and each contract call read against a signed description. Bloom did not execute the calls."
+      : "Exact envelope checked — destination and value come from the transaction bytes. Contract execution effects are not verified."]);
     const first = evmPayloads[0];
     const network = chainLabel(first.chain);
     const sentence = evmPayloads.length === 1
-      ? (first.destination
-        ? (first.calldata_keccak
-          ? `Approve one contract call on <strong>${escapeHtml(network)}</strong> to the address below.`
-          : `Approve one transaction on <strong>${escapeHtml(network)}</strong> to the address below.`)
-        : `Deploy one contract on <strong>${escapeHtml(network)}</strong>.`)
+      ? (first.contract_call
+        ? `${escapeHtml(callHeading(first.contract_call))} on <strong>${escapeHtml(network)}</strong>.`
+        : first.destination
+          ? (first.calldata_keccak
+            ? `Approve one contract call on <strong>${escapeHtml(network)}</strong> to the address below.`
+            : `Approve one transaction on <strong>${escapeHtml(network)}</strong> to the address below.`)
+          : `Deploy one contract on <strong>${escapeHtml(network)}</strong>.`)
       : `Approve <strong>${evmPayloads.length} EVM transactions</strong>. Check each envelope below.`;
     return {sentence, facts, willVerify: true};
   }

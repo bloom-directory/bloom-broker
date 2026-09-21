@@ -10,7 +10,7 @@ use bloom_broker::{
         CeremonyCompletionObserver, CeremonyLimits, CeremonySigner, ReviewManifestContext,
     },
     clock::BrokerClock,
-    journal::{AuditSigner, BrokerJournal},
+    journal::{AuditSigner, BrokerJournal, FrozenReview, NewApprovalRecord},
     service::BrokerRpcService,
     signer_client::BrokerSignerClient,
 };
@@ -1986,6 +1986,7 @@ async fn prepare_scoped_approval(
     match MachineBrokerService::dispatch(
         broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            requested_review_mode: None,
             operation_id,
             terms: terms.clone(),
             canonical_plan_facts_digest: digest("e7"),
@@ -2923,6 +2924,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let stale_policy_error = MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            requested_review_mode: None,
             evm_review_payloads: vec![Base64UrlBytes::from_bytes(&creation)],
             operation_id: operation("d9"),
             terms: SealedApprovalTerms {
@@ -2960,6 +2962,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let approval_prepared = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            requested_review_mode: None,
             evm_review_payloads: Vec::new(),
             operation_id: approval_operation.clone(),
             terms: approval_terms.clone(),
@@ -3092,6 +3095,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let exact_prepared = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            requested_review_mode: None,
             operation_id: exact_approval_operation.clone(),
             terms: exact_terms.clone(),
             canonical_plan_facts_digest: digest("e7"),
@@ -3322,6 +3326,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             MachineBrokerService::dispatch(
                 &broker,
                 MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                    requested_review_mode: None,
                     evm_review_payloads: Vec::new(),
                     operation_id: operation(&format!("{:02x}", 0xc0 + index)),
                     terms: denied_terms,
@@ -3691,11 +3696,14 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     restarted_journal
         .create_approval_record(
             &raced_approval_id,
-            &raced_terms_jcs,
-            &digest("ee"),
-            None,
-            None,
-            None,
+            &NewApprovalRecord {
+                terms_jcs: &raced_terms_jcs,
+                review_manifest_digest: &digest("ee"),
+                approved_claim_digest: None,
+                provenance_jcs: None,
+                renewal_of: None,
+                review: &FrozenReview::legacy(),
+            },
         )
         .unwrap();
     assert!(
@@ -4132,6 +4140,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         MachineBrokerService::dispatch(
             &restarted_scoped_broker,
             MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                requested_review_mode: None,
                 evm_review_payloads: Vec::new(),
                 operation_id: operation("dc"),
                 terms: expired_terms,

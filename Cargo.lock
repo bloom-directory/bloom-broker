@@ -910,6 +910,7 @@ dependencies = [
  "bloom-audit-checkpoint",
  "bloom-broker-api",
  "bloom-broker-debug-driver",
+ "bloom-evm-clear-signing",
  "bloom-platform-containment",
  "bloom-service-activation",
  "bloom-service-observability",
@@ -979,6 +980,24 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "zeroize",
+]
+
+[[package]]
+name = "bloom-evm-clear-signing"
+version = "0.1.0"
+dependencies = [
+ "alloy-dyn-abi",
+ "alloy-json-abi",
+ "alloy-primitives",
+ "bloom-broker-api",
+ "ed25519-dalek",
+ "hex",
+ "rand 0.10.2",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
 ]
 
 [[package]]

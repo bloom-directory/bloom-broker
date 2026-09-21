@@ -2,9 +2,9 @@ use bloom_broker::{
     assurance_verifiers::SolanaSystemTransferVerifier,
     authority::{
         AssuranceRegistry, AssuranceVerifier, AuthorizationInput, BrokerAuthority,
-        CanonicalWalletPolicy, CeremonyApprovalGrant, EpochReconciliation, PolicyAsset,
-        PolicyDestination, ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject,
-        VerifierCapability, canonical_policy_authority_diff,
+        CanonicalWalletPolicy, CeremonyApprovalGrant, EpochReconciliation, FrozenReview,
+        PolicyAsset, PolicyDestination, ProvenanceOperationClass, ProvenanceRecord,
+        ProvenanceSubject, VerifierCapability, canonical_policy_authority_diff,
     },
     journal::{AuditSigner, BrokerJournal},
 };
@@ -292,6 +292,7 @@ impl Harness {
 
     fn policy_snapshot(&self, version: u64) -> SignedPolicySnapshot {
         let policy = CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: self.wallet.clone(),
             maximum_approval_lifetime_ms: 100_000,
             allowed_petal_packages: vec![digest(9)],
@@ -424,7 +425,12 @@ impl Harness {
             Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(claim).unwrap()).into());
         let approval_id = self
             .authority
-            .prepare_approval_with_claim(terms, &review, Some(&claim_digest))
+            .prepare_approval_with_claim(
+                terms,
+                &review,
+                Some(&claim_digest),
+                &FrozenReview::legacy(),
+            )
             .unwrap();
         let grant = self.signed_grant(terms, approval_id, operation(3));
         self.authority.activate_approval(&grant, 1_500).unwrap();
@@ -2596,6 +2602,7 @@ fn initial_policy_snapshot(
         allowed_petal_packages: Vec::new(),
         allowed_destinations: Vec::new(),
         required_verifiers: Vec::new(),
+        clear_signing: None,
     };
     let canonical = serde_jcs::to_vec(&policy).unwrap();
     let mut snapshot = SignedPolicySnapshot {

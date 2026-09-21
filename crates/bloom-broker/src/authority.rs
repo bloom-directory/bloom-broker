@@ -1,6 +1,7 @@
+pub use crate::journal::FrozenReview;
 use crate::journal::{
-    BrokerJournal, BudgetLimits, JournalError, ReservationRequest, SlidingBudgetLimit,
-    SlidingValueLimit,
+    BrokerJournal, BudgetLimits, JournalError, NewApprovalRecord, ReservationRequest, ReviewKind,
+    SlidingBudgetLimit, SlidingValueLimit,
 };
 use bloom_broker_api::{
     ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
@@ -11,9 +12,13 @@ use bloom_broker_api::{
     SignedPolicySnapshot, SigningPayloads, SystemUseClaim, Token,
 };
 pub use bloom_broker_api::{CanonicalWalletPolicy, PolicyDestination, RequiredVerifier};
+pub use bloom_broker_api::{ClearSigningPolicy, ClearSigningStatus, ReviewMode};
 pub use bloom_broker_api::{
     ProvenanceCatalog, ProvenanceFeeAsset as PolicyAsset, ProvenanceOperationClass,
     ProvenanceRecord, ProvenanceSubject,
+};
+use bloom_evm_clear_signing::{
+    AcceptedCatalog, ClearSigningCatalog, ClearSigningEvidence, TrustedCatalogKey,
 };
 use bloom_signer_api::SignerActivationReceipt;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -36,6 +41,22 @@ const APPROVAL_TOMBSTONE_DOMAIN: &[u8] = b"bloom-approval-tombstone/v1";
 const WALLET_TOMBSTONE_DOMAIN: &[u8] = b"bloom-wallet-tombstone/v1";
 const POLICY_AUTHORITY_DIFF_DOMAIN: &[u8] = b"bloom-policy-authority-diff/v1";
 const SIGN_OPERATION_DOMAIN: &[u8] = b"bloom-sign-operation/v1";
+
+/// The durable-state contract this build can interpret.
+///
+/// Version 2 is the first that understands a wallet policy carrying the
+/// clear-signing extension. The floor is raised to 2 in the same transaction
+/// that first stores such a policy, so a later build with a lower version
+/// refuses to open the store before it mutates anything.
+///
+/// This gate protects combinations that have it. A build predating the gate
+/// has no floor to read — it fails a step later instead, when its strict
+/// decoder rejects the unknown `clear_signing` field while loading the
+/// policy. That is fail-closed rather than silent, but it is a different
+/// message, and the supported-downgrade statement in the review packet is
+/// about the whole combination, not about which decoder speaks first.
+pub const BROKER_STATE_VERSION: i64 = 2;
+const STATE_VERSION_WITH_CLEAR_SIGNING: i64 = 2;
 
 #[derive(Serialize)]
 struct MachineSignOperationIdentity {
@@ -71,6 +92,28 @@ pub struct PolicyAuthorityDiff {
     pub removed_destinations: Vec<PolicyAuthorityDestination>,
     pub added_required_verifiers: Vec<PolicyAuthorityVerifier>,
     pub removed_required_verifiers: Vec<PolicyAuthorityVerifier>,
+    /// Present only when clear signing actually changed. Absent when neither
+    /// the current nor the proposed policy carries the extension, so every
+    /// policy update that predates clear signing keeps its exact diff bytes
+    /// and digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_signing: Option<PolicyAuthorityClearSigning>,
+}
+
+/// What a policy update does to clear signing, before and after.
+///
+/// The whole settings document appears on both sides rather than a summary:
+/// the trusted publisher keys, the signature threshold, the observation age
+/// and the two permissions are each authority the owner is granting or
+/// withdrawing, and a diff that named only some of them would be a diff the
+/// ceremony could not honestly present.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyAuthorityClearSigning {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<ClearSigningPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<ClearSigningPolicy>,
 }
 
 impl PolicyAuthorityDiff {
@@ -154,7 +197,14 @@ pub fn canonical_policy_authority_diff(
             }),
     );
 
+    let clear_signing =
+        (current.clear_signing != proposed.clear_signing).then(|| PolicyAuthorityClearSigning {
+            before: current.clear_signing.clone(),
+            after: proposed.clear_signing.clone(),
+        });
+
     PolicyAuthorityDiff {
+        clear_signing,
         maximum_approval_lifetime_ms_before: bloom_broker_api::DecimalU64::new(
             current.maximum_approval_lifetime_ms,
         ),
@@ -569,8 +619,26 @@ impl BrokerAuthority {
                 expires_at_ms TEXT NOT NULL,
                 custody_receipt_digest TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS clear_signing_catalog (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                catalog_id TEXT NOT NULL,
+                sequence TEXT NOT NULL,
+                content_digest TEXT NOT NULL,
+                catalog_jcs TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS store_compatibility (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                minimum_state_version INTEGER NOT NULL
+            );
             ",
             )?;
+            // Before anything is migrated or mutated: refuse to open a store
+            // that records a floor this build cannot honour. A rollback that
+            // opened it anyway would read an enabled clear-signing policy
+            // with a decoder that does not know the field, and the only ways
+            // out of that are dropping a security field or corrupting the
+            // document. Neither is acceptable, so the build stops here.
+            enforce_state_floor(&connection)?;
             migrate_legacy_authority(&mut connection, &legacy_connection, &journal)?;
         }
         let mut policy_keys = policy_keys;
@@ -697,6 +765,7 @@ impl BrokerAuthority {
                 ));
             }
         }
+        check_clear_signing_policy(policy)?;
         let snapshot_jcs = serde_jcs::to_string(snapshot).map_err(storage)?;
         let policy_jcs = serde_jcs::to_string(&policy).map_err(storage)?;
         let connection = self.lock()?;
@@ -746,6 +815,11 @@ impl BrokerAuthority {
                     "policy version must advance monotonically",
                 ));
             }
+        }
+        if policy.clear_signing.is_some() {
+            // Raise the downgrade floor before the document that needs it is
+            // visible, not after.
+            raise_state_floor(&transaction, STATE_VERSION_WITH_CLEAR_SIGNING)?;
         }
         transaction.execute(
             "INSERT INTO policies(wallet_id, version, digest, snapshot_jcs, policy_jcs)
@@ -1538,7 +1612,12 @@ impl BrokerAuthority {
         terms: &SealedApprovalTerms,
         review_manifest_digest: &Digest32,
     ) -> Result<Digest32, AuthorityError> {
-        self.prepare_approval_with_claim(terms, review_manifest_digest, None)
+        self.prepare_approval_with_claim(
+            terms,
+            review_manifest_digest,
+            None,
+            &FrozenReview::legacy(),
+        )
     }
 
     pub fn prepare_approval_with_claim(
@@ -1546,6 +1625,7 @@ impl BrokerAuthority {
         terms: &SealedApprovalTerms,
         review_manifest_digest: &Digest32,
         approved_claim_digest: Option<&Digest32>,
+        review: &FrozenReview,
     ) -> Result<Digest32, AuthorityError> {
         let _barrier = self.lock_authorization_barrier()?;
         terms
@@ -1563,6 +1643,8 @@ impl BrokerAuthority {
                 && existing.review_manifest_digest == review_manifest_digest.as_str()
                 && existing.approved_claim_digest.as_deref()
                     == approved_claim_digest.map(Digest32::as_str)
+                && existing.review_kind == review.kind.as_str()
+                && existing.clear_signing_evidence_jcs.as_deref() == review.evidence_jcs()
             {
                 return Ok(approval_id);
             }
@@ -1689,11 +1771,14 @@ impl BrokerAuthority {
         let terms_jcs = serde_jcs::to_string(terms).map_err(storage)?;
         self.journal.create_approval_record(
             &approval_id,
-            &terms_jcs,
-            review_manifest_digest,
-            approved_claim_digest,
-            Some(&provenance_jcs),
-            terms.renewal_of.as_ref(),
+            &NewApprovalRecord {
+                terms_jcs: &terms_jcs,
+                review_manifest_digest,
+                approved_claim_digest,
+                provenance_jcs: Some(&provenance_jcs),
+                renewal_of: terms.renewal_of.as_ref(),
+                review,
+            },
         )?;
         Ok(approval_id)
     }
@@ -1732,6 +1817,252 @@ impl BrokerAuthority {
         drop(connection);
         self.journal.checkpoint_committed_head()?;
         Ok(digest)
+    }
+
+    /// Install a signed clear-signing catalog, replacing the whole entry set.
+    ///
+    /// The snapshot is verified against the trust a wallet policy pins, so
+    /// the operator supplies bytes and Broker decides whether they authorize
+    /// anything. Sequence must increase; the same sequence with the same
+    /// content is an idempotent retry, and the same sequence with different
+    /// content is refused rather than silently preferred.
+    pub fn install_clear_signing_catalog(
+        &self,
+        catalog: &ClearSigningCatalog,
+        encoded_bytes: usize,
+        trusted: &[TrustedCatalogKey],
+        threshold: usize,
+    ) -> Result<AcceptedCatalog, AuthorityError> {
+        let _barrier = self.lock_authorization_barrier()?;
+        let accepted = catalog
+            .accept(encoded_bytes, trusted, threshold)
+            .map_err(|error| denied("CLEAR_SIGNING_CATALOG_REJECTED", error.to_string()))?;
+        let mut connection = self.lock_for_mutation()?;
+        let transaction = connection.transaction()?;
+        let current: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT sequence, content_digest FROM clear_signing_catalog WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((sequence, digest)) = current {
+            let stored: u64 = sequence.parse().unwrap_or(0);
+            let incoming = catalog.sequence.get();
+            if incoming < stored
+                || (incoming == stored && digest != accepted.content_digest.as_str())
+            {
+                return Err(denied(
+                    "CLEAR_SIGNING_CATALOG_REJECTED",
+                    "catalog sequence rolls back or reuses a sequence with different content",
+                ));
+            }
+            if incoming == stored {
+                // Same sequence, same content: an idempotent retry, not a
+                // second installation to journal.
+                return Ok(accepted);
+            }
+        }
+        transaction.execute(
+            "INSERT INTO clear_signing_catalog(id, catalog_id, sequence, content_digest, catalog_jcs)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                catalog_id=excluded.catalog_id,
+                sequence=excluded.sequence,
+                content_digest=excluded.content_digest,
+                catalog_jcs=excluded.catalog_jcs",
+            params![
+                catalog.catalog_id.as_str(),
+                catalog.sequence.as_str(),
+                accepted.content_digest.as_str(),
+                serde_jcs::to_string(catalog).map_err(storage)?
+            ],
+        )?;
+        self.journal.append_external_audit(
+            &transaction,
+            "clear_signing.catalog_installed",
+            &serde_json::json!({
+                "catalog_id": catalog.catalog_id,
+                "sequence": catalog.sequence,
+                "content_digest": accepted.content_digest,
+                "entries": catalog.entries.len(),
+            }),
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.journal.checkpoint_committed_head()?;
+        Ok(accepted)
+    }
+
+    /// Install a snapshot supplied by the operator at startup.
+    ///
+    /// Storage is not authorization. The snapshot is stored only if some
+    /// enrolled wallet's authenticated policy already trusts its signers and
+    /// names its catalog, and every review re-verifies it against the trust
+    /// of the wallet actually being reviewed. A wallet that later rotates its
+    /// keys stops accepting the stored bytes without anything being deleted.
+    pub fn install_clear_signing_catalog_for_enrolled_wallets(
+        &self,
+        catalog: &ClearSigningCatalog,
+        encoded_bytes: usize,
+    ) -> Result<bool, AuthorityError> {
+        let mut last_error = None;
+        for settings in self.enrolled_clear_signing_policies()? {
+            if settings.catalog_id != catalog.catalog_id {
+                continue;
+            }
+            let trusted = trusted_catalog_keys(&settings)?;
+            match self.install_clear_signing_catalog(
+                catalog,
+                encoded_bytes,
+                &trusted,
+                usize::from(settings.signature_threshold),
+            ) {
+                Ok(_) => return Ok(true),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(false),
+        }
+    }
+
+    fn enrolled_clear_signing_policies(&self) -> Result<Vec<ClearSigningPolicy>, AuthorityError> {
+        let connection = self.lock()?;
+        let mut statement =
+            connection.prepare("SELECT policy_jcs FROM policies ORDER BY wallet_id")?;
+        let rows: Vec<String> = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<_, _>>()?;
+        drop(statement);
+        drop(connection);
+        rows.into_iter()
+            .map(|row| {
+                serde_json::from_str::<CanonicalWalletPolicy>(&row)
+                    .map(|policy| policy.clear_signing)
+                    .map_err(storage)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|policies| policies.into_iter().flatten().collect())
+    }
+
+    /// The stored catalog, re-accepted under the trust the caller's wallet
+    /// policy pins. Stored bytes are not trusted on their own: a policy that
+    /// rotated its keys stops accepting the snapshot it used to accept.
+    pub fn clear_signing_catalog(
+        &self,
+        trusted: &[TrustedCatalogKey],
+        threshold: usize,
+    ) -> Result<Option<AcceptedCatalog>, AuthorityError> {
+        let connection = self.lock()?;
+        let stored: Option<String> = connection
+            .query_row(
+                "SELECT catalog_jcs FROM clear_signing_catalog WHERE id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        drop(connection);
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let catalog: ClearSigningCatalog = serde_json::from_str(&stored).map_err(storage)?;
+        match catalog.accept(stored.len(), trusted, threshold) {
+            Ok(accepted) => Ok(Some(accepted)),
+            // Not a storage failure: the wallet no longer trusts what is
+            // stored, which reads the same as having no catalog.
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+impl BrokerAuthority {
+    /// The review kind and evidence frozen with an approval.
+    ///
+    /// Both come from the one approval record, written in the transaction
+    /// that created it. There is no second copy to lose or to disagree with.
+    pub fn frozen_review(
+        &self,
+        approval_id: &Digest32,
+    ) -> Result<Option<(ReviewKind, Option<ClearSigningEvidence>)>, AuthorityError> {
+        let Some(record) = self.journal.approval_record(approval_id)? else {
+            return Ok(None);
+        };
+        let kind = ReviewKind::from_stored(&record.review_kind);
+        let evidence = record
+            .clear_signing_evidence_jcs
+            .as_deref()
+            .map(serde_json::from_str::<ClearSigningEvidence>)
+            .transpose()
+            // Evidence that no longer parses is corrupt, not absent. Reading
+            // it as absent is exactly the confusion this record prevents.
+            .map_err(|error| {
+                denied(
+                    "CLEAR_SIGNING_EVIDENCE_UNREADABLE",
+                    format!("frozen clear-signing evidence is corrupt: {error}"),
+                )
+            })?;
+        Ok(Some((kind, evidence)))
+    }
+
+    /// Re-resolve a frozen review against the current catalog and policy.
+    ///
+    /// Called at activation and again at each signing authorization, so a
+    /// withdrawal committed before the decision blocks it. A newer catalog
+    /// never extends an approval: only the original expiry does that.
+    ///
+    /// An approval the owner approved as clear signing cannot authorize a
+    /// signature without its evidence. Missing evidence is a denial, not a
+    /// fallback to the envelope review the owner never saw.
+    pub fn recheck_clear_signing(
+        &self,
+        approval_id: &Digest32,
+        policy: &CanonicalWalletPolicy,
+        verifier_digest: &Digest32,
+        now_ms: u64,
+    ) -> Result<(), AuthorityError> {
+        let Some((kind, evidence)) = self.frozen_review(approval_id)? else {
+            return Err(denied(
+                "APPROVAL_NOT_FOUND",
+                "approval has no frozen review record",
+            ));
+        };
+        let evidence = match (kind.requires_clear_signing_evidence(), evidence) {
+            (true, Some(evidence)) => evidence,
+            (true, None) => {
+                return Err(denied(
+                    "CLEAR_SIGNING_EVIDENCE_MISSING",
+                    "approval was approved as clear signing but its frozen evidence is gone",
+                ));
+            }
+            // A non-clear approval carrying evidence is a record this build
+            // did not write. Refuse rather than pick a reading.
+            (false, Some(_)) => {
+                return Err(denied(
+                    "CLEAR_SIGNING_REVIEW_CHANGED",
+                    "approval record carries evidence its review kind does not permit",
+                ));
+            }
+            (false, None) => return Ok(()),
+        };
+        let settings = policy.clear_signing.as_ref().ok_or_else(|| {
+            denied(
+                "CLEAR_SIGNING_REVIEW_CHANGED",
+                "wallet policy no longer enables clear signing",
+            )
+        })?;
+        let trusted = trusted_catalog_keys(settings)?;
+        let catalog =
+            self.clear_signing_catalog(&trusted, usize::from(settings.signature_threshold))?;
+        evidence
+            .recheck(
+                catalog.as_ref(),
+                verifier_digest,
+                now_ms,
+                settings.maximum_observation_age_ms,
+            )
+            .map_err(|error| denied("CLEAR_SIGNING_REVIEW_CHANGED", error.to_string()))
     }
 
     /// Atomically replace the complete installer-owned provenance catalog.
@@ -1827,6 +2158,13 @@ impl BrokerAuthority {
                 "ceremony cannot activate authority from an old or unreconciled epoch",
             ));
         }
+        let (_, activation_policy) = self.current_policy(&terms.wallet_id)?;
+        self.recheck_clear_signing(
+            &grant.approval_id,
+            &activation_policy,
+            &Digest32::from_bytes(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES),
+            now_ms,
+        )?;
         if grant.approval_digest != grant.approval_id
             || grant.approval_id
                 != terms
@@ -2266,6 +2604,7 @@ impl BrokerAuthority {
                 ));
             }
         }
+        check_clear_signing_policy(&proposed)?;
         let authority_diff = canonical_policy_authority_diff(&current, &proposed);
         if authority_diff.digest().map_err(storage)? != request.authority_diff_digest {
             return Err(denied(
@@ -2274,6 +2613,54 @@ impl BrokerAuthority {
             ));
         }
         Ok(authority_diff)
+    }
+
+    /// The operator-visible clear-signing status: what is stored, how long it
+    /// is valid, and which profiles this build can read. Per-wallet trust is
+    /// deliberately absent — that lives in the wallet's policy, which
+    /// `policy.read` already returns.
+    pub fn clear_signing_status(&self) -> Result<Option<ClearSigningStatus>, AuthorityError> {
+        let connection = self.lock()?;
+        let stored: Option<(String, String, String, String)> = connection
+            .query_row(
+                "SELECT catalog_id, sequence, content_digest, catalog_jcs
+                 FROM clear_signing_catalog WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        drop(connection);
+        let Some((catalog_id, sequence, content_digest, stored)) = stored else {
+            return Ok(None);
+        };
+        let catalog: ClearSigningCatalog = serde_json::from_str(&stored).map_err(storage)?;
+        let oldest_observation_ms = catalog
+            .entries
+            .iter()
+            .map(|entry| entry.observed_at_ms.get())
+            .min()
+            .unwrap_or_default();
+        Ok(Some(ClearSigningStatus {
+            catalog_id,
+            sequence,
+            content_digest,
+            expires_at_ms: catalog.expires_at_ms.as_str().to_owned(),
+            entries: catalog.entries.len() as u64,
+            oldest_observation_ms: oldest_observation_ms.to_string(),
+            verifier_id: bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_ID.to_owned(),
+            verifier_digest: Digest32::from_bytes(
+                bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES,
+            )
+            .as_str()
+            .to_owned(),
+        }))
     }
 
     pub fn wallet_ids(&self) -> Result<Vec<Token>, AuthorityError> {
@@ -2356,6 +2743,16 @@ impl BrokerAuthority {
                 "frozen approval policy no longer matches current verified policy",
             ));
         }
+        // A withdrawal committed before this decision blocks it. The decision
+        // boundary is this barrier, so the race resolves the same way every
+        // time; a withdrawal after a short-lived signing request has been
+        // dispatched cannot be recalled, and is not claimed to be.
+        self.recheck_clear_signing(
+            &input.request.approval_id,
+            &policy,
+            &Digest32::from_bytes(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES),
+            input.reserved_at_ms,
+        )?;
         let (local_epoch, reconciled) = self.epoch_state(&terms.wallet_id)?;
         if !reconciled || local_epoch != terms.wallet_revocation_epoch.get() {
             return Err(denied(
@@ -4018,6 +4415,87 @@ fn denied(code: &'static str, message: impl Into<String>) -> AuthorityError {
 
 fn storage(error: impl ToString) -> AuthorityError {
     AuthorityError::Storage(error.to_string())
+}
+
+/// Refuse to open a store whose recorded floor is above this build.
+fn enforce_state_floor(connection: &Connection) -> Result<(), AuthorityError> {
+    let floor: Option<i64> = connection
+        .query_row(
+            "SELECT minimum_state_version FROM store_compatibility WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match floor {
+        Some(floor) if floor > BROKER_STATE_VERSION => Err(AuthorityError::Storage(format!(
+            "this Broker interprets durable state version {BROKER_STATE_VERSION}, but the store              requires at least {floor}; run a build that understands the stored wallet policy              instead of downgrading, which would have to drop a security field to proceed"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Raise the floor in the same transaction as the mutation that needs it, so
+/// there is no window in which incompatible state exists without its gate.
+fn raise_state_floor(
+    transaction: &rusqlite::Transaction<'_>,
+    version: i64,
+) -> Result<(), AuthorityError> {
+    transaction.execute(
+        "INSERT INTO store_compatibility(id, minimum_state_version) VALUES (1, ?1)
+         ON CONFLICT(id) DO UPDATE SET
+            minimum_state_version = MAX(minimum_state_version, excluded.minimum_state_version)",
+        [version],
+    )?;
+    Ok(())
+}
+
+pub fn trusted_catalog_keys(
+    settings: &ClearSigningPolicy,
+) -> Result<Vec<TrustedCatalogKey>, AuthorityError> {
+    settings
+        .trusted_keys
+        .iter()
+        .map(|key| {
+            let bytes: [u8; 32] =
+                key.verifying_key.decode().try_into().map_err(|_| {
+                    denied("POLICY_INVALID", "a trusted catalog key is not 32 bytes")
+                })?;
+            Ok(TrustedCatalogKey {
+                key_id: key.key_id.clone(),
+                verifying_key: VerifyingKey::from_bytes(&bytes).map_err(|_| {
+                    denied(
+                        "POLICY_INVALID",
+                        "a trusted catalog key is not a valid Ed25519 key",
+                    )
+                })?,
+            })
+        })
+        .collect()
+}
+
+/// Validate a clear-signing extension against this build.
+///
+/// The pinned verifier must exist here, exactly as `required_verifiers`
+/// pins a claim verifier: a policy naming a verifier this binary does not
+/// contain is refused rather than quietly ignored.
+fn check_clear_signing_policy(policy: &CanonicalWalletPolicy) -> Result<(), AuthorityError> {
+    let Some(settings) = &policy.clear_signing else {
+        return Ok(());
+    };
+    settings
+        .validate()
+        .map_err(|error| denied("POLICY_INVALID", error.message))?;
+    trusted_catalog_keys(settings)?;
+    if settings.verifier.verifier_id.as_str() != bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_ID
+        || settings.verifier.verifier_digest
+            != Digest32::from_bytes(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES)
+    {
+        return Err(denied(
+            "POLICY_VERIFIER_UNAVAILABLE",
+            "proposed policy pins a clear-signing verifier absent from this build",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

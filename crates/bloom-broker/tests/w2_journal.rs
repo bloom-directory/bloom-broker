@@ -4,8 +4,8 @@ use bloom_audit_checkpoint::{
 };
 use bloom_broker::journal::{
     AuditSigner, BrokerJournal, BudgetLimits, ClockCondition, DurablePoint, FaultHook,
-    JournalError, ReservationRequest, ReservationState, SlidingBudgetLimit, SlidingValueLimit,
-    TimeReading, derive_batch_child_operation_id,
+    FrozenReview, JournalError, NewApprovalRecord, ReservationRequest, ReservationState,
+    SlidingBudgetLimit, SlidingValueLimit, TimeReading, derive_batch_child_operation_id,
 };
 use bloom_broker_api::{
     ApprovalLifecycleState, Base64UrlBytes, BootEpoch, CryptoSuite, DecimalU64, DecimalU256,
@@ -180,7 +180,17 @@ fn open_journal(path: &std::path::Path) -> BrokerJournal {
 fn install_reservation_approval(journal: &BrokerJournal) {
     let approval_id = digest("22");
     journal
-        .create_approval_record(&approval_id, "{}", &digest("aa"), None, None, None)
+        .create_approval_record(
+            &approval_id,
+            &NewApprovalRecord {
+                terms_jcs: "{}",
+                review_manifest_digest: &digest("aa"),
+                approved_claim_digest: None,
+                provenance_jcs: None,
+                renewal_of: None,
+                review: &FrozenReview::legacy(),
+            },
+        )
         .unwrap();
     journal
         .activate_approval_record(&approval_id, &operation_id(250), "{}")

@@ -1995,7 +1995,7 @@ impl CeremonyBroker {
             manifest.claim_assurance.as_ref(),
             manifest.petal_use_claim.as_ref(),
             manifest.system_use_claim.as_ref(),
-            manifest.evm_review.is_some(),
+            manifest.evm_review.as_ref(),
         );
         let canonical_plan = canonical_review_plan(
             request,
@@ -2041,7 +2041,7 @@ impl CeremonyBroker {
             context.claim_assurance.as_ref(),
             context.petal_use_claim.as_ref(),
             context.system_use_claim.as_ref(),
-            context.evm_review.is_some(),
+            context.evm_review.as_ref(),
         );
         let canonical_plan = canonical_review_plan(
             request,
@@ -3186,10 +3186,10 @@ fn review_disclosures(
     assurance: Option<&ClaimAssurance>,
     claim: Option<&PetalUseClaim>,
     system_claim: Option<&SystemUseClaim>,
-    has_evm_review: bool,
+    evm_review: Option<&crate::evm_review::EvmReview>,
 ) -> Vec<String> {
     let mut disclosures = Vec::new();
-    if !has_evm_review
+    if evm_review.is_none()
         && (!request.exact_ordered_payload_digests.is_empty()
             || !request.exact_ordered_hashes.is_empty())
     {
@@ -3198,15 +3198,33 @@ fn review_disclosures(
                 .to_owned(),
         );
     }
-    if has_evm_review {
+    if let Some(review) = evm_review {
         // The decoded destination and value come from the exact transaction
         // bytes, but anything the input data would execute is still
         // unverified. This lives in the signed disclosures (not just the
         // page) so the honesty statement carries the manifest signature.
-        disclosures.push(
-            "Bloom decoded the destination and value from the exact transaction bytes. Bloom has not established the execution effects of any contract input data."
-                .to_owned(),
-        );
+        match &review.clear_signing {
+            Some(evidence) => disclosures.push(format!(
+                "Bloom decoded these transactions from their exact bytes and read their contract calls against catalog {}, whose publisher this wallet trusts to describe these contracts. Bloom has not executed the calls or established what the contracts do.",
+                evidence.catalog_id
+            )),
+            None => disclosures.push(
+                "Bloom decoded the destination and value from the exact transaction bytes. Bloom has not established the execution effects of any contract input data."
+                    .to_owned(),
+            ),
+        }
+        // The mandatory inability-to-explain warning, bound to the exact
+        // bytes through this manifest rather than shown only by the page.
+        if review.payloads.iter().any(|payload| {
+            payload.destination.is_some()
+                && payload.calldata_keccak.is_some()
+                && payload.contract_call.is_none()
+        }) {
+            disclosures.push(
+                "Bloom cannot explain what the contract input data in this request does. Approving it authorizes exactly these bytes and nothing less."
+                    .to_owned(),
+            );
+        }
     }
     let machine_asserted = matches!(assurance, Some(ClaimAssurance::MachineAsserted))
         || claim
