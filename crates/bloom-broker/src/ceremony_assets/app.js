@@ -486,7 +486,7 @@ const sessionTokenKey = "bloom.ceremony.token.v1";
 let token = remoteCeremony ? remoteFragment : (tokenFromPath || readSessionToken());
 let ceremonyId = null;
 if (!remoteCeremony && tokenFromPath) writeSessionToken(tokenFromPath);
-if (remoteCeremony || token) history.replaceState(null, "", "/");
+if (remoteCeremony || token) history.replaceState(null, "", "/ceremony/");
 const authHeaders = remoteCeremony ? {} : {"x-bloom-ceremony-token": token};
 const ceremonyRpId = remoteCeremony ? location.hostname : "localhost";
 const te = new TextEncoder();
@@ -1003,52 +1003,6 @@ async function loadCrossSurface(session) {
   };
 }
 
-function renderRecoveryBootstrap(message = "Have your recovery record ready to continue.") {
-  stopCrossSurface();
-  clearInterval(expiryTimer);
-  for (const fields of [recoveryFields, exportFields, importFields, genericFields]) fields.hidden = true;
-  document.getElementById("recovery-bootstrap").hidden = false;
-  document.getElementById("page-title").textContent = "Recover wallet access";
-  document.getElementById("page-lede").textContent = "Use a recovery record to enroll a new passkey. Successful recovery replaces all previous passkeys and issues a new recovery record.";
-  panelKicker.textContent = "Recovery";
-  panelTitle.textContent = "Identify your recovery record";
-  reviewNode.replaceChildren();
-  statusNode.textContent = message;
-  cancel.hidden = true;
-  approve.hidden = false;
-  approve.disabled = false;
-  approve.textContent = "Start recovery";
-  approve.onclick = async () => {
-    const walletId = document.getElementById("recovery-wallet-id").value.trim();
-    const recoveryId = document.getElementById("recovery-bootstrap-id").value.trim();
-    if (!walletId || !recoveryId) {
-      statusNode.textContent = "Enter the wallet ID and recovery record ID.";
-      return;
-    }
-    approve.disabled = true;
-    try {
-      const response = await fetch("/api/recovery/bootstrap", {
-        method: "POST", credentials: "same-origin", cache: "no-store",
-        headers: {"content-type": "application/json"},
-        body: JSON.stringify({wallet_id: walletId, recovery_id: recoveryId})
-      });
-      if (!response.ok) throw new Error("Recovery is temporarily unavailable");
-      const started = await response.json();
-      const url = new URL(started.ceremony_url);
-      if (url.origin !== location.origin || url.username || url.password ||
-          (remoteCeremony ? !/^#cap=[A-Za-z0-9_-]{43}$/.test(url.hash)
-            : !/^\/ceremony\/[A-Za-z0-9_-]{43}$/.test(url.pathname))) {
-        throw new Error("Invalid recovery destination");
-      }
-      // Forward the opaque launch URL without adding identifiers or secrets.
-      location.assign(url.href);
-    } catch (_) {
-      statusNode.textContent = "Recovery could not start. Wait a moment and try again.";
-      approve.disabled = false;
-    }
-  };
-}
-
 async function load() {
   await cryptoSelfTest();
   await purgeExpiredBrowserState();
@@ -1070,12 +1024,12 @@ async function load() {
       try { exchanged = JSON.parse(browserSessionStorage()?.getItem("bloom.ceremony.remote-session.v1") || "null"); }
       catch (_) {}
     }
-    if (!exchanged) return renderRecoveryBootstrap();
+    if (!exchanged) throw new Error("Open a fresh ceremony link from Bloom.");
     if (!/^[0-9a-f]{64}$/.test(exchanged.ceremony_id) ||
         !/^[A-Za-z0-9_-]{43}$/.test(exchanged.csrf) ||
         !Number.isFinite(exchanged.expires_at) || exchanged.expires_at <= Date.now()) {
       clearSessionToken();
-      return renderRecoveryBootstrap("This ceremony session expired. Start a new request in Bloom, or recover access with your recovery record.");
+      throw new Error("This ceremony session expired. Open a fresh link from Bloom.");
     }
     ceremonyId = exchanged.ceremony_id;
     authHeaders["x-bloom-csrf"] = exchanged.csrf;
@@ -1086,7 +1040,7 @@ async function load() {
     })); } catch (_) {}
     sessionPath = `/api/session/${ceremonyId}`;
   } else if (!token) {
-    return renderRecoveryBootstrap();
+    throw new Error("Open a fresh ceremony link from Bloom.");
   } else if (token.length !== 43) {
     throw new Error("Invalid ceremony URL");
   }

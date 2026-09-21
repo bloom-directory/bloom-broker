@@ -10,8 +10,8 @@ use bloom_signer_api::{
 };
 use ciborium::value::{Integer, Value};
 use hpke::{
-    Deserializable, Kem as KemTrait, OpModeS, Serializable, aead::ChaCha20Poly1305,
-    kdf::HkdfSha256, kem::X25519HkdfSha256, setup_sender,
+    Deserializable, Kem as KemTrait, OpModeR, OpModeS, Serializable, aead::ChaCha20Poly1305,
+    kdf::HkdfSha256, kem::X25519HkdfSha256, setup_receiver, setup_sender,
 };
 use p256::{
     ecdsa::{SigningKey, signature::Signer as _},
@@ -21,6 +21,47 @@ use rand::{TryRng as _, rngs::SysRng};
 use sha2::{Digest as _, Sha256};
 
 type BloomKem = X25519HkdfSha256;
+
+/// Browser-owned, one-use recipient for Signer's sensitive custody result.
+pub struct BrowserResultRecipient {
+    private_key: <BloomKem as KemTrait>::PrivateKey,
+    public_key: Base64UrlBytes,
+}
+
+impl BrowserResultRecipient {
+    pub fn generate() -> Self {
+        let (private_key, public_key) = BloomKem::gen_keypair();
+        Self {
+            private_key,
+            public_key: Base64UrlBytes::from_bytes(&public_key.to_bytes()),
+        }
+    }
+
+    pub fn public_key(&self) -> &Base64UrlBytes {
+        &self.public_key
+    }
+
+    pub fn open(
+        &self,
+        envelope: &HpkeEnvelope,
+        info: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, ProtocolError> {
+        let encapped =
+            <BloomKem as KemTrait>::EncappedKey::from_bytes(&envelope.kem_output.decode())
+                .map_err(|_| driver_error())?;
+        let mut context = setup_receiver::<ChaCha20Poly1305, HkdfSha256, BloomKem>(
+            &OpModeR::Base,
+            &self.private_key,
+            &encapped,
+            info,
+        )
+        .map_err(|_| driver_error())?;
+        context
+            .open(&envelope.ciphertext.decode(), aad)
+            .map_err(|_| driver_error())
+    }
+}
 
 pub struct VirtualAuthenticator {
     signing_key: SigningKey,
@@ -235,7 +276,7 @@ fn driver_error() -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
-    use super::VirtualAuthenticator;
+    use super::{BrowserResultRecipient, VirtualAuthenticator, seal_hpke};
     use bloom_signer_api::Base64UrlBytes;
     use sha2::{Digest as _, Sha256};
 
@@ -248,6 +289,34 @@ mod tests {
         assert_eq!(first.deterministic_prf(), replay.deterministic_prf());
         assert_ne!(first.credential(0), other.credential(0));
         assert_ne!(first.deterministic_prf(), other.deterministic_prf());
+    }
+
+    #[test]
+    fn browser_result_recipient_opens_only_its_bound_envelope() {
+        let recipient = BrowserResultRecipient::generate();
+        let envelope = seal_hpke(
+            recipient.public_key(),
+            b"bloom-custody-output/v1",
+            b"typed-aad",
+            b"private recovery record",
+        )
+        .unwrap();
+        assert_eq!(
+            recipient
+                .open(&envelope, b"bloom-custody-output/v1", b"typed-aad")
+                .unwrap(),
+            b"private recovery record"
+        );
+        assert!(
+            recipient
+                .open(&envelope, b"bloom-custody-output/v1", b"wrong-aad")
+                .is_err()
+        );
+        assert!(
+            BrowserResultRecipient::generate()
+                .open(&envelope, b"bloom-custody-output/v1", b"typed-aad")
+                .is_err()
+        );
     }
 
     #[test]

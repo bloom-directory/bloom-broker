@@ -165,9 +165,7 @@ await load();
 assert.deepEqual(calls, [`/api/session/${session.ceremony_id}`, `/api/session/${session.ceremony_id}/result`]);
 assert.equal(stored.size, 0);
 stored.set("bloom.ceremony.remote-session.v1", JSON.stringify({...reference, expires_at: 0}));
-await load();
-assert.equal(approve.textContent, "Start recovery");
-assert.match(statusNode.textContent, /expired/);
+await assert.rejects(load(), /expired/);
 assert.equal(calls.length, 2);
 process.stdout.write(JSON.stringify({ok:true}));
 "#,
@@ -176,43 +174,11 @@ process.stdout.write(JSON.stringify({ok:true}));
 }
 
 #[test]
-fn public_recovery_landing_collects_only_identifiers_and_refuses_foreign_redirect() {
-    let output = run_browser(
-        r#"
-const assert = require("node:assert/strict");
-const nodes = new Map();
-globalThis.document = {getElementById: id => {
-  if (!nodes.has(id)) nodes.set(id, {value:"",hidden:true});
-  return nodes.get(id);
-}};
-reviewNode.replaceChildren = () => {};
-renderRecoveryBootstrap();
-document.getElementById("recovery-wallet-id").value = "wallet-test";
-document.getElementById("recovery-bootstrap-id").value = "recovery-test";
-let destination;
-location.assign = value => {destination=value;};
-const expected = location.origin + "/#cap=" + "b".repeat(43);
-globalThis.fetch = async (url, options) => {
-  assert.equal(url, "/api/recovery/bootstrap");
-  assert.deepEqual(JSON.parse(options.body), {wallet_id:"wallet-test",recovery_id:"recovery-test"});
-  assert.equal(options.credentials,"same-origin");
-  return {ok:true,json:async()=>({ceremony_url:expected})};
-};
-await approve.onclick();
-assert.equal(destination, expected);
-assert.equal(destination.includes("wallet-test"), false);
-assert.equal(destination.includes("recovery-test"), false);
-destination = undefined;
-globalThis.fetch = async () => ({ok:true,json:async()=>({ceremony_url:"https://foreign.test/#cap="+"b".repeat(43)})});
-await approve.onclick();
-assert.equal(destination, undefined);
-assert.equal(approve.disabled,false);
-assert.match(statusNode.textContent,/could not start/);
-assert.equal(recoveryFields.hidden,true);
-process.stdout.write(JSON.stringify({ok:true}));
-"#,
-    );
-    assert_eq!(output, json!({"ok": true}));
+fn ceremony_asset_has_no_public_recovery_initiation() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let html = include_str!("../src/ceremony_assets/index.html");
+    assert!(!asset.contains("/api/recovery/bootstrap"));
+    assert!(!html.contains("recovery-bootstrap"));
 }
 
 #[test]

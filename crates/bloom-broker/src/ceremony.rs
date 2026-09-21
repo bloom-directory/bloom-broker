@@ -44,7 +44,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     future::{Future, IntoFuture},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
     path::Path as FsPath,
@@ -75,10 +75,6 @@ const OUTPUT_ACK_TTL_MS: u64 = 15 * 60 * 1_000;
 const REMOTE_PRECOMMIT_SESSION_MS: u64 = 5 * 60 * 1_000;
 const REMOTE_COOKIE_MAX_MS: u64 = 25 * 60 * 1_000;
 const CROSS_SURFACE_DEADLINE_MS: u64 = 10 * 60 * 1_000;
-const RECOVERY_BOOTSTRAP_WINDOW_MS: u64 = 10 * 60 * 1_000;
-const RECOVERY_BOOTSTRAP_PER_ID: usize = 5;
-const RECOVERY_BOOTSTRAP_PER_MINUTE: usize = 20;
-const RECOVERY_BOOTSTRAP_GLOBAL: usize = 100;
 const CEREMONY_STORAGE_VERSION: i64 = 2;
 
 /// Compiled default bound on simultaneously live ceremony sessions. This is
@@ -245,6 +241,7 @@ fn bounded(field: &str, value: u64, ceiling: u64) -> Result<(), ProtocolError> {
 }
 
 const SHELL_HTML: &str = include_str!("ceremony_assets/index.html");
+const NEUTRAL_LANDING_HTML: &str = include_str!("ceremony_assets/landing.html");
 const APP_JS: &str = include_str!("ceremony_assets/app.js");
 const STYLE_CSS: &str = include_str!("ceremony_assets/style.css");
 const BLOOM_PRIMARY_SVG: &str = include_str!("ceremony_assets/bloom-primary.svg");
@@ -511,6 +508,7 @@ pub trait CeremonyCompletionObserver: Send + Sync {
 pub struct CeremonyBroker {
     inner: Arc<BrokerInner>,
     served_origin: String,
+    neutral_landing_enabled: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -551,60 +549,10 @@ struct BrokerInner {
     operations: Mutex<HashMap<OperationId, String>>,
     cancellation_backoff: Mutex<HashMap<Token, (u32, BackoffDeadline)>>,
     invalid_attempts: Mutex<HashMap<IpAddr, u32>>,
-    recovery_bootstrap: Mutex<RecoveryBootstrapWindow>,
     database: Option<Arc<std::sync::Mutex<Connection>>>,
     journal: Option<Arc<BrokerJournal>>,
     manifest_signer: Option<(Token, SigningKey)>,
     completion_observer: Mutex<Option<Arc<dyn CeremonyCompletionObserver>>>,
-}
-
-#[derive(Default)]
-struct RecoveryBootstrapWindow {
-    attempts: VecDeque<(u64, [u8; 32])>,
-    last_alert_ms: u64,
-}
-
-enum RecoveryBootstrapAdmission {
-    Allowed,
-    Denied { alert: bool },
-}
-
-impl RecoveryBootstrapWindow {
-    fn admit(&mut self, recovery_id: &Token, now_ms: u64) -> RecoveryBootstrapAdmission {
-        while self
-            .attempts
-            .front()
-            .is_some_and(|(at, _)| at.saturating_add(RECOVERY_BOOTSTRAP_WINDOW_MS) <= now_ms)
-        {
-            self.attempts.pop_front();
-        }
-        let mut hasher = Sha256::new();
-        hasher.update(b"bloom.recovery.bootstrap.admission.v1\0");
-        hasher.update(recovery_id.as_str().as_bytes());
-        let key: [u8; 32] = hasher.finalize().into();
-        let id_count = self
-            .attempts
-            .iter()
-            .filter(|(_, observed)| observed == &key)
-            .count();
-        let minute_count = self
-            .attempts
-            .iter()
-            .filter(|(at, _)| at.saturating_add(60_000) > now_ms)
-            .count();
-        if id_count >= RECOVERY_BOOTSTRAP_PER_ID
-            || minute_count >= RECOVERY_BOOTSTRAP_PER_MINUTE
-            || self.attempts.len() >= RECOVERY_BOOTSTRAP_GLOBAL
-        {
-            let alert = self.last_alert_ms.saturating_add(60_000) <= now_ms;
-            if alert {
-                self.last_alert_ms = now_ms;
-            }
-            return RecoveryBootstrapAdmission::Denied { alert };
-        }
-        self.attempts.push_back((now_ms, key));
-        RecoveryBootstrapAdmission::Allowed
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -733,12 +681,6 @@ struct NewBrowserSession {
     expires_at_ms: u64,
     created_at_ms: u64,
     origin: String,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum CustodyAdmission {
-    Standard,
-    PublicRecoveryBootstrap,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -911,6 +853,13 @@ impl CeremonyBroker {
         self.inner.limits
     }
 
+    /// Control only the unauthenticated root document. Ceremony routes and
+    /// authenticated recovery preparation remain available in either mode.
+    pub fn with_neutral_landing_enabled(mut self, enabled: bool) -> Self {
+        self.neutral_landing_enabled = enabled;
+        self
+    }
+
     /// Resolve a caller's bounded preference against authenticated Signer
     /// state. Only Signer descriptors can authorize an origin or RP ID.
     pub fn select_surface(
@@ -1075,6 +1024,7 @@ impl CeremonyBroker {
     ) -> Self {
         Self {
             served_origin: CEREMONY_ORIGIN.to_owned(),
+            neutral_landing_enabled: true,
             inner: Arc::new(BrokerInner {
                 signer,
                 limits,
@@ -1083,7 +1033,6 @@ impl CeremonyBroker {
                 operations: Mutex::new(HashMap::new()),
                 cancellation_backoff: Mutex::new(HashMap::new()),
                 invalid_attempts: Mutex::new(HashMap::new()),
-                recovery_bootstrap: Mutex::new(RecoveryBootstrapWindow::default()),
                 database,
                 journal,
                 manifest_signer,
@@ -1637,26 +1586,6 @@ impl CeremonyBroker {
         account_review: Option<serde_json::Value>,
         now_ms: u64,
     ) -> Result<CustodyPrepareResponse, ProtocolError> {
-        self.prepare_custody_with_admission(
-            request,
-            account_review,
-            now_ms,
-            CustodyAdmission::Standard,
-        )
-    }
-
-    fn prepare_custody_with_admission(
-        &self,
-        request: CustodyPrepareRequest,
-        account_review: Option<serde_json::Value>,
-        now_ms: u64,
-        admission: CustodyAdmission,
-    ) -> Result<CustodyPrepareResponse, ProtocolError> {
-        if admission == CustodyAdmission::PublicRecoveryBootstrap
-            && request.ceremony_kind != CeremonyKind::WalletRecovery
-        {
-            return Err(kind_mismatch());
-        }
         self.expire_sessions(now_ms)?;
         request
             .validate_legacy_passkey_migration_binding()
@@ -1681,15 +1610,7 @@ impl CeremonyBroker {
         // now supplies its authoritative ID, but it is still unauthenticated
         // by an existing wallet credential and must retain the global bound.
         let anonymous_registration = request.ceremony_kind == CeremonyKind::WalletRegistration;
-        // Public recovery must not reveal prior activity for a guessed wallet
-        // ID. Its own identifier, installation and global bounds are checked
-        // at the bootstrap endpoint; this still enforces global concurrency.
-        let wallet_for_admission = if admission == CustodyAdmission::PublicRecoveryBootstrap {
-            None
-        } else {
-            request.wallet_id.as_ref()
-        };
-        self.enforce_creation_bounds(wallet_for_admission, anonymous_registration, now_ms)?;
+        self.enforce_creation_bounds(request.wallet_id.as_ref(), anonymous_registration, now_ms)?;
         let prepared = self
             .inner
             .signer
@@ -2143,7 +2064,7 @@ impl CeremonyBroker {
             .route("/.well-known/bloom/relay-health", get(remote_health))
             .route("/ceremony/{token}", get(ceremony_shell))
             .route("/api/session/exchange", post(exchange_remote_fragment))
-            .route("/api/recovery/bootstrap", post(bootstrap_recovery))
+            .route("/ceremony/", get(ceremony_resume_shell))
             .route("/assets/app.js", get(app_js))
             .route("/assets/style.css", get(style_css))
             .route("/assets/bloom-primary.svg", get(bloom_primary_svg))
@@ -2192,6 +2113,7 @@ impl CeremonyBroker {
         Ok(Self {
             inner: self.inner.clone(),
             served_origin: origin.to_owned(),
+            neutral_landing_enabled: self.neutral_landing_enabled,
         })
     }
 
@@ -3293,6 +3215,19 @@ async fn shell(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Resp
     if broker.validate_served_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
+    if !broker.neutral_landing_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Html(NEUTRAL_LANDING_HTML).into_response()
+}
+
+async fn ceremony_resume_shell(
+    State(broker): State<CeremonyBroker>,
+    headers: HeaderMap,
+) -> Response {
+    if broker.validate_served_host(&headers).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     Html(SHELL_HTML).into_response()
 }
 
@@ -3376,130 +3311,6 @@ async fn exchange_remote_fragment(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     response
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RecoveryBootstrapRequest {
-    wallet_id: Token,
-    recovery_id: Token,
-}
-
-/// A public entrypoint on either approved origin. The identifying recovery ID
-/// is used only for admission and an opaque terms digest; its secret is never
-/// accepted here and must be HPKE-encrypted to Signer during completion.
-async fn bootstrap_recovery(
-    State(broker): State<CeremonyBroker>,
-    headers: HeaderMap,
-    Json(body): Json<RecoveryBootstrapRequest>,
-) -> Response {
-    if broker.validate_served_host(&headers).is_err()
-        || require_exact_header(&headers, header::ORIGIN, &broker.served_origin).is_err()
-        || require_exact_header(&headers, header::CONTENT_TYPE, "application/json").is_err()
-        || require_exact_header_name(&headers, "sec-fetch-site", "same-origin").is_err()
-    {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    if body.wallet_id.as_str().len() > 128 || body.recovery_id.as_str().len() > 128 {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    let selection = if broker.served_origin == CEREMONY_ORIGIN {
-        CeremonySurfaceSelection::Local
-    } else {
-        CeremonySurfaceSelection::Remote
-    };
-    let Ok(surface) = broker.select_surface(selection) else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    if surface.identity.origin != broker.served_origin {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    let now_ms = unix_time_ms();
-    if let RecoveryBootstrapAdmission::Denied { alert } = broker
-        .inner
-        .recovery_bootstrap
-        .lock()
-        .admit(&body.recovery_id, now_ms)
-    {
-        if alert {
-            tracing::warn!(
-                event = "broker.recovery_bootstrap_rate_limited",
-                "recovery bootstrap admission quota reached"
-            );
-            if let Err(error) = broker.audit_recovery_bootstrap_abuse(now_ms) {
-                tracing::error!(event = "broker.recovery_bootstrap_audit_failed", %error);
-            }
-        }
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({
-                "message": "Recovery is temporarily unavailable. Try again later."
-            })),
-        )
-            .into_response();
-    }
-    let mut random = [0_u8; 32];
-    if SysRng.try_fill_bytes(&mut random).is_err() {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
-    let operation_id = OperationId::from_bytes(random);
-    let terms = match digest(&(
-        "bloom.browser_recovery_bootstrap.v1",
-        &body.wallet_id,
-        &body.recovery_id,
-        &operation_id,
-        surface.reference(),
-    )) {
-        Ok(terms) => terms,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let request = CustodyPrepareRequest {
-        surface: surface.reference(),
-        ceremony_kind: CeremonyKind::WalletRecovery,
-        custody_operation_id: operation_id,
-        wallet_id: Some(body.wallet_id),
-        key_ref: None,
-        exact_terms_digest: terms,
-        expected_input_class: Token::new("recovery-factor-v1").expect("static token"),
-        browser_output_recipient_key: None,
-        petal_key_scope: None,
-        legacy_passkey_migration: None,
-        wallet_seed_profile: None,
-        derivation_requests: Vec::new(),
-    };
-    match broker.prepare_custody_with_admission(
-        request,
-        None,
-        now_ms,
-        CustodyAdmission::PublicRecoveryBootstrap,
-    ) {
-        Ok(prepared) => {
-            tracing::info!(
-                event = "broker.recovery_bootstrap_admitted",
-                "browser recovery session admitted"
-            );
-            (
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({
-                    "ceremony_url": prepared.ceremony_url
-                })),
-            )
-                .into_response()
-        }
-        Err(error) => {
-            // Do not project wallet existence, conflicting sessions, or Signer
-            // internals into a public identifier oracle.
-            tracing::warn!(event = "broker.recovery_bootstrap_pending", error_code = ?error.code,
-                "browser recovery bootstrap could not be admitted");
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
-                    "message": "Recovery is temporarily unavailable. Try again later."
-                })),
-            )
-                .into_response()
-        }
-    }
 }
 
 async fn ceremony_shell(
@@ -3917,7 +3728,7 @@ async fn complete_session(
                 broker.inner.sessions.lock().insert(ceremony_id, snapshot);
             }
             if let Some(floor) = recovery_error_floor {
-                // The public recovery entrypoint must not distinguish an
+                // The browser recovery ceremony must not distinguish an
                 // unknown wallet/recovery ID from a wrong factor or proof.
                 // The Signer keeps its typed internal audit error.
                 tokio::time::sleep_until(floor).await;
@@ -4253,33 +4064,6 @@ impl CeremonyBroker {
         *count = count.saturating_add(1);
         *count > INVALID_ATTEMPT_LIMIT
     }
-
-    fn audit_recovery_bootstrap_abuse(&self, now_ms: u64) -> Result<(), ProtocolError> {
-        let (Some(database), Some(journal)) = (&self.inner.database, &self.inner.journal) else {
-            return Ok(());
-        };
-        let mut database = database
-            .lock()
-            .map_err(|_| storage("ceremony database mutex poisoned"))?;
-        let transaction = database.transaction().map_err(storage)?;
-        journal
-            .append_external_audit(
-                &transaction,
-                "ceremony.recovery_bootstrap_rate_limited",
-                &serde_json::json!({
-                    "origin": self.served_origin,
-                    "at_ms": now_ms,
-                    "window_ms": RECOVERY_BOOTSTRAP_WINDOW_MS,
-                    "per_identifier": RECOVERY_BOOTSTRAP_PER_ID,
-                    "per_minute": RECOVERY_BOOTSTRAP_PER_MINUTE,
-                    "global": RECOVERY_BOOTSTRAP_GLOBAL,
-                }),
-            )
-            .map_err(storage)?;
-        transaction.commit().map_err(storage)?;
-        drop(database);
-        journal.checkpoint_committed_head().map_err(storage)
-    }
 }
 
 async fn security_headers(mut request: Request<Body>, next: Next) -> Response {
@@ -4376,7 +4160,7 @@ fn session_url(session: &BrowserSession) -> String {
     if session.origin == CEREMONY_ORIGIN {
         format!("{CEREMONY_ORIGIN}/ceremony/{}", token.encoded())
     } else {
-        format!("{}/#cap={}", session.origin, token.encoded())
+        format!("{}/ceremony/#cap={}", session.origin, token.encoded())
     }
 }
 
@@ -5152,27 +4936,6 @@ fn custody_review_manifest(
 #[cfg(test)]
 mod remote_storage_tests {
     use super::*;
-
-    #[test]
-    fn recovery_identifier_quota_expires_without_locking_wallet() {
-        let mut admission = RecoveryBootstrapWindow::default();
-        let identifier = Token::new("recovery-aaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        for _ in 0..RECOVERY_BOOTSTRAP_PER_ID {
-            assert!(matches!(
-                admission.admit(&identifier, 1_000_000),
-                RecoveryBootstrapAdmission::Allowed
-            ));
-        }
-        assert!(matches!(
-            admission.admit(&identifier, 1_000_000),
-            RecoveryBootstrapAdmission::Denied { .. }
-        ));
-        assert!(matches!(
-            admission.admit(&identifier, 1_000_000 + RECOVERY_BOOTSTRAP_WINDOW_MS),
-            RecoveryBootstrapAdmission::Allowed
-        ));
-        assert_eq!(admission.attempts.len(), 1);
-    }
 
     #[test]
     fn precommit_cookie_expires_even_while_browser_cookie_remains_present() {

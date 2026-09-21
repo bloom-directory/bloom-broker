@@ -2,15 +2,18 @@ use std::{
     env, fs,
     io::{Read as _, Write as _},
     net::TcpStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
-use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
+use bloom_broker_debug_driver::{BrowserResultRecipient, VirtualAuthenticator, seal_hpke};
 use bloom_signer_api::{
-    Base64UrlBytes, CeremonyChallenge, CeremonyKind, CustodyHpkeAad, CustodySignerContribution,
-    Digest32, LocalPrfHpkeAad, SignerCeremonyContribution, WebAuthnCeremonyProof,
+    Base64UrlBytes, CeremonyChallenge, CeremonyKind, CustodyHpkeAad, CustodyOutputHpkeAad,
+    CustodySignerContribution, Digest32, HpkeEnvelope, LocalPrfHpkeAad, SignerCeremonyContribution,
+    Token, WebAuthnCeremonyProof,
 };
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 mod artifact_scan;
 
@@ -26,29 +29,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("unsupported debug-driver command: {command}").into());
     }
     let url = args.next().ok_or("complete requires a ceremony URL")?;
-    let seed_arg = args
-        .next()
-        .ok_or("complete requires an authenticator seed")?;
-    let seed = if seed_arg == "--authenticator-seed-file" {
-        let path = PathBuf::from(
-            args.next()
-                .ok_or("--authenticator-seed-file requires a path")?,
-        );
-        read_protected_seed_file(&path)?
-    } else {
-        seed_arg
-    };
+    let mut seed = None;
     let mut new_seed = None;
+    let mut new_seed_from_file = false;
+    let mut browser_result_file = None;
+    let mut recovery_record_file = None;
     let mut raw_private_key = None;
     let mut mnemonic = None;
     let mut sign_count = 1_u32;
     while let Some(flag) = args.next() {
         match flag.as_str() {
+            "--authenticator-seed-file" => {
+                if seed.is_some() {
+                    return Err("authenticator seed was specified more than once".into());
+                }
+                let path = PathBuf::from(
+                    args.next()
+                        .ok_or("--authenticator-seed-file requires a path")?,
+                );
+                seed = Some(read_protected_seed_file(&path)?);
+            }
             "--new-authenticator-seed" => {
+                if new_seed.is_some() {
+                    return Err("new authenticator seed was specified more than once".into());
+                }
                 new_seed = Some(
                     args.next()
                         .ok_or("--new-authenticator-seed requires a value")?,
                 );
+            }
+            "--new-authenticator-seed-file" => {
+                if new_seed.is_some() {
+                    return Err("new authenticator seed was specified more than once".into());
+                }
+                let path = PathBuf::from(
+                    args.next()
+                        .ok_or("--new-authenticator-seed-file requires a path")?,
+                );
+                new_seed = Some(read_protected_seed_file(&path)?);
+                new_seed_from_file = true;
+            }
+            "--browser-result-file" => {
+                if browser_result_file.is_some() {
+                    return Err("browser result file was specified more than once".into());
+                }
+                browser_result_file = Some(PathBuf::from(
+                    args.next().ok_or("--browser-result-file requires a path")?,
+                ));
+            }
+            "--recovery-record-file" => {
+                if recovery_record_file.is_some() {
+                    return Err("recovery record file was specified more than once".into());
+                }
+                recovery_record_file = Some(PathBuf::from(
+                    args.next()
+                        .ok_or("--recovery-record-file requires a path")?,
+                ));
             }
             "--raw-private-key" => {
                 raw_private_key = Some(args.next().ok_or("--raw-private-key requires a value")?);
@@ -63,15 +99,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("--sign-count requires a value")?
                     .parse()?;
             }
-            _ => return Err(format!("unknown debug-driver option: {flag}").into()),
+            _ if !flag.starts_with('-') && seed.is_none() => seed = Some(flag),
+            _ => return Err("unknown debug-driver option".into()),
         }
     }
 
     let client = CeremonyClient::connect(&url)?;
-    let session = client.read_session()?;
+    let mut session = client.read_session()?;
     let origin = client.origin();
     let rp_id = client.rp_id();
     let kind: CeremonyKind = serde_json::from_value(session["ceremony_kind"].clone())?;
+    if kind == CeremonyKind::WalletRecovery && recovery_record_file.is_none() {
+        return Err("wallet recovery requires --recovery-record-file".into());
+    }
+    if kind == CeremonyKind::WalletRecovery && browser_result_file.is_none() {
+        return Err("wallet recovery requires --browser-result-file".into());
+    }
+    if kind == CeremonyKind::WalletRecovery && !new_seed_from_file {
+        return Err("wallet recovery requires --new-authenticator-seed-file".into());
+    }
+    if kind != CeremonyKind::WalletRecovery && seed.is_none() {
+        return Err("ceremony requires an authenticator seed".into());
+    }
+    if let (Some(input), Some(output)) = (&recovery_record_file, &browser_result_file) {
+        if input == output {
+            return Err("recovery input and result paths must differ".into());
+        }
+    }
+    if browser_result_file
+        .as_ref()
+        .is_some_and(|path| path.exists())
+    {
+        return Err("browser result file already exists".into());
+    }
+    let output_recipient = if browser_result_file.is_some() {
+        let recipient = BrowserResultRecipient::generate();
+        let ceremony_id: Digest32 =
+            serde_json::from_value(session["signer_contribution"]["ceremony_id"].clone())?;
+        session = client.bind_output_key(&ceremony_id, recipient.public_key())?;
+        Some(recipient)
+    } else {
+        None
+    };
     let challenges = session["challenges"]
         .as_array()
         .ok_or("ceremony session omitted challenges")?
@@ -80,7 +149,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Result<Vec<_>, _>>()?;
     let public_binding_digest: Digest32 =
         serde_json::from_value(session["challenges"][0]["binding"]["exact_terms_digest"].clone())?;
-    let authenticator = VirtualAuthenticator::from_seed(seed.as_bytes());
+    let authenticator = VirtualAuthenticator::from_seed(
+        seed.as_deref().or(new_seed.as_deref()).unwrap().as_bytes(),
+    );
 
     if kind == CeremonyKind::SealedApproval {
         let contribution: SignerCeremonyContribution =
@@ -207,6 +278,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 plaintext,
             )
         }
+        CeremonyKind::WalletRecovery => {
+            if challenges.len() < 2 {
+                return Err("recovery ceremony omitted a proof phase".into());
+            }
+            let record = read_recovery_record(recovery_record_file.as_deref().unwrap())?;
+            let replacement_seed =
+                new_seed.ok_or("wallet recovery requires a new authenticator seed")?;
+            if seed.as_deref() == Some(replacement_seed.as_str()) {
+                return Err(
+                    "replacement authenticator seed must differ from the prior seed".into(),
+                );
+            }
+            let replacement = VirtualAuthenticator::from_seed(replacement_seed.as_bytes());
+            let attestation =
+                replacement.attestation_for(&challenges[0].canonical_bytes()?, origin, rp_id);
+            let assertion =
+                replacement.assertion_for(&challenges[1].canonical_bytes()?, 1, origin, rp_id);
+            let credential_id = attestation.credential_id.clone();
+            let plaintext = serde_jcs::to_vec(&serde_json::json!({
+                "recovery_id": record.recovery_id,
+                "recovery_secret": record.recovery_secret,
+                "new_credential_prf": Base64UrlBytes::from_bytes(&replacement.deterministic_prf()),
+            }))?;
+            (
+                WebAuthnCeremonyProof::RecoveryCredentialChange {
+                    new_credential_attestation: attestation,
+                    new_credential_prf_assertion: Some(assertion),
+                },
+                credential_id,
+                plaintext,
+            )
+        }
         CeremonyKind::WalletDelete
         | CeremonyKind::KeyDerive
         | CeremonyKind::AccountAllocate
@@ -262,6 +365,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "public_binding_digest": public_binding_digest,
     }))?;
     let result = client.complete(&contribution.ceremony_id, &body)?;
+    if let (Some(recipient), Some(path)) = (output_recipient, browser_result_file) {
+        let envelope: HpkeEnvelope =
+            serde_json::from_value(result["encrypted_browser_result"].clone())?;
+        let output_aad = CustodyOutputHpkeAad {
+            surface: contribution.surface.clone(),
+            ceremony_id: contribution.ceremony_id.clone(),
+            ceremony_kind: contribution.ceremony_kind,
+            custody_operation_id: contribution.custody_operation_id.clone(),
+            signer_contribution_digest: contribution.digest()?,
+            public_binding_digest,
+        }
+        .canonical_bytes()?;
+        let plaintext =
+            Zeroizing::new(recipient.open(&envelope, b"bloom-custody-output/v1", &output_aad)?);
+        write_protected_result(&path, &plaintext)?;
+        if kind == CeremonyKind::WalletRecovery {
+            client.ack(&contribution.ceremony_id)?;
+        }
+    }
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
@@ -292,6 +414,54 @@ fn read_nonempty_seed(path: &std::path::Path) -> Result<String, Box<dyn std::err
         return Err("authenticator seed file is empty".into());
     }
     Ok(seed)
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryRecord {
+    recovery_id: Token,
+    recovery_secret: Base64UrlBytes,
+}
+
+fn read_recovery_record(path: &Path) -> Result<RecoveryRecord, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 != 0 {
+            return Err("recovery record must be a private regular file".into());
+        }
+    }
+    let input = Zeroizing::new(fs::read(path)?);
+    let record: RecoveryRecord = serde_json::from_slice(&input)?;
+    if record.recovery_secret.decode().len() != 32 {
+        return Err("recovery record has an invalid secret length".into());
+    }
+    Ok(record)
+}
+
+fn write_protected_result(path: &Path, plaintext: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    // Registration and recovery yield the same typed record. Validate before
+    // creating the file so a malformed result never becomes a recovery token.
+    let record: RecoveryRecord = serde_json::from_slice(plaintext)?;
+    if record.recovery_secret.decode().len() != 32 {
+        return Err("Signer returned an invalid recovery secret length".into());
+    }
+    let bytes = Zeroizing::new(serde_jcs::to_vec(&record)?);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn custody_effect_kind(kind: CeremonyKind) -> Result<serde_json::Value, serde_json::Error> {
@@ -350,12 +520,20 @@ fn parse_ceremony_url(value: &str) -> Result<CeremonyLaunch, Box<dyn std::error:
     if parsed.scheme() == "http"
         && parsed.host_str() == Some("localhost")
         && parsed.port() == Some(18734)
-        && parsed.fragment().is_none()
     {
-        let token = parsed
-            .path()
-            .strip_prefix("/ceremony/")
-            .ok_or("local ceremony URL has an invalid path")?;
+        let token = if parsed.path() == "/ceremony/" {
+            parsed
+                .fragment()
+                .and_then(|fragment| fragment.strip_prefix("cap="))
+                .ok_or("local ceremony URL has no launch capability")?
+        } else if parsed.fragment().is_none() {
+            parsed
+                .path()
+                .strip_prefix("/ceremony/")
+                .ok_or("local ceremony URL has an invalid path")?
+        } else {
+            return Err("local ceremony URL has an invalid path or fragment".into());
+        };
         validate_capability(token)?;
         return Ok(CeremonyLaunch::Local {
             token: token.to_owned(),
@@ -363,7 +541,7 @@ fn parse_ceremony_url(value: &str) -> Result<CeremonyLaunch, Box<dyn std::error:
     }
     if parsed.scheme() != "https"
         || parsed.port_or_known_default() != Some(443)
-        || parsed.path() != "/"
+        || parsed.path() != "/ceremony/"
     {
         return Err("ceremony URL is not an approved Broker origin".into());
     }
@@ -517,6 +695,38 @@ impl CeremonyClient {
             }
         }
     }
+
+    fn bind_output_key(
+        &self,
+        ceremony_id: &Digest32,
+        recipient_key: &Base64UrlBytes,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let body = serde_json::to_vec(&serde_json::json!({"recipient_key": recipient_key}))?;
+        self.post(ceremony_id, "output-key", &body)
+    }
+
+    fn ack(&self, ceremony_id: &Digest32) -> Result<(), Box<dyn std::error::Error>> {
+        self.post(ceremony_id, "ack", b"{}")?;
+        Ok(())
+    }
+
+    fn post(
+        &self,
+        ceremony_id: &Digest32,
+        action: &str,
+        body: &[u8],
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let path = format!("/api/session/{ceremony_id}/{action}");
+        match self {
+            Self::Local { token } => request_local("POST", &path, token, Some(body)),
+            Self::Remote(session) => {
+                if &session.ceremony_id != ceremony_id {
+                    return Err("remote session identity differs from Signer contribution".into());
+                }
+                session.request("POST", &path, Some(body))
+            }
+        }
+    }
 }
 
 impl RemoteSession {
@@ -648,7 +858,8 @@ fn request_local(
 mod tests {
     use super::{
         CeremonyKind, CeremonyLaunch, Digest32, custody_effect_kind, parse_ceremony_url,
-        read_protected_seed_file, validate_remote_cookie,
+        read_protected_seed_file, read_recovery_record, validate_remote_cookie,
+        write_protected_result,
     };
     use std::{fs, path::PathBuf};
 
@@ -658,6 +869,30 @@ mod tests {
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_record_is_private_and_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = temp_path("recovery-result");
+        let secret = bloom_signer_api::Base64UrlBytes::from_bytes(&[7; 32]);
+        let record = serde_json::to_vec(&serde_json::json!({
+            "recovery_id": "recovery-test",
+            "recovery_secret": secret,
+        }))
+        .unwrap();
+        write_protected_result(&path, &record).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(read_recovery_record(&path).unwrap().recovery_secret, secret);
+        assert!(write_protected_result(&path, &record).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(read_recovery_record(&path).is_err());
+        fs::remove_file(&path).unwrap();
     }
 
     #[cfg(unix)]
@@ -706,20 +941,30 @@ mod tests {
                 token: capability.clone()
             }
         );
+        assert_eq!(
+            parse_ceremony_url(&format!(
+                "http://localhost:18734/ceremony/#cap={capability}"
+            ))
+            .unwrap(),
+            CeremonyLaunch::Local {
+                token: capability.clone()
+            }
+        );
         let hostname = "5ixwab6amyu7e42fjobm3myxqe.relay.bloom.directory";
         assert_eq!(
-            parse_ceremony_url(&format!("https://{hostname}/#cap={capability}")).unwrap(),
+            parse_ceremony_url(&format!("https://{hostname}/ceremony/#cap={capability}")).unwrap(),
             CeremonyLaunch::Remote {
                 origin: format!("https://{hostname}"),
-                capability: capability.clone(),
+                capability: capability.clone()
             }
         );
         for invalid in [
+            format!("https://{hostname}/#cap={capability}"),
             format!("http://{hostname}/#cap={capability}"),
-            format!("https://other.example/#cap={capability}"),
+            format!("https://other.example/ceremony/#cap={capability}"),
             format!("https://{hostname}/ceremony/{capability}"),
-            format!("https://{hostname}/#cap={capability}&extra=1"),
-            format!("https://user@{hostname}/#cap={capability}"),
+            format!("https://{hostname}/ceremony/#cap={capability}&extra=1"),
+            format!("https://user@{hostname}/ceremony/#cap={capability}"),
         ] {
             assert!(parse_ceremony_url(&invalid).is_err(), "accepted {invalid}");
         }

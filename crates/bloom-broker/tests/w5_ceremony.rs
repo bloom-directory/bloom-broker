@@ -599,7 +599,8 @@ fn browser_reload_recovers_the_ceremony_token_from_tab_storage() {
 globalThis.crypto = require("node:crypto").webcrypto;
 globalThis.document = {{getElementById: () => ({{}})}};
 globalThis.location = {{pathname: "/"}};
-globalThis.history = {{replaceState: () => {{}}}};
+let resumedPath;
+globalThis.history = {{replaceState: (_state, _title, path) => {{ resumedPath = path; }} }};
 const stored = new Map([["bloom.ceremony.token.v1", {token:?}]]);
 globalThis.sessionStorage = {{
   getItem: key => stored.get(key) || null,
@@ -607,7 +608,7 @@ globalThis.sessionStorage = {{
   removeItem: key => stored.delete(key)
 }};
 {executable}
-if (token !== {token:?} || authHeaders["x-bloom-ceremony-token"] !== {token:?}) {{
+if (token !== {token:?} || authHeaders["x-bloom-ceremony-token"] !== {token:?} || resumedPath !== "/ceremony/") {{
   throw new Error("reload did not recover the ceremony token");
 }}
 process.stdout.write("browser-reload-ok");
@@ -4950,7 +4951,7 @@ async fn remote_fragment_is_single_use_and_cookie_is_ceremony_scoped() {
     assert!(
         prepared
             .ceremony_url
-            .starts_with(&format!("{origin}/#cap="))
+            .starts_with(&format!("{origin}/ceremony/#cap="))
     );
     let capability = prepared.ceremony_url.split("#cap=").nth(1).unwrap();
     let host = origin.strip_prefix("https://").unwrap();
@@ -5283,230 +5284,109 @@ fn assigned_remote_outage_never_silently_changes_default_to_local() {
 }
 
 #[tokio::test]
-async fn browser_recovery_bootstrap_is_non_enumerating_and_uses_active_origin() {
-    let broker = CeremonyBroker::new(Arc::new(MockSigner::with_remote_surface()));
+async fn neutral_landing_switch_preserves_remote_ceremonies_and_rejects_public_recovery() {
     let remote = "https://abcdefghijklmnopqrstuv2345.relay.bloom.directory";
     let host = remote.strip_prefix("https://").unwrap();
-    // A real wallet can already have an owner ceremony. That private state
-    // must not change the public recovery bootstrap response or page shape.
-    let now_ms: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
-        .try_into()
-        .unwrap();
-    let surface = broker
-        .select_surface(bloom_broker_api::CeremonySurfaceSelection::Remote)
-        .unwrap();
-    broker
-        .prepare_custody(
-            CustodyPrepareRequest {
-                surface: surface.reference(),
-                ceremony_kind: CeremonyKind::WalletDelete,
-                custody_operation_id: operation("c8"),
-                wallet_id: Some(Token::new("known-wallet").unwrap()),
-                key_ref: None,
-                exact_terms_digest: digest("c9"),
-                expected_input_class: Token::new("policy-document").unwrap(),
-                browser_output_recipient_key: None,
-                petal_key_scope: None,
-                legacy_passkey_migration: None,
-                wallet_seed_profile: None,
-                derivation_requests: Vec::new(),
-            },
-            now_ms,
-        )
-        .unwrap();
-    let app = broker.for_remote_origin(remote).unwrap().router();
-    let request = |wallet: &str, recovery_id: &str| {
-        Request::builder()
-            .method("POST")
-            .uri("/api/recovery/bootstrap")
-            .header(header::HOST, host)
-            .header(header::ORIGIN, remote)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("sec-fetch-site", "same-origin")
-            .body(Body::from(
-                serde_json::json!({
-                    "wallet_id": wallet,
-                    "recovery_id": recovery_id,
-                })
-                .to_string(),
-            ))
+    let broker = CeremonyBroker::new(Arc::new(MockSigner::with_remote_surface()));
+    for enabled in [true, false] {
+        let app = broker
+            .clone()
+            .with_neutral_landing_enabled(enabled)
+            .for_remote_origin(remote)
             .unwrap()
-    };
-    let first = app
-        .clone()
-        .oneshot(request("known-wallet", "recovery-aaaaaaaaaaaaaaaaaaaaaaaa"))
-        .await
-        .unwrap();
-    let second = app
-        .clone()
-        .oneshot(request(
-            "unknown-wallet",
-            "recovery-bbbbbbbbbbbbbbbbbbbbbbbb",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(first.status(), StatusCode::ACCEPTED);
-    assert_eq!(second.status(), StatusCode::ACCEPTED);
-    let first_body: serde_json::Value =
-        serde_json::from_slice(&first.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    let second_body: serde_json::Value =
-        serde_json::from_slice(&second.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    for body in [&first_body, &second_body] {
-        let url = body["ceremony_url"].as_str().unwrap();
-        assert!(url.starts_with(&format!("{remote}/#cap=")));
-        assert!(!url.contains("wallet"));
-        assert!(!url.contains("recovery-"));
-    }
-    let mut projections = Vec::new();
-    for (body, wallet) in [
-        (&first_body, "known-wallet"),
-        (&second_body, "unknown-wallet"),
-    ] {
-        let capability = body["ceremony_url"]
-            .as_str()
-            .unwrap()
-            .split("#cap=")
-            .nth(1)
-            .unwrap();
-        let exchange = app
+            .router();
+        let root = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .method("POST")
-                    .uri("/api/session/exchange")
+                    .uri("/")
                     .header(header::HOST, host)
-                    .header(header::ORIGIN, remote)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header("sec-fetch-site", "same-origin")
-                    .body(Body::from(
-                        serde_json::json!({"capability": capability}).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(exchange.status(), StatusCode::OK);
-        let cookie = exchange.headers()[header::SET_COOKIE]
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_owned();
-        let exchange_body: serde_json::Value =
-            serde_json::from_slice(&exchange.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        let read = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "/api/session/{}",
-                        exchange_body["ceremony_id"].as_str().unwrap()
-                    ))
-                    .header(header::HOST, host)
-                    .header(header::COOKIE, cookie)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(read.status(), StatusCode::OK);
-        let projection: serde_json::Value =
-            serde_json::from_slice(&read.into_body().collect().await.unwrap().to_bytes()).unwrap();
-        assert_eq!(projection["review_manifest"]["title"], "Recover a wallet");
-        assert_eq!(projection["review_manifest"]["wallet_name"], wallet);
-        assert_eq!(projection["signer_contribution"]["wallet_id"], wallet);
         assert_eq!(
-            projection["signer_contribution"]["credential_authority_generation"],
-            serde_json::to_value(DecimalU64::new(0)).unwrap()
-        );
-        assert!(projection["signer_contribution"]["key_ref"].is_null());
-        assert!(projection["signer_contribution"]["wallet_seed_profile"].is_null());
-        assert_eq!(
-            projection["webauthn_options"]["allowed_credentials"],
-            serde_json::json!([])
-        );
-        projections.push(projection);
-    }
-    fn public_shape(value: &serde_json::Value) -> serde_json::Value {
-        match value {
-            serde_json::Value::Array(values) => {
-                serde_json::Value::Array(values.iter().map(public_shape).collect())
+            root.status(),
+            if enabled {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
             }
-            serde_json::Value::Object(values) => serde_json::Value::Object(
-                values
-                    .iter()
-                    .map(|(key, value)| (key.clone(), public_shape(value)))
-                    .collect(),
-            ),
-            serde_json::Value::String(_) => serde_json::json!("<string>"),
-            serde_json::Value::Number(_) => serde_json::json!(0),
-            other => other.clone(),
+        );
+        let body = root.into_body().collect().await.unwrap().to_bytes();
+        if enabled {
+            let html = String::from_utf8_lossy(&body);
+            assert!(html.contains("Bloom Broker"));
+            assert!(html.contains("https://bloom.directory"));
+            assert!(html.contains("https://docs.bloom.directory"));
+            assert!(!html.contains("recovery"));
+            assert!(!html.contains("wallet"));
+        } else {
+            assert!(body.is_empty());
         }
-    }
-    assert_eq!(public_shape(&projections[0]), public_shape(&projections[1]));
-    let forged = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/recovery/bootstrap")
-                .header(header::HOST, host)
-                .header(header::ORIGIN, "https://attacker.example")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(
-                    serde_json::json!({
-                        "wallet_id": "another-wallet",
-                        "recovery_id": "recovery-cccccccccccccccccccccccc",
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(forged.status(), StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
-async fn browser_recovery_bootstrap_bounds_identifier_attempts() {
-    let broker = CeremonyBroker::new(Arc::new(MockSigner::new()));
-    let app = broker.router();
-    for attempt in 0..6 {
-        let response = app
+        let ceremony = app
             .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ceremony/")
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ceremony.status(), StatusCode::OK);
+        let public = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/api/recovery/bootstrap")
-                    .header(header::HOST, "localhost:18734")
-                    .header(header::ORIGIN, "http://localhost:18734")
+                    .header(header::HOST, host)
+                    .header(header::ORIGIN, remote)
                     .header(header::CONTENT_TYPE, "application/json")
                     .header("sec-fetch-site", "same-origin")
                     .body(Body::from(
-                        serde_json::json!({
-                            "wallet_id": format!("candidate-{attempt}"),
-                            "recovery_id": "recovery-aaaaaaaaaaaaaaaaaaaaaaaa",
-                        })
-                        .to_string(),
+                        r#"{"wallet_id":"candidate-wallet","recovery_id":"recovery-test"}"#,
                     ))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(
-            response.status(),
-            if attempt < 5 {
-                StatusCode::ACCEPTED
-            } else {
-                StatusCode::TOO_MANY_REQUESTS
-            }
-        );
+        assert_eq!(public.status(), StatusCode::NOT_FOUND);
     }
+    let local = broker.with_neutral_landing_enabled(false).router();
+    let root = local
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header(header::HOST, "localhost:18734")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(root.status(), StatusCode::NOT_FOUND);
+    assert!(
+        root.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+    let resume = local
+        .oneshot(
+            Request::builder()
+                .uri("/ceremony/")
+                .header(header::HOST, "localhost:18734")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resume.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -5520,33 +5400,36 @@ async fn browser_recovery_completion_hides_distinct_signer_failures() {
             completion_error: Some(code),
             ..MockSigner::new()
         });
-        let app = CeremonyBroker::new(signer).router();
-        let bootstrap = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/recovery/bootstrap")
-                    .header(header::HOST, "localhost:18734")
-                    .header(header::ORIGIN, "http://localhost:18734")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header("sec-fetch-site", "same-origin")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "wallet_id": "candidate-wallet",
-                            "recovery_id": "recovery-aaaaaaaaaaaaaaaaaaaaaaaa",
-                        })
-                        .to_string(),
-                    ))
+        let broker = CeremonyBroker::new(signer);
+        let prepared = broker
+            .prepare_custody(
+                CustodyPrepareRequest {
+                    surface: broker
+                        .select_surface(bloom_broker_api::CeremonySurfaceSelection::Local)
+                        .unwrap()
+                        .reference(),
+                    ceremony_kind: CeremonyKind::WalletRecovery,
+                    custody_operation_id: operation("e1"),
+                    wallet_id: Some(Token::new("candidate-wallet").unwrap()),
+                    key_ref: None,
+                    exact_terms_digest: digest("e2"),
+                    expected_input_class: Token::new("recovery-factor-v1").unwrap(),
+                    browser_output_recipient_key: None,
+                    petal_key_scope: None,
+                    legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_requests: Vec::new(),
+                },
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    .try_into()
                     .unwrap(),
             )
-            .await
             .unwrap();
-        assert_eq!(bootstrap.status(), StatusCode::ACCEPTED);
-        let started: serde_json::Value =
-            serde_json::from_slice(&bootstrap.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        let token = url_token(started["ceremony_url"].as_str().unwrap());
+        let app = broker.router();
+        let token = url_token(&prepared.ceremony_url);
         let session = app
             .clone()
             .oneshot(
@@ -5624,7 +5507,7 @@ fn explicit_cross_surface_prepare_binds_existing_origins_and_operation() {
     assert!(
         prepared
             .destination_url
-            .starts_with("https://abcdefghijklmnopqrstuv2345.relay.bloom.directory/#cap=")
+            .starts_with("https://abcdefghijklmnopqrstuv2345.relay.bloom.directory/ceremony/#cap=")
     );
     assert_eq!(
         broker

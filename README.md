@@ -62,6 +62,7 @@ These are public values Broker verifies against; none of them is secret.
 | --- | --- |
 | `policy_keys` | Array of `{ "wallet_id", "key_id", "public_key_hex" }`, one entry per wallet whose policy updates Broker will verify. May be empty. |
 | `ceremony_limits` | Optional object; see [Configuring ceremony admission limits](#configuring-ceremony-admission-limits). Omitted, the compiled defaults apply. |
+| `neutral_landing_enabled` | Optional boolean, default `true`. Serves a concise Bloom Broker page at `/`; `false` returns an empty 404 there. Ceremony links at `/ceremony/` continue to work. |
 
 ### Connection, request, and journal controls
 

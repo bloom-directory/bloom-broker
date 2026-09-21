@@ -20,7 +20,7 @@ remote identity is assigned, an outage fails default preparation with a
 retryable error; callers must explicitly select `local` to change origin.
 A Signer state change is checked again at ceremony completion.
 
-The remote launch URL is `https://<assigned-host>/#cap=<43-character base64url
+The remote launch URL is `https://<assigned-host>/ceremony/#cap=<43-character base64url
 capability>`. The capability is 32 random bytes. The first-party page removes
 the fragment from visible history before network requests, POSTs it to
 `/api/session/exchange`, then discards it. Broker stores its SHA-256 verifier,
@@ -72,19 +72,17 @@ destination tab's pre-registered HPKE key. Destination enrollment requires its
 own fresh passkey attestation and PRF assertion. Broker stores neither WKEK nor
 the handoff plaintext and returns only Signer's signed final receipt.
 
-The landing page on each active origin can start recovery without Machine
-access. `POST /api/recovery/bootstrap` accepts a wallet hint and recovery ID,
-but no secret. Broker prepares the same signed recovery ceremony for existing
-and nonexistent hints, returns only an opaque URL, and never projects an
-identifier-existence decision. The browser supplies ID and secret again inside
-the HPKE input to Signer. Broker bounds bootstrap attempts to five per hashed
-recovery ID per ten minutes, 20 per installation per minute, and 100 per ten
-minutes globally; these in-memory windows expire without a durable wallet
-lockout. Limited bursts produce a structured alert and Broker audit event.
-The relay gateway admits at most 120 new browser TLS connections per source IP
-and 5,000 globally per fixed minute, before ClientHello parsing, because
-opaque TLS hides that address from Broker. Broker ignores
-untrusted forwarding headers.
+The bare `/` route serves only a concise Bloom Broker identification with links
+to the website and docs. `neutral_landing_enabled` defaults to true in protected
+Broker configuration; false makes `/` return an empty 404. The dedicated
+`/ceremony/` route serves remote launches and tab reloads independently; local
+launches still use `/ceremony/{token}` and resume at `/ceremony/`. The public recovery
+bootstrap endpoint has been removed. Machine starts recovery over its
+authenticated Broker edge, and the browser supplies the recovery ID and secret
+only inside HPKE input to Signer. The relay gateway admits at most 120 new
+browser TLS connections per source IP and 5,000 globally per fixed minute,
+before ClientHello parsing, because opaque TLS hides that address from Broker.
+Broker ignores untrusted forwarding headers.
 
 Custom code here is limited to Bloom's session binding and lifecycle. The
 existing Broker HTTP parser and state machine, rustls TLS, Signer WebAuthn and
