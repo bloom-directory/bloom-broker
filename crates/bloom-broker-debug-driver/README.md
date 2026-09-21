@@ -25,9 +25,10 @@ for completion. WebAuthn client data and RP hashes bind the exact remote origin
 and hostname. The driver does not print PRF material.
 
 Registration and import accept an optional `--browser-result-file PATH`. When
-provided, the driver binds its one-use HPKE output key to the ceremony, decrypts Signer's result, and
-creates `PATH` as a private regular file (mode `0600`) without overwriting an
-existing file. The file contains the recovery record as JSON:
+provided, the driver binds its one-use HPKE output key to the ceremony,
+decrypts Signer's result, and creates `PATH` as a private regular file (mode
+`0600`) without overwriting an existing file. The driver acknowledges delivery
+only after that file is durable. The file contains the recovery record as JSON:
 `{"recovery_id":"…","recovery_secret":"…"}`. Store it outside Machine's
 state and do not pass its contents on the command line.
 

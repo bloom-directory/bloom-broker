@@ -380,9 +380,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let plaintext =
             Zeroizing::new(recipient.open(&envelope, b"bloom-custody-output/v1", &output_aad)?);
         write_protected_result(&path, &plaintext)?;
-        if kind == CeremonyKind::WalletRecovery {
-            client.ack(&contribution.ceremony_id)?;
-        }
+        client.ack(&contribution.ceremony_id)?;
     }
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
@@ -752,14 +750,7 @@ impl RemoteSession {
         };
         let status = response.status().as_u16();
         let response_body = read_remote_body(&mut response)?;
-        if status != 200 {
-            return Err(format!(
-                "Broker ceremony request failed with HTTP {status}: {}",
-                String::from_utf8_lossy(&response_body)
-            )
-            .into());
-        }
-        Ok(serde_json::from_slice(&response_body)?)
+        parse_ceremony_response(status, path, &response_body)
     }
 }
 
@@ -838,27 +829,39 @@ fn request_local(
         .position(|window| window == b"\r\n\r\n")
         .ok_or("Broker returned a malformed HTTP response")?;
     let headers = std::str::from_utf8(&response[..split])?;
-    let status = headers
+    let status: u16 = headers
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
-        .ok_or("Broker returned no HTTP status")?;
+        .ok_or("Broker returned no HTTP status")?
+        .parse()?;
     let response_body = &response[split + 4..];
-    if status != "200" {
+    parse_ceremony_response(status, path, response_body)
+}
+
+fn parse_ceremony_response(
+    status: u16,
+    path: &str,
+    body: &[u8],
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    if status == 204 && path.ends_with("/ack") && body.is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    if status != 200 {
         return Err(format!(
             "Broker ceremony request failed with HTTP {status}: {}",
-            String::from_utf8_lossy(response_body)
+            String::from_utf8_lossy(body)
         )
         .into());
     }
-    Ok(serde_json::from_slice(response_body)?)
+    Ok(serde_json::from_slice(body)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CeremonyKind, CeremonyLaunch, Digest32, custody_effect_kind, parse_ceremony_url,
-        read_protected_seed_file, read_recovery_record, validate_remote_cookie,
+        CeremonyKind, CeremonyLaunch, Digest32, custody_effect_kind, parse_ceremony_response,
+        parse_ceremony_url, read_protected_seed_file, read_recovery_record, validate_remote_cookie,
         write_protected_result,
     };
     use std::{fs, path::PathBuf};
@@ -869,6 +872,17 @@ mod tests {
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ))
+    }
+
+    #[test]
+    fn private_output_ack_accepts_only_empty_204_ack_response() {
+        let ack = "/api/session/example/ack";
+        assert_eq!(
+            parse_ceremony_response(204, ack, b"").unwrap(),
+            serde_json::Value::Null
+        );
+        assert!(parse_ceremony_response(204, ack, b"unexpected").is_err());
+        assert!(parse_ceremony_response(204, "/api/session/example/complete", b"").is_err());
     }
 
     #[cfg(unix)]
