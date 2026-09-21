@@ -72,13 +72,13 @@ destination tab's pre-registered HPKE key. Destination enrollment requires its
 own fresh passkey attestation and PRF assertion. Broker stores neither WKEK nor
 the handoff plaintext and returns only Signer's signed final receipt.
 
-The bare `/` route serves only a concise Bloom Broker identification with links
-to the website and docs. `neutral_landing_enabled` defaults to true in protected
-Broker configuration; false makes `/` return an empty 404. The dedicated
-`/ceremony/` route serves remote launches and tab reloads independently; local
-launches still use `/ceremony/{token}` and resume at `/ceremony/`. The public recovery
-bootstrap endpoint has been removed. Machine starts recovery over its
-authenticated Broker edge, and the browser supplies the recovery ID and secret
+The bare `/` route redirects to `https://bloom.directory/#` with HTTP 303; the
+explicit empty fragment prevents an old launch capability from following the
+redirect. The dedicated `/ceremony/` route serves remote launches and tab
+reloads independently; local launches still use `/ceremony/{token}` and resume
+at `/ceremony/`. The public recovery bootstrap endpoint has been removed.
+Machine starts recovery over its authenticated Broker edge, and the browser
+supplies the recovery ID and secret
 only inside HPKE input to Signer. The relay gateway admits at most 120 new
 browser TLS connections per source IP and 5,000 globally per fixed minute,
 before ClientHello parsing, because opaque TLS hides that address from Broker.

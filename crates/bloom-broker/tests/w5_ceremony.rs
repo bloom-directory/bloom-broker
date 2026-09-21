@@ -5284,66 +5284,76 @@ fn assigned_remote_outage_never_silently_changes_default_to_local() {
 }
 
 #[tokio::test]
-async fn neutral_landing_switch_preserves_remote_ceremonies_and_rejects_public_recovery() {
+async fn bare_root_redirects_while_ceremonies_remain_available_and_public_recovery_is_absent() {
     let remote = "https://abcdefghijklmnopqrstuv2345.relay.bloom.directory";
     let host = remote.strip_prefix("https://").unwrap();
     let broker = CeremonyBroker::new(Arc::new(MockSigner::with_remote_surface()));
-    for enabled in [true, false] {
-        let app = broker
-            .clone()
-            .with_neutral_landing_enabled(enabled)
-            .for_remote_origin(remote)
-            .unwrap()
-            .router();
-        let root = app
+    let remote_app = broker.for_remote_origin(remote).unwrap().router();
+    for (app, expected_host) in [(remote_app, host), (broker.router(), "localhost:18734")] {
+        for uri in ["/", "/?cap=untrusted"] {
+            let root = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::HOST, expected_host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(root.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                root.headers()[header::LOCATION],
+                "https://bloom.directory/#"
+            );
+            assert!(
+                root.into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .is_empty()
+            );
+        }
+        let wrong_host = app
             .clone()
             .oneshot(
                 Request::builder()
                     .uri("/")
-                    .header(header::HOST, host)
+                    .header(header::HOST, "unapproved.example")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(
-            root.status(),
-            if enabled {
-                StatusCode::OK
-            } else {
-                StatusCode::NOT_FOUND
-            }
-        );
-        let body = root.into_body().collect().await.unwrap().to_bytes();
-        if enabled {
-            let html = String::from_utf8_lossy(&body);
-            assert!(html.contains("Bloom Broker"));
-            assert!(html.contains("https://bloom.directory"));
-            assert!(html.contains("https://docs.bloom.directory"));
-            assert!(!html.contains("recovery"));
-            assert!(!html.contains("wallet"));
-        } else {
-            assert!(body.is_empty());
-        }
-        let ceremony = app
+        assert_eq!(wrong_host.status(), StatusCode::FORBIDDEN);
+        let resume = app
             .clone()
             .oneshot(
                 Request::builder()
                     .uri("/ceremony/")
-                    .header(header::HOST, host)
+                    .header(header::HOST, expected_host)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(ceremony.status(), StatusCode::OK);
+        assert_eq!(resume.status(), StatusCode::OK);
         let public = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/api/recovery/bootstrap")
-                    .header(header::HOST, host)
-                    .header(header::ORIGIN, remote)
+                    .header(header::HOST, expected_host)
+                    .header(
+                        header::ORIGIN,
+                        if expected_host == host {
+                            remote
+                        } else {
+                            "http://localhost:18734"
+                        },
+                    )
                     .header(header::CONTENT_TYPE, "application/json")
                     .header("sec-fetch-site", "same-origin")
                     .body(Body::from(
@@ -5355,38 +5365,6 @@ async fn neutral_landing_switch_preserves_remote_ceremonies_and_rejects_public_r
             .unwrap();
         assert_eq!(public.status(), StatusCode::NOT_FOUND);
     }
-    let local = broker.with_neutral_landing_enabled(false).router();
-    let root = local
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/")
-                .header(header::HOST, "localhost:18734")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(root.status(), StatusCode::NOT_FOUND);
-    assert!(
-        root.into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .is_empty()
-    );
-    let resume = local
-        .oneshot(
-            Request::builder()
-                .uri("/ceremony/")
-                .header(header::HOST, "localhost:18734")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resume.status(), StatusCode::OK);
 }
 
 #[tokio::test]

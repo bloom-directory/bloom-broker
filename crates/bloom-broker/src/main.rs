@@ -93,8 +93,6 @@ struct BrokerConfig {
     /// [`bloom_broker::config`].
     #[serde(default)]
     ceremony_limits: Option<serde_json::Value>,
-    #[serde(default = "default_neutral_landing_enabled")]
-    neutral_landing_enabled: bool,
     network_containment: Option<NetworkContainmentConfig>,
     maximum_connections: usize,
     maximum_in_flight_mutations: usize,
@@ -108,10 +106,6 @@ struct BrokerConfig {
     control_request_window_ms: u64,
     control_maximum_journal_admissions_per_window: usize,
     control_journal_window_ms: u64,
-}
-
-fn default_neutral_landing_enabled() -> bool {
-    true
 }
 
 #[derive(Clone, Deserialize)]
@@ -613,8 +607,7 @@ async fn run_with_paths(
             review_manifest_signing_key,
             journal.clone(),
             ceremony_limits,
-        )?
-        .with_neutral_landing_enabled(config.neutral_landing_enabled);
+        )?;
         let machine_journal = journal.clone();
         let mut service = BrokerRpcService::new(
             authority,
@@ -2033,48 +2026,6 @@ mod startup_failure_tests {
     use super::*;
     use bloom_broker_api::{ApprovalLifecycleState, BootEpoch, ReadinessState};
     use tracing_subscriber::prelude::*;
-
-    #[test]
-    fn neutral_landing_config_defaults_on_and_accepts_explicit_off() {
-        let mut document = serde_json::json!({
-            "journal_path": "/tmp/journal",
-            "authority_path": "/tmp/authority",
-            "ceremony_path": "/tmp/ceremony",
-            "signer_socket_path": "/tmp/signer.sock",
-            "broker_signing_key_id": "test",
-            "broker_signing_seed_hex": "",
-            "audit_key_id": "test",
-            "audit_signing_seed_hex": "",
-            "review_manifest_key_id": "test",
-            "review_manifest_signing_seed_hex": "",
-            "installer_key_id": "test",
-            "installer_public_key_hex": "",
-            "signer_ceremony_key_id": "test",
-            "signer_ceremony_public_key_hex": "",
-            "signer_revocation_key_id": "test",
-            "signer_revocation_public_key_hex": "",
-            "provenance_catalog_path": "/tmp/catalog",
-            "policy_keys": [],
-            "build_digest": "test",
-            "maximum_connections": 1,
-            "maximum_in_flight_mutations": 1,
-            "maximum_requests_per_window": 1,
-            "request_window_ms": 1,
-            "maximum_journal_admissions_per_window": 1,
-            "journal_window_ms": 1,
-            "control_maximum_connections": 1,
-            "control_maximum_in_flight_mutations": 1,
-            "control_maximum_requests_per_window": 1,
-            "control_request_window_ms": 1,
-            "control_maximum_journal_admissions_per_window": 1,
-            "control_journal_window_ms": 1
-        });
-        let default: BrokerConfig = serde_json::from_value(document.clone()).unwrap();
-        assert!(default.neutral_landing_enabled);
-        document["neutral_landing_enabled"] = serde_json::json!(false);
-        let disabled: BrokerConfig = serde_json::from_value(document).unwrap();
-        assert!(!disabled.neutral_landing_enabled);
-    }
 
     #[test]
     fn production_registry_contains_the_digest_pinned_solana_verifier() {

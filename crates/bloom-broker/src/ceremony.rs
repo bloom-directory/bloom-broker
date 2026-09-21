@@ -12,7 +12,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Version, header},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use bloom_broker_api::{
@@ -241,7 +241,6 @@ fn bounded(field: &str, value: u64, ceiling: u64) -> Result<(), ProtocolError> {
 }
 
 const SHELL_HTML: &str = include_str!("ceremony_assets/index.html");
-const NEUTRAL_LANDING_HTML: &str = include_str!("ceremony_assets/landing.html");
 const APP_JS: &str = include_str!("ceremony_assets/app.js");
 const STYLE_CSS: &str = include_str!("ceremony_assets/style.css");
 const BLOOM_PRIMARY_SVG: &str = include_str!("ceremony_assets/bloom-primary.svg");
@@ -508,7 +507,6 @@ pub trait CeremonyCompletionObserver: Send + Sync {
 pub struct CeremonyBroker {
     inner: Arc<BrokerInner>,
     served_origin: String,
-    neutral_landing_enabled: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -853,13 +851,6 @@ impl CeremonyBroker {
         self.inner.limits
     }
 
-    /// Control only the unauthenticated root document. Ceremony routes and
-    /// authenticated recovery preparation remain available in either mode.
-    pub fn with_neutral_landing_enabled(mut self, enabled: bool) -> Self {
-        self.neutral_landing_enabled = enabled;
-        self
-    }
-
     /// Resolve a caller's bounded preference against authenticated Signer
     /// state. Only Signer descriptors can authorize an origin or RP ID.
     pub fn select_surface(
@@ -1024,7 +1015,6 @@ impl CeremonyBroker {
     ) -> Self {
         Self {
             served_origin: CEREMONY_ORIGIN.to_owned(),
-            neutral_landing_enabled: true,
             inner: Arc::new(BrokerInner {
                 signer,
                 limits,
@@ -2113,7 +2103,6 @@ impl CeremonyBroker {
         Ok(Self {
             inner: self.inner.clone(),
             served_origin: origin.to_owned(),
-            neutral_landing_enabled: self.neutral_landing_enabled,
         })
     }
 
@@ -3215,10 +3204,9 @@ async fn shell(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Resp
     if broker.validate_served_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if !broker.neutral_landing_enabled {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    Html(NEUTRAL_LANDING_HTML).into_response()
+    // Explicit empty fragment prevents browsers inheriting any capability
+    // fragment from an old bare-root launch URL during the redirect.
+    Redirect::to("https://bloom.directory/#").into_response()
 }
 
 async fn ceremony_resume_shell(
