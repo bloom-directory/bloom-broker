@@ -2974,8 +2974,32 @@ impl CeremonyBroker {
     }
 
     fn validate_origin(&self, headers: &HeaderMap) -> Result<(), ProtocolError> {
-        require_exact_header(headers, header::ORIGIN, &self.inner.endpoint.origin())
+        let expected = self.inner.endpoint.origin();
+        let observed = headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok());
+        check_origin(observed, &expected)
     }
+}
+
+/// Reject a ceremony `Origin` that is not this Broker's endpoint origin. The
+/// mismatch error names the expected origin so a page served by one Triad
+/// posting to another is recognizable in Broker logs. The check itself is
+/// unchanged: anything but an exact match fails, and HTTP responses stay a
+/// bare 403 — only the log carries the diagnostic.
+fn check_origin(observed: Option<&str>, expected: &str) -> Result<(), ProtocolError> {
+    if observed == Some(expected) {
+        return Ok(());
+    }
+    Err(protocol(
+        ProtocolErrorCode::UnauthenticatedPeer,
+        match observed {
+            Some(observed) => format!(
+                "ceremony request origin {observed} does not match the expected ceremony origin {expected}"
+            ),
+            None => format!("ceremony request is missing the expected ceremony origin {expected}"),
+        },
+    ))
 }
 
 fn require_exact_header(
@@ -3749,4 +3773,38 @@ fn custody_review_manifest(
         manifest["key_ref"] = serde_json::to_value(key_ref).map_err(malformed)?;
     }
     Ok(Some(manifest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_mismatch_names_expected_origin() {
+        let error =
+            check_origin(Some("http://localhost:28735"), "http://localhost:28736").unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::UnauthenticatedPeer);
+        assert!(
+            error.message.contains("http://localhost:28736"),
+            "origin mismatch must name the expected origin: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn missing_origin_names_expected_origin() {
+        let error = check_origin(None, "http://localhost:28736").unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::UnauthenticatedPeer);
+        assert!(
+            error.message.contains("http://localhost:28736"),
+            "missing origin must name the expected origin: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn matching_origin_passes() {
+        check_origin(Some("http://localhost:28736"), "http://localhost:28736")
+            .expect("exact origin match must pass");
+    }
 }
