@@ -49,12 +49,15 @@ pub struct EvmReviewPayload {
     /// is non-empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calldata_keccak: Option<String>,
-    /// The most this transaction can pay in fees: `gas_limit` times the
-    /// envelope's price ceiling, rendered in the chain's authenticated native
-    /// units. It is a maximum, never an estimate, and it is absent rather
-    /// than guessed when the chain's units are unknown.
+    /// The most this transaction can pay for *execution gas*: `gas_limit`
+    /// times the envelope's price ceiling, in the chain's authenticated
+    /// native units. It is a ceiling on that charge and nothing else — a
+    /// chain that bills separately, for data availability or anything the
+    /// envelope does not price, is not covered. Absent rather than guessed
+    /// when the chain's units are unknown; the page then says the fee cannot
+    /// be shown rather than omitting the subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maximum_fee_display: Option<String>,
+    pub maximum_execution_gas_fee_display: Option<String>,
     /// The clear-signed reading of this call, when a signed description
     /// covered it. Absent for native sends, deployments, and every member of
     /// an explicitly opaque batch.
@@ -482,7 +485,11 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
             payload_keccak: format!("{:#x}", keccak256(bytes)),
             calldata_bytes: input.len().to_string(),
             calldata_keccak: (!input.is_empty()).then(|| format!("{:#x}", keccak256(input))),
-            maximum_fee_display: maximum_fee_display(&fee_ceiling, tx.gas_limit(), &chain_name),
+            maximum_execution_gas_fee_display: maximum_execution_gas_fee_display(
+                &fee_ceiling,
+                tx.gas_limit(),
+                &chain_name,
+            ),
             contract_call: None,
         },
         call,
@@ -505,7 +512,11 @@ fn chain_name(chain_id: u64) -> String {
 /// overflow here: both inputs are `u64`/`u128` envelope fields and the
 /// product is taken in `u128` with a checked multiply, so an absurd envelope
 /// yields no fee line rather than a wrong one.
-fn maximum_fee_display(price_ceiling: &u128, gas_limit: u64, chain: &str) -> Option<String> {
+fn maximum_execution_gas_fee_display(
+    price_ceiling: &u128,
+    gas_limit: u64,
+    chain: &str,
+) -> Option<String> {
     let total = price_ceiling.checked_mul(u128::from(gas_limit))?;
     let (decimals, symbol) = crate::ceremony::native_asset_metadata(chain, "native")?;
     Some(format!(
@@ -1153,7 +1164,8 @@ pub(crate) mod tests {
             \"max_priority_fee_per_gas\":\"1\",\
             \"max_priority_fee_per_gas_display\":\"0.000000001 Gwei\"}},\
             \"gas_limit\":\"100000\",\
-            \"maximum_fee_display\":\"0.000000000001 ETH\",\"nonce\":\"3\",\
+            \"maximum_execution_gas_fee_display\":\"0.000000000001 ETH\",\
+            \"nonce\":\"3\",\
             \"payload_keccak\":\"{:#x}\",\
             \"sender\":\"0x0000000000000000000000000000000000000000\",\
             \"value\":\"123\",\

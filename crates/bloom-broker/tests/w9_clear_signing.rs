@@ -1012,3 +1012,36 @@ fn wallet_policy(clear_signing: Option<ClearSigningPolicy>) -> CanonicalWalletPo
         clear_signing,
     }
 }
+
+/// A verifier that moves must not strand the wallet that pinned the old one.
+/// Installing an unknown pin stays refused, and re-presenting the snapshot
+/// already stored stays readable — otherwise the owner could not approve the
+/// policy update that re-pins it, and there would be no way out at all. The
+/// pin is still spent: `clear_signing_context` refuses to produce a review
+/// from a verifier the policy does not name.
+#[test]
+fn an_outdated_verifier_pin_does_not_strand_the_wallet() {
+    let harness = Harness::open(None);
+    let mut stale = clear_signing_policy(7);
+    stale.verifier.verifier_digest = Digest32::from_bytes([0x5a; 32]);
+
+    // Installing a policy pinning a verifier this build lacks is refused.
+    let refused = harness.try_install_policy(2, Some(stale));
+    assert!(
+        refused
+            .as_ref()
+            .err()
+            .is_some_and(|message| message.contains("absent from this build")),
+        "installing an unknown verifier pin must be refused, got {refused:?}"
+    );
+
+    // A policy installed while its verifier was current stays installable
+    // from the identical stored snapshot — the read path a client takes on
+    // every call.
+    harness.install_policy(3, Some(clear_signing_policy(7)));
+    let snapshot = harness.sign_policy(3, &harness.current_policy());
+    harness
+        .authority
+        .install_policy(&snapshot)
+        .expect("re-presenting the stored snapshot must stay readable");
+}

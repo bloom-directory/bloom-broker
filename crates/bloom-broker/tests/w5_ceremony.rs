@@ -6829,9 +6829,22 @@ if (!view.primary.includes("0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512")) {{
 // The envelope's zero native value must not read as the thing being sent.
 if (view.primary.includes("  0 ETH")) throw new Error(`primary showed the native zero: ${{view.primary}}`);
 // The potential cost stays with the decision, labelled as a ceiling.
-if (!view.primary.includes("0.000198510751634520 ETH at most")) {{
-  throw new Error(`the maximum network fee is not visible: ${{view.primary}}`);
+if (!view.primary.includes("Maximum execution gas fee") ||
+    !view.primary.includes("0.000198510751634520 ETH at most")) {{
+  throw new Error(`the execution gas ceiling is not visible: ${{view.primary}}`);
 }}
+// A chain whose units Bloom cannot authenticate must say the cost cannot be
+// shown. Silently dropping the row would read as "no fee".
+const noUnits = previewSession("transfer");
+const unitless = JSON.parse(noUnits.review_manifest.canonical_plan);
+delete unitless.evm_review.payloads[0].maximum_execution_gas_fee_display;
+noUnits.review_manifest.canonical_plan = JSON.stringify(unitless);
+renderReview(noUnits);
+const shown = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
+if (!shown.includes("Cannot be shown")) {{
+  throw new Error(`an unpriceable fee vanished instead of saying so: ${{shown}}`);
+}}
+renderReview(previewSession("transfer"));
 if (view.primary.includes("3.03 gwei")) throw new Error("gas rates leaked into the primary facts");
 if (!view.technical.includes("3.03 gwei")) throw new Error("gas rates are missing from technical details");
 for (const detail of ["5f2a1c6b8d4e0937ab55c1e8d0f34721aa9c6b5e4d3f2a1908b7c6d5e4f302915", "65410"]) {{

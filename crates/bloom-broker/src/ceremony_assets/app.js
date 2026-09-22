@@ -244,12 +244,16 @@ function describeTransfer(manifest) {
     if (!decoded || movesNative) facts.push([label(decoded ? "Native value sent" : "Amount"), payload.value_display]);
     else technical.push([label("Native value sent"), payload.value_display]);
     facts.push([label("Network"), chainLabel(payload.chain)]);
-    // A ceiling, computed by Broker from the envelope's own gas limit and
-    // price in the chain's authenticated units. It is a maximum, not an
-    // estimate, and it stays visible when the rates behind it collapse.
-    if (payload.maximum_fee_display) {
-      facts.push([label("Network fee"), `${payload.maximum_fee_display} at most`]);
-    }
+    // A ceiling on execution gas, computed by Broker from the envelope's own
+    // gas limit and price in the chain's authenticated units. It is a maximum
+    // for that charge, not an estimate and not a cap on every network charge,
+    // and it stays visible when the rates behind it collapse. When the chain's
+    // units are unknown the page says so: a missing cost must not read as no
+    // cost.
+    facts.push([label("Maximum execution gas fee"),
+      payload.maximum_execution_gas_fee_display
+        ? `${payload.maximum_execution_gas_fee_display} at most`
+        : "Cannot be shown — Bloom has no authenticated units for this chain"]);
     // The one field that tells a transfer from a contract call: say plainly
     // whether input data exists. Execution effects are unverified either way
     // (see Bloom verification); size and commitment live in technical details.
@@ -1127,7 +1131,7 @@ function previewPayload(extra) {
     fee: {kind: "eip1559", max_fee_per_gas: "3034880652", max_fee_per_gas_display: "3.03 gwei",
           max_priority_fee_per_gas: "151744032", max_priority_fee_per_gas_display: "0.15 gwei"},
     payload_keccak: "5f2a1c6b8d4e0937ab55c1e8d0f34721aa9c6b5e4d3f2a1908b7c6d5e4f302915",
-    maximum_fee_display: "0.000198510751634520 ETH",
+    maximum_execution_gas_fee_display: "0.000198510751634520 ETH",
     calldata_bytes: "68",
     calldata_keccak: "11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"
   }, extra);

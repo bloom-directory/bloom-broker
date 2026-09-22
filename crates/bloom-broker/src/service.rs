@@ -773,6 +773,22 @@ impl BrokerRpcService {
         // not a mutation, so it does not consume the caller's mutation
         // allowance a second time; `prepare_approval` already takes one.
         let now_ms = self.clock.now_ms(false)?;
+        // The wallet pins the verifier by digest, and this is where that pin
+        // is spent. A build whose verifier sources hash to something else
+        // cannot describe calls for this wallet: refusing here is what stops
+        // an upgraded Broker quietly substituting its own reading for the one
+        // the owner approved.
+        if let Some(settings) = &policy.clear_signing
+            && (settings.verifier.verifier_id.as_str()
+                != bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_ID
+                || settings.verifier.verifier_digest != verifier_digest)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "wallet policy pins a clear-signing verifier absent from this build; \
+                 approve a policy update naming this build's verifier",
+            ));
+        }
         let Some(settings) = &policy.clear_signing else {
             return Ok(crate::evm_review::ClearSigningContext {
                 catalog: None,

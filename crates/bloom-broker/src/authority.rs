@@ -765,7 +765,6 @@ impl BrokerAuthority {
                 ));
             }
         }
-        check_clear_signing_policy(policy)?;
         let snapshot_jcs = serde_jcs::to_string(snapshot).map_err(storage)?;
         let policy_jcs = serde_jcs::to_string(&policy).map_err(storage)?;
         let connection = self.lock()?;
@@ -786,9 +785,19 @@ impl BrokerAuthority {
         if exact.as_ref().is_some_and(|(version, stored)| {
             *version == snapshot.version.get() && stored == &snapshot_jcs
         }) {
+            // Re-presenting the snapshot already stored is a read, not an
+            // install. It must not be refused because the verifier it pins
+            // has since moved: that would make the wallet unreadable and
+            // leave the owner unable to prepare the re-pin ceremony that is
+            // the only way out. Reviews are refused separately, by the
+            // comparison in `clear_signing_context`, so nothing is accepted
+            // from a verifier the policy does not name.
             return Ok(());
         }
         drop(connection);
+        // Installing or changing a policy still requires the verifier it
+        // pins to exist here.
+        check_clear_signing_policy(policy)?;
         let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         let existing: Option<(u64, String)> = transaction

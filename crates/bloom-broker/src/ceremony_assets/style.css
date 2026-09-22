@@ -51,8 +51,11 @@ details.signed pre{max-height:26vh}
    Meaningful text is always DOM content, never CSS-generated: a theme that
    drops every rule still shows the whole review.
 
-   An owner theme is trusted UI code. Arbitrary CSS can hide a warning or a
-   button, and nothing here prevents that.
+   An owner theme has no isolation from security-relevant presentation. CSS
+   can move, cover, recolour, shrink or hide a warning, an address, an amount
+   or a button, and so can alter the apparent meaning of a review without
+   changing its content. Identical review text under a theme shows content
+   preservation, not visual safety.
    ─────────────────────────────────────────────────────────────────────────── */
 :root{
   --ceremony-bg:var(--paper);
