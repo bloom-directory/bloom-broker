@@ -374,7 +374,13 @@ fn parse_ceremony_url(url: &str) -> Result<CeremonyTarget, Box<dyn std::error::E
     {
         return Err("ceremony URL has an invalid session token".into());
     }
-    if token.len() != 43 {
+    // The token is interpolated into an HTTP header, so it must be a
+    // canonical unpadded base64url encoding of exactly the 32 session-token
+    // bytes: this rejects control characters (including CR/LF injection)
+    // and any other non-alphabet input before a request is constructed.
+    let parsed =
+        Base64UrlBytes::parse(token).map_err(|_| "ceremony URL has an invalid session token")?;
+    if parsed.decode().len() != 32 {
         return Err("ceremony URL has an invalid session token".into());
     }
     let origin = format!("http://{}", {
@@ -445,7 +451,10 @@ fn request(
 
 #[cfg(test)]
 mod tests {
-    use super::{CeremonyKind, custody_effect_kind, parse_ceremony_url, read_protected_seed_file};
+    use super::{
+        Base64UrlBytes, CeremonyKind, custody_effect_kind, parse_ceremony_url,
+        read_protected_seed_file,
+    };
     use std::{fs, path::PathBuf};
 
     fn temp_path(name: &str) -> PathBuf {
@@ -495,7 +504,9 @@ mod tests {
 
     #[test]
     fn ceremony_url_parsing_accepts_canonical_local_origins() {
-        let token = "a".repeat(43);
+        // A genuinely encoded 32-byte session token, not a repeated letter.
+        let token = Base64UrlBytes::from_bytes(&[7u8; 32]).encoded().to_owned();
+        assert_eq!(token.len(), 43);
         let target =
             parse_ceremony_url(&format!("http://localhost:28735/ceremony/{token}")).unwrap();
         assert_eq!(target.port, 28_735);
@@ -514,7 +525,17 @@ mod tests {
 
     #[test]
     fn ceremony_url_parsing_rejects_remote_or_malformed_urls() {
-        let token = "a".repeat(43);
+        let token = Base64UrlBytes::from_bytes(&[7u8; 32]).encoded().to_owned();
+        // Tokens that fail canonical base64url validation: non-alphabet
+        // bytes, CR/LF header injection, padding, wrong byte length, and
+        // noncanonical trailing bits.
+        let bad_tokens = [
+            "!".repeat(43),
+            "a".repeat(35) + "\r\nX: y\r\n",
+            format!("{}=", &token[..42]),
+            Base64UrlBytes::from_bytes(&[7u8; 31]).encoded().to_owned(),
+            "b".repeat(43),
+        ];
         for url in [
             format!("http://127.0.0.1:28735/ceremony/{token}"),
             format!("http://[::1]:28735/ceremony/{token}"),
@@ -528,7 +549,13 @@ mod tests {
             format!("http://localhost:abc/ceremony/{token}"),
             "http://localhost:28735/ceremony/short".to_owned(),
             "http://localhost:28735/other/".to_owned() + &token,
-        ] {
+        ]
+        .into_iter()
+        .chain(
+            bad_tokens
+                .iter()
+                .map(|bad| format!("http://localhost:28735/ceremony/{bad}")),
+        ) {
             assert!(parse_ceremony_url(&url).is_err(), "must reject {url}");
         }
     }

@@ -218,21 +218,23 @@ fn linux_ceremony_listeners_are_inherited_and_never_rebound() {
         swapped.message
     );
 
-    // Wildcards are refused.
-    let wildcard = TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(
-        Ipv4Addr::UNSPECIFIED,
-        endpoint.port(),
-    )));
-    if let Ok(wildcard) = wildcard {
-        let observed = wildcard.local_addr().unwrap();
-        let refused = CeremonyBroker::require_canonical_loopback_listener(wildcard, expected_v4)
-            .expect_err("a wildcard listener must never be served");
-        assert!(
-            refused.message.contains(&observed.to_string()),
-            "the refusal must name the observed address: {}",
-            refused.message
-        );
-    }
+    // Wildcards are refused. Bind the wildcard on an ephemeral port so the
+    // bind always succeeds and the rejection assertion always executes (the
+    // configured loopback listeners stay held by the parent throughout).
+    let wildcard = TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+        .expect("bind an ephemeral wildcard listener");
+    let observed = wildcard.local_addr().unwrap();
+    assert!(
+        observed.ip().is_unspecified(),
+        "the probe must be a wildcard address: {observed}"
+    );
+    let refused = CeremonyBroker::require_canonical_loopback_listener(wildcard, expected_v4)
+        .expect_err("a wildcard listener must never be served");
+    assert!(
+        refused.message.contains(&observed.to_string()),
+        "the refusal must name the observed address: {}",
+        refused.message
+    );
 
     // The load-bearing case: the child acquires BOTH configured listeners
     // while the parent still holds them. Success is only possible by

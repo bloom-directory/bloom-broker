@@ -81,19 +81,6 @@ impl CeremonyEndpoint {
         Ok(Self { port })
     }
 
-    /// Validate a raw integer from configuration before narrowing to u16.
-    pub fn new_from_u32(port: u32) -> Result<Self, ProtocolError> {
-        if port == 0 || port > u32::from(u16::MAX) {
-            return Err(protocol(
-                ProtocolErrorCode::MalformedFrame,
-                format!(
-                    "ceremony_port must be between 1 and 65535, but is {port}; correct it in the Broker configuration file"
-                ),
-            ));
-        }
-        Self::new(port as u16)
-    }
-
     pub fn default_endpoint() -> Self {
         Self {
             port: DEFAULT_CEREMONY_PORT,
@@ -699,14 +686,6 @@ impl CeremonyBroker {
         )
     }
 
-    pub fn new_with_limits_and_endpoint(
-        signer: Arc<dyn CeremonySigner>,
-        limits: CeremonyLimits,
-        endpoint: CeremonyEndpoint,
-    ) -> Self {
-        Self::from_parts(signer, endpoint, limits, None, None, None)
-    }
-
     pub fn new_with_manifest_signer(
         signer: Arc<dyn CeremonySigner>,
         broker_key_id: Token,
@@ -715,22 +694,6 @@ impl CeremonyBroker {
         Self::from_parts(
             signer,
             CeremonyEndpoint::default(),
-            CeremonyLimits::default(),
-            None,
-            Some((broker_key_id, signing_key)),
-            None,
-        )
-    }
-
-    pub fn new_with_manifest_signer_and_endpoint(
-        signer: Arc<dyn CeremonySigner>,
-        broker_key_id: Token,
-        signing_key: SigningKey,
-        endpoint: CeremonyEndpoint,
-    ) -> Self {
-        Self::from_parts(
-            signer,
-            endpoint,
             CeremonyLimits::default(),
             None,
             Some((broker_key_id, signing_key)),
@@ -779,25 +742,6 @@ impl CeremonyBroker {
             signing_key,
             journal,
             CeremonyLimits::default(),
-        )
-    }
-
-    pub fn open_with_manifest_signer_and_endpoint(
-        path: impl AsRef<FsPath>,
-        signer: Arc<dyn CeremonySigner>,
-        broker_key_id: Token,
-        signing_key: SigningKey,
-        journal: Arc<BrokerJournal>,
-        endpoint: CeremonyEndpoint,
-    ) -> Result<Self, ProtocolError> {
-        Self::open_with_manifest_signer_audited_and_endpoint(
-            path,
-            signer,
-            broker_key_id,
-            signing_key,
-            journal,
-            CeremonyLimits::default(),
-            endpoint,
         )
     }
 

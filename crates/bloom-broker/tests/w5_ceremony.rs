@@ -5056,12 +5056,10 @@ fn ceremony_endpoint_formats_host_origin_and_urls_without_sockets() {
     assert_eq!(port80.host(), "localhost");
     assert_eq!(port80.origin(), "http://localhost");
     assert!(CeremonyEndpoint::new(0).is_err());
-    assert!(CeremonyEndpoint::new_from_u32(0).is_err());
-    assert!(CeremonyEndpoint::new_from_u32(65_536).is_err());
-    assert_eq!(
-        CeremonyEndpoint::new_from_u32(28_735).unwrap().port(),
-        28_735
-    );
+    assert_eq!(CeremonyEndpoint::new(28_735).unwrap().port(), 28_735);
+    // Out-of-range JSON values never reach the endpoint: the protected
+    // config declares `ceremony_port` as `Option<u16>`, so serde rejects
+    // non-integers and values above 65535 while parsing.
 }
 
 #[test]
