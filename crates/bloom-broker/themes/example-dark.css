@@ -1,0 +1,37 @@
+/* Example owner theme.
+ *
+ * Install it by naming the file in the Broker configuration:
+ *
+ *     "ceremony_theme_css_path": "/etc/bloom/ceremony-theme.css"
+ *
+ * Broker reads that one file once at startup and serves it at
+ * /assets/theme.css, after the default stylesheet. No path, name or query
+ * from a request reaches the filesystem, and a theme never arrives from a
+ * descriptor, a publisher, a dapp or a URL.
+ *
+ * This is trusted UI code. Redefining the documented custom properties is the
+ * supported path and is what this file does. The stable class names are also
+ * available for deeper changes — and with them you can move, cover or hide a
+ * warning or a button. Nothing in Broker prevents that, so treat an installed
+ * theme with the same care as any other code you run.
+ */
+:root{
+  --ceremony-bg:#14161a;
+  --ceremony-surface:#1c1f25;
+  --ceremony-text:#eef1f5;
+  --ceremony-muted:#9aa4b2;
+  --ceremony-border:#2c313a;
+  --ceremony-accent:#7aa2f7;
+  --ceremony-warning:#e8b04b;
+  --ceremony-warning-surface:rgba(232,176,75,.12);
+  --ceremony-danger:#f07178;
+  --ceremony-radius:10px;
+}
+/* The default sheet still paints the page chrome from its own variables, so
+   an owner theme that changes the review surface also sets these. */
+:root{--paper:var(--ceremony-bg);--surface:var(--ceremony-surface);--ink:var(--ceremony-text);
+      --ink-2:#c8d0dc;--muted:var(--ceremony-muted);--rule:var(--ceremony-border);
+      --rule-2:#39404b;--accent:var(--ceremony-accent);--accent-deep:#5d86e0;--error:var(--ceremony-danger)}
+body::before,body::after{display:none}
+.panel{background:var(--ceremony-surface);box-shadow:none}
+button{color:#10131a}

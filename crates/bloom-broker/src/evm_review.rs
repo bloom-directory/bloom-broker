@@ -49,6 +49,12 @@ pub struct EvmReviewPayload {
     /// is non-empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calldata_keccak: Option<String>,
+    /// The most this transaction can pay in fees: `gas_limit` times the
+    /// envelope's price ceiling, rendered in the chain's authenticated native
+    /// units. It is a maximum, never an estimate, and it is absent rather
+    /// than guessed when the chain's units are unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_fee_display: Option<String>,
     /// The clear-signed reading of this call, when a signed description
     /// covered it. Absent for native sends, deployments, and every member of
     /// an explicitly opaque batch.
@@ -388,13 +394,14 @@ fn render_eip1559(
     policy: &CanonicalWalletPolicy,
     from: Address,
 ) -> Result<(EvmReviewPayload, Option<DecodedCall>), ProtocolError> {
+    let fee_ceiling = tx.max_fee_per_gas;
     let fee = EvmFeeReview::Eip1559 {
         max_fee_per_gas: tx.max_fee_per_gas.to_string(),
         max_fee_per_gas_display: format_gwei(tx.max_fee_per_gas),
         max_priority_fee_per_gas: tx.max_priority_fee_per_gas.to_string(),
         max_priority_fee_per_gas_display: format_gwei(tx.max_priority_fee_per_gas),
     };
-    render(tx, bytes, policy, from, fee)
+    render(tx, bytes, policy, from, fee, fee_ceiling)
 }
 
 fn render_legacy(
@@ -403,11 +410,12 @@ fn render_legacy(
     policy: &CanonicalWalletPolicy,
     from: Address,
 ) -> Result<(EvmReviewPayload, Option<DecodedCall>), ProtocolError> {
+    let fee_ceiling = tx.gas_price;
     let fee = EvmFeeReview::Legacy {
         gas_price: tx.gas_price.to_string(),
         gas_price_display: format_gwei(tx.gas_price),
     };
-    render(tx, bytes, policy, from, fee)
+    render(tx, bytes, policy, from, fee, fee_ceiling)
 }
 
 fn render<T: Transaction + SignableTransaction<Signature>>(
@@ -416,6 +424,7 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
     policy: &CanonicalWalletPolicy,
     from: Address,
     fee: EvmFeeReview,
+    fee_ceiling: u128,
 ) -> Result<(EvmReviewPayload, Option<DecodedCall>), ProtocolError> {
     if tx.encoded_for_signing() != bytes {
         return Err(invalid(
@@ -473,6 +482,7 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
             payload_keccak: format!("{:#x}", keccak256(bytes)),
             calldata_bytes: input.len().to_string(),
             calldata_keccak: (!input.is_empty()).then(|| format!("{:#x}", keccak256(input))),
+            maximum_fee_display: maximum_fee_display(&fee_ceiling, tx.gas_limit(), &chain_name),
             contract_call: None,
         },
         call,
@@ -489,6 +499,19 @@ fn chain_name(chain_id: u64) -> String {
         42161 => "arbitrum".into(),
         id => format!("evm-{id}"),
     }
+}
+
+/// `gas_limit * price ceiling`, in the chain's native units. `u128` cannot
+/// overflow here: both inputs are `u64`/`u128` envelope fields and the
+/// product is taken in `u128` with a checked multiply, so an absurd envelope
+/// yields no fee line rather than a wrong one.
+fn maximum_fee_display(price_ceiling: &u128, gas_limit: u64, chain: &str) -> Option<String> {
+    let total = price_ceiling.checked_mul(u128::from(gas_limit))?;
+    let (decimals, symbol) = crate::ceremony::native_asset_metadata(chain, "native")?;
+    Some(format!(
+        "{} {symbol}",
+        crate::ceremony::format_base_units(&total.to_string(), usize::from(decimals))
+    ))
 }
 
 fn native_value_display(value: &str, chain: &str) -> String {
@@ -1129,7 +1152,8 @@ pub(crate) mod tests {
             \"max_fee_per_gas_display\":\"0.00000001 Gwei\",\
             \"max_priority_fee_per_gas\":\"1\",\
             \"max_priority_fee_per_gas_display\":\"0.000000001 Gwei\"}},\
-            \"gas_limit\":\"100000\",\"nonce\":\"3\",\
+            \"gas_limit\":\"100000\",\
+            \"maximum_fee_display\":\"0.000000000001 ETH\",\"nonce\":\"3\",\
             \"payload_keccak\":\"{:#x}\",\
             \"sender\":\"0x0000000000000000000000000000000000000000\",\
             \"value\":\"123\",\

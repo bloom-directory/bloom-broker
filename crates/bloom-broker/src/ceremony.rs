@@ -1285,14 +1285,9 @@ impl CeremonyBroker {
     }
 
     pub fn router(&self) -> Router {
-        Router::new()
+        let router = Router::new()
             .route("/", get(shell))
             .route("/ceremony/{token}", get(ceremony_shell))
-            // Design previews. They serve the same shell and the same
-            // renderer; the page recognises the path and draws a fixture. No
-            // session exists, so nothing here can be approved.
-            .route("/preview", get(shell))
-            .route("/preview/{name}", get(shell))
             .route("/assets/app.js", get(app_js))
             .route("/assets/style.css", get(style_css))
             .route("/assets/theme.css", get(theme_css))
@@ -1309,7 +1304,18 @@ impl CeremonyBroker {
                 post(bind_output_key),
             )
             .route("/api/session/{ceremony_id}/ack", post(acknowledge_result))
-            .route("/api/session/{ceremony_id}/cancel", post(cancel_session))
+            .route("/api/session/{ceremony_id}/cancel", post(cancel_session));
+        // Design previews. They serve the same shell and the same renderer;
+        // the page recognises the path and draws a fixture. A preview name is
+        // not a ceremony token and no session is created for it, so the
+        // approval API behind these paths has nothing to act on. They exist
+        // only in a developer-harness build, so a released Broker serves no
+        // preview surface at all.
+        #[cfg(feature = "triad-dev-harness")]
+        let router = router
+            .route("/preview", get(shell))
+            .route("/preview/{name}", get(shell));
+        router
             .layer(DefaultBodyLimit::max(MAX_CEREMONY_BODY_BYTES))
             .layer(middleware::from_fn(security_headers))
             .with_state(self.clone())

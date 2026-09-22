@@ -6827,7 +6827,13 @@ if (!view.primary.includes("0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512")) {{
   throw new Error("the token contract address is not on the page");
 }}
 // The envelope's zero native value must not read as the thing being sent.
-if (view.primary.includes("0 ETH")) throw new Error(`primary showed the native zero: ${{view.primary}}`);
+if (view.primary.includes("  0 ETH")) throw new Error(`primary showed the native zero: ${{view.primary}}`);
+// The potential cost stays with the decision, labelled as a ceiling.
+if (!view.primary.includes("0.000198510751634520 ETH at most")) {{
+  throw new Error(`the maximum network fee is not visible: ${{view.primary}}`);
+}}
+if (view.primary.includes("3.03 gwei")) throw new Error("gas rates leaked into the primary facts");
+if (!view.technical.includes("3.03 gwei")) throw new Error("gas rates are missing from technical details");
 for (const detail of ["5f2a1c6b8d4e0937ab55c1e8d0f34721aa9c6b5e4d3f2a1908b7c6d5e4f302915", "65410"]) {{
   if (view.primary.includes(detail)) throw new Error(`primary exposed ${{detail}}`);
   if (!view.technical.includes(detail)) throw new Error(`technical details omitted ${{detail}}`);
@@ -6855,6 +6861,9 @@ view = show("allowance-unlimited");
 if (view.heading !== "Allow unlimited BDT spending") throw new Error(`unlimited heading: ${{view.heading}}`);
 if (view.magnitude !== "unlimited") throw new Error(`unlimited magnitude: ${{view.magnitude}}`);
 if (view.heading.includes("115792089")) throw new Error("the U256 maximum led the heading");
+// Deciding must never require reading the raw integer.
+if (view.primary.includes("115792089")) throw new Error("the U256 maximum is still a primary fact");
+if (!view.technical.includes("115792089")) throw new Error("the exact maximum left technical details");
 if (!view.primary.includes("UNLIMITED ALLOWANCE")) throw new Error("the unlimited warning is not visible");
 // The exact value is still recoverable, at full precision, further down.
 if (!view.all.includes("115792089237316195423570985008687907853269984665640564039457584007913129639")) {{
@@ -6905,6 +6914,146 @@ if (!relabelled.includes("Send 250 BDT")) {{
 }}
 if (!relabelled.includes("Beneficiary")) {{
   throw new Error("the publisher's own label stopped being shown beside its argument");
+}}
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A preview is a drawing, not a ceremony. Removing the buttons is the
+/// cosmetic half; this is the half that matters — a preview name reaches no
+/// session, no approval operation and no completion path, and the whole
+/// preview surface exists only in a developer-harness build.
+#[tokio::test]
+async fn a_preview_name_reaches_no_session_and_cannot_be_completed() {
+    let signer = Arc::new(MockSigner::new());
+    let broker = CeremonyBroker::new(signer);
+    let app = broker.router();
+    let get = |uri: &str, token: Option<&str>| {
+        let mut builder = Request::builder()
+            .uri(uri.to_owned())
+            .header(header::HOST, "localhost:18734");
+        if let Some(token) = token {
+            builder = builder.header("x-bloom-ceremony-token", token);
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+
+    // The preview page itself is served, and is the ordinary shell.
+    let page = app.clone().oneshot(get("/preview/transfer", None)).await.unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+
+    // Every approval path refuses a preview name. It is not a token, so it
+    // resolves to nothing: there is no session to read and none to complete.
+    for name in ["transfer", "allowance-unlimited", "batch", "index"] {
+        let session = app
+            .clone()
+            .oneshot(get("/api/session", Some(name)))
+            .await
+            .unwrap();
+        assert_ne!(
+            session.status(),
+            StatusCode::OK,
+            "preview name `{name}` resolved to a session"
+        );
+        let by_id = app
+            .clone()
+            .oneshot(get(&format!("/api/session/{name}"), Some(name)))
+            .await
+            .unwrap();
+        assert_ne!(
+            by_id.status(),
+            StatusCode::OK,
+            "preview name `{name}` resolved to a session by id"
+        );
+        let complete = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/session/{name}/complete"))
+                    .header(header::HOST, "localhost:18734")
+                    .header("x-bloom-ceremony-token", name)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("origin", "http://localhost:18734")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            complete.status(),
+            StatusCode::OK,
+            "preview name `{name}` completed a ceremony"
+        );
+    }
+}
+
+/// Enabling unlimited allowances is an authority change, so the page has to
+/// show it as current → proposed and say what it does and does not grant.
+/// An empty diff for a real widening is the defect this guards.
+#[test]
+fn the_policy_page_shows_the_clear_signing_authority_change() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = "";
+                       this.attrs = {{}}; this.hidden = false; }}
+  setAttribute(key, value) {{ this.attrs[key] = value; }}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+renderReview(previewSession("policy-unlimited"));
+const rendered = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
+for (const phrase of ["Allow unlimited-allowance requests", "blocked → allowed",
+                      "grants no spender any allowance", "needs its own approval ceremony"]) {{
+  if (!rendered.includes(phrase)) throw new Error(`policy page omitted ${{phrase}}: ${{rendered}}`);
+}}
+if (nodes.approve.textContent !== "Approve policy change") {{
+  throw new Error(`policy button: ${{nodes.approve.textContent}}`);
+}}
+// A verifier re-pin is authority too: it decides which build may describe
+// calls for this wallet at all.
+const repin = previewSession("policy-unlimited");
+repin.review_manifest.authority_diff = {{clear_signing: {{
+  before: {{unlimited_allowance_allowed: false,
+           verifier: {{verifier_digest: "77f7d9d939a496a16a9e5d517bb57c8e8eea397751dabdac5f923e0f2e91cc20"}}}},
+  after: {{unlimited_allowance_allowed: false,
+          verifier: {{verifier_digest: "12d21da9f7eeaf72df3ddd51202a79366b020e2f7bbc3df30286d7d65ab79374"}}}}
+}}}};
+renderReview(repin);
+const pinned = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
+for (const phrase of ["Pinned verifier", "77f7d9d9", "12d21da9", "stops being able to describe"]) {{
+  if (!pinned.includes(phrase)) throw new Error(`verifier re-pin omitted ${{phrase}}: ${{pinned}}`);
 }}
 "#
     );

@@ -204,8 +204,9 @@ function callIntent(call) {
       action: "allowance", magnitude: "zero",
       eyebrow: "Token allowance",
       heading: `Set ${who}'s ${symbol} allowance to zero`,
-      detail: `If this executes, ${who} can no longer move your ${symbol} under this allowance. ` +
-        "It does not revoke any other permission this spender may hold.",
+      detail: `If this transaction executes successfully, this spender's ${symbol} allowance ` +
+        "becomes zero. Nothing has been revoked yet, and no other permission this spender " +
+        "holds — for another token, or granted another way — is affected.",
       relation: `loses its ${symbol} allowance from`
     };
   }
@@ -243,6 +244,12 @@ function describeTransfer(manifest) {
     if (!decoded || movesNative) facts.push([label(decoded ? "Native value sent" : "Amount"), payload.value_display]);
     else technical.push([label("Native value sent"), payload.value_display]);
     facts.push([label("Network"), chainLabel(payload.chain)]);
+    // A ceiling, computed by Broker from the envelope's own gas limit and
+    // price in the chain's authenticated units. It is a maximum, not an
+    // estimate, and it stays visible when the rates behind it collapse.
+    if (payload.maximum_fee_display) {
+      facts.push([label("Network fee"), `${payload.maximum_fee_display} at most`]);
+    }
     // The one field that tells a transfer from a contract call: say plainly
     // whether input data exists. Execution effects are unverified either way
     // (see Bloom verification); size and commitment live in technical details.
@@ -278,8 +285,14 @@ function describeTransfer(manifest) {
     // decoded argument is still listed even when the heading already named
     // the two that matter. The publisher's label names the argument; it does
     // not decide what the argument means.
+    const unlimited = call.intent_summary?.magnitude === "unlimited";
     for (const field of call.fields || []) {
-      facts.push([label(field.label), field.value, field.format === "addressName"]);
+      // The U256 maximum is not a human amount. For an unlimited allowance the
+      // consequence is the heading and the exact value stays recoverable under
+      // technical details, where nobody has to read it to decide.
+      const row = [label(field.label), field.value, field.format === "addressName"];
+      if (unlimited && field.format === "tokenAmount") technical.push(row);
+      else facts.push(row);
     }
     if (call.token) {
       facts.push([label("Token"), `${call.token.symbol} — ${call.token.name}`]);
@@ -538,11 +551,61 @@ function describePolicy(manifest) {
   if (Number.isFinite(before) && Number.isFinite(after) && before !== after) {
     lines.push(["Max approval lifetime", `${fmtRemaining(before)} → ${fmtRemaining(after)}`]);
   }
+  // Clear-signing settings are authority, so a change to them is shown as
+  // current → proposed rather than left to an empty diff. Each one says what
+  // it permits: none of them grants anyone an allowance by itself.
+  const CLEAR_SIGNING_SETTINGS = [
+    ["unlimited_allowance_allowed", "Unlimited-allowance requests",
+     "A request with no spending cap is refused outright.",
+     "A request with no spending cap can be prepared. It still needs its own approval ceremony, " +
+     "and approving this change grants no spender any allowance."],
+    ["opaque_exact_allowed", "Requests Bloom cannot describe",
+     "A call with no signed description is refused.",
+     "A call with no signed description can be approved as exact bytes, carrying the " +
+     "inability-to-explain warning."]
+  ];
+  const clearBefore = diff.clear_signing?.before || null;
+  const clearAfter = diff.clear_signing?.after || null;
+  const intentLines = [];
+  if (clearBefore || clearAfter) {
+    for (const [key, title, whenOff, whenOn] of CLEAR_SIGNING_SETTINGS) {
+      const was = Boolean(clearBefore?.[key]);
+      const now = Boolean(clearAfter?.[key]);
+      if (was === now) continue;
+      lines.push([title, `${was ? "allowed" : "blocked"} → ${now ? "allowed" : "blocked"}`]);
+      intentLines.push([title, now ? whenOn : whenOff]);
+    }
+    for (const [key, title] of [["catalog_id", "Descriptions come from catalog"],
+                                ["signature_threshold", "Publisher signatures required"],
+                                ["maximum_observation_age_ms", "Oldest usable observation"]]) {
+      const was = clearBefore?.[key];
+      const now = clearAfter?.[key];
+      if (was === now || (was == null && now == null)) continue;
+      lines.push([title, `${was == null ? "none" : was} → ${now == null ? "none" : now}`]);
+    }
+    const wasVerifier = clearBefore?.verifier?.verifier_digest;
+    const nowVerifier = clearAfter?.verifier?.verifier_digest;
+    if (wasVerifier !== nowVerifier) {
+      lines.push(["Pinned verifier", `${shortDigest(wasVerifier) || "none"} → ${shortDigest(nowVerifier) || "none"}`, true]);
+      intentLines.push(["Pinned verifier",
+        "Reviews are accepted only from the build whose verifier sources hash to the new value. " +
+        "A different build stops being able to describe calls for this wallet."]);
+    }
+  }
   const n = lines.length;
   const sentence = n === 0
     ? "No rule changes are proposed."
     : `Change <strong>${n} rule${n === 1 ? "" : "s"}</strong> for this wallet. Nothing moves; after approval Bloom applies the new rules to future transactions.`;
-  return {sentence, facts: lines};
+  const intent = n === 0 ? null : {
+    action: "policy", eyebrow: "Wallet policy change",
+    heading: intentLines.length === 1 && intentLines[0][0] === "Unlimited-allowance requests"
+      ? "Allow unlimited-allowance requests"
+      : `Change ${n} wallet rule${n === 1 ? "" : "s"}`,
+    detail: (intentLines.map(([, text]) => text).join(" ") ||
+      "These rules apply to future requests. Approving them moves nothing now.") +
+      " No funds move and no permission is granted to anyone by this change."
+  };
+  return {sentence, intent, facts: lines};
 }
 function planDisclosures(manifest) {
   try {
@@ -1064,6 +1127,7 @@ function previewPayload(extra) {
     fee: {kind: "eip1559", max_fee_per_gas: "3034880652", max_fee_per_gas_display: "3.03 gwei",
           max_priority_fee_per_gas: "151744032", max_priority_fee_per_gas_display: "0.15 gwei"},
     payload_keccak: "5f2a1c6b8d4e0937ab55c1e8d0f34721aa9c6b5e4d3f2a1908b7c6d5e4f302915",
+    maximum_fee_display: "0.000198510751634520 ETH",
     calldata_bytes: "68",
     calldata_keccak: "11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"
   }, extra);
@@ -1071,7 +1135,7 @@ function previewPayload(extra) {
 function previewClearSigning() {
   return {
     assurance: "trusted_description", verifier_id: "evm-clear-signing-v1",
-    verifier_digest: "77f7d9d939a496a16a9e5d517bb57c8e8eea397751dabdac5f923e0f2e91cc20",
+    verifier_digest: "12d21da9f7eeaf72df3ddd51202a79366b020e2f7bbc3df30286d7d65ab79374",
     catalog_id: "bloom-demo-tokens", catalog_sequence: "5",
     catalog_digest: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
     catalog_expires_at_ms: String(Date.now() + 86400000),
@@ -1157,7 +1221,7 @@ const PREVIEWS = {
     review_manifest: {
       schema: "bloom.custody_ceremony_review.v1", title: "Approve a policy change",
       summary: "Review the policy change below.",
-      policy_authority_diff: {
+      authority_diff: {
         clear_signing: {
           before: {unlimited_allowance_allowed: false},
           after: {unlimited_allowance_allowed: true}
