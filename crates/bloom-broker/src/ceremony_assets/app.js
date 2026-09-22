@@ -951,8 +951,9 @@ function renderReview(session) {
   const expiryHost = document.getElementById("action-expiry");
   if (expiryHost) expiryHost.replaceChildren(expiry);
   else facts.append(el("dt", {}, "Expires"), el("dd", {}, expiry));
+  let advisory = [];
   if (kind === "sealed_approval") {
-    for (const item of session.review_manifest?.attributed_advisory_items || []) warns.push(item);
+    advisory = session.review_manifest?.attributed_advisory_items || [];
     // Proof verification occurs during authorization, after this review.
     // Never suppress the plan's present-tense disclosure merely because the
     // Machine requested proof verification for the later signing step.
@@ -1090,6 +1091,11 @@ function renderReview(session) {
       : el("span", {}, "Cannot be shown for this network");
     parts.push(el("div", {class: "ceremony-fee", "aria-label": "Execution gas only; other network charges may apply"},
       el("span", {class: "ceremony-fee-label"}, label), amount));
+  }
+  if (advisory.length) {
+    parts.push(el("div", {class: "advisory"},
+      el("p", {class: "advisory-note"}, advisory[0]),
+      el("ul", {}, ...advisory.slice(1).map(item => el("li", {}, item)))));
   }
   if (meta.warn) warns.unshift(meta.warn);
   for (const w of warns) parts.push(el("p", {class: "warn"}, w));

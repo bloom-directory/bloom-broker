@@ -816,6 +816,8 @@ impl BrokerRpcService {
         &self,
         request: ApprovalPrepareRequest,
     ) -> Result<SealedApprovalPrepareResponse, ProtocolError> {
+        const ADVISORY_ATTRIBUTION: &str =
+            "The app describes this operation as follows. Bloom has not checked these statements.";
         if request.petal_use_claim.is_some() && request.system_use_claim.is_some() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
@@ -913,6 +915,26 @@ impl BrokerRpcService {
                 .as_ref()
                 .map(jcs_digest)
                 .transpose()?);
+        // A Petal's own description of the operation. It is bounded and
+        // escaped before it reaches the page, and rendered under an
+        // attribution line so the owner is never shown Petal text as a Broker
+        // finding. A malformed advisory fails the preparation rather than
+        // being dropped: approving an operation whose description Broker threw
+        // away is worse than not being asked.
+        context.attributed_advisory_items = match request.attributed_advisory.as_ref() {
+            None => Vec::new(),
+            Some(advisory) => {
+                let items = advisory.validated().map_err(|reason| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::MalformedFrame,
+                        format!("attributed advisory: {reason}"),
+                    )
+                })?;
+                std::iter::once(ADVISORY_ATTRIBUTION.to_owned())
+                    .chain(items)
+                    .collect()
+            }
+        };
         context.petal_use_claim = request.petal_use_claim;
         context.system_use_claim = request.system_use_claim;
         context.claim_assurance = claim_assurance;
@@ -1103,6 +1125,7 @@ impl BrokerRpcService {
             terms: request.replacement_terms,
             petal_use_claim: None,
             system_use_claim: None,
+            attributed_advisory: None,
         })
         .await
     }

@@ -1865,6 +1865,7 @@ async fn approve_and_sign(
             evm_review_payloads: Vec::new(),
             petal_use_claim: None,
             system_use_claim: None,
+            attributed_advisory: None,
         }),
     )
     .await

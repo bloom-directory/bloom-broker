@@ -2198,6 +2198,15 @@ async fn prepare_scoped_approval(
     terms: &SealedApprovalTerms,
     operation_id: OperationId,
 ) -> Result<bloom_broker_api::SealedApprovalPrepareResponse, ProtocolError> {
+    prepare_scoped_approval_with_advisory(broker, terms, operation_id, None).await
+}
+
+async fn prepare_scoped_approval_with_advisory(
+    broker: &BrokerRpcService,
+    terms: &SealedApprovalTerms,
+    operation_id: OperationId,
+    attributed_advisory: Option<bloom_broker_api::AttributedAdvisory>,
+) -> Result<bloom_broker_api::SealedApprovalPrepareResponse, ProtocolError> {
     match MachineBrokerService::dispatch(
         broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
@@ -2208,6 +2217,7 @@ async fn prepare_scoped_approval(
             petal_use_claim: None,
             system_use_claim: None,
             evm_review_payloads: Vec::new(),
+            attributed_advisory,
         }),
     )
     .await?
@@ -3184,6 +3194,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             canonical_plan_facts_digest: digest("d4"),
             petal_use_claim: None,
             system_use_claim: None,
+            attributed_advisory: None,
         }),
     )
     .await
@@ -3317,6 +3328,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             petal_use_claim: None,
             system_use_claim: None,
             evm_review_payloads: Vec::new(),
+            attributed_advisory: None,
         }),
     )
     .await
@@ -3548,6 +3560,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                     canonical_plan_facts_digest: digest("c9"),
                     petal_use_claim: None,
                     system_use_claim: None,
+                    attributed_advisory: None,
                 }),
             )
             .await
@@ -4154,10 +4167,85 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let sweep_payload = b"fixture-recovery-sweep";
     let sweep = recovery_terms(sweep_payload, 0xe6);
     let sweep_operation = operation("e6");
-    let sweep_prepared =
-        prepare_scoped_approval(&restarted_scoped_broker, &sweep, sweep_operation.clone())
-            .await
-            .unwrap();
+
+    // An advisory Broker cannot render honestly fails the preparation. It is
+    // never dropped: an owner asked to approve an operation whose description
+    // was silently discarded is worse off than one who is not asked at all.
+    let malformed = prepare_scoped_approval_with_advisory(
+        &restarted_scoped_broker,
+        &sweep,
+        sweep_operation.clone(),
+        Some(bloom_broker_api::AttributedAdvisory {
+            schema: Token::new(bloom_broker_api::AttributedAdvisory::SCHEMA).unwrap(),
+            items: vec!["forged\nline structure".into()],
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(malformed.code, ProtocolErrorCode::MalformedFrame);
+    assert!(
+        malformed.message.contains("attributed advisory"),
+        "{malformed:?}"
+    );
+    cancellation_backoff().await;
+
+    let sweep_prepared = prepare_scoped_approval_with_advisory(
+        &restarted_scoped_broker,
+        &sweep,
+        sweep_operation.clone(),
+        Some(bloom_broker_api::AttributedAdvisory {
+            schema: Token::new(bloom_broker_api::AttributedAdvisory::SCHEMA).unwrap(),
+            items: vec![
+                "Sell on Pump.fun".into(),
+                "Guaranteed minimum received: 0.5 SOL".into(),
+            ],
+        }),
+    )
+    .await
+    .unwrap();
+
+    // The advisory reaches the page the owner actually reads, attributed to
+    // the app rather than presented as something Broker established.
+    {
+        let session: serde_json::Value = serde_json::from_slice(
+            &restarted_scoped_broker
+                .ceremony()
+                .router()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/session")
+                        .header(header::HOST, "localhost:18734")
+                        .header(
+                            "x-bloom-ceremony-token",
+                            url_token(&sweep_prepared.ceremony_url),
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        let items = session["review_manifest"]["attributed_advisory_items"]
+            .as_array()
+            .expect("the advisory reaches the review manifest");
+        assert!(
+            items[0]
+                .as_str()
+                .is_some_and(|line| line.contains("Bloom has not checked")),
+            "the app's own text must be attributed: {items:?}"
+        );
+        assert_eq!(items[1], serde_json::json!("Sell on Pump.fun"));
+        assert_eq!(
+            items[2],
+            serde_json::json!("Guaranteed minimum received: 0.5 SOL")
+        );
+    }
     let (sweep_status, sweep_body) = complete_scoped_ceremony(
         &restarted_scoped_broker,
         &authenticator,
@@ -4362,6 +4450,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                 canonical_plan_facts_digest: digest("dd"),
                 petal_use_claim: None,
                 system_use_claim: None,
+                attributed_advisory: None,
             }),
         )
         .await

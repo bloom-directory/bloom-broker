@@ -115,6 +115,12 @@ pub struct ApprovalPrepareRequest {
     pub petal_use_claim: Option<PetalUseClaim>,
     #[serde(default)]
     pub system_use_claim: Option<SystemUseClaim>,
+    /// What the Petal says this operation does, for the review page. The
+    /// Machine hashes these same bytes into `canonical_plan_facts_digest`, so
+    /// an approval prepared for one advisory cannot later sign a different
+    /// one.
+    #[serde(default)]
+    pub attributed_advisory: Option<crate::AttributedAdvisory>,
 }
 
 /// One mode for the whole batch. There is no mixed badge, no automatic
