@@ -998,7 +998,6 @@ impl BrokerRpcService {
             .map_err(journal_error)?
             && snapshot.kind == crate::journal::OPERATION_KIND
             && snapshot.is_batch == is_batch
-            && snapshot.operation_digest == request.operation_digest
             && let Some(result) = snapshot.result
             && result.operation_digest == snapshot.operation_digest
             && self
