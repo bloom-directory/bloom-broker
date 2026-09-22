@@ -34,6 +34,11 @@ proof, exact Host/Origin, same-origin Fetch Metadata and JSON content type.
 All result, acknowledgement and cancellation reads/mutations are scoped to
 the matching ceremony cookie. Two concurrent tabs use different cookie names.
 The local HTTP ceremony retains its existing token path and header mechanism.
+An unavailable launch shows one neutral page for expired, consumed, and service
+failures. It hides review details and controls and does not disclose the raw
+failure or recommend refreshing a single-use link. It stops timers and polling
+without deleting a saved browser output key or session reference; normal
+ceremony expiry and acknowledgement rules still apply.
 
 The staged `/.well-known/bloom/relay-health` endpoint returns 204 only on the
 remote TLS router with an exact Host. It carries no wallet data and does not

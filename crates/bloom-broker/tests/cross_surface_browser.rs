@@ -182,15 +182,72 @@ fn ceremony_asset_has_no_public_recovery_initiation() {
 }
 
 #[test]
-fn boot_failure_replaces_initial_loading_heading() {
+fn launch_failures_show_one_neutral_page_and_hide_all_stale_controls() {
+    let html = include_str!("../src/ceremony_assets/index.html");
+    for id in [
+        "ceremony-page",
+        "ceremony-panel",
+        "ceremony-eyebrow",
+        "ceremony-trust",
+    ] {
+        assert!(html.contains(&format!("id=\"{id}\"")));
+    }
     let output = run_browser(
         r#"
 const assert = require("node:assert/strict");
-const heading = {textContent: "One moment…"};
-globalThis.document = {getElementById: id => id === "page-title" ? heading : {}};
-reportLoadFailure(new Error("unavailable"));
-assert.equal(heading.textContent, "Ceremony could not load");
-assert.match(statusNode.textContent, /Ceremony failed to load/);
+const nodes = new Map();
+const pageClasses = new Set();
+const node = id => {
+  if (!nodes.has(id)) nodes.set(id, {hidden:false, textContent:"", classList:{add: name => pageClasses.add(name)}});
+  return nodes.get(id);
+};
+globalThis.document = {getElementById: node, querySelectorAll: () => inputs};
+const inputs = [{value:"wallet-secret"}, {value:"recovery-secret"}];
+const stored = new Map([["bloom.ceremony.remote-session.v1", "saved-session"]]);
+globalThis.sessionStorage = {getItem: key => stored.get(key), removeItem: key => stored.delete(key)};
+let reviewClears = 0;
+reviewNode.replaceChildren = () => { reviewClears += 1; };
+const logged = [];
+console.error = (...args) => logged.push(args);
+const results = [];
+for (const message of ["expired wallet alpha", "already used operation beta", "network failed with secret gamma"]) {
+  const retainedOutput = {privateKey:"saved-browser-result-key"};
+  outputRecipient = retainedOutput;
+  expiryTimer = setInterval(() => {}, 1000);
+  const capability = new Uint8Array([7]);
+  crossSurfaceState = {poll:null, expiry:null, capability, recipient:{}};
+  approve.disabled = false; cancel.disabled = false;
+  approve.onclick = () => {}; cancel.onclick = () => {};
+  for (const fields of [recoveryFields, exportFields, importFields, genericFields]) fields.hidden = false;
+  for (const input of inputs) input.value = "stale-secret";
+  statusNode.textContent = "wallet alpha operation beta";
+  reportLoadFailure(new Error(message));
+  results.push({
+    title: node("page-title").textContent,
+    lede: node("page-lede").textContent,
+    panelHidden: node("ceremony-panel").hidden,
+    eyebrowHidden: node("ceremony-eyebrow").hidden,
+    trustHidden: node("ceremony-trust").hidden,
+    pageClass: pageClasses.has("link-unavailable"),
+    actionsDisabled: approve.disabled && cancel.disabled && approve.onclick === null && cancel.onclick === null,
+    fieldsHidden: [recoveryFields, exportFields, importFields, genericFields].every(field => field.hidden),
+    inputsCleared: inputs.every(input => input.value === ""),
+    statusCleared: statusNode.textContent === "",
+    pairingStopped: crossSurfaceState === null && capability[0] === 0,
+    outputRetained: outputRecipient === retainedOutput,
+    sessionRetained: stored.get("bloom.ceremony.remote-session.v1") === "saved-session",
+    timerStopped: expiryTimer === null
+  });
+}
+assert.deepEqual(results[0], results[1]);
+assert.deepEqual(results[1], results[2]);
+assert.equal(results[0].title, "This link couldn’t be opened");
+assert.equal(results[0].lede, "It may have expired or already been used. Generate a new link in Bloom, or ask your agent to generate one.");
+for (const [key, value] of Object.entries(results[0])) {
+  if (typeof value === "boolean") assert.equal(value, true, key);
+}
+assert.equal(reviewClears, 3);
+assert.deepEqual(logged, []);
 process.stdout.write(JSON.stringify({ok:true}));
 "#,
     );

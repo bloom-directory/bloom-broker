@@ -1575,9 +1575,27 @@ function chacha20Poly1305Open(key, nonce, aad, sealed) {
   return chachaXor(key, nonce, ciphertext);
 }
 
-function reportLoadFailure(error) {
-  document.getElementById("page-title").textContent = "Ceremony could not load";
-  reportCeremonyError(error, "Ceremony failed to load. Please refresh and try again.");
+function reportLoadFailure(_error) {
+  clearInterval(expiryTimer);
+  expiryTimer = null;
+  stopCrossSurface();
+  approve.disabled = true;
+  cancel.disabled = true;
+  approve.onclick = null;
+  cancel.onclick = null;
+  reviewNode.replaceChildren();
+  for (const field of document.querySelectorAll("#ceremony-panel input, #ceremony-panel textarea")) {
+    field.value = "";
+  }
+  for (const fields of [recoveryFields, exportFields, importFields, genericFields]) fields.hidden = true;
+  statusNode.textContent = "";
+  document.getElementById("ceremony-panel").hidden = true;
+  document.getElementById("ceremony-eyebrow").hidden = true;
+  document.getElementById("ceremony-trust").hidden = true;
+  document.getElementById("ceremony-page").classList.add("link-unavailable");
+  document.getElementById("page-title").textContent = "This link couldn’t be opened";
+  document.getElementById("page-lede").textContent =
+    "It may have expired or already been used. Generate a new link in Bloom, or ask your agent to generate one.";
 }
 
 load().catch(reportLoadFailure);
