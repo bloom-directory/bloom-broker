@@ -230,6 +230,32 @@ fn the_shipped_page_handles_every_custody_ceremony_kind() {
     }
 }
 
+/// A description of what a transaction does is not a warning, and the page
+/// must not render it as one. This is a source assertion because the review
+/// block has no behaviour to drive: a real browser run is the only thing that
+/// confirms the layout, and it is not something this suite can do.
+#[test]
+fn the_shipped_page_renders_an_attributed_advisory_as_its_own_block() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let style = include_str!("../src/ceremony_assets/style.css");
+    assert!(
+        asset.contains("attributed_advisory_items"),
+        "the page must read the advisory the manifest carries"
+    );
+    assert!(
+        !asset.contains("attributed_advisory_items || []) warns.push"),
+        "advisory items must not be pushed into the warning list"
+    );
+    assert!(
+        asset.contains(r#"el("div", {class: "advisory"}"#),
+        "the advisory needs its own block"
+    );
+    assert!(
+        style.contains(".advisory{"),
+        "the advisory block needs a style, or it renders as unstyled text"
+    );
+}
+
 #[test]
 fn browser_crypto_self_test_executes_the_shipped_asset() {
     let asset = include_str!("../src/ceremony_assets/app.js");
