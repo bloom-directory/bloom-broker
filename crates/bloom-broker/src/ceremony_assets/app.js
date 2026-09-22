@@ -1171,9 +1171,8 @@ const PREVIEW_SPENDER = "0x9fE46736679d2d9a65F0992F2272dE9f3c7fa6e0";
 const PREVIEW_TOKEN = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
 const PREVIEW_TOKEN_IDENTITY =
   {address: PREVIEW_TOKEN, symbol: "BDT", name: "Bloom Demo Token", decimals: 6};
-const PREVIEW_ADVISORY =
-  "Bloom checked these bytes against a signed description of this contract. " +
-  "Bloom has not executed the call or verified what the contract does.";
+const PREVIEW_ASSURANCE =
+  "Interpreted using a trusted signed description. Contract behavior has not been verified.";
 const PREVIEW_ALLOWANCE_ADVISORY =
   "An allowance lets this spender move your tokens later, with no further Bloom approval. " +
   "It does not expire when this approval expires.";
@@ -1207,7 +1206,7 @@ function previewCall(action, amount, amountDisplay, magnitude, warnings) {
     function_signature: action === "transfer"
       ? "transfer(address to, uint256 amount)" : "approve(address spender, uint256 amount)",
     selector: action === "transfer" ? "0xa9059cbb" : "0x095ea7b3",
-    action, token: PREVIEW_TOKEN_IDENTITY,
+    action, token: PREVIEW_TOKEN_IDENTITY, assurance: PREVIEW_ASSURANCE,
     fields: [
       {label: action === "transfer" ? "To" : "Spender", format: "addressName",
        value: PREVIEW_SPENDER, raw: PREVIEW_SPENDER},
@@ -1217,7 +1216,7 @@ function previewCall(action, amount, amountDisplay, magnitude, warnings) {
       action, counterparty_role: role, counterparty: PREVIEW_SPENDER,
       amount, amount_display: amountDisplay, magnitude, token: PREVIEW_TOKEN_IDENTITY
     },
-    warnings: [PREVIEW_ADVISORY].concat(warnings)
+    warnings
   };
 }
 function previewApproval(payloads, clear) {
