@@ -682,7 +682,7 @@ process.stdout.write("browser-error-feedback-ok");
     );
     assert!(asset.contains("approve.onclick = () => run(session).catch(reportApprovalFailure)"));
     assert!(asset.contains("Cancellation failed. Please try again."));
-    assert!(asset.contains("Ceremony failed to load. Please refresh and try again."));
+    assert!(asset.contains("This link couldn’t be opened"));
 }
 
 #[test]
@@ -4967,7 +4967,11 @@ async fn remote_fragment_is_single_use_and_cookie_is_ceremony_scoped() {
         )
         .await
         .unwrap();
-    assert_eq!(root.status(), StatusCode::OK);
+    assert_eq!(root.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        root.headers()[header::LOCATION],
+        "https://bloom.directory/#"
+    );
     let asset = app
         .clone()
         .oneshot(
@@ -5005,7 +5009,7 @@ async fn remote_fragment_is_single_use_and_cookie_is_ceremony_scoped() {
         )
         .await
         .unwrap();
-    assert_eq!(matching_authority.status(), StatusCode::OK);
+    assert_eq!(matching_authority.status(), StatusCode::SEE_OTHER);
     let duplicate_host = app
         .clone()
         .oneshot(
@@ -5824,7 +5828,7 @@ async fn paired_loopback_servers_validate_serve_both_families_and_shutdown() {
             let mut response = String::new();
             stream.read_to_string(&mut response).await.unwrap();
             assert!(
-                response.starts_with("HTTP/1.1 200"),
+                response.starts_with("HTTP/1.1 303"),
                 "{address}: {response}"
             );
         }

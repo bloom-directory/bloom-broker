@@ -1300,6 +1300,7 @@ impl CeremonyBroker {
                 operation_id: destination.operation_id.clone(),
                 exact_terms_digest: flow.exact_terms_digest.clone(),
                 destination_hpke_public_key: body.destination_hpke_public_key,
+                expires_at_ms: DecimalU64::new(destination.expires_at_ms),
             })
             .map_err(signer_error_to_machine)?;
         if pairing.destination_surface != flow.destination_surface
@@ -4566,17 +4567,70 @@ fn open_audited_ceremony_store(
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS ceremony_sessions (
                     ceremony_id TEXT PRIMARY KEY,
-                    operation_id TEXT NOT NULL UNIQUE,
+                    operation_id TEXT NOT NULL,
                     session_jcs TEXT NOT NULL
                 );",
             )
             .map_err(storage)?;
         migrate_legacy_ceremonies(&mut connection, &legacy, journal)?;
+        let transaction = connection.transaction().map_err(storage)?;
+        if migrate_pairing_session_index(&transaction)? {
+            journal
+                .append_external_audit(
+                    &transaction,
+                    "storage.ceremony_pairing_index_migrated",
+                    &serde_json::json!({"primary_operation_uniqueness": true}),
+                )
+                .map_err(storage)?;
+        }
+        transaction.commit().map_err(storage)?;
         connection
             .pragma_update(None, "user_version", CEREMONY_STORAGE_VERSION)
             .map_err(storage)?;
     }
     Ok(database)
+}
+
+// A pairing has one primary destination session and an auxiliary source session
+// with the same logical operation. Preserve the primary uniqueness constraint
+// while permitting the source to be stored under its own ceremony ID.
+fn migrate_pairing_session_index(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<bool, ProtocolError> {
+    let old_unique: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_index_list('ceremony_sessions') AS idx
+         JOIN pragma_index_info(idx.name) AS col
+         WHERE idx.\"unique\" = 1 AND idx.partial = 0 AND col.name = 'operation_id')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if !old_unique {
+        transaction
+            .execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ceremony_primary_operation
+             ON ceremony_sessions(operation_id)
+             WHERE COALESCE(json_extract(session_jcs, '$.auxiliary'), 0) = 0;",
+            )
+            .map_err(storage)?;
+        return Ok(false);
+    }
+    transaction
+        .execute_batch(
+            "ALTER TABLE ceremony_sessions RENAME TO ceremony_sessions_before_pairing;
+         CREATE TABLE ceremony_sessions (
+             ceremony_id TEXT PRIMARY KEY,
+             operation_id TEXT NOT NULL,
+             session_jcs TEXT NOT NULL
+         );
+         INSERT INTO ceremony_sessions SELECT * FROM ceremony_sessions_before_pairing;
+         DROP TABLE ceremony_sessions_before_pairing;
+         CREATE UNIQUE INDEX ceremony_primary_operation ON ceremony_sessions(operation_id)
+             WHERE COALESCE(json_extract(session_jcs, '$.auxiliary'), 0) = 0;",
+        )
+        .map_err(storage)?;
+    Ok(true)
 }
 
 /// The consolidated Broker database owns ceremony session persistence. A
@@ -4924,6 +4978,49 @@ fn custody_review_manifest(
 #[cfg(test)]
 mod remote_storage_tests {
     use super::*;
+
+    #[test]
+    fn pairing_storage_migration_retains_primary_uniqueness_and_auxiliary_rows() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ceremony_sessions (
+                ceremony_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE,
+                session_jcs TEXT NOT NULL);
+             INSERT INTO ceremony_sessions VALUES ('destination', 'operation', '{}');",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(migrate_pairing_session_index(&transaction).unwrap());
+        transaction.commit().unwrap();
+        connection
+            .execute(
+                "INSERT INTO ceremony_sessions VALUES ('source', 'operation', ?1)",
+                [r#"{"auxiliary":true}"#],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO ceremony_sessions VALUES ('duplicate', 'operation', '{}')",
+                    [],
+                )
+                .is_err()
+        );
+        drop(connection);
+        let mut reopened = Connection::open(file.path()).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("SELECT COUNT(*) FROM ceremony_sessions", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let transaction = reopened.transaction().unwrap();
+        assert!(!migrate_pairing_session_index(&transaction).unwrap());
+        transaction.commit().unwrap();
+    }
 
     #[test]
     fn precommit_cookie_expires_even_while_browser_cookie_remains_present() {
