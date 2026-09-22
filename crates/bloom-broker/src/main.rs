@@ -158,6 +158,32 @@ impl RemoteTlsConfig {
     }
 }
 
+const RELAY_STATE_DIR_ENV: &str = "BLOOM_BROKER_RELAY_STATE_DIR";
+
+fn resolve_remote_tls_config(
+    configured: Option<RemoteTlsConfig>,
+    config_dir: &Path,
+    relay_state_dir: Option<PathBuf>,
+) -> Result<RemoteTlsConfig, std::io::Error> {
+    if let Some(configured) = configured {
+        return Ok(configured.resolve(config_dir));
+    }
+
+    let Some(relay_state_dir) = relay_state_dir else {
+        return Ok(RemoteTlsConfig::defaults(config_dir));
+    };
+    if !relay_state_dir.is_absolute() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{RELAY_STATE_DIR_ENV} must be an absolute path, got {}",
+                relay_state_dir.display()
+            ),
+        ));
+    }
+    Ok(RemoteTlsConfig::defaults(&relay_state_dir))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuditPublicKeyConfig {
@@ -669,11 +695,11 @@ async fn run_with_paths(
         let config_dir = config_path
             .parent()
             .unwrap_or(Path::new("/etc/bloom/broker"));
-        let remote_tls = config
-            .remote_tls
-            .clone()
-            .unwrap_or_else(|| RemoteTlsConfig::defaults(config_dir))
-            .resolve(config_dir);
+        let remote_tls = resolve_remote_tls_config(
+            config.remote_tls.clone(),
+            config_dir,
+            std::env::var_os(RELAY_STATE_DIR_ENV).map(PathBuf::from),
+        )?;
         let machine_journals = Arc::new(BrokerMachineJournals {
             journal: machine_journal,
             checkpoints: signer_checkpoints.clone(),
@@ -2026,6 +2052,101 @@ mod startup_failure_tests {
     use super::*;
     use bloom_broker_api::{ApprovalLifecycleState, BootEpoch, ReadinessState};
     use tracing_subscriber::prelude::*;
+
+    #[test]
+    fn relay_state_directory_selects_implicit_remote_tls_material() {
+        let config = resolve_remote_tls_config(
+            None,
+            Path::new("/etc/bloom/broker"),
+            Some(PathBuf::from("/var/lib/bloom/501/broker/relay")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.bundle_path,
+            Path::new("/var/lib/bloom/501/broker/relay/relay-tls-bundle.json")
+        );
+        assert_eq!(
+            config.control_ca_path,
+            Path::new("/var/lib/bloom/501/broker/relay/relay-control-ca.pem")
+        );
+        assert_eq!(
+            config.tunnel_credential_path,
+            Path::new("/var/lib/bloom/501/broker/relay/relay-tunnel.credential")
+        );
+        assert_eq!(
+            config.dns_credential_path.as_deref(),
+            Some(Path::new(
+                "/var/lib/bloom/501/broker/relay/relay-dns.credential"
+            ))
+        );
+    }
+
+    #[test]
+    fn relay_state_directory_must_be_absolute_for_implicit_material() {
+        let error = resolve_remote_tls_config(
+            None,
+            Path::new("/etc/bloom/broker"),
+            Some(PathBuf::from("relative/relay")),
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "BLOOM_BROKER_RELAY_STATE_DIR must be an absolute path, got relative/relay"
+        );
+    }
+
+    #[test]
+    fn explicit_remote_tls_paths_ignore_relay_state_directory() {
+        let configured = RemoteTlsConfig {
+            bundle_path: PathBuf::from("custom/bundle.json"),
+            gateway: Some("127.0.0.1:9443".parse().unwrap()),
+            control_ca_path: PathBuf::from("custom/control-ca.pem"),
+            tunnel_credential_path: PathBuf::from("custom/tunnel.credential"),
+            dns_credential_path: Some(PathBuf::from("custom/dns.credential")),
+        };
+        let config = resolve_remote_tls_config(
+            Some(configured),
+            Path::new("/etc/bloom/broker"),
+            Some(PathBuf::from("relative/ignored")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.bundle_path,
+            Path::new("/etc/bloom/broker/custom/bundle.json")
+        );
+        assert_eq!(config.gateway, Some("127.0.0.1:9443".parse().unwrap()));
+        assert_eq!(
+            config.control_ca_path,
+            Path::new("/etc/bloom/broker/custom/control-ca.pem")
+        );
+        assert_eq!(
+            config.tunnel_credential_path,
+            Path::new("/etc/bloom/broker/custom/tunnel.credential")
+        );
+        assert_eq!(
+            config.dns_credential_path.as_deref(),
+            Some(Path::new("/etc/bloom/broker/custom/dns.credential"))
+        );
+    }
+
+    #[test]
+    fn absent_relay_state_directory_keeps_config_directory_defaults() {
+        let config = resolve_remote_tls_config(None, Path::new("/etc/bloom/broker"), None).unwrap();
+
+        assert_eq!(
+            config.bundle_path,
+            Path::new("/etc/bloom/broker/relay-tls-bundle.json")
+        );
+        assert_eq!(
+            config.dns_credential_path.as_deref(),
+            Some(Path::new("/etc/bloom/broker/relay-dns.credential"))
+        );
+    }
 
     #[test]
     fn production_registry_contains_the_digest_pinned_solana_verifier() {

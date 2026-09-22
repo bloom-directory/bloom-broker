@@ -115,6 +115,7 @@ from the environment.
 | `BLOOM_EDGE_MANIFEST` | `/etc/bloom/edge-manifest.json` |
 | `BLOOM_AUTHORITY_EDGE_HISTORY` | `/etc/bloom/authority-edge-history.json` |
 | `BLOOM_BROKER_AUDIT_CHECKPOINT_DIR` | `/var/db/bloom/broker/audit-checkpoints` |
+| `BLOOM_BROKER_RELAY_STATE_DIR` | Broker configuration directory; when `remote_tls` is omitted, selects the directory for the relay TLS bundle, control CA, and tunnel/DNS credentials. Must be absolute. |
 | `BLOOM_SESSION_SOCKET` | `/var/run/bloom/session/session.sock` |
 | `BLOOM_BROKER_SOCKET`, `BLOOM_BROKER_CONTROL_SOCKET` | No default; both are required by the service profile. |
 | `BLOOM_BROKER_STARTUP_STATUS` | No default; when set, Broker writes a startup-conflict diagnostic there. |
