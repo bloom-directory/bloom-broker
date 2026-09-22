@@ -357,7 +357,7 @@ renderReview(session({{
 let rendered = allText(nodes.review);
 for (const expected of ["0x2222222222222222222222222222222222222222", "0.0003 ETH",
   "Base", "Maximum fee rate", "1.5 Gwei", "Priority fee cap",
-  "Exact envelope checked", "Contract execution effects are not verified",
+  "Only the transaction envelope was checked", "What the contract does has not been verified",
   "Data", "None — plain transfer"]) {{
   if (!rendered.includes(expected)) throw new Error(`missing ${{expected}}: ${{rendered}}`);
 }}
@@ -941,8 +941,10 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
         "href=\"/assets/style.css\"",
         "href=\"/assets/bloom-primary.svg\"",
         "src=\"/assets/bloom-primary.svg\"",
-        "Signed local review",
-        "Review before continuing",
+        // The shell carries structure and controls; every word of the review
+        // comes from the renderer, so no marketing copy is asserted here.
+        "id=\"panel-title\"",
+        "id=\"action-expiry\"",
         "id=\"status\"",
         "id=\"review\"",
         "id=\"approve\"",
@@ -959,12 +961,28 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
         !shell.contains("<style>"),
         "the ceremony shell must not contain CSP-blocked inline styles"
     );
+    // The desktop introduction column is gone: one review column, and no
+    // reassurance competing with the decision.
+    for removed in ["class=\"layout\"", "class=\"intro\"", "trust-item",
+                    "Nothing leaves this computer"] {
+        assert!(
+            !shell.contains(removed),
+            "the ceremony shell still carries {removed}"
+        );
+    }
 
     let stylesheet = include_str!("../src/ceremony_assets/style.css");
     for required in [
-        "--paper:#f4efe6",
-        ".layout{display:grid",
+        // One centred column with a documented measure, the stable component
+        // hooks a theme may target, and the narrow-width behaviour.
+        "--ceremony-width:960px",
+        "--ceremony-accent:",
+        ".ceremony-intent{",
+        ".ceremony-party{",
+        ".ceremony-warning{",
+        ".ceremony-actions{",
         "@media(max-width:560px)",
+        "@media(prefers-reduced-motion:reduce)",
     ] {
         assert!(
             stylesheet.contains(required),
@@ -5134,7 +5152,12 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         "text/css; charset=utf-8"
     );
     let stylesheet_body = stylesheet.into_body().collect().await.unwrap().to_bytes();
-    assert!(stylesheet_body.starts_with(b":root{"));
+    // The sheet is the compiled-in default, identified by the documented
+    // measure token rather than by whatever happens to be its first byte.
+    assert!(
+        String::from_utf8_lossy(&stylesheet_body).contains("--ceremony-width:960px"),
+        "the served stylesheet is not the default ceremony sheet"
+    );
     let logo = app
         .clone()
         .oneshot(
@@ -6829,7 +6852,7 @@ if (!view.primary.includes("0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512")) {{
 // The envelope's zero native value must not read as the thing being sent.
 if (view.primary.includes("  0 ETH")) throw new Error(`primary showed the native zero: ${{view.primary}}`);
 // The potential cost stays with the decision, labelled as a ceiling.
-if (!view.primary.includes("Maximum execution gas fee") ||
+if (!view.primary.includes("Maximum execution fee") ||
     !view.primary.includes("0.000198510751634520 ETH at most")) {{
   throw new Error(`the execution gas ceiling is not visible: ${{view.primary}}`);
 }}
@@ -7061,11 +7084,11 @@ repin.review_manifest.authority_diff = {{clear_signing: {{
   before: {{unlimited_allowance_allowed: false,
            verifier: {{verifier_digest: "77f7d9d939a496a16a9e5d517bb57c8e8eea397751dabdac5f923e0f2e91cc20"}}}},
   after: {{unlimited_allowance_allowed: false,
-          verifier: {{verifier_digest: "12d21da9f7eeaf72df3ddd51202a79366b020e2f7bbc3df30286d7d65ab79374"}}}}
+          verifier: {{verifier_digest: "e12e0cbb6873ab1c2ef89cb2e7e41333d0238b574a4629f36ba6b16f21b38beb"}}}}
 }}}};
 renderReview(repin);
 const pinned = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
-for (const phrase of ["Pinned verifier", "77f7d9d9", "12d21da9", "stops being able to describe"]) {{
+for (const phrase of ["Pinned verifier", "77f7d9d9", "e12e0cbb", "stops being able to describe"]) {{
   if (!pinned.includes(phrase)) throw new Error(`verifier re-pin omitted ${{phrase}}: ${{pinned}}`);
 }}
 "#

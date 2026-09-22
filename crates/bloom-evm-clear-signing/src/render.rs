@@ -60,6 +60,13 @@ pub struct TokenIdentity {
     pub decimals: u8,
 }
 
+/// What clear signing establishes, and what it does not. One sentence, the
+/// same for every call, stated once per review.
+pub fn standing_assurance() -> String {
+    "Interpreted using a trusted signed description. Contract behavior has not been verified."
+        .to_owned()
+}
+
 /// The decoded instruction, typed.
 ///
 /// The page states what the owner is deciding from this, never from a
@@ -107,6 +114,13 @@ pub struct ClearSignedCall {
     /// Present only for the canonical ERC-20 actions; see [`CallIntent`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent_summary: Option<CallIntent>,
+    /// What reading this call against a signed description does and does not
+    /// establish. Identical for every clear-signed call, so a review states
+    /// it once; it is not a property of this call and never a warning.
+    #[serde(default = "standing_assurance")]
+    pub assurance: String,
+    /// Risks specific to this call: upgradeability, and what an allowance
+    /// grants. Never the standing assurance.
     pub warnings: Vec<String>,
 }
 
@@ -260,10 +274,12 @@ pub fn review_call(
         )?);
     }
 
-    let mut warnings = vec![
-        "Bloom checked these bytes against a signed description of this contract. Bloom has not executed the call or verified what the contract does."
-            .to_owned(),
-    ];
+    // The standing assurance is not a warning about this call: it is the same
+    // sentence for every clear-signed call, and it was sitting at index 0 of
+    // `warnings` where the only way to tell it apart was to match its text.
+    // Typed, a page can state it once per review and keep `warnings` for the
+    // risks that actually differ between calls.
+    let mut warnings: Vec<String> = Vec::new();
     if entry.upgradeable {
         warnings.push(format!(
             "This contract can be upgraded. The publisher observed it at {}; its code may have changed since.",
@@ -284,6 +300,7 @@ pub fn review_call(
             fields,
             token: SelectedEntry::of(entry).token,
             intent_summary,
+            assurance: standing_assurance(),
             warnings,
         },
         used,

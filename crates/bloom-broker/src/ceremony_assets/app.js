@@ -233,30 +233,27 @@ function describeTransfer(manifest) {
   // available under "Technical details" without competing for attention.
   const appendEnvelopeFacts = (facts, technical, payload, prefix) => {
     const label = name => prefix ? `${prefix} ${name.toLowerCase()}` : name;
-    // When the call was read against a signed description, the envelope's own
-    // "to" and native "amount" describe the transport, not the instruction.
-    // "Amount 0 ETH" must never sit beside "Send 250 BDT".
+    // The heading states the amount and the identity rows state every
+    // address, so the envelope's own "to" and "amount" are the same facts a
+    // second time. They stay in technical details, where the exact bytes are.
+    // The one exception is native value riding along with a contract call:
+    // that is a second thing being moved and nothing else says so.
     const decoded = Boolean(payload.contract_call);
     const movesNative = !/^0(\.0+)?(\s|$)/.test(String(payload.value_display || "0"));
-    if (decoded) technical.push([label("Transaction to"), payload.destination, true]);
-    else facts.push([label(payload.destination ? "To" : "Action"),
+    technical.push([label(payload.destination ? "Transaction to" : "Action"),
       payload.destination || "Deploy contract (CREATE)", Boolean(payload.destination)]);
-    if (!decoded || movesNative) facts.push([label(decoded ? "Native value sent" : "Amount"), payload.value_display]);
+    if (decoded && movesNative) facts.push([label("Native value sent"), payload.value_display]);
     else technical.push([label("Native value sent"), payload.value_display]);
     facts.push([label("Network"), chainLabel(payload.chain)]);
     // A ceiling on execution gas, computed by Broker from the envelope's own
     // gas limit and price in the chain's authenticated units. It is a maximum
-    // for that charge, not an estimate and not a cap on every network charge,
-    // and it stays visible when the rates behind it collapse. When the chain's
-    // units are unknown the page says so: a missing cost must not read as no
-    // cost.
-    facts.push([label("Maximum execution gas fee"),
+    // for that charge, not an estimate and not a cap on every network charge.
+    // When the chain's units are unknown the page says so: a missing cost
+    // must not read as no cost.
+    facts.push([label("Maximum execution fee"),
       payload.maximum_execution_gas_fee_display
         ? `${payload.maximum_execution_gas_fee_display} at most`
         : "Cannot be shown — Bloom has no authenticated units for this chain"]);
-    // The one field that tells a transfer from a contract call: say plainly
-    // whether input data exists. Execution effects are unverified either way
-    // (see Bloom verification); size and commitment live in technical details.
     if (decoded) {
       technical.push([label("Data"), `${Number(payload.calldata_bytes).toLocaleString("en-US")} bytes`]);
     } else {
@@ -289,24 +286,21 @@ function describeTransfer(manifest) {
     // decoded argument is still listed even when the heading already named
     // the two that matter. The publisher's label names the argument; it does
     // not decide what the argument means.
-    const unlimited = call.intent_summary?.magnitude === "unlimited";
+    const summary = call.intent_summary;
+    // The heading states the amount and the identity rows state the
+    // counterparty, so repeating them in a table below is noise. Every other
+    // decoded argument is still listed: complete coverage is a property of
+    // the review, and only the two the typed intent already named are
+    // dropped — never a field whose meaning is unsupported.
     for (const field of call.fields || []) {
-      // The U256 maximum is not a human amount. For an unlimited allowance the
-      // consequence is the heading and the exact value stays recoverable under
-      // technical details, where nobody has to read it to decide.
-      const row = [label(field.label), field.value, field.format === "addressName"];
-      if (unlimited && field.format === "tokenAmount") technical.push(row);
-      else facts.push(row);
+      if (summary && field.format === "tokenAmount" && field.raw === summary.amount) continue;
+      if (summary && field.raw === summary.counterparty) continue;
+      facts.push([label(field.label), field.value, field.format === "addressName"]);
     }
-    if (call.token) {
-      facts.push([label("Token"), `${call.token.symbol} — ${call.token.name}`]);
-      facts.push([label("Token contract"), call.token.address, true]);
-    }
-    facts.push([label("Contract called"),
-      call.contract_name ? `${call.contract_name} (${call.contract})` : call.contract, true]);
     if (call.intent) facts.push([label("Publisher description"), call.intent]);
     technical.push([label("Function"), call.function_signature, true]);
     technical.push([label("Selector"), call.selector, true]);
+    if (summary) technical.push([label("Exact amount"), summary.amount, true]);
   };
   if (evmPayloads.length) {
     const facts = [];
@@ -324,19 +318,14 @@ function describeTransfer(manifest) {
     for (const payload of calls) {
       for (const warning of payload.contract_call.warnings || []) warnings.push(warning);
     }
+    const interpretation = [];
     if (clear) {
-      facts.push(["Description source",
-        `Catalog ${clear.catalog_id}, sequence ${clear.catalog_sequence} — a trusted description, not proof of execution.`]);
-      technical.push(["Description commitment", clear.catalog_digest, true]);
       for (const entry of clear.entries || []) {
         if (!entry.upgradeable) continue;
         warnings.push(`${entry.contract_address} can be upgraded. The publisher observed it at ` +
           `${formatObserved(entry.observed_at_ms)}; its code may have changed since.`);
       }
     }
-    facts.push(["Bloom verification", clear
-      ? "Exact envelope checked, and each contract call read against a signed description. Bloom did not execute the calls."
-      : "Exact envelope checked — destination and value come from the transaction bytes. Contract execution effects are not verified."]);
     const first = evmPayloads[0];
     const network = chainLabel(first.chain);
     // One approval covers the whole batch, so a batch never collapses into one
@@ -380,21 +369,57 @@ function describeTransfer(manifest) {
           : {action: "deploy", eyebrow: "Contract creation", heading: "Deploy a contract",
              detail: "This creates a new contract from the initcode below. Bloom does not verify " +
                "what that code does.", relation: "creates"};
-    const counterparty = first.contract_call?.intent_summary?.counterparty ||
+    const summary = first.contract_call?.intent_summary;
+    const counterparty = summary?.counterparty ||
       (first.contract_call ? null : first.destination);
-    const flow = {
-      network,
-      source: {role: "wallet", label: "From this wallet", value: first.sender},
-      relation: intent.relation,
-      target: counterparty
-        ? {role: intent.action === "allowance" ? "spender"
-             : intent.action === "transfer" || intent.action === "send" ? "recipient" : "contract",
-           label: intent.action === "allowance" ? "Spender"
-             : intent.action === "transfer" || intent.action === "send" ? "Recipient"
-             : "Contract", value: counterparty}
-        : null
-    };
-    return {intent, flow, facts, technical, warnings, willVerify: true};
+    const parties = [{role: "source", label: "From this wallet", value: first.sender}];
+    if (counterparty) {
+      parties.push({
+        role: intent.action === "allowance" ? "spender"
+          : intent.action === "transfer" || intent.action === "send" ? "recipient" : "contract",
+        label: intent.action === "allowance" ? "Spender — gains permission to move your tokens"
+          : intent.action === "transfer" || intent.action === "send" ? "Recipient — receives the tokens"
+          : "Contract being called",
+        value: counterparty
+      });
+    }
+    // For the canonical ERC-20 actions the token is the contract being
+    // called, and showing the same address twice under two headings invites
+    // the reader to check it twice. One row, labelled for both. Different
+    // addresses keep both roles, whatever their names say.
+    if (summary?.token) {
+      const sameAddress = summary.token.address.toLowerCase() ===
+        String(first.contract_call.contract).toLowerCase();
+      parties.push({
+        role: "token",
+        label: sameAddress ? "Token contract — the contract being called"
+          : "Token contract",
+        name: `${summary.token.symbol} — ${summary.token.name}`,
+        value: summary.token.address
+      });
+      if (!sameAddress) {
+        parties.push({role: "contract", label: "Contract being called",
+          name: first.contract_call.contract_name || null,
+          value: first.contract_call.contract});
+      }
+    } else if (first.contract_call) {
+      parties.push({role: "contract", label: "Contract being called",
+        name: first.contract_call.contract_name || null,
+        value: first.contract_call.contract});
+    }
+    // One sentence, from the review rather than from matching warning text.
+    const assurance = first.contract_call?.assurance ||
+      (clear ? "Interpreted using a trusted signed description. Contract behavior has not been verified."
+             : "Only the transaction envelope was checked: the destination, the value and the exact " +
+               "bytes below. What the contract does has not been verified.");
+    if (clear) {
+      interpretation.push(["Catalog", `${clear.catalog_id}, sequence ${clear.catalog_sequence}`]);
+      interpretation.push(["Assurance class", clear.assurance]);
+      interpretation.push(["Verifier", `${clear.verifier_id} (${shortDigest(clear.verifier_digest)})`]);
+      technical.push(["Catalog commitment", clear.catalog_digest, true]);
+    }
+    return {intent, parties, assurance, interpretation, facts, technical, warnings,
+            willVerify: true};
   }
   if (!claim) return null;
   const debits = claim.declared_debits || [];
@@ -626,7 +651,7 @@ function renderReview(session) {
   const contribution = session.signer_contribution || {};
   const wallet = contribution.wallet_id || manifest?.wallet_name || manifest?.wallet_id || "";
   panelKicker.textContent = "Step 1 of 2 · Check";
-  panelTitle.textContent = "What will happen";
+  panelTitle.textContent = "Requested action";
   approve.textContent = meta.button;
   const pageTitle = document.getElementById("page-title");
   const pageLede = document.getElementById("page-lede");
@@ -704,7 +729,9 @@ function renderReview(session) {
     fact("Scope", canonicalJson(contribution.petal_key_scope), true);
   }
   const expiry = el("span", {class: "expiry"});
-  facts.append(el("dt", {}, "Expires"), el("dd", {}, expiry));
+  const expiryHost = document.getElementById("action-expiry");
+  if (expiryHost) expiryHost.replaceChildren(el("span", {}, "Expires "), expiry);
+  else facts.append(el("dt", {}, "Expires"), el("dd", {}, expiry));
   if (kind === "sealed_approval") {
     for (const item of session.review_manifest?.attributed_advisory_items || []) warns.push(item);
     // Proof verification occurs during authorization, after this review.
@@ -716,48 +743,74 @@ function renderReview(session) {
   // Reading order: what this is, who it moves value or permission to, the
   // consequences, then the supporting facts. Byte-level identity is the last
   // thing on the page and never the first.
-  const partyCard = party => el("div", {class: "ceremony-party", "data-role": party.role},
-    el("p", {class: "ceremony-party-label"}, party.label),
-    el("p", {class: "ceremony-party-address"}, el("code", {}, party.value)));
+  const partyRow = party => {
+    const row = el("div", {class: "ceremony-party", "data-role": party.role},
+      el("p", {class: "ceremony-party-label"}, party.label));
+    if (party.name) row.append(el("p", {class: "ceremony-party-name"}, party.name));
+    const address = el("code", {}, party.value);
+    const copy = el("button", {type: "button", class: "ceremony-copy"}, "Copy");
+    // Copies the exact address that is displayed, never a shortened form.
+    copy.onclick = async () => {
+      try { await navigator.clipboard.writeText(party.value); copy.textContent = "Copied"; }
+      catch (_) { copy.textContent = "Select it instead"; }
+    };
+    row.append(el("p", {class: "ceremony-party-address"}, address, copy));
+    return row;
+  };
   const intentBlock = intent => {
     const block = el("section", {class: "ceremony-intent", "data-action": intent.action});
     if (intent.magnitude) block.setAttribute("data-magnitude", intent.magnitude);
     block.append(
       el("p", {class: "ceremony-eyebrow"}, intent.eyebrow),
-      el("h3", {class: "ceremony-heading"}, intent.heading),
+      el("h2", {class: "ceremony-heading"}, intent.heading),
       el("p", {class: "ceremony-detail"}, intent.detail));
     return block;
   };
   const parts = [];
   if (transfer?.intent) {
+    panelTitle.textContent = transfer.intent.heading;
     parts.push(intentBlock(transfer.intent));
     for (const card of transfer.intent.cards || []) {
       const wrapper = el("section", {class: "ceremony-card"},
         el("p", {class: "ceremony-card-position"}, `Transaction ${card.position}`),
         intentBlock(card.intent));
       if (card.counterparty) {
-        wrapper.append(partyCard({role: "counterparty", label: "To", value: card.counterparty}));
+        wrapper.append(el("div", {class: "ceremony-identity"},
+          partyRow({role: "counterparty", label: "To", value: card.counterparty})));
       }
       parts.push(wrapper);
     }
-    if (transfer.flow) {
-      const flow = el("div", {class: "ceremony-flow"});
-      flow.append(partyCard(transfer.flow.source));
-      flow.append(el("p", {class: "ceremony-relation"}, transfer.flow.relation));
-      if (transfer.flow.target) flow.append(partyCard(transfer.flow.target));
-      else flow.append(el("p", {class: "ceremony-party ceremony-party-none"}, "No destination — this creates a contract"));
-      parts.push(flow);
+    if (transfer.parties?.length) {
+      parts.push(el("div", {class: "ceremony-identity"},
+        ...transfer.parties.map(partyRow)));
     }
   } else {
     parts.push(el("p", {class: "summary", html: summaryHtml}));
   }
+  if (transfer?.assurance) {
+    parts.push(el("p", {class: "ceremony-assurance"}, transfer.assurance));
+  }
   for (const warning of transfer?.warnings || []) {
-    parts.push(el("p", {class: "ceremony-warning warn"}, warning));
+    const node = el("p", {class: "ceremony-warning"}, warning);
+    if (/^UNLIMITED ALLOWANCE/.test(warning)) node.setAttribute("data-severity", "danger");
+    parts.push(node);
   }
   parts.push(facts);
   if (meta.warn) warns.unshift(meta.warn);
   for (const w of warns) parts.push(el("p", {class: "warn"}, w));
 
+  if (transfer?.interpretation?.length) {
+    const rows = el("dl", {class: "facts"});
+    for (const [label, value, mono] of transfer.interpretation) {
+      rows.append(el("dt", {}, label), el("dd", {}, mono ? el("code", {}, value) : value));
+    }
+    parts.push(el("details", {class: "ceremony-details"},
+      el("summary", {}, "How this was interpreted"),
+      el("p", {}, "The catalog publisher is trusted to describe this deployment accurately, and a " +
+        "signature authenticates that claim. It is not proof of what the contract does, and Bloom " +
+        "did not execute anything."),
+      rows));
+  }
   if (transfer?.technical?.length) {
     const technical = el("dl", {class: "facts technical"});
     for (const [label, value, mono] of transfer.technical) {
@@ -1139,7 +1192,7 @@ function previewPayload(extra) {
 function previewClearSigning() {
   return {
     assurance: "trusted_description", verifier_id: "evm-clear-signing-v1",
-    verifier_digest: "12d21da9f7eeaf72df3ddd51202a79366b020e2f7bbc3df30286d7d65ab79374",
+    verifier_digest: "e12e0cbb6873ab1c2ef89cb2e7e41333d0238b574a4629f36ba6b16f21b38beb",
     catalog_id: "bloom-demo-tokens", catalog_sequence: "5",
     catalog_digest: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
     catalog_expires_at_ms: String(Date.now() + 86400000),
@@ -1236,7 +1289,8 @@ const PREVIEWS = {
   expiring: () => {
     const session = PREVIEWS.transfer();
     session.expires_at_ms = Date.now() + 25 * 1000;
-    session.preview_status = "Expires in under a minute";
+    session.preview_status = "Preview of a ceremony close to expiry";
+    session.preview_expiry = "Simulated state: expires in under a minute. Previews do not count down.";
     return session;
   },
   cancelled: () => {
@@ -1281,6 +1335,10 @@ function renderPreview(name) {
   }
   approve.hidden = true;
   cancel.hidden = true;
+  // No live countdown on a page that cannot be approved. A fixture whose
+  // subject is expiry states its simulated state in words instead.
+  const expiryHost = document.getElementById("action-expiry");
+  if (expiryHost) expiryHost.textContent = session.preview_expiry || "";
   statusNode.textContent = session.preview_status || "Preview";
 }
 
