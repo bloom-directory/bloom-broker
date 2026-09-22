@@ -6843,6 +6843,12 @@ function show(name) {{
 let view = show("transfer");
 if (view.heading !== "Send 250 BDT") throw new Error(`transfer heading: ${{view.heading}}`);
 if (view.primary.includes(view.heading)) throw new Error("action title was printed twice");
+if (!nodes["page-title"].textContent.includes("Chain ID 31337")) {{
+  throw new Error("the exact EVM chain is missing from the primary context");
+}}
+if (!view.primary.includes("BDT — Bloom Demo Token")) {{
+  throw new Error("the token's full name is missing from the primary review");
+}}
 if (view.action !== "transfer") throw new Error(`transfer action: ${{view.action}}`);
 if (!view.roles.includes("recipient")) throw new Error(`transfer roles: ${{view.roles}}`);
 if (view.roles.includes("spender")) throw new Error("a transfer must not name a spender");
@@ -7089,7 +7095,8 @@ function allText(node) {{
 renderReview(previewSession("policy-unlimited"));
 const rendered = allText({{textContent: "", innerHTML: "", children: [nodes["panel-title"], ...nodes.review.children]}});
 for (const phrase of ["Allow requests for unlimited token spending", "blocked → allowed",
-                      "does not move tokens or grant a spender an allowance", "Each request will still need your approval"]) {{
+                      "does not move tokens or grant a spender an allowance", "Each request will still need your approval",
+                      "applies to all supported tokens", "will name its token and spender"]) {{
   if (!rendered.includes(phrase)) throw new Error(`policy page omitted ${{phrase}}: ${{rendered}}`);
 }}
 if (nodes.approve.textContent !== "Approve policy change") {{

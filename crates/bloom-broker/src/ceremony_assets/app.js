@@ -416,7 +416,9 @@ function describeTransfer(manifest) {
       interpretation.push(["Verifier", `${clear.verifier_id} (${shortDigest(clear.verifier_digest)})`]);
       technical.push(["Catalog commitment", clear.catalog_digest, true]);
     }
-    return {intent, parties, assurance, interpretation, facts, technical, warnings,
+    const networkIdentity = evmPayloads.length === 1
+      ? `EVM · ${network} · Chain ID ${first.chain_id}` : null;
+    return {intent, parties, assurance, interpretation, facts, technical, warnings, networkIdentity,
             willVerify: true};
   }
   if (!claim) return null;
@@ -584,7 +586,8 @@ function describePolicy(manifest) {
   const CLEAR_SIGNING_SETTINGS = [
     ["unlimited_allowance_allowed", "Unlimited-allowance requests",
      "A request with no spending cap is refused outright.",
-     "Each request will still need your approval. This setting does not move tokens or grant a spender an allowance."],
+     "This wallet setting applies to all supported tokens. Each request will still need your approval " +
+     "and will name its token and spender. This setting does not move tokens or grant a spender an allowance."],
     ["opaque_exact_allowed", "Requests Bloom cannot describe",
      "A call with no signed description is refused.",
      "A call with no signed description can be approved as exact bytes, carrying the " +
@@ -714,9 +717,8 @@ function renderReview(session) {
   }
   const contextualFacts = transfer?.intent ? new Set(["Network"]) : new Set();
   if (transfer?.intent && pageTitle) {
-    const network = transfer.facts.find(([label]) => label === "Network")?.[1];
-    pageTitle.textContent = [kind === "policy_update" ? "Wallet settings" : null,
-      walletName, network].filter(Boolean).join(" · ");
+    const network = transfer.networkIdentity || transfer.facts.find(([label]) => label === "Network")?.[1];
+    pageTitle.textContent = network || ["Wallet settings", walletName].filter(Boolean).join(" · ");
   } else fact("Wallet", walletName);
   if (kind !== "sealed_approval" &&
       session.signer_contribution?.wallet_seed_profile === "bip39-multicurve-v1") {
@@ -776,7 +778,19 @@ function renderReview(session) {
     panelTitle.textContent = transfer.intent.heading;
     panelTitle.setAttribute("data-action", transfer.intent.action);
     panelTitle.setAttribute("data-magnitude", transfer.intent.magnitude || "");
+    const token = transfer.parties?.find(party => party.role === "token");
+    if (token && transfer.intent.action !== "batch") {
+      // The asset is identified by its contract on this chain. A ticker or
+      // an icon alone must never stand in for that identity. This placeholder
+      // is deliberately not a fetched logo or a claim of token verification.
+      const asset = partyRow({...token, label: "Token contract"});
+      asset.className = "ceremony-party ceremony-asset-identity";
+      const icon = el("span", {class: "ceremony-token-icon", "aria-hidden": "true"},
+        (token.name || "?").split(" — ")[0].slice(0, 4));
+      parts.push(el("section", {class: "ceremony-asset", "aria-label": "Token being transferred or approved"}, icon, asset));
+    }
     if (transfer.intent.detail) parts.push(intentBlock(transfer.intent));
+    const warningParts = [];
     if (transfer.warnings?.length) {
       const warningGroup = el("aside", {class: "ceremony-warning", "aria-label": "Risks and consequences"});
       if (transfer.intent.magnitude === "unlimited") {
@@ -787,7 +801,7 @@ function renderReview(session) {
       if (transfer.intent.magnitude === "unlimited") {
         warningGroup.append(el("p", {}, "You can later request a lower allowance or set it to zero."));
       }
-      parts.push(warningGroup);
+      warningParts.push(warningGroup);
     }
     for (const card of transfer.intent.cards || []) {
       const wrapper = el("section", {class: "ceremony-card"},
@@ -800,10 +814,22 @@ function renderReview(session) {
       parts.push(wrapper);
     }
     if (transfer.parties?.length) {
-      parts.push(el("div", {class: "ceremony-identity"},
-        ...[...transfer.parties].sort((a, b) =>
-          Number(b.role === "spender") - Number(a.role === "spender")).map(partyRow)));
+      const isTransfer = ["transfer", "send"].includes(transfer.intent.action);
+      const parties = [...transfer.parties].filter(party =>
+        party !== token || transfer.intent.action === "batch").sort((a, b) =>
+          Number(b.role === "spender") - Number(a.role === "spender"));
+      const flow = el("div", {class: `ceremony-identity ${isTransfer ? "ceremony-transfer-path" : "ceremony-permission"}`});
+      for (const party of parties) {
+        if (isTransfer && party.role === "recipient") {
+          flow.append(el("div", {class: "ceremony-flow-arrow", "aria-hidden": "true"}, "↓"));
+        }
+        flow.append(partyRow(party.role === "source"
+          ? {...party, label: "From your wallet", name: walletName}
+          : party));
+      }
+      parts.push(flow);
     }
+    parts.push(...warningParts);
   } else {
     parts.push(el("p", {class: "summary", html: summaryHtml}));
   }
