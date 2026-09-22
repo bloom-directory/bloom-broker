@@ -146,6 +146,7 @@ function startExpiry(session, node) {
     session.signer_contribution?.expires_at_ms ||
     session.review_manifest?.expires_at_ms);
   const deadline = document.getElementById("review-deadline");
+  const counting = !session.is_preview || session.preview_countdown;
   if (!Number.isFinite(new Date(expiresAt).getTime()) || !node) {
     if (deadline) deadline.textContent = "";
     return;
@@ -153,8 +154,10 @@ function startExpiry(session, node) {
   const absolute = new Date(expiresAt).toLocaleString(undefined, {
     month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit", timeZoneName: "short"
   });
+  const countdown = el("span", {class: "review-countdown"});
   if (deadline) {
-    deadline.textContent = `${session.is_preview ? "Example deadline" : "Approve by"}: ${absolute}`;
+    deadline.replaceChildren(el("span", {}, `${session.is_preview ? "Example deadline" : "Approve by"}: ${absolute}`));
+    if (counting) deadline.append(countdown);
     deadline.setAttribute("title", new Date(expiresAt).toISOString());
   }
   const tick = () => {
@@ -162,14 +165,19 @@ function startExpiry(session, node) {
     node.textContent = left <= 0 ? "Expired — ask Bloom to start this again"
       : `Time left: ${fmtRemaining(left)}`;
     node.className = left <= 0 ? "expired" : (left < 60000 ? "expiry soon" : "expiry");
+    countdown.textContent = left <= 0
+      ? (session.is_preview ? "Demo expired — reload to replay" : "Expired")
+      : `${session.is_preview ? "Demo: " : ""}${fmtRemaining(left)} left`;
+    countdown.className = `review-countdown ${left <= 0 ? "expired" : left < 60000 ? "expiry soon" : "expiry"}`;
     if (left <= 0) {
       approve.disabled = true;
-      statusNode.textContent = "This ceremony has expired. Nothing was changed.";
+      statusNode.textContent = session.is_preview ? "Preview only — nothing can be approved."
+        : "This ceremony has expired. Nothing was changed.";
       clearInterval(expiryTimer);
     }
   };
   tick();
-  if (!session.is_preview) expiryTimer = setInterval(tick, 1000);
+  if (counting && expiresAt > Date.now()) expiryTimer = setInterval(tick, 1000);
 }
 
 function chainLabel(chain, ctx) {
@@ -882,14 +890,7 @@ function renderReview(session) {
       target: "_blank", rel: "noopener noreferrer", referrerpolicy: "no-referrer",
       title: `View on ${explorer.name} (opens a new tab)`,
       "aria-label": `${party.label}: ${party.value}. View on ${explorer.name} (opens a new tab)`}, address) : address;
-    const copy = el("button", {type: "button", class: "ceremony-copy",
-      "aria-label": `Copy ${party.label.toLowerCase()} address`}, "Copy");
-    // Copies the exact address that is displayed, never a shortened form.
-    copy.onclick = async () => {
-      try { await navigator.clipboard.writeText(party.value); copy.textContent = "Copied"; }
-      catch (_) { copy.textContent = "Select it instead"; }
-    };
-    row.append(el("p", {class: "ceremony-party-address"}, identity, copy));
+    row.append(el("p", {class: "ceremony-party-address"}, identity));
     return row;
   };
   const intentBlock = (intent, nested = false) => {
@@ -1554,8 +1555,8 @@ const PREVIEWS = {
   expiring: () => {
     const session = PREVIEWS.transfer();
     session.expires_at_ms = Date.now() + 25 * 1000;
-    session.preview_status = "Preview of a ceremony close to expiry";
-    session.preview_expiry = "Simulated state: expires in under a minute. Previews do not count down.";
+    session.preview_status = "Demo countdown — no approval is possible";
+    session.preview_countdown = true;
     return session;
   },
   cancelled: () => {
@@ -1577,6 +1578,8 @@ function previewSession(name) {
   return {...fixture(), is_preview: true};
 }
 function renderPreview(name) {
+  clearInterval(expiryTimer);
+  document.getElementById("review-deadline")?.replaceChildren();
   const banner = document.getElementById("preview-banner");
   if (banner) {
     banner.hidden = false;
@@ -1600,14 +1603,13 @@ function renderPreview(name) {
   }
   approve.hidden = true;
   cancel.hidden = true;
-  // No live countdown on a page that cannot be approved. A fixture whose
-  // subject is expiry states its simulated state in words instead.
+  // The expiry demo counts down in the header, without approval controls.
   const expiryHost = document.getElementById("action-expiry");
-  if (expiryHost) expiryHost.textContent = session.preview_expiry || "";
+  if (expiryHost) expiryHost.replaceChildren();
   statusNode.textContent = session.preview_status || "";
   if (pageLede) pageLede.textContent = "Review preview";
   const actions = document.querySelector(".ceremony-actions");
-  if (actions) actions.hidden = !session.preview_expiry;
+  if (actions) actions.hidden = true;
 }
 
 async function load() {

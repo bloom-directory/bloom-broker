@@ -69,7 +69,8 @@ body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-f
 .panel-title{margin:0;font:400 var(--ceremony-heading-size)/1.2 var(--ceremony-font-display);letter-spacing:-.025em;overflow-wrap:anywhere}
 #status{margin:var(--ceremony-space-1) 0 0;color:var(--ceremony-muted);font-size:14px}
 #status:empty{display:none}
-.review-deadline{margin:8px 0 0;color:var(--ceremony-muted);font-size:13px}
+.review-deadline{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 16px;margin:8px 0 0;color:var(--ceremony-muted);font-size:13px}
+.review-countdown{font-size:15px;font-weight:600;font-variant-numeric:tabular-nums;color:var(--ceremony-text)}
 .review-deadline:empty{display:none}
 #review{padding:0 var(--ceremony-padding) var(--ceremony-padding)}
 #review>*+*{margin-top:var(--ceremony-space-3)}
@@ -121,8 +122,6 @@ body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-f
 .ceremony-transfer-path .ceremony-party-label,.ceremony-permission .ceremony-party-label{grid-column:1;grid-row:1 / span 2}
 .ceremony-transfer-path .ceremony-party-name,.ceremony-permission .ceremony-party-name{grid-column:2}
 .ceremony-flow-arrow{margin-left:calc(var(--ceremony-label-width) + var(--ceremony-space-2));color:var(--ceremony-accent);font-size:24px;line-height:1}
-.ceremony-copy{flex:0 0 72px;width:72px;min-height:32px;padding:4px 12px;border:1px solid var(--ceremony-border);border-radius:6px;background:transparent;color:var(--ceremony-muted);font:500 13px var(--ceremony-font);box-shadow:none}
-.ceremony-copy:hover:not(:disabled){background:var(--ceremony-bg);color:var(--ceremony-text);transform:none}
 
 /* One sentence. The rest is a disclosure. */
 .ceremony-assurance{max-width:65ch;margin:0;color:var(--ceremony-muted);font-size:14px}
@@ -189,7 +188,6 @@ textarea{resize:vertical}
   .ceremony-party-address code{flex:1 1 0}
   .ceremony-address-link{flex:1 1 0}
   .ceremony-balance-change{text-align:left}
-  .ceremony-copy{padding:4px 8px}
   .ceremony-asset{grid-template-columns:36px minmax(0,1fr);gap:var(--ceremony-space-1);padding:12px}
   .ceremony-token-icon{width:36px;height:36px}
   .ceremony-token-icon svg{width:26px;height:26px}
