@@ -104,3 +104,12 @@ details.signed pre{max-height:26vh}
 :focus-visible{outline:3px solid var(--ceremony-accent);outline-offset:2px}
 /* Previews are unmistakable and carry no controls. */
 .preview-banner{margin:0;padding:12px 20px;border-bottom:1px solid var(--ceremony-border);background:repeating-linear-gradient(135deg,rgba(138,42,58,.10),rgba(138,42,58,.10) 10px,transparent 10px,transparent 20px);color:var(--ceremony-warning);font-family:var(--ceremony-font-mono);font-size:12px}
+/* The fact list's label column is sized to its content, which a long
+   batch-prefixed label ("Transaction 2 payload commitment") can push past a
+   narrow viewport. Below the stacking width the label sits above its value
+   instead, so nothing depends on the widest label fitting. */
+@media(max-width:560px){
+  .facts{grid-template-columns:1fr;gap:3px 0}
+  .facts dt{padding-top:10px}
+  .facts dd{margin-bottom:2px}
+}
