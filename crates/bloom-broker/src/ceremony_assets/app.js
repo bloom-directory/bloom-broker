@@ -371,10 +371,6 @@ function describeTransfer(manifest) {
     // for that charge, not an estimate and not a cap on every network charge.
     // When the chain's units are unknown the page says so: a missing cost
     // must not read as no cost.
-    facts.push([label("Execution gas cap"),
-      payload.maximum_execution_gas_fee_display
-        ? `${compactFeeCap(payload.maximum_execution_gas_fee_display)} at most`
-        : "Cannot be shown — Bloom has no authenticated units for this chain"]);
     if (payload.maximum_execution_gas_fee_display) technical.push([
       label("Exact execution gas cap"), payload.maximum_execution_gas_fee_display]);
     if (decoded) {
@@ -937,7 +933,7 @@ function renderReview(session) {
       const icon = el("span", {class: "ceremony-token-icon", "aria-hidden": "true"}, reviewIcon("token"));
       const summary = transfer.assetSummary;
       const sending = summary?.action === "transfer";
-      if (sending) panelTitle.textContent = "Review transfer";
+      if (sending) panelTitle.textContent = "Requested transfer";
       const amount = summary && !sending ? el("div", {class: "ceremony-asset-amount permission"},
         el("span", {class: "ceremony-amount-label"}, sending ? "You send · requested" : "Spending limit"),
         el("strong", {}, sending ? `−${summary.amount_display}`
@@ -1004,8 +1000,6 @@ function renderReview(session) {
           ...(party.role === "source" ? {label: isTransfer ? "Sender" : "Your wallet", name: walletName} : {})}));
       }
       parts.push(flow);
-      if (movement) parts.push(el("p", {class: "ceremony-movements-note"},
-        "Requested movements, not simulated balances."));
     }
     parts.push(...warningParts);
     for (const [index, payload] of (transfer.payloads || []).entries()) {
@@ -1023,8 +1017,15 @@ function renderReview(session) {
     parts.push(el("p", {class: "summary", html: summaryHtml}));
   }
   parts.push(facts);
-  if (transfer?.assurance) {
-    parts.push(el("p", {class: "ceremony-assurance"}, transfer.assurance));
+  for (const [index, payload] of (transfer?.payloads || []).entries()) {
+    const exact = payload.maximum_execution_gas_fee_display;
+    const label = transfer.payloads.length > 1 ? `Transaction ${index + 1} gas fee cap` : "Gas fee cap";
+    const amount = exact ? el("span", {class: "ceremony-fee-amount"},
+      reviewIcon(exact.endsWith(" ETH") ? "ethereum" : "token"),
+      el("span", {}, `${compactFeeCap(exact)} at most`))
+      : el("span", {}, "Cannot be shown — Bloom has no authenticated units for this chain");
+    parts.push(el("div", {class: "ceremony-fee", "aria-label": "Execution gas only; other network charges may apply"},
+      el("span", {class: "ceremony-fee-label"}, label), amount));
   }
   if (meta.warn) warns.unshift(meta.warn);
   for (const w of warns) parts.push(el("p", {class: "warn"}, w));
@@ -1068,7 +1069,9 @@ function renderReview(session) {
   const disclosures = parts.filter(node => node.tagName === "DETAILS");
   reviewNode.replaceChildren(...parts.filter(node => node.tagName !== "DETAILS"),
     el("details", {class: "ceremony-details ceremony-evidence"},
-      el("summary", {}, "Verification and technical details"), ...disclosures));
+      el("summary", {}, "Verification and technical details"),
+      transfer?.assurance ? el("p", {class: "ceremony-assurance"}, transfer.assurance) : null,
+      ...disclosures));
   startExpiry(session, expiry);
 }
 

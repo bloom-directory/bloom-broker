@@ -93,7 +93,10 @@ body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-f
 .ceremony-balance-change.incoming{color:var(--ceremony-success)}
 .ceremony-transfer-path .ceremony-party{grid-template-columns:minmax(0,1fr) auto}
 .ceremony-transfer-path .ceremony-party-address{grid-column:1 / -1;grid-row:3}
-.ceremony-movements-note{margin:0;font-size:13px;color:var(--ceremony-muted)}
+.ceremony-fee{display:flex;align-items:baseline;justify-content:space-between;gap:8px 16px;flex-wrap:wrap;font-size:14px}
+.ceremony-fee-label{color:var(--ceremony-muted)}
+.ceremony-fee-amount{display:inline-flex;align-items:center;gap:5px;color:var(--ceremony-danger);font-variant-numeric:tabular-nums}
+.ceremony-fee-amount svg{width:14px;height:14px;flex:none}
 .ceremony-party-address{display:flex;align-items:center;gap:var(--ceremony-space-2);margin:0;min-width:0}
 .ceremony-address-link{flex:1 1 auto;min-width:0;color:var(--ceremony-accent-deep);text-decoration:underline;text-decoration-color:var(--ceremony-border);text-underline-offset:4px;overflow-wrap:anywhere}
 .ceremony-address-link:hover{text-decoration-color:currentColor}
@@ -148,6 +151,7 @@ body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-f
 
 /* Sentence-case labels; no column of letter-spaced uppercase. */
 .facts{display:grid;grid-template-columns:var(--ceremony-label-width) minmax(0,1fr);gap:var(--ceremony-space-1) var(--ceremony-space-2);margin:0}
+.facts:empty{display:none}
 .facts dt{color:var(--ceremony-muted)}
 .facts dd{margin:0;overflow-wrap:anywhere}
 .facts code{font:var(--ceremony-address-size)/1.5 var(--ceremony-font-mono)}

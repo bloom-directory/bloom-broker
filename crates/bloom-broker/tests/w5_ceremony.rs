@@ -6846,13 +6846,13 @@ function show(name) {{
 // A transfer names the amount and the recipient, and the recipient is a
 // recipient — never the contract, never a generic "To".
 let view = show("transfer");
-if (view.heading !== "Review transfer") throw new Error(`transfer heading: ${{view.heading}}`);
+if (view.heading !== "Requested transfer") throw new Error(`transfer heading: ${{view.heading}}`);
 if (view.primary.includes(view.heading)) throw new Error("action title was printed twice");
 if (!view.primary.includes("−250 BDT") || !view.primary.includes("+250 BDT")) {{
   throw new Error("requested sender/recipient movements are missing");
 }}
-if (!view.primary.includes("not simulated balances")) {{
-  throw new Error("requested movements must not imply observed balances");
+if (!view.technical.includes("Contract behavior has not been verified")) {{
+  throw new Error("the interpretation limitation disappeared from details");
 }}
 if (!allText(nodes["page-title"]).includes("Chain ID 31337")) {{
   throw new Error("the exact EVM chain is missing from the primary context");
@@ -6874,7 +6874,7 @@ if (!view.primary.includes("0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512")) {{
 // The envelope's zero native value must not read as the thing being sent.
 if (view.primary.includes("  0 ETH")) throw new Error(`primary showed the native zero: ${{view.primary}}`);
 // The potential cost stays with the decision, labelled as a ceiling.
-if (!view.primary.includes("Execution gas cap") ||
+if (!view.primary.includes("Gas fee cap") ||
     !view.primary.includes("0.000199 ETH at most")) {{
   throw new Error(`the execution gas ceiling is not visible: ${{view.primary}}`);
 }}
@@ -7007,7 +7007,7 @@ call.intent = "Totally different publisher story";
 renamed.review_manifest.canonical_plan = JSON.stringify(plan);
 renderReview(renamed);
 const relabelled = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
-if (nodes["panel-title"].textContent !== "Review transfer") {{
+if (nodes["panel-title"].textContent !== "Requested transfer") {{
   throw new Error(`relabelling changed the heading: ${{relabelled}}`);
 }}
 if (!relabelled.includes("Beneficiary")) {{
