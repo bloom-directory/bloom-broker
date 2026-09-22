@@ -168,6 +168,19 @@ function chainLabel(chain, ctx) {
   return {ethereum: "Ethereum", mainnet: "Ethereum", base: "Base", arbitrum: "Arbitrum",
     optimism: "Optimism", polygon: "Polygon", anvil: "local test chain"}[chain] || chain;
 }
+
+function addressExplorer(chainId, address) {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) return null;
+  const explorers = {
+    "1": ["Etherscan", "https://etherscan.io"],
+    "8453": ["Basescan", "https://basescan.org"],
+    "42161": ["Arbiscan", "https://arbiscan.io"],
+    "10": ["Optimism Etherscan", "https://optimistic.etherscan.io"],
+    "137": ["Polygonscan", "https://polygonscan.com"]
+  };
+  const explorer = explorers[String(chainId)];
+  return Array.isArray(explorer) ? {name: explorer[0], url: `${explorer[1]}/address/${address}`} : null;
+}
 // Bloom's heading, never the descriptor's. A publisher can describe an
 // argument; it cannot decide what the owner is told they are approving.
 //
@@ -441,6 +454,7 @@ function describeTransfer(manifest) {
     const networkIdentity = evmPayloads.length === 1
       ? `EVM · ${network} · Chain ID ${first.chain_id}` : null;
     return {intent, parties, assurance, interpretation, facts, technical, warnings, networkIdentity,
+            chainId: evmPayloads.length === 1 ? first.chain_id : null,
             assetSummary: evmPayloads.length === 1 ? summary : null,
             networkIcon: {"1": "ethereum", "8453": "base", "31337": "test"}[first.chain_id] || "unknown",
             willVerify: true};
@@ -784,13 +798,20 @@ function renderReview(session) {
     if (party.name) row.append(el("p", {class: "ceremony-party-name"}, party.name));
     if (party.change) row.append(el("span", {class: `ceremony-balance-change ${party.role === "source" ? "outgoing" : "incoming"}`}, party.change));
     const address = el("code", {}, party.value);
-    const copy = el("button", {type: "button", class: "ceremony-copy"}, "Copy");
+    const explorer = ["token", "contract"].includes(party.role)
+      ? addressExplorer(transfer?.chainId, party.value) : null;
+    const identity = explorer ? el("a", {class: "ceremony-address-link", href: explorer.url,
+      target: "_blank", rel: "noopener noreferrer", referrerpolicy: "no-referrer",
+      title: `View on ${explorer.name} (opens a new tab)`,
+      "aria-label": `${party.label}: ${party.value}. View on ${explorer.name} (opens a new tab)`}, address) : address;
+    const copy = el("button", {type: "button", class: "ceremony-copy",
+      "aria-label": `Copy ${party.label.toLowerCase()} address`}, "Copy");
     // Copies the exact address that is displayed, never a shortened form.
     copy.onclick = async () => {
       try { await navigator.clipboard.writeText(party.value); copy.textContent = "Copied"; }
       catch (_) { copy.textContent = "Select it instead"; }
     };
-    row.append(el("p", {class: "ceremony-party-address"}, address, copy));
+    row.append(el("p", {class: "ceremony-party-address"}, identity, copy));
     return row;
   };
   const intentBlock = (intent, nested = false) => {
