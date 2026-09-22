@@ -361,9 +361,9 @@ function describeTransfer(manifest) {
     // for that charge, not an estimate and not a cap on every network charge.
     // When the chain's units are unknown the page says so: a missing cost
     // must not read as no cost.
-    facts.push([label("Maximum execution gas fee"),
+    facts.push([label("Max execution gas fee"),
       payload.maximum_execution_gas_fee_display
-        ? `${payload.maximum_execution_gas_fee_display} at most`
+        ? payload.maximum_execution_gas_fee_display
         : "Cannot be shown — Bloom has no authenticated units for this chain"]);
     if (decoded) {
       technical.push([label("Data"), `${Number(payload.calldata_bytes).toLocaleString("en-US")} bytes`]);
@@ -408,7 +408,7 @@ function describeTransfer(manifest) {
       if (summary && field.raw === summary.counterparty) continue;
       facts.push([label(field.label), field.value, field.format === "addressName"]);
     }
-    if (call.intent) facts.push([label("Publisher description"), call.intent]);
+    if (call.intent) technical.push([label("Publisher description"), call.intent]);
     technical.push([label("Function"), call.function_signature, true]);
     technical.push([label("Selector"), call.selector, true]);
     if (summary) technical.push([label("Exact amount"), summary.amount, true]);
@@ -509,7 +509,7 @@ function describeTransfer(manifest) {
         String(first.contract_call.contract).toLowerCase();
       parties.push({
         role: "token",
-        label: sameAddress ? "Token contract — the contract being called"
+        label: sameAddress ? "Token contract"
           : "Token contract",
         name: `${summary.token.symbol} — ${summary.token.name}`,
         value: summary.token.address
@@ -536,7 +536,7 @@ function describeTransfer(manifest) {
       technical.push(["Catalog commitment", clear.catalog_digest, true]);
     }
     const networkIdentity = evmPayloads.length === 1
-      ? `EVM · ${network} · Chain ID ${first.chain_id}` : null;
+      ? `${network} · ${first.chain_id}` : null;
     return {intent, parties: parties.map(party => ({...party, chainId: first.chain_id})), assurance, interpretation, facts, technical, warnings, networkIdentity,
             chainId: evmPayloads.length === 1 ? first.chain_id : null,
             assetSummary: evmPayloads.length === 1 ? summary : null,
@@ -859,7 +859,7 @@ function renderReview(session) {
     fact("Wallet type", "BIP-39 recovery phrase (multi-chain)");
   }
   if (transfer) {
-    if (keyInfo.account) fact("From", keyInfo.account);
+    if (keyInfo.account) transfer.technical?.push(["Signing account", keyInfo.account]);
     for (const [label, value, mono, chainId] of transfer.facts) {
       if (!contextualFacts.has(label)) fact(label, value, mono, chainId);
     }
@@ -913,21 +913,25 @@ function renderReview(session) {
     panelTitle.setAttribute("data-action", transfer.intent.action);
     panelTitle.setAttribute("data-magnitude", transfer.intent.magnitude || "");
     const token = transfer.parties?.find(party => party.role === "token");
+    // One row list: label, value, and nothing else. The heading already states
+    // the amount, so no row repeats it and no column competes with it.
+    const rows = el("dl", {class: "ceremony-rows"});
+    let rowCount = 0;
+    const row = (label, {name, address, chainId, role} = {}) => {
+      if (!name && !address) return;
+      rowCount += 1;
+      rows.append(el("dt", {}, label));
+      const value = el("dd", {class: "ceremony-value", ...(role ? {"data-role": role} : {})});
+      if (name) value.append(el("p", {class: "ceremony-name"}, name));
+      if (address) {
+        const explorer = addressExplorer(chainId ?? transfer?.chainId, address);
+        value.append(el("p", {class: "ceremony-address"},
+          explorer ? explorerAnchor(explorer, address, label) : el("code", {}, address)));
+      }
+      rows.append(value);
+    };
     if (token && transfer.intent.action !== "batch") {
-      // The asset is identified by its contract on this chain. A ticker or
-      // an icon alone must never stand in for that identity. This placeholder
-      // is deliberately not a fetched logo or a claim of token verification.
-      const asset = partyRow({...token, label: "Token contract"});
-      asset.className = "ceremony-party ceremony-asset-identity";
-      const icon = el("span", {class: "ceremony-token-icon", "aria-hidden": "true"}, reviewIcon("token"));
-      const summary = transfer.assetSummary;
-      const sending = summary?.action === "transfer";
-      if (sending) panelTitle.textContent = "Review transfer";
-      const amount = summary && !sending ? el("div", {class: "ceremony-asset-amount permission"},
-        el("span", {class: "ceremony-amount-label"}, sending ? "You send · requested" : "Spending limit"),
-        el("strong", {}, sending ? `−${summary.amount_display}`
-          : summary.magnitude === "unlimited" ? "Unlimited" : summary.amount_display)) : null;
-      parts.push(el("section", {class: "ceremony-asset", "aria-label": "Token being transferred or approved"}, icon, asset, amount));
+      row("Token", {name: token.name, address: token.value, chainId: token.chainId, role: token.role});
     }
     if (transfer.intent.detail) parts.push(intentBlock(transfer.intent));
     const warningParts = [];
@@ -944,8 +948,14 @@ function renderReview(session) {
         el("p", {class: "ceremony-card-position"}, `Transaction ${card.position}`),
         intentBlock(card.intent, true));
       if (card.counterparty) {
-        wrapper.append(el("div", {class: "ceremony-identity"},
-          partyRow({role: "counterparty", label: "To", value: card.counterparty, chainId: card.chainId})));
+        const cardRows = el("dl", {class: "ceremony-rows"});
+        cardRows.append(el("dt", {}, "To"));
+        const value = el("dd", {class: "ceremony-value"});
+        const explorer = addressExplorer(card.chainId, card.counterparty);
+        value.append(el("p", {class: "ceremony-address"}, explorer
+          ? explorerAnchor(explorer, card.counterparty, "To") : el("code", {}, card.counterparty)));
+        cardRows.append(value);
+        wrapper.append(cardRows);
       }
       parts.push(wrapper);
     }
@@ -954,21 +964,14 @@ function renderReview(session) {
       const parties = [...transfer.parties].filter(party =>
         party !== token || transfer.intent.action === "batch").sort((a, b) =>
           Number(b.role === "spender") - Number(a.role === "spender"));
-      const flow = el("div", {class: `ceremony-identity ${isTransfer ? "ceremony-transfer-path" : "ceremony-permission"}`});
-      const movement = transfer.assetSummary?.action === "transfer" ? transfer.assetSummary.amount_display : null;
       for (const party of parties) {
-        if (isTransfer && party.role === "recipient") {
-          flow.append(el("div", {class: "ceremony-flow-arrow", "aria-hidden": "true"}, "↓"));
-        }
-        const change = movement && ["source", "recipient"].includes(party.role)
-          ? `${party.role === "source" ? "−" : "+"}${movement}` : null;
-        flow.append(partyRow({...party, change,
-          ...(party.role === "source" ? {label: isTransfer ? "Sender" : "Your wallet", name: walletName} : {})}));
+        const label = party.role === "source" ? (isTransfer ? "From" : "Wallet")
+          : party.role === "recipient" ? "To" : party.label;
+        row(label, {name: party.role === "source" ? walletName : party.name,
+          address: party.value, chainId: party.chainId, role: party.role});
       }
-      parts.push(flow);
-      if (movement) parts.push(el("p", {class: "ceremony-movements-note"},
-        "Requested movements, not simulated balances. Actual balances before and after are not available."));
     }
+    if (rowCount) parts.push(rows);
     parts.push(...warningParts);
   } else {
     parts.push(el("p", {class: "summary", html: summaryHtml}));

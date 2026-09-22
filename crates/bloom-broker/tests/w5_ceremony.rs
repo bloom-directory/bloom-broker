@@ -987,7 +987,7 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
         "--ceremony-width:840px",
         "--ceremony-accent:",
         ".ceremony-intent{",
-        ".ceremony-party{",
+        ".ceremony-rows{",
         ".ceremony-warning{",
         ".ceremony-actions{",
         "@media(max-width:560px)",
@@ -6836,8 +6836,7 @@ function show(name) {{
     magnitude: nodes["panel-title"].attrs["data-magnitude"],
     roles: [].concat(...nodes.review.children.map(function collect(n) {{
       if (typeof n === "string") return [];
-      const here = String(n.className || "").includes("ceremony-party") && n.attrs?.["data-role"]
-        ? [n.attrs["data-role"]] : [];
+      const here = n.attrs?.["data-role"] ? [n.attrs["data-role"]] : [];
       return here.concat(...n.children.map(collect));
     }})),
     button: nodes.approve.textContent
@@ -6847,15 +6846,17 @@ function show(name) {{
 // A transfer names the amount and the recipient, and the recipient is a
 // recipient — never the contract, never a generic "To".
 let view = show("transfer");
-if (view.heading !== "Review transfer") throw new Error(`transfer heading: ${{view.heading}}`);
+if (view.heading !== "Send 250 BDT") throw new Error(`transfer heading: ${{view.heading}}`);
 if (view.primary.includes(view.heading)) throw new Error("action title was printed twice");
-if (!view.primary.includes("−250 BDT") || !view.primary.includes("+250 BDT")) {{
-  throw new Error("requested sender/recipient movements are missing");
+// The amount is stated once, by the heading, and no row repeats it as a
+// balance change. Nothing on the page may look like an observed balance.
+if (view.primary.includes("250 BDT")) {{
+  throw new Error(`the amount is repeated below its own heading: ${{view.primary}}`);
 }}
-if (!view.primary.includes("not simulated balances")) {{
-  throw new Error("requested movements must not imply observed balances");
+if (/balance/i.test(view.primary)) {{
+  throw new Error(`the review implied a balance it never read: ${{view.primary}}`);
 }}
-if (!allText(nodes["page-title"]).includes("Chain ID 31337")) {{
+if (!allText(nodes["page-title"]).includes("31337")) {{
   throw new Error("the exact EVM chain is missing from the primary context");
 }}
 if (!view.primary.includes("BDT — Bloom Demo Token")) {{
@@ -6875,8 +6876,8 @@ if (!view.primary.includes("0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512")) {{
 // The envelope's zero native value must not read as the thing being sent.
 if (view.primary.includes("  0 ETH")) throw new Error(`primary showed the native zero: ${{view.primary}}`);
 // The potential cost stays with the decision, labelled as a ceiling.
-if (!view.primary.includes("Maximum execution gas fee") ||
-    !view.primary.includes("0.000198510751634520 ETH at most")) {{
+if (!view.primary.includes("Max execution gas fee") ||
+    !view.primary.includes("0.000198510751634520 ETH")) {{
   throw new Error(`the execution gas ceiling is not visible: ${{view.primary}}`);
 }}
 // A chain whose units Bloom cannot authenticate must say the cost cannot be
@@ -6986,7 +6987,7 @@ call.intent = "Totally different publisher story";
 renamed.review_manifest.canonical_plan = JSON.stringify(plan);
 renderReview(renamed);
 const relabelled = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
-if (nodes["panel-title"].textContent !== "Review transfer") {{
+if (nodes["panel-title"].textContent !== "Send 250 BDT") {{
   throw new Error(`relabelling changed the heading: ${{relabelled}}`);
 }}
 if (!relabelled.includes("Beneficiary")) {{
