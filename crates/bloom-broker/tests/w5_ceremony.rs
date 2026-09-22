@@ -258,6 +258,7 @@ const nodes = {{}};
 globalThis.document = {{
   getElementById: id => nodes[id] ||= new Node(id),
   createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
   createTextNode: text => String(text)
 }};
 globalThis.location = {{hash: "", search: "", pathname: "/"}};
@@ -319,6 +320,7 @@ const nodes = {{}};
 globalThis.document = {{
   getElementById: id => nodes[id] ||= new Node(id),
   createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
   createTextNode: text => String(text)
 }};
 globalThis.location = {{hash: "", search: "", pathname: "/"}};
@@ -449,6 +451,7 @@ const nodes = {{}};
 globalThis.document = {{
   getElementById: id => nodes[id] ||= new Node(id),
   createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
   createTextNode: text => String(text)
 }};
 globalThis.location = {{hash: "", search: "", pathname: "/"}};
@@ -559,6 +562,7 @@ const nodes = {{}};
 globalThis.document = {{
   getElementById: id => nodes[id] ||= new Node(id),
   createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
   createTextNode: text => String(text)
 }};
 globalThis.location = {{hash: "", search: "", pathname: "/"}};
@@ -641,6 +645,7 @@ const nodes = {{}};
 globalThis.document = {{
   getElementById: id => nodes[id] ||= new Node(id),
   createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
   createTextNode: text => String(text)
 }};
 globalThis.location = {{hash: "", search: "", pathname: "/"}};
@@ -6793,6 +6798,7 @@ const nodes = {{}};
 globalThis.document = {{
   getElementById: id => nodes[id] ||= new Node(id),
   createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
   createTextNode: text => String(text)
 }};
 globalThis.location = {{hash: "", search: "", pathname: "/"}};
@@ -6841,9 +6847,9 @@ function show(name) {{
 // A transfer names the amount and the recipient, and the recipient is a
 // recipient — never the contract, never a generic "To".
 let view = show("transfer");
-if (view.heading !== "Send 250 BDT") throw new Error(`transfer heading: ${{view.heading}}`);
+if (view.heading !== "Review transfer") throw new Error(`transfer heading: ${{view.heading}}`);
 if (view.primary.includes(view.heading)) throw new Error("action title was printed twice");
-if (!nodes["page-title"].textContent.includes("Chain ID 31337")) {{
+if (!allText(nodes["page-title"]).includes("Chain ID 31337")) {{
   throw new Error("the exact EVM chain is missing from the primary context");
 }}
 if (!view.primary.includes("BDT — Bloom Demo Token")) {{
@@ -6911,7 +6917,7 @@ if (view.heading.includes("115792089")) throw new Error("the U256 maximum led th
 // Deciding must never require reading the raw integer.
 if (view.primary.includes("115792089")) throw new Error("the U256 maximum is still a primary fact");
 if (!view.technical.includes("115792089")) throw new Error("the exact maximum left technical details");
-if (!view.primary.includes("UNLIMITED ALLOWANCE")) throw new Error("the unlimited warning is not visible");
+if (!view.primary.includes("all your current and future BDT")) throw new Error("the unlimited warning is not visible");
 const unfamiliar = previewSession("allowance-unlimited");
 const unfamiliarPlan = JSON.parse(unfamiliar.review_manifest.canonical_plan);
 unfamiliarPlan.evm_review.payloads[0].contract_call.warnings.push("A new warning the renderer does not recognise");
@@ -6965,7 +6971,7 @@ call.intent = "Totally different publisher story";
 renamed.review_manifest.canonical_plan = JSON.stringify(plan);
 renderReview(renamed);
 const relabelled = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
-if (nodes["panel-title"].textContent !== "Send 250 BDT") {{
+if (nodes["panel-title"].textContent !== "Review transfer") {{
   throw new Error(`relabelling changed the heading: ${{relabelled}}`);
 }}
 if (!relabelled.includes("Beneficiary")) {{
@@ -7003,13 +7009,20 @@ async fn a_preview_name_reaches_no_session_and_cannot_be_completed() {
         builder.body(Body::empty()).unwrap()
     };
 
-    // The preview page itself is served, and is the ordinary shell.
+    // Only harness builds serve previews. Release builds must refuse them.
     let page = app
         .clone()
         .oneshot(get("/preview/transfer", None))
         .await
         .unwrap();
-    assert_eq!(page.status(), StatusCode::OK);
+    assert_eq!(
+        page.status(),
+        if cfg!(feature = "triad-dev-harness") {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        }
+    );
 
     // Every approval path refuses a preview name. It is not a token, so it
     // resolves to nothing: there is no session to read and none to complete.
@@ -7081,6 +7094,7 @@ const nodes = {{}};
 globalThis.document = {{
   getElementById: id => nodes[id] ||= new Node(id),
   createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
   createTextNode: text => String(text)
 }};
 globalThis.location = {{hash: "", search: "", pathname: "/"}};

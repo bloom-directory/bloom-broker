@@ -95,8 +95,16 @@ fn a_maximum_allowance_is_denied_until_policy_enables_it() {
     assert!(
         call.warnings
             .iter()
-            .any(|warning| warning.contains("UNLIMITED ALLOWANCE"))
+            .any(|warning| warning.contains("all your current and future EXA"))
     );
+    assert_eq!(
+        call.warnings.len(),
+        1,
+        "one complete unlimited-allowance warning"
+    );
+    assert!(call.warnings[0].contains("without asking again"));
+    assert!(call.warnings[0].contains("no expiry"));
+    assert!(call.warnings[0].contains("another transaction"));
     assert_eq!(field(&call, "Amount").raw, U256::MAX.to_string());
 }
 

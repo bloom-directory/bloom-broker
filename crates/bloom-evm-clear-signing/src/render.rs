@@ -455,10 +455,6 @@ fn apply_safety_rules(
             Some(summary("transfer", "recipient", "finite")),
         ));
     }
-    warnings.push(
-        "An allowance lets this spender move your tokens later, with no further Bloom approval. It does not expire when this approval expires."
-            .to_owned(),
-    );
     let magnitude = if amount.is_zero() {
         warnings.push("This sets the spender's allowance to zero, clearing it.".to_owned());
         "zero"
@@ -469,12 +465,16 @@ fn apply_safety_rules(
                 "wallet policy denies unlimited allowances; enable them in a policy ceremony first",
             ));
         }
-        warnings.push(
-            "UNLIMITED ALLOWANCE. This spender may move every token of this kind you now hold or later receive."
-                .to_owned(),
-        );
+        warnings.push(format!(
+            "If executed, this spender can use all your current and future {} without asking again. This permission has no expiry; changing it requires another transaction.",
+            identity.symbol
+        ));
         "unlimited"
     } else {
+        warnings.push(
+            "This spender can move your tokens later without another approval. The permission does not expire with this review."
+                .to_owned(),
+        );
         warnings.push(
             "This sets the spender's total allowance to the amount shown. It is not added to any existing allowance."
                 .to_owned(),

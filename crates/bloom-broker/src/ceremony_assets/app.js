@@ -91,7 +91,9 @@ const KINDS = {
 };
 
 function el(tag, attrs = {}, ...children) {
-  const node = document.createElement(tag);
+  const node = ["svg", "path", "circle", "rect"].includes(tag)
+    ? document.createElementNS("http://www.w3.org/2000/svg", tag)
+    : document.createElement(tag);
   for (const [key, value] of Object.entries(attrs)) {
     if (key === "class") node.className = value;
     else if (key === "html") node.innerHTML = value;
@@ -102,6 +104,24 @@ function el(tag, attrs = {}, ...children) {
     node.append(typeof child === "string" ? document.createTextNode(child) : child);
   }
   return node;
+}
+
+// Bundled geometric symbols, never images fetched by ticker. Network marks
+// are selected by numeric chain ID. Unknown tokens use a neutral coin.
+function reviewIcon(kind) {
+  const svg = el("svg", {viewBox: "0 0 32 32", "aria-hidden": "true", focusable: "false"});
+  if (kind === "ethereum") {
+    svg.append(el("path", {d: "M16 2 7 17l9 5 9-5ZM7 19l9 11 9-11-9 5Z", fill: "currentColor"}));
+  } else if (kind === "base") {
+    svg.append(el("circle", {cx: "16", cy: "16", r: "14", fill: "#0052ff"}),
+      el("path", {d: "M2 16h19", stroke: "white", "stroke-width": "3"}));
+  } else if (kind === "test") {
+    svg.append(el("path", {d: "M12 3h8M14 3v10L6 26q-1 3 3 3h14q4 0 3-3l-8-13V3M10 20h12", fill: "none", stroke: "currentColor", "stroke-width": "2", "stroke-linejoin": "round"}));
+  } else {
+    svg.append(el("circle", {cx: "16", cy: "16", r: "12", fill: "none", stroke: "currentColor", "stroke-width": "2"}),
+      el("circle", {cx: "16", cy: "16", r: "8", fill: "none", stroke: "currentColor", "stroke-width": "1"}));
+  }
+  return svg;
 }
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, c => ({
@@ -419,6 +439,8 @@ function describeTransfer(manifest) {
     const networkIdentity = evmPayloads.length === 1
       ? `EVM · ${network} · Chain ID ${first.chain_id}` : null;
     return {intent, parties, assurance, interpretation, facts, technical, warnings, networkIdentity,
+            assetSummary: evmPayloads.length === 1 ? summary : null,
+            networkIcon: {"1": "ethereum", "8453": "base", "31337": "test"}[first.chain_id] || "unknown",
             willVerify: true};
   }
   if (!claim) return null;
@@ -719,6 +741,8 @@ function renderReview(session) {
   if (transfer?.intent && pageTitle) {
     const network = transfer.networkIdentity || transfer.facts.find(([label]) => label === "Network")?.[1];
     pageTitle.textContent = network || ["Wallet settings", walletName].filter(Boolean).join(" · ");
+    if (transfer.networkIdentity) pageTitle.replaceChildren(reviewIcon(transfer.networkIcon),
+      el("span", {}, network));
   } else fact("Wallet", walletName);
   if (kind !== "sealed_approval" &&
       session.signer_contribution?.wallet_seed_profile === "bip39-multicurve-v1") {
@@ -785,9 +809,15 @@ function renderReview(session) {
       // is deliberately not a fetched logo or a claim of token verification.
       const asset = partyRow({...token, label: "Token contract"});
       asset.className = "ceremony-party ceremony-asset-identity";
-      const icon = el("span", {class: "ceremony-token-icon", "aria-hidden": "true"},
-        (token.name || "?").split(" — ")[0].slice(0, 4));
-      parts.push(el("section", {class: "ceremony-asset", "aria-label": "Token being transferred or approved"}, icon, asset));
+      const icon = el("span", {class: "ceremony-token-icon", "aria-hidden": "true"}, reviewIcon("token"));
+      const summary = transfer.assetSummary;
+      const sending = summary?.action === "transfer";
+      if (sending) panelTitle.textContent = "Review transfer";
+      const amount = summary ? el("div", {class: `ceremony-asset-amount ${sending ? "outgoing" : "permission"}`},
+        el("span", {class: "ceremony-amount-label"}, sending ? "You send · requested" : "Spending limit"),
+        el("strong", {}, sending ? `−${summary.amount_display}`
+          : summary.magnitude === "unlimited" ? "Unlimited" : summary.amount_display)) : null;
+      parts.push(el("section", {class: "ceremony-asset", "aria-label": "Token being transferred or approved"}, icon, asset, amount));
     }
     if (transfer.intent.detail) parts.push(intentBlock(transfer.intent));
     const warningParts = [];
@@ -795,12 +825,8 @@ function renderReview(session) {
       const warningGroup = el("aside", {class: "ceremony-warning", "aria-label": "Risks and consequences"});
       if (transfer.intent.magnitude === "unlimited") {
         warningGroup.setAttribute("data-severity", "danger");
-        warningGroup.append(el("p", {class: "ceremony-warning-title"}, "If this transaction succeeds"));
       }
       for (const warning of transfer.warnings) warningGroup.append(el("p", {}, warning));
-      if (transfer.intent.magnitude === "unlimited") {
-        warningGroup.append(el("p", {}, "You can later request a lower allowance or set it to zero."));
-      }
       warningParts.push(warningGroup);
     }
     for (const card of transfer.intent.cards || []) {
@@ -1218,8 +1244,7 @@ const PREVIEW_TOKEN_IDENTITY =
 const PREVIEW_ASSURANCE =
   "Interpreted using a trusted signed description. Contract behavior has not been verified.";
 const PREVIEW_ALLOWANCE_ADVISORY =
-  "An allowance lets this spender move your tokens later, with no further Bloom approval. " +
-  "It does not expire when this approval expires.";
+  "This spender can move your tokens later without another approval. The permission does not expire with this review.";
 function previewPayload(extra) {
   return Object.assign({
     chain_id: "31337", chain: "anvil", sender: PREVIEW_WALLET, destination: PREVIEW_TOKEN,
@@ -1235,7 +1260,7 @@ function previewPayload(extra) {
 function previewClearSigning() {
   return {
     assurance: "trusted_description", verifier_id: "evm-clear-signing-v1",
-    verifier_digest: "e12e0cbb6873ab1c2ef89cb2e7e41333d0238b574a4629f36ba6b16f21b38beb",
+    verifier_digest: "2c75ec2390991c0bbab6e17694525cd46ef65614fa31e62cadac6aab58751a15",
     catalog_id: "bloom-demo-tokens", catalog_sequence: "5",
     catalog_digest: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
     catalog_expires_at_ms: String(Date.now() + 86400000),
@@ -1285,7 +1310,6 @@ const PREVIEWS = {
   })], previewClearSigning()),
   "allowance-zero": () => previewApproval([previewPayload({
     contract_call: previewCall("allowance", "0", "0 BDT", "zero", [
-      PREVIEW_ALLOWANCE_ADVISORY,
       "This sets the spender's allowance to zero, clearing it."])
   })], previewClearSigning()),
   "allowance-unlimited": () => previewApproval([previewPayload({
@@ -1293,8 +1317,7 @@ const PREVIEWS = {
       "115792089237316195423570985008687907853269984665640564039457584007913129639935",
       "115792089237316195423570985008687907853269984665640564039457584007913129639.935935 BDT",
       "unlimited", [
-        PREVIEW_ALLOWANCE_ADVISORY,
-        "UNLIMITED ALLOWANCE. This spender may move every token of this kind you now hold or later receive."])
+        "If executed, this spender can use all your current and future BDT without asking again. This permission has no expiry; changing it requires another transaction."])
   })], previewClearSigning()),
   "opaque-call": () => previewApproval([previewPayload({})], null),
   "native-send": () => previewApproval([previewPayload({
