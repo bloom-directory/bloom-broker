@@ -5161,11 +5161,10 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         "text/css; charset=utf-8"
     );
     let stylesheet_body = stylesheet.into_body().collect().await.unwrap().to_bytes();
-    // The sheet is the compiled-in default, identified by the documented
-    // measure token rather than by whatever happens to be its first byte.
-    assert!(
-        String::from_utf8_lossy(&stylesheet_body).contains("--ceremony-width:960px"),
-        "the served stylesheet is not the default ceremony sheet"
+    assert_eq!(
+        stylesheet_body.as_ref(),
+        include_bytes!("../src/ceremony_assets/style.css"),
+        "the route must serve the complete compiled-in default stylesheet"
     );
     let logo = app
         .clone()
@@ -6875,7 +6874,7 @@ if (!view.primary.includes("0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512")) {{
 // The envelope's zero native value must not read as the thing being sent.
 if (view.primary.includes("  0 ETH")) throw new Error(`primary showed the native zero: ${{view.primary}}`);
 // The potential cost stays with the decision, labelled as a ceiling.
-if (!view.primary.includes("Maximum execution gas fee") ||
+if (!view.primary.includes("Execution gas cap") ||
     !view.primary.includes("0.000198510751634520 ETH at most")) {{
   throw new Error(`the execution gas ceiling is not visible: ${{view.primary}}`);
 }}
@@ -6955,6 +6954,9 @@ if (!view.primary.includes("cannot say what")) throw new Error(`opaque detail: $
 // A batch keeps every member, in order, under one approval.
 view = show("batch");
 if (view.action !== "batch") throw new Error(`batch action: ${{view.action}}`);
+if (allText(nodes["page-title"]).includes("Wallet settings")) {{
+  throw new Error("a transaction batch was labelled as wallet settings");
+}}
 if (!view.primary.includes("Transaction 1") || !view.primary.includes("Transaction 2")) {{
   throw new Error("batch members are not listed in order");
 }}
@@ -6962,6 +6964,9 @@ if (view.primary.indexOf("Transaction 1") > view.primary.indexOf("Transaction 2"
   throw new Error("batch members are out of order");
 }}
 if (view.button !== "Approve all transactions") throw new Error(`batch button: ${{view.button}}`);
+if (!view.roles.includes("spender") || !view.roles.includes("recipient")) {{
+  throw new Error("batch members lost their distinct spender and recipient roles");
+}}
 
 // Markup in a publisher's name is text, not markup, and does not reach innerHTML.
 view = show("long-identity");

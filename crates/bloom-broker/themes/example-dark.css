@@ -28,16 +28,12 @@
   --ceremony-muted:#9aa4b2;
   --ceremony-border:#2c313a;
   --ceremony-accent:#7aa2f7;
+  --ceremony-accent-deep:#a5c2ff;
   --ceremony-warning:#e8b04b;
   --ceremony-warning-surface:rgba(232,176,75,.12);
   --ceremony-danger:#f07178;
+  --ceremony-danger-surface:#382329;
+  --ceremony-success:#8ac69b;
   --ceremony-radius:10px;
 }
-/* The default sheet still paints the page chrome from its own variables, so
-   an owner theme that changes the review surface also sets these. */
-:root{--paper:var(--ceremony-bg);--surface:var(--ceremony-surface);--ink:var(--ceremony-text);
-      --ink-2:#c8d0dc;--muted:var(--ceremony-muted);--rule:var(--ceremony-border);
-      --rule-2:#39404b;--accent:var(--ceremony-accent);--accent-deep:#5d86e0;--error:var(--ceremony-danger)}
-body::before,body::after{display:none}
-.panel{background:var(--ceremony-surface);box-shadow:none}
-button{color:#10131a}
+button:not(.secondary){color:#10131a}

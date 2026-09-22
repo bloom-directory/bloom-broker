@@ -147,7 +147,7 @@ function startExpiry(session, node) {
     session.review_manifest?.expires_at_ms);
   const deadline = document.getElementById("review-deadline");
   const counting = !session.is_preview || session.preview_countdown;
-  if (!Number.isFinite(new Date(expiresAt).getTime()) || !node) {
+  if (!counting || !Number.isFinite(new Date(expiresAt).getTime()) || !node) {
     if (deadline) deadline.textContent = "";
     return;
   }
@@ -284,8 +284,7 @@ function callIntent(call) {
       action: "call",
       eyebrow: "Contract call",
       heading: `Call ${String(call?.function_signature || "").split("(")[0] || "this contract"}`,
-      detail: "Bloom read this call against a signed description of the contract. " +
-        "It has not executed the call and does not verify what the contract does.",
+      detail: "",
       relation: "calls"
     };
   }
@@ -314,9 +313,8 @@ function callIntent(call) {
       action: "allowance", magnitude: "zero",
       eyebrow: "Token allowance",
       heading: `Set ${who}'s ${symbol} allowance to zero`,
-      detail: `If this transaction executes successfully, this spender's ${symbol} allowance ` +
-        "becomes zero. Nothing has been revoked yet, and no other permission this spender " +
-        "holds — for another token, or granted another way — is affected.",
+      detail: `Only this spender's ${symbol} allowance changes, if the transaction succeeds. ` +
+        "Other tokens and permissions are unaffected.",
       relation: `loses its ${symbol} allowance from`
     };
   }
@@ -361,7 +359,7 @@ function describeTransfer(manifest) {
     // for that charge, not an estimate and not a cap on every network charge.
     // When the chain's units are unknown the page says so: a missing cost
     // must not read as no cost.
-    facts.push([label("Maximum execution gas fee"),
+    facts.push([label("Execution gas cap"),
       payload.maximum_execution_gas_fee_display
         ? `${payload.maximum_execution_gas_fee_display} at most`
         : "Cannot be shown — Bloom has no authenticated units for this chain"]);
@@ -466,7 +464,13 @@ function describeTransfer(manifest) {
                    ? "Bloom checked the envelope: destination and value come from the transaction bytes."
                    : "This creates a new contract. Bloom does not verify what its code does.",
                  relation: payload.destination ? `sends ${payload.value_display} to` : "creates"},
-            counterparty: payload.contract_call?.intent_summary?.counterparty || payload.destination
+            counterparty: payload.contract_call?.intent_summary?.counterparty || payload.destination,
+            counterpartyRole: payload.contract_call?.intent_summary?.counterparty_role ||
+              (payload.contract_call || payload.calldata_keccak ? "contract" : "recipient"),
+            contract: payload.contract_call?.contract,
+            contractName: payload.contract_call?.intent_summary?.token
+              ? `${payload.contract_call.intent_summary.token.symbol} — ${payload.contract_call.intent_summary.token.name}`
+              : payload.contract_call?.contract_name
           }))
         }
       : first.contract_call
@@ -480,8 +484,7 @@ function describeTransfer(manifest) {
                relation: "calls"}
             : {action: "send", eyebrow: "Native transfer",
                heading: `Send ${first.value_display}`,
-               detail: "Bloom checked the envelope: the destination and value come from the " +
-                 "transaction bytes. It has not executed anything.",
+               detail: "",
                relation: `sends ${first.value_display} to`})
           : {action: "deploy", eyebrow: "Contract creation", heading: "Deploy a contract",
              detail: "This creates a new contract from the initcode below. Bloom does not verify " +
@@ -535,12 +538,13 @@ function describeTransfer(manifest) {
       interpretation.push(["Verifier", `${clear.verifier_id} (${shortDigest(clear.verifier_digest)})`]);
       technical.push(["Catalog commitment", clear.catalog_digest, true]);
     }
-    const networkIdentity = evmPayloads.length === 1
-      ? `EVM · ${network} · Chain ID ${first.chain_id}` : null;
+    const oneNetwork = evmPayloads.every(payload => String(payload.chain_id) === String(first.chain_id));
+    const networkIdentity = oneNetwork
+      ? `EVM · ${network} · Chain ID ${first.chain_id}` : "EVM · Multiple networks";
     return {intent, parties: parties.map(party => ({...party, chainId: first.chain_id})), assurance, interpretation, facts, technical, warnings, networkIdentity,
             chainId: evmPayloads.length === 1 ? first.chain_id : null,
             assetSummary: evmPayloads.length === 1 ? summary : null,
-            networkIcon: {"1": "ethereum", "8453": "base", "31337": "test"}[first.chain_id] || "unknown",
+            networkIcon: oneNetwork ? ({"1": "ethereum", "8453": "base", "31337": "test"}[first.chain_id] || "unknown") : "unknown",
             willVerify: true};
   }
   if (!claim) return null;
@@ -945,14 +949,22 @@ function renderReview(session) {
         intentBlock(card.intent, true));
       if (card.counterparty) {
         wrapper.append(el("div", {class: "ceremony-identity"},
-          partyRow({role: "counterparty", label: "To", value: card.counterparty, chainId: card.chainId})));
+          partyRow({role: card.counterpartyRole,
+            label: card.counterpartyRole === "spender" ? "Spender"
+              : card.counterpartyRole === "recipient" ? "Recipient" : "Contract called",
+            value: card.counterparty, chainId: card.chainId})));
+      }
+      if (card.contract && card.contract !== card.counterparty) {
+        wrapper.append(el("div", {class: "ceremony-identity"},
+          partyRow({role: "contract", label: "Contract called", name: card.contractName,
+            value: card.contract, chainId: card.chainId})));
       }
       parts.push(wrapper);
     }
     if (transfer.parties?.length) {
       const isTransfer = ["transfer", "send"].includes(transfer.intent.action);
       const parties = [...transfer.parties].filter(party =>
-        party !== token || transfer.intent.action === "batch").sort((a, b) =>
+        transfer.intent.action === "batch" ? party.role === "source" : party !== token).sort((a, b) =>
           Number(b.role === "spender") - Number(a.role === "spender"));
       const flow = el("div", {class: `ceremony-identity ${isTransfer ? "ceremony-transfer-path" : "ceremony-permission"}`});
       const movement = transfer.assetSummary?.action === "transfer" ? transfer.assetSummary.amount_display : null;
@@ -967,7 +979,7 @@ function renderReview(session) {
       }
       parts.push(flow);
       if (movement) parts.push(el("p", {class: "ceremony-movements-note"},
-        "Requested movements, not simulated balances. Actual balances before and after are not available."));
+        "Requested movements, not simulated balances."));
     }
     parts.push(...warningParts);
   } else {
@@ -1593,7 +1605,7 @@ function renderPreview(name) {
   const banner = document.getElementById("preview-banner");
   if (banner) {
     banner.hidden = false;
-    banner.textContent = `Preview — “${name}”. Nothing here can be approved; no ceremony exists.`;
+    banner.textContent = `Preview · ${name} · Nothing can be approved here.`;
   }
   const pageTitle = document.getElementById("page-title");
   if (pageTitle) pageTitle.textContent = "Preview";
