@@ -82,6 +82,13 @@ struct BrokerConfig {
     /// network fetch, no refresh command and no second audit family.
     #[serde(default)]
     clear_signing_catalog_path: Option<PathBuf>,
+    /// Optional path to an owner-installed ceremony stylesheet. It is read
+    /// once here and served at `/assets/theme.css` after the default sheet;
+    /// no other file is reachable through that route. It is trusted UI code:
+    /// arbitrary CSS can obscure a warning or a control, so it comes from the
+    /// owner's configuration and never from a request, a descriptor or a URL.
+    #[serde(default)]
+    ceremony_theme_css_path: Option<PathBuf>,
     policy_keys: Vec<PolicyKeyConfig>,
     build_digest: String,
     /// Non-secret global ceremony admission limits. Kept as a raw document so
@@ -524,6 +531,12 @@ async fn run_with_paths(
             if let Some(path) = &config.clear_signing_catalog_path {
                 install_clear_signing_catalog(&authority, path)?;
             }
+        }
+        if let Some(path) = &config.ceremony_theme_css_path {
+            let css = std::fs::read_to_string(path).map_err(|error| {
+                format!("read ceremony theme {}: {error}", path.display())
+            })?;
+            bloom_broker::ceremony::install_owner_theme_css(css);
         }
         let signer = BrokerSignerClient::connect_unix(
             &config.signer_socket_path,

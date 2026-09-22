@@ -233,6 +233,24 @@ const APP_JS: &str = include_str!("ceremony_assets/app.js");
 const STYLE_CSS: &str = include_str!("ceremony_assets/style.css");
 const BLOOM_PRIMARY_SVG: &str = include_str!("ceremony_assets/bloom-primary.svg");
 
+/// Optional owner-installed ceremony CSS, read once at startup from the path
+/// named in the Broker configuration and held in memory.
+///
+/// Only that one configured file is ever served: the route takes no path,
+/// name or query, so it cannot be used to read anything else. The stylesheet
+/// loads after the default one, so the documented custom properties override
+/// cleanly. It is trusted UI code and nothing pretends otherwise — arbitrary
+/// CSS can hide a warning or a button, which is why it comes from the
+/// owner's own configuration and never from a descriptor, a publisher, a
+/// dapp, a request parameter or a URL.
+static OWNER_THEME_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Install the owner's theme. Called once during startup, before the listener
+/// accepts anything; a wallet with no configured theme keeps the default.
+pub fn install_owner_theme_css(css: String) {
+    let _ = OWNER_THEME_CSS.set(css);
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ReviewManifestContext {
     pub petal_use_claim: Option<PetalUseClaim>,
@@ -1270,8 +1288,14 @@ impl CeremonyBroker {
         Router::new()
             .route("/", get(shell))
             .route("/ceremony/{token}", get(ceremony_shell))
+            // Design previews. They serve the same shell and the same
+            // renderer; the page recognises the path and draws a fixture. No
+            // session exists, so nothing here can be approved.
+            .route("/preview", get(shell))
+            .route("/preview/{name}", get(shell))
             .route("/assets/app.js", get(app_js))
             .route("/assets/style.css", get(style_css))
+            .route("/assets/theme.css", get(theme_css))
             .route("/assets/bloom-primary.svg", get(bloom_primary_svg))
             .route("/api/session", get(read_session_by_token))
             .route("/api/session/{ceremony_id}", get(read_session))
@@ -2303,6 +2327,19 @@ async fn style_css(headers: HeaderMap) -> Response {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         STYLE_CSS,
+    )
+        .into_response()
+}
+
+/// The owner's theme, or nothing. An absent theme is an empty stylesheet
+/// rather than a 404, so the default page never reports a missing asset.
+async fn theme_css(headers: HeaderMap) -> Response {
+    if validate_host(&headers).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        OWNER_THEME_CSS.get().cloned().unwrap_or_default(),
     )
         .into_response()
 }

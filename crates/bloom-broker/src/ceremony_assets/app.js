@@ -150,10 +150,73 @@ function chainLabel(chain, ctx) {
 }
 // Bloom's heading, never the descriptor's. A publisher can describe an
 // argument; it cannot decide what the owner is told they are approving.
-function callHeading(call) {
-  if (call.action === "transfer") return "Send tokens";
-  if (call.action === "allowance") return "Grant a spending allowance";
-  return `Call ${call.function_signature.split("(")[0]}`;
+//
+// Every value below comes from the typed intent Broker froze into the review
+// (`intent_summary`), which the verifier derived from the decoded arguments
+// under the same safety rules that produced the warnings. Nothing here reads
+// a descriptor label, a field position, a publisher's intent string, a
+// formatted amount or the text of a warning, and nothing decodes calldata a
+// second time. A call without a typed intent stays generic rather than
+// guessed at.
+function shortAddress(value) {
+  const text = String(value || "");
+  return /^0x[0-9a-fA-F]{40}$/.test(text) ? `${text.slice(0, 6)}…${text.slice(-4)}` : text;
+}
+// Headings describe the requested call. None of them promise an outcome:
+// Bloom has not executed anything, and a passkey response is an approval,
+// not a settlement.
+function callIntent(call) {
+  const summary = call?.intent_summary;
+  if (!summary) {
+    return {
+      action: "call",
+      eyebrow: "Contract call",
+      heading: `Call ${String(call?.function_signature || "").split("(")[0] || "this contract"}`,
+      detail: "Bloom read this call against a signed description of the contract. " +
+        "It has not executed the call and does not verify what the contract does.",
+      relation: "calls"
+    };
+  }
+  const who = shortAddress(summary.counterparty);
+  const symbol = summary.token?.symbol || "tokens";
+  if (summary.action === "transfer") {
+    return {
+      action: "transfer", magnitude: summary.magnitude,
+      eyebrow: "Token transfer",
+      heading: `Send ${summary.amount_display}`,
+      detail: "This is the transfer the transaction requests. It is not a guarantee that the " +
+        "balance changes: Bloom has not executed the call.",
+      relation: `sends ${summary.amount_display} to`
+    };
+  }
+  if (summary.magnitude === "unlimited") {
+    return {
+      action: "allowance", magnitude: "unlimited",
+      eyebrow: "Token allowance",
+      heading: `Allow unlimited ${symbol} spending`,
+      detail: `There is no spending cap. ${who} may move ${symbol} you hold now and ${symbol} ` +
+        "you receive later, without a further Bloom approval, until you set the allowance back down.",
+      relation: `may spend any amount of ${symbol} held by`
+    };
+  }
+  if (summary.magnitude === "zero") {
+    return {
+      action: "allowance", magnitude: "zero",
+      eyebrow: "Token allowance",
+      heading: `Set ${who}'s ${symbol} allowance to zero`,
+      detail: `If this executes, ${who} can no longer move your ${symbol} under this allowance. ` +
+        "It does not revoke any other permission this spender may hold.",
+      relation: `loses its ${symbol} allowance from`
+    };
+  }
+  return {
+    action: "allowance", magnitude: "finite",
+    eyebrow: "Token allowance",
+    heading: `Allow ${who} to spend up to ${summary.amount_display}`,
+    detail: "This sets the total allowance to that amount — it is not added to any allowance " +
+      "already in place. The spender can use it without a new approval for each transfer.",
+    relation: `may spend up to ${summary.amount_display} of`
+  };
 }
 function formatObserved(milliseconds) {
   const value = Number(milliseconds);
@@ -169,16 +232,27 @@ function describeTransfer(manifest) {
   // available under "Technical details" without competing for attention.
   const appendEnvelopeFacts = (facts, technical, payload, prefix) => {
     const label = name => prefix ? `${prefix} ${name.toLowerCase()}` : name;
-    facts.push([label(payload.destination ? "To" : "Action"),
+    // When the call was read against a signed description, the envelope's own
+    // "to" and native "amount" describe the transport, not the instruction.
+    // "Amount 0 ETH" must never sit beside "Send 250 BDT".
+    const decoded = Boolean(payload.contract_call);
+    const movesNative = !/^0(\.0+)?(\s|$)/.test(String(payload.value_display || "0"));
+    if (decoded) technical.push([label("Transaction to"), payload.destination, true]);
+    else facts.push([label(payload.destination ? "To" : "Action"),
       payload.destination || "Deploy contract (CREATE)", Boolean(payload.destination)]);
-    facts.push([label("Amount"), payload.value_display]);
+    if (!decoded || movesNative) facts.push([label(decoded ? "Native value sent" : "Amount"), payload.value_display]);
+    else technical.push([label("Native value sent"), payload.value_display]);
     facts.push([label("Network"), chainLabel(payload.chain)]);
     // The one field that tells a transfer from a contract call: say plainly
     // whether input data exists. Execution effects are unverified either way
     // (see Bloom verification); size and commitment live in technical details.
-    facts.push([label("Data"), payload.calldata_keccak
-      ? `${payload.destination ? "Contract call" : "Initcode"}, ${Number(payload.calldata_bytes).toLocaleString("en-US")} bytes — meaning not verified`
-      : "None — plain transfer"]);
+    if (decoded) {
+      technical.push([label("Data"), `${Number(payload.calldata_bytes).toLocaleString("en-US")} bytes`]);
+    } else {
+      facts.push([label("Data"), payload.calldata_keccak
+        ? `${payload.destination ? "Contract call" : "Initcode"}, ${Number(payload.calldata_bytes).toLocaleString("en-US")} bytes — meaning not verified`
+        : "None — plain transfer"]);
+    }
     technical.push([label("Sender"), payload.sender, true]);
     technical.push([label("Nonce"), payload.nonce]);
     technical.push([label("Gas limit"), payload.gas_limit]);
@@ -197,21 +271,25 @@ function describeTransfer(manifest) {
   // A clear-signed call puts the contract's own reading first: what moves,
   // to whom, in which token. The envelope facts stay underneath — they are
   // what was actually signed, and the description never replaces them.
-  const appendCallFacts = (facts, payload, prefix) => {
+  const appendCallFacts = (facts, technical, payload, prefix) => {
     const call = payload.contract_call;
     const label = name => prefix ? `${prefix} ${name.toLowerCase()}` : name;
-    facts.push([label("Action"), callHeading(call)]);
+    // Complete argument coverage is a property of the review, so every
+    // decoded argument is still listed even when the heading already named
+    // the two that matter. The publisher's label names the argument; it does
+    // not decide what the argument means.
     for (const field of call.fields || []) {
-      // Bloom owns the heading; the publisher's label names the argument.
       facts.push([label(field.label), field.value, field.format === "addressName"]);
     }
     if (call.token) {
       facts.push([label("Token"), `${call.token.symbol} — ${call.token.name}`]);
       facts.push([label("Token contract"), call.token.address, true]);
     }
-    facts.push([label("Contract"),
+    facts.push([label("Contract called"),
       call.contract_name ? `${call.contract_name} (${call.contract})` : call.contract, true]);
     if (call.intent) facts.push([label("Publisher description"), call.intent]);
+    technical.push([label("Function"), call.function_signature, true]);
+    technical.push([label("Selector"), call.selector, true]);
   };
   if (evmPayloads.length) {
     const facts = [];
@@ -220,23 +298,23 @@ function describeTransfer(manifest) {
     const calls = evmPayloads.filter(payload => payload.contract_call);
     for (const [index, payload] of evmPayloads.entries()) {
       const prefix = evmPayloads.length > 1 ? `Transaction ${index + 1}` : "";
-      if (payload.contract_call) appendCallFacts(facts, payload, prefix);
+      if (payload.contract_call) appendCallFacts(facts, technical, payload, prefix);
       appendEnvelopeFacts(facts, technical, payload, prefix);
     }
-    // Every mandatory warning, in the order the verifier produced it.
+    // Every mandatory warning, in the order the verifier produced it, kept
+    // visible rather than folded into the fact list or the details section.
+    const warnings = [];
     for (const payload of calls) {
-      for (const warning of payload.contract_call.warnings || []) {
-        facts.push(["Warning", warning]);
-      }
+      for (const warning of payload.contract_call.warnings || []) warnings.push(warning);
     }
     if (clear) {
       facts.push(["Description source",
         `Catalog ${clear.catalog_id}, sequence ${clear.catalog_sequence} — a trusted description, not proof of execution.`]);
-      facts.push(["Description commitment", clear.catalog_digest, true]);
+      technical.push(["Description commitment", clear.catalog_digest, true]);
       for (const entry of clear.entries || []) {
         if (!entry.upgradeable) continue;
-        facts.push(["Upgradeable contract",
-          `${entry.contract_address} was observed at ${formatObserved(entry.observed_at_ms)} and may have been upgraded since.`, true]);
+        warnings.push(`${entry.contract_address} can be upgraded. The publisher observed it at ` +
+          `${formatObserved(entry.observed_at_ms)}; its code may have changed since.`);
       }
     }
     facts.push(["Bloom verification", clear
@@ -244,16 +322,62 @@ function describeTransfer(manifest) {
       : "Exact envelope checked — destination and value come from the transaction bytes. Contract execution effects are not verified."]);
     const first = evmPayloads[0];
     const network = chainLabel(first.chain);
-    const sentence = evmPayloads.length === 1
-      ? (first.contract_call
-        ? `${escapeHtml(callHeading(first.contract_call))} on <strong>${escapeHtml(network)}</strong>.`
+    // One approval covers the whole batch, so a batch never collapses into one
+    // member's heading: it says how many actions it carries and lists them in
+    // order, each with its own intent.
+    const intent = evmPayloads.length > 1
+      ? {
+          action: "batch", eyebrow: `${evmPayloads.length} transactions, in order`,
+          heading: `Approve ${evmPayloads.length} transactions on ${network}`,
+          detail: "One approval covers every transaction listed below. They are signed in the " +
+            "order shown and there is no way to approve only part of the batch.",
+          cards: evmPayloads.map((payload, index) => ({
+            position: index + 1,
+            intent: payload.contract_call
+              ? callIntent(payload.contract_call)
+              : {action: payload.destination ? "send" : "deploy",
+                 eyebrow: payload.destination ? "Native transfer" : "Contract creation",
+                 heading: payload.destination
+                   ? `Send ${payload.value_display}` : "Deploy a contract",
+                 detail: payload.destination
+                   ? "Bloom checked the envelope: destination and value come from the transaction bytes."
+                   : "This creates a new contract. Bloom does not verify what its code does.",
+                 relation: payload.destination ? `sends ${payload.value_display} to` : "creates"},
+            counterparty: payload.contract_call?.intent_summary?.counterparty || payload.destination
+          }))
+        }
+      : first.contract_call
+        ? callIntent(first.contract_call)
         : first.destination
           ? (first.calldata_keccak
-            ? `Approve one contract call on <strong>${escapeHtml(network)}</strong> to the address below.`
-            : `Approve one transaction on <strong>${escapeHtml(network)}</strong> to the address below.`)
-          : `Deploy one contract on <strong>${escapeHtml(network)}</strong>.`)
-      : `Approve <strong>${evmPayloads.length} EVM transactions</strong>. Check each envelope below.`;
-    return {sentence, facts, technical, willVerify: true};
+            ? {action: "opaque", eyebrow: "Contract call", heading: "Approve a call Bloom cannot read",
+               detail: "There is no signed description of this contract, so Bloom cannot say what " +
+                 "the call does. It checked the envelope only: the destination, the value and the " +
+                 "exact bytes shown below are what your passkey approves.",
+               relation: "calls"}
+            : {action: "send", eyebrow: "Native transfer",
+               heading: `Send ${first.value_display}`,
+               detail: "Bloom checked the envelope: the destination and value come from the " +
+                 "transaction bytes. It has not executed anything.",
+               relation: `sends ${first.value_display} to`})
+          : {action: "deploy", eyebrow: "Contract creation", heading: "Deploy a contract",
+             detail: "This creates a new contract from the initcode below. Bloom does not verify " +
+               "what that code does.", relation: "creates"};
+    const counterparty = first.contract_call?.intent_summary?.counterparty ||
+      (first.contract_call ? null : first.destination);
+    const flow = {
+      network,
+      source: {role: "wallet", label: "From this wallet", value: first.sender},
+      relation: intent.relation,
+      target: counterparty
+        ? {role: intent.action === "allowance" ? "spender"
+             : intent.action === "transfer" || intent.action === "send" ? "recipient" : "contract",
+           label: intent.action === "allowance" ? "Spender"
+             : intent.action === "transfer" || intent.action === "send" ? "Recipient"
+             : "Contract", value: counterparty}
+        : null
+    };
+    return {intent, flow, facts, technical, warnings, willVerify: true};
   }
   if (!claim) return null;
   const debits = claim.declared_debits || [];
@@ -464,7 +588,16 @@ function renderReview(session) {
   if (kind === "sealed_approval") {
     transfer = describeTransfer(session.review_manifest);
     if (transfer) {
-      summaryHtml = transfer.sentence;
+      if (transfer.sentence) summaryHtml = transfer.sentence;
+      // The button names what is being approved. A passkey response means
+      // approved — not signed, broadcast or confirmed.
+      if (transfer.intent) {
+        approve.textContent = transfer.intent.action === "allowance" ? "Approve allowance"
+          : transfer.intent.action === "transfer" || transfer.intent.action === "send" ? "Approve transfer"
+          : transfer.intent.action === "batch" ? "Approve all transactions"
+          : transfer.intent.action === "deploy" ? "Approve contract creation"
+          : "Approve call";
+      }
     } else {
       petalApproval = describePetalApproval(session.review_manifest);
       if (petalApproval) {
@@ -476,7 +609,10 @@ function renderReview(session) {
     }
   } else if (kind === "policy_update") {
     transfer = describePolicy(session.review_manifest);
-    if (transfer) summaryHtml = transfer.sentence;
+    if (transfer) {
+      summaryHtml = transfer.sentence;
+      approve.textContent = "Approve policy change";
+    }
   } else if (kind === "key_derive" && contribution.petal_key_scope) {
     petalScope = describePetalScope(contribution.petal_key_scope);
     if (petalScope) {
@@ -510,15 +646,48 @@ function renderReview(session) {
     if (petalApproval) warns.push(petalApproval.warning);
     else for (const item of planDisclosures(session.review_manifest)) warns.push(item);
   }
-  const parts = [
-    el("p", {class: "summary", html: summaryHtml}),
-    facts
-  ];
-  if (kind !== "key_derive" && custodyManifest && typeof manifest.canonical_plan === "string" &&
-      manifest.canonical_plan.trim()) {
-    parts.push(el("div", {class: "plan"},
-      el("pre", {}, manifest.canonical_plan)));
+  // Reading order: what this is, who it moves value or permission to, the
+  // consequences, then the supporting facts. Byte-level identity is the last
+  // thing on the page and never the first.
+  const partyCard = party => el("div", {class: "ceremony-party", "data-role": party.role},
+    el("p", {class: "ceremony-party-label"}, party.label),
+    el("p", {class: "ceremony-party-address"}, el("code", {}, party.value)));
+  const intentBlock = intent => {
+    const block = el("section", {class: "ceremony-intent", "data-action": intent.action});
+    if (intent.magnitude) block.setAttribute("data-magnitude", intent.magnitude);
+    block.append(
+      el("p", {class: "ceremony-eyebrow"}, intent.eyebrow),
+      el("h3", {class: "ceremony-heading"}, intent.heading),
+      el("p", {class: "ceremony-detail"}, intent.detail));
+    return block;
+  };
+  const parts = [];
+  if (transfer?.intent) {
+    parts.push(intentBlock(transfer.intent));
+    for (const card of transfer.intent.cards || []) {
+      const wrapper = el("section", {class: "ceremony-card"},
+        el("p", {class: "ceremony-card-position"}, `Transaction ${card.position}`),
+        intentBlock(card.intent));
+      if (card.counterparty) {
+        wrapper.append(partyCard({role: "counterparty", label: "To", value: card.counterparty}));
+      }
+      parts.push(wrapper);
+    }
+    if (transfer.flow) {
+      const flow = el("div", {class: "ceremony-flow"});
+      flow.append(partyCard(transfer.flow.source));
+      flow.append(el("p", {class: "ceremony-relation"}, transfer.flow.relation));
+      if (transfer.flow.target) flow.append(partyCard(transfer.flow.target));
+      else flow.append(el("p", {class: "ceremony-party ceremony-party-none"}, "No destination — this creates a contract"));
+      parts.push(flow);
+    }
+  } else {
+    parts.push(el("p", {class: "summary", html: summaryHtml}));
   }
+  for (const warning of transfer?.warnings || []) {
+    parts.push(el("p", {class: "ceremony-warning warn"}, warning));
+  }
+  parts.push(facts);
   if (meta.warn) warns.unshift(meta.warn);
   for (const w of warns) parts.push(el("p", {class: "warn"}, w));
 
@@ -530,6 +699,12 @@ function renderReview(session) {
     parts.push(el("details", {class: "signed technical"},
       el("summary", {}, "Technical details — nonce, fees, exact byte commitments"),
       technical));
+  }
+  if (kind !== "key_derive" && custodyManifest && typeof manifest.canonical_plan === "string" &&
+      manifest.canonical_plan.trim()) {
+    parts.push(el("details", {class: "signed ceremony-details"},
+      el("summary", {}, "The exact plan that was reviewed"),
+      el("pre", {}, manifest.canonical_plan)));
   }
   const signed = session.review_manifest || {
     ceremony_kind: kind, signer_contribution: session.signer_contribution
@@ -869,7 +1044,195 @@ async function ensureNewCredentialPrf(session, credential, confirmPhase) {
   return {prf: result, assertion: assertionJson(confirmation)};
 }
 
+// Preview fixtures. Shapes match what Broker freezes into a review manifest,
+// including the typed intent; nothing here is a hand-drawn mockup.
+const PREVIEW_WALLET = "0x252aF4bf35C95d7d9AB3De1eB0Ee40D38DD3e5B4";
+const PREVIEW_SPENDER = "0x9fE46736679d2d9a65F0992F2272dE9f3c7fa6e0";
+const PREVIEW_TOKEN = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
+const PREVIEW_TOKEN_IDENTITY =
+  {address: PREVIEW_TOKEN, symbol: "BDT", name: "Bloom Demo Token", decimals: 6};
+const PREVIEW_ADVISORY =
+  "Bloom checked these bytes against a signed description of this contract. " +
+  "Bloom has not executed the call or verified what the contract does.";
+const PREVIEW_ALLOWANCE_ADVISORY =
+  "An allowance lets this spender move your tokens later, with no further Bloom approval. " +
+  "It does not expire when this approval expires.";
+function previewPayload(extra) {
+  return Object.assign({
+    chain_id: "31337", chain: "anvil", sender: PREVIEW_WALLET, destination: PREVIEW_TOKEN,
+    value: "0", value_display: "0 ETH", nonce: "7", gas_limit: "65410",
+    fee: {kind: "eip1559", max_fee_per_gas: "3034880652", max_fee_per_gas_display: "3.03 gwei",
+          max_priority_fee_per_gas: "151744032", max_priority_fee_per_gas_display: "0.15 gwei"},
+    payload_keccak: "5f2a1c6b8d4e0937ab55c1e8d0f34721aa9c6b5e4d3f2a1908b7c6d5e4f302915",
+    calldata_bytes: "68",
+    calldata_keccak: "11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"
+  }, extra);
+}
+function previewClearSigning() {
+  return {
+    assurance: "trusted_description", verifier_id: "evm-clear-signing-v1",
+    verifier_digest: "77f7d9d939a496a16a9e5d517bb57c8e8eea397751dabdac5f923e0f2e91cc20",
+    catalog_id: "bloom-demo-tokens", catalog_sequence: "5",
+    catalog_digest: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+    catalog_expires_at_ms: String(Date.now() + 86400000),
+    entries: [{chain_id: "31337", contract_address: PREVIEW_TOKEN,
+               observed_at_ms: String(Date.now() - 3600000), upgradeable: false}]
+  };
+}
+function previewCall(action, amount, amountDisplay, magnitude, warnings) {
+  const role = action === "transfer" ? "recipient" : "spender";
+  return {
+    contract: PREVIEW_TOKEN, contract_name: "Bloom Demo Token",
+    function_signature: action === "transfer"
+      ? "transfer(address to, uint256 amount)" : "approve(address spender, uint256 amount)",
+    selector: action === "transfer" ? "0xa9059cbb" : "0x095ea7b3",
+    action, token: PREVIEW_TOKEN_IDENTITY,
+    fields: [
+      {label: action === "transfer" ? "To" : "Spender", format: "addressName",
+       value: PREVIEW_SPENDER, raw: PREVIEW_SPENDER},
+      {label: "Amount", format: "tokenAmount", value: amountDisplay, raw: amount}
+    ],
+    intent_summary: {
+      action, counterparty_role: role, counterparty: PREVIEW_SPENDER,
+      amount, amount_display: amountDisplay, magnitude, token: PREVIEW_TOKEN_IDENTITY
+    },
+    warnings: [PREVIEW_ADVISORY].concat(warnings)
+  };
+}
+function previewApproval(payloads, clear) {
+  return {
+    ceremony_kind: "sealed_approval", expires_at_ms: Date.now() + 9 * 60 * 1000,
+    signer_contribution: {wallet_id: "clearsign-owner"},
+    review_manifest: {
+      schema: "bloom.custody_ceremony_review.v1", title: "Approve a transaction",
+      summary: "Review the transaction below.",
+      canonical_plan: JSON.stringify({evm_review: {payloads, clear_signing: clear}})
+    }
+  };
+}
+const PREVIEWS = {
+  transfer: () => previewApproval([previewPayload({
+    contract_call: previewCall("transfer", "250000000", "250 BDT", "finite", [])
+  })], previewClearSigning()),
+  "allowance-finite": () => previewApproval([previewPayload({
+    contract_call: previewCall("allowance", "100000000", "100 BDT", "finite", [
+      PREVIEW_ALLOWANCE_ADVISORY,
+      "This sets the spender's total allowance to the amount shown. It is not added to any existing allowance."])
+  })], previewClearSigning()),
+  "allowance-zero": () => previewApproval([previewPayload({
+    contract_call: previewCall("allowance", "0", "0 BDT", "zero", [
+      PREVIEW_ALLOWANCE_ADVISORY,
+      "This sets the spender's allowance to zero, clearing it."])
+  })], previewClearSigning()),
+  "allowance-unlimited": () => previewApproval([previewPayload({
+    contract_call: previewCall("allowance",
+      "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+      "115792089237316195423570985008687907853269984665640564039457584007913129639.935935 BDT",
+      "unlimited", [
+        PREVIEW_ALLOWANCE_ADVISORY,
+        "UNLIMITED ALLOWANCE. This spender may move every token of this kind you now hold or later receive."])
+  })], previewClearSigning()),
+  "opaque-call": () => previewApproval([previewPayload({})], null),
+  "native-send": () => previewApproval([previewPayload({
+    destination: PREVIEW_SPENDER, value: "10000000000000000", value_display: "0.01 ETH",
+    calldata_bytes: "0", calldata_keccak: undefined
+  })], null),
+  batch: () => previewApproval([
+    previewPayload({contract_call: previewCall("allowance", "100000000", "100 BDT", "finite", [
+      PREVIEW_ALLOWANCE_ADVISORY,
+      "This sets the spender's total allowance to the amount shown. It is not added to any existing allowance."])}),
+    previewPayload({nonce: "8",
+      contract_call: previewCall("transfer", "250000000", "250 BDT", "finite", [])})
+  ], previewClearSigning()),
+  "long-identity": () => previewApproval([previewPayload({
+    contract_call: Object.assign(
+      previewCall("transfer", "1", "0.000001 BDT", "finite", []),
+      {contract_name: "<script>alert(1)</script> Extremely Long Token Name That Should Wrap Rather Than Overflow",
+       token: Object.assign({}, PREVIEW_TOKEN_IDENTITY,
+         {name: "<b>Bloom</b> Demo Token With An Unusually Long Descriptive Name"})})
+  })], previewClearSigning()),
+  "policy-unlimited": () => ({
+    ceremony_kind: "policy_update", expires_at_ms: Date.now() + 9 * 60 * 1000,
+    signer_contribution: {wallet_id: "clearsign-owner"},
+    review_manifest: {
+      schema: "bloom.custody_ceremony_review.v1", title: "Approve a policy change",
+      summary: "Review the policy change below.",
+      policy_authority_diff: {
+        clear_signing: {
+          before: {unlimited_allowance_allowed: false},
+          after: {unlimited_allowance_allowed: true}
+        }
+      }
+    }
+  }),
+  expiring: () => {
+    const session = PREVIEWS.transfer();
+    session.expires_at_ms = Date.now() + 25 * 1000;
+    session.preview_status = "Expires in under a minute";
+    return session;
+  },
+  cancelled: () => {
+    const session = PREVIEWS.transfer();
+    session.preview_terminal = "cancelled";
+    session.preview_status = "Cancelled";
+    return session;
+  }
+};
+
+// Design previews. They render through this renderer — the one the Broker
+// actually serves — so what is reviewed here is what an owner sees. They
+// carry no ceremony token, never reach the session API, and the approve and
+// cancel controls are removed rather than disabled, so a preview cannot
+// authorise anything.
+function previewSession(name) {
+  const fixture = PREVIEWS[name];
+  if (!fixture) throw new Error(`Unknown preview: ${name}`);
+  return fixture();
+}
+function renderPreview(name) {
+  const banner = document.getElementById("preview-banner");
+  if (banner) {
+    banner.hidden = false;
+    banner.textContent = `Preview — “${name}”. Nothing here can be approved; no ceremony exists.`;
+  }
+  const pageTitle = document.getElementById("page-title");
+  if (pageTitle) pageTitle.textContent = "Preview";
+  const pageLede = document.getElementById("page-lede");
+  if (pageLede) {
+    pageLede.textContent = "A rendering of the review page, drawn by the same code the Broker " +
+      "serves. It authorises nothing.";
+  }
+  const session = previewSession(name);
+  if (session.preview_terminal === "cancelled") {
+    panelKicker.textContent = "Done";
+    panelTitle.textContent = "Cancelled — nothing was signed";
+    reviewNode.replaceChildren(el("p", {class: "summary"},
+      "You cancelled this ceremony. No signature was created and nothing was broadcast."));
+  } else {
+    renderReview(session);
+  }
+  approve.hidden = true;
+  cancel.hidden = true;
+  statusNode.textContent = session.preview_status || "Preview";
+}
+
 async function load() {
+  if (location.pathname.startsWith("/preview")) {
+    const name = location.pathname.slice("/preview".length).replace(/^\//, "") || "index";
+    if (name === "index") {
+      const pageTitle = document.getElementById("page-title");
+      if (pageTitle) pageTitle.textContent = "Previews";
+      statusNode.textContent = "Choose a preview";
+      reviewNode.replaceChildren(el("ul", {class: "words"},
+        ...Object.keys(PREVIEWS).map(key =>
+          el("li", {}, el("a", {href: `/preview/${key}`}, key)))));
+      approve.hidden = true;
+      cancel.hidden = true;
+      return;
+    }
+    renderPreview(name);
+    return;
+  }
   await cryptoSelfTest();
   await purgeExpiredBrowserState();
   if (token.length !== 43) {

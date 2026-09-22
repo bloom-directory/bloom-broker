@@ -395,7 +395,8 @@ renderReview(session({{
   calldata_bytes: "1234", calldata_keccak: "0x1234"
 }}));
 rendered = allText(nodes.review);
-for (const expected of ["Approve one contract call", "1,234 bytes", "0x1234"]) {{
+// An uninterpretable call says so, and still discloses the exact input.
+for (const expected of ["Approve a call Bloom cannot read", "1,234 bytes", "0x1234"]) {{
   if (!rendered.includes(expected)) throw new Error(`contract call not disclosed ${{expected}}: ${{rendered}}`);
 }}
 
@@ -413,7 +414,7 @@ renderReview(session({{
   calldata_bytes: "5", calldata_keccak: "0xcafe"
 }}));
 rendered = allText(nodes.review);
-for (const expected of ["Deploy one contract", "Deploy contract (CREATE)", "Initcode", "5 bytes", "0xcafe"]) {{
+for (const expected of ["Deploy a contract", "Initcode", "5 bytes", "0xcafe"]) {{
   if (!rendered.includes(expected)) throw new Error(`creation not disclosed ${{expected}}: ${{rendered}}`);
 }}
 "#
@@ -6739,4 +6740,181 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         .await
         .unwrap();
     assert_eq!(replay_after_ack.status(), StatusCode::FORBIDDEN);
+}
+
+/// The review's semantics come from the typed intent Broker froze, not from
+/// anything a publisher controls. These assertions are the boundary: rename
+/// every label, reverse the field order, put markup in the names, and the
+/// heading, the roles and the classification must not move.
+#[test]
+fn the_clear_signed_review_reads_its_meaning_only_from_the_typed_intent() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = "";
+                       this.attrs = {{}}; this.hidden = false; }}
+  setAttribute(key, value) {{ this.attrs[key] = value; }}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+function find(node, predicate) {{
+  if (typeof node === "string") return null;
+  if (predicate(node)) return node;
+  for (const child of node.children) {{
+    const hit = find(child, predicate);
+    if (hit) return hit;
+  }}
+  return null;
+}}
+function show(name) {{
+  const session = previewSession(name);
+  renderReview(session);
+  const root = {{textContent: "", innerHTML: "", children: nodes.review.children}};
+  const intent = find(root, n => String(n.className || "").includes("ceremony-intent"));
+  const details = nodes.review.children.filter(child => child?.name === "details");
+  return {{
+    all: allText(root),
+    primary: allText({{textContent: "", innerHTML: "", children:
+      nodes.review.children.filter(child => child?.name !== "details")}}),
+    technical: details.map(allText).join(" "),
+    heading: allText(find(root, n => String(n.className || "").includes("ceremony-heading")) || "")
+      .replace(/\s+/g, " ").trim(),
+    action: intent?.attrs?.["data-action"],
+    magnitude: intent?.attrs?.["data-magnitude"],
+    roles: [].concat(...nodes.review.children.map(function collect(n) {{
+      if (typeof n === "string") return [];
+      const here = String(n.className || "").includes("ceremony-party") && n.attrs?.["data-role"]
+        ? [n.attrs["data-role"]] : [];
+      return here.concat(...n.children.map(collect));
+    }})),
+    button: nodes.approve.textContent
+  }};
+}}
+
+// A transfer names the amount and the recipient, and the recipient is a
+// recipient — never the contract, never a generic "To".
+let view = show("transfer");
+if (view.heading !== "Send 250 BDT") throw new Error(`transfer heading: ${{view.heading}}`);
+if (view.action !== "transfer") throw new Error(`transfer action: ${{view.action}}`);
+if (!view.roles.includes("recipient")) throw new Error(`transfer roles: ${{view.roles}}`);
+if (view.roles.includes("spender")) throw new Error("a transfer must not name a spender");
+if (view.button !== "Approve transfer") throw new Error(`transfer button: ${{view.button}}`);
+// Identity is the address. A name may accompany it and must never stand in.
+if (!view.primary.includes("0x9fE46736679d2d9a65F0992F2272dE9f3c7fa6e0")) {{
+  throw new Error("the recipient address is not on the page");
+}}
+if (!view.primary.includes("0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512")) {{
+  throw new Error("the token contract address is not on the page");
+}}
+// The envelope's zero native value must not read as the thing being sent.
+if (view.primary.includes("0 ETH")) throw new Error(`primary showed the native zero: ${{view.primary}}`);
+for (const detail of ["5f2a1c6b8d4e0937ab55c1e8d0f34721aa9c6b5e4d3f2a1908b7c6d5e4f302915", "65410"]) {{
+  if (view.primary.includes(detail)) throw new Error(`primary exposed ${{detail}}`);
+  if (!view.technical.includes(detail)) throw new Error(`technical details omitted ${{detail}}`);
+}}
+
+// A finite allowance states the cap and that it is a total, and the
+// counterparty is a spender.
+view = show("allowance-finite");
+if (!view.heading.includes("to spend up to 100 BDT")) throw new Error(`finite heading: ${{view.heading}}`);
+if (view.magnitude !== "finite") throw new Error(`finite magnitude: ${{view.magnitude}}`);
+if (!view.roles.includes("spender")) throw new Error(`finite roles: ${{view.roles}}`);
+if (view.button !== "Approve allowance") throw new Error(`finite button: ${{view.button}}`);
+if (!view.primary.includes("not added to any existing allowance")) {{
+  throw new Error("the total-not-increment warning is not visible");
+}}
+
+// Zero is a revocation, not a cap of zero.
+view = show("allowance-zero");
+if (!view.heading.includes("allowance to zero")) throw new Error(`zero heading: ${{view.heading}}`);
+if (view.magnitude !== "zero") throw new Error(`zero magnitude: ${{view.magnitude}}`);
+if (view.heading.includes("spend up to")) throw new Error("zero read as a spending cap");
+
+// Unlimited says so in the heading, and does not lead with the U256 maximum.
+view = show("allowance-unlimited");
+if (view.heading !== "Allow unlimited BDT spending") throw new Error(`unlimited heading: ${{view.heading}}`);
+if (view.magnitude !== "unlimited") throw new Error(`unlimited magnitude: ${{view.magnitude}}`);
+if (view.heading.includes("115792089")) throw new Error("the U256 maximum led the heading");
+if (!view.primary.includes("UNLIMITED ALLOWANCE")) throw new Error("the unlimited warning is not visible");
+// The exact value is still recoverable, at full precision, further down.
+if (!view.all.includes("115792089237316195423570985008687907853269984665640564039457584007913129639")) {{
+  throw new Error("the exact maximum lost precision");
+}}
+
+// An uninterpretable call says so instead of drawing a transfer.
+view = show("opaque-call");
+if (view.action !== "opaque") throw new Error(`opaque action: ${{view.action}}`);
+if (!view.primary.includes("cannot say what")) throw new Error(`opaque detail: ${{view.primary}}`);
+
+// A batch keeps every member, in order, under one approval.
+view = show("batch");
+if (view.action !== "batch") throw new Error(`batch action: ${{view.action}}`);
+if (!view.primary.includes("Transaction 1") || !view.primary.includes("Transaction 2")) {{
+  throw new Error("batch members are not listed in order");
+}}
+if (view.primary.indexOf("Transaction 1") > view.primary.indexOf("Transaction 2")) {{
+  throw new Error("batch members are out of order");
+}}
+if (view.button !== "Approve all transactions") throw new Error(`batch button: ${{view.button}}`);
+
+// Markup in a publisher's name is text, not markup, and does not reach innerHTML.
+view = show("long-identity");
+if (view.all.includes("<script>alert(1)</script>") === false) {{
+  throw new Error("the publisher name was dropped rather than shown inertly");
+}}
+if (nodes.review.children.some(function live(n) {{
+  if (typeof n === "string") return false;
+  return String(n.innerHTML || "").includes("<script>") || n.children.some(live);
+}})) {{
+  throw new Error("publisher text reached innerHTML");
+}}
+
+// Relabelling and reordering every descriptor field cannot move the meaning.
+const renamed = previewSession("transfer");
+const plan = JSON.parse(renamed.review_manifest.canonical_plan);
+const call = plan.evm_review.payloads[0].contract_call;
+call.fields = call.fields.slice().reverse().map((field, index) => Object.assign({{}}, field, {{
+  label: index === 0 ? "Beneficiary" : "Quantity of value"
+}}));
+call.intent = "Totally different publisher story";
+renamed.review_manifest.canonical_plan = JSON.stringify(plan);
+renderReview(renamed);
+const relabelled = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
+if (!relabelled.includes("Send 250 BDT")) {{
+  throw new Error(`relabelling changed the heading: ${{relabelled}}`);
+}}
+if (!relabelled.includes("Beneficiary")) {{
+  throw new Error("the publisher's own label stopped being shown beside its argument");
+}}
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

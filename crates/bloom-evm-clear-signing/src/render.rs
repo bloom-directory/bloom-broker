@@ -60,6 +60,34 @@ pub struct TokenIdentity {
     pub decimals: u8,
 }
 
+/// The decoded instruction, typed.
+///
+/// The page states what the owner is deciding from this, never from a
+/// publisher's label, the order the fields happen to be in, or the wording of
+/// a warning. It is a projection of the same strictly decoded arguments the
+/// safety rules already ran on: not a second decoding, and not a new
+/// authority over what a call means. Only the two canonical ERC-20 actions
+/// get one; everything else stays generic rather than guessed at, and a
+/// record written before this existed renders generically too.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallIntent {
+    /// `transfer` or `allowance`.
+    pub action: String,
+    /// `recipient` for a transfer, `spender` for an allowance. They are not
+    /// interchangeable and must never share one label on the page.
+    pub counterparty_role: String,
+    pub counterparty: String,
+    /// Exact base units, as decoded. `amount_display` is derived from this;
+    /// nothing reads the display string back.
+    pub amount: String,
+    pub amount_display: String,
+    /// `zero`, `finite` or `unlimited`, decided on the decoded integer rather
+    /// than on its rendering.
+    pub magnitude: String,
+    pub token: TokenIdentity,
+}
+
 /// The reviewed contract call, as it is frozen into the manifest.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -76,6 +104,9 @@ pub struct ClearSignedCall {
     pub fields: Vec<DisplayField>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<TokenIdentity>,
+    /// Present only for the canonical ERC-20 actions; see [`CallIntent`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_summary: Option<CallIntent>,
     pub warnings: Vec<String>,
 }
 
@@ -239,7 +270,8 @@ pub fn review_call(
             format_timestamp_ms(entry.observed_at_ms.get())
         ));
     }
-    let action = apply_safety_rules(call, &leaves, entry, context, &mut warnings)?;
+    let (action, intent_summary) =
+        apply_safety_rules(call, &leaves, entry, context, &mut warnings)?;
 
     Ok((
         ClearSignedCall {
@@ -251,6 +283,7 @@ pub fn review_call(
             intent: call.intent.clone(),
             fields,
             token: SelectedEntry::of(entry).token,
+            intent_summary,
             warnings,
         },
         used,
@@ -323,7 +356,7 @@ fn apply_safety_rules(
     entry: &CatalogEntry,
     context: &CallContext<'_>,
     warnings: &mut Vec<String>,
-) -> Result<ActionClass, ReviewError> {
+) -> Result<(ActionClass, Option<CallIntent>), ReviewError> {
     let canonical = Function::parse(&call.signature)
         .map_err(|error| invalid(error.to_string()))?
         .signature();
@@ -355,7 +388,7 @@ fn apply_safety_rules(
         _ => {}
     }
     if call.action_class == ActionClass::Other {
-        return Ok(ActionClass::Other);
+        return Ok((ActionClass::Other, None));
     }
     let (DynSolValue::Address(counterparty), DynSolValue::Uint(amount, _)) =
         (&leaves[0], &leaves[1])
@@ -375,20 +408,43 @@ fn apply_safety_rules(
             "the catalog has no decimals for this token, so its amount cannot be shown",
         ));
     }
+    // The identity every typed intent is denominated in. `token_metadata` was
+    // just proved present, and for these two calls the target contract is the
+    // token, so this is the same identity the fields were rendered against.
+    let identity = SelectedEntry::of(entry)
+        .token
+        .expect("ERC-20 rules already required the catalog's token metadata");
+    let summary = |action: &str, role: &str, magnitude: &str| CallIntent {
+        action: action.to_owned(),
+        counterparty_role: role.to_owned(),
+        counterparty: checksum(&format!("0x{counterparty:x}")),
+        amount: amount.to_string(),
+        amount_display: format!(
+            "{} {}",
+            format_base_units(&amount.to_string(), identity.decimals),
+            identity.symbol
+        ),
+        magnitude: magnitude.to_owned(),
+        token: identity.clone(),
+    };
     if call.action_class == ActionClass::Transfer {
         if format!("0x{:x}", counterparty) == entry.contract_address {
             return Err(invalid(
                 "the token contract is not a valid recipient of its own transfer",
             ));
         }
-        return Ok(ActionClass::Transfer);
+        return Ok((
+            ActionClass::Transfer,
+            Some(summary("transfer", "recipient", "finite")),
+        ));
     }
     warnings.push(
         "An allowance lets this spender move your tokens later, with no further Bloom approval. It does not expire when this approval expires."
             .to_owned(),
     );
-    if amount.is_zero() {
+    let magnitude = if amount.is_zero() {
         warnings.push("This sets the spender's allowance to zero, clearing it.".to_owned());
+        "zero"
     } else if *amount == U256::MAX {
         if !context.unlimited_allowance_allowed {
             return Err(ReviewError::new(
@@ -400,14 +456,19 @@ fn apply_safety_rules(
             "UNLIMITED ALLOWANCE. This spender may move every token of this kind you now hold or later receive."
                 .to_owned(),
         );
+        "unlimited"
     } else {
         warnings.push(
             "This sets the spender's total allowance to the amount shown. It is not added to any existing allowance."
                 .to_owned(),
         );
-    }
+        "finite"
+    };
     let _ = context.chain_id;
-    Ok(ActionClass::Allowance)
+    Ok((
+        ActionClass::Allowance,
+        Some(summary("allowance", "spender", magnitude)),
+    ))
 }
 
 fn render_field(

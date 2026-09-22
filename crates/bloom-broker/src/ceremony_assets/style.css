@@ -39,3 +39,65 @@ button{font:600 15px/1.2 var(--sans);letter-spacing:0}button.secondary{font-weig
 .facts.technical{gap:7px 16px}.facts.technical dd{font-size:13.5px;color:var(--ink-2)}.facts.technical dd code{font-size:12px}
 details.signed.technical{margin-top:14px}
 details.signed pre{max-height:26vh}
+
+/* ───────────────────────────────────────────────────────────────────────────
+   Ceremony review components.
+
+   The supported customisation surface is the custom properties below plus the
+   stable class names (.ceremony-intent, .ceremony-eyebrow, .ceremony-heading,
+   .ceremony-detail, .ceremony-flow, .ceremony-party, .ceremony-relation,
+   .ceremony-warning, .ceremony-card, .ceremony-details, .ceremony-actions)
+   and the [data-action] / [data-magnitude] hooks on .ceremony-intent.
+   Meaningful text is always DOM content, never CSS-generated: a theme that
+   drops every rule still shows the whole review.
+
+   An owner theme is trusted UI code. Arbitrary CSS can hide a warning or a
+   button, and nothing here prevents that.
+   ─────────────────────────────────────────────────────────────────────────── */
+:root{
+  --ceremony-bg:var(--paper);
+  --ceremony-surface:var(--surface);
+  --ceremony-text:var(--ink);
+  --ceremony-muted:var(--muted);
+  --ceremony-border:var(--rule);
+  --ceremony-accent:var(--accent);
+  --ceremony-warning:var(--accent-deep);
+  --ceremony-warning-surface:rgba(138,42,58,.06);
+  --ceremony-danger:var(--error);
+  --ceremony-font:var(--sans);
+  --ceremony-font-display:var(--serif);
+  --ceremony-font-mono:var(--mono);
+  --ceremony-space:16px;
+  --ceremony-radius:12px;
+}
+.ceremony-intent{margin:0 0 var(--ceremony-space);padding:18px 20px;border:1px solid var(--ceremony-border);border-left:4px solid var(--ceremony-accent);border-radius:var(--ceremony-radius);background:var(--ceremony-surface)}
+.ceremony-eyebrow{margin:0;color:var(--ceremony-muted);font-family:var(--ceremony-font-mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase}
+.ceremony-heading{margin:6px 0 0;font-family:var(--ceremony-font-display);font-size:clamp(24px,3.4vw,32px);font-weight:400;line-height:1.15;color:var(--ceremony-text);overflow-wrap:anywhere}
+.ceremony-detail{margin:10px 0 0;color:var(--ceremony-muted);font-size:14px;line-height:1.55}
+/* An unlimited permission is the one case where the heading itself is the
+   warning, so it carries the warning colour rather than the accent. */
+.ceremony-intent[data-magnitude="unlimited"]{border-left-color:var(--ceremony-danger);background:var(--ceremony-warning-surface)}
+.ceremony-intent[data-magnitude="unlimited"] .ceremony-heading{color:var(--ceremony-danger)}
+.ceremony-intent[data-action="opaque"]{border-left-style:dashed}
+/* Source → relationship → destination. The arrow is decoration; the words
+   carry the meaning, so a narrow screen simply stacks them. */
+.ceremony-flow{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px;margin:0 0 var(--ceremony-space)}
+.ceremony-party{min-width:0;padding:12px 14px;border:1px solid var(--ceremony-border);border-radius:var(--ceremony-radius);background:var(--ceremony-surface)}
+.ceremony-party-label{margin:0;color:var(--ceremony-muted);font-family:var(--ceremony-font-mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase}
+.ceremony-party-address{margin:5px 0 0}
+.ceremony-party-address code{font-family:var(--ceremony-font-mono);font-size:13px;color:var(--ceremony-text);overflow-wrap:anywhere;user-select:all}
+.ceremony-relation{margin:0;color:var(--ceremony-muted);font-size:13px;text-align:center}
+.ceremony-relation::after{content:"";display:block;margin:4px auto 0;width:28px;border-top:1px solid var(--ceremony-border)}
+.ceremony-party-none{color:var(--ceremony-muted);font-size:13px}
+.ceremony-card{margin:0 0 var(--ceremony-space);padding-left:14px;border-left:2px solid var(--ceremony-border)}
+.ceremony-card-position{margin:0 0 6px;color:var(--ceremony-muted);font-family:var(--ceremony-font-mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase}
+.ceremony-warning{border-color:var(--ceremony-warning);background:var(--ceremony-warning-surface);color:var(--ceremony-warning)}
+@media(max-width:560px){
+  .ceremony-flow{grid-template-columns:1fr}
+  .ceremony-relation{text-align:left}
+  .ceremony-relation::after{margin-left:0}
+}
+@media(prefers-reduced-motion:reduce){.ceremony-intent,.ceremony-party{transition:none}}
+:focus-visible{outline:3px solid var(--ceremony-accent);outline-offset:2px}
+/* Previews are unmistakable and carry no controls. */
+.preview-banner{margin:0;padding:12px 20px;border-bottom:1px solid var(--ceremony-border);background:repeating-linear-gradient(135deg,rgba(138,42,58,.10),rgba(138,42,58,.10) 10px,transparent 10px,transparent 20px);color:var(--ceremony-warning);font-family:var(--ceremony-font-mono);font-size:12px}
