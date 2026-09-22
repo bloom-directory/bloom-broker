@@ -141,10 +141,22 @@ function fmtRemaining(ms) {
 }
 let expiryTimer = null;
 function startExpiry(session, node) {
+  clearInterval(expiryTimer);
   const expiresAt = Number(session.expires_at_ms ||
     session.signer_contribution?.expires_at_ms ||
     session.review_manifest?.expires_at_ms);
-  if (!Number.isFinite(expiresAt) || !node) return;
+  const deadline = document.getElementById("review-deadline");
+  if (!Number.isFinite(new Date(expiresAt).getTime()) || !node) {
+    if (deadline) deadline.textContent = "";
+    return;
+  }
+  const absolute = new Date(expiresAt).toLocaleString(undefined, {
+    month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit", timeZoneName: "short"
+  });
+  if (deadline) {
+    deadline.textContent = `${session.is_preview ? "Example deadline" : "Approve by"}: ${absolute}`;
+    deadline.setAttribute("title", new Date(expiresAt).toISOString());
+  }
   const tick = () => {
     const left = expiresAt - Date.now();
     node.textContent = left <= 0 ? "Expired — ask Bloom to start this again"
@@ -157,7 +169,7 @@ function startExpiry(session, node) {
     }
   };
   tick();
-  expiryTimer = setInterval(tick, 1000);
+  if (!session.is_preview) expiryTimer = setInterval(tick, 1000);
 }
 
 function chainLabel(chain, ctx) {
@@ -171,12 +183,71 @@ function chainLabel(chain, ctx) {
 
 function addressExplorer(chainId, address) {
   if (!/^0x[0-9a-fA-F]{40}$/.test(address)) return null;
+  // Etherscan public chainlist snapshot, 2026-09-22: https://api.etherscan.io/v2/chainlist
   const explorers = {
-    "1": ["Etherscan", "https://etherscan.io"],
-    "8453": ["Basescan", "https://basescan.org"],
-    "42161": ["Arbiscan", "https://arbiscan.io"],
-    "10": ["Optimism Etherscan", "https://optimistic.etherscan.io"],
-    "137": ["Polygonscan", "https://polygonscan.com"]
+    "1": ["etherscan.io", "https://etherscan.io"],
+    "11155111": ["sepolia.etherscan.io", "https://sepolia.etherscan.io"],
+    "560048": ["hoodi.etherscan.io", "https://hoodi.etherscan.io"],
+    "56": ["bscscan.com", "https://bscscan.com"],
+    "97": ["testnet.bscscan.com", "https://testnet.bscscan.com"],
+    "137": ["polygonscan.com", "https://polygonscan.com"],
+    "80002": ["amoy.polygonscan.com", "https://amoy.polygonscan.com"],
+    "8453": ["basescan.org", "https://basescan.org"],
+    "84532": ["sepolia.basescan.org", "https://sepolia.basescan.org"],
+    "42161": ["arbiscan.io", "https://arbiscan.io"],
+    "421614": ["sepolia.arbiscan.io", "https://sepolia.arbiscan.io"],
+    "59144": ["lineascan.build", "https://lineascan.build"],
+    "59141": ["sepolia.lineascan.build", "https://sepolia.lineascan.build"],
+    "81457": ["blastscan.io", "https://blastscan.io"],
+    "168587773": ["sepolia.blastscan.io", "https://sepolia.blastscan.io"],
+    "10": ["optimistic.etherscan.io", "https://optimistic.etherscan.io"],
+    "11155420": ["sepolia-optimism.etherscan.io", "https://sepolia-optimism.etherscan.io"],
+    "43114": ["snowscan.xyz", "https://snowscan.xyz"],
+    "43113": ["testnet.snowscan.xyz", "https://testnet.snowscan.xyz"],
+    "199": ["bttcscan.com", "https://bttcscan.com"],
+    "1029": ["testnet.bttcscan.com", "https://testnet.bttcscan.com"],
+    "42220": ["celoscan.io", "https://celoscan.io"],
+    "11142220": ["sepolia.celoscan.io", "https://sepolia.celoscan.io"],
+    "252": ["fraxscan.com", "https://fraxscan.com"],
+    "2523": ["hoodi.fraxscan.com", "https://hoodi.fraxscan.com"],
+    "100": ["gnosisscan.io", "https://gnosisscan.io"],
+    "5000": ["mantlescan.xyz", "https://mantlescan.xyz"],
+    "5003": ["sepolia.mantlescan.xyz", "https://sepolia.mantlescan.xyz"],
+    "4352": ["memecorescan.io", "https://memecorescan.io"],
+    "43522": ["testnet.memecorescan.io", "https://testnet.memecorescan.io"],
+    "204": ["opbnb.bscscan.com", "https://opbnb.bscscan.com"],
+    "5611": ["opbnb-testnet.bscscan.com", "https://opbnb-testnet.bscscan.com"],
+    "167000": ["taikoscan.io", "https://taikoscan.io"],
+    "167013": ["hoodi.taikoscan.io", "https://hoodi.taikoscan.io"],
+    "50": ["xdcscan.com", "https://xdcscan.com"],
+    "51": ["testnet.xdcscan.com", "https://testnet.xdcscan.com"],
+    "33139": ["apescan.io", "https://apescan.io"],
+    "33111": ["curtis.apescan.io", "https://curtis.apescan.io"],
+    "480": ["worldscan.org", "https://worldscan.org"],
+    "4801": ["sepolia.worldscan.org", "https://sepolia.worldscan.org"],
+    "146": ["sonicscan.org", "https://sonicscan.org"],
+    "14601": ["testnet.sonicscan.org", "https://testnet.sonicscan.org"],
+    "130": ["uniscan.xyz", "https://uniscan.xyz"],
+    "1301": ["sepolia.uniscan.xyz", "https://sepolia.uniscan.xyz"],
+    "2741": ["abscan.org", "https://abscan.org"],
+    "11124": ["sepolia.abscan.org", "https://sepolia.abscan.org"],
+    "80094": ["berascan.com", "https://berascan.com"],
+    "80069": ["testnet.berascan.com", "https://testnet.berascan.com"],
+    "143": ["monadscan.com", "https://monadscan.com"],
+    "10143": ["testnet.monadscan.com", "https://testnet.monadscan.com"],
+    "999": ["hyperevmscan.io", "https://hyperevmscan.io"],
+    "747474": ["katanascan.com", "https://katanascan.com"],
+    "737373": ["bokuto.katanascan.com", "https://bokuto.katanascan.com"],
+    "1329": ["seiscan.io", "https://seiscan.io"],
+    "1328": ["testnet.seiscan.io", "https://testnet.seiscan.io"],
+    "988": ["stablescan.xyz", "https://stablescan.xyz"],
+    "2201": ["testnet.stablescan.xyz", "https://testnet.stablescan.xyz"],
+    "9745": ["plasmascan.to", "https://plasmascan.to"],
+    "9746": ["testnet.plasmascan.to", "https://testnet.plasmascan.to"],
+    "4326": ["mega.etherscan.io", "https://mega.etherscan.io"],
+    "6343": ["testnet-mega.etherscan.io", "https://testnet-mega.etherscan.io"],
+    "4663": ["robin.etherscan.io", "https://robin.etherscan.io"],
+    "5042": ["arc.etherscan.io", "https://arc.etherscan.io"]
   };
   const explorer = explorers[String(chainId)];
   return Array.isArray(explorer) ? {name: explorer[0], url: `${explorer[1]}/address/${address}`} : null;
@@ -245,8 +316,7 @@ function callIntent(call) {
     action: "allowance", magnitude: "finite",
     eyebrow: "Token allowance",
     heading: `Allow ${who} to spend up to ${summary.amount_display}`,
-    detail: "This sets the total allowance to that amount — it is not added to any allowance " +
-      "already in place. The spender can use it without a new approval for each transfer.",
+    detail: "",
     relation: `may spend up to ${summary.amount_display} of`
   };
 }
@@ -341,9 +411,13 @@ function describeTransfer(manifest) {
     const clear = plan.evm_review?.clear_signing;
     const calls = evmPayloads.filter(payload => payload.contract_call);
     for (const [index, payload] of evmPayloads.entries()) {
+      const factStart = facts.length;
+      const technicalStart = technical.length;
       const prefix = evmPayloads.length > 1 ? `Transaction ${index + 1}` : "";
       if (payload.contract_call) appendCallFacts(facts, technical, payload, prefix);
       appendEnvelopeFacts(facts, technical, payload, prefix);
+      for (const row of facts.slice(factStart)) row[3] = payload.chain_id;
+      for (const row of technical.slice(technicalStart)) row[3] = payload.chain_id;
     }
     // Every mandatory warning, in the order the verifier produced it, kept
     // visible rather than folded into the fact list or the details section.
@@ -369,9 +443,11 @@ function describeTransfer(manifest) {
           action: "batch", eyebrow: `${evmPayloads.length} transactions, in order`,
           heading: `Approve ${evmPayloads.length} transactions on ${network}`,
           detail: "One approval covers every transaction listed below. They are signed in the " +
-            "order shown and there is no way to approve only part of the batch.",
+            "order shown and there is no way to approve only part of the batch. " +
+            "Execution is not atomic: an earlier transaction can succeed even if a later one fails.",
           cards: evmPayloads.map((payload, index) => ({
             position: index + 1,
+            chainId: payload.chain_id,
             intent: payload.contract_call
               ? callIntent(payload.contract_call)
               : {action: payload.destination ? "send" : "deploy",
@@ -453,7 +529,7 @@ function describeTransfer(manifest) {
     }
     const networkIdentity = evmPayloads.length === 1
       ? `EVM · ${network} · Chain ID ${first.chain_id}` : null;
-    return {intent, parties, assurance, interpretation, facts, technical, warnings, networkIdentity,
+    return {intent, parties: parties.map(party => ({...party, chainId: first.chain_id})), assurance, interpretation, facts, technical, warnings, networkIdentity,
             chainId: evmPayloads.length === 1 ? first.chain_id : null,
             assetSummary: evmPayloads.length === 1 ? summary : null,
             networkIcon: {"1": "ethereum", "8453": "base", "31337": "test"}[first.chain_id] || "unknown",
@@ -704,9 +780,12 @@ function renderReview(session) {
   }
 
   const facts = el("dl", {class: "facts"});
-  const fact = (label, value, mono) => {
+  const fact = (label, value, mono, chainId = transfer?.chainId) => {
     if (value == null || value === "") return;
-    facts.append(el("dt", {}, label), el("dd", {}, mono ? el("code", {}, value) : value));
+    const explorer = addressExplorer(chainId, String(value));
+    const shown = explorer ? el("a", {href: explorer.url, class: "ceremony-address-link", target: "_blank", rel: "noopener noreferrer", referrerpolicy: "no-referrer"}, el("code", {}, value))
+      : mono ? el("code", {}, value) : value;
+    facts.append(el("dt", {}, label), el("dd", {}, shown));
   };
   const ref = contribution.key_ref;
   const keyInfo = describeKey(ref);
@@ -766,8 +845,8 @@ function renderReview(session) {
   }
   if (transfer) {
     if (keyInfo.account) fact("From", keyInfo.account);
-    for (const [label, value, mono] of transfer.facts) {
-      if (!contextualFacts.has(label)) fact(label, value, mono);
+    for (const [label, value, mono, chainId] of transfer.facts) {
+      if (!contextualFacts.has(label)) fact(label, value, mono, chainId);
     }
   } else if (keyInfo.account) {
     fact("Account", keyInfo.account);
@@ -779,7 +858,7 @@ function renderReview(session) {
   }
   const expiry = el("span", {class: "expiry"});
   const expiryHost = document.getElementById("action-expiry");
-  if (expiryHost) expiryHost.replaceChildren(el("span", {}, "Expires "), expiry);
+  if (expiryHost) expiryHost.replaceChildren(expiry);
   else facts.append(el("dt", {}, "Expires"), el("dd", {}, expiry));
   if (kind === "sealed_approval") {
     for (const item of session.review_manifest?.attributed_advisory_items || []) warns.push(item);
@@ -798,8 +877,7 @@ function renderReview(session) {
     if (party.name) row.append(el("p", {class: "ceremony-party-name"}, party.name));
     if (party.change) row.append(el("span", {class: `ceremony-balance-change ${party.role === "source" ? "outgoing" : "incoming"}`}, party.change));
     const address = el("code", {}, party.value);
-    const explorer = ["token", "contract"].includes(party.role)
-      ? addressExplorer(transfer?.chainId, party.value) : null;
+    const explorer = addressExplorer(party.chainId || transfer?.chainId, party.value);
     const identity = explorer ? el("a", {class: "ceremony-address-link", href: explorer.url,
       target: "_blank", rel: "noopener noreferrer", referrerpolicy: "no-referrer",
       title: `View on ${explorer.name} (opens a new tab)`,
@@ -859,7 +937,7 @@ function renderReview(session) {
         intentBlock(card.intent, true));
       if (card.counterparty) {
         wrapper.append(el("div", {class: "ceremony-identity"},
-          partyRow({role: "counterparty", label: "To", value: card.counterparty})));
+          partyRow({role: "counterparty", label: "To", value: card.counterparty, chainId: card.chainId})));
       }
       parts.push(wrapper);
     }
@@ -908,8 +986,11 @@ function renderReview(session) {
   }
   if (transfer?.technical?.length) {
     const technical = el("dl", {class: "facts technical"});
-    for (const [label, value, mono] of transfer.technical) {
-      technical.append(el("dt", {}, label), el("dd", {}, mono ? el("code", {}, value) : value));
+    for (const [label, value, mono, chainId] of transfer.technical) {
+      const explorer = addressExplorer(chainId, String(value));
+      const shown = explorer ? el("a", {href: explorer.url, class: "ceremony-address-link", target: "_blank", rel: "noopener noreferrer", referrerpolicy: "no-referrer"}, el("code", {}, value))
+        : mono ? el("code", {}, value) : value;
+      technical.append(el("dt", {}, label), el("dd", {}, shown));
     }
     parts.push(el("details", {class: "signed technical"},
       el("summary", {}, "Technical details — nonce, fees, exact byte commitments"),
@@ -1493,7 +1574,7 @@ const PREVIEWS = {
 function previewSession(name) {
   const fixture = PREVIEWS[name];
   if (!fixture) throw new Error(`Unknown preview: ${name}`);
-  return fixture();
+  return {...fixture(), is_preview: true};
 }
 function renderPreview(name) {
   const banner = document.getElementById("preview-banner");
