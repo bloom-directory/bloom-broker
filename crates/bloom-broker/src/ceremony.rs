@@ -1950,6 +1950,7 @@ impl CeremonyBroker {
         now_ms: u64,
         backoff_clock: BackoffClock,
     ) -> Result<(), ProtocolError> {
+        let _guard = self.inner.creation_admission.lock();
         self.expire_sessions(now_ms)?;
         let ceremony_id = self
             .inner
@@ -1991,6 +1992,26 @@ impl CeremonyBroker {
             .signer
             .cancel(operation_id)
             .map_err(signer_error_to_machine)?;
+        // Both tabs belong to one operation. Leaving its auxiliary source live
+        // would strand the wallet's admission slot after a successful cancel.
+        let auxiliary = self
+            .inner
+            .sessions
+            .lock()
+            .iter()
+            .filter(|(_, session)| {
+                session.auxiliary
+                    && &session.operation_id == operation_id
+                    && !is_terminal(session.state)
+            })
+            .map(|(id, session)| (id.clone(), session.clone()))
+            .collect::<Vec<_>>();
+        for (id, mut source) in auxiliary {
+            source.state = CeremonyState::Cancelled;
+            latch_terminal(&mut source, now_ms);
+            self.persist_session(&source)?;
+            self.inner.sessions.lock().insert(id, source);
+        }
         self.persist_session(&snapshot)?;
         self.inner.sessions.lock().insert(ceremony_id, snapshot);
         if let Some(wallet_id) = &wallet_id {
