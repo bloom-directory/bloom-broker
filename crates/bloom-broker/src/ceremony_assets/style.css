@@ -20,22 +20,21 @@
  */
 :root{
   /* Palette */
-  --ceremony-bg:#f4efe6;
-  --ceremony-surface:#fffdf9;
-  --ceremony-text:#15130f;
-  --ceremony-muted:#6b6355;
-  --ceremony-border:#ddd2bf;
+  --ceremony-bg:#f5f4f2;
+  --ceremony-surface:#ffffff;
+  --ceremony-text:#242326;
+  --ceremony-muted:#646169;
+  --ceremony-border:#e5e2e4;
   --ceremony-accent:#8a2a3a;
   --ceremony-accent-deep:#5e1a26;
   --ceremony-warning:#7a4a10;
   --ceremony-warning-surface:#fdf3e2;
   --ceremony-danger:#8a1f2b;
-  --ceremony-danger-surface:#fbeceh;
   --ceremony-danger-surface:#fceced;
   --ceremony-success:#355f47;
   /* Type */
   --ceremony-font:"Avenir Next",Inter,system-ui,-apple-system,"Segoe UI",sans-serif;
-  --ceremony-font-display:"Iowan Old Style","Palatino Linotype",Georgia,serif;
+  --ceremony-font-display:var(--ceremony-font);
   --ceremony-font-mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace;
   --ceremony-text-size:16px;
   --ceremony-address-size:15px;
@@ -63,34 +62,39 @@ body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-f
 .brand-context{margin:0 0 0 auto;text-align:right}
 
 .panel{border:1px solid var(--ceremony-border);border-radius:var(--ceremony-radius);background:var(--ceremony-surface)}
-.panel-header{padding:var(--ceremony-padding) var(--ceremony-padding) var(--ceremony-space-2)}
+.panel-header{padding:var(--ceremony-padding) var(--ceremony-padding) var(--ceremony-space-3)}
 .panel-context{margin:0 0 var(--ceremony-space-1);color:var(--ceremony-muted);font-size:14px}
-.panel-title{margin:0;font:400 var(--ceremony-heading-size)/1.15 var(--ceremony-font-display)}
+.panel-title{margin:0;font:600 var(--ceremony-heading-size)/1.2 var(--ceremony-font-display);letter-spacing:-.025em;overflow-wrap:anywhere}
 #status{margin:var(--ceremony-space-1) 0 0;color:var(--ceremony-muted);font-size:14px}
-#review{padding:var(--ceremony-space-2) var(--ceremony-padding) var(--ceremony-padding)}
+#status:empty{display:none}
+#review{padding:0 var(--ceremony-padding) var(--ceremony-padding)}
 #review>*+*{margin-top:var(--ceremony-space-3)}
 
 /* The action. One heading, at the largest size on the page. */
 .ceremony-intent{margin:0}
 .ceremony-eyebrow{margin:0;color:var(--ceremony-muted);font-size:14px}
-.ceremony-heading{margin:var(--ceremony-space-1) 0 0;font:400 var(--ceremony-heading-size)/1.15 var(--ceremony-font-display);overflow-wrap:anywhere}
-.ceremony-detail{margin:var(--ceremony-space-2) 0 0;color:var(--ceremony-muted)}
+.ceremony-heading{margin:0;font:600 22px/1.3 var(--ceremony-font-display);overflow-wrap:anywhere}
+.ceremony-detail{max-width:65ch;margin:0;color:var(--ceremony-text)}
+.ceremony-heading+.ceremony-detail{margin-top:var(--ceremony-space-1)}
 .ceremony-intent[data-magnitude="unlimited"] .ceremony-heading{color:var(--ceremony-danger)}
 
 /* Identity rows run the full width so a 42-character address fits one line. */
 .ceremony-identity{margin:0;display:grid;gap:var(--ceremony-space-2)}
-.ceremony-party{display:grid;gap:var(--ceremony-space-1);padding-top:var(--ceremony-space-2);border-top:1px solid var(--ceremony-border)}
+.ceremony-party{display:grid;gap:var(--ceremony-space-1)}
 .ceremony-party-label{margin:0;color:var(--ceremony-muted);font-size:14px}
 .ceremony-party-name{margin:0;font-weight:600}
 .ceremony-party-address{display:flex;align-items:baseline;gap:var(--ceremony-space-2);margin:0}
 .ceremony-party-address code{flex:1 1 auto;min-width:0;font:var(--ceremony-address-size)/1.5 var(--ceremony-font-mono);overflow-wrap:anywhere;user-select:all}
-.ceremony-copy{flex:0 0 auto;min-height:0;padding:2px 10px;border:1px solid var(--ceremony-border);border-radius:6px;background:transparent;color:var(--ceremony-muted);font:500 13px var(--ceremony-font);box-shadow:none}
+.ceremony-copy{flex:0 0 auto;min-height:32px;padding:4px 12px;border:1px solid var(--ceremony-border);border-radius:6px;background:transparent;color:var(--ceremony-muted);font:500 13px var(--ceremony-font);box-shadow:none}
 .ceremony-copy:hover:not(:disabled){background:var(--ceremony-bg);color:var(--ceremony-text);transform:none}
 
 /* One sentence. The rest is a disclosure. */
-.ceremony-assurance{margin:0;color:var(--ceremony-muted)}
+.ceremony-assurance{max-width:65ch;margin:0;color:var(--ceremony-muted);font-size:14px}
 .ceremony-warning{margin:0;padding:var(--ceremony-space-2);border-radius:var(--ceremony-radius);background:var(--ceremony-warning-surface);color:var(--ceremony-warning)}
-.ceremony-warning[data-severity="danger"]{background:var(--ceremony-danger-surface);color:var(--ceremony-danger);font-weight:600}
+.ceremony-warning[data-severity="danger"]{background:var(--ceremony-danger-surface);color:var(--ceremony-danger);border-left:3px solid var(--ceremony-danger)}
+.ceremony-warning p{max-width:65ch;margin:0;font-size:15px}
+.ceremony-warning p+p{margin-top:var(--ceremony-space-1)}
+.ceremony-warning-title{font-weight:600}
 .ceremony-card{margin:0;padding-top:var(--ceremony-space-2);border-top:1px solid var(--ceremony-border)}
 .ceremony-card-position{margin:0 0 var(--ceremony-space-1);color:var(--ceremony-muted);font-size:14px}
 
@@ -103,6 +107,7 @@ body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-f
 details.ceremony-details,details.signed{margin:0}
 details.ceremony-details summary,details.signed summary{cursor:pointer;color:var(--ceremony-accent);font-size:15px}
 details.ceremony-details>*+*,details.signed>*+*{margin-top:var(--ceremony-space-2)}
+.ceremony-evidence{padding-top:var(--ceremony-space-2);border-top:1px solid var(--ceremony-border)}
 details pre{max-height:40vh;margin:0;padding:var(--ceremony-space-2);overflow:auto;border:1px solid var(--ceremony-border);border-radius:8px;font:12px/1.55 var(--ceremony-font-mono);white-space:pre-wrap;overflow-wrap:anywhere}
 
 /* Expiry sits with the controls it constrains. */

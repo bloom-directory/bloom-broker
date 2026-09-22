@@ -184,8 +184,7 @@ function callIntent(call) {
       action: "transfer", magnitude: summary.magnitude,
       eyebrow: "Token transfer",
       heading: `Send ${summary.amount_display}`,
-      detail: "This is the transfer the transaction requests. It is not a guarantee that the " +
-        "balance changes: Bloom has not executed the call.",
+      detail: "",
       relation: `sends ${summary.amount_display} to`
     };
   }
@@ -194,8 +193,7 @@ function callIntent(call) {
       action: "allowance", magnitude: "unlimited",
       eyebrow: "Token allowance",
       heading: `Allow unlimited ${symbol} spending`,
-      detail: `There is no spending cap. ${who} may move ${symbol} you hold now and ${symbol} ` +
-        "you receive later, without a further Bloom approval, until you set the allowance back down.",
+      detail: "",
       relation: `may spend any amount of ${symbol} held by`
     };
   }
@@ -377,8 +375,8 @@ function describeTransfer(manifest) {
       parties.push({
         role: intent.action === "allowance" ? "spender"
           : intent.action === "transfer" || intent.action === "send" ? "recipient" : "contract",
-        label: intent.action === "allowance" ? "Spender — gains permission to move your tokens"
-          : intent.action === "transfer" || intent.action === "send" ? "Recipient — receives the tokens"
+        label: intent.action === "allowance" ? "Spender"
+          : intent.action === "transfer" || intent.action === "send" ? "Recipient"
           : "Contract being called",
         value: counterparty
       });
@@ -586,8 +584,7 @@ function describePolicy(manifest) {
   const CLEAR_SIGNING_SETTINGS = [
     ["unlimited_allowance_allowed", "Unlimited-allowance requests",
      "A request with no spending cap is refused outright.",
-     "A request with no spending cap can be prepared. It still needs its own approval ceremony, " +
-     "and approving this change grants no spender any allowance."],
+     "Each request will still need your approval. This setting does not move tokens or grant a spender an allowance."],
     ["opaque_exact_allowed", "Requests Bloom cannot describe",
      "A call with no signed description is refused.",
      "A call with no signed description can be approved as exact bytes, carrying the " +
@@ -627,12 +624,13 @@ function describePolicy(manifest) {
     : `Change <strong>${n} rule${n === 1 ? "" : "s"}</strong> for this wallet. Nothing moves; after approval Bloom applies the new rules to future transactions.`;
   const intent = n === 0 ? null : {
     action: "policy", eyebrow: "Wallet policy change",
-    heading: intentLines.length === 1 && intentLines[0][0] === "Unlimited-allowance requests"
-      ? "Allow unlimited-allowance requests"
+    heading: n === 1 && intentLines.length === 1 && intentLines[0][0] === "Unlimited-allowance requests"
+      ? (clearAfter?.unlimited_allowance_allowed
+          ? "Allow requests for unlimited token spending"
+          : "Block requests for unlimited token spending")
       : `Change ${n} wallet rule${n === 1 ? "" : "s"}`,
     detail: (intentLines.map(([, text]) => text).join(" ") ||
-      "These rules apply to future requests. Approving them moves nothing now.") +
-      " No funds move and no permission is granted to anyone by this change."
+      "These rules apply to future requests. Approving them moves no funds.")
   };
   return {sentence, intent, facts: lines};
 }
@@ -652,6 +650,8 @@ function renderReview(session) {
   const wallet = contribution.wallet_id || manifest?.wallet_name || manifest?.wallet_id || "";
   panelKicker.textContent = "Step 1 of 2 · Check";
   panelTitle.textContent = "Requested action";
+  panelTitle.setAttribute("data-action", "");
+  panelTitle.setAttribute("data-magnitude", "");
   approve.textContent = meta.button;
   const pageTitle = document.getElementById("page-title");
   const pageLede = document.getElementById("page-lede");
@@ -712,14 +712,21 @@ function renderReview(session) {
       approve.textContent = petalScope.button;
     }
   }
-  fact("Wallet", walletName);
+  const contextualFacts = transfer?.intent ? new Set(["Network"]) : new Set();
+  if (transfer?.intent && pageTitle) {
+    const network = transfer.facts.find(([label]) => label === "Network")?.[1];
+    pageTitle.textContent = [kind === "policy_update" ? "Wallet settings" : null,
+      walletName, network].filter(Boolean).join(" · ");
+  } else fact("Wallet", walletName);
   if (kind !== "sealed_approval" &&
       session.signer_contribution?.wallet_seed_profile === "bip39-multicurve-v1") {
     fact("Wallet type", "BIP-39 recovery phrase (multi-chain)");
   }
   if (transfer) {
     if (keyInfo.account) fact("From", keyInfo.account);
-    for (const [label, value, mono] of transfer.facts) fact(label, value, mono);
+    for (const [label, value, mono] of transfer.facts) {
+      if (!contextualFacts.has(label)) fact(label, value, mono);
+    }
   } else if (keyInfo.account) {
     fact("Account", keyInfo.account);
   }
@@ -757,23 +764,35 @@ function renderReview(session) {
     row.append(el("p", {class: "ceremony-party-address"}, address, copy));
     return row;
   };
-  const intentBlock = intent => {
+  const intentBlock = (intent, nested = false) => {
     const block = el("section", {class: "ceremony-intent", "data-action": intent.action});
     if (intent.magnitude) block.setAttribute("data-magnitude", intent.magnitude);
-    block.append(
-      el("p", {class: "ceremony-eyebrow"}, intent.eyebrow),
-      el("h2", {class: "ceremony-heading"}, intent.heading),
-      el("p", {class: "ceremony-detail"}, intent.detail));
+    if (nested) block.append(el("h2", {class: "ceremony-heading"}, intent.heading));
+    if (intent.detail) block.append(el("p", {class: "ceremony-detail"}, intent.detail));
     return block;
   };
   const parts = [];
   if (transfer?.intent) {
     panelTitle.textContent = transfer.intent.heading;
-    parts.push(intentBlock(transfer.intent));
+    panelTitle.setAttribute("data-action", transfer.intent.action);
+    panelTitle.setAttribute("data-magnitude", transfer.intent.magnitude || "");
+    if (transfer.intent.detail) parts.push(intentBlock(transfer.intent));
+    if (transfer.warnings?.length) {
+      const warningGroup = el("aside", {class: "ceremony-warning", "aria-label": "Risks and consequences"});
+      if (transfer.intent.magnitude === "unlimited") {
+        warningGroup.setAttribute("data-severity", "danger");
+        warningGroup.append(el("p", {class: "ceremony-warning-title"}, "If this transaction succeeds"));
+      }
+      for (const warning of transfer.warnings) warningGroup.append(el("p", {}, warning));
+      if (transfer.intent.magnitude === "unlimited") {
+        warningGroup.append(el("p", {}, "You can later request a lower allowance or set it to zero."));
+      }
+      parts.push(warningGroup);
+    }
     for (const card of transfer.intent.cards || []) {
       const wrapper = el("section", {class: "ceremony-card"},
         el("p", {class: "ceremony-card-position"}, `Transaction ${card.position}`),
-        intentBlock(card.intent));
+        intentBlock(card.intent, true));
       if (card.counterparty) {
         wrapper.append(el("div", {class: "ceremony-identity"},
           partyRow({role: "counterparty", label: "To", value: card.counterparty})));
@@ -782,20 +801,16 @@ function renderReview(session) {
     }
     if (transfer.parties?.length) {
       parts.push(el("div", {class: "ceremony-identity"},
-        ...transfer.parties.map(partyRow)));
+        ...[...transfer.parties].sort((a, b) =>
+          Number(b.role === "spender") - Number(a.role === "spender")).map(partyRow)));
     }
   } else {
     parts.push(el("p", {class: "summary", html: summaryHtml}));
   }
+  parts.push(facts);
   if (transfer?.assurance) {
     parts.push(el("p", {class: "ceremony-assurance"}, transfer.assurance));
   }
-  for (const warning of transfer?.warnings || []) {
-    const node = el("p", {class: "ceremony-warning"}, warning);
-    if (/^UNLIMITED ALLOWANCE/.test(warning)) node.setAttribute("data-severity", "danger");
-    parts.push(node);
-  }
-  parts.push(facts);
   if (meta.warn) warns.unshift(meta.warn);
   for (const w of warns) parts.push(el("p", {class: "warn"}, w));
 
@@ -832,7 +847,10 @@ function renderReview(session) {
   parts.push(el("details", {class: "signed"},
     el("summary", {}, "What your passkey signs (signed manifest)"),
     el("pre", {}, canonicalJson(signed).replace(/,"/g, ',\n"'))));
-  reviewNode.replaceChildren(...parts);
+  const disclosures = parts.filter(node => node.tagName === "DETAILS");
+  reviewNode.replaceChildren(...parts.filter(node => node.tagName !== "DETAILS"),
+    el("details", {class: "ceremony-details ceremony-evidence"},
+      el("summary", {}, "Verification and technical details"), ...disclosures));
   startExpiry(session, expiry);
 }
 
@@ -1338,7 +1356,10 @@ function renderPreview(name) {
   // subject is expiry states its simulated state in words instead.
   const expiryHost = document.getElementById("action-expiry");
   if (expiryHost) expiryHost.textContent = session.preview_expiry || "";
-  statusNode.textContent = session.preview_status || "Preview";
+  statusNode.textContent = session.preview_status || "";
+  if (pageLede) pageLede.textContent = "Review preview";
+  const actions = document.querySelector(".ceremony-actions");
+  if (actions) actions.hidden = !session.preview_expiry;
 }
 
 async function load() {

@@ -249,7 +249,7 @@ fn custody_manifest_is_rendered_on_the_primary_review_surface() {
     let script = format!(
         r#"
 class Node {{
-  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
   setAttribute() {{}}
   append(...children) {{ this.children.push(...children); }}
   replaceChildren(...children) {{ this.children = children; }}
@@ -281,7 +281,7 @@ renderReview({{
     canonical_plan: `Remove a passkey\n\nOperation     ${{operation}}`
   }}
 }});
-const rendered = allText(nodes.review);
+const rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
 if (nodes["page-title"].textContent !== "Remove a passkey from a wallet" ||
     !rendered.includes("This credential stops being an authority") ||
     !rendered.includes(operation)) {{
@@ -310,7 +310,7 @@ fn evm_manifest_is_rendered_as_primary_review_facts() {
     let script = format!(
         r#"
 class Node {{
-  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
   setAttribute() {{}}
   append(...children) {{ this.children.push(...children); }}
   replaceChildren(...children) {{ this.children = children; }}
@@ -354,7 +354,7 @@ renderReview(session({{
   payload_keccak: "0xabc",
   calldata_bytes: "0"
 }}));
-let rendered = allText(nodes.review);
+let rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
 for (const expected of ["0x2222222222222222222222222222222222222222", "0.0003 ETH",
   "Base", "Maximum fee rate", "1.5 Gwei", "Priority fee cap",
   "Only the transaction envelope was checked", "What the contract does has not been verified",
@@ -376,7 +376,7 @@ renderReview(session({{
   payload_keccak: "0xdef",
   calldata_bytes: "0"
 }}));
-rendered = allText(nodes.review);
+rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
 if (!rendered.includes("300000000000000 raw native units on evm-999999") ||
     rendered.includes("0.0003 ETH") || rendered.includes("0.0003 POL")) {{
   throw new Error(`unknown chain invented asset metadata: ${{rendered}}`);
@@ -394,7 +394,7 @@ renderReview(session({{
   payload_keccak: "0x47e9",
   calldata_bytes: "1234", calldata_keccak: "0x1234"
 }}));
-rendered = allText(nodes.review);
+rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
 // An uninterpretable call says so, and still discloses the exact input.
 for (const expected of ["Approve a call Bloom cannot read", "1,234 bytes", "0x1234"]) {{
   if (!rendered.includes(expected)) throw new Error(`contract call not disclosed ${{expected}}: ${{rendered}}`);
@@ -413,7 +413,7 @@ renderReview(session({{
   payload_keccak: "0xbeef",
   calldata_bytes: "5", calldata_keccak: "0xcafe"
 }}));
-rendered = allText(nodes.review);
+rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
 for (const expected of ["Deploy a contract", "Initcode", "5 bytes", "0xcafe"]) {{
   if (!rendered.includes(expected)) throw new Error(`creation not disclosed ${{expected}}: ${{rendered}}`);
 }}
@@ -440,7 +440,7 @@ fn policy_page_states_the_numeric_chain_exact_opt_in_scope() {
     let script = format!(
         r#"
 class Node {{
-  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
   setAttribute() {{}}
   append(...children) {{ this.children.push(...children); }}
   replaceChildren(...children) {{ this.children = children; }}
@@ -477,7 +477,7 @@ renderReview({{
     }}
   }}
 }});
-const rendered = allText(nodes.review);
+const rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
 for (const expected of [
   "Allow exact transactions on evm-31337",
   "any address through the deployment workflow, including contract creation",
@@ -550,7 +550,7 @@ fn key_derive_primary_review_explains_the_session_without_internal_scope_json() 
     let script = format!(
         r#"
 class Node {{
-  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
   setAttribute() {{}}
   append(...children) {{ this.children.push(...children); }}
   replaceChildren(...children) {{ this.children = children; }}
@@ -632,7 +632,7 @@ fn reusable_pumpfun_approval_is_plain_language_with_raw_grants_collapsed() {
     let script = format!(
         r#"
 class Node {{
-  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
   setAttribute() {{}}
   append(...children) {{ this.children.push(...children); }}
   replaceChildren(...children) {{ this.children = children; }}
@@ -963,8 +963,12 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
     );
     // The desktop introduction column is gone: one review column, and no
     // reassurance competing with the decision.
-    for removed in ["class=\"layout\"", "class=\"intro\"", "trust-item",
-                    "Nothing leaves this computer"] {
+    for removed in [
+        "class=\"layout\"",
+        "class=\"intro\"",
+        "trust-item",
+        "Nothing leaves this computer",
+    ] {
         assert!(
             !shell.contains(removed),
             "the ceremony shell still carries {removed}"
@@ -6779,7 +6783,7 @@ fn the_clear_signed_review_reads_its_meaning_only_from_the_typed_intent() {
     let script = format!(
         r#"
 class Node {{
-  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = "";
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = "";
                        this.attrs = {{}}; this.hidden = false; }}
   setAttribute(key, value) {{ this.attrs[key] = value; }}
   append(...children) {{ this.children.push(...children); }}
@@ -6820,10 +6824,10 @@ function show(name) {{
     primary: allText({{textContent: "", innerHTML: "", children:
       nodes.review.children.filter(child => child?.name !== "details")}}),
     technical: details.map(allText).join(" "),
-    heading: allText(find(root, n => String(n.className || "").includes("ceremony-heading")) || "")
+    heading: allText(nodes["panel-title"])
       .replace(/\s+/g, " ").trim(),
-    action: intent?.attrs?.["data-action"],
-    magnitude: intent?.attrs?.["data-magnitude"],
+    action: nodes["panel-title"].attrs["data-action"],
+    magnitude: nodes["panel-title"].attrs["data-magnitude"],
     roles: [].concat(...nodes.review.children.map(function collect(n) {{
       if (typeof n === "string") return [];
       const here = String(n.className || "").includes("ceremony-party") && n.attrs?.["data-role"]
@@ -6838,6 +6842,7 @@ function show(name) {{
 // recipient — never the contract, never a generic "To".
 let view = show("transfer");
 if (view.heading !== "Send 250 BDT") throw new Error(`transfer heading: ${{view.heading}}`);
+if (view.primary.includes(view.heading)) throw new Error("action title was printed twice");
 if (view.action !== "transfer") throw new Error(`transfer action: ${{view.action}}`);
 if (!view.roles.includes("recipient")) throw new Error(`transfer roles: ${{view.roles}}`);
 if (view.roles.includes("spender")) throw new Error("a transfer must not name a spender");
@@ -6901,6 +6906,15 @@ if (view.heading.includes("115792089")) throw new Error("the U256 maximum led th
 if (view.primary.includes("115792089")) throw new Error("the U256 maximum is still a primary fact");
 if (!view.technical.includes("115792089")) throw new Error("the exact maximum left technical details");
 if (!view.primary.includes("UNLIMITED ALLOWANCE")) throw new Error("the unlimited warning is not visible");
+const unfamiliar = previewSession("allowance-unlimited");
+const unfamiliarPlan = JSON.parse(unfamiliar.review_manifest.canonical_plan);
+unfamiliarPlan.evm_review.payloads[0].contract_call.warnings.push("A new warning the renderer does not recognise");
+unfamiliar.review_manifest.canonical_plan = JSON.stringify(unfamiliarPlan);
+renderReview(unfamiliar);
+const unfamiliarPrimary = nodes.review.children.filter(child => child.name !== "details").map(allText).join(" ");
+if (!unfamiliarPrimary.includes("A new warning the renderer does not recognise")) {{
+  throw new Error("grouping warnings hid an unfamiliar warning");
+}}
 // The exact value is still recoverable, at full precision, further down.
 if (!view.all.includes("115792089237316195423570985008687907853269984665640564039457584007913129639")) {{
   throw new Error("the exact maximum lost precision");
@@ -6945,7 +6959,7 @@ call.intent = "Totally different publisher story";
 renamed.review_manifest.canonical_plan = JSON.stringify(plan);
 renderReview(renamed);
 const relabelled = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
-if (!relabelled.includes("Send 250 BDT")) {{
+if (nodes["panel-title"].textContent !== "Send 250 BDT") {{
   throw new Error(`relabelling changed the heading: ${{relabelled}}`);
 }}
 if (!relabelled.includes("Beneficiary")) {{
@@ -6984,7 +6998,11 @@ async fn a_preview_name_reaches_no_session_and_cannot_be_completed() {
     };
 
     // The preview page itself is served, and is the ordinary shell.
-    let page = app.clone().oneshot(get("/preview/transfer", None)).await.unwrap();
+    let page = app
+        .clone()
+        .oneshot(get("/preview/transfer", None))
+        .await
+        .unwrap();
     assert_eq!(page.status(), StatusCode::OK);
 
     // Every approval path refuses a preview name. It is not a token, so it
@@ -7047,7 +7065,7 @@ fn the_policy_page_shows_the_clear_signing_authority_change() {
     let script = format!(
         r#"
 class Node {{
-  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = "";
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = "";
                        this.attrs = {{}}; this.hidden = false; }}
   setAttribute(key, value) {{ this.attrs[key] = value; }}
   append(...children) {{ this.children.push(...children); }}
@@ -7069,13 +7087,20 @@ function allText(node) {{
   return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
 }}
 renderReview(previewSession("policy-unlimited"));
-const rendered = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
-for (const phrase of ["Allow unlimited-allowance requests", "blocked → allowed",
-                      "grants no spender any allowance", "needs its own approval ceremony"]) {{
+const rendered = allText({{textContent: "", innerHTML: "", children: [nodes["panel-title"], ...nodes.review.children]}});
+for (const phrase of ["Allow requests for unlimited token spending", "blocked → allowed",
+                      "does not move tokens or grant a spender an allowance", "Each request will still need your approval"]) {{
   if (!rendered.includes(phrase)) throw new Error(`policy page omitted ${{phrase}}: ${{rendered}}`);
 }}
 if (nodes.approve.textContent !== "Approve policy change") {{
   throw new Error(`policy button: ${{nodes.approve.textContent}}`);
+}}
+const blocked = previewSession("policy-unlimited");
+const change = blocked.review_manifest.authority_diff.clear_signing;
+[change.before, change.after] = [change.after, change.before];
+renderReview(blocked);
+if (nodes["panel-title"].textContent !== "Block requests for unlimited token spending") {{
+  throw new Error("disabling unlimited requests was labelled as enabling them");
 }}
 // A verifier re-pin is authority too: it decides which build may describe
 // calls for this wallet at all.
