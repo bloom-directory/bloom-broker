@@ -795,7 +795,7 @@ function renderReview(session) {
     ? manifest.title : meta.title;
   if (pageLede) {
     pageLede.textContent = meta.lede ||
-      "Read what will happen, then press the button. Your device will ask for your fingerprint, face, or PIN.";
+      "Passkey approval";
   }
 
   const facts = el("dl", {class: "facts"});
@@ -1680,7 +1680,7 @@ async function load() {
       recipient_key: encodeUrl(outputRecipient.publicKey)
     });
   }
-  statusNode.textContent = "Check the details, then continue with your passkey.";
+  statusNode.textContent = "";
   // Rendering applies the deadline and must have the final say on whether
   // approval is enabled, including a page first opened after its deadline.
   approve.disabled = false;
