@@ -356,9 +356,9 @@ renderReview(session({{
 }}));
 let rendered = allText(nodes.review);
 for (const expected of ["0x2222222222222222222222222222222222222222", "0.0003 ETH",
-  "Base", "Gas limit", "Maximum fee rate", "1.5 Gwei", "Priority fee cap",
+  "Base", "Maximum fee rate", "1.5 Gwei", "Priority fee cap",
   "Exact envelope checked", "Contract execution effects are not verified",
-  "Calldata", "None — plain transfer"]) {{
+  "Data", "None — plain transfer"]) {{
   if (!rendered.includes(expected)) throw new Error(`missing ${{expected}}: ${{rendered}}`);
 }}
 for (const stale of ["Native value (wei)", "per gas (wei)", "Some("]) {{
@@ -413,7 +413,7 @@ renderReview(session({{
   calldata_bytes: "5", calldata_keccak: "0xcafe"
 }}));
 rendered = allText(nodes.review);
-for (const expected of ["Deploy one contract", "Deploy contract (CREATE)", "5 bytes", "0xcafe"]) {{
+for (const expected of ["Deploy one contract", "Deploy contract (CREATE)", "Initcode", "5 bytes", "0xcafe"]) {{
   if (!rendered.includes(expected)) throw new Error(`creation not disclosed ${{expected}}: ${{rendered}}`);
 }}
 "#
@@ -427,6 +427,116 @@ for (const expected of ["Deploy one contract", "Deploy contract (CREATE)", "5 by
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn policy_page_states_the_numeric_chain_exact_opt_in_scope() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  setAttribute() {{}}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+renderReview({{
+  ceremony_kind: "policy_update",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "wallet-primary"}},
+  review_manifest: {{
+    schema: "bloom.review-manifest.v1",
+    authority_diff: {{
+      added_destinations: [
+        {{chain: "evm-31337", destination: "exact"}},
+        {{chain: "anvil", destination: "0x000000000000000000000000000000000000dEaD"}}
+      ],
+      removed_destinations: [
+        {{chain: "evm-1", destination: "exact"}}
+      ]
+    }}
+  }}
+}});
+const rendered = allText(nodes.review);
+for (const expected of [
+  "Allow exact transactions on evm-31337",
+  "any address through the deployment workflow, including contract creation",
+  "every transaction still needs its own approval",
+  "Allow sending to",
+  "0x000000000000000000000000000000000000dEaD",
+  "Stop allowing exact transactions on evm-1"
+]) {{
+  if (!rendered.includes(expected)) throw new Error(`missing ${{expected}}: ${{rendered}}`);
+}}
+// The old label understated the grant by calling it only a deploy permission.
+for (const stale of ["Allow deploying contracts on", "Stop allowing contract deployment on"]) {{
+  if (rendered.includes(stale)) throw new Error(`stale policy wording ${{stale}}: ${{rendered}}`);
+}}
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn browser_cancel_disables_approve_before_awaiting_and_reports_the_outcome() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let start = asset
+        .find("cancel.onclick = async () => {")
+        .expect("asset must install a cancel handler");
+    let end = asset[start..]
+        .find("\n  };")
+        .map(|offset| &asset[start..start + offset]);
+    let handler = end.expect("cancel handler must close");
+    // A slow cancel response must not leave an approve button live next to a
+    // ceremony being cancelled: both buttons disable before the first await.
+    let first_await = handler.find("await").expect("handler awaits the cancel");
+    let approve_off = handler
+        .find("approve.disabled = true;")
+        .expect("handler disables approve");
+    assert!(
+        approve_off < first_await,
+        "approve must be disabled before the cancel request is awaited"
+    );
+    for (needle, why) in [
+        (
+            "statusNode.textContent = \"Cancelling…\";",
+            "immediate feedback",
+        ),
+        ("Cancelled — nothing was signed", "terminal outcome message"),
+        ("cancel.hidden = true;", "buttons removed on success"),
+    ] {
+        assert!(
+            handler.contains(needle),
+            "cancel handler must provide {why}: {needle}"
+        );
+    }
 }
 
 #[test]

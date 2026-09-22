@@ -164,31 +164,35 @@ function describeTransfer(manifest) {
   let plan = {};
   try { plan = JSON.parse(manifest?.canonical_plan || "{}"); } catch (_) {}
   const evmPayloads = Array.isArray(plan.evm_review?.payloads) ? plan.evm_review.payloads : [];
-  const appendEnvelopeFacts = (facts, payload, prefix) => {
+  // Primary facts state the operation a person is accountable for; technical
+  // facts (identities of the exact bytes, gas pricing, ordering) stay
+  // available under "Technical details" without competing for attention.
+  const appendEnvelopeFacts = (facts, technical, payload, prefix) => {
     const label = name => prefix ? `${prefix} ${name.toLowerCase()}` : name;
     facts.push([label(payload.destination ? "To" : "Action"),
       payload.destination || "Deploy contract (CREATE)", Boolean(payload.destination)]);
     facts.push([label("Amount"), payload.value_display]);
     facts.push([label("Network"), chainLabel(payload.chain)]);
-    facts.push([label("Sender"), payload.sender, true]);
-    facts.push([label("Nonce"), payload.nonce]);
-    facts.push([label("Gas limit"), payload.gas_limit]);
-    // The one field that tells a transfer from a contract call: disclose the
-    // input size and commitment, or state plainly that there is none.
-    // Execution effects remain unverified either way (see Bloom verification).
+    // The one field that tells a transfer from a contract call: say plainly
+    // whether input data exists. Execution effects are unverified either way
+    // (see Bloom verification); size and commitment live in technical details.
+    facts.push([label("Data"), payload.calldata_keccak
+      ? `${payload.destination ? "Contract call" : "Initcode"}, ${Number(payload.calldata_bytes).toLocaleString("en-US")} bytes — meaning not verified`
+      : "None — plain transfer"]);
+    technical.push([label("Sender"), payload.sender, true]);
+    technical.push([label("Nonce"), payload.nonce]);
+    technical.push([label("Gas limit"), payload.gas_limit]);
     if (payload.calldata_keccak) {
-      const calldataBytes = Number(payload.calldata_bytes).toLocaleString("en-US");
-      facts.push([label("Calldata"), `${calldataBytes} bytes, keccak ${payload.calldata_keccak}`, true]);
-    } else {
-      facts.push([label("Calldata"), "None — plain transfer"]);
+      technical.push([label(payload.destination ? "Calldata hash" : "Initcode hash"),
+        payload.calldata_keccak, true]);
     }
     if (payload.fee?.kind === "legacy") {
-      facts.push([label("Gas price"), payload.fee.gas_price_display]);
+      technical.push([label("Gas price"), payload.fee.gas_price_display]);
     } else if (payload.fee?.kind === "eip1559") {
-      facts.push([label("Maximum fee rate"), payload.fee.max_fee_per_gas_display]);
-      facts.push([label("Priority fee cap"), payload.fee.max_priority_fee_per_gas_display]);
+      technical.push([label("Maximum fee rate"), payload.fee.max_fee_per_gas_display]);
+      technical.push([label("Priority fee cap"), payload.fee.max_priority_fee_per_gas_display]);
     }
-    facts.push([label("Payload commitment"), payload.payload_keccak, true]);
+    technical.push([label("Payload commitment"), payload.payload_keccak, true]);
   };
   // A clear-signed call puts the contract's own reading first: what moves,
   // to whom, in which token. The envelope facts stay underneath — they are
@@ -211,12 +215,13 @@ function describeTransfer(manifest) {
   };
   if (evmPayloads.length) {
     const facts = [];
+    const technical = [];
     const clear = plan.evm_review?.clear_signing;
     const calls = evmPayloads.filter(payload => payload.contract_call);
     for (const [index, payload] of evmPayloads.entries()) {
       const prefix = evmPayloads.length > 1 ? `Transaction ${index + 1}` : "";
       if (payload.contract_call) appendCallFacts(facts, payload, prefix);
-      appendEnvelopeFacts(facts, payload, prefix);
+      appendEnvelopeFacts(facts, technical, payload, prefix);
     }
     // Every mandatory warning, in the order the verifier produced it.
     for (const payload of calls) {
@@ -248,7 +253,7 @@ function describeTransfer(manifest) {
             : `Approve one transaction on <strong>${escapeHtml(network)}</strong> to the address below.`)
           : `Deploy one contract on <strong>${escapeHtml(network)}</strong>.`)
       : `Approve <strong>${evmPayloads.length} EVM transactions</strong>. Check each envelope below.`;
-    return {sentence, facts, willVerify: true};
+    return {sentence, facts, technical, willVerify: true};
   }
   if (!claim) return null;
   const debits = claim.declared_debits || [];
@@ -391,11 +396,13 @@ function describePolicy(manifest) {
   // opt-in, not a destination: saying "sending to" inverts what is granted.
   const isDeployGrant = d => d.destination === "exact" && String(d.chain || "").startsWith("evm-");
   for (const d of diff.added_destinations || []) {
-    if (isDeployGrant(d)) lines.push(["Allow deploying contracts on", chainLabel(d.chain), false]);
+    if (isDeployGrant(d)) lines.push([`Allow exact transactions on ${chainLabel(d.chain)}`,
+      "any address through the deployment workflow, including contract creation; every transaction still needs its own approval"]);
     else lines.push(["Allow sending to", dest(d), true]);
   }
   for (const d of diff.removed_destinations || []) {
-    if (isDeployGrant(d)) lines.push(["Stop allowing contract deployment on", chainLabel(d.chain), false]);
+    if (isDeployGrant(d)) lines.push([`Stop allowing exact transactions on ${chainLabel(d.chain)}`,
+      "deployment transactions need listed recipients again and contract creation is refused"]);
     else lines.push(["Stop allowing sending to", dest(d), true]);
   }
   for (const p of diff.added_petal_packages || []) lines.push(["Allow app (petal)", shortDigest(p), true]);
@@ -515,11 +522,20 @@ function renderReview(session) {
   if (meta.warn) warns.unshift(meta.warn);
   for (const w of warns) parts.push(el("p", {class: "warn"}, w));
 
+  if (transfer?.technical?.length) {
+    const technical = el("dl", {class: "facts technical"});
+    for (const [label, value, mono] of transfer.technical) {
+      technical.append(el("dt", {}, label), el("dd", {}, mono ? el("code", {}, value) : value));
+    }
+    parts.push(el("details", {class: "signed technical"},
+      el("summary", {}, "Technical details — nonce, fees, exact byte commitments"),
+      technical));
+  }
   const signed = session.review_manifest || {
     ceremony_kind: kind, signer_contribution: session.signer_contribution
   };
   parts.push(el("details", {class: "signed"},
-    el("summary", {}, "Technical details (what your passkey signs)"),
+    el("summary", {}, "What your passkey signs (signed manifest)"),
     el("pre", {}, canonicalJson(signed).replace(/,"/g, ',\n"'))));
   reviewNode.replaceChildren(...parts);
   startExpiry(session, expiry);
@@ -901,14 +917,28 @@ async function load() {
   approve.disabled = false;
   approve.onclick = () => run(session).catch(reportApprovalFailure);
   cancel.onclick = async () => {
+    // Both buttons stop accepting input immediately; a slow cancel response
+    // must not leave an approve button clickable beside a dead ceremony.
     cancel.disabled = true;
+    approve.disabled = true;
+    statusNode.textContent = "Cancelling…";
     try {
       await mutate(`/api/session/${ceremonyId}/cancel`, {});
       await clearBrowserState(ceremonyId);
-      statusNode.textContent = "Cancelled. You may close this tab.";
-      approve.disabled = true;
+      clearInterval(expiryTimer);
+      panelKicker.textContent = "Done";
+      panelTitle.textContent = "Cancelled — nothing was signed";
+      const pageTitle = document.getElementById("page-title");
+      const pageLede = document.getElementById("page-lede");
+      if (pageTitle) pageTitle.textContent = "Cancelled.";
+      if (pageLede) pageLede.textContent = "Nothing was signed or sent. You can close this tab.";
+      reviewNode.replaceChildren(el("p", {class: "summary"},
+        "You cancelled this ceremony. No signature was created and nothing was broadcast."));
+      cancel.hidden = true;
+      approve.hidden = true;
     } catch (error) {
       cancel.disabled = false;
+      approve.disabled = false;
       reportCeremonyError(error, "Cancellation failed. Please try again.");
     }
   };

@@ -32,3 +32,10 @@ button{font:600 15px/1.2 var(--sans);letter-spacing:0}button.secondary{font-weig
 .lede{font-size:18px}.panel-title{font-size:26px}
 #review{padding:26px 30px}
 .facts dd code{font-size:13px;line-height:1.5}
+/* Approval hierarchy: the operation's primary facts read first at a larger
+   size; byte-level detail lives collapsed under technical details. */
+.facts{gap:12px 20px}.facts dd{font-size:16.5px}.facts dd code{font-size:14px}
+.facts dt{font-size:11px}
+.facts.technical{gap:7px 16px}.facts.technical dd{font-size:13.5px;color:var(--ink-2)}.facts.technical dd code{font-size:12px}
+details.signed.technical{margin-top:14px}
+details.signed pre{max-height:26vh}
