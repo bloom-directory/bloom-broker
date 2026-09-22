@@ -1082,13 +1082,16 @@ function renderDone(session, result) {
     receipt ? el("dl", {class: "facts"}, el("dt", {}, "Receipt"), el("dd", {}, el("code", {}, receipt))) : null
   );
 }
+// Read before anything rewrites the URL below. A preview is decided by the
+// path it was opened at, never by what the tab happens to still hold.
+const previewPath = location.pathname.startsWith("/preview") ? location.pathname : "";
 const tokenFromPath = location.pathname.startsWith("/ceremony/")
   ? location.pathname.slice("/ceremony/".length) : "";
 const sessionTokenKey = "bloom.ceremony.token.v1";
 const token = tokenFromPath || readSessionToken();
 let ceremonyId = null;
 if (tokenFromPath) writeSessionToken(tokenFromPath);
-if (token) history.replaceState(null, "", "/");
+if (token && !previewPath) history.replaceState(null, "", "/");
 const authHeaders = {"x-bloom-ceremony-token": token};
 const te = new TextEncoder();
 let outputRecipient = null;
@@ -1620,8 +1623,8 @@ function renderPreview(name) {
 }
 
 async function load() {
-  if (location.pathname.startsWith("/preview")) {
-    const name = location.pathname.slice("/preview".length).replace(/^\//, "") || "index";
+  if (previewPath) {
+    const name = previewPath.slice("/preview".length).replace(/^\//, "") || "index";
     if (name === "index") {
       const pageTitle = document.getElementById("page-title");
       if (pageTitle) pageTitle.textContent = "Previews";
