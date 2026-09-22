@@ -19,7 +19,7 @@ use bloom_audit_checkpoint::{
 use bloom_broker::{
     assurance_verifiers::SolanaSystemTransferVerifier,
     authority::{AssuranceRegistry, BrokerAuthority},
-    ceremony::CeremonyBroker,
+    ceremony::{CeremonyBroker, CeremonyEndpoint, DEFAULT_CEREMONY_PORT},
     clock::BrokerClock,
     journal::{AuditSigner, BrokerJournal},
     service::BrokerRpcService,
@@ -84,6 +84,8 @@ struct BrokerConfig {
     /// [`bloom_broker::config`].
     #[serde(default)]
     ceremony_limits: Option<serde_json::Value>,
+    #[serde(default)]
+    ceremony_port: Option<u16>,
     network_containment: Option<NetworkContainmentConfig>,
     maximum_connections: usize,
     maximum_in_flight_mutations: usize,
@@ -130,11 +132,11 @@ struct PolicyKeyConfig {
 }
 
 #[derive(Serialize)]
-struct StartupFailure {
+struct StartupFailure<'a> {
     schema: &'static str,
     state: &'static str,
     incident: &'static str,
-    address: &'static str,
+    address: &'a str,
     message: &'static str,
     observed_at_ms: u64,
 }
@@ -342,24 +344,39 @@ async fn run_with_paths(
             maximum_anonymous_registrations = ceremony_limits.maximum_anonymous_registrations(),
             "Broker ceremony admission limits configured"
         );
-        // Own the canonical origin before opening or mutating any durable Broker
+        let ceremony_endpoint = CeremonyEndpoint::new(
+            config.ceremony_port.unwrap_or(DEFAULT_CEREMONY_PORT),
+        )
+        .map_err(|error| {
+            Box::<dyn std::error::Error>::from(format!(
+                "Broker ceremony_port configuration is invalid: {error}"
+            ))
+        })?;
+        tracing::info!(
+            event = "broker.ceremony_endpoint_configured",
+            ceremony_port = ceremony_endpoint.port(),
+            ceremony_origin = ceremony_endpoint.origin(),
+            "Broker ceremony endpoint configured"
+        );
+        // Own the configured origin before opening or mutating any durable Broker
         // authority state. A losing AC-31 contender must die without racing the
         // owning Broker's journal or checkpoint store.
-        let (ceremony_listener_v4, ceremony_listener_v6) = match acquire_ceremony_listeners() {
-            Ok(listeners) => {
-                if let Some(path) = startup_status_path.as_deref() {
-                    clear_startup_failure(path, broker_effective_uid)?;
+        let (ceremony_listener_v4, ceremony_listener_v6) =
+            match acquire_ceremony_listeners(ceremony_endpoint) {
+                Ok(listeners) => {
+                    if let Some(path) = startup_status_path.as_deref() {
+                        clear_startup_failure(path, broker_effective_uid)?;
+                    }
+                    listeners
                 }
-                listeners
-            }
-            Err(error) => {
-                tracing::error!(%error, "cannot acquire ceremony listener pair");
-                if let Some(path) = startup_status_path.as_deref() {
-                    write_listener_failure(path, broker_effective_uid)?;
+                Err(error) => {
+                    tracing::error!(%error, "cannot acquire ceremony listener pair");
+                    if let Some(path) = startup_status_path.as_deref() {
+                        write_listener_failure(path, broker_effective_uid, ceremony_endpoint)?;
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
         let broker_signing_key = take_signing_key(&mut config.broker_signing_seed_hex)?;
         let audit_signing_key = take_signing_key(&mut config.audit_signing_seed_hex)?;
         let previous_audit_signing_key = config
@@ -532,13 +549,14 @@ async fn run_with_paths(
             attempt_initial_signer_head_exchange(&signer).await;
         }
         let signer_head_exchange = signer.clone();
-        let ceremony = CeremonyBroker::open_with_manifest_signer_audited(
+        let ceremony = CeremonyBroker::open_with_manifest_signer_audited_and_endpoint(
             &config.ceremony_path,
             Arc::new(signer.clone()),
             Token::new(config.review_manifest_key_id.clone())?,
             review_manifest_signing_key,
             journal.clone(),
             ceremony_limits,
+            ceremony_endpoint,
         )?;
         let machine_journal = journal.clone();
         let mut service = BrokerRpcService::new(
@@ -788,7 +806,12 @@ fn is_session_disconnect(error: &std::io::Error) -> bool {
     )
 }
 
-fn write_listener_failure(path: &Path, broker_uid: u32) -> Result<(), Box<dyn std::error::Error>> {
+fn write_listener_failure(
+    path: &Path,
+    broker_uid: u32,
+    endpoint: CeremonyEndpoint,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let address = endpoint.address_string();
     write_startup_failure(
         path,
         broker_uid,
@@ -796,7 +819,7 @@ fn write_listener_failure(path: &Path, broker_uid: u32) -> Result<(), Box<dyn st
             schema: "bloom.broker-startup.1",
             state: "fatal",
             incident: "ceremony_listeners_unavailable",
-            address: "localhost:18734",
+            address: address.as_str(),
             message: "could not acquire both ceremony loopback listeners; see Broker service logs",
             observed_at_ms: unix_time_ms()?,
         },
@@ -806,7 +829,7 @@ fn write_listener_failure(path: &Path, broker_uid: u32) -> Result<(), Box<dyn st
 fn write_startup_failure(
     path: &Path,
     broker_uid: u32,
-    failure: &StartupFailure,
+    failure: &StartupFailure<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (parent, parent_gid) = verified_status_parent(path, broker_uid)?;
     let bytes = serde_json::to_vec(failure)?;
@@ -918,14 +941,15 @@ fn acquire_unix_listener(
 /// IPv4 socket and one for the IPv6 socket. The systemd `.socket` unit must
 /// publish exactly one descriptor under each name. macOS ignores the names
 /// and binds both loopback families directly.
-fn acquire_ceremony_listeners()
--> Result<(std::net::TcpListener, std::net::TcpListener), Box<dyn std::error::Error>> {
+fn acquire_ceremony_listeners(
+    endpoint: CeremonyEndpoint,
+) -> Result<(std::net::TcpListener, std::net::TcpListener), Box<dyn std::error::Error>> {
     let v4_name = std::env::var("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV4")
         .unwrap_or_else(|_| "broker-ceremony-ipv4".to_string());
     let v6_name = std::env::var("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV6")
         .unwrap_or_else(|_| "broker-ceremony-ipv6".to_string());
     Ok(CeremonyBroker::acquire_canonical_loopback_listeners(
-        &v4_name, &v6_name,
+        &v4_name, &v6_name, endpoint,
     )?)
 }
 

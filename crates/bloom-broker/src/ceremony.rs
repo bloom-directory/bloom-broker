@@ -57,6 +57,95 @@ pub const CEREMONY_ADDR_V6: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LO
 /// A listener on any address outside this set is refused at acquisition.
 pub const CEREMONY_LOOPBACK_ADDRS: [SocketAddr; 2] = [CEREMONY_ADDR_V4, CEREMONY_ADDR_V6];
 pub const CEREMONY_ORIGIN: &str = "http://localhost:18734";
+/// Compiled default ceremony port. Used when the protected configuration
+/// omits `ceremony_port`.
+pub const DEFAULT_CEREMONY_PORT: u16 = 18_734;
+
+/// Small immutable ceremony endpoint value. Port, IPv4/IPv6 bind addresses,
+/// Host, origin, and URL construction live together so they cannot disagree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CeremonyEndpoint {
+    port: u16,
+}
+
+impl CeremonyEndpoint {
+    /// Resolve and validate a configured port. Accepts 1 through 65535 in
+    /// every build; rejects zero before listeners or ceremony state open.
+    pub fn new(port: u16) -> Result<Self, ProtocolError> {
+        if port == 0 {
+            return Err(protocol(
+                ProtocolErrorCode::MalformedFrame,
+                "ceremony_port must be between 1 and 65535; correct it in the Broker configuration file",
+            ));
+        }
+        Ok(Self { port })
+    }
+
+    /// Validate a raw integer from configuration before narrowing to u16.
+    pub fn new_from_u32(port: u32) -> Result<Self, ProtocolError> {
+        if port == 0 || port > u32::from(u16::MAX) {
+            return Err(protocol(
+                ProtocolErrorCode::MalformedFrame,
+                format!(
+                    "ceremony_port must be between 1 and 65535, but is {port}; correct it in the Broker configuration file"
+                ),
+            ));
+        }
+        Self::new(port as u16)
+    }
+
+    pub fn default_endpoint() -> Self {
+        Self {
+            port: DEFAULT_CEREMONY_PORT,
+        }
+    }
+
+    pub fn port(self) -> u16 {
+        self.port
+    }
+
+    pub fn addr_v4(self) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.port)
+    }
+
+    pub fn addr_v6(self) -> SocketAddr {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), self.port)
+    }
+
+    pub fn addrs(self) -> [SocketAddr; 2] {
+        [self.addr_v4(), self.addr_v6()]
+    }
+
+    /// Host header value, serialized as browsers do: bare `localhost` for
+    /// HTTP port 80, otherwise `localhost:<port>`.
+    pub fn host(self) -> String {
+        if self.port == 80 {
+            "localhost".to_owned()
+        } else {
+            format!("localhost:{}", self.port)
+        }
+    }
+
+    /// Ceremony origin, serialized as browsers do.
+    pub fn origin(self) -> String {
+        format!("http://{}", self.host())
+    }
+
+    pub fn session_url(self, token: &Base64UrlBytes) -> String {
+        format!("{}/ceremony/{}", self.origin(), token.encoded())
+    }
+
+    /// `localhost:<port>` diagnostic form used in startup failure reports.
+    pub fn address_string(self) -> String {
+        format!("localhost:{}", self.port)
+    }
+}
+
+impl Default for CeremonyEndpoint {
+    fn default() -> Self {
+        Self::default_endpoint()
+    }
+}
 pub const MAX_CEREMONY_BODY_BYTES: usize = 16 * 1024;
 pub const CEREMONY_OWNER_HEADER: &str = "x-bloom-ceremony-owner";
 pub const CEREMONY_OWNER_VALUE: &str = "bloom-broker-v1";
@@ -474,6 +563,7 @@ impl BackoffDeadline {
 
 struct BrokerInner {
     signer: Arc<dyn CeremonySigner>,
+    endpoint: CeremonyEndpoint,
     limits: CeremonyLimits,
     /// Serializes the admission decision through durable session insertion so
     /// concurrent prepares cannot all reserve the same remaining capacity.
@@ -588,7 +678,33 @@ impl CeremonyBroker {
     /// policy at startup; this constructor is how a non-default policy reaches
     /// an in-memory Broker.
     pub fn new_with_limits(signer: Arc<dyn CeremonySigner>, limits: CeremonyLimits) -> Self {
-        Self::from_parts(signer, limits, None, None, None)
+        Self::from_parts(
+            signer,
+            CeremonyEndpoint::default(),
+            limits,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub fn new_with_endpoint(signer: Arc<dyn CeremonySigner>, endpoint: CeremonyEndpoint) -> Self {
+        Self::from_parts(
+            signer,
+            endpoint,
+            CeremonyLimits::default(),
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub fn new_with_limits_and_endpoint(
+        signer: Arc<dyn CeremonySigner>,
+        limits: CeremonyLimits,
+        endpoint: CeremonyEndpoint,
+    ) -> Self {
+        Self::from_parts(signer, endpoint, limits, None, None, None)
     }
 
     pub fn new_with_manifest_signer(
@@ -598,6 +714,23 @@ impl CeremonyBroker {
     ) -> Self {
         Self::from_parts(
             signer,
+            CeremonyEndpoint::default(),
+            CeremonyLimits::default(),
+            None,
+            Some((broker_key_id, signing_key)),
+            None,
+        )
+    }
+
+    pub fn new_with_manifest_signer_and_endpoint(
+        signer: Arc<dyn CeremonySigner>,
+        broker_key_id: Token,
+        signing_key: SigningKey,
+        endpoint: CeremonyEndpoint,
+    ) -> Self {
+        Self::from_parts(
+            signer,
+            endpoint,
             CeremonyLimits::default(),
             None,
             Some((broker_key_id, signing_key)),
@@ -610,9 +743,19 @@ impl CeremonyBroker {
         signer: Arc<dyn CeremonySigner>,
         journal: Arc<BrokerJournal>,
     ) -> Result<Self, ProtocolError> {
+        Self::open_with_endpoint(legacy_path, signer, journal, CeremonyEndpoint::default())
+    }
+
+    pub fn open_with_endpoint(
+        legacy_path: impl AsRef<FsPath>,
+        signer: Arc<dyn CeremonySigner>,
+        journal: Arc<BrokerJournal>,
+        endpoint: CeremonyEndpoint,
+    ) -> Result<Self, ProtocolError> {
         let database = open_audited_ceremony_store(legacy_path, &journal)?;
         let broker = Self::from_parts(
             signer,
+            endpoint,
             CeremonyLimits::default(),
             Some(database),
             None,
@@ -639,6 +782,25 @@ impl CeremonyBroker {
         )
     }
 
+    pub fn open_with_manifest_signer_and_endpoint(
+        path: impl AsRef<FsPath>,
+        signer: Arc<dyn CeremonySigner>,
+        broker_key_id: Token,
+        signing_key: SigningKey,
+        journal: Arc<BrokerJournal>,
+        endpoint: CeremonyEndpoint,
+    ) -> Result<Self, ProtocolError> {
+        Self::open_with_manifest_signer_audited_and_endpoint(
+            path,
+            signer,
+            broker_key_id,
+            signing_key,
+            journal,
+            CeremonyLimits::default(),
+            endpoint,
+        )
+    }
+
     pub fn open_with_manifest_signer_audited(
         legacy_path: impl AsRef<FsPath>,
         signer: Arc<dyn CeremonySigner>,
@@ -647,9 +809,30 @@ impl CeremonyBroker {
         journal: Arc<BrokerJournal>,
         limits: CeremonyLimits,
     ) -> Result<Self, ProtocolError> {
+        Self::open_with_manifest_signer_audited_and_endpoint(
+            legacy_path,
+            signer,
+            broker_key_id,
+            signing_key,
+            journal,
+            limits,
+            CeremonyEndpoint::default(),
+        )
+    }
+
+    pub fn open_with_manifest_signer_audited_and_endpoint(
+        legacy_path: impl AsRef<FsPath>,
+        signer: Arc<dyn CeremonySigner>,
+        broker_key_id: Token,
+        signing_key: SigningKey,
+        journal: Arc<BrokerJournal>,
+        limits: CeremonyLimits,
+        endpoint: CeremonyEndpoint,
+    ) -> Result<Self, ProtocolError> {
         let database = open_audited_ceremony_store(legacy_path, &journal)?;
         let broker = Self::from_parts(
             signer,
+            endpoint,
             limits,
             Some(database),
             Some((broker_key_id, signing_key)),
@@ -664,8 +847,18 @@ impl CeremonyBroker {
         self.inner.limits
     }
 
+    /// The instance ceremony endpoint (port, addrs, Host, origin, URLs).
+    pub fn endpoint(&self) -> CeremonyEndpoint {
+        self.inner.endpoint
+    }
+
+    pub fn ceremony_session_url(&self, token: &Base64UrlBytes) -> String {
+        self.inner.endpoint.session_url(token)
+    }
+
     fn from_parts(
         signer: Arc<dyn CeremonySigner>,
+        endpoint: CeremonyEndpoint,
         limits: CeremonyLimits,
         database: Option<Arc<std::sync::Mutex<Connection>>>,
         manifest_signer: Option<(Token, SigningKey)>,
@@ -674,6 +867,7 @@ impl CeremonyBroker {
         Self {
             inner: Arc::new(BrokerInner {
                 signer,
+                endpoint,
                 limits,
                 creation_admission: Mutex::new(()),
                 sessions: Mutex::new(HashMap::new()),
@@ -761,7 +955,7 @@ impl CeremonyBroker {
             expires_at_ms,
             created_at_ms: now_ms,
         })?;
-        let url = session_url(&token_for(&session));
+        let url = self.ceremony_session_url(&token_for(&session));
         self.insert_session(ceremony_id.clone(), session)?;
         Ok(SealedApprovalPrepareResponse {
             approval_id: request
@@ -872,7 +1066,7 @@ impl CeremonyBroker {
             expires_at_ms,
             created_at_ms: now_ms,
         })?;
-        let url = session_url(&token_for(&session));
+        let url = self.ceremony_session_url(&token_for(&session));
         self.insert_session(ceremony_id, session)?;
         Ok(CustodyPrepareResponse {
             ceremony_kind: kind_to_machine(request.ceremony_kind),
@@ -945,7 +1139,7 @@ impl CeremonyBroker {
         let response = PolicyUpdatePrepareResponse {
             operation_id: request.update.operation_id,
             ceremony_kind: BrokerCeremonyKind::PolicyUpdate,
-            ceremony_url: session_url(&token_for(&session)),
+            ceremony_url: self.ceremony_session_url(&token_for(&session)),
             ceremony_expires_at_ms: DecimalU64::new(expires_at_ms),
             review_manifest_digest: request.broker_validation_receipt.review_manifest_digest,
         };
@@ -984,7 +1178,7 @@ impl CeremonyBroker {
         Some(Ok(PolicyUpdatePrepareResponse {
             operation_id: update.operation_id.clone(),
             ceremony_kind: BrokerCeremonyKind::PolicyUpdate,
-            ceremony_url: session_url(&token_for(session)),
+            ceremony_url: self.ceremony_session_url(&token_for(session)),
             ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             review_manifest_digest: manifest.digest().ok()?,
         }))
@@ -1024,7 +1218,10 @@ impl CeremonyBroker {
             None => None,
         };
         let ceremony_url = if session.state == CeremonyState::AwaitingUser {
-            session.token.as_ref().map(session_url)
+            session
+                .token
+                .as_ref()
+                .map(|token| self.ceremony_session_url(token))
         } else {
             None
         };
@@ -1067,10 +1264,12 @@ impl CeremonyBroker {
             if manifest_approval_id != approval_id.as_str() {
                 return None;
             }
-            session
-                .token
-                .as_ref()
-                .map(|token| (session_url(token), DecimalU64::new(session.expires_at_ms)))
+            session.token.as_ref().map(|token| {
+                (
+                    self.ceremony_session_url(token),
+                    DecimalU64::new(session.expires_at_ms),
+                )
+            })
         }))
     }
 
@@ -1383,11 +1582,11 @@ impl CeremonyBroker {
         Ok(())
     }
 
-    /// Acquire the canonical ceremony listener pair for this platform.
+    /// Acquire the configured ceremony listener pair for this platform.
     ///
-    /// The canonical ceremony origin is `http://localhost:18734`, and Chromium
+    /// The ceremony origin is `http://localhost:<port>`, and Chromium
     /// resolves `localhost` to `::1` before `127.0.0.1`, so the Broker must
-    /// own both the IPv4 and the IPv6 loopback socket on the canonical port.
+    /// own both the IPv4 and the IPv6 loopback socket on the configured port.
     /// macOS binds them directly. Linux always consumes the listeners its
     /// launch manager inherited, including under `triad-dev-harness`: that
     /// feature selects which identity and manifest are loaded, not how a
@@ -1401,14 +1600,16 @@ impl CeremonyBroker {
     pub fn acquire_canonical_loopback_listeners(
         _v4_activation_name: &str,
         _v6_activation_name: &str,
+        endpoint: CeremonyEndpoint,
     ) -> Result<(StdTcpListener, StdTcpListener), ProtocolError> {
-        Self::bind_canonical_loopback()
+        Self::bind_canonical_loopback_for(endpoint)
     }
 
     #[cfg(not(target_os = "macos"))]
     pub fn acquire_canonical_loopback_listeners(
         v4_activation_name: &str,
         v6_activation_name: &str,
+        endpoint: CeremonyEndpoint,
     ) -> Result<(StdTcpListener, StdTcpListener), ProtocolError> {
         let v4 = bloom_service_activation::take_tcp_listener(v4_activation_name).map_err(
             |error| {
@@ -1430,21 +1631,22 @@ impl CeremonyBroker {
                 )
             },
         )?;
-        let v4 = Self::require_canonical_loopback_listener(v4, CEREMONY_ADDR_V4)?;
-        let v6 = Self::require_canonical_loopback_listener(v6, CEREMONY_ADDR_V6)?;
+        let v4 = Self::require_canonical_loopback_listener(v4, endpoint.addr_v4())?;
+        let v6 = Self::require_canonical_loopback_listener(v6, endpoint.addr_v6())?;
         Ok((v4, v6))
     }
 
-    /// Verify that an already-acquired listener is the canonical ceremony
+    /// Verify that an already-acquired listener is the configured ceremony
     /// socket for `expected_family`.
     ///
     /// An inherited listener is supplied by the launch manager rather than
     /// chosen by this process, so its address is an input to be checked, not
     /// an invariant to be assumed. A descriptor bound to any other address
     /// is refused outright: the ceremony origin, the `Host` header check,
-    /// and the browser's same-origin expectations are all pinned to
-    /// [`CEREMONY_LOOPBACK_ADDRS`], so serving on a different address would
-    /// silently break them rather than fail closed.
+    /// and the browser's same-origin expectations are all pinned to the
+    /// configured endpoint, so serving on a different address would
+    /// silently break them rather than fail closed. Wildcards, wrong ports,
+    /// swapped families, and missing descriptors are all refused.
     pub fn require_canonical_loopback_listener(
         listener: StdTcpListener,
         expected_family: SocketAddr,
@@ -1455,14 +1657,6 @@ impl CeremonyBroker {
                 format!("inherited ceremony listener has no readable address: {error}"),
             )
         })?;
-        if !CEREMONY_LOOPBACK_ADDRS.contains(&observed) {
-            return Err(protocol(
-                ProtocolErrorCode::ServiceUnavailable,
-                format!(
-                    "inherited ceremony listener is bound to {observed}; expected one of {CEREMONY_LOOPBACK_ADDRS:?} but no other address will be served"
-                ),
-            ));
-        }
         if observed != expected_family {
             return Err(protocol(
                 ProtocolErrorCode::ServiceUnavailable,
@@ -1483,8 +1677,16 @@ impl CeremonyBroker {
     /// Exclusively acquire both canonical loopback sockets. There is
     /// deliberately no fallback address or port.
     pub fn bind_canonical_loopback() -> Result<(StdTcpListener, StdTcpListener), ProtocolError> {
-        let v4 = Self::bind_loopback_one(CEREMONY_ADDR_V4)?;
-        let v6 = Self::bind_loopback_one(CEREMONY_ADDR_V6)?;
+        Self::bind_canonical_loopback_for(CeremonyEndpoint::default())
+    }
+
+    /// Exclusively acquire both loopback sockets for `endpoint`. There is
+    /// deliberately no fallback address or port.
+    pub fn bind_canonical_loopback_for(
+        endpoint: CeremonyEndpoint,
+    ) -> Result<(StdTcpListener, StdTcpListener), ProtocolError> {
+        let v4 = Self::bind_loopback_one(endpoint.addr_v4())?;
+        let v6 = Self::bind_loopback_one(endpoint.addr_v6())?;
         Ok((v4, v6))
     }
 
@@ -1506,21 +1708,23 @@ impl CeremonyBroker {
         Ok(listener)
     }
 
-    /// Bind and serve both canonical loopback listeners until `shutdown`
+    /// Bind and serve both configured loopback listeners until `shutdown`
     /// resolves. macOS-only.
     pub async fn serve_canonical_loopback_until<F>(self, shutdown: F) -> Result<(), ProtocolError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let (v4, v6) = Self::bind_canonical_loopback()?;
+        let endpoint = self.inner.endpoint;
+        let (v4, v6) = Self::bind_canonical_loopback_for(endpoint)?;
         self.serve_loopback_listeners_until(v4, v6, shutdown).await
     }
 
-    /// Serve an already-acquired pair of canonical loopback listeners until
+    /// Serve an already-acquired pair of configured loopback listeners until
     /// `shutdown` resolves. Linux uses this with descriptors inherited from
     /// the launch manager; tests use it with synthesized listeners. Both
     /// listeners run under one graceful shutdown. If either server exits,
     /// its peer is also asked to stop so the pair cannot strand shutdown.
+    /// Each descriptor must match the instance endpoint exactly.
     pub async fn serve_loopback_listeners_until<F>(
         self,
         v4: StdTcpListener,
@@ -1530,8 +1734,9 @@ impl CeremonyBroker {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let v4 = Self::require_canonical_loopback_listener(v4, CEREMONY_ADDR_V4)?;
-        let v6 = Self::require_canonical_loopback_listener(v6, CEREMONY_ADDR_V6)?;
+        let endpoint = self.inner.endpoint;
+        let v4 = Self::require_canonical_loopback_listener(v4, endpoint.addr_v4())?;
+        let v6 = Self::require_canonical_loopback_listener(v6, endpoint.addr_v6())?;
         let router = self.router();
         let v4 = tokio::net::TcpListener::from_std(v4).map_err(|error| {
             protocol(
@@ -1767,7 +1972,7 @@ impl CeremonyBroker {
         Some(Ok(SealedApprovalPrepareResponse {
             approval_id: manifest.approval_id.clone(),
             state: ApprovalPrepareState::AwaitingCeremony,
-            ceremony_url: session_url(&token_for(session)),
+            ceremony_url: self.ceremony_session_url(&token_for(session)),
             ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             review_manifest_digest: digest(&manifest).ok()?,
         }))
@@ -1793,7 +1998,7 @@ impl CeremonyBroker {
             ceremony_kind: kind_to_machine(session.ceremony_kind),
             custody_operation_id: operation_id.clone(),
             state: CustodyPrepareState::AwaitingUser,
-            ceremony_url: session_url(&token_for(session)),
+            ceremony_url: self.ceremony_session_url(&token_for(session)),
             ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             signer_contribution_digest: contribution.digest().ok()?,
         }))
@@ -1817,7 +2022,7 @@ impl CeremonyBroker {
         Some(Ok(PolicyUpdatePrepareResponse {
             operation_id: operation_id.clone(),
             ceremony_kind: BrokerCeremonyKind::PolicyUpdate,
-            ceremony_url: session_url(&token_for(session)),
+            ceremony_url: self.ceremony_session_url(&token_for(session)),
             ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             review_manifest_digest: review_manifest_digest.clone(),
         }))
@@ -2246,8 +2451,8 @@ impl CeremonyBroker {
     }
 }
 
-async fn shell(headers: HeaderMap) -> Response {
-    if validate_host(&headers).is_err() {
+async fn shell(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    if broker.validate_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     Html(SHELL_HTML).into_response()
@@ -2258,7 +2463,7 @@ async fn ceremony_shell(
     Path(token): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if validate_host(&headers).is_err() {
+    if broker.validate_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     if broker.expire_sessions(unix_time_ms()).is_err() {
@@ -2271,8 +2476,8 @@ async fn ceremony_shell(
     Html(SHELL_HTML).into_response()
 }
 
-async fn app_js(headers: HeaderMap) -> Response {
-    if validate_host(&headers).is_err() {
+async fn app_js(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    if broker.validate_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     (
@@ -2285,8 +2490,8 @@ async fn app_js(headers: HeaderMap) -> Response {
         .into_response()
 }
 
-async fn style_css(headers: HeaderMap) -> Response {
-    if validate_host(&headers).is_err() {
+async fn style_css(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    if broker.validate_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     (
@@ -2296,8 +2501,8 @@ async fn style_css(headers: HeaderMap) -> Response {
         .into_response()
 }
 
-async fn bloom_primary_svg(headers: HeaderMap) -> Response {
-    if validate_host(&headers).is_err() {
+async fn bloom_primary_svg(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    if broker.validate_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     (
@@ -2312,7 +2517,7 @@ async fn read_session(
     Path(ceremony_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if validate_host(&headers).is_err()
+    if broker.validate_host(&headers).is_err()
         || broker
             .authorize_browser(&ceremony_id, &headers, false)
             .is_err()
@@ -2346,7 +2551,7 @@ async fn read_result(
     Path(ceremony_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if validate_host(&headers).is_err()
+    if broker.validate_host(&headers).is_err()
         || broker
             .authorize_browser(&ceremony_id, &headers, false)
             .is_err()
@@ -2716,7 +2921,7 @@ impl CeremonyBroker {
 
     fn authorize_browser_token(&self, headers: &HeaderMap) -> Result<String, ProtocolError> {
         self.expire_sessions(unix_time_ms())?;
-        validate_host(headers)?;
+        self.validate_host(headers)?;
         let ceremony_id = headers
             .get("x-bloom-ceremony-token")
             .and_then(|value| value.to_str().ok())
@@ -2742,9 +2947,9 @@ impl CeremonyBroker {
         mutation: bool,
     ) -> Result<(), ProtocolError> {
         self.expire_sessions(unix_time_ms())?;
-        validate_host(headers)?;
+        self.validate_host(headers)?;
         if mutation {
-            validate_origin(headers)?;
+            self.validate_origin(headers)?;
             require_exact_header(headers, header::CONTENT_TYPE, "application/json")?;
             require_exact_header_name(headers, "sec-fetch-site", "same-origin")?;
         }
@@ -2819,12 +3024,14 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
     response
 }
 
-fn validate_host(headers: &HeaderMap) -> Result<(), ProtocolError> {
-    require_exact_header(headers, header::HOST, "localhost:18734")
-}
+impl CeremonyBroker {
+    fn validate_host(&self, headers: &HeaderMap) -> Result<(), ProtocolError> {
+        require_exact_header(headers, header::HOST, &self.inner.endpoint.host())
+    }
 
-fn validate_origin(headers: &HeaderMap) -> Result<(), ProtocolError> {
-    require_exact_header(headers, header::ORIGIN, CEREMONY_ORIGIN)
+    fn validate_origin(&self, headers: &HeaderMap) -> Result<(), ProtocolError> {
+        require_exact_header(headers, header::ORIGIN, &self.inner.endpoint.origin())
+    }
 }
 
 fn require_exact_header(
@@ -2848,10 +3055,6 @@ fn require_exact_header_name(
     expected: &str,
 ) -> Result<(), ProtocolError> {
     require_exact_header(headers, HeaderName::from_static(name), expected)
-}
-
-fn session_url(token: &Base64UrlBytes) -> String {
-    format!("{CEREMONY_ORIGIN}/ceremony/{}", token.encoded())
 }
 
 fn token_for(session: &BrowserSession) -> Base64UrlBytes {
