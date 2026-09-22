@@ -6875,7 +6875,7 @@ if (!view.primary.includes("0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512")) {{
 // The envelope's zero native value must not read as the thing being sent.
 if (view.primary.includes("  0 ETH")) throw new Error(`primary showed the native zero: ${{view.primary}}`);
 // The potential cost stays with the decision, labelled as a ceiling.
-if (!view.primary.includes("Maximum execution fee") ||
+if (!view.primary.includes("Maximum execution gas fee") ||
     !view.primary.includes("0.000198510751634520 ETH at most")) {{
   throw new Error(`the execution gas ceiling is not visible: ${{view.primary}}`);
 }}

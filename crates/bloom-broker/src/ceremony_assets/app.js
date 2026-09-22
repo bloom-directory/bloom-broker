@@ -157,7 +157,7 @@ function startExpiry(session, node) {
   const countdown = el("span", {class: "review-countdown"});
   if (deadline) {
     deadline.replaceChildren(el("span", {}, `${session.is_preview ? "Example deadline" : "Approve by"}: ${absolute}`));
-    if (counting) deadline.append(countdown);
+    if (counting) deadline.append(" · ", countdown);
     deadline.setAttribute("title", new Date(expiresAt).toISOString());
   }
   const tick = () => {
@@ -361,7 +361,7 @@ function describeTransfer(manifest) {
     // for that charge, not an estimate and not a cap on every network charge.
     // When the chain's units are unknown the page says so: a missing cost
     // must not read as no cost.
-    facts.push([label("Maximum execution fee"),
+    facts.push([label("Maximum execution gas fee"),
       payload.maximum_execution_gas_fee_display
         ? `${payload.maximum_execution_gas_fee_display} at most`
         : "Cannot be shown — Bloom has no authenticated units for this chain"]);
@@ -766,6 +766,13 @@ function planDisclosures(manifest) {
   } catch (_) { return []; }
 }
 
+const explorerAnchor = (explorer, value, label) =>
+  el("a", {href: explorer.url, class: "ceremony-address-link", target: "_blank",
+    rel: "noopener noreferrer", referrerpolicy: "no-referrer",
+    title: `View on ${explorer.name} (opens a new tab)`,
+    "aria-label": `${label}: ${value}. View on ${explorer.name} (opens a new tab)`},
+    el("code", {}, value));
+
 function renderReview(session) {
   const kind = session.ceremony_kind;
   const meta = KINDS[kind] || {title: kind.replace(/_/g, " "), summary: "", button: "Continue with passkey"};
@@ -791,7 +798,7 @@ function renderReview(session) {
   const fact = (label, value, mono, chainId = transfer?.chainId) => {
     if (value == null || value === "") return;
     const explorer = addressExplorer(chainId, String(value));
-    const shown = explorer ? el("a", {href: explorer.url, class: "ceremony-address-link", target: "_blank", rel: "noopener noreferrer", referrerpolicy: "no-referrer"}, el("code", {}, value))
+    const shown = explorer ? explorerAnchor(explorer, value, label)
       : mono ? el("code", {}, value) : value;
     facts.append(el("dt", {}, label), el("dd", {}, shown));
   };
@@ -989,7 +996,7 @@ function renderReview(session) {
     const technical = el("dl", {class: "facts technical"});
     for (const [label, value, mono, chainId] of transfer.technical) {
       const explorer = addressExplorer(chainId, String(value));
-      const shown = explorer ? el("a", {href: explorer.url, class: "ceremony-address-link", target: "_blank", rel: "noopener noreferrer", referrerpolicy: "no-referrer"}, el("code", {}, value))
+      const shown = explorer ? explorerAnchor(explorer, value, label)
         : mono ? el("code", {}, value) : value;
       technical.append(el("dt", {}, label), el("dd", {}, shown));
     }
