@@ -984,7 +984,7 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
     for required in [
         // One centred column with a documented measure, the stable component
         // hooks a theme may target, and the narrow-width behaviour.
-        "--ceremony-width:960px",
+        "--ceremony-width:840px",
         "--ceremony-accent:",
         ".ceremony-intent{",
         ".ceremony-party{",
@@ -6849,6 +6849,12 @@ function show(name) {{
 let view = show("transfer");
 if (view.heading !== "Review transfer") throw new Error(`transfer heading: ${{view.heading}}`);
 if (view.primary.includes(view.heading)) throw new Error("action title was printed twice");
+if (!view.primary.includes("−250 BDT") || !view.primary.includes("+250 BDT")) {{
+  throw new Error("requested sender/recipient movements are missing");
+}}
+if (!view.primary.includes("not simulated balances")) {{
+  throw new Error("requested movements must not imply observed balances");
+}}
 if (!allText(nodes["page-title"]).includes("Chain ID 31337")) {{
   throw new Error("the exact EVM chain is missing from the primary context");
 }}
@@ -6933,6 +6939,15 @@ if (!view.all.includes("11579208923731619542357098500868790785326998466564056403
 }}
 
 // An uninterpretable call says so instead of drawing a transfer.
+view = show("deposit-native-opaque");
+if (!view.primary.includes("Native value sent") || !view.primary.includes("1 ETH")) {{
+  throw new Error("an opaque payable call hid the native value it sends");
+}}
+for (const name of ["deposit-static", "stake-static", "operator-approval"]) {{
+  view = show(name);
+  if (view.action !== "call") throw new Error(`generic function became a transfer: ${{name}}`);
+  if (view.primary.includes("Requested movements")) throw new Error(`invented balance changes: ${{name}}`);
+}}
 view = show("opaque-call");
 if (view.action !== "opaque") throw new Error(`opaque action: ${{view.action}}`);
 if (!view.primary.includes("cannot say what")) throw new Error(`opaque detail: ${{view.primary}}`);

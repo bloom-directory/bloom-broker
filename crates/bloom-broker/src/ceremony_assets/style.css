@@ -40,7 +40,7 @@
   --ceremony-address-size:15px;
   --ceremony-heading-size:32px;
   /* Measure and rhythm: an 8px scale. */
-  --ceremony-width:960px;
+  --ceremony-width:840px;
   --ceremony-gutter:24px;
   --ceremony-padding:32px;
   --ceremony-space-1:8px;
@@ -84,6 +84,12 @@ body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-f
 .ceremony-party{display:grid;gap:var(--ceremony-space-1)}
 .ceremony-party-label{margin:0;color:var(--ceremony-muted);font-size:14px}
 .ceremony-party-name{margin:0;font-weight:600}
+.ceremony-balance-change{grid-column:3;grid-row:1;font-weight:600;font-size:22px;line-height:1.3;white-space:nowrap}
+.ceremony-balance-change.outgoing{color:var(--ceremony-danger)}
+.ceremony-balance-change.incoming{color:var(--ceremony-success)}
+.ceremony-transfer-path .ceremony-party{grid-template-columns:110px minmax(0,1fr) auto}
+.ceremony-transfer-path .ceremony-party-address{grid-column:2 / -1}
+.ceremony-movements-note{margin:0;font-size:13px;color:var(--ceremony-muted)}
 .ceremony-party-address{display:flex;align-items:baseline;gap:var(--ceremony-space-2);margin:0}
 .ceremony-party-address code{flex:1 1 auto;min-width:0;font:var(--ceremony-address-size)/1.5 var(--ceremony-font-mono);overflow-wrap:anywhere;user-select:all}
 .ceremony-asset{display:grid;grid-template-columns:48px minmax(0,1fr) auto;align-items:start;gap:var(--ceremony-space-2);padding:20px;background:var(--ceremony-bg);border:1px solid var(--ceremony-border);border-radius:var(--ceremony-radius)}
@@ -101,11 +107,13 @@ body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-f
 .ceremony-asset-identity .ceremony-party-address{flex-wrap:wrap;gap:4px}
 .ceremony-transfer-path,.ceremony-permission{padding:0;}
 .ceremony-transfer-path{gap:4px}
-.ceremony-transfer-path .ceremony-party,.ceremony-permission .ceremony-party{grid-template-columns:140px minmax(0,1fr);align-items:baseline;gap:4px var(--ceremony-space-2)}
-.ceremony-transfer-path .ceremony-party-address,.ceremony-permission .ceremony-party-address{grid-column:2;margin:0}
+.ceremony-transfer-path .ceremony-party,.ceremony-permission .ceremony-party{align-items:baseline;gap:4px var(--ceremony-space-2)}
+.ceremony-permission .ceremony-party{grid-template-columns:110px minmax(0,1fr)}
+.ceremony-transfer-path .ceremony-party-address,.ceremony-permission .ceremony-party-address{margin:0}
+.ceremony-permission .ceremony-party-address{grid-column:2}
 .ceremony-transfer-path .ceremony-party-label,.ceremony-permission .ceremony-party-label{grid-column:1;grid-row:1 / span 2}
 .ceremony-transfer-path .ceremony-party-name,.ceremony-permission .ceremony-party-name{grid-column:2}
-.ceremony-flow-arrow{margin-left:calc(140px + var(--ceremony-space-2));color:var(--ceremony-accent);font-size:24px;line-height:1}
+.ceremony-flow-arrow{margin-left:calc(110px + var(--ceremony-space-2));color:var(--ceremony-accent);font-size:24px;line-height:1}
 .ceremony-copy{flex:0 0 auto;min-height:32px;padding:4px 12px;border:1px solid var(--ceremony-border);border-radius:6px;background:transparent;color:var(--ceremony-muted);font:500 13px var(--ceremony-font);box-shadow:none}
 .ceremony-copy:hover:not(:disabled){background:var(--ceremony-bg);color:var(--ceremony-text);transform:none}
 
