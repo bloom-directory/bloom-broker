@@ -123,7 +123,8 @@ body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-f
 .ceremony-permission .ceremony-party-name{grid-column:2}
 .ceremony-transfer-path .ceremony-party-label{grid-column:1;grid-row:1}
 .ceremony-transfer-path .ceremony-party-name{grid-column:1;grid-row:2}
-.ceremony-flow-arrow{margin:8px 0;color:var(--ceremony-accent);font-size:24px;line-height:1}
+.ceremony-flow-arrow{display:flex;align-items:center;gap:12px;margin:8px 0;color:var(--ceremony-accent);font-size:24px;line-height:1}
+.ceremony-flow-arrow::after{content:"";flex:1;border-top:1px solid var(--ceremony-border)}
 .ceremony-call-arguments{padding:16px;border:1px solid var(--ceremony-border);border-radius:var(--ceremony-radius)}
 .ceremony-section-title{margin:0 0 8px;font-size:16px;font-weight:600}
 .ceremony-function{display:block;margin-bottom:16px;font:14px/1.5 var(--ceremony-font-mono);overflow-wrap:anywhere}
