@@ -88,11 +88,11 @@ body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-f
 .ceremony-party{display:grid;gap:var(--ceremony-space-1)}
 .ceremony-party-label{margin:0;color:var(--ceremony-muted);font-size:14px}
 .ceremony-party-name{margin:0;font-weight:600}
-.ceremony-balance-change{grid-column:3;grid-row:1;font-weight:600;font-size:22px;line-height:1.3;font-variant-numeric:tabular-nums;text-align:right;overflow-wrap:anywhere}
+.ceremony-balance-change{grid-column:2;grid-row:1;font-weight:600;font-size:22px;line-height:1.3;font-variant-numeric:tabular-nums;text-align:right;overflow-wrap:anywhere}
 .ceremony-balance-change.outgoing{color:var(--ceremony-danger)}
 .ceremony-balance-change.incoming{color:var(--ceremony-success)}
-.ceremony-transfer-path .ceremony-party{grid-template-columns:var(--ceremony-label-width) minmax(0,1fr) auto}
-.ceremony-transfer-path .ceremony-party-address{grid-column:2 / -1}
+.ceremony-transfer-path .ceremony-party{grid-template-columns:minmax(0,1fr) auto}
+.ceremony-transfer-path .ceremony-party-address{grid-column:1 / -1;grid-row:3}
 .ceremony-movements-note{margin:0;font-size:13px;color:var(--ceremony-muted)}
 .ceremony-party-address{display:flex;align-items:center;gap:var(--ceremony-space-2);margin:0;min-width:0}
 .ceremony-address-link{flex:1 1 auto;min-width:0;color:var(--ceremony-accent-deep);text-decoration:underline;text-decoration-color:var(--ceremony-border);text-underline-offset:4px;overflow-wrap:anywhere}
@@ -119,9 +119,16 @@ body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-f
 .ceremony-permission .ceremony-party{grid-template-columns:var(--ceremony-label-width) minmax(0,1fr)}
 .ceremony-transfer-path .ceremony-party-address,.ceremony-permission .ceremony-party-address{margin:0}
 .ceremony-permission .ceremony-party-address{grid-column:2}
-.ceremony-transfer-path .ceremony-party-label,.ceremony-permission .ceremony-party-label{grid-column:1;grid-row:1 / span 2}
-.ceremony-transfer-path .ceremony-party-name,.ceremony-permission .ceremony-party-name{grid-column:2}
-.ceremony-flow-arrow{margin-left:calc(var(--ceremony-label-width) + var(--ceremony-space-2));color:var(--ceremony-accent);font-size:24px;line-height:1}
+.ceremony-permission .ceremony-party-label{grid-column:1;grid-row:1 / span 2}
+.ceremony-permission .ceremony-party-name{grid-column:2}
+.ceremony-transfer-path .ceremony-party-label{grid-column:1;grid-row:1}
+.ceremony-transfer-path .ceremony-party-name{grid-column:1;grid-row:2}
+.ceremony-flow-arrow{margin:8px 0;color:var(--ceremony-accent);font-size:24px;line-height:1}
+.ceremony-call-arguments{padding:16px;border:1px solid var(--ceremony-border);border-radius:var(--ceremony-radius)}
+.ceremony-section-title{margin:0 0 8px;font-size:16px;font-weight:600}
+.ceremony-function{display:block;margin-bottom:16px;font:14px/1.5 var(--ceremony-font-mono);overflow-wrap:anywhere}
+.ceremony-call-arguments .facts{grid-template-columns:minmax(100px,1fr) minmax(0,2fr)}
+.ceremony-calldata pre{max-height:160px}
 
 /* One sentence. The rest is a disclosure. */
 .ceremony-assurance{max-width:65ch;margin:0;color:var(--ceremony-muted);font-size:14px}
@@ -201,6 +208,7 @@ textarea{resize:vertical}
   .ceremony-asset-identity .ceremony-party-address{grid-column:1 / -1;grid-row:4}
   .ceremony-transfer-path,.ceremony-permission{padding:0}
   .ceremony-transfer-path .ceremony-party,.ceremony-permission .ceremony-party,.ceremony-card .ceremony-party{display:flex;flex-direction:column;align-items:stretch}
+  .ceremony-call-arguments .facts{grid-template-columns:1fr}
   .ceremony-flow-arrow{margin-left:0;padding:8px 0}
   .action-buttons{margin-left:0;width:100%}
   .action-buttons button{flex:1 1 auto}

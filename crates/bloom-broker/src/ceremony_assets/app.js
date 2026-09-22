@@ -330,6 +330,18 @@ function formatObserved(milliseconds) {
   const value = Number(milliseconds);
   return Number.isFinite(value) ? new Date(value).toISOString().replace("T", " ").slice(0, 19) + " UTC" : "an unknown time";
 }
+// Round a displayed upper bound upwards using decimal integers. Floating
+// point rounding must never turn a maximum into an understated charge.
+function compactFeeCap(value) {
+  const match = /^(\d+)(?:\.(\d+))? (.+)$/.exec(String(value));
+  if (!match) return value;
+  const fraction = match[2] || "";
+  if (fraction.length <= 6) return value;
+  let units = BigInt(match[1]) * 1000000n + BigInt(fraction.slice(0, 6));
+  if (/[1-9]/.test(fraction.slice(6))) units += 1n;
+  const decimals = (units % 1000000n).toString().padStart(6, "0").replace(/0+$/, "");
+  return `${units / 1000000n}${decimals ? `.${decimals}` : ""} ${match[3]}`;
+}
 function describeTransfer(manifest) {
   const claim = manifest?.system_use_claim || manifest?.petal_use_claim;
   let plan = {};
@@ -361,11 +373,13 @@ function describeTransfer(manifest) {
     // must not read as no cost.
     facts.push([label("Execution gas cap"),
       payload.maximum_execution_gas_fee_display
-        ? `${payload.maximum_execution_gas_fee_display} at most`
+        ? `${compactFeeCap(payload.maximum_execution_gas_fee_display)} at most`
         : "Cannot be shown — Bloom has no authenticated units for this chain"]);
+    if (payload.maximum_execution_gas_fee_display) technical.push([
+      label("Exact execution gas cap"), payload.maximum_execution_gas_fee_display]);
     if (decoded) {
       technical.push([label("Data"), `${Number(payload.calldata_bytes).toLocaleString("en-US")} bytes`]);
-    } else {
+    } else if (!payload.calldata_hex) {
       facts.push([label("Data"), payload.calldata_keccak
         ? `${payload.destination ? "Contract call" : "Initcode"}, ${Number(payload.calldata_bytes).toLocaleString("en-US")} bytes — meaning not verified`
         : "None — plain transfer"]);
@@ -383,7 +397,7 @@ function describeTransfer(manifest) {
       technical.push([label("Maximum fee rate"), payload.fee.max_fee_per_gas_display]);
       technical.push([label("Priority fee cap"), payload.fee.max_priority_fee_per_gas_display]);
     }
-    technical.push([label("Payload commitment"), payload.payload_keccak, true]);
+    // Payload commitments remain in the complete signed manifest below.
   };
   // A clear-signed call puts the contract's own reading first: what moves,
   // to whom, in which token. The envelope facts stay underneath — they are
@@ -404,9 +418,9 @@ function describeTransfer(manifest) {
     for (const field of call.fields || []) {
       if (summary && field.format === "tokenAmount" && field.raw === summary.amount) continue;
       if (summary && field.raw === summary.counterparty) continue;
-      facts.push([label(field.label), field.value, field.format === "addressName"]);
+      if (summary) facts.push([label(field.label), field.value, field.format === "addressName"]);
     }
-    if (call.intent) facts.push([label("Publisher description"), call.intent]);
+    if (call.intent) technical.push([label("Publisher description"), call.intent]);
     technical.push([label("Function"), call.function_signature, true]);
     technical.push([label("Selector"), call.selector, true]);
     if (summary) technical.push([label("Exact amount"), summary.amount, true]);
@@ -478,9 +492,7 @@ function describeTransfer(manifest) {
         : first.destination
           ? (first.calldata_keccak
             ? {action: "opaque", eyebrow: "Contract call", heading: "Approve a call Bloom cannot read",
-               detail: "There is no signed description of this contract, so Bloom cannot say what " +
-                 "the call does. It checked the envelope only: the destination, the value and the " +
-                 "exact bytes shown below are what your passkey approves.",
+               detail: "No signed description is available. Bloom cannot say what this call does.",
                relation: "calls"}
             : {action: "send", eyebrow: "Native transfer",
                heading: `Send ${first.value_display}`,
@@ -530,18 +542,17 @@ function describeTransfer(manifest) {
     // One sentence, from the review rather than from matching warning text.
     const assurance = first.contract_call?.assurance ||
       (clear ? "Interpreted using a trusted signed description. Contract behavior has not been verified."
-             : "Only the transaction envelope was checked: the destination, the value and the exact " +
-               "bytes below. What the contract does has not been verified.");
+             : "Transaction destination, value and bytes checked. Contract behavior not verified.");
     if (clear) {
       interpretation.push(["Catalog", `${clear.catalog_id}, sequence ${clear.catalog_sequence}`]);
       interpretation.push(["Assurance class", clear.assurance]);
       interpretation.push(["Verifier", `${clear.verifier_id} (${shortDigest(clear.verifier_digest)})`]);
-      technical.push(["Catalog commitment", clear.catalog_digest, true]);
+      // The catalog commitment is already in the complete signed manifest.
     }
     const oneNetwork = evmPayloads.every(payload => String(payload.chain_id) === String(first.chain_id));
     const networkIdentity = oneNetwork
       ? `EVM · ${network} · Chain ID ${first.chain_id}` : "EVM · Multiple networks";
-    return {intent, parties: parties.map(party => ({...party, chainId: first.chain_id})), assurance, interpretation, facts, technical, warnings, networkIdentity,
+    return {intent, payloads: evmPayloads, parties: parties.map(party => ({...party, chainId: first.chain_id})), assurance, interpretation, facts, technical, warnings, networkIdentity,
             chainId: evmPayloads.length === 1 ? first.chain_id : null,
             assetSummary: evmPayloads.length === 1 ? summary : null,
             networkIcon: oneNetwork ? ({"1": "ethereum", "8453": "base", "31337": "test"}[first.chain_id] || "unknown") : "unknown",
@@ -934,6 +945,21 @@ function renderReview(session) {
       parts.push(el("section", {class: "ceremony-asset", "aria-label": "Token being transferred or approved"}, icon, asset, amount));
     }
     if (transfer.intent.detail) parts.push(intentBlock(transfer.intent));
+    for (const [index, payload] of (transfer.payloads || []).entries()) {
+      const call = payload.contract_call;
+      if (!call || call.intent_summary) continue;
+      const argumentsList = el("dl", {class: "facts"});
+      for (const field of call.fields || []) {
+        const explorer = addressExplorer(payload.chain_id, field.value);
+        const value = explorer ? explorerAnchor(explorer, field.value, field.label)
+          : el("code", {}, field.value);
+        argumentsList.append(el("dt", {}, field.label), el("dd", {}, value));
+      }
+      parts.push(el("section", {class: "ceremony-call-arguments"},
+        el("h2", {class: "ceremony-section-title"}, transfer.payloads.length > 1 ? `Transaction ${index + 1} arguments` : "Function arguments"),
+        el("code", {class: "ceremony-function"}, call.function_signature),
+        argumentsList));
+    }
     const warningParts = [];
     if (transfer.warnings?.length) {
       const warningGroup = el("aside", {class: "ceremony-warning", "aria-label": "Risks and consequences"});
@@ -982,6 +1008,17 @@ function renderReview(session) {
         "Requested movements, not simulated balances."));
     }
     parts.push(...warningParts);
+    for (const [index, payload] of (transfer.payloads || []).entries()) {
+      if (!payload.calldata_keccak) continue;
+      const name = payload.destination ? "Calldata" : "Initcode";
+      const prefix = transfer.payloads.length > 1 ? `Transaction ${index + 1} · ` : "";
+      const raw = el("details", {class: "ceremony-details ceremony-calldata"},
+        el("summary", {}, `${prefix}${name} · ${payload.calldata_bytes} bytes`),
+        payload.calldata_hex ? el("pre", {}, payload.calldata_hex)
+          : el("p", {class: "ceremony-assurance"}, "This older review records only the data length and hash. Prepare a new review to see the bytes."));
+      if (!payload.contract_call) raw.setAttribute("open", "");
+      parts.push(payload.contract_call ? raw : el("section", {class: "ceremony-raw"}, raw));
+    }
   } else {
     parts.push(el("p", {class: "summary", html: summaryHtml}));
   }
@@ -1378,7 +1415,7 @@ const PREVIEW_ASSURANCE =
 const PREVIEW_ALLOWANCE_ADVISORY =
   "This spender can move your tokens later without another approval. The permission does not expire with this review.";
 function previewPayload(extra) {
-  return Object.assign({
+  const payload = Object.assign({
     chain_id: "31337", chain: "anvil", sender: PREVIEW_WALLET, destination: PREVIEW_TOKEN,
     value: "0", value_display: "0 ETH", nonce: "7", gas_limit: "65410",
     fee: {kind: "eip1559", max_fee_per_gas: "3034880652", max_fee_per_gas_display: "3.03 gwei",
@@ -1388,6 +1425,10 @@ function previewPayload(extra) {
     calldata_bytes: "68",
     calldata_keccak: "11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"
   }, extra);
+  const summary = payload.contract_call?.intent_summary;
+  if (summary) payload.calldata_hex = (summary.action === "transfer" ? "0xa9059cbb" : "0x095ea7b3") +
+    summary.counterparty.slice(2).toLowerCase().padStart(64, "0") + BigInt(summary.amount).toString(16).padStart(64, "0");
+  return payload;
 }
 function previewClearSigning() {
   return {
@@ -1518,13 +1559,20 @@ const PREVIEWS = {
   "operator-approval": () => previewProtocolCall("operator-approval"),
   "deposit-native-opaque": () => {
     const session = previewApproval([previewPayload({chain_id: "1", chain: "ethereum",
-      value: "1000000000000000000", value_display: "1 ETH", calldata_bytes: "4"})], null);
+      value: "1000000000000000000", value_display: "1 ETH", calldata_bytes: "4", calldata_hex: "0xd0e30db0"})], null);
     session.preview_status = "Synthetic deposit() example — zero-argument descriptors are unsupported; explicit opaque review only";
     return session;
   },
   transfer: () => previewApproval([previewPayload({
     contract_call: previewCall("transfer", "250000000", "250 BDT", "finite", [])
   })], previewClearSigning()),
+  "transfer-ethereum": () => {
+    const session = previewApproval([previewPayload({chain_id: "1", chain: "ethereum",
+      contract_call: previewCall("transfer", "250000000", "250 BDT", "finite", [])
+    })], previewClearSigning());
+    session.preview_status = "Synthetic Ethereum example — addresses are for layout testing only";
+    return session;
+  },
   "allowance-finite": () => previewApproval([previewPayload({
     contract_call: previewCall("allowance", "100000000", "100 BDT", "finite", [
       PREVIEW_ALLOWANCE_ADVISORY,
@@ -1541,7 +1589,9 @@ const PREVIEWS = {
       "unlimited", [
         "If executed, this spender can use all your current and future BDT without asking again. This permission has no expiry; changing it requires another transaction."])
   })], previewClearSigning()),
-  "opaque-call": () => previewApproval([previewPayload({})], null),
+  "opaque-call": () => previewApproval([previewPayload({calldata_hex:
+    "0xa9059cbb" + PREVIEW_SPENDER.slice(2).toLowerCase().padStart(64, "0") +
+    (250000000n).toString(16).padStart(64, "0")})], null),
   "native-send": () => previewApproval([previewPayload({
     destination: PREVIEW_SPENDER, value: "10000000000000000", value_display: "0.01 ETH",
     calldata_bytes: "0", calldata_keccak: undefined

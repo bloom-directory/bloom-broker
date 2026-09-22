@@ -45,6 +45,10 @@ pub struct EvmReviewPayload {
     /// for creation). Present so the owner can tell a plain transfer from a
     /// contract call: execution effects remain unverified either way.
     pub calldata_bytes: String,
+    /// Exact input decoded from the signing preimage, never supplied by a
+    /// descriptor. Older frozen reviews may contain only its size and hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calldata_hex: Option<String>,
     /// Keccak-256 of the transaction input bytes, present only when the input
     /// is non-empty.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -484,6 +488,7 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
             fee,
             payload_keccak: format!("{:#x}", keccak256(bytes)),
             calldata_bytes: input.len().to_string(),
+            calldata_hex: (!input.is_empty()).then(|| format!("0x{}", hex::encode(input))),
             calldata_keccak: (!input.is_empty()).then(|| format!("{:#x}", keccak256(input))),
             maximum_execution_gas_fee_display: maximum_execution_gas_fee_display(
                 &fee_ceiling,
@@ -666,6 +671,7 @@ pub(crate) mod tests {
             // Initcode is disclosed by size and commitment, not hidden: the
             // owner sees this creation carries 5 bytes of initcode.
             assert_eq!(reviewed.calldata_bytes, "5");
+            assert_eq!(reviewed.calldata_hex.as_deref(), Some("0x60006000f3"));
             let initcode_keccak = reviewed
                 .calldata_keccak
                 .as_deref()
@@ -1155,6 +1161,7 @@ pub(crate) mod tests {
         let expected = format!(
             "{{\
             \"calldata_bytes\":\"5\",\
+            \"calldata_hex\":\"0x60006000f3\",\
             \"calldata_keccak\":\"{:#x}\",\
             \"chain\":\"anvil\",\
             \"chain_id\":\"31337\",\
@@ -1174,6 +1181,11 @@ pub(crate) mod tests {
             keccak256(&bytes),
         );
         assert_eq!(serde_jcs::to_string(payload).unwrap(), expected);
+        let mut older = serde_json::to_value(payload).unwrap();
+        older.as_object_mut().unwrap().remove("calldata_hex");
+        let older: EvmReviewPayload = serde_json::from_value(older).unwrap();
+        assert_eq!(older.calldata_hex, None);
+        assert_eq!(older.calldata_keccak, payload.calldata_keccak);
     }
 }
 

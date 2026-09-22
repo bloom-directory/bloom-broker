@@ -359,7 +359,7 @@ renderReview(session({{
 let rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
 for (const expected of ["0x2222222222222222222222222222222222222222", "0.0003 ETH",
   "Base", "Maximum fee rate", "1.5 Gwei", "Priority fee cap",
-  "Only the transaction envelope was checked", "What the contract does has not been verified",
+  "Transaction destination, value and bytes checked", "Contract behavior not verified",
   "Data", "None — plain transfer"]) {{
   if (!rendered.includes(expected)) throw new Error(`missing ${{expected}}: ${{rendered}}`);
 }}
@@ -6875,8 +6875,19 @@ if (!view.primary.includes("0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512")) {{
 if (view.primary.includes("  0 ETH")) throw new Error(`primary showed the native zero: ${{view.primary}}`);
 // The potential cost stays with the decision, labelled as a ceiling.
 if (!view.primary.includes("Execution gas cap") ||
-    !view.primary.includes("0.000198510751634520 ETH at most")) {{
+    !view.primary.includes("0.000199 ETH at most")) {{
   throw new Error(`the execution gas ceiling is not visible: ${{view.primary}}`);
+}}
+if (!view.technical.includes("0.000198510751634520 ETH")) {{
+  throw new Error("the exact execution cap disappeared");
+}}
+for (const [input, expected] of [
+  ["0.999999999 ETH", "1 ETH"],
+  ["0.000000001 ETH", "0.000001 ETH"],
+  ["9007199254740993.1234567 ETH", "9007199254740993.123457 ETH"],
+  ["1.2345000 ETH", "1.2345 ETH"]
+]) {{
+  if (compactFeeCap(input) !== expected) throw new Error(`fee rounded incorrectly: ${{input}}`);
 }}
 // A chain whose units Bloom cannot authenticate must say the cost cannot be
 // shown. Silently dropping the row would read as "no fee".
@@ -6948,8 +6959,13 @@ for (const name of ["deposit-static", "stake-static", "operator-approval"]) {{
   if (view.primary.includes("Requested movements")) throw new Error(`invented balance changes: ${{name}}`);
 }}
 view = show("opaque-call");
+if (!view.primary.includes("0xa9059cbb")) throw new Error("opaque calldata is not visible");
 if (view.action !== "opaque") throw new Error(`opaque action: ${{view.action}}`);
 if (!view.primary.includes("cannot say what")) throw new Error(`opaque detail: ${{view.primary}}`);
+view = show("operator-approval");
+if (!view.primary.includes("Function arguments") ||
+    !view.primary.includes("setApprovalForAll(address operator, bool approved)") ||
+    !view.primary.includes("true")) throw new Error("generic call arguments lost their function context");
 
 // A batch keeps every member, in order, under one approval.
 view = show("batch");
