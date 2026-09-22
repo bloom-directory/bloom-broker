@@ -1681,6 +1681,9 @@ async function load() {
     });
   }
   statusNode.textContent = "Check the details, then continue with your passkey.";
+  // Rendering applies the deadline and must have the final say on whether
+  // approval is enabled, including a page first opened after its deadline.
+  approve.disabled = false;
   renderReview(session);
   recoveryFields.hidden = session.ceremony_kind !== "wallet_recovery";
   exportFields.hidden = session.ceremony_kind !== "wallet_export";
@@ -1695,7 +1698,6 @@ async function load() {
     genericInput.placeholder =
       '{"namespace_id":"...","grant":{...},"authority_signature":"..."}';
   }
-  approve.disabled = false;
   approve.onclick = () => run(session).catch(reportApprovalFailure);
   cancel.onclick = async () => {
     // Both buttons stop accepting input immediately; a slow cancel response
