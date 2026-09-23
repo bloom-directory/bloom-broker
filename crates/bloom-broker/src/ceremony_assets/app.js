@@ -598,7 +598,7 @@ function describeTransfer(manifest) {
   const to = dests.map(d => d.destination);
   const network = chainLabel(chain, ctx);
   let sentence;
-  if (amounts.length && to.length) {
+  if (amounts.length && to.length && manifest?.system_use_claim) {
     sentence = `Send <strong>${escapeHtml(amounts.join(" + "))}</strong> on ${escapeHtml(network)} to the address below.`;
   } else if (amounts.length) {
     sentence = `Spend up to <strong>${escapeHtml(amounts.join(" + "))}</strong> on ${escapeHtml(network)}.`;
@@ -606,7 +606,18 @@ function describeTransfer(manifest) {
     sentence = `Sign one operation on ${escapeHtml(network)}.`;
   }
   const facts = [];
-  if (to.length) facts.push(["To", to.join(", "), true]);
+  // A system claim's destination is a recipient: value leaves for it. A
+  // Petal's declared destinations are the addresses its transaction is
+  // permitted to reach, which for a swap is the protocol program it routes
+  // through — the assets come back to the signer. Labelling those "To" reads
+  // as "your money goes here", which is false.
+  if (to.length) {
+    facts.push([
+      manifest?.system_use_claim ? "To" : "Declared destinations",
+      to.join(", "),
+      true,
+    ]);
+  }
   if (amounts.length) facts.push(["Amount", amounts.join(" + ")]);
   if (fee && fee.amount) {
     const reviewedFee = reviewed.find(a => a.kind === "declared_fee");

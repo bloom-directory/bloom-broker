@@ -254,6 +254,12 @@ fn the_shipped_page_renders_an_attributed_advisory_as_its_own_block() {
         style.contains(".advisory{"),
         "the advisory block needs a style, or it renders as unstyled text"
     );
+    // A Petal's declared destinations are the addresses its transaction may
+    // reach, not recipients. Only a system claim's destination is a "To".
+    assert!(
+        asset.contains(r#"manifest?.system_use_claim ? "To" : "Declared destinations""#),
+        "a Petal claim's destinations must not be labelled as recipients"
+    );
 }
 
 #[test]
@@ -4836,6 +4842,22 @@ async fn a_pumpfun_trade_projection_carries_its_review_to_the_page() {
 
     let mut request = approval_request();
     request.terms.wallet_id = Token::new("main").unwrap();
+    // A Solana trade signs with an Ed25519 account key, not the secp256k1
+    // root the generic fixture carries. The page derives what it shows from
+    // this, so an unrepresentative key makes unrepresentative evidence.
+    request.terms.key_ref = bloom_signer_api::KeyRef {
+        backend: Token::new("local").unwrap(),
+        backend_instance: Token::new("main").unwrap(),
+        key_spec: bloom_signer_api::KeySpec::Ed25519,
+        locator: "wallet/main/solana/0".into(),
+        derivation: Some(bloom_signer_api::DerivationRef::Bip39Multicurve {
+            wallet_seed_ref: Token::new("main").unwrap(),
+            profile: bloom_signer_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            path: "m/44'/501'/0'/0'".into(),
+        }),
+        public_key_fingerprint: digest("2b"),
+    };
+    request.terms.allowed_crypto_suites = vec![bloom_signer_api::CryptoSuite::Ed25519Message];
     let claim = PetalUseClaim {
         package_hash: digest("bb"),
         route: "r000004".into(),
