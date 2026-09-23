@@ -66,8 +66,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let token = ceremony_token(&url)?;
-    let session = request("GET", "/api/session", token, None)?;
+    let target = parse_ceremony_url(&url)?;
+    let session = request("GET", "/api/session", &target, None)?;
     let kind: CeremonyKind = serde_json::from_value(session["ceremony_kind"].clone())?;
     let challenges = session["challenges"]
         .as_array()
@@ -77,7 +77,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Result<Vec<_>, _>>()?;
     let public_binding_digest: Digest32 =
         serde_json::from_value(session["challenges"][0]["binding"]["exact_terms_digest"].clone())?;
-    let authenticator = VirtualAuthenticator::from_seed(seed.as_bytes());
+    let authenticator =
+        VirtualAuthenticator::from_seed_with_origin(seed.as_bytes(), &target.origin);
 
     if kind == CeremonyKind::SealedApproval {
         let contribution: SignerCeremonyContribution =
@@ -114,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let result = request(
             "POST",
             &format!("/api/session/{}/complete", contribution.ceremony_id),
-            token,
+            &target,
             Some(&body),
         )?;
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -171,7 +172,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("credential-change ceremony omitted a proof phase".into());
             }
             let new_seed = new_seed.ok_or("credential change requires --new-authenticator-seed")?;
-            let replacement = VirtualAuthenticator::from_seed(new_seed.as_bytes());
+            let replacement =
+                VirtualAuthenticator::from_seed_with_origin(new_seed.as_bytes(), &target.origin);
             let authority_assertion =
                 authenticator.assertion(&challenges[0].canonical_bytes()?, sign_count);
             let new_credential_attestation =
@@ -244,7 +246,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = request(
         "POST",
         &format!("/api/session/{}/complete", contribution.ceremony_id),
-        token,
+        &target,
         Some(&body),
     )?;
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -321,33 +323,103 @@ fn assert_machine_secret_confinement_command(
     Ok(())
 }
 
-fn ceremony_token(url: &str) -> Result<&str, Box<dyn std::error::Error>> {
-    let prefix = "http://localhost:18734/ceremony/";
-    let token = url
-        .strip_prefix(prefix)
-        .ok_or("ceremony URL is not the canonical Broker origin")?;
-    if token.len() != 43 || token.contains('/') {
+struct CeremonyTarget {
+    port: u16,
+    host: String,
+    origin: String,
+    token: String,
+}
+
+fn parse_ceremony_url(url: &str) -> Result<CeremonyTarget, Box<dyn std::error::Error>> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or("ceremony URL is not a canonical local Broker origin")?;
+    let (authority, path) = rest
+        .split_once('/')
+        .ok_or("ceremony URL is not a canonical local Broker origin")?;
+    if authority.contains('@') {
+        return Err("ceremony URL must not carry credentials".into());
+    }
+    let port = match authority.split_once(':') {
+        Some((name, port_text)) => {
+            if name != "localhost" {
+                return Err("ceremony URL is not a canonical local Broker origin".into());
+            }
+            let port: u32 = port_text
+                .parse()
+                .map_err(|_| "ceremony URL has a malformed port")?;
+            if port == 0 || port > u32::from(u16::MAX) {
+                return Err("ceremony URL has a malformed port".into());
+            }
+            port as u16
+        }
+        None => {
+            if authority != "localhost" {
+                return Err("ceremony URL is not a canonical local Broker origin".into());
+            }
+            80
+        }
+    };
+    let token = path
+        .strip_prefix("ceremony/")
+        .ok_or("ceremony URL is not a canonical local Broker origin")?;
+    if token.is_empty()
+        || token.contains('/')
+        || token.contains('?')
+        || token.contains('#')
+        || path.contains('?')
+        || path.contains('#')
+        || url.contains('?')
+        || url.contains('#')
+    {
         return Err("ceremony URL has an invalid session token".into());
     }
-    Ok(token)
+    // The token is interpolated into an HTTP header, so it must be a
+    // canonical unpadded base64url encoding of exactly the 32 session-token
+    // bytes: this rejects control characters (including CR/LF injection)
+    // and any other non-alphabet input before a request is constructed.
+    let parsed =
+        Base64UrlBytes::parse(token).map_err(|_| "ceremony URL has an invalid session token")?;
+    if parsed.decode().len() != 32 {
+        return Err("ceremony URL has an invalid session token".into());
+    }
+    let origin = format!("http://{}", {
+        if port == 80 {
+            "localhost".to_owned()
+        } else {
+            format!("localhost:{port}")
+        }
+    });
+    Ok(CeremonyTarget {
+        port,
+        host: if port == 80 {
+            "localhost".to_owned()
+        } else {
+            format!("localhost:{port}")
+        },
+        origin,
+        token: token.to_owned(),
+    })
 }
 
 fn request(
     method: &str,
     path: &str,
-    token: &str,
+    target: &CeremonyTarget,
     body: Option<&[u8]>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let body = body.unwrap_or_default();
-    let mut stream = TcpStream::connect("127.0.0.1:18734")?;
+    let mut stream = TcpStream::connect(("127.0.0.1", target.port))?;
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: localhost:18734\r\nConnection: close\r\nX-Bloom-Ceremony-Token: {token}\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nX-Bloom-Ceremony-Token: {}\r\n",
+        target.host, target.token
     )?;
     if method == "POST" {
         write!(
             stream,
-            "Origin: http://localhost:18734\r\nSec-Fetch-Site: same-origin\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+            "Origin: {}\r\nSec-Fetch-Site: same-origin\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+            target.origin,
             body.len()
         )?;
     }
@@ -379,7 +451,10 @@ fn request(
 
 #[cfg(test)]
 mod tests {
-    use super::{CeremonyKind, custody_effect_kind, read_protected_seed_file};
+    use super::{
+        Base64UrlBytes, CeremonyKind, custody_effect_kind, parse_ceremony_url,
+        read_protected_seed_file,
+    };
     use std::{fs, path::PathBuf};
 
     fn temp_path(name: &str) -> PathBuf {
@@ -425,5 +500,63 @@ mod tests {
             custody_effect_kind(CeremonyKind::AccountRetire).unwrap(),
             serde_json::json!("account_retire")
         );
+    }
+
+    #[test]
+    fn ceremony_url_parsing_accepts_canonical_local_origins() {
+        // A genuinely encoded 32-byte session token, not a repeated letter.
+        let token = Base64UrlBytes::from_bytes(&[7u8; 32]).encoded().to_owned();
+        assert_eq!(token.len(), 43);
+        let target =
+            parse_ceremony_url(&format!("http://localhost:28735/ceremony/{token}")).unwrap();
+        assert_eq!(target.port, 28_735);
+        assert_eq!(target.host, "localhost:28735");
+        assert_eq!(target.origin, "http://localhost:28735");
+        assert_eq!(target.token, token);
+        let default =
+            parse_ceremony_url(&format!("http://localhost:18734/ceremony/{token}")).unwrap();
+        assert_eq!(default.port, 18_734);
+        // Port 80 serializes bare, as browsers do.
+        let bare = parse_ceremony_url(&format!("http://localhost/ceremony/{token}")).unwrap();
+        assert_eq!(bare.port, 80);
+        assert_eq!(bare.host, "localhost");
+        assert_eq!(bare.origin, "http://localhost");
+    }
+
+    #[test]
+    fn ceremony_url_parsing_rejects_remote_or_malformed_urls() {
+        let token = Base64UrlBytes::from_bytes(&[7u8; 32]).encoded().to_owned();
+        // Tokens that fail canonical base64url validation: non-alphabet
+        // bytes, CR/LF header injection, padding, wrong byte length, and
+        // noncanonical trailing bits.
+        let bad_tokens = [
+            "!".repeat(43),
+            "a".repeat(35) + "\r\nX: y\r\n",
+            format!("{}=", &token[..42]),
+            Base64UrlBytes::from_bytes(&[7u8; 31]).encoded().to_owned(),
+            "b".repeat(43),
+        ];
+        for url in [
+            format!("http://127.0.0.1:28735/ceremony/{token}"),
+            format!("http://[::1]:28735/ceremony/{token}"),
+            format!("http://attacker.invalid:28735/ceremony/{token}"),
+            format!("https://localhost:28735/ceremony/{token}"),
+            format!("http://user@localhost:28735/ceremony/{token}"),
+            format!("http://localhost:28735/ceremony/{token}?x=1"),
+            format!("http://localhost:28735/ceremony/{token}#f"),
+            format!("http://localhost:0/ceremony/{token}"),
+            format!("http://localhost:99999/ceremony/{token}"),
+            format!("http://localhost:abc/ceremony/{token}"),
+            "http://localhost:28735/ceremony/short".to_owned(),
+            "http://localhost:28735/other/".to_owned() + &token,
+        ]
+        .into_iter()
+        .chain(
+            bad_tokens
+                .iter()
+                .map(|bad| format!("http://localhost:28735/ceremony/{bad}")),
+        ) {
+            assert!(parse_ceremony_url(&url).is_err(), "must reject {url}");
+        }
     }
 }
