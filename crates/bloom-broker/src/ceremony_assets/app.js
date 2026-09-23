@@ -1020,11 +1020,11 @@ function renderReview(session) {
   parts.push(facts);
   for (const [index, payload] of (transfer?.payloads || []).entries()) {
     const exact = payload.maximum_execution_gas_fee_display;
-    const label = transfer.payloads.length > 1 ? `Transaction ${index + 1} gas fee cap` : "Gas fee cap";
+    const label = transfer.payloads.length > 1 ? `Transaction ${index + 1} gas fee` : "Gas fee";
     const amount = exact ? el("span", {class: "ceremony-fee-amount"},
       reviewIcon(exact.endsWith(" ETH") ? "ethereum" : "token"),
-      el("span", {}, `${compactFeeCap(exact)} at most`))
-      : el("span", {}, "Cannot be shown — Bloom has no authenticated units for this chain");
+      el("span", {}, `Up to ${compactFeeCap(exact)}`))
+      : el("span", {}, "Cannot be shown for this network");
     parts.push(el("div", {class: "ceremony-fee", "aria-label": "Execution gas only; other network charges may apply"},
       el("span", {class: "ceremony-fee-label"}, label), amount));
   }
@@ -1659,7 +1659,7 @@ function renderPreview(name) {
   const banner = document.getElementById("preview-banner");
   if (banner) {
     banner.hidden = false;
-    banner.textContent = `Preview · ${name} · Nothing can be approved here.`;
+    banner.textContent = "Preview only · No transactions can be approved.";
   }
   const pageTitle = document.getElementById("page-title");
   if (pageTitle) pageTitle.textContent = "Preview";
