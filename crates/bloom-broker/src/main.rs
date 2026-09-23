@@ -533,9 +533,8 @@ async fn run_with_paths(
             }
         }
         if let Some(path) = &config.ceremony_theme_css_path {
-            let css = std::fs::read_to_string(path).map_err(|error| {
-                format!("read ceremony theme {}: {error}", path.display())
-            })?;
+            let css = std::fs::read_to_string(path)
+                .map_err(|error| format!("read ceremony theme {}: {error}", path.display()))?;
             bloom_broker::ceremony::install_owner_theme_css(css);
         }
         let signer = BrokerSignerClient::connect_unix(
