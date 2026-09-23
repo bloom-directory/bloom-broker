@@ -123,6 +123,19 @@ function reviewIcon(kind) {
   }
   return svg;
 }
+
+// Reviewed, bundled artwork. Never select a logo by publisher-supplied text.
+function tokenReviewIcon(chainId, address) {
+  const logos = {
+    "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "usdc",
+    "1:0x6b175474e89094c44da98b954eedeac495271d0f": "dai"
+  };
+  const name = logos[`${chainId}:${String(address).toLowerCase()}`];
+  if (!name) return reviewIcon("token");
+  const image = el("img", {src: `/assets/tokens/${name}.svg`, alt: "", width: "40", height: "40"});
+  image.onerror = () => image.replaceWith(reviewIcon("token"));
+  return image;
+}
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
@@ -926,12 +939,11 @@ function renderReview(session) {
     panelTitle.setAttribute("data-magnitude", transfer.intent.magnitude || "");
     const token = transfer.parties?.find(party => party.role === "token");
     if (token && transfer.intent.action !== "batch") {
-      // The asset is identified by its contract on this chain. A ticker or
-      // an icon alone must never stand in for that identity. This placeholder
-      // is deliberately not a fetched logo or a claim of token verification.
+      // Keep the full contract identity visible beside the decorative logo.
       const asset = partyRow({...token, label: "Token contract"});
       asset.className = "ceremony-party ceremony-asset-identity";
-      const icon = el("span", {class: "ceremony-token-icon", "aria-hidden": "true"}, reviewIcon("token"));
+      const icon = el("span", {class: "ceremony-token-icon", "aria-hidden": "true"},
+        tokenReviewIcon(token.chainId, token.value));
       const summary = transfer.assetSummary;
       const sending = summary?.action === "transfer";
       if (sending) panelTitle.textContent = "Requested transfer";

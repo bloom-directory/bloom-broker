@@ -1292,6 +1292,7 @@ impl CeremonyBroker {
             .route("/assets/style.css", get(style_css))
             .route("/assets/theme.css", get(theme_css))
             .route("/assets/bloom-primary.svg", get(bloom_primary_svg))
+            .route("/assets/tokens/{name}", get(token_svg))
             .route("/api/session", get(read_session_by_token))
             .route("/api/session/{ceremony_id}", get(read_session))
             .route("/api/session/{ceremony_id}/result", get(read_result))
@@ -2357,6 +2358,22 @@ async fn bloom_primary_svg(headers: HeaderMap) -> Response {
     (
         [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
         BLOOM_PRIMARY_SVG,
+    )
+        .into_response()
+}
+
+async fn token_svg(Path(name): Path<String>, headers: HeaderMap) -> Response {
+    if validate_host(&headers).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let asset = match name.as_str() {
+        "usdc.svg" => include_str!("ceremony_assets/tokens/usdc.svg"),
+        "dai.svg" => include_str!("ceremony_assets/tokens/dai.svg"),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+        asset,
     )
         .into_response()
 }

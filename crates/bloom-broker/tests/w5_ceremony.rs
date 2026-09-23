@@ -5187,6 +5187,79 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         logo_body.as_ref(),
         include_bytes!("../src/ceremony_assets/bloom-primary.svg")
     );
+    // Bundled token artwork. Only the reviewed names exist, and the route is
+    // a fixed match rather than a path lookup, so no other file is reachable
+    // through it and a request for one is a plain 404.
+    for (name, bytes) in [
+        (
+            "usdc.svg",
+            include_bytes!("../src/ceremony_assets/tokens/usdc.svg").as_slice(),
+        ),
+        (
+            "dai.svg",
+            include_bytes!("../src/ceremony_assets/tokens/dai.svg").as_slice(),
+        ),
+    ] {
+        let artwork = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assets/tokens/{name}"))
+                    .header(header::HOST, "localhost:18734")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(artwork.status(), StatusCode::OK, "{name} must be served");
+        assert_eq!(
+            artwork.headers()[header::CONTENT_TYPE],
+            "image/svg+xml; charset=utf-8"
+        );
+        let body = artwork.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), bytes, "{name} must be the compiled-in file");
+    }
+    for name in [
+        "unknown.svg",
+        "usdc.svg.bak",
+        "style.css",
+        "..%2Fstyle.css",
+        "%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+    ] {
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assets/tokens/{name}"))
+                    .header(header::HOST, "localhost:18734")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.status(),
+            StatusCode::NOT_FOUND,
+            "{name} must not resolve through the token artwork route"
+        );
+    }
+    let wrong_host_artwork = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/assets/tokens/usdc.svg")
+                .header(header::HOST, "attacker.invalid:18734")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        wrong_host_artwork.status(),
+        StatusCode::FORBIDDEN,
+        "token artwork must enforce the same Host check as every other asset"
+    );
+
     let unknown_token = Base64UrlBytes::from_bytes(&[99; 32]);
     let unknown = app
         .clone()
@@ -6771,6 +6844,131 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         .await
         .unwrap();
     assert_eq!(replay_after_ack.status(), StatusCode::FORBIDDEN);
+}
+
+/// Bundled token artwork is chosen by chain id and full contract address, and
+/// by nothing else. The attack this defends against is a lookalike token:
+/// same name, same ticker, one hex digit different. If a familiar logo could
+/// be obtained with publisher-supplied text, or with the right address on the
+/// wrong chain, the picture would manufacture confidence the wallet has not
+/// earned. The logo is decorative; the address stays the identity.
+#[test]
+fn token_artwork_is_selected_by_chain_and_contract_and_nothing_else() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = "";
+                       this.attrs = {{}}; this.hidden = false; }}
+  setAttribute(key, value) {{ this.attrs[key] = value; }}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+  replaceWith(node) {{ this.replacedWith = node; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+
+const USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+const DAI = "0x6B175474E89094C44Da98b954EedeAC495271d0F";
+const src = node => node.attrs && node.attrs.src;
+const isGeneric = node => node.tagName === "SVG" || src(node) === undefined;
+
+// The two reviewed deployments resolve, in either hex case: an address is
+// not case-sensitive and the renderer must not depend on how it arrived.
+for (const address of [USDC, USDC.toLowerCase(), USDC.toUpperCase().replace("0X", "0x")]) {{
+  const icon = tokenReviewIcon("1", address);
+  if (src(icon) !== "/assets/tokens/usdc.svg") {{
+    throw new Error(`USDC artwork missing for ${{address}}: ${{src(icon)}}`);
+  }}
+}}
+if (src(tokenReviewIcon("1", DAI)) !== "/assets/tokens/dai.svg") {{
+  throw new Error("DAI artwork missing");
+}}
+
+// A lookalike contract must not borrow a familiar mark. These differ from
+// USDC by a single hex digit at each end.
+for (const lookalike of [
+  "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB49",
+  "0xB0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+  "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB4",
+  "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB480"
+]) {{
+  if (!isGeneric(tokenReviewIcon("1", lookalike))) {{
+    throw new Error(`a lookalike contract received real artwork: ${{lookalike}}`);
+  }}
+}}
+
+// The same address on another chain is another deployment, and this bundle
+// speaks only for Ethereum. USDC exists at different addresses elsewhere.
+for (const chain of ["8453", "137", "42161", "31337", "10", "", null, undefined]) {{
+  if (!isGeneric(tokenReviewIcon(chain, USDC))) {{
+    throw new Error(`USDC artwork leaked onto chain ${{chain}}`);
+  }}
+}}
+
+// Nothing a publisher writes can reach the selection. A catalog naming an
+// arbitrary contract "USDC" gets the generic icon.
+for (const hostile of ["usdc", "USDC", "dai", "1:usdc", "../usdc.svg", "usdc.svg",
+                       "/assets/tokens/usdc.svg", "__proto__", "constructor", "toString"]) {{
+  if (!isGeneric(tokenReviewIcon("1", hostile))) {{
+    throw new Error(`artwork selected from publisher text: ${{hostile}}`);
+  }}
+}}
+// Inherited object properties must not resolve as entries either.
+if (!isGeneric(tokenReviewIcon("constructor", "prototype"))) {{
+  throw new Error("prototype chain leaked into artwork selection");
+}}
+
+// Artwork is decorative: it carries no alternative text that could be read
+// as an identity, and the wrapper is hidden from assistive technology.
+const usdcIcon = tokenReviewIcon("1", USDC);
+if (usdcIcon.attrs.alt !== "") throw new Error("artwork must have empty alt text");
+
+// An image that fails to load falls back to the generic icon rather than
+// leaving an empty frame where an identity cue belongs.
+if (typeof usdcIcon.onerror !== "function") {{
+  throw new Error("artwork has no load-failure fallback");
+}}
+usdcIcon.onerror();
+if (!usdcIcon.replacedWith || !isGeneric(usdcIcon.replacedWith)) {{
+  throw new Error("a failed artwork load did not fall back to the generic icon");
+}}
+"#
+    );
+    let mut child = std::process::Command::new("node")
+        .arg("--input-type=module")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(script.as_bytes())
+        .expect("write script");
+    let output = child.wait_with_output().expect("run node");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// The review's semantics come from the typed intent Broker froze, not from
