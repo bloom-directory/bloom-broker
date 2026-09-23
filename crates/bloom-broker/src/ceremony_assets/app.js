@@ -584,6 +584,9 @@ async function purgeExpiredBrowserState() {
     database?.close();
   }
 }
+function unstorableBrowserKey(error) {
+  return ["DataCloneError", "DataError", "NotSupportedError"].includes(error?.name);
+}
 async function outputRecipientFor(session, existingOnly = false) {
   const keyPair = await crypto.subtle.generateKey(
     {name: "X25519"}, false, ["deriveBits"]
@@ -606,7 +609,17 @@ async function outputRecipientFor(session, existingOnly = false) {
     if (!stored || !Number.isFinite(stored.expiresAtMs) ||
         stored.expiresAtMs <= Date.now()) {
       if (existingOnly) throw new Error("The original result recipient is unavailable in this browser");
-      await requestResult(store.put(candidate));
+      let request = null;
+      try {
+        request = store.put(candidate);
+      } catch (error) {
+        // Some browsers (iOS Safari 27) cannot persist an X25519 CryptoKey
+        // and throw while cloning the record. Keep the non-extractable key
+        // in this page only; a reload then loses the result instead of
+        // weakening the key to make it storable.
+        if (!unstorableBrowserKey(error)) throw error;
+      }
+      if (request) await requestResult(request);
       stored = candidate;
     }
     await done;

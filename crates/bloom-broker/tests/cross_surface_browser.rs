@@ -253,3 +253,65 @@ process.stdout.write(JSON.stringify({ok:true}));
     );
     assert_eq!(output, json!({"ok": true}));
 }
+
+#[test]
+fn unstorable_output_key_stays_in_the_page_without_weakening_it() {
+    let output = run_browser(
+        r#"
+const assert = require("node:assert/strict");
+const records = new Map();
+let putFailure = null;
+const pending = result => {
+  const request = {result};
+  queueMicrotask(() => request.onsuccess?.());
+  return request;
+};
+const store = {
+  get: id => pending(records.get(id)),
+  put: record => {
+    if (putFailure) throw Object.assign(new Error("cannot store record"), {name: putFailure});
+    records.set(record.ceremonyId, record);
+    return pending(record.ceremonyId);
+  }
+};
+const database = {
+  objectStoreNames: {contains: () => true},
+  close: () => {},
+  transaction: () => {
+    const transaction = {objectStore: () => store};
+    setTimeout(() => transaction.oncomplete?.(), 0);
+    return transaction;
+  }
+};
+globalThis.indexedDB = {open: () => pending(database)};
+const session = {ceremony_id: "ab".repeat(32), expires_at_ms: String(Date.now() + 60_000)};
+
+// iOS Safari 27 throws while cloning an X25519 CryptoKey into IndexedDB.
+putFailure = "DataError";
+const memory = await outputRecipientFor(session);
+assert.equal(records.size, 0);
+assert.equal(memory.privateKey.extractable, false);
+assert.equal(memory.publicKey.length, 32);
+const peer = await crypto.subtle.generateKey({name: "X25519"}, false, ["deriveBits"]);
+const shared = await crypto.subtle.deriveBits(
+  {name: "X25519", public: await crypto.subtle.importKey("raw", memory.publicKey, {name: "X25519"}, true, [])},
+  peer.privateKey, 256
+);
+assert.equal(shared.byteLength, 32);
+await assert.rejects(outputRecipientFor(session, true), /original result recipient is unavailable/);
+
+// Browsers that can store the key keep reusing the one bound key.
+putFailure = null;
+const bound = await outputRecipientFor(session);
+assert.equal(records.size, 1);
+assert.equal((await outputRecipientFor(session, true)).privateKey, bound.privateKey);
+
+// Storage failures unrelated to cloning the key still fail the ceremony.
+records.clear();
+putFailure = "QuotaExceededError";
+await assert.rejects(outputRecipientFor(session), {name: "QuotaExceededError"});
+process.stdout.write(JSON.stringify({ok:true}));
+"#,
+    );
+    assert_eq!(output, json!({"ok": true}));
+}
