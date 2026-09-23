@@ -15,12 +15,12 @@ license = "MIT"
 
 [workspace.dependencies]
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "839c083d5ed51febedec3d2afa827f2a9225aea1" }
-bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "839c083d5ed51febedec3d2afa827f2a9225aea1" }
+bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d" }
+bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d" }
 bloom-solana-verify = { path = "crates/bloom-solana-verify" }
-bloom-relay-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "6c8771b66b618cd13b7cad3e0cd850af2982b5aa" }
-bloom-relay-protocol = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "6c8771b66b618cd13b7cad3e0cd850af2982b5aa" }
-bloom-relay-admin-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "6c8771b66b618cd13b7cad3e0cd850af2982b5aa" }
+bloom-relay-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "2dc211ff3df1374c4fc42192057a43a89b397d70" }
+bloom-relay-protocol = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "2dc211ff3df1374c4fc42192057a43a89b397d70" }
+bloom-relay-admin-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "2dc211ff3df1374c4fc42192057a43a89b397d70" }
 bs58 = "0.5"
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }
 bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }

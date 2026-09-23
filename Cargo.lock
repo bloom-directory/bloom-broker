@@ -416,9 +416,9 @@ dependencies = [
  "bloom-broker-api",
  "bloom-broker-debug-driver",
  "bloom-platform-containment",
- "bloom-relay-admin-client",
+ "bloom-relay-admin-client 0.1.0 (git+https://github.com/bloom-directory/bloom-relay.git?rev=2dc211ff3df1374c4fc42192057a43a89b397d70)",
  "bloom-relay-client",
- "bloom-relay-protocol",
+ "bloom-relay-protocol 0.1.0 (git+https://github.com/bloom-directory/bloom-relay.git?rev=2dc211ff3df1374c4fc42192057a43a89b397d70)",
  "bloom-service-activation",
  "bloom-service-observability",
  "bloom-signer",
@@ -510,10 +510,27 @@ dependencies = [
 [[package]]
 name = "bloom-relay-admin-client"
 version = "0.1.0"
+source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=2dc211ff3df1374c4fc42192057a43a89b397d70#2dc211ff3df1374c4fc42192057a43a89b397d70"
+dependencies = [
+ "base64 0.22.1",
+ "bloom-relay-protocol 0.1.0 (git+https://github.com/bloom-directory/bloom-relay.git?rev=2dc211ff3df1374c4fc42192057a43a89b397d70)",
+ "rand 0.8.8",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "thiserror",
+ "ureq",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "bloom-relay-admin-client"
+version = "0.1.0"
 source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=6c8771b66b618cd13b7cad3e0cd850af2982b5aa#6c8771b66b618cd13b7cad3e0cd850af2982b5aa"
 dependencies = [
  "base64 0.22.1",
- "bloom-relay-protocol",
+ "bloom-relay-protocol 0.1.0 (git+https://github.com/bloom-directory/bloom-relay.git?rev=6c8771b66b618cd13b7cad3e0cd850af2982b5aa)",
  "rand 0.8.8",
  "serde",
  "serde_jcs",
@@ -527,9 +544,9 @@ dependencies = [
 [[package]]
 name = "bloom-relay-client"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=6c8771b66b618cd13b7cad3e0cd850af2982b5aa#6c8771b66b618cd13b7cad3e0cd850af2982b5aa"
+source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=2dc211ff3df1374c4fc42192057a43a89b397d70#2dc211ff3df1374c4fc42192057a43a89b397d70"
 dependencies = [
- "bloom-relay-protocol",
+ "bloom-relay-protocol 0.1.0 (git+https://github.com/bloom-directory/bloom-relay.git?rev=2dc211ff3df1374c4fc42192057a43a89b397d70)",
  "bytes",
  "futures-util",
  "h2",
@@ -540,6 +557,21 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "ureq",
+ "uuid",
+]
+
+[[package]]
+name = "bloom-relay-protocol"
+version = "0.1.0"
+source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=2dc211ff3df1374c4fc42192057a43a89b397d70#2dc211ff3df1374c4fc42192057a43a89b397d70"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek 2.2.0",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
  "uuid",
 ]
 
@@ -597,13 +629,13 @@ dependencies = [
 [[package]]
 name = "bloom-signer"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=839c083d5ed51febedec3d2afa827f2a9225aea1#839c083d5ed51febedec3d2afa827f2a9225aea1"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d#8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d"
 dependencies = [
  "blake3",
  "bloom-audit-checkpoint",
  "bloom-platform-containment",
- "bloom-relay-admin-client",
- "bloom-relay-protocol",
+ "bloom-relay-admin-client 0.1.0 (git+https://github.com/bloom-directory/bloom-relay.git?rev=6c8771b66b618cd13b7cad3e0cd850af2982b5aa)",
+ "bloom-relay-protocol 0.1.0 (git+https://github.com/bloom-directory/bloom-relay.git?rev=6c8771b66b618cd13b7cad3e0cd850af2982b5aa)",
  "bloom-service-activation",
  "bloom-service-observability",
  "bloom-signer-api",
@@ -644,7 +676,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=839c083d5ed51febedec3d2afa827f2a9225aea1#839c083d5ed51febedec3d2afa827f2a9225aea1"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d#8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek 3.0.0",
@@ -659,7 +691,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-backend-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=839c083d5ed51febedec3d2afa827f2a9225aea1#839c083d5ed51febedec3d2afa827f2a9225aea1"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d#8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d"
 dependencies = [
  "bloom-signer-api",
  "serde",
@@ -670,7 +702,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-backend-local"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=839c083d5ed51febedec3d2afa827f2a9225aea1#839c083d5ed51febedec3d2afa827f2a9225aea1"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d#8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d"
 dependencies = [
  "bip32 0.6.0-rc.0",
  "bloom-signer-api",
@@ -693,7 +725,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=839c083d5ed51febedec3d2afa827f2a9225aea1#839c083d5ed51febedec3d2afa827f2a9225aea1"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d#8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d"
 dependencies = [
  "bip39",
  "ed25519-dalek 3.0.0",
@@ -710,7 +742,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-process-hardening"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=839c083d5ed51febedec3d2afa827f2a9225aea1#839c083d5ed51febedec3d2afa827f2a9225aea1"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d#8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d"
 dependencies = [
  "libc",
  "zeroize",
@@ -719,7 +751,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-vectors"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=839c083d5ed51febedec3d2afa827f2a9225aea1#839c083d5ed51febedec3d2afa827f2a9225aea1"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d#8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d"
 
 [[package]]
 name = "bloom-solana-verify"
