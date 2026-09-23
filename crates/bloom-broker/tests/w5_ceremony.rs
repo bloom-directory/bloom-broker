@@ -7039,6 +7039,159 @@ if (!usdcIcon.replacedWith || !isGeneric(usdcIcon.replacedWith)) {{
     );
 }
 
+/// Upgradeability is one fact about one contract. It used to arrive twice —
+/// once from the verifier's per-call `warnings` and once from the page's walk
+/// over the selected catalog entries — so a single-entry review printed the
+/// same sentence and the same timestamp in two consecutive paragraphs. The
+/// catalog entries are now the only source, and the observation moves into
+/// the details section where the rest of the provenance already lives.
+#[test]
+fn the_upgradeable_warning_is_stated_once_per_contract_and_keeps_its_timestamp_in_details() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = "";
+                       this.attrs = {{}}; this.hidden = false; }}
+  setAttribute(key, value) {{ this.attrs[key] = value; }}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+  replaceWith(node) {{ this.replacedWith = node; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+function count(haystack, needle) {{
+  let seen = 0;
+  let at = haystack.indexOf(needle);
+  while (at !== -1) {{ seen += 1; at = haystack.indexOf(needle, at + needle.length); }}
+  return seen;
+}}
+const SECOND = "0x1111111111111111111111111111111111111111";
+// `name` picks the preview; `addresses` become the upgradeable entries.
+function render(name, addresses) {{
+  const session = previewSession(name);
+  const plan = JSON.parse(session.review_manifest.canonical_plan);
+  const clear = plan.evm_review.clear_signing;
+  const template = clear.entries[0];
+  clear.entries = clear.entries.map(entry => ({{...entry, upgradeable: false}}));
+  for (const [index, address] of addresses.entries()) {{
+    if (index < clear.entries.length) {{
+      clear.entries[index] = {{...clear.entries[index], contract_address: address, upgradeable: true}};
+    }} else {{
+      clear.entries.push({{...template, contract_address: address, upgradeable: true}});
+    }}
+  }}
+  session.review_manifest.canonical_plan = JSON.stringify(plan);
+  renderReview(session);
+  const children = nodes.review.children;
+  const details = children.filter(child => child?.name === "details");
+  return {{
+    primary: allText({{textContent: "", innerHTML: "", children:
+      children.filter(child => child?.name !== "details")}}),
+    details: details.map(allText).join(" ")
+  }};
+}}
+const TOKEN = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
+const SENTENCE = "Upgradeable contract — its behavior can change.";
+
+// One affected contract: the exact short sentence, once, and nothing of the
+// long form it replaced anywhere on the page.
+let view = render("transfer", [TOKEN]);
+if (count(view.primary, SENTENCE) !== 1) {{
+  throw new Error(`one upgradeable contract produced ${{count(view.primary, SENTENCE)}} warnings: ${{view.primary}}`);
+}}
+for (const stale of ["can be upgraded", "The publisher observed it at"]) {{
+  if (`${{view.primary}} ${{view.details}}`.includes(stale)) {{
+    throw new Error(`the superseded wording survived: ${{stale}}`);
+  }}
+}}
+// The decision does not carry a timestamp; the details section does, once.
+if (/\d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}} UTC/.test(view.primary)) {{
+  throw new Error(`an observation timestamp is still beside the decision: ${{view.primary}}`);
+}}
+if (count(view.details, "the publisher observed this deployment at") !== 1) {{
+  throw new Error(`the observation is not stated exactly once in details: ${{view.details}}`);
+}}
+if (!view.details.includes(TOKEN)) {{
+  throw new Error("details do not say which contract is upgradeable");
+}}
+
+// Two affected contracts: two warnings, each naming its own deployment, so
+// they are not two identical lines the reader cannot tell apart.
+view = render("transfer", [TOKEN, SECOND]);
+if (count(view.primary, "its behavior can change.") !== 2) {{
+  throw new Error(`two upgradeable contracts did not produce two warnings: ${{view.primary}}`);
+}}
+if (count(view.primary, SENTENCE) !== 0) {{
+  throw new Error("an unqualified sentence appeared while several contracts were affected");
+}}
+for (const address of [TOKEN, SECOND]) {{
+  const short = `${{address.slice(0, 6)}}…${{address.slice(-4)}}`;
+  if (!view.primary.includes(`Upgradeable contract ${{short}} — its behavior can change.`)) {{
+    throw new Error(`no warning names ${{short}}: ${{view.primary}}`);
+  }}
+}}
+
+// A contract the publisher did not mark upgradeable says nothing at all.
+view = render("transfer", []);
+if (view.primary.includes("Upgradeable") || view.details.includes("Upgradeable")) {{
+  throw new Error(`a direct deployment was described as upgradeable: ${{view.primary}}`);
+}}
+
+// Removing the duplicate must not remove the warnings that come from the
+// call itself. The allowance advisory is one of those and is unrelated.
+view = render("allowance-finite", [TOKEN]);
+if (count(view.primary, SENTENCE) !== 1) {{
+  throw new Error("the upgradeable warning is missing from an allowance review");
+}}
+if (!view.primary.includes("not added to any existing allowance")) {{
+  throw new Error("a call warning was lost with the duplicate");
+}}
+if (!view.primary.includes("can move your tokens later without another approval")) {{
+  throw new Error("the allowance advisory was lost with the duplicate");
+}}
+"#
+    );
+    let mut child = std::process::Command::new("node")
+        .arg("--input-type=module")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(script.as_bytes())
+        .expect("write script");
+    let output = child.wait_with_output().expect("run node");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// The review's semantics come from the typed intent Broker froze, not from
 /// anything a publisher controls. These assertions are the boundary: rename
 /// every label, reverse the field order, put markup in the names, and the

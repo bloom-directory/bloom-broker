@@ -3,6 +3,7 @@
 mod support;
 
 use alloy_primitives::U256;
+use bloom_broker_api::Digest32;
 use bloom_evm_clear_signing::*;
 use support::*;
 
@@ -66,6 +67,46 @@ fn an_allowance_shows_the_spender_and_the_total_it_sets() {
         "a finite allowance sets a total, not an increment: {:?}",
         call.warnings
     );
+}
+
+/// Upgradeability reaches the page as a typed property of the selected
+/// entry, never as a sentence in `warnings`. It used to be both, and a page
+/// that walks the entries — as it must, to cover a token an argument named
+/// rather than the contract called — then printed the same fact twice for
+/// every single-entry review.
+#[test]
+fn an_upgradeable_contract_is_typed_evidence_and_not_a_call_warning() {
+    let mut upgradeable = erc20_entry();
+    upgradeable.upgradeable = true;
+    upgradeable.implementation_hash = Some(Digest32::from_bytes([7; 32]));
+    let mut catalog = catalog(vec![upgradeable]);
+    sign(&mut catalog, &[(1, "publisher-1")]);
+    let catalog = accept(&catalog).unwrap();
+
+    let bytes = transfer_bytes(RECIPIENT, U256::from(100_000_000u64));
+    let (call, used) = review_call(&catalog, &context(&bytes, false)).unwrap();
+
+    // The property survives, on the entry, where a page can state it once per
+    // contract however many calls referenced that contract.
+    assert_eq!(used.len(), 1);
+    assert!(used[0].upgradeable);
+    assert_eq!(used[0].contract_address, TOKEN);
+
+    // No call warning restates it, and no observation timestamp rides along.
+    for warning in &call.warnings {
+        assert!(
+            !warning.to_lowercase().contains("upgrad"),
+            "upgradeability came back as a call warning: {warning:?}"
+        );
+        assert!(
+            !warning.contains("publisher observed"),
+            "an observation timestamp came back as a call warning: {warning:?}"
+        );
+    }
+
+    // A direct deployment differs only in the flag, never in the warnings.
+    let (direct, _) = review_call(&accepted_erc20(), &context(&bytes, false)).unwrap();
+    assert_eq!(call.warnings, direct.warnings);
 }
 
 #[test]

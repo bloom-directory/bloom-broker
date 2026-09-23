@@ -279,13 +279,14 @@ pub fn review_call(
     // `warnings` where the only way to tell it apart was to match its text.
     // Typed, a page can state it once per review and keep `warnings` for the
     // risks that actually differ between calls.
+    //
+    // Upgradeability is the same shape of problem one level up. It is a
+    // property of a contract, not of a call, and it already reaches the page
+    // on every selected entry as `upgradeable` beside the observation the
+    // publisher made. Emitting a sentence here as well meant a single-entry
+    // call carried the fact twice, timestamp and all. The page states it once
+    // per affected contract and keeps the timestamp in its details section.
     let mut warnings: Vec<String> = Vec::new();
-    if entry.upgradeable {
-        warnings.push(format!(
-            "This contract can be upgraded. The publisher observed it at {}; its code may have changed since.",
-            format_timestamp_ms(entry.observed_at_ms.get())
-        ));
-    }
     let (action, intent_summary) =
         apply_safety_rules(call, &leaves, entry, context, &mut warnings)?;
 

@@ -456,12 +456,22 @@ function describeTransfer(manifest) {
       for (const warning of payload.contract_call.warnings || []) warnings.push(warning);
     }
     const interpretation = [];
-    if (clear) {
-      for (const entry of clear.entries || []) {
-        if (!entry.upgradeable) continue;
-        warnings.push(`${entry.contract_address} can be upgraded. The publisher observed it at ` +
-          `${formatObserved(entry.observed_at_ms)}; its code may have changed since.`);
-      }
+    // Upgradeability belongs to a contract, so it is stated once per affected
+    // contract and taken only from the selected catalog entries — the one
+    // place that already lists every contract the review depended on, each
+    // exactly once. The consequence is the whole warning; when the review
+    // touches a single upgradeable contract the identity is already on the
+    // page, and when it touches more than one the address distinguishes them.
+    // Which deployment was observed, and when, is a detail and lives in the
+    // details section rather than beside the decision.
+    const upgradeable = clear ? (clear.entries || []).filter(entry => entry.upgradeable) : [];
+    for (const entry of upgradeable) {
+      warnings.push(upgradeable.length > 1
+        ? `Upgradeable contract ${shortAddress(entry.contract_address)} — its behavior can change.`
+        : "Upgradeable contract — its behavior can change.");
+      interpretation.push(["Upgradeable contract",
+        `${entry.contract_address} — the publisher observed this deployment at ` +
+        `${formatObserved(entry.observed_at_ms)}; its code may have changed since.`]);
     }
     const first = evmPayloads[0];
     const network = chainLabel(first.chain);
