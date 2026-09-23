@@ -833,10 +833,33 @@ pub(crate) mod tests {
             EvmFeeReview::Legacy { gas_price_display, .. } if gas_price_display == "1.5 Gwei"
         ));
 
+        for (chain_id, symbol) in [
+            (1, "ETH"),
+            (10, "ETH"),
+            (8453, "ETH"),
+            (42161, "ETH"),
+            (137, "POL"),
+            (56, "BNB"),
+            (43114, "AVAX"),
+            (999, "HYPE"),
+        ] {
+            let mut tx = legacy.clone();
+            tx.chain_id = Some(chain_id);
+            let reviewed = review_ok(&request(&tx.encoded_for_signing()));
+            assert_eq!(
+                reviewed.payloads[0].value_display,
+                format!("0.0003 {symbol}")
+            );
+            assert_eq!(
+                reviewed.payloads[0].maximum_execution_gas_fee_display,
+                Some(format!("0.0000315 {symbol}"))
+            );
+        }
         let mut unknown = legacy;
         unknown.chain_id = Some(999_999);
         let unknown = review_ok(&request(&unknown.encoded_for_signing()));
         assert_eq!(unknown.payloads[0].chain, "evm-999999");
+        assert_eq!(unknown.payloads[0].maximum_execution_gas_fee_display, None);
         assert_eq!(
             unknown.payloads[0].value_display,
             "300000000000000 raw native units on evm-999999 (token decimals unknown)"

@@ -96,7 +96,7 @@ body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-f
 .ceremony-fee{display:flex;align-items:baseline;justify-content:space-between;gap:8px 16px;flex-wrap:wrap;font-size:14px}
 .ceremony-fee-label{color:var(--ceremony-muted)}
 .ceremony-fee-amount{display:inline-flex;align-items:center;gap:5px;color:var(--ceremony-danger);font-variant-numeric:tabular-nums}
-.ceremony-fee-amount svg{width:14px;height:14px;flex:none}
+.ceremony-fee-amount svg{width:14px;height:14px;flex:none;color:var(--ceremony-muted)}
 .ceremony-party-address{display:flex;align-items:center;gap:var(--ceremony-space-2);margin:0;min-width:0}
 .ceremony-address-link{flex:1 1 auto;min-width:0;color:var(--ceremony-accent-deep);text-decoration:underline;text-decoration-color:var(--ceremony-border);text-underline-offset:4px;overflow-wrap:anywhere}
 .ceremony-address-link:hover{text-decoration-color:currentColor}

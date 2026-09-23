@@ -186,7 +186,8 @@ function chainLabel(chain, ctx) {
       ? "Solana mainnet" : "Solana";
   }
   return {ethereum: "Ethereum", mainnet: "Ethereum", base: "Base", arbitrum: "Arbitrum",
-    optimism: "Optimism", polygon: "Polygon", anvil: "local test chain"}[chain] || chain;
+    optimism: "Optimism", polygon: "Polygon", "evm-56": "BNB Chain",
+    "evm-43114": "Avalanche", "evm-999": "HyperEVM", anvil: "local test chain"}[chain] || chain;
 }
 
 function addressExplorer(chainId, address) {
