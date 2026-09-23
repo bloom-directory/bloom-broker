@@ -4463,7 +4463,15 @@ async fn ending_an_abandoned_approvals_ceremony_frees_the_wallet_at_once() {
 #[tokio::test]
 async fn every_revoke_frees_the_wallet_not_only_the_single_approval_path() {
     let signer = Arc::new(MockSigner::new());
-    let now_ms: u64 = 1_700_000_000_000;
+    // A live timestamp, because the best-effort form sweeps with the host wall
+    // clock. With a fixed 2023 fixture the sweep expires the session before the
+    // code under test runs, and every assertion below passes without it ever
+    // being called - which is exactly how the first version of this test
+    // managed to prove nothing.
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let broker = CeremonyBroker::new_with_manifest_signer(
         signer.clone(),
         Token::new("broker-review-key").unwrap(),

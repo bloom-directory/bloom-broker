@@ -6,11 +6,10 @@ use bloom_broker_api::{
     ApprovalLifecycleState, ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector,
     Base64UrlBytes, BootEpoch, DecimalU64, Digest32, MachineBrokerMethod, MachineBrokerRequest,
     MachineBrokerResponse, MachineBrokerService, MachineSignRequest, OperationId,
-    OperationPublicStatus, OperationReservation, OperationState, PolicyUpdateRequest,
-    ProtocolError, ProtocolErrorCode, RPC_ENVELOPE_SCHEMA_V1, Readiness, ReadinessState,
-    RevokeRequest, SealedApprovalPrepareResponse, ServiceCapabilities, ServiceFuture,
-    SigningPayloads, Token, VerifierPublicCapability, WalletAccountsPublic, WalletPublic,
-    WalletRequest, WalletSeedProfile,
+    OperationPublicStatus, OperationState, PolicyUpdateRequest, ProtocolError, ProtocolErrorCode,
+    RPC_ENVELOPE_SCHEMA_V1, Readiness, ReadinessState, RevokeRequest,
+    SealedApprovalPrepareResponse, ServiceCapabilities, ServiceFuture, SigningPayloads, Token,
+    VerifierPublicCapability, WalletAccountsPublic, WalletPublic, WalletRequest, WalletSeedProfile,
 };
 use bloom_platform_containment::NetworkContainmentGuard;
 use bloom_signer_api::{
@@ -1966,9 +1965,6 @@ impl BrokerRpcService {
                     state: OperationState::Succeeded,
                     result: Some(result),
                     error: None,
-                    // A batch child's signature is published under its parent's
-                    // reservation, and it succeeded.
-                    reservation: Some(OperationReservation::Committed),
                 });
             }
             return Err(ProtocolError::new(
@@ -1976,23 +1972,12 @@ impl BrokerRpcService {
                 "operation not found",
             ));
         };
-        let reservation = self
-            .journal
-            .reservation_for_operation(operation_id)
-            .map_err(journal_error)?
-            .map(|state| match state {
-                ReservationState::Reserved => OperationReservation::Reserved,
-                ReservationState::Committed => OperationReservation::Committed,
-                ReservationState::Released => OperationReservation::Released,
-                ReservationState::Quarantined => OperationReservation::Quarantined,
-            });
         Ok(OperationPublicStatus {
             operation_id: snapshot.operation_id,
             operation_digest: snapshot.operation_digest,
             state: snapshot.state,
             result: snapshot.result,
             error: None,
-            reservation,
         })
     }
 
