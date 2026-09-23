@@ -29,6 +29,13 @@ const assets = join(dirname(fileURLToPath(import.meta.url)), "..", "crates", "bl
 const read = name => readFileSync(join(assets, name));
 const projection = readFileSync(projectionPath);
 const token = readFileSync(`${projectionPath}.token`, "utf8").trim();
+// The attribution line the server prepends, then the Petal's own lines.
+const [attribution, ...expected] =
+  JSON.parse(projection).review_manifest?.attributed_advisory_items ?? [];
+if (!attribution?.includes("Bloom has not checked")) {
+  console.error("FAIL the projection carries no attributed advisory");
+  process.exit(1);
+}
 
 const routes = {
   "/assets/app.js": ["text/javascript", read("app.js")],
@@ -86,16 +93,18 @@ for (const [name, viewport] of [["desktop", { width: 1280, height: 900 }], ["nar
   if (!found.note?.includes("Bloom has not checked")) {
     failures.push(`${name}: the app's text is not attributed (note=${JSON.stringify(found.note)})`);
   }
-  const floor = found.items.find(item => item.startsWith("Guaranteed minimum received:"));
-  if (!floor) failures.push(`${name}: the guaranteed minimum is not on the page`);
+  // Every line the manifest carries must be on the page, and none of them may
+  // also be a warning. Asserting the manifest's own items rather than fixed
+  // wording keeps this honest for any operation the Petal describes.
+  for (const item of expected) {
+    if (!found.items.includes(item)) failures.push(`${name}: missing from the page: ${item}`);
+    if (found.warnings.includes(item)) failures.push(`${name}: rendered as a warning: ${item}`);
+  }
+  if (found.items.length !== expected.length) {
+    failures.push(`${name}: page shows ${found.items.length} items, manifest carries ${expected.length}`);
+  }
   if (!found.items.some(item => item.startsWith("Trading account:"))) {
     failures.push(`${name}: the trading account is not on the page`);
-  }
-  if (!found.items.some(item => item.startsWith("Most this can cost in total:"))) {
-    failures.push(`${name}: the worst-case total is not on the page`);
-  }
-  if (found.warnings.some(warning => warning.startsWith("Guaranteed minimum received:"))) {
-    failures.push(`${name}: the review is rendered as a warning`);
   }
   if (found.overflow) failures.push(`${name}: the page scrolls horizontally`);
   await page.close();
