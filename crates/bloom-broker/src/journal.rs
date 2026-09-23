@@ -1607,6 +1607,36 @@ impl BrokerJournal {
             .transpose()
     }
 
+    /// The reservation an operation holds, without needing to know which
+    /// approval it was taken against. A caller reconciling an operation whose
+    /// outcome it never learned has the operation id and nothing else.
+    ///
+    /// An operation reserves against exactly one approval, so at most one row
+    /// matches; the ordering makes an unexpected second row deterministic and
+    /// biased towards the state that admits a signature.
+    pub fn reservation_for_operation(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<ReservationState>, JournalError> {
+        let connection = self.lock()?;
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT state FROM reservations WHERE operation_id = ?1
+                 ORDER BY CASE state
+                     WHEN 'COMMITTED' THEN 0
+                     WHEN 'QUARANTINED' THEN 1
+                     WHEN 'RESERVED' THEN 2
+                     ELSE 3 END
+                 LIMIT 1",
+                params![operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .map(|value| parse_reservation_state(&value))
+            .transpose()
+    }
+
     pub fn reservation_signature_count(
         &self,
         approval_id: &Digest32,

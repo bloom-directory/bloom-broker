@@ -6,10 +6,11 @@ use bloom_broker_api::{
     ApprovalLifecycleState, ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector,
     Base64UrlBytes, BootEpoch, DecimalU64, Digest32, MachineBrokerMethod, MachineBrokerRequest,
     MachineBrokerResponse, MachineBrokerService, MachineSignRequest, OperationId,
-    OperationPublicStatus, OperationState, PolicyUpdateRequest, ProtocolError, ProtocolErrorCode,
-    RPC_ENVELOPE_SCHEMA_V1, Readiness, ReadinessState, RevokeRequest,
-    SealedApprovalPrepareResponse, ServiceCapabilities, ServiceFuture, SigningPayloads, Token,
-    VerifierPublicCapability, WalletAccountsPublic, WalletPublic, WalletRequest, WalletSeedProfile,
+    OperationPublicStatus, OperationReservation, OperationState, PolicyUpdateRequest,
+    ProtocolError, ProtocolErrorCode, RPC_ENVELOPE_SCHEMA_V1, Readiness, ReadinessState,
+    RevokeRequest, SealedApprovalPrepareResponse, ServiceCapabilities, ServiceFuture,
+    SigningPayloads, Token, VerifierPublicCapability, WalletAccountsPublic, WalletPublic,
+    WalletRequest, WalletSeedProfile,
 };
 use bloom_platform_containment::NetworkContainmentGuard;
 use bloom_signer_api::{
@@ -240,7 +241,7 @@ impl BrokerRpcService {
                 // in order to do next. Idempotent: a replayed revoke finds no
                 // live ceremony and does nothing.
                 self.ceremony
-                    .end_approval_ceremonies(&request.approval_id, self.clock.now_ms(false)?)?;
+                    .end_approval_ceremonies_best_effort(&request.approval_id);
                 Ok(Response::SealedApprovalRevoke(
                     self.approval_public_status(&request.approval_id)?,
                 ))
@@ -306,6 +307,14 @@ impl BrokerRpcService {
                     self.authority
                         .revoke_local_approval(&approval_id)
                         .map_err(authority_error)?;
+                    // Same reason as the single-approval path, and more
+                    // urgent: this is the owner stopping a key. Leaving the
+                    // ceremony live holds the wallet's one live-ceremony slot
+                    // for the full TTL after an emergency stop, and leaves the
+                    // owner holding a URL for an approval that can never
+                    // activate.
+                    self.ceremony
+                        .end_approval_ceremonies_best_effort(&approval_id);
                     statuses.push(self.approval_public_status(&approval_id)?);
                 }
                 // Every pass that revoked all of its targets completes the
@@ -320,6 +329,7 @@ impl BrokerRpcService {
                 Ok(Response::SealedApprovalRevokeForKey(statuses))
             }
             Request::SealedApprovalRevokeAll(request) => {
+                let wallet_id = request.wallet_id.clone();
                 let current = self
                     .authority
                     .wallet_epoch(&request.wallet_id)
@@ -341,12 +351,17 @@ impl BrokerRpcService {
                     .request_for_machine(BrokerSignerRequest::SealedApprovalRevokeAll(
                         bloom_signer_api::WalletOperationRequest {
                             operation_id: request.operation_id,
-                            wallet_id: request.wallet_id,
+                            wallet_id: wallet_id.clone(),
                         },
                     ))
                     .await?
                 {
                     BrokerSignerResponse::SealedApprovalRevokeAll(state) => {
+                        // The epoch advance revoked every approval on this
+                        // wallet, so every ceremony waiting on one is waiting
+                        // on nobody.
+                        self.ceremony
+                            .end_wallet_approval_ceremonies_best_effort(&wallet_id);
                         Ok(Response::SealedApprovalRevokeAll(
                             translate_revocation::state_to_machine(state),
                         ))
@@ -1951,6 +1966,9 @@ impl BrokerRpcService {
                     state: OperationState::Succeeded,
                     result: Some(result),
                     error: None,
+                    // A batch child's signature is published under its parent's
+                    // reservation, and it succeeded.
+                    reservation: Some(OperationReservation::Committed),
                 });
             }
             return Err(ProtocolError::new(
@@ -1958,12 +1976,23 @@ impl BrokerRpcService {
                 "operation not found",
             ));
         };
+        let reservation = self
+            .journal
+            .reservation_for_operation(operation_id)
+            .map_err(journal_error)?
+            .map(|state| match state {
+                ReservationState::Reserved => OperationReservation::Reserved,
+                ReservationState::Committed => OperationReservation::Committed,
+                ReservationState::Released => OperationReservation::Released,
+                ReservationState::Quarantined => OperationReservation::Quarantined,
+            });
         Ok(OperationPublicStatus {
             operation_id: snapshot.operation_id,
             operation_digest: snapshot.operation_digest,
             state: snapshot.state,
             result: snapshot.result,
             error: None,
+            reservation,
         })
     }
 

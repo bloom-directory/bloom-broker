@@ -1222,6 +1222,34 @@ impl CeremonyBroker {
     /// a time, so leaving it until it expires blocks the wallet's next
     /// approval. Not an owner cancellation: no backoff is recorded, because
     /// the owner did not walk away from this ceremony.
+    /// End any live ceremony waiting on an approval that has just been
+    /// revoked. Never fails the caller: by the time this runs the revoke has
+    /// already happened, locally and at the Signer, and reporting an error
+    /// would tell the caller the approval is still live when it is not.
+    /// Machine reads a failed revoke as "outcome unknown" and refuses to
+    /// replace the attempt, so a clock fault here would wedge it permanently.
+    pub fn end_approval_ceremonies_best_effort(&self, approval_id: &Digest32) {
+        // Wall time, like the other self-driven sweeps in this module. The
+        // trusted clock is the right source for anything an owner approves;
+        // it is the wrong thing to make cleanup depend on, because a
+        // rollback-frozen clock would then be enough to wedge a replacement.
+        let now_ms = unix_time_ms();
+        // Sweep first, as the neighbouring paths do, so an already-expired
+        // session is recorded Expired rather than Cancelled and the Signer is
+        // not asked to cancel an operation it has already timed out.
+        if let Err(error) = self
+            .expire_sessions(now_ms)
+            .and_then(|()| self.end_approval_ceremonies(approval_id, now_ms))
+        {
+            tracing::warn!(
+                event = "ceremony.revoke_cleanup_failed",
+                approval_id = approval_id.as_str(),
+                code = ?error.code,
+                "approval is revoked; its ceremony will expire on its own"
+            );
+        }
+    }
+
     pub fn end_approval_ceremonies(
         &self,
         approval_id: &Digest32,
@@ -1246,27 +1274,69 @@ impl CeremonyBroker {
             .map(|(id, session)| (id.clone(), session.operation_id.clone()))
             .collect::<Vec<_>>();
         for (ceremony_id, operation_id) in live {
-            self.inner
-                .signer
-                .cancel(&operation_id)
-                .map_err(signer_error_to_machine)?;
+            // Claim the session under the lock BEFORE asking the Signer, the
+            // way `cancel_with_backoff` does. Dropping the lock first leaves a
+            // window in which the owner's assertion flips the session to
+            // Verifying and `complete_approval` races our `cancel` on the same
+            // operation. Marking it terminal here makes `complete_session`
+            // find it no longer AwaitingUser and refuse, so only one of the
+            // two can reach the Signer.
             let snapshot = {
-                let sessions = self.inner.sessions.lock();
-                let Some(session) = sessions.get(&ceremony_id) else {
+                let mut sessions = self.inner.sessions.lock();
+                let Some(session) = sessions.get_mut(&ceremony_id) else {
                     continue;
                 };
                 if session.state != CeremonyState::AwaitingUser {
                     continue;
                 }
-                let mut snapshot = session.clone();
-                snapshot.state = CeremonyState::Cancelled;
-                latch_terminal(&mut snapshot, now_ms);
-                snapshot
+                session.state = CeremonyState::Cancelled;
+                latch_terminal(session, now_ms);
+                session.clone()
             };
+            self.inner
+                .signer
+                .cancel(&operation_id)
+                .map_err(signer_error_to_machine)?;
             self.persist_session(&snapshot)?;
-            self.inner.sessions.lock().insert(ceremony_id, snapshot);
         }
         Ok(())
+    }
+
+    /// Every approval on a wallet has just been revoked at once by an epoch
+    /// advance, so every ceremony waiting on any of them is waiting on nobody.
+    /// Best-effort for the same reason as the single-approval form.
+    pub fn end_wallet_approval_ceremonies_best_effort(&self, wallet_id: &Token) {
+        let now_ms = unix_time_ms();
+        if let Err(error) = self.expire_sessions(now_ms) {
+            tracing::warn!(
+                event = "ceremony.revoke_all_sweep_failed",
+                code = ?error.code,
+                "continuing to end this wallet's ceremonies"
+            );
+        }
+        let approvals = self
+            .inner
+            .sessions
+            .lock()
+            .values()
+            .filter(|session| {
+                session.ceremony_kind == CeremonyKind::SealedApproval
+                    && session.state == CeremonyState::AwaitingUser
+                    && session.wallet_id.as_ref() == Some(wallet_id)
+            })
+            .filter_map(|session| {
+                session
+                    .projection
+                    .review_manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.get("approval_id"))
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| Digest32::new(value.to_owned()).ok())
+            })
+            .collect::<Vec<_>>();
+        for approval_id in approvals {
+            self.end_approval_ceremonies_best_effort(&approval_id);
+        }
     }
 
     /// True when every owner ceremony minted for this approval died without

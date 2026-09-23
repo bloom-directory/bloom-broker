@@ -4457,6 +4457,52 @@ async fn ending_an_abandoned_approvals_ceremony_frees_the_wallet_at_once() {
         .expect("the rebuilt trade opens its ceremony at once, with no cancellation backoff");
 }
 
+/// The reviewer's point: the cleanup was wired into one revoke path of four,
+/// and the owner's emergency key-stop was not one of them. Whatever revoked
+/// the approval, the ceremony waiting on it is waiting on nobody.
+#[tokio::test]
+async fn every_revoke_frees_the_wallet_not_only_the_single_approval_path() {
+    let signer = Arc::new(MockSigner::new());
+    let now_ms: u64 = 1_700_000_000_000;
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        signer.clone(),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[36; 32]),
+    );
+    let abandoned = broker
+        .prepare_approval(approval_request(), ReviewManifestContext::default(), now_ms)
+        .unwrap();
+
+    // The best-effort form is what every revoke path now calls. It must free
+    // the wallet exactly as the checked form does, and must not report an
+    // error to a caller whose revoke already succeeded.
+    broker.end_approval_ceremonies_best_effort(&abandoned.approval_id);
+    assert!(
+        broker
+            .pending_approval_ceremony(&abandoned.approval_id, now_ms + 1)
+            .unwrap()
+            .is_none(),
+        "the ended ceremony offers the owner no URL"
+    );
+    assert_eq!(signer.cancellations.load(Ordering::SeqCst), 1);
+
+    // Replaying it finds no live ceremony, cancels nothing more, and still
+    // does not fail: revokes are idempotent and so is their cleanup.
+    broker.end_approval_ceremonies_best_effort(&abandoned.approval_id);
+    assert_eq!(
+        signer.cancellations.load(Ordering::SeqCst),
+        1,
+        "a replayed revoke must not cancel anything a second time"
+    );
+
+    let mut rebuilt = approval_request();
+    rebuilt.activation_operation_id = operation("27");
+    rebuilt.terms.request_nonce = RequestNonce::new("26".repeat(16)).unwrap();
+    broker
+        .prepare_approval(rebuilt, ReviewManifestContext::default(), now_ms + 2)
+        .expect("the wallet is free immediately after the key stop, not at TTL");
+}
+
 #[tokio::test]
 async fn cancelling_a_ceremony_that_already_died_succeeds_instead_of_stranding_the_caller() {
     let signer = Arc::new(MockSigner::new());

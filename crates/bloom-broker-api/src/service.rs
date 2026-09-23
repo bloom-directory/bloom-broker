@@ -209,6 +209,32 @@ pub enum OperationState {
     Quarantined,
 }
 
+/// What became of the signing reservation this operation held.
+///
+/// `OperationState` alone cannot answer "could this have produced a
+/// signature?", because `Failed` is reachable both before the Signer was ever
+/// asked and after it was. The reservation can: Broker releases it only on a
+/// definite terminal answer — a refusal code the Signer returns before
+/// signing, or the Signer's own status reporting a terminal failure — and
+/// quarantines it whenever the effect is ambiguous.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum OperationReservation {
+    /// Held: the Signer was asked and has not given a terminal answer. A
+    /// signature may exist.
+    #[serde(rename = "RESERVED")]
+    Reserved,
+    /// A signature was produced and committed.
+    #[serde(rename = "COMMITTED")]
+    Committed,
+    /// Released against a definite terminal answer: no signature was produced,
+    /// and none can now be.
+    #[serde(rename = "RELEASED")]
+    Released,
+    /// The provider effect is ambiguous. A signature may exist.
+    #[serde(rename = "QUARANTINED")]
+    Quarantined,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationPublicStatus {
@@ -217,6 +243,10 @@ pub struct OperationPublicStatus {
     pub state: OperationState,
     pub result: Option<SigningResult>,
     pub error: Option<ProtocolError>,
+    /// `None` when the operation never reserved anything, which is itself
+    /// proof that the Signer was never asked.
+    #[serde(default)]
+    pub reservation: Option<OperationReservation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

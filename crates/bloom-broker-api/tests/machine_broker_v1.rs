@@ -439,6 +439,7 @@ fn machine_responses() -> Vec<MachineBrokerResponse> {
         state: OperationState::Succeeded,
         result: Some(signing_result()),
         error: None,
+        reservation: Some(OperationReservation::Committed),
     };
     let custody_prepared = CustodyPrepareResponse {
         ceremony_kind: CeremonyKind::WalletRegistration,
@@ -545,7 +546,7 @@ fn every_machine_broker_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "78b67e7d3c1ad1604e0b6662fe2320df503dbd007918d93540727d220130cc39",
+        "1b518882de5832ed710fe261f96ffd15e3a42a6144910ebb6f1e9dcd9ec35154",
     );
 }
 
