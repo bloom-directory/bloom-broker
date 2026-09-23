@@ -16,8 +16,8 @@ license = "MIT"
 
 [workspace.dependencies]
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "ccc9adb3866b17b87d2774018dcfa015184b1918" }
-bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "ccc9adb3866b17b87d2774018dcfa015184b1918" }
+bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "97b9ac7e47ee682e59804d04f6288419f3598a58" }
+bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "97b9ac7e47ee682e59804d04f6288419f3598a58" }
 bloom-evm-clear-signing = { path = "crates/bloom-evm-clear-signing" }
 bloom-solana-verify = { path = "crates/bloom-solana-verify" }
 # Pinned to the versions the Alloy 2.x consensus types already resolve to, so
