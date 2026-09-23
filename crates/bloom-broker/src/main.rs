@@ -77,6 +77,18 @@ struct BrokerConfig {
     signer_revocation_key_id: String,
     signer_revocation_public_key_hex: String,
     provenance_catalog_path: PathBuf,
+    /// Optional path to a signed clear-signing catalog. Replacing this file
+    /// and restarting Broker is the whole import surface: there is no
+    /// network fetch, no refresh command and no second audit family.
+    #[serde(default)]
+    clear_signing_catalog_path: Option<PathBuf>,
+    /// Optional path to an owner-installed ceremony stylesheet. It is read
+    /// once here and served at `/assets/theme.css` after the default sheet;
+    /// no other file is reachable through that route. It is trusted UI code:
+    /// arbitrary CSS can obscure a warning or a control, so it comes from the
+    /// owner's configuration and never from a request, a descriptor or a URL.
+    #[serde(default)]
+    ceremony_theme_css_path: Option<PathBuf>,
     policy_keys: Vec<PolicyKeyConfig>,
     build_digest: String,
     /// Non-secret global ceremony admission limits. Kept as a raw document so
@@ -533,6 +545,14 @@ async fn run_with_paths(
         let provenance_catalog = load_provenance_catalog(&config.provenance_catalog_path)?;
         if !journal.audit_degraded() {
             authority.synchronize_provenance_catalog(&provenance_catalog)?;
+            if let Some(path) = &config.clear_signing_catalog_path {
+                install_clear_signing_catalog(&authority, path)?;
+            }
+        }
+        if let Some(path) = &config.ceremony_theme_css_path {
+            let css = std::fs::read_to_string(path)
+                .map_err(|error| format!("read ceremony theme {}: {error}", path.display()))?;
+            bloom_broker::ceremony::install_owner_theme_css(css);
         }
         let signer = BrokerSignerClient::connect_unix(
             &config.signer_socket_path,
@@ -1571,6 +1591,63 @@ fn load_config(path: &Path) -> Result<BrokerConfig, ProtocolError> {
     });
     bytes.zeroize();
     decoded
+}
+
+/// Read and install the operator's signed clear-signing catalog.
+///
+/// A snapshot no enrolled wallet trusts is a configuration mistake worth
+/// naming, not a reason to refuse to start: wallets that never enabled clear
+/// signing keep working, and the log says why nothing was installed.
+fn install_clear_signing_catalog(
+    authority: &BrokerAuthority,
+    path: &Path,
+) -> Result<(), ProtocolError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            format!("inspect {}: {error}", path.display()),
+        )
+    })?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            "clear-signing catalog must be a non-symlink regular file not writable by group or other",
+        ));
+    }
+    let bytes = fs::read(path).map_err(|error| {
+        ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            format!("read {}: {error}", path.display()),
+        )
+    })?;
+    if bytes.len() > bloom_evm_clear_signing::CATALOG_MAX_BYTES {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::LimitExceededFrame,
+            "clear-signing catalog exceeds 1 MiB",
+        ));
+    }
+    let catalog: bloom_evm_clear_signing::ClearSigningCatalog = serde_json::from_slice(&bytes)
+        .map_err(|error| {
+            ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                format!("parse clear-signing catalog: {error}"),
+            )
+        })?;
+    let installed = authority
+        .install_clear_signing_catalog_for_enrolled_wallets(&catalog, bytes.len())
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::ClaimInvalid, error.to_string()))?;
+    tracing::info!(
+        event = "broker.clear_signing_catalog",
+        catalog_id = catalog.catalog_id.as_str(),
+        sequence = catalog.sequence.as_str(),
+        entries = catalog.entries.len(),
+        installed,
+        "Broker read the operator's clear-signing catalog"
+    );
+    Ok(())
 }
 
 fn load_provenance_catalog(path: &Path) -> Result<ProvenanceCatalog, ProtocolError> {

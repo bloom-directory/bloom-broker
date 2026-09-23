@@ -102,6 +102,7 @@ fn capabilities() -> ServiceCapabilities {
             verifier_id: token("webauthn"),
             verifier_digest: digest(13),
         }],
+        clear_signing: None,
         frame_max_bytes: DecimalU64::new(FRAME_MAX_BYTES as u64),
     }
 }
@@ -262,6 +263,8 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
         MachineBrokerRequest::BrokerCapabilities(Empty {}),
         MachineBrokerRequest::ActionValidate(digest(58)),
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            requested_review_mode: None,
+            evm_review_payloads: Vec::new(),
             operation_id: operation(54),
             terms: approval_terms(),
             canonical_plan_facts_digest: digest(59),
@@ -536,6 +539,9 @@ where
 
 #[test]
 fn every_machine_broker_variant_matches_frozen_v1_frames() {
+    // Protocol 1.6 adds the native assurance claims and the EVM review
+    // payload field to the request frames; empty review payloads remain
+    // omitted from the pre-existing approval request vectors.
     assert_eq!(MachineBrokerMethod::ALL.len(), 43);
     assert_wire_digest(
         "machine requests",

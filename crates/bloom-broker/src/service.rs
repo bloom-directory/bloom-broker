@@ -108,6 +108,35 @@ fn seed_profile_from_key_projection(
     }
 }
 
+fn evm_address_from_public_key(bytes: &[u8]) -> Result<alloy::primitives::Address, ProtocolError> {
+    // Strict canonical SPKI via the shared parser: it rejects compressed
+    // points and non-canonical DER that a general-purpose parser tolerates.
+    let point =
+        crate::translation::wallet_account::secp256k1_uncompressed_point(bytes).map_err(|_| {
+            ProtocolError::new(
+                ProtocolErrorCode::SelectorMismatch,
+                "invalid EVM public key",
+            )
+        })?;
+    Ok(alloy::primitives::Address::from_raw_public_key(&point[1..]))
+}
+
+/// Renewals pass no review payloads, and a real Broker never re-reviews on
+/// renewal. A native transaction approval's owner review *is* the decoded
+/// preimage, so it has no valid renewal shape: refuse it by name instead of
+/// as a generic missing-payload error.
+fn renewal_of_native_transaction_is_refused(
+    terms: &bloom_broker_api::SealedApprovalTerms,
+) -> Option<ProtocolError> {
+    if crate::evm_review::subject_is_native_evm_transaction(&terms.subject) {
+        return Some(ProtocolError::new(
+            ProtocolErrorCode::SelectorMismatch,
+            "native transaction approvals are single-use and cannot be renewed",
+        ));
+    }
+    None
+}
+
 impl BrokerRpcService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -731,6 +760,54 @@ impl BrokerRpcService {
         }
     }
 
+    /// Resolve what this wallet's authenticated policy says about clear
+    /// signing, and load the catalog under exactly that trust. A stored
+    /// snapshot the policy no longer trusts reads as no catalog at all.
+    fn clear_signing_context(
+        &self,
+        policy: &bloom_broker_api::CanonicalWalletPolicy,
+    ) -> Result<crate::evm_review::ClearSigningContext, ProtocolError> {
+        let verifier_digest =
+            Digest32::from_bytes(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES);
+        // The same authority clock the rest of preparation uses. This read is
+        // not a mutation, so it does not consume the caller's mutation
+        // allowance a second time; `prepare_approval` already takes one.
+        let now_ms = self.clock.now_ms(false)?;
+        // The wallet pins the verifier by digest, and this is where that pin
+        // is spent. A build whose verifier sources hash to something else
+        // cannot describe calls for this wallet: refusing here is what stops
+        // an upgraded Broker quietly substituting its own reading for the one
+        // the owner approved.
+        if let Some(settings) = &policy.clear_signing
+            && (settings.verifier.verifier_id.as_str()
+                != bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_ID
+                || settings.verifier.verifier_digest != verifier_digest)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "wallet policy pins a clear-signing verifier absent from this build; \
+                 approve a policy update naming this build's verifier",
+            ));
+        }
+        let Some(settings) = &policy.clear_signing else {
+            return Ok(crate::evm_review::ClearSigningContext {
+                catalog: None,
+                verifier_digest,
+                now_ms,
+            });
+        };
+        let trusted = crate::authority::trusted_catalog_keys(settings).map_err(authority_error)?;
+        let catalog = self
+            .authority
+            .clear_signing_catalog(&trusted, usize::from(settings.signature_threshold))
+            .map_err(authority_error)?;
+        Ok(crate::evm_review::ClearSigningContext {
+            catalog,
+            verifier_digest,
+            now_ms,
+        })
+    }
+
     async fn prepare_approval(
         &self,
         request: ApprovalPrepareRequest,
@@ -742,6 +819,79 @@ impl BrokerRpcService {
             ));
         }
         self.reconcile_wallet(&request.terms.wallet_id).await?;
+        let mut context = ReviewManifestContext::default();
+        let native_evm =
+            crate::evm_review::subject_is_native_evm_transaction(&request.terms.subject);
+        if native_evm && request.evm_review_payloads.is_empty() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::SelectorMismatch,
+                "native EVM approval requires full review payloads; upgrade Bloom Machine",
+            ));
+        }
+        // The policy the review was produced against, kept so the frozen
+        // review kind is read from the same document the reading used.
+        let mut review_policy: Option<bloom_broker_api::CanonicalWalletPolicy> = None;
+        if !request.evm_review_payloads.is_empty() {
+            let response = self
+                .signer
+                .request_for_machine(BrokerSignerRequest::KeyGetPublic(
+                    translate_service::key_request_to_signer(bloom_broker_api::KeyRequest {
+                        key_ref: request.terms.key_ref.clone(),
+                    }),
+                ))
+                .await?;
+            let BrokerSignerResponse::KeyGetPublic(key) = response else {
+                return Err(response_mismatch("key.get_public"));
+            };
+            let key = translate_service::key_to_machine(key);
+            if key.key_ref != request.terms.key_ref {
+                return Err(response_mismatch("EVM review key identity"));
+            }
+            let from = evm_address_from_public_key(&key.canonical_public_key.decode())?;
+            let snapshot = self
+                .authority
+                .policy_snapshot(&request.terms.wallet_id)
+                .map_err(authority_error)?;
+            // Review against the policy these terms are bound to, so the
+            // creation opt-in is never read from a different version.
+            if snapshot.version != request.terms.policy_version
+                || snapshot.policy_digest != request.terms.policy_digest
+            {
+                return Err(authority_error(AuthorityError::Denied {
+                    code: "POLICY_SNAPSHOT_MISMATCH",
+                    message: "approval is not bound to Broker's verified current policy".into(),
+                }));
+            }
+            let policy =
+                serde_json::from_slice(&snapshot.canonical_policy.decode()).map_err(|_| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "invalid canonical policy",
+                    )
+                })?;
+            let clear_signing = self.clear_signing_context(&policy)?;
+            context.evm_review =
+                crate::evm_review::review(&request, &policy, from, &clear_signing)?;
+            review_policy = Some(policy.clone());
+            if let Some(review) = &context.evm_review
+                && let Some(evidence) = &review.clear_signing
+                && let Some(settings) = &policy.clear_signing
+            {
+                // Cap the approval before a ceremony exists. Returning the
+                // permitted instant lets Machine regenerate terms under the
+                // existing operation-conflict rules instead of guessing.
+                let permitted = evidence.permitted_expiry_ms(settings.maximum_observation_age_ms);
+                if request.terms.expires_at_ms.get() > permitted {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ClaimInvalid,
+                        format!(
+                            "POLICY_DENIED: clear-signing evidence permits approval only until                              {permitted}; regenerate the terms with an expiry at or before that.                              {}",
+                            bloom_evm_clear_signing::ReviewReason::PolicyDenied.owner_action()
+                        ),
+                    ));
+                }
+            }
+        }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
             ApprovalSelector::Exact {
                 ordered_payload_digests,
@@ -777,22 +927,36 @@ impl BrokerRpcService {
                 .as_ref()
                 .map(jcs_digest)
                 .transpose()?);
-        let response = self.ceremony.prepare_approval(
-            ceremony_request,
-            ReviewManifestContext {
-                petal_use_claim: request.petal_use_claim,
-                system_use_claim: request.system_use_claim,
-                claim_assurance,
-                attributed_advisory_items: Vec::new(),
-            },
-            self.clock.now_ms(true)?,
-        )?;
+        context.petal_use_claim = request.petal_use_claim;
+        context.system_use_claim = request.system_use_claim;
+        context.claim_assurance = claim_assurance;
+        // Freeze what Broker itself concluded, alongside the record that
+        // authorizes signing. There is no second write to lose: an approval
+        // record either exists with its review, or does not exist at all.
+        let review_kind = review_policy
+            .as_ref()
+            .map_or(crate::journal::ReviewKind::Legacy, |policy| {
+                crate::evm_review::review_kind(context.evm_review.as_ref(), policy)
+            });
+        let frozen_review = match context
+            .evm_review
+            .as_ref()
+            .and_then(|review| review.clear_signing.as_ref())
+        {
+            Some(evidence) => crate::authority::FrozenReview::with_evidence(review_kind, evidence),
+            None => crate::authority::FrozenReview::without_evidence(review_kind),
+        }
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::ClaimInvalid, error))?;
+        let response =
+            self.ceremony
+                .prepare_approval(ceremony_request, context, self.clock.now_ms(true)?)?;
         if let Err(error) = self
             .authority
             .prepare_approval_with_claim(
                 &request.terms,
                 &response.review_manifest_digest,
                 approved_claim_digest.as_ref(),
+                &frozen_review,
             )
             .map_err(authority_error)
         {
@@ -942,7 +1106,12 @@ impl BrokerRpcService {
                 "renewal terms do not name the requested predecessor",
             ));
         }
+        if let Some(error) = renewal_of_native_transaction_is_refused(&request.replacement_terms) {
+            return Err(error);
+        }
         self.prepare_approval(ApprovalPrepareRequest {
+            requested_review_mode: None,
+            evm_review_payloads: Vec::new(),
             operation_id: request.operation_id,
             canonical_plan_facts_digest: request.replacement_terms.approval_digest()?,
             terms: request.replacement_terms,
@@ -2012,6 +2181,10 @@ impl BrokerRpcService {
                     verifier_digest: capability.artifact_digest,
                 })
                 .collect(),
+            clear_signing: self
+                .authority
+                .clear_signing_status()
+                .map_err(authority_error)?,
             frame_max_bytes: DecimalU64::new(bloom_broker_api::FRAME_MAX_BYTES as u64),
         })
     }
@@ -2363,6 +2536,96 @@ fn malformed(error: impl std::fmt::Display) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evm_review_accepts_the_signers_spki_public_key() {
+        use k256::{elliptic_curve::sec1::ToEncodedPoint as _, pkcs8::EncodePublicKey as _};
+
+        let signing_key = k256::ecdsa::SigningKey::from_bytes((&[7_u8; 32]).into()).unwrap();
+        let public = signing_key.verifying_key().as_affine();
+        let der = k256::PublicKey::from_affine(*public)
+            .unwrap()
+            .to_public_key_der()
+            .unwrap();
+        let encoded = public.to_encoded_point(false);
+        let expected = alloy::primitives::Address::from_raw_public_key(&encoded.as_bytes()[1..]);
+
+        assert_eq!(
+            evm_address_from_public_key(der.as_bytes()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_native_transaction_renewal_is_refused_by_name_and_other_subjects_are_not() {
+        use bloom_broker_api::{
+            ActivationMode, ApprovalLimits, ApprovalSubject, CryptoSuite, KeyRef, KeySpec,
+            RequestNonce, SealedApprovalTerms,
+        };
+        let terms = |subject| SealedApprovalTerms {
+            subject,
+            wallet_id: Token::new("wallet").unwrap(),
+            key_ref: KeyRef {
+                backend: Token::new("local").unwrap(),
+                backend_instance: Token::new("default").unwrap(),
+                locator: "wallet/root".into(),
+                key_spec: KeySpec::Secp256k1,
+                public_key_fingerprint: Digest32::from_bytes([1; 32]),
+                derivation: None,
+            },
+            allowed_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+            selector: ApprovalSelector::Exact {
+                ordered_payload_digests: vec![Digest32::from_bytes([2; 32])],
+                ordered_hashes: vec![Digest32::from_bytes([3; 32])],
+            },
+            limits: ApprovalLimits {
+                max_operations: DecimalU64::new(1),
+                max_signatures: DecimalU64::new(1),
+                operation_rate_limits: Vec::new(),
+                signature_rate_limits: Vec::new(),
+                value_limits: Vec::new(),
+            },
+            activation_mode: ActivationMode::BootBound,
+            wallet_revocation_epoch: DecimalU64::new(0),
+            policy_version: DecimalU64::new(1),
+            policy_digest: Digest32::from_bytes([4; 32]),
+            provenance_digest: Digest32::from_bytes([5; 32]),
+            request_nonce: RequestNonce::from_bytes([6; 16]),
+            issued_at_ms: DecimalU64::new(10),
+            not_before_ms: DecimalU64::new(10),
+            expires_at_ms: DecimalU64::new(20),
+            renewal_of: None,
+        };
+        for class in [
+            "transaction.confirm",
+            "transaction.replace",
+            "transaction.cancel",
+        ] {
+            let error = renewal_of_native_transaction_is_refused(&terms(ApprovalSubject::Cli {
+                client_id: Token::new("machine").unwrap(),
+                command_class: Token::new(class).unwrap(),
+            }))
+            .expect(class);
+            assert_eq!(error.code, ProtocolErrorCode::SelectorMismatch);
+            assert!(error.message.contains("single-use"), "{error:?}");
+        }
+        for subject in [
+            ApprovalSubject::Cli {
+                client_id: Token::new("machine").unwrap(),
+                command_class: Token::new("vfs.test").unwrap(),
+            },
+            ApprovalSubject::Petal {
+                package_hash: Digest32::from_bytes([7; 32]),
+                route: "orders/place".into(),
+                agent_id: None,
+            },
+        ] {
+            assert!(
+                renewal_of_native_transaction_is_refused(&terms(subject)).is_none(),
+                "non-transaction renewals keep the existing path"
+            );
+        }
+    }
     use crate::journal::OperationSnapshot;
     use bloom_broker_api::OperationState;
     use bloom_signer_api::{CryptoSuite, NormalizedSignature, SignerClaimAssurance, SigningResult};

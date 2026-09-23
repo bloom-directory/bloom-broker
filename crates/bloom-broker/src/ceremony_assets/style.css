@@ -1,34 +1,222 @@
-:root{--paper:#f4efe6;--surface:#faf7f1;--ink:#15130f;--ink-2:#342d24;--muted:#706757;--rule:#d5c9b6;--rule-2:#c4b59d;--leaf:#526f51;--accent:#8a2a3a;--accent-deep:#5e1a26;--success:#355f47;--error:#7a2230;--serif:"Iowan Old Style","Palatino Linotype",Georgia,serif;--sans:"Avenir Next",Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace}
-*{box-sizing:border-box}[hidden]{display:none!important}html{min-height:100%;background:var(--paper);color:var(--ink);-webkit-text-size-adjust:100%}
-body{min-height:100vh;margin:0;font-family:var(--sans);font-size:16px;line-height:1.5;-webkit-font-smoothing:antialiased}
-body::before{content:"";position:fixed;inset:0;pointer-events:none;background:linear-gradient(115deg,rgba(255,255,255,.68),transparent 38%),linear-gradient(180deg,rgba(82,111,81,.08),transparent 50%),linear-gradient(0deg,rgba(138,42,58,.055),transparent 38%)}
-body::after{content:"";position:fixed;width:440px;height:440px;right:-180px;top:-190px;border:1px solid rgba(138,42,58,.13);border-radius:50%;box-shadow:0 0 0 72px rgba(138,42,58,.025),0 0 0 144px rgba(82,111,81,.02);pointer-events:none}
-.page{position:relative;z-index:1;width:min(1080px,100%);margin:0 auto;padding:28px clamp(20px,4vw,56px) 56px}
-.brand{display:inline-flex;align-items:center;gap:10px;color:var(--ink);font-family:var(--mono);font-size:12px;text-transform:uppercase}.brand strong{color:var(--accent-deep)}.brand img{display:block;width:30px;height:30px}
-.layout{display:grid;grid-template-columns:minmax(260px,.72fr) minmax(460px,1fr);gap:clamp(44px,7vw,92px);align-items:start;margin-top:48px}
-.intro{position:sticky;top:28px;padding-top:12px}.eyebrow{margin:0 0 15px;color:var(--accent);font-family:var(--mono);font-size:11px;letter-spacing:.07em;text-transform:uppercase}
-h1{margin:0;font-family:var(--serif);font-size:clamp(48px,6vw,72px);font-style:italic;font-weight:400;line-height:.96;letter-spacing:-.025em}.lede{margin:22px 0 0;color:var(--ink-2);font-size:17px}
-.trust{display:grid;gap:14px;margin-top:34px;padding-top:22px;border-top:1px solid var(--rule);color:var(--muted);font-size:13px}.trust strong{display:block;color:var(--ink-2);font-size:14px}.trust-item{display:grid;grid-template-columns:22px 1fr;gap:10px}.trust-item svg{width:19px;color:var(--leaf)}
-.panel{overflow:hidden;border:1px solid var(--rule-2);border-radius:18px;background:rgba(250,247,241,.92);box-shadow:0 24px 70px rgba(52,45,36,.09),0 2px 8px rgba(52,45,36,.04);backdrop-filter:blur(12px)}
-.panel-header{padding:27px 30px 23px;border-bottom:1px solid var(--rule);background:rgba(236,228,214,.38)}.panel-kicker{margin:0 0 6px;color:var(--muted);font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase}.panel-title{margin:0;font-family:var(--serif);font-size:30px;font-weight:400}
-#status{margin:7px 0 0;color:var(--muted);font-size:13px}#review{padding:24px 30px;border-bottom:1px solid var(--rule)}
-#review pre{max-height:42vh;margin:0;padding:16px;overflow:auto;border:1px solid var(--rule);border-radius:9px;background:#fffdf9;color:var(--ink-2);font-family:var(--mono);font-size:11px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}
-fieldset{margin:0;padding:24px 30px;border:0;border-bottom:1px solid var(--rule)}legend{padding:0;color:var(--ink);font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase}label{display:grid;gap:5px;margin-top:13px;color:var(--ink-2);font-size:13px}input,textarea{width:100%;padding:11px 12px;border:1px solid var(--rule-2);border-radius:8px;background:#fffdf9;color:var(--ink);font:13px/1.45 var(--mono)}textarea{resize:vertical}input:focus,textarea:focus{border-color:var(--accent);outline:3px solid rgba(138,42,58,.1)}fieldset p{color:var(--muted);font-size:12px}
-.actions{display:grid;grid-template-columns:1fr auto;gap:10px;padding:26px 30px 30px;background:rgba(236,228,214,.22)}button{min-height:49px;padding:12px 18px;border:0;border-radius:9px;background:var(--accent);color:var(--paper);font:500 12px var(--mono);cursor:pointer;box-shadow:0 8px 20px rgba(94,26,38,.17);transition:transform .16s,background .16s}button:hover:not(:disabled){transform:translateY(-1px);background:var(--accent-deep)}button:disabled{opacity:.48;cursor:wait;box-shadow:none}button.secondary{border:1px solid var(--rule-2);background:transparent;color:var(--ink-2);box-shadow:none}
-@media(max-width:820px){.layout{grid-template-columns:1fr;gap:30px;margin-top:32px}.intro{position:static}.trust{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:560px){.page{padding:19px 14px 28px}h1{font-size:46px}.panel{border-radius:14px}.panel-header,#review,fieldset,.actions{padding-left:20px;padding-right:20px}.actions{grid-template-columns:1fr}.trust{grid-template-columns:1fr}}
-@media(prefers-reduced-motion:reduce){*{transition:none!important}}
-.facts{display:grid;grid-template-columns:max-content 1fr;gap:9px 18px;margin:0;font-size:14px}.facts dt{color:var(--muted);font-family:var(--mono);font-size:11px;letter-spacing:.05em;text-transform:uppercase;padding-top:3px}.facts dd{margin:0;color:var(--ink);overflow-wrap:anywhere}.facts dd code{font-family:var(--mono);font-size:12px;color:var(--ink-2)}
-.summary{margin:0 0 18px;font-size:16px;line-height:1.5;color:var(--ink)}.summary strong{color:var(--accent-deep)}
-.warn{margin:16px 0 0;padding:12px 14px;border:1px solid rgba(138,42,58,.35);border-radius:9px;background:rgba(138,42,58,.06);color:var(--accent-deep);font-size:13px}
-.plan{margin:14px 0 0}.plan pre{max-height:32vh}
-details.signed{margin-top:18px}details.signed summary{cursor:pointer;color:var(--muted);font-family:var(--mono);font-size:11px;letter-spacing:.05em;text-transform:uppercase}details.signed pre{margin-top:10px;max-height:30vh}
-.expiry{color:var(--muted)}.expiry.soon{color:var(--accent);font-weight:600}.expired{color:var(--error);font-weight:600}
-.choice{grid-template-columns:auto 1fr;align-items:start;gap:10px;cursor:pointer;font-size:14px}.choice input{width:auto;margin-top:4px}.choice strong{color:var(--ink)}
-.words{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin:14px 0 0;padding:0;list-style:none;counter-reset:w}.words li{display:flex;gap:8px;align-items:baseline;padding:9px 11px;border:1px solid var(--rule);border-radius:8px;background:#fffdf9;font-family:var(--mono);font-size:14px}.words li::before{counter-increment:w;content:counter(w);min-width:1.6em;color:var(--muted);font-size:11px}
-.result-title{margin:0 0 6px;font-family:var(--serif);font-size:24px;font-weight:400}.result-actions{display:flex;gap:10px;margin-top:16px}.result-actions button{min-height:40px;padding:8px 14px}
-.ok{color:var(--success)}
-button{font:600 15px/1.2 var(--sans);letter-spacing:0}button.secondary{font-weight:500}
-.lede{font-size:18px}.panel-title{font-size:26px}
-#review{padding:26px 30px}
-.facts dd code{font-size:13px;line-height:1.5}
+/* Bloom ceremony review.
+ *
+ * One centred column. The decision reads top to bottom: wallet and network,
+ * the action, who receives value or permission, what it costs at most, what
+ * the interpretation does and does not establish, then the controls. Byte
+ * identity lives in disclosures underneath.
+ *
+ * Customisation: redefine the --ceremony-* properties below, and rely on the
+ * stable class names (.ceremony-intent, .ceremony-identity, .ceremony-party,
+ * .ceremony-warning, .ceremony-assurance, .ceremony-details, .ceremony-actions)
+ * and the [data-action] / [data-magnitude] hooks. Meaningful text is always
+ * DOM content, never CSS-generated, so a theme that drops every rule still
+ * shows the whole review.
+ *
+ * An owner theme has no isolation from security-relevant presentation. CSS
+ * can move, cover, recolour, shrink or hide a warning, an address, an amount
+ * or a button, and so alter what a review appears to say without changing its
+ * content. Identical review text under a theme shows content preservation,
+ * not visual safety.
+ */
+:root{
+  /* Palette */
+  --ceremony-bg:#f7f6f3;
+  --ceremony-surface:#fffefa;
+  --ceremony-text:#15130f;
+  --ceremony-muted:#706757;
+  --ceremony-border:#e5e0d8;
+  --ceremony-accent:#8a2a3a;
+  --ceremony-accent-deep:#5e1a26;
+  --ceremony-warning:#7a4a10;
+  --ceremony-warning-surface:#fdf3e2;
+  --ceremony-danger:#8a1f2b;
+  --ceremony-danger-surface:#fceced;
+  --ceremony-success:#355f47;
+  /* Type */
+  --ceremony-font:"Avenir Next",Inter,system-ui,-apple-system,"Segoe UI",sans-serif;
+  --ceremony-font-display:var(--ceremony-font);
+  --ceremony-font-mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace;
+  --ceremony-text-size:16px;
+  --ceremony-address-size:13px;
+  --ceremony-heading-size:28px;
+  /* Measure and rhythm: an 8px scale. */
+  --ceremony-width:840px;
+  --ceremony-gutter:24px;
+  --ceremony-padding:32px;
+  --ceremony-label-width:184px;
+  --ceremony-space-1:8px;
+  --ceremony-space-2:16px;
+  --ceremony-space-3:24px;
+  --ceremony-space-4:32px;
+  --ceremony-radius:12px;
+}
+
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html{background:var(--ceremony-bg);color:var(--ceremony-text);-webkit-text-size-adjust:100%}
+body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-font-smoothing:antialiased}
+.page{width:min(var(--ceremony-width),100%);margin:0 auto;padding:var(--ceremony-space-3) var(--ceremony-gutter) var(--ceremony-space-4)}
+
+.brand{display:flex;align-items:center;gap:var(--ceremony-space-1);margin-bottom:var(--ceremony-space-3);color:var(--ceremony-muted);font-size:14px}
+.brand img{display:block}
+.brand strong{color:var(--ceremony-accent-deep);font-weight:600}
+.brand-context{margin:0 0 0 auto;text-align:right}
+
+.panel{border:1px solid var(--ceremony-border);border-radius:var(--ceremony-radius);background:var(--ceremony-surface)}
+.panel-header{padding:var(--ceremony-padding) var(--ceremony-padding) var(--ceremony-space-3)}
+.panel-context{display:flex;align-items:center;gap:8px;margin:0 0 var(--ceremony-space-2);color:var(--ceremony-accent-deep);font-size:14px}
+.panel-context svg{width:22px;height:22px;flex:none}
+.panel-title{margin:0;font:600 var(--ceremony-heading-size)/1.25 var(--ceremony-font-display);letter-spacing:-.035em;overflow-wrap:anywhere}
+#status{margin:var(--ceremony-space-1) 0 0;color:var(--ceremony-muted);font-size:14px}
+#status:empty{display:none}
+.review-deadline{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 16px;margin:8px 0 0;color:var(--ceremony-muted);font-size:13px}
+.review-countdown{font-size:15px;font-weight:600;font-variant-numeric:tabular-nums;color:var(--ceremony-text)}
+.review-deadline:empty{display:none}
+#review{padding:0 var(--ceremony-padding) var(--ceremony-padding)}
+#review>*+*{margin-top:var(--ceremony-space-3)}
+
+/* The action. One heading, at the largest size on the page. */
+.ceremony-intent{margin:0}
+.ceremony-eyebrow{margin:0;color:var(--ceremony-muted);font-size:14px}
+.ceremony-heading{margin:0;font:600 19px/1.4 var(--ceremony-font-display);letter-spacing:-.02em;overflow-wrap:anywhere}
+.ceremony-detail{max-width:65ch;margin:0;color:var(--ceremony-text)}
+.ceremony-heading+.ceremony-detail{margin-top:var(--ceremony-space-1)}
+.ceremony-intent[data-magnitude="unlimited"] .ceremony-heading{color:var(--ceremony-danger)}
+
+/* Identity rows run the full width so a 42-character address fits one line. */
+.ceremony-identity{margin:0;display:grid;gap:var(--ceremony-space-2)}
+.ceremony-party{display:grid;gap:var(--ceremony-space-1)}
+.ceremony-party-label{margin:0;color:var(--ceremony-muted);font-size:14px}
+.ceremony-party-name{margin:0;font-weight:600}
+.ceremony-balance-change{grid-column:2;grid-row:1;font-weight:600;font-size:22px;line-height:1.3;font-variant-numeric:tabular-nums;text-align:right;overflow-wrap:anywhere}
+.ceremony-balance-change.outgoing{color:var(--ceremony-danger)}
+.ceremony-balance-change.incoming{color:var(--ceremony-success)}
+.ceremony-transfer-path .ceremony-party{grid-template-columns:minmax(0,1fr) auto}
+.ceremony-transfer-path .ceremony-party-address{grid-column:1 / -1;grid-row:3}
+.ceremony-fee{display:flex;align-items:baseline;justify-content:space-between;gap:8px 16px;flex-wrap:wrap;font-size:14px}
+.ceremony-fee-label{color:var(--ceremony-muted)}
+.ceremony-fee-amount{display:inline-flex;align-items:center;gap:6px;color:var(--ceremony-text);font-variant-numeric:tabular-nums}
+.ceremony-fee-amount svg{width:14px;height:14px;flex:none;color:var(--ceremony-muted)}
+.ceremony-party-address{display:flex;align-items:center;gap:var(--ceremony-space-2);margin:0;min-width:0}
+.ceremony-address-link{flex:1 1 auto;min-width:0;color:var(--ceremony-accent-deep);text-decoration:underline;text-decoration-color:var(--ceremony-border);text-underline-offset:4px;overflow-wrap:anywhere}
+.ceremony-address-link:hover{text-decoration-color:currentColor}
+.ceremony-party-address code{flex:1 1 auto;min-width:0;font:var(--ceremony-address-size)/1.5 var(--ceremony-font-mono);overflow-wrap:anywhere;user-select:all}
+.ceremony-asset{display:grid;grid-template-columns:40px minmax(0,1fr) auto;align-items:start;gap:6px 12px;padding:16px;background:var(--ceremony-bg);border:1px solid var(--ceremony-border);border-radius:var(--ceremony-radius)}
+.ceremony-token-icon{width:40px;height:40px;display:grid;place-items:center;border:1px solid var(--ceremony-border);border-radius:50%;background:var(--ceremony-surface);color:var(--ceremony-accent-deep)}
+.ceremony-token-icon svg{width:32px;height:32px}
+.ceremony-token-icon img{width:100%;height:100%;object-fit:contain;border-radius:50%}
+.ceremony-asset-amount{display:flex;flex-direction:column;align-items:flex-end;gap:4px;max-width:260px;overflow-wrap:anywhere}
+.ceremony-amount-label{font-size:12px;color:var(--ceremony-muted)}
+.ceremony-asset-amount strong{font-size:28px;line-height:1.3;letter-spacing:-.03em;font-weight:600;font-variant-numeric:tabular-nums}
+.ceremony-asset-amount.outgoing strong{color:var(--ceremony-danger)}
+.ceremony-asset-amount.permission strong{color:var(--ceremony-accent-deep)}
+.ceremony-asset-identity{display:contents}
+.ceremony-asset-identity .ceremony-party-name{grid-column:2;grid-row:1;font-size:16px;min-width:0;overflow-wrap:anywhere}
+.ceremony-asset-identity .ceremony-party-label{grid-column:2;grid-row:2;font-size:12px}
+.ceremony-asset-identity code{font-size:12px}
+.ceremony-asset-identity .ceremony-party-address{grid-column:2 / -1;grid-row:3;gap:8px;margin-top:0}
+.ceremony-asset>.ceremony-token-icon{grid-column:1;grid-row:1 / span 2}
+.ceremony-asset>.ceremony-asset-amount{grid-column:3;grid-row:1 / span 2;align-self:start}
+.ceremony-transfer-path,.ceremony-permission{padding:0;}
+.ceremony-transfer-path{gap:4px}
+.ceremony-transfer-path .ceremony-party,.ceremony-permission .ceremony-party{align-items:baseline;gap:4px var(--ceremony-space-2)}
+.ceremony-permission .ceremony-party{grid-template-columns:var(--ceremony-label-width) minmax(0,1fr)}
+.ceremony-transfer-path .ceremony-party-address,.ceremony-permission .ceremony-party-address{margin:0}
+.ceremony-permission .ceremony-party-address{grid-column:2}
+.ceremony-permission .ceremony-party-label{grid-column:1;grid-row:1 / span 2}
+.ceremony-permission .ceremony-party-name{grid-column:2}
+.ceremony-transfer-path .ceremony-party-label{grid-column:1;grid-row:1}
+.ceremony-transfer-path .ceremony-party-name{grid-column:1;grid-row:2}
+.ceremony-flow-arrow{display:flex;align-items:center;gap:12px;margin:8px 0;color:var(--ceremony-accent);font-size:24px;line-height:1}
+.ceremony-flow-arrow::after{content:"";flex:1;border-top:1px solid var(--ceremony-border)}
+.ceremony-call-arguments{padding:16px;border:1px solid var(--ceremony-border);border-radius:var(--ceremony-radius)}
+.ceremony-section-title{margin:0 0 8px;font-size:16px;font-weight:600}
+.ceremony-function{display:block;margin-bottom:16px;font:14px/1.5 var(--ceremony-font-mono);overflow-wrap:anywhere}
+.ceremony-call-arguments .facts{grid-template-columns:minmax(100px,1fr) minmax(0,2fr)}
+.ceremony-calldata pre{max-height:160px}
+
+/* One sentence. The rest is a disclosure. */
+.ceremony-assurance{max-width:65ch;margin:0;color:var(--ceremony-muted);font-size:14px}
+.ceremony-warning{margin:0;padding:var(--ceremony-space-2);border-radius:var(--ceremony-radius);background:var(--ceremony-warning-surface);color:var(--ceremony-warning)}
+.ceremony-warning[data-severity="danger"]{background:var(--ceremony-danger-surface);color:var(--ceremony-danger);border-left:3px solid var(--ceremony-danger)}
+.ceremony-warning p{max-width:65ch;margin:0;font-size:15px}
+.ceremony-warning p+p{margin-top:var(--ceremony-space-1)}
+.ceremony-warning-title{font-weight:600}
+.ceremony-card{margin:0;padding-top:var(--ceremony-space-2);border-top:1px solid var(--ceremony-border)}
+.ceremony-card-position{margin:0 0 var(--ceremony-space-1);color:var(--ceremony-muted);font-size:14px}
+.ceremony-card .ceremony-identity{margin-top:var(--ceremony-space-2)}
+.ceremony-card .ceremony-party{grid-template-columns:var(--ceremony-label-width) minmax(0,1fr);align-items:baseline;gap:4px var(--ceremony-space-2)}
+.ceremony-card .ceremony-party-label{grid-column:1;grid-row:1 / span 2}
+.ceremony-card .ceremony-party-name{grid-column:2}
+.ceremony-card .ceremony-party-address{grid-column:2}
+
+/* Sentence-case labels; no column of letter-spaced uppercase. */
+.facts{display:grid;grid-template-columns:var(--ceremony-label-width) minmax(0,1fr);gap:var(--ceremony-space-1) var(--ceremony-space-2);margin:0}
+.facts:empty{display:none}
+.facts dt{color:var(--ceremony-muted)}
+.facts dd{margin:0;overflow-wrap:anywhere}
+.facts code{font:var(--ceremony-address-size)/1.5 var(--ceremony-font-mono)}
+
+details.ceremony-details,details.signed{margin:0}
+details.ceremony-details summary,details.signed summary{cursor:pointer;color:var(--ceremony-accent);font-size:15px}
+details.ceremony-details>*+*,details.signed>*+*{margin-top:var(--ceremony-space-2)}
+.ceremony-evidence{padding-top:var(--ceremony-space-2);border-top:1px solid var(--ceremony-border)}
+details pre{max-height:40vh;margin:0;padding:var(--ceremony-space-2);overflow:auto;border:1px solid var(--ceremony-border);border-radius:8px;font:12px/1.55 var(--ceremony-font-mono);white-space:pre-wrap;overflow-wrap:anywhere}
+
+/* Expiry sits with the controls it constrains. */
+.ceremony-actions{display:flex;flex-wrap:wrap;align-items:center;gap:var(--ceremony-space-2);padding:var(--ceremony-space-3) var(--ceremony-padding);border-top:1px solid var(--ceremony-border)}
+.action-expiry{margin:0;color:var(--ceremony-muted);font-size:14px}
+.action-expiry:empty{display:none}
+.action-buttons{display:flex;flex-wrap:wrap;gap:var(--ceremony-space-1);margin-left:auto}
+button{min-height:44px;padding:10px 20px;border:0;border-radius:8px;background:var(--ceremony-accent);color:var(--ceremony-surface);font:600 15px var(--ceremony-font);cursor:pointer}
+button:hover:not(:disabled){background:var(--ceremony-accent-deep)}
+button:disabled{opacity:.5;cursor:default}
+button.secondary{border:1px solid var(--ceremony-border);background:transparent;color:var(--ceremony-text)}
+:focus-visible{outline:3px solid var(--ceremony-accent);outline-offset:2px}
+
+fieldset{margin:0;padding:var(--ceremony-space-3) var(--ceremony-padding);border:0;border-top:1px solid var(--ceremony-border)}
+legend{padding:0;font-weight:600}
+label{display:grid;gap:var(--ceremony-space-1);margin-top:var(--ceremony-space-2)}
+input,textarea{width:100%;padding:10px 12px;border:1px solid var(--ceremony-border);border-radius:8px;background:var(--ceremony-surface);color:var(--ceremony-text);font:15px/1.5 var(--ceremony-font-mono)}
+textarea{resize:vertical}
+.choice{grid-template-columns:auto 1fr;align-items:start}
+.choice input{width:auto}
+
+.summary{margin:0}
+.warn{margin:0;padding:var(--ceremony-space-2);border-radius:var(--ceremony-radius);background:var(--ceremony-warning-surface);color:var(--ceremony-warning)}
+.expiry.soon{color:var(--ceremony-accent);font-weight:600}
+.expired{color:var(--ceremony-danger);font-weight:600}
+.ok{color:var(--ceremony-success)}
+.result-title{margin:0;font:400 24px var(--ceremony-font-display)}
+.result-actions{display:flex;gap:var(--ceremony-space-1)}
+.words{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:var(--ceremony-space-1);margin:0;padding:0;list-style:none;counter-reset:w}
+.words li{display:flex;gap:var(--ceremony-space-1);align-items:baseline;padding:10px 12px;border:1px solid var(--ceremony-border);border-radius:8px;font:15px var(--ceremony-font-mono)}
+.words li::before{counter-increment:w;content:counter(w);min-width:1.6em;color:var(--ceremony-muted);font-size:13px}
+
+/* Previews are unmistakable and carry no approval controls. */
+.preview-banner{margin:0;padding:10px var(--ceremony-padding);border-bottom:1px solid var(--ceremony-border);border-radius:var(--ceremony-radius) var(--ceremony-radius) 0 0;background:var(--ceremony-bg);color:var(--ceremony-muted);font-size:13px}
+
+@media(max-width:560px){
+  :root{--ceremony-gutter:16px;--ceremony-padding:16px;--ceremony-heading-size:26px}
+  .brand{flex-wrap:wrap}
+  .brand-context{margin-left:auto}
+  .facts{grid-template-columns:1fr;gap:2px 0}
+  .facts dt{padding-top:var(--ceremony-space-1)}
+  .ceremony-party-address{gap:var(--ceremony-space-1)}
+  .ceremony-party-address code{display:block;flex:1 1 0;min-width:0;word-break:break-all;text-wrap:balance}
+  .ceremony-address-link{flex:1 1 0}
+  .ceremony-balance-change{font-size:20px}
+  .ceremony-asset{grid-template-columns:36px minmax(0,1fr);gap:var(--ceremony-space-1);padding:12px}
+  .ceremony-token-icon{width:36px;height:36px}
+  .ceremony-token-icon svg{width:26px;height:26px}
+  .ceremony-asset-amount{grid-column:1 / -1;align-items:flex-start;max-width:none;padding-top:8px}
+  .ceremony-asset>.ceremony-asset-amount{grid-column:2;grid-row:3}
+  .ceremony-asset-identity .ceremony-party-address{grid-column:1 / -1;grid-row:4}
+  .ceremony-transfer-path,.ceremony-permission{padding:0}
+  .ceremony-permission .ceremony-party,.ceremony-card .ceremony-party{display:flex;flex-direction:column;align-items:stretch}
+  .ceremony-call-arguments .facts{grid-template-columns:1fr}
+  .ceremony-flow-arrow{margin-left:0;padding:8px 0}
+  .action-buttons{margin-left:0;width:100%}
+  .action-buttons button{flex:1 1 auto}
+}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
