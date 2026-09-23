@@ -651,6 +651,62 @@ fn local_ceremony_origin() -> String {
     CEREMONY_ORIGIN.to_owned()
 }
 
+/// Decode the released schema-1 projection. Surface identity and credential
+/// authority generation were added after that release; their only valid
+/// predecessor meaning is the compiled localhost identity at generation zero.
+fn decode_stored_browser_session(encoded: &str) -> Result<BrowserSession, serde_json::Error> {
+    let mut value: serde_json::Value = serde_json::from_str(encoded)?;
+    let legacy_surface = serde_json::to_value(bloom_signer_api::legacy_local_surface())
+        .expect("the compiled legacy surface must serialize");
+    if let Some(session) = value.as_object_mut() {
+        if let Some(policy_custody) = session
+            .get_mut("policy_update")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|policy| policy.get_mut("custody"))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            if !policy_custody.contains_key("surface") {
+                policy_custody.insert("surface".to_owned(), legacy_surface.clone());
+            }
+        }
+        if let Some(projection) = session
+            .get_mut("projection")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            if let Some(contribution) = projection
+                .get_mut("signer_contribution")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                if !contribution.contains_key("surface") {
+                    contribution.insert("surface".to_owned(), legacy_surface.clone());
+                }
+                if !contribution.contains_key("credential_authority_generation") {
+                    contribution.insert(
+                        "credential_authority_generation".to_owned(),
+                        serde_json::Value::String("0".to_owned()),
+                    );
+                }
+            }
+            if let Some(challenges) = projection
+                .get_mut("challenges")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for challenge in challenges {
+                    if let Some(binding) = challenge
+                        .get_mut("binding")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        if !binding.contains_key("surface") {
+                            binding.insert("surface".to_owned(), legacy_surface.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    serde_json::from_value(value)
+}
+
 #[derive(Deserialize)]
 struct StoredSessionIndex {
     operation_id: OperationId,
@@ -2824,7 +2880,7 @@ impl CeremonyBroker {
             .is_some_and(|journal| journal.audit_degraded());
 
         for (ceremony_id, operation_id, encoded) in rows {
-            let mut session: BrowserSession = match serde_json::from_str(&encoded) {
+            let mut session = match decode_stored_browser_session(&encoded) {
                 Ok(session) => session,
                 Err(error) => {
                     let decode_error = error.to_string();
@@ -2847,17 +2903,29 @@ impl CeremonyBroker {
                     continue;
                 }
             };
+            let parsed_operation = OperationId::new(operation_id)?;
+            if parsed_operation != session.operation_id
+                || ceremony_id != session.projection.ceremony_id.as_str()
+            {
+                return Err(protocol(
+                    ProtocolErrorCode::MalformedFrame,
+                    "durable ceremony index does not match its signed session",
+                ));
+            }
+            if matches!(
+                session.state,
+                CeremonyState::WalletCommitted | CeremonyState::AwaitingRecoveryAck
+            ) {
+                validate_completion_identity(
+                    session.ceremony_kind,
+                    &session.operation_id,
+                    &session.projection.ceremony_id,
+                    session.terminal_result.as_ref().ok_or_else(not_found)?,
+                )?;
+            }
             let preserve_awaiting = session.state == CeremonyState::AwaitingRecoveryAck
                 && session.expires_at_ms > unix_time_ms();
             if session.auxiliary {
-                if operation_id != session.operation_id.as_str()
-                    || ceremony_id != session.projection.ceremony_id.as_str()
-                {
-                    return Err(protocol(
-                        ProtocolErrorCode::MalformedFrame,
-                        "durable auxiliary ceremony index does not match session",
-                    ));
-                }
                 // Cross-surface source unlock material lives only in Signer
                 // memory. A process restart can never resume that authority.
                 if !is_terminal(session.state) {
@@ -2920,15 +2988,6 @@ impl CeremonyBroker {
                     )?;
                 }
                 self.persist_session(&session)?;
-            }
-            let parsed_operation = OperationId::new(operation_id)?;
-            if parsed_operation != session.operation_id
-                || ceremony_id != session.projection.ceremony_id.as_str()
-            {
-                return Err(protocol(
-                    ProtocolErrorCode::MalformedFrame,
-                    "durable ceremony index does not match its signed session",
-                ));
             }
             self.inner
                 .operations

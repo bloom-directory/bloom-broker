@@ -1048,6 +1048,7 @@ struct MockSigner {
     custody_prepare_events: Option<std::sync::mpsc::Sender<usize>>,
     first_custody_release: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     pending: parking_lot::Mutex<HashSet<OperationId>>,
+    completed_custody: parking_lot::Mutex<Option<(OperationId, CustodyResult)>>,
     reject_completion: bool,
     completion_error: Option<bloom_signer_api::ProtocolErrorCode>,
     sensitive_result: bool,
@@ -1528,6 +1529,7 @@ impl MockSigner {
             custody_prepare_events: None,
             first_custody_release: parking_lot::Mutex::new(None),
             pending: parking_lot::Mutex::new(HashSet::new()),
+            completed_custody: parking_lot::Mutex::new(None),
             reject_completion: false,
             completion_error: None,
             sensitive_result: false,
@@ -1855,6 +1857,17 @@ impl CeremonySigner for MockSigner {
     }
 
     fn cancel(&self, operation_id: &OperationId) -> Result<(), bloom_signer_api::ProtocolError> {
+        if self
+            .completed_custody
+            .lock()
+            .as_ref()
+            .is_some_and(|(completed, _)| completed == operation_id)
+        {
+            return Err(bloom_signer_api::ProtocolError::new(
+                bloom_signer_api::ProtocolErrorCode::OperationIdConflict,
+                "completed ceremonies cannot be cancelled",
+            ));
+        }
         self.cancellations.fetch_add(1, Ordering::SeqCst);
         if self.cancellation_fails.load(Ordering::SeqCst) {
             // The operation stays pending: the Signer still holds the wallet's
@@ -1884,6 +1897,13 @@ impl CeremonySigner for MockSigner {
         &self,
         operation_id: &OperationId,
     ) -> Result<SignerCeremonyStatus, bloom_signer_api::ProtocolError> {
+        if let Some((completed_operation, result)) = self.completed_custody.lock().as_ref() {
+            if completed_operation == operation_id {
+                return Ok(SignerCeremonyStatus::CompletedCustody(Box::new(
+                    result.clone(),
+                )));
+            }
+        }
         Ok(if self.pending.lock().contains(operation_id) {
             SignerCeremonyStatus::Pending
         } else {
@@ -6075,6 +6095,294 @@ fn ac18_populated_ceremony_migration_is_atomic_idempotent_and_retains_source() {
         )
         .unwrap();
     assert_eq!(marker, 0);
+}
+
+#[test]
+fn schema1_release_state_migrates_pending_and_preserves_completed_receipt() {
+    const SCHEMA1_BROKER_COMMIT: &str = "dd2add2b9d41540521d08c77d19fb467a2d8029e";
+    const FIXTURE_SHA256: &str = "27772833a792ddcfb1d1493fa56bd6c7efdd06bcbc2b12edd749aea2dc8bb825";
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("broker-journal.sqlite");
+    let fixture = fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/schema1/broker-journal.sqlite"
+    ))
+    .unwrap();
+    assert_eq!(hex::encode(sha2::Sha256::digest(&fixture)), FIXTURE_SHA256);
+    fs::write(&journal_path, fixture).unwrap();
+
+    let source = rusqlite::Connection::open(&journal_path).unwrap();
+    assert_eq!(
+        source
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        source
+            .query_row("SELECT COUNT(*) FROM policies", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "the {SCHEMA1_BROKER_COMMIT} fixture must remain populated authority state"
+    );
+    let completed_jcs_before: String = source
+        .query_row(
+            "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
+            [operation("e1").as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(source);
+
+    let journal =
+        Arc::new(BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let authority = BrokerAuthority::open(
+        directory.path().join("authority.sqlite"),
+        journal.clone(),
+        BTreeMap::new(),
+        Token::new("installer-key").unwrap(),
+        SigningKey::from_bytes(&[5; 32]).verifying_key(),
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]).verifying_key(),
+        Token::new("signer-revocation-key").unwrap(),
+        SigningKey::from_bytes(&[4; 32]).verifying_key(),
+        AssuranceRegistry::compiled(Vec::new()).unwrap(),
+    )
+    .unwrap();
+    let policy = authority
+        .policy_snapshot(&Token::new("quiet-lilac").unwrap())
+        .expect("current startup must preserve schema-1 authority state");
+    assert_eq!(policy.wallet_id.as_str(), "quiet-lilac");
+
+    let pending_operation = operation("31");
+    let completed_operation = operation("e1");
+    let signer = Arc::new(MockSigner::new());
+    signer.pending.lock().insert(pending_operation.clone());
+    let migrated = CeremonyBroker::open(
+        directory.path().join("ceremony.sqlite"),
+        signer.clone(),
+        journal.clone(),
+    )
+    .unwrap();
+    assert_eq!(signer.cancellations.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        migrated.status(&pending_operation),
+        Some(CeremonyState::Expired),
+        "a schema-1 pending operation must be invalidated during current startup"
+    );
+    assert!(
+        migrated
+            .public_status(&pending_operation)
+            .unwrap()
+            .ceremony_url
+            .is_none(),
+        "migration must not revive the old browser capability"
+    );
+    assert!(matches!(
+        try_prepare(
+            &migrated,
+            pending_operation.clone(),
+            Some(Token::new("schema1-pending-wallet").unwrap()),
+            60_000,
+        )
+        .unwrap_err()
+        .code,
+        ProtocolErrorCode::CeremonyReplay | ProtocolErrorCode::OperationIdConflict
+    ));
+    assert_eq!(
+        migrated.status(&completed_operation),
+        Some(CeremonyState::Completed)
+    );
+    let receipt_digest = migrated
+        .public_status(&completed_operation)
+        .unwrap()
+        .receipt_digest
+        .expect("schema-1 completed receipt digest must survive migration");
+    drop(migrated);
+
+    let reopened = CeremonyBroker::open(
+        directory.path().join("ceremony.sqlite"),
+        Arc::new(MockSigner::new()),
+        journal,
+    )
+    .unwrap();
+    assert_eq!(
+        reopened
+            .public_status(&completed_operation)
+            .unwrap()
+            .receipt_digest,
+        Some(receipt_digest),
+        "receipt identity must remain stable after the migrated store reopens"
+    );
+    let migrated_store = rusqlite::Connection::open(&journal_path).unwrap();
+    assert_eq!(
+        migrated_store
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        2
+    );
+    let completed_jcs_after: String = migrated_store
+        .query_row(
+            "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
+            [completed_operation.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        completed_jcs_after, completed_jcs_before,
+        "migration must retain the exact signed completed projection"
+    );
+}
+
+#[test]
+fn schema1_receipt_reconciliation_preserves_committed_and_awaiting_delivery() {
+    let completed_operation = operation("e1");
+    let fixture = fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/schema1/broker-journal.sqlite"
+    ))
+    .unwrap();
+    let prepare = |state: &str, expires_at_ms: Option<u64>| {
+        let directory = tempfile::tempdir().unwrap();
+        let journal_path = directory.path().join("broker-journal.sqlite");
+        fs::write(&journal_path, &fixture).unwrap();
+        let database = rusqlite::Connection::open(&journal_path).unwrap();
+        let completed_jcs: String = database
+            .query_row(
+                "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
+                [completed_operation.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let completed_value: serde_json::Value = serde_json::from_str(&completed_jcs).unwrap();
+        assert!(completed_value["projection"]["signer_contribution"]["surface"].is_null());
+        let receipt_value = completed_value["terminal_result"].clone();
+        let receipt: CustodyResult = serde_json::from_value(receipt_value.clone()).unwrap();
+        database
+            .execute(
+                "UPDATE ceremony_sessions
+                 SET session_jcs=json_set(session_jcs, '$.state', ?1, '$.terminal_at_ms', NULL)
+                 WHERE operation_id=?2",
+                [state, completed_operation.as_str()],
+            )
+            .unwrap();
+        if let Some(expires_at_ms) = expires_at_ms {
+            database
+                .execute(
+                    "UPDATE ceremony_sessions
+                     SET session_jcs=json_set(session_jcs, '$.expires_at_ms', ?1)
+                     WHERE operation_id=?2",
+                    rusqlite::params![expires_at_ms as i64, completed_operation.as_str()],
+                )
+                .unwrap();
+        }
+        drop(database);
+        (directory, journal_path, receipt_value, receipt)
+    };
+
+    let (commit_directory, commit_path, receipt_value, receipt) = prepare("VERIFYING", None);
+    let journal =
+        Arc::new(BrokerJournal::open(&commit_path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let signer = Arc::new(MockSigner::new());
+    *signer.completed_custody.lock() = Some((completed_operation.clone(), receipt));
+    let committed = CeremonyBroker::open(
+        commit_directory.path().join("ceremony.sqlite"),
+        signer.clone(),
+        journal,
+    )
+    .unwrap();
+    assert_eq!(signer.cancellations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        committed.status(&completed_operation),
+        Some(CeremonyState::WalletCommitted),
+        "a Signer receipt committed before Broker persistence must be recovered"
+    );
+    drop(committed);
+
+    let committed_store = rusqlite::Connection::open(&commit_path).unwrap();
+    let committed_jcs: String = committed_store
+        .query_row(
+            "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
+            [completed_operation.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&committed_jcs).unwrap()["terminal_result"],
+        receipt_value,
+        "reconciliation must retain the exact schema-1 receipt"
+    );
+    drop(committed_store);
+
+    let (wallet_directory, wallet_path, wallet_receipt_value, wallet_receipt) =
+        prepare("WALLET_COMMITTED", None);
+    let wallet_journal =
+        Arc::new(BrokerJournal::open(&wallet_path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let wallet_signer = Arc::new(MockSigner::new());
+    *wallet_signer.completed_custody.lock() = Some((completed_operation.clone(), wallet_receipt));
+    let wallet = CeremonyBroker::open(
+        wallet_directory.path().join("ceremony.sqlite"),
+        wallet_signer.clone(),
+        wallet_journal,
+    )
+    .unwrap();
+    assert_eq!(wallet_signer.cancellations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        wallet.status(&completed_operation),
+        Some(CeremonyState::WalletCommitted)
+    );
+    let wallet_jcs: String = rusqlite::Connection::open(&wallet_path)
+        .unwrap()
+        .query_row(
+            "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
+            [completed_operation.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&wallet_jcs).unwrap()["terminal_result"],
+        wallet_receipt_value
+    );
+
+    let (awaiting_directory, awaiting_path, awaiting_receipt_value, awaiting_receipt) =
+        prepare("AWAITING_RECOVERY_ACK", Some(9_999_999_999_999));
+    let awaiting_journal =
+        Arc::new(BrokerJournal::open(&awaiting_path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let awaiting_signer = Arc::new(MockSigner::new());
+    *awaiting_signer.completed_custody.lock() =
+        Some((completed_operation.clone(), awaiting_receipt));
+    let awaiting = CeremonyBroker::open(
+        awaiting_directory.path().join("ceremony.sqlite"),
+        awaiting_signer.clone(),
+        awaiting_journal,
+    )
+    .unwrap();
+    assert_eq!(awaiting_signer.cancellations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        awaiting.status(&completed_operation),
+        Some(CeremonyState::AwaitingRecoveryAck),
+        "an undelivered schema-1 receipt must remain available after startup"
+    );
+    assert!(
+        awaiting
+            .public_status(&completed_operation)
+            .unwrap()
+            .receipt_digest
+            .is_some()
+    );
+    let awaiting_jcs: String = rusqlite::Connection::open(&awaiting_path)
+        .unwrap()
+        .query_row(
+            "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
+            [completed_operation.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&awaiting_jcs).unwrap()["terminal_result"],
+        awaiting_receipt_value
+    );
 }
 
 #[test]
