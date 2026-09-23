@@ -701,6 +701,8 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
     for required in [
         "href=\"/assets/style.css\"",
         "href=\"/assets/bloom-primary.svg\"",
+        // Paint under the Dynamic Island and home indicator; .page insets content.
+        "viewport-fit=cover",
         "src=\"/assets/bloom-primary.svg\"",
         "Signed wallet review",
         "Review before continuing",
@@ -725,6 +727,10 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
     for required in [
         "--paper:#f4efe6",
         ".layout{display:grid",
+        "env(safe-area-inset-top,0px)",
+        "env(safe-area-inset-right,0px)",
+        "env(safe-area-inset-bottom,0px)",
+        "env(safe-area-inset-left,0px)",
         "@media(max-width:560px)",
     ] {
         assert!(
