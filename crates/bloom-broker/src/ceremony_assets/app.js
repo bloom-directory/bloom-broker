@@ -954,6 +954,14 @@ function renderReview(session) {
   let advisory = [];
   if (kind === "sealed_approval") {
     advisory = session.review_manifest?.attributed_advisory_items || [];
+    // A claim's declared destination is not necessarily a recipient: a swap
+    // declares the protocol program it routes through, and the assets come
+    // back to the signer. When the app has described the operation itself,
+    // stop asserting a transfer shape the claim does not establish, and let
+    // its description say what happens. The facts below are unchanged.
+    if (advisory.length && transfer) {
+      summaryHtml = `Approve one operation on ${escapeHtml(transfer.facts.find(([label]) => label === "Network")?.[1] || "this network")}, as described below.`;
+    }
     // Proof verification occurs during authorization, after this review.
     // Never suppress the plan's present-tense disclosure merely because the
     // Machine requested proof verification for the later signing step.

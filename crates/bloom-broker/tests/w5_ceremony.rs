@@ -4813,6 +4813,118 @@ async fn legacy_passkey_prepare_renders_only_digest_bound_public_migration_terms
     );
 }
 
+/// The session projection a browser would fetch for a Pump.fun trade,
+/// produced by the real Broker from a real Petal claim and a real advisory,
+/// and written out when `BLOOM_CEREMONY_PROJECTION_OUT` names a path.
+///
+/// The page render itself is not a Rust test; `scripts/ceremony-review-render.mjs`
+/// loads these bytes in Chromium and asserts what the owner actually sees.
+#[tokio::test]
+async fn a_pumpfun_trade_projection_carries_its_review_to_the_page() {
+    let signer = Arc::new(MockSigner::new());
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        signer,
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[37; 32]),
+    );
+
+    let mut request = approval_request();
+    request.terms.wallet_id = Token::new("main").unwrap();
+    let claim = PetalUseClaim {
+        package_hash: digest("bb"),
+        route: "r000004".into(),
+        operation_class: Token::new("pumpfun.buy").unwrap(),
+        crypto_suite: bloom_broker_api::CryptoSuite::Ed25519Message,
+        payload_digest: digest("12"),
+        ordered_hashes: vec![digest("13")],
+        // 0.001 SOL of trade plus the associated-token rent allowance.
+        declared_debits: vec![bloom_broker_api::DeclaredDebit {
+            asset: bloom_broker_api::AssetId {
+                chain: Token::new("solana").unwrap(),
+                asset: "native".into(),
+            },
+            amount: bloom_broker_api::DecimalU256::parse("3100000").unwrap(),
+        }],
+        declared_destinations: vec![bloom_broker_api::DeclaredDestination {
+            chain: Token::new("solana").unwrap(),
+            destination: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P".into(),
+        }],
+        declared_fee: bloom_broker_api::DeclaredFee::Fee {
+            chain: Token::new("solana").unwrap(),
+            asset: "native".into(),
+            amount: bloom_broker_api::DecimalU256::parse("5000").unwrap(),
+        },
+        nonce: RequestNonce::new("2a".repeat(16)).unwrap(),
+        claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+    };
+    let items = vec![
+        "Buy on Pump.fun".to_owned(),
+        "Trading account: FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF".to_owned(),
+        "Token: C8CMvu8FXZruHrNjFaixaDJjiveG6gKmUvT5BrK5pump".to_owned(),
+        "Maximum spent on the trade: 0.00102 SOL".to_owned(),
+        "Guaranteed minimum received: 41900000 raw units of C8CMvu8FXZruHrNjFaixaDJjiveG6gKmUvT5BrK5pump".to_owned(),
+        "Estimated network fee: 0.000005 SOL (a cap, charged as used)".to_owned(),
+        "Rent for 1 new token account(s), up to 0.0021 SOL; recoverable by closing them while empty".to_owned(),
+        "Most this can cost in total: 0.003125 SOL".to_owned(),
+    ];
+    let attribution =
+        "The app describes this operation as follows. Bloom has not checked these statements."
+            .to_owned();
+    let response = broker
+        .prepare_approval(
+            request,
+            ReviewManifestContext {
+                petal_use_claim: Some(claim.clone()),
+                claim_assurance: Some(claim.claim_assurance.clone()),
+                attributed_advisory_items: std::iter::once(attribution.clone())
+                    .chain(items.clone())
+                    .collect(),
+                ..ReviewManifestContext::default()
+            },
+            now_ms,
+        )
+        .unwrap();
+
+    let token = url_token(&response.ceremony_url);
+    let session = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = session.into_body().collect().await.unwrap().to_bytes();
+    let projection: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    let carried = projection["review_manifest"]["attributed_advisory_items"]
+        .as_array()
+        .expect("advisory items");
+    assert_eq!(carried[0], serde_json::json!(attribution));
+    assert_eq!(carried.len(), items.len() + 1);
+    assert!(
+        carried.iter().any(|item| item
+            .as_str()
+            .is_some_and(|item| item.starts_with("Guaranteed minimum received:"))),
+        "the floor must survive to the projection: {carried:?}"
+    );
+
+    if let Ok(path) = std::env::var("BLOOM_CEREMONY_PROJECTION_OUT") {
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(format!("{path}.token"), token).unwrap();
+    }
+}
+
 #[tokio::test]
 async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
     let signer = Arc::new(MockSigner::new());
