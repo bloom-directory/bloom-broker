@@ -211,11 +211,36 @@ impl BrokerRpcService {
                 self.authority
                     .revoke_local_approval(&request.approval_id)
                     .map_err(authority_error)?;
-                self.signer
+                match self
+                    .signer
                     .request_for_machine(BrokerSignerRequest::SealedApprovalRevoke(
                         translate_revocation::revoke_request_to_signer(request.clone()),
                     ))
-                    .await?;
+                    .await
+                {
+                    Ok(_) => {}
+                    // Signer learns of an approval when a ceremony activates
+                    // it, so one it has never seen is one no owner completed.
+                    // The local revoke above already happened, and it is what
+                    // stops a later activation, so this answer leaves the
+                    // approval revoked either way and the ceremony below still
+                    // has to end. `revoke_for_key` reads it the same way.
+                    //
+                    // It says nothing more than that. It is not evidence that
+                    // nothing signed, and nothing here treats it as such: a
+                    // caller that needs to know whether a signature exists asks
+                    // about the signing operation, which Signer's view of the
+                    // approval does not answer.
+                    Err(error) if error.code == ProtocolErrorCode::ApprovalNotFound => {}
+                    Err(error) => return Err(error),
+                }
+                // The revoked approval can never activate, so its ceremony is
+                // waiting on nobody. A wallet holds one live ceremony, so
+                // leaving it to expire blocks whatever the caller revoked it
+                // in order to do next. Idempotent: a replayed revoke finds no
+                // live ceremony and does nothing.
+                self.ceremony
+                    .end_approval_ceremonies(&request.approval_id, self.clock.now_ms(false)?)?;
                 Ok(Response::SealedApprovalRevoke(
                     self.approval_public_status(&request.approval_id)?,
                 ))

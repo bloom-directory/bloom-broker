@@ -4389,6 +4389,51 @@ async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
     );
 }
 
+/// An approval whose caller gave it up — a trade whose blockhash expired
+/// before the owner answered — leaves a live ceremony behind. A wallet holds
+/// one live ceremony, so until it expires the rebuilt trade cannot be offered
+/// at all. Ending it with the approval frees the wallet at once, and records
+/// no cancellation backoff: the owner did not walk away from this ceremony.
+#[tokio::test]
+async fn ending_an_abandoned_approvals_ceremony_frees_the_wallet_at_once() {
+    let signer = Arc::new(MockSigner::new());
+    let now_ms: u64 = 1_700_000_000_000;
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        signer.clone(),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[35; 32]),
+    );
+    let abandoned = broker
+        .prepare_approval(approval_request(), ReviewManifestContext::default(), now_ms)
+        .unwrap();
+    let mut rebuilt = approval_request();
+    rebuilt.activation_operation_id = operation("27");
+    rebuilt.terms.request_nonce = RequestNonce::new("26".repeat(16)).unwrap();
+    assert_eq!(
+        broker
+            .prepare_approval(rebuilt.clone(), ReviewManifestContext::default(), now_ms)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::QuotaExceeded,
+        "fixture: the abandoned approval's live ceremony blocks the rebuilt one"
+    );
+
+    broker
+        .end_approval_ceremonies(&abandoned.approval_id, now_ms + 1)
+        .unwrap();
+    assert!(
+        broker
+            .pending_approval_ceremony(&abandoned.approval_id, now_ms + 1)
+            .unwrap()
+            .is_none(),
+        "the ended ceremony offers the owner no URL"
+    );
+    assert_eq!(signer.cancellations.load(Ordering::SeqCst), 1);
+    broker
+        .prepare_approval(rebuilt, ReviewManifestContext::default(), now_ms + 2)
+        .expect("the rebuilt trade opens its ceremony at once, with no cancellation backoff");
+}
+
 #[tokio::test]
 async fn cancelling_a_ceremony_that_already_died_succeeds_instead_of_stranding_the_caller() {
     let signer = Arc::new(MockSigner::new());

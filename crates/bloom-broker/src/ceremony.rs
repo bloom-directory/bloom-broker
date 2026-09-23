@@ -1074,6 +1074,58 @@ impl CeremonyBroker {
         }))
     }
 
+    /// End every live ceremony for an approval that can no longer complete,
+    /// such as one its caller has revoked. A wallet holds one live ceremony at
+    /// a time, so leaving it until it expires blocks the wallet's next
+    /// approval. Not an owner cancellation: no backoff is recorded, because
+    /// the owner did not walk away from this ceremony.
+    pub fn end_approval_ceremonies(
+        &self,
+        approval_id: &Digest32,
+        now_ms: u64,
+    ) -> Result<(), ProtocolError> {
+        let live = self
+            .inner
+            .sessions
+            .lock()
+            .iter()
+            .filter(|(_, session)| {
+                session.ceremony_kind == CeremonyKind::SealedApproval
+                    && session.state == CeremonyState::AwaitingUser
+                    && session
+                        .projection
+                        .review_manifest
+                        .as_ref()
+                        .and_then(|manifest| manifest.get("approval_id"))
+                        .and_then(|value| value.as_str())
+                        == Some(approval_id.as_str())
+            })
+            .map(|(id, session)| (id.clone(), session.operation_id.clone()))
+            .collect::<Vec<_>>();
+        for (ceremony_id, operation_id) in live {
+            self.inner
+                .signer
+                .cancel(&operation_id)
+                .map_err(signer_error_to_machine)?;
+            let snapshot = {
+                let sessions = self.inner.sessions.lock();
+                let Some(session) = sessions.get(&ceremony_id) else {
+                    continue;
+                };
+                if session.state != CeremonyState::AwaitingUser {
+                    continue;
+                }
+                let mut snapshot = session.clone();
+                snapshot.state = CeremonyState::Cancelled;
+                latch_terminal(&mut snapshot, now_ms);
+                snapshot
+            };
+            self.persist_session(&snapshot)?;
+            self.inner.sessions.lock().insert(ceremony_id, snapshot);
+        }
+        Ok(())
+    }
+
     /// True when every owner ceremony minted for this approval died without
     /// activating it. No URL exists for the owner and none can appear, so a
     /// caller waiting on this approval is waiting on nothing.
