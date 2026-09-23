@@ -1884,6 +1884,18 @@ impl CeremonyBroker {
         })
     }
 
+    /// Public status as of `now_ms`. Status requests are a lifecycle boundary
+    /// just like opening the browser: sweep first so an elapsed AwaitingUser
+    /// session is reported as expired rather than as still awaiting the user.
+    pub fn current_public_status(
+        &self,
+        operation_id: &OperationId,
+        now_ms: u64,
+    ) -> Result<BrokerCeremonyPublicStatus, ProtocolError> {
+        self.expire_sessions(now_ms)?;
+        self.public_status(operation_id)
+    }
+
     /// Return the owner-visible URL for an approval ceremony while it is
     /// awaiting the user. Approval status is keyed by the approval digest,
     /// whereas the ceremony store is keyed by activation operation ID, so the

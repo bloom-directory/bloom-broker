@@ -721,7 +721,8 @@ impl BrokerRpcService {
             Request::CeremonyStatus(request) => {
                 let operation_id = OperationId::new(request.id.as_str().to_owned())?;
                 Ok(Response::CeremonyStatus(
-                    self.ceremony.public_status(&operation_id)?,
+                    self.ceremony
+                        .current_public_status(&operation_id, self.clock.now_ms(false)?)?,
                 ))
             }
             Request::CeremonyCancel(request) => {

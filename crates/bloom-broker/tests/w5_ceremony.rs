@@ -7054,6 +7054,27 @@ fn automatic_expiry_does_not_impose_cancellation_backoff() {
 }
 
 #[test]
+fn status_sweeps_an_elapsed_ceremony_before_reporting_it() {
+    let signer = Arc::new(MockSigner::new());
+    let broker = CeremonyBroker::new(signer);
+    let wallet = Token::new("wallet-status-expiry").unwrap();
+    prepare(&broker, operation("e1"), Some(wallet), 10_000);
+
+    let live = broker
+        .current_public_status(&operation("e1"), 10_001)
+        .unwrap();
+    assert_eq!(live.state, CeremonyState::AwaitingUser);
+    assert!(live.ceremony_url.is_some());
+
+    // Nobody opened the page, so only the status request can observe expiry.
+    let elapsed = broker
+        .current_public_status(&operation("e1"), live.expires_at_ms.get() + 1)
+        .unwrap();
+    assert_eq!(elapsed.state, CeremonyState::Expired);
+    assert!(elapsed.ceremony_url.is_none());
+}
+
+#[test]
 fn requested_wallet_ids_still_count_as_new_registration_attempts() {
     let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
     let engine = Arc::new(
