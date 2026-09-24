@@ -2304,6 +2304,74 @@ impl BrokerAuthority {
         self.authorize_for_clock_profile(input, true)
     }
 
+    /// The operation digest a signing request describes, computed from its
+    /// own contents: id, approval, key, suite, exact payloads, claim and
+    /// assurance, and the approval's policy snapshot. `None` when the request
+    /// names no known approval or its provenance does not match that
+    /// approval's subject. Used only to match a retry to a completed
+    /// operation; it authorizes nothing.
+    pub fn request_operation_digest(
+        &self,
+        request: &MachineSignRequest,
+    ) -> Result<Option<Digest32>, AuthorityError> {
+        let Some(terms) = self.approval_terms(&request.approval_id)? else {
+            return Ok(None);
+        };
+        let subject_matches = match (&terms.selector, &terms.subject, &request.provenance) {
+            (
+                ApprovalSelector::Petal { route_grants, .. },
+                ApprovalSubject::Petal { package_hash, .. },
+                ProvenanceSubject::Petal {
+                    package_hash: requested_hash,
+                    route,
+                },
+            ) if !route_grants.is_empty() => {
+                package_hash == requested_hash
+                    && route_grants.iter().any(|grant| &grant.route == route)
+            }
+            (_, subject, provenance) => provenance_subject_matches(subject, provenance),
+        };
+        if !subject_matches {
+            return Ok(None);
+        }
+        let payloads = payload_bytes(&request.payloads);
+        let claim_digest = request
+            .petal_use_claim
+            .as_ref()
+            .map(jcs_digest)
+            .transpose()?
+            .or(request
+                .system_use_claim
+                .as_ref()
+                .map(jcs_digest)
+                .transpose()?);
+        let claim_assurance_digest = match (&request.petal_use_claim, &request.system_use_claim) {
+            (Some(claim), None) => Some(jcs_digest(&claim.claim_assurance)?),
+            (None, Some(claim)) => Some(jcs_digest(&claim.claim_assurance)?),
+            _ => None,
+        };
+        MachineSignOperationIdentity {
+            operation_id: request.operation_id.clone(),
+            approval_id: request.approval_id.clone(),
+            key_ref: request.key_ref.clone(),
+            crypto_suite: request.crypto_suite,
+            ordered_payload_digests: payloads
+                .iter()
+                .map(|payload| Digest32::from_bytes(Sha256::digest(payload).into()))
+                .collect(),
+            ordered_hashes: payloads
+                .iter()
+                .map(|payload| suite_hash(request.crypto_suite, payload))
+                .collect(),
+            petal_use_claim_digest: claim_digest,
+            claim_assurance_digest,
+            policy_version: terms.policy_version.clone(),
+            policy_digest: terms.policy_digest.clone(),
+        }
+        .digest()
+        .map(Some)
+    }
+
     pub fn authorize_for_clock_profile(
         &self,
         input: &AuthorizationInput,
