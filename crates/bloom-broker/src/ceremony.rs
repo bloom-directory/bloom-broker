@@ -63,8 +63,13 @@ pub const CEREMONY_ADDR_V6: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LO
 /// A listener on any address outside this set is refused at acquisition.
 pub const CEREMONY_LOOPBACK_ADDRS: [SocketAddr; 2] = [CEREMONY_ADDR_V4, CEREMONY_ADDR_V6];
 pub const CEREMONY_ORIGIN: &str = "http://localhost:18734";
-pub const REMOTE_CEREMONY_UPSTREAM: SocketAddr =
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_735);
+/// Compiled default loopback port for the hosted-relay upstream. Used when
+/// the protected configuration omits `remote_upstream_port`.
+pub const DEFAULT_REMOTE_UPSTREAM_PORT: u16 = 18_735;
+pub const REMOTE_CEREMONY_UPSTREAM: SocketAddr = SocketAddr::new(
+    IpAddr::V4(Ipv4Addr::LOCALHOST),
+    DEFAULT_REMOTE_UPSTREAM_PORT,
+);
 /// Compiled default ceremony port. Used when the protected configuration
 /// omits `ceremony_port`.
 pub const DEFAULT_CEREMONY_PORT: u16 = 18_734;
@@ -74,6 +79,8 @@ pub const DEFAULT_CEREMONY_PORT: u16 = 18_734;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CeremonyEndpoint {
     port: u16,
+    /// Loopback port where the relay tunnel delivers hosted-surface streams.
+    remote_upstream_port: u16,
 }
 
 impl CeremonyEndpoint {
@@ -86,17 +93,53 @@ impl CeremonyEndpoint {
                 "ceremony_port must be between 1 and 65535; correct it in the Broker configuration file",
             ));
         }
-        Ok(Self { port })
+        Ok(Self {
+            port,
+            remote_upstream_port: DEFAULT_REMOTE_UPSTREAM_PORT,
+        })
     }
 
     pub fn default_endpoint() -> Self {
         Self {
             port: DEFAULT_CEREMONY_PORT,
+            remote_upstream_port: DEFAULT_REMOTE_UPSTREAM_PORT,
         }
+    }
+
+    /// Use a configured relay upstream port. Accepts 1 through 65535 in every
+    /// build and rejects the ceremony port itself, so the two loopback
+    /// listeners can never contend for one address.
+    pub fn with_remote_upstream_port(self, port: u16) -> Result<Self, ProtocolError> {
+        if port == 0 {
+            return Err(protocol(
+                ProtocolErrorCode::MalformedFrame,
+                "remote_upstream_port must be between 1 and 65535; correct it in the Broker configuration file",
+            ));
+        }
+        if port == self.port {
+            return Err(protocol(
+                ProtocolErrorCode::MalformedFrame,
+                "remote_upstream_port must differ from ceremony_port; correct it in the Broker configuration file",
+            ));
+        }
+        Ok(Self {
+            remote_upstream_port: port,
+            ..self
+        })
     }
 
     pub fn port(self) -> u16 {
         self.port
+    }
+
+    pub fn remote_upstream_port(self) -> u16 {
+        self.remote_upstream_port
+    }
+
+    /// IPv4 loopback address the hosted-surface listener binds and the relay
+    /// tunnel forwards to.
+    pub fn remote_upstream_addr(self) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.remote_upstream_port)
     }
 
     pub fn addr_v4(self) -> SocketAddr {
@@ -2361,12 +2404,13 @@ impl CeremonyBroker {
                     format!("remote TLS material invalid: {error}"),
                 )
             })?;
-        let listener = StdTcpListener::bind(REMOTE_CEREMONY_UPSTREAM).map_err(|error| {
-            protocol(
-                ProtocolErrorCode::ServiceUnavailable,
-                format!("remote ceremony listener unavailable: {error}"),
-            )
-        })?;
+        let listener =
+            StdTcpListener::bind(self.inner.endpoint.remote_upstream_addr()).map_err(|error| {
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!("remote ceremony listener unavailable: {error}"),
+                )
+            })?;
         listener.set_nonblocking(true).map_err(|error| {
             protocol(
                 ProtocolErrorCode::ServiceUnavailable,

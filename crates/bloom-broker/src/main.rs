@@ -19,7 +19,9 @@ use bloom_audit_checkpoint::{
 use bloom_broker::{
     assurance_verifiers::SolanaSystemTransferVerifier,
     authority::{AssuranceRegistry, BrokerAuthority},
-    ceremony::{CeremonyBroker, CeremonyEndpoint, DEFAULT_CEREMONY_PORT},
+    ceremony::{
+        CeremonyBroker, CeremonyEndpoint, DEFAULT_CEREMONY_PORT, DEFAULT_REMOTE_UPSTREAM_PORT,
+    },
     clock::BrokerClock,
     journal::{AuditSigner, BrokerJournal},
     service::BrokerRpcService,
@@ -95,6 +97,12 @@ struct BrokerConfig {
     ceremony_limits: Option<serde_json::Value>,
     #[serde(default)]
     ceremony_port: Option<u16>,
+    /// Optional loopback port for the hosted-relay upstream, so a second
+    /// development Triad can serve a relay surface beside the installed one.
+    /// Missing keeps the default 18735; an explicit integer 1 through 65535
+    /// that differs from the ceremony port is validated before listeners open.
+    #[serde(default)]
+    remote_upstream_port: Option<u16>,
     network_containment: Option<NetworkContainmentConfig>,
     maximum_connections: usize,
     maximum_in_flight_mutations: usize,
@@ -438,18 +446,28 @@ async fn run_with_paths(
             maximum_anonymous_registrations = ceremony_limits.maximum_anonymous_registrations(),
             "Broker ceremony admission limits configured"
         );
-        let ceremony_endpoint = CeremonyEndpoint::new(
-            config.ceremony_port.unwrap_or(DEFAULT_CEREMONY_PORT),
-        )
-        .map_err(|error| {
-            Box::<dyn std::error::Error>::from(format!(
-                "Broker ceremony_port configuration is invalid: {error}"
-            ))
-        })?;
+        let ceremony_endpoint =
+            CeremonyEndpoint::new(config.ceremony_port.unwrap_or(DEFAULT_CEREMONY_PORT))
+                .map_err(|error| {
+                    Box::<dyn std::error::Error>::from(format!(
+                        "Broker ceremony_port configuration is invalid: {error}"
+                    ))
+                })?
+                .with_remote_upstream_port(
+                    config
+                        .remote_upstream_port
+                        .unwrap_or(DEFAULT_REMOTE_UPSTREAM_PORT),
+                )
+                .map_err(|error| {
+                    Box::<dyn std::error::Error>::from(format!(
+                        "Broker remote_upstream_port configuration is invalid: {error}"
+                    ))
+                })?;
         tracing::info!(
             event = "broker.ceremony_endpoint_configured",
             ceremony_port = ceremony_endpoint.port(),
             ceremony_origin = ceremony_endpoint.origin(),
+            remote_upstream_port = ceremony_endpoint.remote_upstream_port(),
             "Broker ceremony endpoint configured"
         );
         // Own the configured origin before opening or mutating any durable Broker
@@ -1018,7 +1036,7 @@ impl RemoteRuntime {
                 credential_path: config.tunnel_credential_path.clone(),
                 tls: Arc::new(tls_config),
             },
-            bloom_broker::ceremony::REMOTE_CEREMONY_UPSTREAM,
+            ceremony.endpoint().remote_upstream_addr(),
         )
         .map_err(std::io::Error::other)?;
         let (stop, stop_rx) = watch::channel(false);

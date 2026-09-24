@@ -5829,9 +5829,35 @@ fn ceremony_endpoint_formats_host_origin_and_urls_without_sockets() {
     assert_eq!(port80.origin(), "http://localhost");
     assert!(CeremonyEndpoint::new(0).is_err());
     assert_eq!(CeremonyEndpoint::new(28_735).unwrap().port(), 28_735);
+    // The hosted-relay upstream defaults to the installed port and moves with
+    // configuration, so a second Triad can serve a relay surface beside it.
+    assert_eq!(default.remote_upstream_port(), 18_735);
+    assert_eq!(
+        default.remote_upstream_addr(),
+        "127.0.0.1:18735".parse().unwrap()
+    );
+    let candidate = CeremonyEndpoint::new(28_735)
+        .unwrap()
+        .with_remote_upstream_port(38_735)
+        .unwrap();
+    assert_eq!(candidate.remote_upstream_port(), 38_735);
+    assert_eq!(
+        candidate.remote_upstream_addr(),
+        "127.0.0.1:38735".parse().unwrap()
+    );
+    assert_eq!(candidate.origin(), "http://localhost:28735");
+    assert!(default.with_remote_upstream_port(0).is_err());
+    assert!(
+        CeremonyEndpoint::new(28_735)
+            .unwrap()
+            .with_remote_upstream_port(28_735)
+            .is_err(),
+        "the relay upstream must never share the ceremony port"
+    );
     // Out-of-range JSON values never reach the endpoint: the protected
-    // config declares `ceremony_port` as `Option<u16>`, so serde rejects
-    // non-integers and values above 65535 while parsing.
+    // config declares `ceremony_port` and `remote_upstream_port` as
+    // `Option<u16>`, so serde rejects non-integers and values above 65535
+    // while parsing.
 }
 
 #[test]
