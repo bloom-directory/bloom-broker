@@ -1217,17 +1217,17 @@ impl CeremonyBroker {
         }))
     }
 
-    /// End every live ceremony for an approval that can no longer complete,
-    /// such as one its caller has revoked. A wallet holds one live ceremony at
-    /// a time, so leaving it until it expires blocks the wallet's next
-    /// approval. Not an owner cancellation: no backoff is recorded, because
-    /// the owner did not walk away from this ceremony.
-    /// End any live ceremony waiting on an approval that has just been
-    /// revoked. Never fails the caller: by the time this runs the revoke has
-    /// already happened, locally and at the Signer, and reporting an error
-    /// would tell the caller the approval is still live when it is not.
-    /// Machine reads a failed revoke as "outcome unknown" and refuses to
-    /// replace the attempt, so a clock fault here would wedge it permanently.
+    /// End every live ceremony waiting on an approval that can no longer
+    /// complete, such as one its caller has revoked. A wallet holds one live
+    /// ceremony at a time, so leaving it until it expires blocks the wallet's
+    /// next approval. Not an owner cancellation: no backoff is recorded,
+    /// because the owner did not walk away from this ceremony.
+    ///
+    /// Never fails the caller: by the time this runs the revoke has already
+    /// happened, locally and at the Signer, and reporting an error would tell
+    /// the caller the approval is still live when it is not. Machine reads a
+    /// failed revoke as "outcome unknown" and refuses to replace the attempt,
+    /// so a clock fault here would wedge it permanently.
     pub fn end_approval_ceremonies_best_effort(&self, approval_id: &Digest32) {
         // Wall time, like the other self-driven sweeps in this module. The
         // trusted clock is the right source for anything an owner approves;
