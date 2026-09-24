@@ -15,8 +15,8 @@ license = "MIT"
 
 [workspace.dependencies]
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "2ea4a8c49636bcfbc482033b8923cd4e364c6b13" }
-bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "2ea4a8c49636bcfbc482033b8923cd4e364c6b13" }
+bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "c66c4ba7ed604ab74d7ca9ab49a3eba06e099cd5" }
+bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "c66c4ba7ed604ab74d7ca9ab49a3eba06e099cd5" }
 bloom-solana-verify = { path = "crates/bloom-solana-verify" }
 bloom-relay-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "e6d15ee7373cd459f4d76a9b0c4bf2a198b90bec" }
 bloom-relay-protocol = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "e6d15ee7373cd459f4d76a9b0c4bf2a198b90bec" }

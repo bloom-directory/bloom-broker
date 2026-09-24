@@ -7,7 +7,8 @@ use bloom_broker::{
     authority::{AssuranceRegistry, BrokerAuthority, canonical_policy_authority_diff},
     ceremony::{
         CEREMONY_ADDR_V4, CEREMONY_OWNER_HEADER, CEREMONY_OWNER_VALUE, CeremonyBroker,
-        CeremonyCompletionObserver, CeremonyLimits, CeremonySigner, ReviewManifestContext,
+        CeremonyCompletionObserver, CeremonyEndpoint, CeremonyLimits, CeremonySigner,
+        ReviewManifestContext,
     },
     clock::BrokerClock,
     journal::{AuditSigner, BrokerJournal},
@@ -61,7 +62,29 @@ use std::sync::{
 };
 use tower::ServiceExt as _;
 
-static CANONICAL_LISTENERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static EPHEMERAL_PORT_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Bind IPv4 on port 0, hold it, bind IPv6 on the same selected port, and
+/// return the held pair plus its explicit nonzero endpoint. Retries selection
+/// if the second bind collides. Test setup only, never 18734.
+fn ephemeral_endpoint_pair() -> (
+    std::net::TcpListener,
+    std::net::TcpListener,
+    CeremonyEndpoint,
+) {
+    loop {
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral IPv4");
+        let port = v4.local_addr().expect("ephemeral v4 port").port();
+        assert_ne!(port, 0);
+        assert_ne!(port, 18_734);
+        let endpoint = CeremonyEndpoint::new(port).expect("ephemeral port valid");
+        match std::net::TcpListener::bind(endpoint.addr_v6()) {
+            Ok(v6) => return (v4, v6, endpoint),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("bind ephemeral IPv6: {error}"),
+        }
+    }
+}
 
 fn test_time_source() -> &'static str {
     #[cfg(target_os = "linux")]
@@ -5781,18 +5804,34 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
 
 #[tokio::test]
 async fn prebound_canonical_listener_is_a_fatal_no_fallback_failure() {
-    let _guard = CANONICAL_LISTENERS.lock().await;
-    let listener = match std::net::TcpListener::bind(CEREMONY_ADDR_V4) {
-        Ok(listener) => Some(listener),
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
-        Err(error) => panic!("cannot establish canonical-listener precondition: {error}"),
-    };
-    let error = CeremonyBroker::bind_canonical_loopback()
+    let _guard = EPHEMERAL_PORT_GUARD.lock().await;
+    let (held_v4, held_v6, endpoint) = ephemeral_endpoint_pair();
+    // A second bind while the first pair is still held must fail; never
+    // close-probe-and-assume.
+    let error = CeremonyBroker::bind_canonical_loopback_for(endpoint)
         .map(|(v4, _)| v4)
         .unwrap_err();
     assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
-    assert!(error.message.contains("18734"));
-    drop(listener);
+    assert!(error.message.contains(&endpoint.port().to_string()));
+    drop(held_v4);
+    drop(held_v6);
+}
+
+#[test]
+fn ceremony_endpoint_formats_host_origin_and_urls_without_sockets() {
+    let default = CeremonyEndpoint::default();
+    assert_eq!(default.port(), 18_734);
+    assert_eq!(default.host(), "localhost:18734");
+    assert_eq!(default.origin(), "http://localhost:18734");
+    assert_eq!(default.addr_v4(), CEREMONY_ADDR_V4);
+    let port80 = CeremonyEndpoint::new(80).unwrap();
+    assert_eq!(port80.host(), "localhost");
+    assert_eq!(port80.origin(), "http://localhost");
+    assert!(CeremonyEndpoint::new(0).is_err());
+    assert_eq!(CeremonyEndpoint::new(28_735).unwrap().port(), 28_735);
+    // Out-of-range JSON values never reach the endpoint: the protected
+    // config declares `ceremony_port` as `Option<u16>`, so serde rejects
+    // non-integers and values above 65535 while parsing.
 }
 
 #[test]
@@ -5815,10 +5854,32 @@ fn login_session_disconnect_terminalizes_every_live_browser_session() {
 #[tokio::test]
 async fn paired_loopback_servers_validate_serve_both_families_and_shutdown() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    let _guard = CANONICAL_LISTENERS.lock().await;
+    let _guard = EPHEMERAL_PORT_GUARD.lock().await;
     let signer = Arc::new(MockSigner::new());
-    let broker = CeremonyBroker::new(signer);
-    let (v4, v6) = CeremonyBroker::bind_canonical_loopback().unwrap();
+    // Select a free port (never 18734), then bind the pair through the
+    // product helper. Retries on a lost race; the held-pair collision case
+    // is covered by the prebound test above.
+    let (broker, endpoint, v4, v6) = loop {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral IPv4");
+        let port = probe.local_addr().expect("ephemeral port").port();
+        drop(probe);
+        if port == 0 || port == 18_734 {
+            continue;
+        }
+        let endpoint = CeremonyEndpoint::new(port).expect("ephemeral port valid");
+        match CeremonyBroker::bind_canonical_loopback_for(endpoint) {
+            Ok((v4, v6)) => {
+                break (
+                    CeremonyBroker::new_with_endpoint(signer.clone(), endpoint),
+                    endpoint,
+                    v4,
+                    v6,
+                );
+            }
+            Err(error) if error.message.contains("already in use") => continue,
+            Err(error) => panic!("bind ephemeral pair: {error}"),
+        }
+    };
     for (first, second) in [
         (
             std::net::TcpListener::bind("0.0.0.0:0").unwrap(),
@@ -5845,10 +5906,17 @@ async fn paired_loopback_servers_validate_serve_both_families_and_shutdown() {
         let _ = stopped.await;
     });
     let client = async {
-        for address in ["127.0.0.1:18734", "[::1]:18734"] {
-            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let host = endpoint.host();
+        for address in [
+            endpoint.addr_v4().to_string(),
+            endpoint.addr_v6().to_string(),
+        ] {
+            let mut stream = tokio::net::TcpStream::connect(&address).await.unwrap();
             stream
-                .write_all(b"GET / HTTP/1.1\r\nHost: localhost:18734\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
                 .await
                 .unwrap();
             let mut response = String::new();
@@ -7532,4 +7600,307 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         .await
         .unwrap();
     assert_eq!(replay_after_ack.status(), StatusCode::FORBIDDEN);
+}
+
+/// Two differently configured Brokers in one process isolate Host, Origin,
+/// generated URLs, and completion: each mints URLs under its own origin,
+/// refuses the other's Host/Origin, and the default broker still completes a
+/// real registration through its router with the software authenticator.
+/// Alternate-port real-Signer completion awaits the Signer ceremony_port
+/// change (pinned Signer still pins `http://localhost:18734`), so the
+/// alternate instance proves routing isolation while completion there runs
+/// through the mock-backed router path below at the Host/Origin layer.
+#[tokio::test]
+async fn two_differently_configured_brokers_isolate_ceremony_origin() {
+    let (_a_v4, _a_v6, endpoint_a) = ephemeral_endpoint_pair();
+    let (_b_v4, _b_v6, endpoint_b) = ephemeral_endpoint_pair();
+    assert_ne!(endpoint_a, endpoint_b);
+    assert_ne!(endpoint_a.port(), 18_734);
+    assert_ne!(endpoint_b.port(), 18_734);
+
+    let broker_a = CeremonyBroker::new_with_endpoint(Arc::new(MockSigner::new()), endpoint_a);
+    let broker_b = CeremonyBroker::new_with_endpoint(Arc::new(MockSigner::new()), endpoint_b);
+
+    // Router auth enforces expiry against the real clock, so prepare with
+    // real wall-clock time (as the browser path does).
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let prepared_a = prepare(
+        &broker_a,
+        operation("a1"),
+        Some(Token::new("wallet-iso-a").unwrap()),
+        now_ms,
+    );
+    let prepared_b = prepare(
+        &broker_b,
+        operation("b1"),
+        Some(Token::new("wallet-iso-b").unwrap()),
+        now_ms,
+    );
+    assert!(
+        prepared_a
+            .ceremony_url
+            .starts_with(&format!("{}/ceremony/", endpoint_a.origin())),
+        "broker A must mint its own origin URL: {}",
+        prepared_a.ceremony_url
+    );
+    assert!(
+        prepared_b
+            .ceremony_url
+            .starts_with(&format!("{}/ceremony/", endpoint_b.origin())),
+        "broker B must mint its own origin URL: {}",
+        prepared_b.ceremony_url
+    );
+    // public_status serves the same instance URL while awaiting the user.
+    let status_a = broker_a.public_status(&operation("a1")).unwrap();
+    assert_eq!(
+        status_a.ceremony_url.as_deref(),
+        Some(prepared_a.ceremony_url.as_str())
+    );
+
+    let token_a = url_token(&prepared_a.ceremony_url);
+    let app_a = broker_a.clone().router();
+
+    // Correct Host succeeds.
+    let ok = app_a
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, endpoint_a.host())
+                .header("x-bloom-ceremony-token", &token_a)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    // Wrong Host values fail: the other instance, an attacker host, and IP
+    // literals never authenticate.
+    for wrong_host in [
+        endpoint_b.host(),
+        "localhost:18734".to_owned(),
+        "attacker.invalid:18734".to_owned(),
+        format!("127.0.0.1:{}", endpoint_a.port()),
+        format!("[::1]:{}", endpoint_a.port()),
+    ] {
+        let denied = app_a
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session")
+                    .header(header::HOST, wrong_host.clone())
+                    .header("x-bloom-ceremony-token", &token_a)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            denied.status(),
+            StatusCode::FORBIDDEN,
+            "wrong Host {wrong_host} must be refused"
+        );
+    }
+
+    // Static assets enforce the same instance Host.
+    let asset_ok = app_a
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/assets/app.js")
+                .header(header::HOST, endpoint_a.host())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asset_ok.status(), StatusCode::OK);
+    let asset_denied = app_a
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/assets/app.js")
+                .header(header::HOST, endpoint_b.host())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asset_denied.status(), StatusCode::FORBIDDEN);
+
+    // A token minted by B is unknown to A even with A's correct Host.
+    let token_b = url_token(&prepared_b.ceremony_url);
+    let cross = app_a
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, endpoint_a.host())
+                .header("x-bloom-ceremony-token", &token_b)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross.status(), StatusCode::FORBIDDEN);
+
+    // Mutations with the wrong Origin fail on the alternate instance.
+    let ceremony_id_a = broker_a
+        .public_status(&operation("a1"))
+        .unwrap()
+        .ceremony_id
+        .to_string();
+    let wrong_origin = app_a
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/session/{ceremony_id_a}/cancel"))
+                .header(header::HOST, endpoint_a.host())
+                .header(header::ORIGIN, endpoint_b.origin())
+                .header("x-bloom-ceremony-token", &token_a)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_origin.status(), StatusCode::FORBIDDEN);
+
+    // The software authenticator signs the instance origin it is given.
+    let driver = VirtualAuthenticator::from_seed_with_origin(b"iso-seed", &endpoint_a.origin());
+    let probe = driver.assertion(b"iso-challenge", 1);
+    let client_data: serde_json::Value =
+        serde_json::from_slice(&probe.client_data_json.decode()).unwrap();
+    assert_eq!(client_data["origin"], endpoint_a.origin());
+
+    // Real Signer completion still works on the default broker in the same
+    // process, through its router, with the default-origin authenticator.
+    let broker_d = CeremonyBroker::new(real_ceremony_signer());
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let operation_id = operation("c1");
+    let prepared = broker_d
+        .prepare_custody(
+            CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
+                ceremony_kind: CeremonyKind::WalletRegistration,
+                custody_operation_id: operation_id.clone(),
+                wallet_id: Some(Token::new("wallet-iso-default").unwrap()),
+                key_ref: None,
+                exact_terms_digest: digest("51"),
+                expected_input_class: Token::new("passkey-prf").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1),
+                derivation_requests: Vec::new(),
+            },
+            now_ms,
+        )
+        .unwrap();
+    assert!(
+        prepared
+            .ceremony_url
+            .starts_with("http://localhost:18734/ceremony/"),
+        "default broker keeps the default origin: {}",
+        prepared.ceremony_url
+    );
+    let ceremony_id = broker_d
+        .public_status(&operation_id)
+        .unwrap()
+        .ceremony_id
+        .to_string();
+    let token = url_token(&prepared.ceremony_url);
+    let app = broker_d.router();
+    let session_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/session/{ceremony_id}"))
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", &token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session_response.status(), StatusCode::OK);
+    let session: serde_json::Value = serde_json::from_slice(
+        &session_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    let first_challenge: CeremonyChallenge =
+        serde_json::from_value(session["challenges"][0]["binding"].clone()).unwrap();
+    let second_challenge: CeremonyChallenge =
+        serde_json::from_value(session["challenges"][1]["binding"].clone()).unwrap();
+    let contribution: CustodySignerContribution =
+        serde_json::from_value(session["signer_contribution"].clone()).unwrap();
+    let authenticator = VirtualAuthenticator::generate();
+    let attestation = authenticator.attestation(&first_challenge.canonical_bytes().unwrap());
+    let assertion = authenticator.assertion(&second_challenge.canonical_bytes().unwrap(), 1);
+    let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
+        ceremony_id: contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::WalletRegistration,
+        custody_operation_id: operation_id,
+        signer_nonce: contribution.signer_nonce.clone(),
+        signer_contribution_digest: contribution.digest().unwrap(),
+        wallet_id: contribution.wallet_id.clone(),
+        key_ref: None,
+        credential_id: Some(attestation.credential_id.clone()),
+        expected_input_class: Token::new("passkey-prf").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let envelope = seal_hpke(
+        &contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &authenticator.deterministic_prf(),
+    )
+    .unwrap();
+    let completed = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/session/{ceremony_id}/complete"))
+                .header(header::HOST, "localhost:18734")
+                .header(header::ORIGIN, "http://localhost:18734")
+                .header("x-bloom-ceremony-token", token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "proof": {
+                            "kind": "registration",
+                            "attestation": attestation,
+                            "prf_assertion": assertion
+                        },
+                        "encrypted_input": envelope,
+                        "public_binding_digest": digest("51")
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
 }

@@ -63,14 +63,22 @@ impl BrowserResultRecipient {
     }
 }
 
+/// Default ceremony origin used by existing callers and tests.
+pub const DEFAULT_CEREMONY_ORIGIN: &str = "http://localhost:18734";
+
 pub struct VirtualAuthenticator {
     signing_key: SigningKey,
     credential_id: Base64UrlBytes,
     user_handle: Base64UrlBytes,
+    origin: String,
 }
 
 impl VirtualAuthenticator {
     pub fn generate() -> Self {
+        Self::generate_with_origin(DEFAULT_CEREMONY_ORIGIN)
+    }
+
+    pub fn generate_with_origin(origin: &str) -> Self {
         let mut credential_id = [0_u8; 32];
         let mut user_handle = [0_u8; 32];
         SysRng
@@ -83,6 +91,7 @@ impl VirtualAuthenticator {
             signing_key: SigningKey::generate(),
             credential_id: Base64UrlBytes::from_bytes(&credential_id),
             user_handle: Base64UrlBytes::from_bytes(&user_handle),
+            origin: origin.to_owned(),
         }
     }
 
@@ -91,6 +100,10 @@ impl VirtualAuthenticator {
     /// material. Domain-separated hashes keep the credential ID and user
     /// handle independent from the signing scalar.
     pub fn from_seed(seed: &[u8]) -> Self {
+        Self::from_seed_with_origin(seed, DEFAULT_CEREMONY_ORIGIN)
+    }
+
+    pub fn from_seed_with_origin(seed: &[u8], origin: &str) -> Self {
         let credential_id =
             Sha256::digest([b"bloom-debug-driver-credential/v1".as_slice(), seed].concat());
         let user_handle = Sha256::digest([b"bloom-debug-driver-user/v1".as_slice(), seed].concat());
@@ -113,7 +126,12 @@ impl VirtualAuthenticator {
             signing_key,
             credential_id: Base64UrlBytes::from_bytes(&credential_id),
             user_handle: Base64UrlBytes::from_bytes(&user_handle),
+            origin: origin.to_owned(),
         }
+    }
+
+    pub fn origin(&self) -> &str {
+        &self.origin
     }
 
     pub fn credential(&self, sign_count: u32) -> WebAuthnCredential {
@@ -141,7 +159,7 @@ impl VirtualAuthenticator {
     }
 
     pub fn assertion(&self, challenge: &[u8], sign_count: u32) -> WebAuthnAssertion {
-        self.assertion_for(challenge, sign_count, "http://localhost:18734", "localhost")
+        self.assertion_for(challenge, sign_count, &self.origin, "localhost")
     }
 
     pub fn assertion_for(
@@ -166,7 +184,7 @@ impl VirtualAuthenticator {
     }
 
     pub fn attestation(&self, challenge: &[u8]) -> WebAuthnAttestation {
-        self.attestation_for(challenge, "http://localhost:18734", "localhost")
+        self.attestation_for(challenge, &self.origin, "localhost")
     }
 
     pub fn attestation_for(
@@ -276,9 +294,28 @@ fn driver_error() -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
-    use super::{BrowserResultRecipient, VirtualAuthenticator, seal_hpke};
+    use super::{BrowserResultRecipient, DEFAULT_CEREMONY_ORIGIN, VirtualAuthenticator, seal_hpke};
     use bloom_signer_api::Base64UrlBytes;
     use sha2::{Digest as _, Sha256};
+
+    #[test]
+    fn instance_origin_is_stamped_into_client_data() {
+        let alternate = "http://localhost:28735";
+        let authenticator = VirtualAuthenticator::from_seed_with_origin(b"origin-probe", alternate);
+        assert_eq!(authenticator.origin(), alternate);
+        let assertion = authenticator.assertion(b"challenge", 1);
+        let client_data: serde_json::Value =
+            serde_json::from_slice(&assertion.client_data_json.decode()).unwrap();
+        assert_eq!(client_data["origin"], alternate);
+        let attestation = authenticator.attestation(b"challenge");
+        let attestation_data: serde_json::Value =
+            serde_json::from_slice(&attestation.client_data_json.decode()).unwrap();
+        assert_eq!(attestation_data["origin"], alternate);
+        assert_eq!(
+            VirtualAuthenticator::from_seed(b"origin-probe").origin(),
+            DEFAULT_CEREMONY_ORIGIN
+        );
+    }
 
     #[test]
     fn seeded_authenticator_is_repeatable_and_domain_separated() {
