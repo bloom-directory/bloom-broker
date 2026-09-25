@@ -501,7 +501,7 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
     ))
 }
 
-fn chain_name(chain_id: u64) -> String {
+pub(crate) fn chain_name(chain_id: u64) -> String {
     match chain_id {
         1 => "ethereum".into(),
         10 => "optimism".into(),
@@ -530,7 +530,7 @@ fn maximum_execution_gas_fee_display(
     ))
 }
 
-fn native_value_display(value: &str, chain: &str) -> String {
+pub(crate) fn native_value_display(value: &str, chain: &str) -> String {
     // Decimals and symbols come from the shared asset table so the EVM
     // review can never disagree with the claim amount display.
     match crate::ceremony::native_asset_metadata(chain, "native") {
@@ -561,6 +561,7 @@ pub(crate) mod tests {
             operation_id: OperationId::from_bytes([2; 32]),
             canonical_plan_facts_digest: digest.clone(),
             evm_review_payloads: vec![Base64UrlBytes::from_bytes(bytes)],
+            safe_review_payloads: Vec::new(),
             petal_use_claim: None,
             system_use_claim: None,
             terms: SealedApprovalTerms {

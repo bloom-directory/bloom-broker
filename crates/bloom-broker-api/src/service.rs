@@ -103,6 +103,10 @@ pub struct ApprovalPrepareRequest {
     /// and decodes these bytes itself before constructing the owner review.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evm_review_payloads: Vec<Base64UrlBytes>,
+    /// Canonical Safe review envelopes. Broker reconstructs the Safe EIP-712
+    /// preimage from each envelope and binds it to the exact selector.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safe_review_payloads: Vec<Base64UrlBytes>,
     /// The review mode the caller requires for this whole batch. Omitted
     /// means `clear` in a wallet that has clear signing enabled, and leaves
     /// the previous envelope behavior in one that has not. A peer that does

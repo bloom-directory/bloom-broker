@@ -9,6 +9,11 @@ use crate::{
 
 const APPROVAL_DOMAIN: &[u8] = b"bloom-sealed-approval-terms/v1";
 
+/// Petal operation class whose owner signature is an opaque EIP-712 preimage,
+/// reviewable only through the Safe envelope Broker rebuilds it from. Broker
+/// refuses an exact approval from a package declaring this class without one.
+pub const SAFE_CONFIRM_OPERATION_CLASS: &str = "safe.transaction.confirm";
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApprovalSubject {
