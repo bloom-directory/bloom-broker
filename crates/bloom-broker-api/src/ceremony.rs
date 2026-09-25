@@ -80,6 +80,84 @@ pub enum CeremonyKind {
     PolicyUpdate,
 }
 
+/// A caller can ask for a specific existing surface. The default is resolved by
+/// Broker from authenticated Signer exposure state and its own readiness;
+/// callers cannot name or create a ceremony origin.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CeremonySurfaceSelection {
+    #[default]
+    Default,
+    Local,
+    Remote,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CeremonyExposureMode {
+    RemoteEnabled,
+    LocalhostOnly,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CeremonyExposureStage {
+    Unprovisioned,
+    CertificatePending,
+    RoutingPending,
+    Enabled,
+    LocalhostOnly,
+    Degraded,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CeremonyExposureStatus {
+    pub desired_mode: CeremonyExposureMode,
+    pub desired_revision: DecimalU64,
+    pub effective_mode: CeremonyExposureMode,
+    pub effective_revision: DecimalU64,
+    pub local_origin: String,
+    pub remote_origin: Option<String>,
+    pub remote_tls_ready: bool,
+    pub remote_routing_ready: bool,
+    pub stage: CeremonyExposureStage,
+}
+
+/// Begin an authority-first passkey enrollment on the other existing origin.
+/// `destination` must be explicit; Broker resolves both immutable Signer refs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CeremonyCrossSurfacePrepareRequest {
+    pub operation_id: OperationId,
+    pub wallet_id: Token,
+    pub destination: CeremonySurfaceSelection,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CeremonyCrossSurfacePrepareResponse {
+    pub operation_id: OperationId,
+    pub ceremony_id: Digest32,
+    pub state: crate::CeremonyState,
+    pub destination_url: String,
+    pub expires_at_ms: DecimalU64,
+}
+
+/// Public projection of Signer's exact immutable surface binding.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CeremonySurfaceRef {
+    pub surface_id: Token,
+    pub identity_digest: Digest32,
+}
+
+impl CeremonySurfaceSelection {
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Default)
+    }
+}
+
 impl CeremonyKind {
     pub const fn successful_terminal_state(self) -> Option<crate::CeremonyState> {
         match self {
@@ -157,6 +235,8 @@ impl LegacyPasskeyMigrationPublic {
 #[serde(deny_unknown_fields)]
 pub struct CustodyPrepareRequest {
     pub ceremony_kind: CeremonyKind,
+    #[serde(default, skip_serializing_if = "CeremonySurfaceSelection::is_default")]
+    pub surface_selection: CeremonySurfaceSelection,
     pub custody_operation_id: OperationId,
     /// The authoritative wallet ID. New registrations and ordinary imports
     /// require the caller-selected ID; legacy migration derives it from the
@@ -628,6 +708,10 @@ pub enum CustodyPrepareState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustodyResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<CeremonySurfaceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_authority_generation: Option<DecimalU64>,
     pub ceremony_kind: CeremonyKind,
     pub custody_operation_id: OperationId,
     pub public_status: crate::CeremonyState,
@@ -645,14 +729,77 @@ pub struct CustodyResult {
 #[serde(deny_unknown_fields)]
 pub struct CredentialSummary {
     pub credential_id: Base64UrlBytes,
-    pub rp_id: Token,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<CeremonySurfaceRef>,
+    pub rp_id: RpId,
     pub active: bool,
+}
+
+/// A WebAuthn relying-party identifier encoded as a lowercase DNS name.
+///
+/// DNS labels may begin with a digit, unlike the generic protocol [`Token`].
+/// Signer remains the authority for which validated RP ID belongs to a
+/// credential; this type preserves that value in the public Machine receipt.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct RpId(String);
+
+impl RpId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 253
+            || value.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || !label.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+                    || !label
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    || !label
+                        .as_bytes()
+                        .last()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+            })
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "WebAuthn RP ID must be a lowercase DNS name",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for RpId {
+    type Error = ProtocolError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<RpId> for String {
+    fn from(value: RpId) -> Self {
+        value.0
+    }
 }
 
 impl CustodyResult {
     pub fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
         #[derive(Serialize)]
         struct Unsigned<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            surface: &'a Option<CeremonySurfaceRef>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            credential_authority_generation: &'a Option<DecimalU64>,
             ceremony_kind: CeremonyKind,
             custody_operation_id: &'a OperationId,
             public_status: crate::CeremonyState,
@@ -665,6 +812,8 @@ impl CustodyResult {
             signer_key_id: &'a Token,
         }
         serde_jcs::to_vec(&Unsigned {
+            surface: &self.surface,
+            credential_authority_generation: &self.credential_authority_generation,
             ceremony_kind: self.ceremony_kind,
             custody_operation_id: &self.custody_operation_id,
             public_status: self.public_status,
@@ -688,9 +837,34 @@ fn canonical_error(error: impl std::fmt::Display) -> ProtocolError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rp_id_accepts_digit_leading_dns_labels_and_round_trips_as_a_string() {
+        let hostname = "5ixwab6amyu7e42fjobm3myxqe.relay.bloom.directory";
+        let rp_id = RpId::new(hostname).unwrap();
+        assert_eq!(rp_id.as_str(), hostname);
+        assert_eq!(
+            serde_json::to_string(&rp_id).unwrap(),
+            format!("\"{hostname}\"")
+        );
+        assert_eq!(
+            serde_json::from_str::<RpId>(&format!("\"{hostname}\"")).unwrap(),
+            rp_id
+        );
+
+        for invalid in [
+            "Relay.example",
+            "-relay.example",
+            "relay-.example",
+            "relay..example",
+        ] {
+            assert!(RpId::new(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
     fn registration_prepare(wallet_id: Option<Token>) -> CustodyPrepareRequest {
         CustodyPrepareRequest {
             ceremony_kind: CeremonyKind::WalletRegistration,
+            surface_selection: CeremonySurfaceSelection::Default,
             custody_operation_id: OperationId::from_bytes([1; 32]),
             wallet_id,
             key_ref: None,

@@ -10,27 +10,33 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Version, header},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use bloom_broker_api::{
-    ApprovalPrepareState, CeremonyKind as BrokerCeremonyKind,
-    CeremonyPublicStatus as BrokerCeremonyPublicStatus, CeremonyState as BrokerCeremonyState,
-    ClaimAssurance, CustodyPrepareResponse, CustodyPrepareState, PetalUseClaim,
-    PolicyUpdatePrepareResponse, ProtocolError, ProtocolErrorCode, RateLimitDetails,
-    SealedApprovalPrepareResponse, SystemUseClaim,
+    ApprovalPrepareState, CeremonyCrossSurfacePrepareRequest, CeremonyCrossSurfacePrepareResponse,
+    CeremonyExposureMode, CeremonyExposureStage, CeremonyExposureStatus,
+    CeremonyKind as BrokerCeremonyKind, CeremonyPublicStatus as BrokerCeremonyPublicStatus,
+    CeremonyState as BrokerCeremonyState, CeremonySurfaceSelection, ClaimAssurance,
+    CustodyPrepareResponse, CustodyPrepareState, PetalUseClaim, PolicyUpdatePrepareResponse,
+    ProtocolError, ProtocolErrorCode, RateLimitDetails, SealedApprovalPrepareResponse,
+    SystemUseClaim,
 };
 use bloom_signer_api::{
     Base64UrlBytes, CeremonyChallenge, CeremonyCompleteRequest, CeremonyKind,
-    CeremonyPrepareRequest, CeremonyState, CeremonyWebAuthnOptions, CustodyCompleteRequest,
-    CustodyPrepareRequest, CustodyResult, CustodySignerContribution, DecimalU64, Digest32,
-    HpkeEnvelope, OperationId, PolicyUpdateCeremonyCompleteRequest,
-    PolicyUpdateCeremonyPrepareRequest, ProtocolError as SignerProtocolError,
-    ProtocolErrorCode as SignerProtocolErrorCode, SignerActivationReceipt,
-    SignerCeremonyContribution, SignerCeremonyStatus, SignerPreparedApproval,
-    SignerPreparedCustody, Token, WebAuthnCeremonyProof, WebAuthnCredential,
+    CeremonyPrepareRequest, CeremonyState, CeremonyWebAuthnOptions,
+    CrossSurfaceAlreadyRegisteredRequest, CrossSurfaceCompleteDestinationRequest,
+    CrossSurfaceCompleteSourceRequest, CrossSurfaceHandoff, CrossSurfacePairStartRequest,
+    CrossSurfacePairing, CrossSurfacePrepareSourceRequest, CrossSurfaceSourcePrepared,
+    CustodyCompleteRequest, CustodyPrepareRequest, CustodyResult, CustodySignerContribution,
+    DecimalU64, Digest32, ExposureMode, HpkeEnvelope, OperationId,
+    PolicyUpdateCeremonyCompleteRequest, PolicyUpdateCeremonyPrepareRequest,
+    ProtocolError as SignerProtocolError, ProtocolErrorCode as SignerProtocolErrorCode,
+    SignerActivationReceipt, SignerCeremonyContribution, SignerCeremonyStatus,
+    SignerPreparedApproval, SignerPreparedCustody, SurfaceDescriptor, SurfaceEffectiveReport,
+    SurfaceLifecycle, SurfaceRef, SurfaceStatus, Token, WebAuthnCeremonyProof, WebAuthnCredential,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use parking_lot::Mutex;
@@ -44,6 +50,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
     path::Path as FsPath,
     sync::Arc,
+    time::Duration,
 };
 
 /// Canonical IPv4 loopback ceremony listener address.
@@ -57,6 +64,13 @@ pub const CEREMONY_ADDR_V6: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LO
 /// A listener on any address outside this set is refused at acquisition.
 pub const CEREMONY_LOOPBACK_ADDRS: [SocketAddr; 2] = [CEREMONY_ADDR_V4, CEREMONY_ADDR_V6];
 pub const CEREMONY_ORIGIN: &str = "http://localhost:18734";
+/// Compiled default loopback port for the hosted-relay upstream. Used when
+/// the protected configuration omits `remote_upstream_port`.
+pub const DEFAULT_REMOTE_UPSTREAM_PORT: u16 = 18_735;
+pub const REMOTE_CEREMONY_UPSTREAM: SocketAddr = SocketAddr::new(
+    IpAddr::V4(Ipv4Addr::LOCALHOST),
+    DEFAULT_REMOTE_UPSTREAM_PORT,
+);
 /// Compiled default ceremony port. Used when the protected configuration
 /// omits `ceremony_port`.
 pub const DEFAULT_CEREMONY_PORT: u16 = 18_734;
@@ -66,6 +80,8 @@ pub const DEFAULT_CEREMONY_PORT: u16 = 18_734;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CeremonyEndpoint {
     port: u16,
+    /// Loopback port where the relay tunnel delivers hosted-surface streams.
+    remote_upstream_port: u16,
 }
 
 impl CeremonyEndpoint {
@@ -78,17 +94,53 @@ impl CeremonyEndpoint {
                 "ceremony_port must be between 1 and 65535; correct it in the Broker configuration file",
             ));
         }
-        Ok(Self { port })
+        Ok(Self {
+            port,
+            remote_upstream_port: DEFAULT_REMOTE_UPSTREAM_PORT,
+        })
     }
 
     pub fn default_endpoint() -> Self {
         Self {
             port: DEFAULT_CEREMONY_PORT,
+            remote_upstream_port: DEFAULT_REMOTE_UPSTREAM_PORT,
         }
+    }
+
+    /// Use a configured relay upstream port. Accepts 1 through 65535 in every
+    /// build and rejects the ceremony port itself, so the two loopback
+    /// listeners can never contend for one address.
+    pub fn with_remote_upstream_port(self, port: u16) -> Result<Self, ProtocolError> {
+        if port == 0 {
+            return Err(protocol(
+                ProtocolErrorCode::MalformedFrame,
+                "remote_upstream_port must be between 1 and 65535; correct it in the Broker configuration file",
+            ));
+        }
+        if port == self.port {
+            return Err(protocol(
+                ProtocolErrorCode::MalformedFrame,
+                "remote_upstream_port must differ from ceremony_port; correct it in the Broker configuration file",
+            ));
+        }
+        Ok(Self {
+            remote_upstream_port: port,
+            ..self
+        })
     }
 
     pub fn port(self) -> u16 {
         self.port
+    }
+
+    pub fn remote_upstream_port(self) -> u16 {
+        self.remote_upstream_port
+    }
+
+    /// IPv4 loopback address the hosted-surface listener binds and the relay
+    /// tunnel forwards to.
+    pub fn remote_upstream_addr(self) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.remote_upstream_port)
     }
 
     pub fn addr_v4(self) -> SocketAddr {
@@ -139,7 +191,11 @@ pub const CEREMONY_OWNER_VALUE: &str = "bloom-broker-v1";
 const INVALID_ATTEMPT_LIMIT: u32 = 8;
 const CANCELLATION_BACKOFF_MS: u64 = 2_000;
 const REVIEW_MANIFEST_DOMAIN: &[u8] = b"bloom-broker-review-manifest/v1";
-const OUTPUT_ACK_TTL_MS: u64 = 5 * 60 * 1_000;
+const OUTPUT_ACK_TTL_MS: u64 = 15 * 60 * 1_000;
+const REMOTE_PRECOMMIT_SESSION_MS: u64 = 5 * 60 * 1_000;
+const REMOTE_COOKIE_MAX_MS: u64 = 25 * 60 * 1_000;
+const CROSS_SURFACE_DEADLINE_MS: u64 = 10 * 60 * 1_000;
+const CEREMONY_STORAGE_VERSION: i64 = 2;
 
 /// Compiled default bound on simultaneously live ceremony sessions. This is
 /// the independent limit on concurrent resource usage; the rolling creation
@@ -436,6 +492,81 @@ impl PolicyUpdateReviewManifest {
 /// Typed Broker-to-Signer seam. Broker only forwards raw proof and opaque HPKE
 /// envelopes; no method accepts plaintext PRF or custody input.
 pub trait CeremonySigner: Send + Sync {
+    fn surface_status(&self) -> Result<SurfaceStatus, SignerProtocolError>;
+
+    fn report_surface_effective(
+        &self,
+        _report: SurfaceEffectiveReport,
+    ) -> Result<SurfaceStatus, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "surface readiness reporting unavailable",
+        ))
+    }
+
+    fn cross_surface_pair_start(
+        &self,
+        _request: CrossSurfacePairStartRequest,
+    ) -> Result<CrossSurfacePairing, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "cross-surface pairing unavailable",
+        ))
+    }
+
+    fn cross_surface_prepare_source(
+        &self,
+        _request: CrossSurfacePrepareSourceRequest,
+    ) -> Result<CrossSurfaceSourcePrepared, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "cross-surface preparation unavailable",
+        ))
+    }
+
+    fn cross_surface_complete_source(
+        &self,
+        _request: CrossSurfaceCompleteSourceRequest,
+    ) -> Result<CrossSurfaceHandoff, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "cross-surface authorization unavailable",
+        ))
+    }
+
+    fn cross_surface_complete_destination(
+        &self,
+        _request: CrossSurfaceCompleteDestinationRequest,
+    ) -> Result<CustodyResult, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "cross-surface completion unavailable",
+        ))
+    }
+
+    fn cross_surface_already_registered(
+        &self,
+        _request: CrossSurfaceAlreadyRegisteredRequest,
+    ) -> Result<bloom_signer_api::CeremonyPublicStatus, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "cross-surface existing-passkey outcome unavailable",
+        ))
+    }
+
+    /// Public credential projection for one wallet. Broker uses it only to
+    /// choose which surface can approve a passkey addition; Signer still
+    /// enforces eligibility when it prepares the approving leg.
+    fn credential_list_public(
+        &self,
+        _request: bloom_signer_api::WalletRequest,
+    ) -> Result<Vec<bloom_signer_api::CredentialPublic>, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "credential listing unavailable",
+        ))
+    }
+
     fn prepare_approval(
         &self,
         request: CeremonyPrepareRequest,
@@ -518,6 +649,7 @@ pub trait CeremonyCompletionObserver: Send + Sync {
 #[derive(Clone)]
 pub struct CeremonyBroker {
     inner: Arc<BrokerInner>,
+    served_origin: String,
 }
 
 #[derive(Clone, Copy)]
@@ -577,16 +709,146 @@ struct BrowserSession {
     #[serde(skip)]
     token: Option<Base64UrlBytes>,
     token_hash: [u8; 32],
+    #[serde(default)]
+    remote_auth: Option<RemoteBrowserAuth>,
+    #[serde(default = "local_ceremony_origin")]
+    origin: String,
     expires_at_ms: u64,
     created_at_ms: u64,
     terminal_at_ms: Option<u64>,
     state: CeremonyState,
     terminal_result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result_retain_until_ms: Option<u64>,
     #[serde(default)]
     verification_credentials: Vec<WebAuthnCredential>,
     #[serde(default)]
     policy_update: Option<PolicyUpdateCeremonyPrepareRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cross_surface: Option<CrossSurfaceFlow>,
+    #[serde(default)]
+    auxiliary: bool,
     projection: BrowserProjection,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CrossSurfaceFlow {
+    role: CrossSurfaceRole,
+    source_surface: SurfaceRef,
+    destination_surface: SurfaceRef,
+    exact_terms_digest: Digest32,
+    destination_ceremony_id: Digest32,
+    source_ceremony_id: Option<Digest32>,
+    pairing: Option<CrossSurfacePairing>,
+    source_prepared: Option<CrossSurfaceSourcePrepared>,
+    handoff: Option<CrossSurfaceHandoff>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CrossSurfaceRole {
+    Destination,
+    Source,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CrossSurfaceBrowserProjection {
+    role: CrossSurfaceRole,
+    wallet_id: Token,
+    source_origin: String,
+    destination_origin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pairing: Option<CrossSurfacePairing>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_prepared: Option<CrossSurfaceSourcePrepared>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteBrowserAuth {
+    cookie_hash: [u8; 32],
+    csrf_hash: [u8; 32],
+    #[serde(default)]
+    precommit_expires_at_ms: u64,
+    expires_at_ms: u64,
+}
+
+impl RemoteBrowserAuth {
+    fn allows(&self, state: CeremonyState, result_until_ms: Option<u64>, now_ms: u64) -> bool {
+        let deadline = if matches!(
+            state,
+            CeremonyState::WalletCommitted | CeremonyState::AwaitingRecoveryAck
+        ) {
+            self.expires_at_ms
+        } else if state == CeremonyState::Succeeded {
+            result_until_ms.unwrap_or(0).min(self.expires_at_ms)
+        } else {
+            self.precommit_expires_at_ms
+        };
+        now_ms < deadline
+    }
+}
+
+fn local_ceremony_origin() -> String {
+    CEREMONY_ORIGIN.to_owned()
+}
+
+/// Decode the released schema-1 projection. Surface identity and credential
+/// authority generation were added after that release; their only valid
+/// predecessor meaning is the compiled localhost identity at generation zero.
+fn decode_stored_browser_session(encoded: &str) -> Result<BrowserSession, serde_json::Error> {
+    let mut value: serde_json::Value = serde_json::from_str(encoded)?;
+    let legacy_surface = serde_json::to_value(bloom_signer_api::legacy_local_surface())
+        .expect("the compiled legacy surface must serialize");
+    if let Some(session) = value.as_object_mut() {
+        if let Some(policy_custody) = session
+            .get_mut("policy_update")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|policy| policy.get_mut("custody"))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            if !policy_custody.contains_key("surface") {
+                policy_custody.insert("surface".to_owned(), legacy_surface.clone());
+            }
+        }
+        if let Some(projection) = session
+            .get_mut("projection")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            if let Some(contribution) = projection
+                .get_mut("signer_contribution")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                if !contribution.contains_key("surface") {
+                    contribution.insert("surface".to_owned(), legacy_surface.clone());
+                }
+                if !contribution.contains_key("credential_authority_generation") {
+                    contribution.insert(
+                        "credential_authority_generation".to_owned(),
+                        serde_json::Value::String("0".to_owned()),
+                    );
+                }
+            }
+            if let Some(challenges) = projection
+                .get_mut("challenges")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for challenge in challenges {
+                    if let Some(binding) = challenge
+                        .get_mut("binding")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        if !binding.contains_key("surface") {
+                            binding.insert("surface".to_owned(), legacy_surface.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    serde_json::from_value(value)
 }
 
 #[derive(Deserialize)]
@@ -616,6 +878,7 @@ struct NewBrowserSession {
     policy_update: Option<PolicyUpdateCeremonyPrepareRequest>,
     expires_at_ms: u64,
     created_at_ms: u64,
+    origin: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -629,6 +892,8 @@ struct BrowserProjection {
     signer_contribution: serde_json::Value,
     webauthn_options: CeremonyWebAuthnOptions,
     expires_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cross_surface: Option<CrossSurfaceBrowserProjection>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -656,7 +921,58 @@ struct BrowserOutputKey {
 #[serde(deny_unknown_fields)]
 struct BrowserAck {}
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteFragmentExchange {
+    capability: Base64UrlBytes,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrossPairBody {
+    destination_hpke_public_key: Base64UrlBytes,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrossAuthorizeBody {
+    authority_assertion: bloom_signer_api::WebAuthnAssertion,
+    encrypted_authority_prf: HpkeEnvelope,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrossAlreadyRegisteredBody {
+    capability: Base64UrlBytes,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrossFinishBody {
+    capability: Base64UrlBytes,
+    attestation: bloom_signer_api::WebAuthnAttestation,
+    prf_assertion: bloom_signer_api::WebAuthnAssertion,
+    encrypted_new_prf: HpkeEnvelope,
+}
+
 impl CeremonyBroker {
+    pub fn signer_surface_status(&self) -> Result<SurfaceStatus, ProtocolError> {
+        self.inner
+            .signer
+            .surface_status()
+            .map_err(signer_error_to_machine)
+    }
+
+    pub fn report_surface_effective(
+        &self,
+        report: SurfaceEffectiveReport,
+    ) -> Result<SurfaceStatus, ProtocolError> {
+        self.inner
+            .signer
+            .report_surface_effective(report)
+            .map_err(signer_error_to_machine)
+    }
+
     pub fn new(signer: Arc<dyn CeremonySigner>) -> Self {
         Self::new_with_limits(signer, CeremonyLimits::default())
     }
@@ -791,6 +1107,166 @@ impl CeremonyBroker {
         self.inner.limits
     }
 
+    /// Resolve a caller's bounded preference against authenticated Signer
+    /// state. Only Signer descriptors can authorize an origin or RP ID.
+    pub fn select_surface(
+        &self,
+        selection: CeremonySurfaceSelection,
+    ) -> Result<SurfaceDescriptor, ProtocolError> {
+        let status = self
+            .inner
+            .signer
+            .surface_status()
+            .map_err(signer_error_to_machine)?;
+        let mut local = None;
+        let mut remote = None;
+        for descriptor in status.surfaces {
+            descriptor.validate().map_err(signer_error_to_machine)?;
+            if descriptor.identity.surface_id.as_str() == "local" && local.is_none() {
+                local = Some(descriptor);
+            } else if descriptor.identity.surface_id.as_str() == "remote" && remote.is_none() {
+                remote = Some(descriptor);
+            } else {
+                return Err(protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "invalid Signer surface inventory",
+                ));
+            }
+        }
+        let local = local.ok_or_else(|| {
+            protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                "Signer local surface missing",
+            )
+        })?;
+        if local.lifecycle != SurfaceLifecycle::Active {
+            return Err(protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                "Signer local surface inactive",
+            ));
+        }
+        match selection {
+            CeremonySurfaceSelection::Local => Ok(local),
+            CeremonySurfaceSelection::Default
+                if status.desired_mode == ExposureMode::LocalhostOnly =>
+            {
+                Ok(local)
+            }
+            CeremonySurfaceSelection::Default | CeremonySurfaceSelection::Remote => {
+                if selection == CeremonySurfaceSelection::Default && remote.is_none() {
+                    // A fresh legacy installation has not received a hosted
+                    // identity yet. Preserve explicit pending status while
+                    // keeping its existing local ceremony entrypoints usable.
+                    return Ok(local);
+                }
+                if status.desired_mode != ExposureMode::RemoteEnabled
+                    || status.effective_mode != ExposureMode::RemoteEnabled
+                    || status.desired_revision != status.effective_revision
+                    || !status.remote_tls_ready
+                    || !status.remote_routing_ready
+                    || !remote
+                        .as_ref()
+                        .is_some_and(|surface| surface.lifecycle == SurfaceLifecycle::Active)
+                {
+                    return Err(protocol(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "hosted ceremony surface is pending; explicitly select local for a localhost ceremony",
+                    ));
+                }
+                remote.ok_or_else(|| {
+                    protocol(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "Signer remote surface missing",
+                    )
+                })
+            }
+        }
+    }
+
+    pub fn exposure_status(&self) -> Result<CeremonyExposureStatus, ProtocolError> {
+        let status = self
+            .inner
+            .signer
+            .surface_status()
+            .map_err(signer_error_to_machine)?;
+        let remote = status
+            .surfaces
+            .iter()
+            .find(|surface| surface.identity.surface_id.as_str() == "remote")
+            .map(|surface| {
+                surface.validate().map_err(signer_error_to_machine)?;
+                Ok::<_, ProtocolError>(surface.identity.origin.clone())
+            })
+            .transpose()?;
+        let mode = |mode| match mode {
+            ExposureMode::RemoteEnabled => CeremonyExposureMode::RemoteEnabled,
+            ExposureMode::LocalhostOnly => CeremonyExposureMode::LocalhostOnly,
+        };
+        let stage = if status.desired_mode == ExposureMode::LocalhostOnly {
+            if status.effective_mode == ExposureMode::LocalhostOnly
+                && status.desired_revision == status.effective_revision
+            {
+                CeremonyExposureStage::LocalhostOnly
+            } else {
+                CeremonyExposureStage::Degraded
+            }
+        } else if remote.is_none() {
+            CeremonyExposureStage::Unprovisioned
+        } else if !status.remote_tls_ready {
+            CeremonyExposureStage::CertificatePending
+        } else if !status.remote_routing_ready {
+            CeremonyExposureStage::RoutingPending
+        } else if status.effective_mode == ExposureMode::RemoteEnabled
+            && status.desired_revision == status.effective_revision
+        {
+            CeremonyExposureStage::Enabled
+        } else {
+            CeremonyExposureStage::Degraded
+        };
+        Ok(CeremonyExposureStatus {
+            desired_mode: mode(status.desired_mode),
+            desired_revision: status.desired_revision,
+            effective_mode: mode(status.effective_mode),
+            effective_revision: status.effective_revision,
+            local_origin: self.inner.endpoint.origin(),
+            remote_origin: remote,
+            remote_tls_ready: status.remote_tls_ready,
+            remote_routing_ready: status.remote_routing_ready,
+            stage,
+        })
+    }
+
+    fn origin_for_surface(&self, surface: &SurfaceRef) -> Result<String, ProtocolError> {
+        let status = self
+            .inner
+            .signer
+            .surface_status()
+            .map_err(signer_error_to_machine)?;
+        let descriptor = status
+            .surfaces
+            .into_iter()
+            .find(|candidate| candidate.reference() == *surface)
+            .ok_or_else(|| {
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "Signer surface changed",
+                )
+            })?;
+        descriptor.validate().map_err(signer_error_to_machine)?;
+        if descriptor.lifecycle != SurfaceLifecycle::Active {
+            return Err(protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                "Signer surface inactive",
+            ));
+        }
+        // The local surface is served on this Broker's configured ceremony
+        // port; its persisted Signer identity stays at the shipping origin.
+        if descriptor.identity.surface_id.as_str() == "local" {
+            return Ok(self.inner.endpoint.origin());
+        }
+        Ok(descriptor.identity.origin)
+    }
+
     /// The instance ceremony endpoint (port, addrs, Host, origin, URLs).
     pub fn endpoint(&self) -> CeremonyEndpoint {
         self.inner.endpoint
@@ -809,6 +1285,7 @@ impl CeremonyBroker {
         journal: Option<Arc<BrokerJournal>>,
     ) -> Self {
         Self {
+            served_origin: endpoint.origin(),
             inner: Arc::new(BrokerInner {
                 signer,
                 endpoint,
@@ -883,6 +1360,7 @@ impl CeremonyBroker {
             .map_err(signer_error_to_machine)?;
         let ceremony_id = prepared.contribution.ceremony_id.clone();
         let expires_at_ms = prepared.contribution.expires_at_ms.get();
+        let origin = self.origin_for_surface(&prepared.contribution.surface)?;
         let session = self.new_session(NewBrowserSession {
             operation_id: request.activation_operation_id.clone(),
             request_digest,
@@ -898,8 +1376,9 @@ impl CeremonyBroker {
             policy_update: None,
             expires_at_ms,
             created_at_ms: now_ms,
+            origin,
         })?;
-        let url = self.ceremony_session_url(&token_for(&session));
+        let url = session_url(&session);
         self.insert_session(ceremony_id.clone(), session)?;
         Ok(SealedApprovalPrepareResponse {
             approval_id: request
@@ -919,6 +1398,532 @@ impl CeremonyBroker {
         now_ms: u64,
     ) -> Result<CustodyPrepareResponse, ProtocolError> {
         self.prepare_custody_reviewed(request, None, now_ms)
+    }
+
+    pub fn prepare_cross_surface(
+        &self,
+        request: CeremonyCrossSurfacePrepareRequest,
+        now_ms: u64,
+    ) -> Result<CeremonyCrossSurfacePrepareResponse, ProtocolError> {
+        self.expire_sessions(now_ms)?;
+        // `Default` resolves like every other ceremony: the hosted surface
+        // when it is effective, otherwise localhost.
+        let destination = self.select_surface(request.destination)?;
+        let request_digest = digest(&request)?;
+        let _guard = self.inner.creation_admission.lock();
+        if let Some(ceremony_id) = self
+            .inner
+            .operations
+            .lock()
+            .get(&request.operation_id)
+            .cloned()
+        {
+            let sessions = self.inner.sessions.lock();
+            let session = sessions.get(&ceremony_id).ok_or_else(not_found)?;
+            if session.request_digest != request_digest || session.cross_surface.is_none() {
+                return Err(operation_conflict());
+            }
+            if session.state != CeremonyState::AwaitingUser || session.token.is_none() {
+                return Err(replay());
+            }
+            return Ok(CeremonyCrossSurfacePrepareResponse {
+                operation_id: request.operation_id,
+                ceremony_id: session.projection.ceremony_id.clone(),
+                state: BrokerCeremonyState::AwaitingUser,
+                destination_url: session_url(session),
+                expires_at_ms: DecimalU64::new(session.expires_at_ms),
+            });
+        }
+        let source = self.select_approving_surface(&request.wallet_id, &destination)?;
+        self.enforce_creation_bounds(Some(&request.wallet_id), false, now_ms)?;
+        let destination_surface = destination.reference();
+        let source_surface = source.reference();
+        let terms_digest = digest(&(
+            "bloom.cross_surface_credential_add.v1",
+            &request.operation_id,
+            &request.wallet_id,
+            &source_surface,
+            &destination_surface,
+        ))?;
+        let mut id_bytes = [0_u8; 32];
+        SysRng.try_fill_bytes(&mut id_bytes).map_err(malformed)?;
+        let ceremony_id = Digest32::from_bytes(id_bytes);
+        let expires_at_ms = now_ms.saturating_add(CROSS_SURFACE_DEADLINE_MS);
+        let mut session = self.new_session(NewBrowserSession {
+            operation_id: request.operation_id.clone(),
+            request_digest,
+            wallet_id: Some(request.wallet_id.clone()),
+            anonymous_registration: false,
+            ceremony_kind: CeremonyKind::CredentialAdd,
+            ceremony_id: ceremony_id.clone(),
+            review_manifest: Some(serde_json::json!({
+                "schema": "bloom.cross_surface_add_review.v1",
+                "title": "Add a wallet passkey",
+                "wallet_name": request.wallet_id,
+                "source_origin": source.identity.origin.clone(),
+                "destination_origin": destination.identity.origin.clone(),
+                "exact_terms_digest": terms_digest,
+            })),
+            challenges: Vec::new(),
+            signer_contribution: serde_json::Value::Null,
+            webauthn_options: CeremonyWebAuthnOptions {
+                allowed_credentials: Vec::new(),
+                registration_user_handle: None,
+                registration_prf_salt: None,
+            },
+            verification_credentials: Vec::new(),
+            policy_update: None,
+            expires_at_ms,
+            created_at_ms: now_ms,
+            origin: destination.identity.origin.clone(),
+        })?;
+        session.projection.cross_surface = Some(CrossSurfaceBrowserProjection {
+            role: CrossSurfaceRole::Destination,
+            wallet_id: request.wallet_id,
+            source_origin: source.identity.origin,
+            destination_origin: destination.identity.origin,
+            pairing: None,
+            source_prepared: None,
+        });
+        session.cross_surface = Some(CrossSurfaceFlow {
+            role: CrossSurfaceRole::Destination,
+            source_surface,
+            destination_surface,
+            exact_terms_digest: terms_digest,
+            destination_ceremony_id: ceremony_id.clone(),
+            source_ceremony_id: None,
+            pairing: None,
+            source_prepared: None,
+            handoff: None,
+        });
+        let url = session_url(&session);
+        self.insert_session(ceremony_id.clone(), session)?;
+        Ok(CeremonyCrossSurfacePrepareResponse {
+            operation_id: request.operation_id,
+            ceremony_id,
+            state: BrokerCeremonyState::AwaitingUser,
+            destination_url: url,
+            expires_at_ms: DecimalU64::new(expires_at_ms),
+        })
+    }
+
+    /// Choose the surface whose existing passkey approves a new one.
+    ///
+    /// A wallet passkey on the destination's own surface is preferred: that
+    /// approval link opens on any device holding one, whereas a localhost
+    /// link only opens on the Bloom host. Otherwise the other surface
+    /// approves, which is the original cross-surface addition. With neither,
+    /// no approval can ever succeed, so the ceremony is refused here instead
+    /// of reaching `AWAITING_USER` and failing on the user's device.
+    fn select_approving_surface(
+        &self,
+        wallet_id: &Token,
+        destination: &SurfaceDescriptor,
+    ) -> Result<SurfaceDescriptor, ProtocolError> {
+        let credentials = self
+            .inner
+            .signer
+            .credential_list_public(bloom_signer_api::WalletRequest {
+                wallet_id: wallet_id.clone(),
+            })
+            .map_err(signer_error_to_machine)?;
+        let other = if destination.identity.surface_id.as_str() == "local" {
+            CeremonySurfaceSelection::Remote
+        } else {
+            CeremonySurfaceSelection::Local
+        };
+        approving_surface(&credentials, destination, self.select_surface(other).ok()).ok_or_else(
+            || {
+                protocol(
+                    ProtocolErrorCode::ApprovalNotFound,
+                    format!(
+                        "wallet {} has no active passkey that can approve adding another",
+                        wallet_id.as_str()
+                    ),
+                )
+            },
+        )
+    }
+
+    fn pair_cross_surface(
+        &self,
+        ceremony_id: &str,
+        body: CrossPairBody,
+        now_ms: u64,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let _guard = self.inner.creation_admission.lock();
+        let destination = self
+            .inner
+            .sessions
+            .lock()
+            .get(ceremony_id)
+            .cloned()
+            .ok_or_else(not_found)?;
+        let flow = destination
+            .cross_surface
+            .as_ref()
+            .filter(|flow| flow.role == CrossSurfaceRole::Destination)
+            .ok_or_else(kind_mismatch)?;
+        if destination.state != CeremonyState::AwaitingUser || destination.expires_at_ms <= now_ms {
+            return Err(replay());
+        }
+        if let (Some(source_id), Some(pairing)) = (&flow.source_ceremony_id, &flow.pairing) {
+            let source = self
+                .inner
+                .sessions
+                .lock()
+                .get(source_id.as_str())
+                .cloned()
+                .ok_or_else(not_found)?;
+            if pairing.destination_hpke_public_key != body.destination_hpke_public_key
+                || source.token.is_none()
+            {
+                return Err(operation_conflict());
+            }
+            return Ok(serde_json::json!({
+                "source_url": session_url(&source),
+                "confirmation_code": pairing.confirmation_code,
+                "pairing_id": pairing.pairing_id,
+                "expires_at_ms": pairing.expires_at_ms,
+            }));
+        }
+        if body.destination_hpke_public_key.decode().len() != 32 {
+            return Err(protocol(
+                ProtocolErrorCode::MalformedFrame,
+                "destination HPKE key must be 32 bytes",
+            ));
+        }
+        let pairing = self
+            .inner
+            .signer
+            .cross_surface_pair_start(CrossSurfacePairStartRequest {
+                destination_surface: flow.destination_surface.clone(),
+                operation_id: destination.operation_id.clone(),
+                exact_terms_digest: flow.exact_terms_digest.clone(),
+                destination_hpke_public_key: body.destination_hpke_public_key,
+                expires_at_ms: DecimalU64::new(destination.expires_at_ms),
+            })
+            .map_err(signer_error_to_machine)?;
+        if pairing.destination_surface != flow.destination_surface
+            || pairing.operation_id != destination.operation_id
+            || pairing.exact_terms_digest != flow.exact_terms_digest
+            || pairing.expires_at_ms.get() > destination.expires_at_ms
+        {
+            return Err(operation_conflict());
+        }
+        let wallet_id = destination.wallet_id.clone().ok_or_else(not_found)?;
+        let prepared = self
+            .inner
+            .signer
+            .cross_surface_prepare_source(CrossSurfacePrepareSourceRequest {
+                pairing_id: pairing.pairing_id.clone(),
+                operation_id: destination.operation_id.clone(),
+                source_surface: flow.source_surface.clone(),
+                wallet_id: wallet_id.clone(),
+                exact_terms_digest: flow.exact_terms_digest.clone(),
+            })
+            .map_err(signer_error_to_machine)?;
+        if prepared.pairing != pairing
+            || prepared.source_surface != flow.source_surface
+            || prepared.wallet_id != wallet_id
+        {
+            return Err(operation_conflict());
+        }
+        let mut id_bytes = [0_u8; 32];
+        SysRng.try_fill_bytes(&mut id_bytes).map_err(malformed)?;
+        let source_id = Digest32::from_bytes(id_bytes);
+        let source_origin = self.origin_for_surface(&flow.source_surface)?;
+        let destination_origin = destination.origin.clone();
+        let mut source = self.new_session(NewBrowserSession {
+            operation_id: destination.operation_id.clone(),
+            request_digest: destination.request_digest.clone(),
+            wallet_id: Some(wallet_id.clone()),
+            anonymous_registration: false,
+            ceremony_kind: CeremonyKind::CredentialAdd,
+            ceremony_id: source_id.clone(),
+            review_manifest: destination.projection.review_manifest.clone(),
+            challenges: vec![prepared.source_challenge.clone()],
+            signer_contribution: serde_json::to_value(&prepared).map_err(malformed)?,
+            webauthn_options: CeremonyWebAuthnOptions {
+                allowed_credentials: prepared.source_prf_inputs.clone(),
+                registration_user_handle: None,
+                registration_prf_salt: None,
+            },
+            verification_credentials: prepared.source_credentials.clone(),
+            policy_update: None,
+            expires_at_ms: pairing.expires_at_ms.get(),
+            created_at_ms: now_ms,
+            origin: source_origin.clone(),
+        })?;
+        source.auxiliary = true;
+        source.cross_surface = Some(CrossSurfaceFlow {
+            role: CrossSurfaceRole::Source,
+            source_surface: flow.source_surface.clone(),
+            destination_surface: flow.destination_surface.clone(),
+            exact_terms_digest: flow.exact_terms_digest.clone(),
+            destination_ceremony_id: flow.destination_ceremony_id.clone(),
+            source_ceremony_id: Some(source_id.clone()),
+            pairing: Some(pairing.clone()),
+            source_prepared: Some(prepared.clone()),
+            handoff: None,
+        });
+        source.projection.cross_surface = Some(CrossSurfaceBrowserProjection {
+            role: CrossSurfaceRole::Source,
+            wallet_id,
+            source_origin,
+            destination_origin,
+            pairing: Some(pairing.clone()),
+            source_prepared: Some(prepared.clone()),
+        });
+        let source_url = session_url(&source);
+        let mut next_destination = destination.clone();
+        let next_flow = next_destination
+            .cross_surface
+            .as_mut()
+            .ok_or_else(not_found)?;
+        next_flow.pairing = Some(pairing.clone());
+        next_flow.source_prepared = Some(prepared);
+        next_flow.source_ceremony_id = Some(source_id.clone());
+        if let Some(projection) = next_destination.projection.cross_surface.as_mut() {
+            projection.pairing = Some(pairing.clone());
+        }
+        self.persist_session(&source)?;
+        self.persist_session(&next_destination)?;
+        let mut sessions = self.inner.sessions.lock();
+        sessions.insert(source_id.as_str().to_owned(), source);
+        sessions.insert(ceremony_id.to_owned(), next_destination);
+        Ok(serde_json::json!({
+            "source_url": source_url,
+            "confirmation_code": pairing.confirmation_code,
+            "pairing_id": pairing.pairing_id,
+            "expires_at_ms": pairing.expires_at_ms,
+        }))
+    }
+
+    fn authorize_cross_surface(
+        &self,
+        ceremony_id: &str,
+        body: CrossAuthorizeBody,
+        now_ms: u64,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let _guard = self.inner.creation_admission.lock();
+        let source = self
+            .inner
+            .sessions
+            .lock()
+            .get(ceremony_id)
+            .cloned()
+            .ok_or_else(not_found)?;
+        let flow = source
+            .cross_surface
+            .as_ref()
+            .filter(|flow| flow.role == CrossSurfaceRole::Source)
+            .ok_or_else(kind_mismatch)?;
+        if source.state != CeremonyState::AwaitingUser || source.expires_at_ms <= now_ms {
+            return Err(replay());
+        }
+        let pairing = flow.pairing.as_ref().ok_or_else(not_found)?;
+        let handoff = self
+            .inner
+            .signer
+            .cross_surface_complete_source(CrossSurfaceCompleteSourceRequest {
+                pairing_id: pairing.pairing_id.clone(),
+                operation_id: source.operation_id.clone(),
+                authority_assertion: body.authority_assertion,
+                encrypted_authority_prf: body.encrypted_authority_prf,
+            })
+            .map_err(signer_error_to_machine)?;
+        if handoff.pairing_id != pairing.pairing_id
+            || handoff.expires_at_ms.get() > pairing.expires_at_ms.get()
+        {
+            return Err(operation_conflict());
+        }
+        let destination_id = flow.destination_ceremony_id.as_str().to_owned();
+        let mut destination = self
+            .inner
+            .sessions
+            .lock()
+            .get(&destination_id)
+            .cloned()
+            .ok_or_else(not_found)?;
+        let destination_flow = destination
+            .cross_surface
+            .as_mut()
+            .ok_or_else(kind_mismatch)?;
+        if destination_flow.role != CrossSurfaceRole::Destination
+            || destination_flow.pairing.as_ref() != Some(pairing)
+        {
+            return Err(operation_conflict());
+        }
+        destination_flow.handoff = Some(handoff);
+        let mut source_done = source;
+        source_done.state = CeremonyState::Completed;
+        latch_terminal(&mut source_done, now_ms);
+        self.persist_session(&destination)?;
+        self.persist_session(&source_done)?;
+        let mut sessions = self.inner.sessions.lock();
+        sessions.insert(destination_id, destination.clone());
+        sessions.insert(ceremony_id.to_owned(), source_done);
+        Ok(serde_json::json!({"destination_origin": destination.origin}))
+    }
+
+    fn cross_surface_handoff(
+        &self,
+        ceremony_id: &str,
+        now_ms: u64,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let destination = self
+            .inner
+            .sessions
+            .lock()
+            .get(ceremony_id)
+            .cloned()
+            .ok_or_else(not_found)?;
+        let flow = destination
+            .cross_surface
+            .as_ref()
+            .filter(|flow| flow.role == CrossSurfaceRole::Destination)
+            .ok_or_else(kind_mismatch)?;
+        if destination.expires_at_ms <= now_ms || is_terminal(destination.state) {
+            return Err(replay());
+        }
+        if let (Some(handoff), Some(prepared)) = (&flow.handoff, &flow.source_prepared) {
+            Ok(
+                serde_json::json!({"state":"ready", "encrypted_capability": handoff.encrypted_capability,
+                "source_prepared": prepared}),
+            )
+        } else {
+            Ok(serde_json::json!({"state":"waiting"}))
+        }
+    }
+
+    fn finish_cross_surface(
+        &self,
+        ceremony_id: &str,
+        body: CrossFinishBody,
+        now_ms: u64,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let _guard = self.inner.creation_admission.lock();
+        let destination = self
+            .inner
+            .sessions
+            .lock()
+            .get(ceremony_id)
+            .cloned()
+            .ok_or_else(not_found)?;
+        let flow = destination
+            .cross_surface
+            .as_ref()
+            .filter(|flow| flow.role == CrossSurfaceRole::Destination)
+            .ok_or_else(kind_mismatch)?;
+        if destination.state == CeremonyState::WalletCommitted {
+            return self.finalize_committed_session(ceremony_id, now_ms);
+        }
+        if destination.state == CeremonyState::Succeeded
+            && destination
+                .result_retain_until_ms
+                .is_some_and(|deadline| deadline > now_ms)
+        {
+            return destination.terminal_result.ok_or_else(not_found);
+        }
+        if destination.state != CeremonyState::AwaitingUser
+            || destination.expires_at_ms <= now_ms
+            || flow.handoff.is_none()
+        {
+            return Err(replay());
+        }
+        let pairing = flow.pairing.as_ref().ok_or_else(not_found)?;
+        let result = self
+            .inner
+            .signer
+            .cross_surface_complete_destination(CrossSurfaceCompleteDestinationRequest {
+                pairing_id: pairing.pairing_id.clone(),
+                operation_id: destination.operation_id.clone(),
+                capability: body.capability,
+                attestation: body.attestation,
+                prf_assertion: body.prf_assertion,
+                encrypted_new_prf: body.encrypted_new_prf,
+            })
+            .map_err(signer_error_to_machine)?;
+        if result.surface.as_ref() != Some(&flow.destination_surface)
+            || result.credential_authority_generation.is_none()
+            || result.wallet_id.as_ref() != destination.wallet_id.as_ref()
+        {
+            return Err(operation_conflict());
+        }
+        let receipt = serde_json::to_value(result).map_err(malformed)?;
+        validate_completion_identity(
+            CeremonyKind::CredentialAdd,
+            &destination.operation_id,
+            &destination.projection.ceremony_id,
+            &receipt,
+        )?;
+        let mut committed = destination;
+        committed.state = CeremonyState::WalletCommitted;
+        committed.terminal_result = Some(receipt);
+        self.persist_session(&committed)?;
+        self.inner
+            .sessions
+            .lock()
+            .insert(ceremony_id.to_owned(), committed);
+        self.finalize_committed_session(ceremony_id, now_ms)
+    }
+
+    /// The destination's passkey provider already holds one of the wallet's
+    /// passkeys for this surface, so WebAuthn refused to create another.
+    /// Signer verifies the handoff capability and records the terminal
+    /// outcome; the destination session ends as `ALREADY_REGISTERED` with no
+    /// credential change.
+    fn already_registered_cross_surface(
+        &self,
+        ceremony_id: &str,
+        body: CrossAlreadyRegisteredBody,
+        now_ms: u64,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let _guard = self.inner.creation_admission.lock();
+        let destination = self
+            .inner
+            .sessions
+            .lock()
+            .get(ceremony_id)
+            .cloned()
+            .ok_or_else(not_found)?;
+        let flow = destination
+            .cross_surface
+            .as_ref()
+            .filter(|flow| flow.role == CrossSurfaceRole::Destination)
+            .ok_or_else(kind_mismatch)?;
+        if destination.state != CeremonyState::AwaitingUser
+            || destination.expires_at_ms <= now_ms
+            || flow.handoff.is_none()
+        {
+            return Err(replay());
+        }
+        let pairing = flow.pairing.as_ref().ok_or_else(not_found)?;
+        let status = self
+            .inner
+            .signer
+            .cross_surface_already_registered(CrossSurfaceAlreadyRegisteredRequest {
+                pairing_id: pairing.pairing_id.clone(),
+                operation_id: destination.operation_id.clone(),
+                capability: body.capability,
+            })
+            .map_err(signer_error_to_machine)?;
+        if status.state != CeremonyState::AlreadyRegistered
+            || status.operation_id != destination.operation_id
+            || status.ceremony_id != pairing.pairing_id
+        {
+            return Err(operation_conflict());
+        }
+        let mut done = destination;
+        done.state = CeremonyState::AlreadyRegistered;
+        latch_terminal(&mut done, now_ms);
+        self.persist_session(&done)?;
+        self.inner
+            .sessions
+            .lock()
+            .insert(ceremony_id.to_owned(), done);
+        Ok(serde_json::json!({"state": "already_registered"}))
     }
 
     /// [`Self::prepare_custody`] with a broker-authored review JSON the
@@ -989,6 +1994,7 @@ impl CeremonyBroker {
             .digest()
             .map_err(signer_error_to_machine)?;
         let expires_at_ms = prepared.contribution.expires_at_ms.get();
+        let origin = self.origin_for_surface(&prepared.contribution.surface)?;
         let session = self.new_session(NewBrowserSession {
             operation_id: request.custody_operation_id.clone(),
             request_digest,
@@ -1009,8 +2015,9 @@ impl CeremonyBroker {
             policy_update: None,
             expires_at_ms,
             created_at_ms: now_ms,
+            origin,
         })?;
-        let url = self.ceremony_session_url(&token_for(&session));
+        let url = session_url(&session);
         self.insert_session(ceremony_id, session)?;
         Ok(CustodyPrepareResponse {
             ceremony_kind: kind_to_machine(request.ceremony_kind),
@@ -1064,6 +2071,7 @@ impl CeremonyBroker {
             .map_err(signer_error_to_machine)?;
         let ceremony_id = prepared.contribution.ceremony_id.clone();
         let expires_at_ms = prepared.contribution.expires_at_ms.get();
+        let origin = self.origin_for_surface(&prepared.contribution.surface)?;
         let session = self.new_session(NewBrowserSession {
             operation_id: request.update.operation_id.clone(),
             request_digest,
@@ -1079,11 +2087,12 @@ impl CeremonyBroker {
             policy_update: Some(request.clone()),
             expires_at_ms,
             created_at_ms: now_ms,
+            origin,
         })?;
         let response = PolicyUpdatePrepareResponse {
             operation_id: request.update.operation_id,
             ceremony_kind: BrokerCeremonyKind::PolicyUpdate,
-            ceremony_url: self.ceremony_session_url(&token_for(&session)),
+            ceremony_url: session_url(&session),
             ceremony_expires_at_ms: DecimalU64::new(expires_at_ms),
             review_manifest_digest: request.broker_validation_receipt.review_manifest_digest,
         };
@@ -1122,7 +2131,7 @@ impl CeremonyBroker {
         Some(Ok(PolicyUpdatePrepareResponse {
             operation_id: update.operation_id.clone(),
             ceremony_kind: BrokerCeremonyKind::PolicyUpdate,
-            ceremony_url: self.ceremony_session_url(&token_for(session)),
+            ceremony_url: session_url(session),
             ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             review_manifest_digest: manifest.digest().ok()?,
         }))
@@ -1162,10 +2171,7 @@ impl CeremonyBroker {
             None => None,
         };
         let ceremony_url = if session.state == CeremonyState::AwaitingUser {
-            session
-                .token
-                .as_ref()
-                .map(|token| self.ceremony_session_url(token))
+            session.token.as_ref().map(|_| session_url(session))
         } else {
             None
         };
@@ -1178,6 +2184,18 @@ impl CeremonyBroker {
             ceremony_url,
             receipt_digest,
         })
+    }
+
+    /// Public status as of `now_ms`. Status requests are a lifecycle boundary
+    /// just like opening the browser: sweep first so an elapsed AwaitingUser
+    /// session is reported as expired rather than as still awaiting the user.
+    pub fn current_public_status(
+        &self,
+        operation_id: &OperationId,
+        now_ms: u64,
+    ) -> Result<BrokerCeremonyPublicStatus, ProtocolError> {
+        self.expire_sessions(now_ms)?;
+        self.public_status(operation_id)
     }
 
     /// Return the owner-visible URL for an approval ceremony while it is
@@ -1208,12 +2226,10 @@ impl CeremonyBroker {
             if manifest_approval_id != approval_id.as_str() {
                 return None;
             }
-            session.token.as_ref().map(|token| {
-                (
-                    self.ceremony_session_url(token),
-                    DecimalU64::new(session.expires_at_ms),
-                )
-            })
+            session
+                .token
+                .as_ref()
+                .map(|_| (session_url(session), DecimalU64::new(session.expires_at_ms)))
         }))
     }
 
@@ -1304,6 +2320,7 @@ impl CeremonyBroker {
         now_ms: u64,
         backoff_clock: BackoffClock,
     ) -> Result<(), ProtocolError> {
+        let _guard = self.inner.creation_admission.lock();
         self.expire_sessions(now_ms)?;
         let ceremony_id = self
             .inner
@@ -1345,6 +2362,26 @@ impl CeremonyBroker {
             .signer
             .cancel(operation_id)
             .map_err(signer_error_to_machine)?;
+        // Both tabs belong to one operation. Leaving its auxiliary source live
+        // would strand the wallet's admission slot after a successful cancel.
+        let auxiliary = self
+            .inner
+            .sessions
+            .lock()
+            .iter()
+            .filter(|(_, session)| {
+                session.auxiliary
+                    && &session.operation_id == operation_id
+                    && !is_terminal(session.state)
+            })
+            .map(|(id, session)| (id.clone(), session.clone()))
+            .collect::<Vec<_>>();
+        for (id, mut source) in auxiliary {
+            source.state = CeremonyState::Cancelled;
+            latch_terminal(&mut source, now_ms);
+            self.persist_session(&source)?;
+            self.inner.sessions.lock().insert(id, source);
+        }
         self.persist_session(&snapshot)?;
         self.inner.sessions.lock().insert(ceremony_id, snapshot);
         if let Some(wallet_id) = &wallet_id {
@@ -1406,7 +2443,10 @@ impl CeremonyBroker {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/", get(shell))
+            .route("/.well-known/bloom/relay-health", get(remote_health))
             .route("/ceremony/{token}", get(ceremony_shell))
+            .route("/api/session/exchange", post(exchange_remote_fragment))
+            .route("/ceremony/", get(ceremony_resume_shell))
             .route("/assets/app.js", get(app_js))
             .route("/assets/style.css", get(style_css))
             .route("/assets/bloom-primary.svg", get(bloom_primary_svg))
@@ -1423,9 +2463,102 @@ impl CeremonyBroker {
             )
             .route("/api/session/{ceremony_id}/ack", post(acknowledge_result))
             .route("/api/session/{ceremony_id}/cancel", post(cancel_session))
+            .route("/api/cross/{ceremony_id}/pair", post(cross_surface_pair))
+            .route(
+                "/api/cross/{ceremony_id}/authorize",
+                post(cross_surface_authorize),
+            )
+            .route(
+                "/api/cross/{ceremony_id}/handoff",
+                get(cross_surface_handoff),
+            )
+            .route(
+                "/api/cross/{ceremony_id}/finish",
+                post(cross_surface_finish),
+            )
+            .route(
+                "/api/cross/{ceremony_id}/already-registered",
+                post(cross_surface_already_registered),
+            )
             .layer(DefaultBodyLimit::max(MAX_CEREMONY_BODY_BYTES))
             .layer(middleware::from_fn(security_headers))
             .with_state(self.clone())
+    }
+
+    /// Use the same ceremony state and handlers on a Broker-owned TLS listener.
+    /// The caller must obtain this exact assigned origin from authenticated
+    /// Signer state and must attach the router only to that TLS listener.
+    pub fn for_remote_origin(&self, origin: &str) -> Result<Self, ProtocolError> {
+        let hostname = origin.strip_prefix("https://").ok_or_else(|| {
+            protocol(
+                ProtocolErrorCode::MalformedFrame,
+                "invalid remote ceremony origin",
+            )
+        })?;
+        bloom_signer_api::SurfaceIdentity::remote(hostname, 0).map_err(signer_error_to_machine)?;
+        Ok(Self {
+            inner: self.inner.clone(),
+            served_origin: origin.to_owned(),
+        })
+    }
+
+    /// Serve the exact Signer-assigned origin through Broker-owned TLS. The
+    /// relay client is separately pinned to this loopback socket; neither
+    /// caller nor gateway supplies a forwarding destination.
+    pub async fn serve_remote_tls_until<F>(
+        self,
+        origin: &str,
+        certificate_pem: Vec<u8>,
+        private_key_pem: Vec<u8>,
+        shutdown: F,
+    ) -> Result<(), ProtocolError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let remote = self.for_remote_origin(origin)?;
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem(certificate_pem, private_key_pem)
+            .await
+            .map_err(|error| {
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!("remote TLS material invalid: {error}"),
+                )
+            })?;
+        let listener =
+            StdTcpListener::bind(self.inner.endpoint.remote_upstream_addr()).map_err(|error| {
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!("remote ceremony listener unavailable: {error}"),
+                )
+            })?;
+        listener.set_nonblocking(true).map_err(|error| {
+            protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                format!("remote ceremony listener setup failed: {error}"),
+            )
+        })?;
+        let handle = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            shutdown.await;
+            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+        });
+        axum_server::from_tcp_rustls(listener, tls)
+            .map_err(|error| {
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!("remote TLS listener handoff failed: {error}"),
+                )
+            })?
+            .handle(handle)
+            .serve(remote.router().into_make_service())
+            .await
+            .map_err(|error| {
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!("remote TLS service failed: {error}"),
+                )
+            })
     }
 
     pub fn expire_sessions(&self, now_ms: u64) -> Result<(), ProtocolError> {
@@ -1434,10 +2567,53 @@ impl CeremonyBroker {
             .sessions
             .lock()
             .iter()
-            .filter(|(_, session)| !is_terminal(session.state) && session.expires_at_ms <= now_ms)
+            .filter(|(_, session)| {
+                session.expires_at_ms <= now_ms
+                    && (!is_terminal(session.state) || session.result_retain_until_ms.is_some())
+            })
             .map(|(id, session)| (id.clone(), session.operation_id.clone()))
             .collect::<Vec<_>>();
         for (ceremony_id, operation_id) in expired {
+            if self
+                .inner
+                .sessions
+                .lock()
+                .get(&ceremony_id)
+                .is_some_and(|session| session.result_retain_until_ms.is_some())
+            {
+                let mut result = self
+                    .inner
+                    .sessions
+                    .lock()
+                    .get(&ceremony_id)
+                    .cloned()
+                    .ok_or_else(not_found)?;
+                result.result_retain_until_ms = None;
+                latch_terminal(&mut result, now_ms);
+                self.persist_session(&result)?;
+                self.inner.sessions.lock().insert(ceremony_id, result);
+                continue;
+            }
+            if self
+                .inner
+                .sessions
+                .lock()
+                .get(&ceremony_id)
+                .is_some_and(|session| session.auxiliary)
+            {
+                let mut source = self
+                    .inner
+                    .sessions
+                    .lock()
+                    .get(&ceremony_id)
+                    .cloned()
+                    .ok_or_else(not_found)?;
+                source.state = CeremonyState::Expired;
+                latch_terminal(&mut source, now_ms);
+                self.persist_session(&source)?;
+                self.inner.sessions.lock().insert(ceremony_id, source);
+                continue;
+            }
             if self
                 .inner
                 .sessions
@@ -1740,13 +2916,18 @@ impl CeremonyBroker {
             ceremony_kind: new.ceremony_kind,
             token: Some(Base64UrlBytes::from_bytes(&token_bytes)),
             token_hash: Sha256::digest(token_bytes).into(),
+            remote_auth: None,
+            origin: new.origin,
             expires_at_ms: new.expires_at_ms,
             created_at_ms: new.created_at_ms,
             terminal_at_ms: None,
             state: CeremonyState::AwaitingUser,
             terminal_result: None,
+            result_retain_until_ms: None,
             verification_credentials: new.verification_credentials,
             policy_update: new.policy_update,
+            cross_surface: None,
+            auxiliary: false,
             projection: BrowserProjection {
                 ceremony_id: new.ceremony_id,
                 ceremony_kind: new.ceremony_kind,
@@ -1765,6 +2946,7 @@ impl CeremonyBroker {
                 signer_contribution: new.signer_contribution,
                 webauthn_options: new.webauthn_options,
                 expires_at_ms: new.expires_at_ms,
+                cross_surface: None,
             },
         })
     }
@@ -1916,7 +3098,7 @@ impl CeremonyBroker {
         Some(Ok(SealedApprovalPrepareResponse {
             approval_id: manifest.approval_id.clone(),
             state: ApprovalPrepareState::AwaitingCeremony,
-            ceremony_url: self.ceremony_session_url(&token_for(session)),
+            ceremony_url: session_url(session),
             ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             review_manifest_digest: digest(&manifest).ok()?,
         }))
@@ -1942,7 +3124,7 @@ impl CeremonyBroker {
             ceremony_kind: kind_to_machine(session.ceremony_kind),
             custody_operation_id: operation_id.clone(),
             state: CustodyPrepareState::AwaitingUser,
-            ceremony_url: self.ceremony_session_url(&token_for(session)),
+            ceremony_url: session_url(session),
             ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             signer_contribution_digest: contribution.digest().ok()?,
         }))
@@ -1966,7 +3148,7 @@ impl CeremonyBroker {
         Some(Ok(PolicyUpdatePrepareResponse {
             operation_id: operation_id.clone(),
             ceremony_kind: BrokerCeremonyKind::PolicyUpdate,
-            ceremony_url: self.ceremony_session_url(&token_for(session)),
+            ceremony_url: session_url(session),
             ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             review_manifest_digest: review_manifest_digest.clone(),
         }))
@@ -2023,7 +3205,7 @@ impl CeremonyBroker {
             .is_some_and(|journal| journal.audit_degraded());
 
         for (ceremony_id, operation_id, encoded) in rows {
-            let mut session: BrowserSession = match serde_json::from_str(&encoded) {
+            let mut session = match decode_stored_browser_session(&encoded) {
                 Ok(session) => session,
                 Err(error) => {
                     let decode_error = error.to_string();
@@ -2046,8 +3228,39 @@ impl CeremonyBroker {
                     continue;
                 }
             };
+            let parsed_operation = OperationId::new(operation_id)?;
+            if parsed_operation != session.operation_id
+                || ceremony_id != session.projection.ceremony_id.as_str()
+            {
+                return Err(protocol(
+                    ProtocolErrorCode::MalformedFrame,
+                    "durable ceremony index does not match its signed session",
+                ));
+            }
+            if matches!(
+                session.state,
+                CeremonyState::WalletCommitted | CeremonyState::AwaitingRecoveryAck
+            ) {
+                validate_completion_identity(
+                    session.ceremony_kind,
+                    &session.operation_id,
+                    &session.projection.ceremony_id,
+                    session.terminal_result.as_ref().ok_or_else(not_found)?,
+                )?;
+            }
             let preserve_awaiting = session.state == CeremonyState::AwaitingRecoveryAck
                 && session.expires_at_ms > unix_time_ms();
+            if session.auxiliary {
+                // Cross-surface source unlock material lives only in Signer
+                // memory. A process restart can never resume that authority.
+                if !is_terminal(session.state) {
+                    session.state = CeremonyState::Expired;
+                    latch_terminal(&mut session, unix_time_ms());
+                    self.persist_session(&session)?;
+                }
+                self.inner.sessions.lock().insert(ceremony_id, session);
+                continue;
+            }
             if audit_degraded {
                 // AC-18 keeps the exact durable read/status projection
                 // available while every security mutation remains latched.
@@ -2100,15 +3313,6 @@ impl CeremonyBroker {
                     )?;
                 }
                 self.persist_session(&session)?;
-            }
-            let parsed_operation = OperationId::new(operation_id)?;
-            if parsed_operation != session.operation_id
-                || ceremony_id != session.projection.ceremony_id.as_str()
-            {
-                return Err(protocol(
-                    ProtocolErrorCode::MalformedFrame,
-                    "durable ceremony index does not match its signed session",
-                ));
             }
             self.inner
                 .operations
@@ -2360,9 +3564,7 @@ impl CeremonyBroker {
                 );
                 let mut failed = committed;
                 failed.state = CeremonyState::Failed;
-                failed.terminal_at_ms = Some(now_ms);
-                failed.token = None;
-                failed.token_hash = [0_u8; 32];
+                latch_terminal(&mut failed, now_ms);
                 self.persist_session(&failed)?;
                 self.inner
                     .sessions
@@ -2378,6 +3580,15 @@ impl CeremonyBroker {
         let mut finalized = committed;
         if has_sensitive_output {
             finalized.state = CeremonyState::AwaitingRecoveryAck;
+            finalized.expires_at_ms = now_ms.saturating_add(OUTPUT_ACK_TTL_MS);
+        } else if finalized
+            .cross_surface
+            .as_ref()
+            .is_some_and(|flow| flow.role == CrossSurfaceRole::Destination)
+        {
+            finalized.state = CeremonyState::Succeeded;
+            finalized.terminal_at_ms = Some(now_ms);
+            finalized.result_retain_until_ms = Some(now_ms.saturating_add(OUTPUT_ACK_TTL_MS));
             finalized.expires_at_ms = now_ms.saturating_add(OUTPUT_ACK_TTL_MS);
         } else {
             finalized.state = finalized
@@ -2396,10 +3607,104 @@ impl CeremonyBroker {
 }
 
 async fn shell(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
-    if broker.validate_host(&headers).is_err() {
+    if broker.validate_served_host(&headers).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    // Explicit empty fragment prevents browsers inheriting any capability
+    // fragment from an old bare-root launch URL during the redirect.
+    Redirect::to("https://bloom.directory/#").into_response()
+}
+
+async fn ceremony_resume_shell(
+    State(broker): State<CeremonyBroker>,
+    headers: HeaderMap,
+) -> Response {
+    if broker.validate_served_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     Html(SHELL_HTML).into_response()
+}
+
+async fn remote_health(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    if broker.serves_local() || broker.validate_served_host(&headers).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn exchange_remote_fragment(
+    State(broker): State<CeremonyBroker>,
+    headers: HeaderMap,
+    Json(body): Json<RemoteFragmentExchange>,
+) -> Response {
+    if broker.serves_local()
+        || broker.validate_served_host(&headers).is_err()
+        || require_exact_header(&headers, header::ORIGIN, &broker.served_origin).is_err()
+        || require_exact_header(&headers, header::CONTENT_TYPE, "application/json").is_err()
+        || require_exact_header_name(&headers, "sec-fetch-site", "same-origin").is_err()
+        || body.capability.decode().len() != 32
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if broker.expire_sessions(unix_time_ms()).is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let _exchange_guard = broker.inner.creation_admission.lock();
+    let token_hash = <[u8; 32]>::from(Sha256::digest(body.capability.decode()));
+    let (ceremony_id, mut snapshot) = {
+        let sessions = broker.inner.sessions.lock();
+        let Some((id, session)) = sessions.iter().find(|(_, session)| {
+            session.token_hash == token_hash
+                && session.origin == broker.served_origin
+                && session.state == CeremonyState::AwaitingUser
+                && session.expires_at_ms > unix_time_ms()
+        }) else {
+            broker.record_invalid_browser_token();
+            return StatusCode::FORBIDDEN.into_response();
+        };
+        let mut snapshot = session.clone();
+        snapshot.token = None;
+        snapshot.token_hash = [0; 32];
+        (id.clone(), snapshot)
+    };
+    let mut cookie = [0_u8; 32];
+    let mut csrf = [0_u8; 32];
+    if SysRng.try_fill_bytes(&mut cookie).is_err() || SysRng.try_fill_bytes(&mut csrf).is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    snapshot.remote_auth = Some(RemoteBrowserAuth {
+        cookie_hash: Sha256::digest(cookie).into(),
+        csrf_hash: Sha256::digest(csrf).into(),
+        precommit_expires_at_ms: snapshot
+            .expires_at_ms
+            .min(unix_time_ms().saturating_add(REMOTE_PRECOMMIT_SESSION_MS)),
+        expires_at_ms: unix_time_ms().saturating_add(REMOTE_COOKIE_MAX_MS),
+    });
+    if broker.persist_session(&snapshot).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    broker
+        .inner
+        .sessions
+        .lock()
+        .insert(ceremony_id.clone(), snapshot.clone());
+    let cookie_value = Base64UrlBytes::from_bytes(&cookie);
+    let csrf_value = Base64UrlBytes::from_bytes(&csrf);
+    let mut response = Json(serde_json::json!({
+        "ceremony_id": ceremony_id,
+        "csrf": csrf_value,
+    }))
+    .into_response();
+    let set_cookie = format!(
+        "__Host-bloom-ceremony-{ceremony_id}={}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=1500",
+        cookie_value.encoded(),
+    );
+    if let Ok(value) = HeaderValue::from_str(&set_cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    } else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    response
 }
 
 async fn ceremony_shell(
@@ -2407,7 +3712,7 @@ async fn ceremony_shell(
     Path(token): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if broker.validate_host(&headers).is_err() {
+    if broker.validate_served_host(&headers).is_err() || !broker.serves_local() {
         return StatusCode::FORBIDDEN.into_response();
     }
     if broker.expire_sessions(unix_time_ms()).is_err() {
@@ -2421,7 +3726,7 @@ async fn ceremony_shell(
 }
 
 async fn app_js(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
-    if broker.validate_host(&headers).is_err() {
+    if broker.validate_served_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     (
@@ -2435,7 +3740,7 @@ async fn app_js(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Res
 }
 
 async fn style_css(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
-    if broker.validate_host(&headers).is_err() {
+    if broker.validate_served_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     (
@@ -2446,7 +3751,7 @@ async fn style_css(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> 
 }
 
 async fn bloom_primary_svg(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
-    if broker.validate_host(&headers).is_err() {
+    if broker.validate_served_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     (
@@ -2461,7 +3766,7 @@ async fn read_session(
     Path(ceremony_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if broker.validate_host(&headers).is_err()
+    if broker.validate_served_host(&headers).is_err()
         || broker
             .authorize_browser(&ceremony_id, &headers, false)
             .is_err()
@@ -2495,7 +3800,7 @@ async fn read_result(
     Path(ceremony_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if broker.validate_host(&headers).is_err()
+    if broker.validate_served_host(&headers).is_err()
         || broker
             .authorize_browser(&ceremony_id, &headers, false)
             .is_err()
@@ -2506,10 +3811,20 @@ async fn read_result(
     let Some(session) = sessions.get(&ceremony_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if !matches!(
-        session.state,
-        CeremonyState::WalletCommitted | CeremonyState::AwaitingRecoveryAck
-    ) {
+    let cross_result = session
+        .cross_surface
+        .as_ref()
+        .is_some_and(|flow| flow.role == CrossSurfaceRole::Destination)
+        && session.state == CeremonyState::Succeeded
+        && session
+            .result_retain_until_ms
+            .is_some_and(|deadline| deadline > unix_time_ms());
+    if !cross_result
+        && !matches!(
+            session.state,
+            CeremonyState::WalletCommitted | CeremonyState::AwaitingRecoveryAck
+        )
+    {
         return StatusCode::CONFLICT.into_response();
     }
     session
@@ -2517,6 +3832,96 @@ async fn read_result(
         .as_ref()
         .map(|result| Json(result).into_response())
         .unwrap_or_else(|| StatusCode::CONFLICT.into_response())
+}
+
+async fn cross_surface_pair(
+    State(broker): State<CeremonyBroker>,
+    Path(ceremony_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<CrossPairBody>,
+) -> Response {
+    if broker
+        .authorize_browser(&ceremony_id, &headers, true)
+        .is_err()
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let result = broker.pair_cross_surface(&ceremony_id, body, unix_time_ms());
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(error)).into_response(),
+    }
+}
+
+async fn cross_surface_authorize(
+    State(broker): State<CeremonyBroker>,
+    Path(ceremony_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<CrossAuthorizeBody>,
+) -> Response {
+    if broker
+        .authorize_browser(&ceremony_id, &headers, true)
+        .is_err()
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match broker.authorize_cross_surface(&ceremony_id, body, unix_time_ms()) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(error)).into_response(),
+    }
+}
+
+async fn cross_surface_handoff(
+    State(broker): State<CeremonyBroker>,
+    Path(ceremony_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if broker
+        .authorize_browser(&ceremony_id, &headers, false)
+        .is_err()
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match broker.cross_surface_handoff(&ceremony_id, unix_time_ms()) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(error)).into_response(),
+    }
+}
+
+async fn cross_surface_finish(
+    State(broker): State<CeremonyBroker>,
+    Path(ceremony_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<CrossFinishBody>,
+) -> Response {
+    if broker
+        .authorize_browser(&ceremony_id, &headers, true)
+        .is_err()
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match broker.finish_cross_surface(&ceremony_id, body, unix_time_ms()) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(error)).into_response(),
+    }
+}
+
+async fn cross_surface_already_registered(
+    State(broker): State<CeremonyBroker>,
+    Path(ceremony_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<CrossAlreadyRegisteredBody>,
+) -> Response {
+    if broker
+        .authorize_browser(&ceremony_id, &headers, true)
+        .is_err()
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match broker.already_registered_cross_surface(&ceremony_id, body, unix_time_ms()) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(error)).into_response(),
+    }
 }
 
 async fn acknowledge_result(
@@ -2605,6 +4010,8 @@ async fn complete_session(
         .sessions
         .lock()
         .insert(ceremony_id.clone(), verifying_snapshot.clone());
+    let recovery_error_floor = (ceremony_kind == CeremonyKind::WalletRecovery)
+        .then(|| tokio::time::Instant::now() + Duration::from_millis(750));
     let result = if ceremony_kind == CeremonyKind::SealedApproval {
         let contribution: SignerCeremonyContribution =
             match serde_json::from_value(projection.signer_contribution.clone()) {
@@ -2732,8 +4139,21 @@ async fn complete_session(
                 }
                 broker.inner.sessions.lock().insert(ceremony_id, snapshot);
             }
-            // The browser needs the structured rejection either way: a failed
-            // best-effort cancel must never replace it with an empty 500.
+            if let Some(floor) = recovery_error_floor {
+                // The browser recovery ceremony must not distinguish an
+                // unknown wallet/recovery ID from a wrong factor or proof.
+                // The Signer keeps its typed internal audit error.
+                tokio::time::sleep_until(floor).await;
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(protocol(
+                        ProtocolErrorCode::BackendInvalidRequest,
+                        "Recovery could not be completed",
+                    )),
+                )
+                    .into_response();
+            }
+            // Ordinary browser ceremonies retain their structured rejection.
             (StatusCode::BAD_REQUEST, Json(error)).into_response()
         }
     }
@@ -2865,11 +4285,24 @@ impl CeremonyBroker {
 
     fn authorize_browser_token(&self, headers: &HeaderMap) -> Result<String, ProtocolError> {
         self.expire_sessions(unix_time_ms())?;
-        self.validate_host(headers)?;
+        self.validate_served_host(headers)?;
+        if !self.serves_local() {
+            return Err(protocol(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "remote sessions require fragment exchange",
+            ));
+        }
         let ceremony_id = headers
             .get("x-bloom-ceremony-token")
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| self.ceremony_for_encoded_token(value));
+            .and_then(|value| self.ceremony_for_encoded_token(value))
+            .filter(|id| {
+                self.inner
+                    .sessions
+                    .lock()
+                    .get(id)
+                    .is_some_and(|session| session.origin == self.served_origin)
+            });
         if let Some(ceremony_id) = ceremony_id {
             return Ok(ceremony_id);
         }
@@ -2891,11 +4324,14 @@ impl CeremonyBroker {
         mutation: bool,
     ) -> Result<(), ProtocolError> {
         self.expire_sessions(unix_time_ms())?;
-        self.validate_host(headers)?;
+        self.validate_served_host(headers)?;
         if mutation {
-            self.validate_origin(headers)?;
+            self.validate_served_origin(headers)?;
             require_exact_header(headers, header::CONTENT_TYPE, "application/json")?;
             require_exact_header_name(headers, "sec-fetch-site", "same-origin")?;
+        }
+        if !self.serves_local() {
+            return self.authorize_remote_cookie(ceremony_id, headers, mutation);
         }
         let supplied = headers
             .get("x-bloom-ceremony-token")
@@ -2903,7 +4339,10 @@ impl CeremonyBroker {
             .and_then(|value| Base64UrlBytes::parse(value.to_owned()).ok())
             .filter(|value| value.decode().len() == 32);
         let sessions = self.inner.sessions.lock();
-        let expected = sessions.get(ceremony_id).map(|session| session.token_hash);
+        let expected = sessions
+            .get(ceremony_id)
+            .filter(|session| session.origin == self.served_origin)
+            .map(|session| session.token_hash);
         let valid = supplied
             .map(|token| {
                 Sha256::digest(token.decode()).as_slice()
@@ -2925,6 +4364,124 @@ impl CeremonyBroker {
         Ok(())
     }
 
+    /// Whether this handle serves the local listener on the configured port.
+    fn serves_local(&self) -> bool {
+        self.served_origin == self.inner.endpoint.origin()
+    }
+
+    fn validate_served_host(&self, headers: &HeaderMap) -> Result<(), ProtocolError> {
+        if self.serves_local() {
+            return require_exact_header(headers, header::HOST, &self.inner.endpoint.host());
+        }
+        let expected = self.served_origin.strip_prefix("https://").ok_or_else(|| {
+            protocol(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "invalid served origin",
+            )
+        })?;
+        require_exact_header(headers, header::HOST, expected)
+    }
+
+    /// Exact `Origin` check against the served origin; a mismatch names the
+    /// expected origin in the log while the HTTP response stays a bare 403.
+    fn validate_served_origin(&self, headers: &HeaderMap) -> Result<(), ProtocolError> {
+        let observed = headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok());
+        check_origin(observed, &self.served_origin)
+    }
+
+    fn authorize_remote_cookie(
+        &self,
+        ceremony_id: &str,
+        headers: &HeaderMap,
+        mutation: bool,
+    ) -> Result<(), ProtocolError> {
+        let cookie_name = format!("__Host-bloom-ceremony-{ceremony_id}=");
+        // HTTP/2 permits a browser to split its Cookie header into multiple
+        // fields. Earlier ceremonies leave other scoped cookies behind, so
+        // the requested ceremony's cookie may not be in the first field.
+        // Ambiguous duplicates of this exact name are never accepted.
+        let mut cookie_value = None;
+        for field in headers.get_all(header::COOKIE) {
+            let field = field.to_str().map_err(|_| {
+                protocol(
+                    ProtocolErrorCode::UnauthenticatedPeer,
+                    "invalid remote ceremony cookie header",
+                )
+            })?;
+            for part in field.split(';').map(str::trim) {
+                if let Some(value) = part.strip_prefix(&cookie_name) {
+                    if cookie_value.replace(value).is_some() {
+                        return Err(protocol(
+                            ProtocolErrorCode::UnauthenticatedPeer,
+                            "duplicate remote ceremony cookie",
+                        ));
+                    }
+                }
+            }
+        }
+        let cookie = cookie_value
+            .and_then(|value| Base64UrlBytes::parse(value.to_owned()).ok())
+            .filter(|value| value.decode().len() == 32);
+        let hash = cookie
+            .map(|value| <[u8; 32]>::from(Sha256::digest(value.decode())))
+            .ok_or_else(|| {
+                protocol(
+                    ProtocolErrorCode::UnauthenticatedPeer,
+                    "missing remote ceremony session",
+                )
+            })?;
+        let sessions = self.inner.sessions.lock();
+        let session = sessions.get(ceremony_id).ok_or_else(|| {
+            protocol(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "unknown remote ceremony session",
+            )
+        })?;
+        let remote = session.remote_auth.as_ref().ok_or_else(|| {
+            protocol(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "unknown remote ceremony session",
+            )
+        })?;
+        if remote.cookie_hash != hash
+            || !remote.allows(
+                session.state,
+                session.result_retain_until_ms,
+                unix_time_ms(),
+            )
+        {
+            return Err(protocol(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "remote ceremony session expired",
+            ));
+        }
+        if mutation {
+            let csrf = headers
+                .get("x-bloom-csrf")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| Base64UrlBytes::parse(value.to_owned()).ok())
+                .filter(|value| value.decode().len() == 32)
+                .ok_or_else(|| {
+                    protocol(ProtocolErrorCode::UnauthenticatedPeer, "missing CSRF proof")
+                })?;
+            if <[u8; 32]>::from(Sha256::digest(csrf.decode())) != remote.csrf_hash {
+                return Err(protocol(
+                    ProtocolErrorCode::UnauthenticatedPeer,
+                    "invalid CSRF proof",
+                ));
+            }
+        }
+        if session.origin != self.served_origin {
+            return Err(protocol(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "ceremony surface mismatch",
+            ));
+        }
+        Ok(())
+    }
+
     fn record_invalid_browser_token(&self) -> bool {
         let source = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let mut attempts = self.inner.invalid_attempts.lock();
@@ -2934,8 +4491,41 @@ impl CeremonyBroker {
     }
 }
 
-async fn security_headers(request: Request<Body>, next: Next) -> Response {
-    let mut response = next.run(request).await;
+async fn security_headers(mut request: Request<Body>, next: Next) -> Response {
+    let mut response = if normalize_http2_authority(&mut request).is_ok() {
+        next.run(request).await
+    } else {
+        StatusCode::FORBIDDEN.into_response()
+    };
+    apply_security_headers(&mut response);
+    response
+}
+
+/// Hyper exposes HTTP/2 `:authority` through the request URI, while the
+/// ceremony handlers deliberately consume one strict `Host` value. Normalize
+/// that transport representation once for every route. HTTP/1 remains
+/// unchanged, and a client cannot override the authority with a conflicting or
+/// duplicate Host header.
+fn normalize_http2_authority(request: &mut Request<Body>) -> Result<(), ()> {
+    if request.version() != Version::HTTP_2 {
+        return Ok(());
+    }
+
+    let authority = request.uri().authority().ok_or(())?.as_str();
+    let mut hosts = request.headers().get_all(header::HOST).iter();
+    if let Some(host) = hosts.next() {
+        if hosts.next().is_some() || host.as_bytes() != authority.as_bytes() {
+            return Err(());
+        }
+        return Ok(());
+    }
+
+    let host = HeaderValue::from_str(authority).map_err(|_| ())?;
+    request.headers_mut().insert(header::HOST, host);
+    Ok(())
+}
+
+fn apply_security_headers(response: &mut Response) {
     let headers = response.headers_mut();
     // This marker is diagnostic only. It lets a Machine whose authenticated
     // Unix edge is unavailable report that a Bloom-shaped listener appears to
@@ -2965,21 +4555,6 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
         HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
     );
-    response
-}
-
-impl CeremonyBroker {
-    fn validate_host(&self, headers: &HeaderMap) -> Result<(), ProtocolError> {
-        require_exact_header(headers, header::HOST, &self.inner.endpoint.host())
-    }
-
-    fn validate_origin(&self, headers: &HeaderMap) -> Result<(), ProtocolError> {
-        let expected = self.inner.endpoint.origin();
-        let observed = headers
-            .get(header::ORIGIN)
-            .and_then(|value| value.to_str().ok());
-        check_origin(observed, &expected)
-    }
 }
 
 /// Reject a ceremony `Origin` that is not this Broker's endpoint origin. The
@@ -3025,6 +4600,18 @@ fn require_exact_header_name(
     require_exact_header(headers, HeaderName::from_static(name), expected)
 }
 
+/// Launch URL for a session on its own origin. Local surfaces are plain
+/// HTTP on this Broker's ceremony port and carry the token in the path; the
+/// hosted relay is HTTPS and carries a one-use capability in the fragment.
+fn session_url(session: &BrowserSession) -> String {
+    let token = token_for(session);
+    if session.origin.starts_with("http://") {
+        format!("{}/ceremony/{}", session.origin, token.encoded())
+    } else {
+        format!("{}/ceremony/#cap={}", session.origin, token.encoded())
+    }
+}
+
 fn token_for(session: &BrowserSession) -> Base64UrlBytes {
     session
         .token
@@ -3035,10 +4622,30 @@ fn token_for(session: &BrowserSession) -> Base64UrlBytes {
 /// Stamp when a session reached its terminal state and destroy the launch
 /// token material. Every terminal state latches identically: no terminal
 /// session may keep a usable bearer token, whichever state ended it.
+/// The destination's own surface approves when the wallet has an active
+/// passkey there; otherwise the other usable surface does, if it has one.
+fn approving_surface(
+    credentials: &[bloom_signer_api::CredentialPublic],
+    destination: &SurfaceDescriptor,
+    other: Option<SurfaceDescriptor>,
+) -> Option<SurfaceDescriptor> {
+    let has_passkey_on = |surface: &SurfaceRef| {
+        credentials.iter().any(|credential| {
+            credential.state == bloom_signer_api::CredentialState::Active
+                && &credential.surface == surface
+        })
+    };
+    if has_passkey_on(&destination.reference()) {
+        return Some(destination.clone());
+    }
+    other.filter(|other| has_passkey_on(&other.reference()))
+}
+
 fn latch_terminal(session: &mut BrowserSession, now_ms: u64) {
     session.terminal_at_ms = Some(now_ms);
     session.token = None;
     session.token_hash = [0_u8; 32];
+    session.remote_auth = None;
 }
 
 fn is_terminal(state: CeremonyState) -> bool {
@@ -3049,6 +4656,7 @@ fn is_terminal(state: CeremonyState) -> bool {
             | CeremonyState::Cancelled
             | CeremonyState::Expired
             | CeremonyState::Failed
+            | CeremonyState::AlreadyRegistered
     )
 }
 
@@ -3086,6 +4694,7 @@ fn ceremony_state_name(state: CeremonyState) -> &'static str {
         CeremonyState::Cancelled => "cancelled",
         CeremonyState::Expired => "expired",
         CeremonyState::Failed => "failed",
+        CeremonyState::AlreadyRegistered => "already_registered",
     }
 }
 
@@ -3433,18 +5042,89 @@ fn open_audited_ceremony_store(
                 "ceremony database mutex poisoned",
             )
         })?;
+        guard_ceremony_storage_version(&connection)?;
         connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS ceremony_sessions (
                     ceremony_id TEXT PRIMARY KEY,
-                    operation_id TEXT NOT NULL UNIQUE,
+                    operation_id TEXT NOT NULL,
                     session_jcs TEXT NOT NULL
                 );",
             )
             .map_err(storage)?;
         migrate_legacy_ceremonies(&mut connection, &legacy, journal)?;
+        let transaction = connection.transaction().map_err(storage)?;
+        if migrate_pairing_session_index(&transaction)? {
+            journal
+                .append_external_audit(
+                    &transaction,
+                    "storage.ceremony_pairing_index_migrated",
+                    &serde_json::json!({"primary_operation_uniqueness": true}),
+                )
+                .map_err(storage)?;
+        }
+        transaction.commit().map_err(storage)?;
+        connection
+            .pragma_update(None, "user_version", CEREMONY_STORAGE_VERSION)
+            .map_err(storage)?;
     }
     Ok(database)
+}
+
+// A pairing has one primary destination session and an auxiliary source session
+// with the same logical operation. Preserve the primary uniqueness constraint
+// while permitting the source to be stored under its own ceremony ID.
+fn migrate_pairing_session_index(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<bool, ProtocolError> {
+    let old_unique: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_index_list('ceremony_sessions') AS idx
+         JOIN pragma_index_info(idx.name) AS col
+         WHERE idx.\"unique\" = 1 AND idx.partial = 0 AND col.name = 'operation_id')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if !old_unique {
+        transaction
+            .execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ceremony_primary_operation
+             ON ceremony_sessions(operation_id)
+             WHERE COALESCE(json_extract(session_jcs, '$.auxiliary'), 0) = 0;",
+            )
+            .map_err(storage)?;
+        return Ok(false);
+    }
+    transaction
+        .execute_batch(
+            "ALTER TABLE ceremony_sessions RENAME TO ceremony_sessions_before_pairing;
+         CREATE TABLE ceremony_sessions (
+             ceremony_id TEXT PRIMARY KEY,
+             operation_id TEXT NOT NULL,
+             session_jcs TEXT NOT NULL
+         );
+         INSERT INTO ceremony_sessions SELECT * FROM ceremony_sessions_before_pairing;
+         DROP TABLE ceremony_sessions_before_pairing;
+         CREATE UNIQUE INDEX ceremony_primary_operation ON ceremony_sessions(operation_id)
+             WHERE COALESCE(json_extract(session_jcs, '$.auxiliary'), 0) = 0;",
+        )
+        .map_err(storage)?;
+    Ok(true)
+}
+
+/// The consolidated Broker database owns ceremony session persistence. A
+/// future schema cannot be interpreted by this binary; existing v0/v1 rows
+/// are decoded by the normal legacy session migration path before this gate
+/// advances the marker.
+fn guard_ceremony_storage_version(connection: &Connection) -> Result<(), ProtocolError> {
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(storage)?;
+    if !(0..=CEREMONY_STORAGE_VERSION).contains(&version) {
+        return Err(storage("unsupported ceremony storage version"));
+    }
+    Ok(())
 }
 
 fn migrate_legacy_ceremonies(
@@ -3773,6 +5453,147 @@ fn custody_review_manifest(
         manifest["key_ref"] = serde_json::to_value(key_ref).map_err(malformed)?;
     }
     Ok(Some(manifest))
+}
+
+#[cfg(test)]
+mod remote_storage_tests {
+    use super::*;
+
+    #[test]
+    fn pairing_storage_migration_retains_primary_uniqueness_and_auxiliary_rows() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ceremony_sessions (
+                ceremony_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE,
+                session_jcs TEXT NOT NULL);
+             INSERT INTO ceremony_sessions VALUES ('destination', 'operation', '{}');",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(migrate_pairing_session_index(&transaction).unwrap());
+        transaction.commit().unwrap();
+        connection
+            .execute(
+                "INSERT INTO ceremony_sessions VALUES ('source', 'operation', ?1)",
+                [r#"{"auxiliary":true}"#],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO ceremony_sessions VALUES ('duplicate', 'operation', '{}')",
+                    [],
+                )
+                .is_err()
+        );
+        drop(connection);
+        let mut reopened = Connection::open(file.path()).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("SELECT COUNT(*) FROM ceremony_sessions", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let transaction = reopened.transaction().unwrap();
+        assert!(!migrate_pairing_session_index(&transaction).unwrap());
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn precommit_cookie_expires_even_while_browser_cookie_remains_present() {
+        let auth = RemoteBrowserAuth {
+            cookie_hash: [1; 32],
+            csrf_hash: [2; 32],
+            precommit_expires_at_ms: 5 * 60_000,
+            expires_at_ms: 25 * 60_000,
+        };
+        assert!(auth.allows(CeremonyState::AwaitingUser, None, 5 * 60_000 - 1));
+        assert!(!auth.allows(CeremonyState::AwaitingUser, None, 5 * 60_000));
+        assert!(auth.allows(CeremonyState::AwaitingRecoveryAck, None, 15 * 60_000));
+        assert!(!auth.allows(CeremonyState::AwaitingRecoveryAck, None, 25 * 60_000));
+        assert!(auth.allows(CeremonyState::Succeeded, Some(20 * 60_000), 19 * 60_000));
+        assert!(!auth.allows(CeremonyState::Succeeded, Some(20 * 60_000), 20 * 60_000));
+        let persisted = serde_json::to_string(&auth).unwrap();
+        let restored: RemoteBrowserAuth = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(restored, auth);
+    }
+
+    #[test]
+    fn ceremony_store_rejects_future_schema() {
+        let connection = Connection::open_in_memory().unwrap();
+        guard_ceremony_storage_version(&connection).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        guard_ceremony_storage_version(&connection).unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
+        assert!(guard_ceremony_storage_version(&connection).is_err());
+    }
+}
+
+#[cfg(test)]
+mod approving_surface_tests {
+    use super::*;
+
+    fn descriptor(identity: bloom_signer_api::SurfaceIdentity) -> SurfaceDescriptor {
+        let reference = identity.reference().unwrap();
+        SurfaceDescriptor {
+            identity,
+            identity_digest: reference.identity_digest,
+            lifecycle: SurfaceLifecycle::Active,
+            lifecycle_revision: DecimalU64::new(0),
+        }
+    }
+
+    fn passkey(
+        surface: &SurfaceDescriptor,
+        state: bloom_signer_api::CredentialState,
+    ) -> bloom_signer_api::CredentialPublic {
+        bloom_signer_api::CredentialPublic {
+            credential_id: Base64UrlBytes::from_bytes(&[1; 16]),
+            wallet_id: Token::new("main").unwrap(),
+            surface: surface.reference(),
+            created_at_ms: DecimalU64::new(1),
+            state,
+        }
+    }
+
+    #[test]
+    fn same_surface_is_preferred_then_the_other_surface_then_nothing() {
+        use bloom_signer_api::CredentialState::{Active, Revoked};
+        let local = descriptor(bloom_signer_api::SurfaceIdentity::local(0));
+        let remote = descriptor(
+            bloom_signer_api::SurfaceIdentity::remote(
+                "abcdefghijklmnopqrstuv2345.relay.bloom.directory",
+                1,
+            )
+            .unwrap(),
+        );
+        let chosen = |credentials: &[bloom_signer_api::CredentialPublic],
+                      other: Option<&SurfaceDescriptor>| {
+            approving_surface(credentials, &remote, other.cloned())
+                .map(|surface| surface.identity.surface_id.as_str().to_owned())
+        };
+        // A phone joining a wallet whose passkeys are remote.
+        assert_eq!(
+            chosen(
+                &[passkey(&remote, Active), passkey(&local, Active)],
+                Some(&local)
+            )
+            .as_deref(),
+            Some("remote")
+        );
+        // Only a localhost passkey: the original cross-surface addition.
+        assert_eq!(
+            chosen(&[passkey(&local, Active)], Some(&local)).as_deref(),
+            Some("local")
+        );
+        // Revoked passkeys and an unusable other surface approve nothing.
+        assert_eq!(chosen(&[passkey(&remote, Revoked)], Some(&local)), None);
+        assert_eq!(chosen(&[passkey(&local, Active)], None), None);
+        assert_eq!(chosen(&[], Some(&local)), None);
+    }
 }
 
 #[cfg(test)]

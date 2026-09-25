@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    http::{Request, StatusCode, header},
+    http::{Request, StatusCode, Version, header},
 };
 use bloom_audit_checkpoint::{AppendOutcome, CheckpointError, CheckpointSink};
 use bloom_broker::{
@@ -596,7 +596,7 @@ fn browser_ceremony_state_survives_reload_and_reuses_one_output_key() {
         );
     }
     let persisted_key_flow = asset
-        .split_once("async function outputRecipientFor(session)")
+        .split_once("async function outputRecipientFor(")
         .expect("asset must define persisted browser output-key state")
         .1
         .split_once("async function clearBrowserState(id)")
@@ -622,7 +622,8 @@ fn browser_reload_recovers_the_ceremony_token_from_tab_storage() {
 globalThis.crypto = require("node:crypto").webcrypto;
 globalThis.document = {{getElementById: () => ({{}})}};
 globalThis.location = {{pathname: "/"}};
-globalThis.history = {{replaceState: () => {{}}}};
+let resumedPath;
+globalThis.history = {{replaceState: (_state, _title, path) => {{ resumedPath = path; }} }};
 const stored = new Map([["bloom.ceremony.token.v1", {token:?}]]);
 globalThis.sessionStorage = {{
   getItem: key => stored.get(key) || null,
@@ -630,7 +631,7 @@ globalThis.sessionStorage = {{
   removeItem: key => stored.delete(key)
 }};
 {executable}
-if (token !== {token:?} || authHeaders["x-bloom-ceremony-token"] !== {token:?}) {{
+if (token !== {token:?} || authHeaders["x-bloom-ceremony-token"] !== {token:?} || resumedPath !== "/ceremony/") {{
   throw new Error("reload did not recover the ceremony token");
 }}
 process.stdout.write("browser-reload-ok");
@@ -704,7 +705,7 @@ process.stdout.write("browser-error-feedback-ok");
     );
     assert!(asset.contains("approve.onclick = () => run(session).catch(reportApprovalFailure)"));
     assert!(asset.contains("Cancellation failed. Please try again."));
-    assert!(asset.contains("Ceremony failed to load. Please refresh and try again."));
+    assert!(asset.contains("This link couldn’t be opened"));
 }
 
 #[test]
@@ -723,8 +724,10 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
     for required in [
         "href=\"/assets/style.css\"",
         "href=\"/assets/bloom-primary.svg\"",
+        // Paint under the Dynamic Island and home indicator; .page insets content.
+        "viewport-fit=cover",
         "src=\"/assets/bloom-primary.svg\"",
-        "Signed local review",
+        "Signed wallet review",
         "Review before continuing",
         "id=\"status\"",
         "id=\"review\"",
@@ -747,6 +750,10 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
     for required in [
         "--paper:#f4efe6",
         ".layout{display:grid",
+        "env(safe-area-inset-top,0px)",
+        "env(safe-area-inset-right,0px)",
+        "env(safe-area-inset-bottom,0px)",
+        "env(safe-area-inset-left,0px)",
         "@media(max-width:560px)",
     ] {
         assert!(
@@ -1050,6 +1057,7 @@ fn approval_request() -> CeremonyPrepareRequest {
         renewal_of: None,
     };
     CeremonyPrepareRequest {
+        surface: bloom_signer_api::legacy_local_surface(),
         activation_operation_id: operation("17"),
         terms,
         review_manifest_digest: digest("00"),
@@ -1060,15 +1068,22 @@ fn approval_request() -> CeremonyPrepareRequest {
 }
 
 struct MockSigner {
+    remote_enabled: bool,
+    remote_assigned: bool,
+    remote_ready: bool,
     completions: AtomicUsize,
     cancellations: AtomicUsize,
     custody_preparations: AtomicUsize,
     custody_prepare_events: Option<std::sync::mpsc::Sender<usize>>,
     first_custody_release: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     pending: parking_lot::Mutex<HashSet<OperationId>>,
+    completed_custody: parking_lot::Mutex<Option<(OperationId, CustodyResult)>>,
     reject_completion: bool,
+    completion_error: Option<bloom_signer_api::ProtocolErrorCode>,
     sensitive_result: bool,
     cancellation_fails: AtomicBool,
+    /// Surfaces holding one active passkey for every wallet.
+    passkey_surfaces: Vec<&'static str>,
 }
 
 struct RealSigner {
@@ -1145,6 +1160,7 @@ fn custody_result_to_machine(value: &CustodyResult) -> bloom_broker_api::Custody
             bloom_signer_api::CeremonyState::Cancelled => CeremonyState::Cancelled,
             bloom_signer_api::CeremonyState::Expired => CeremonyState::Expired,
             bloom_signer_api::CeremonyState::Failed => CeremonyState::Failed,
+            bloom_signer_api::CeremonyState::AlreadyRegistered => CeremonyState::AlreadyRegistered,
         }
     }
     fn key(value: &bloom_signer_api::KeyRef) -> KeyRef {
@@ -1187,6 +1203,14 @@ fn custody_result_to_machine(value: &CustodyResult) -> bloom_broker_api::Custody
         }
     }
     bloom_broker_api::CustodyResult {
+        surface: value
+            .surface
+            .as_ref()
+            .map(|surface| bloom_broker_api::CeremonySurfaceRef {
+                surface_id: surface.surface_id.clone(),
+                identity_digest: surface.identity_digest.clone(),
+            }),
+        credential_authority_generation: value.credential_authority_generation.clone(),
         ceremony_kind: kind(value.ceremony_kind),
         custody_operation_id: value.custody_operation_id.clone(),
         public_status: state(value.public_status),
@@ -1197,7 +1221,13 @@ fn custody_result_to_machine(value: &CustodyResult) -> bloom_broker_api::Custody
             .iter()
             .map(|credential| bloom_broker_api::CredentialSummary {
                 credential_id: credential.credential_id.clone(),
-                rp_id: credential.rp_id.clone(),
+                surface: credential.surface.as_ref().map(|surface| {
+                    bloom_broker_api::CeremonySurfaceRef {
+                        surface_id: surface.surface_id.clone(),
+                        identity_digest: surface.identity_digest.clone(),
+                    }
+                }),
+                rp_id: bloom_broker_api::RpId::new(credential.rp_id.as_str()).unwrap(),
                 active: credential.active,
             })
             .collect(),
@@ -1357,6 +1387,12 @@ impl CeremonyCompletionObserver for FailOnceAdoptionObserver {
 }
 
 impl CeremonySigner for RealSigner {
+    fn surface_status(
+        &self,
+    ) -> Result<bloom_signer_api::SurfaceStatus, bloom_signer_api::ProtocolError> {
+        self.service.surface_status()
+    }
+
     fn prepare_approval(
         &self,
         request: CeremonyPrepareRequest,
@@ -1516,21 +1552,58 @@ impl CeremonySigner for RealSigner {
 impl MockSigner {
     fn new() -> Self {
         Self {
+            remote_enabled: false,
+            remote_assigned: false,
+            remote_ready: false,
             completions: AtomicUsize::new(0),
             cancellations: AtomicUsize::new(0),
             custody_preparations: AtomicUsize::new(0),
             custody_prepare_events: None,
             first_custody_release: parking_lot::Mutex::new(None),
             pending: parking_lot::Mutex::new(HashSet::new()),
+            completed_custody: parking_lot::Mutex::new(None),
             reject_completion: false,
+            completion_error: None,
             sensitive_result: false,
             cancellation_fails: AtomicBool::new(false),
+            passkey_surfaces: vec!["local"],
         }
     }
 
     fn with_sensitive_result() -> Self {
         Self {
             sensitive_result: true,
+            ..Self::new()
+        }
+    }
+
+    fn with_remote_surface() -> Self {
+        Self {
+            remote_enabled: true,
+            remote_assigned: true,
+            remote_ready: true,
+            ..Self::new()
+        }
+    }
+
+    fn with_remote_degraded() -> Self {
+        Self {
+            remote_enabled: true,
+            remote_assigned: true,
+            ..Self::new()
+        }
+    }
+
+    fn with_remote_disabled() -> Self {
+        Self {
+            remote_assigned: true,
+            ..Self::new()
+        }
+    }
+
+    fn with_remote_unassigned() -> Self {
+        Self {
+            remote_enabled: true,
             ..Self::new()
         }
     }
@@ -1566,6 +1639,73 @@ impl MockSigner {
 }
 
 impl CeremonySigner for MockSigner {
+    fn credential_list_public(
+        &self,
+        request: bloom_signer_api::WalletRequest,
+    ) -> Result<Vec<bloom_signer_api::CredentialPublic>, bloom_signer_api::ProtocolError> {
+        let status = self.surface_status()?;
+        Ok(status
+            .surfaces
+            .iter()
+            .filter(|surface| {
+                self.passkey_surfaces
+                    .contains(&surface.identity.surface_id.as_str())
+            })
+            .map(|surface| bloom_signer_api::CredentialPublic {
+                credential_id: bloom_signer_api::Base64UrlBytes::from_bytes(&[1; 16]),
+                wallet_id: request.wallet_id.clone(),
+                surface: surface.reference(),
+                created_at_ms: DecimalU64::new(1),
+                state: bloom_signer_api::CredentialState::Active,
+            })
+            .collect())
+    }
+
+    fn surface_status(
+        &self,
+    ) -> Result<bloom_signer_api::SurfaceStatus, bloom_signer_api::ProtocolError> {
+        let identity = bloom_signer_api::SurfaceIdentity::local(0);
+        let reference = identity.reference()?;
+        let remote_identity = bloom_signer_api::SurfaceIdentity::remote(
+            "abcdefghijklmnopqrstuv2345.relay.bloom.directory",
+            1,
+        )?;
+        let remote_reference = remote_identity.reference()?;
+        let mut surfaces = vec![bloom_signer_api::SurfaceDescriptor {
+            identity,
+            identity_digest: reference.identity_digest,
+            lifecycle: bloom_signer_api::SurfaceLifecycle::Active,
+            lifecycle_revision: DecimalU64::new(0),
+        }];
+        if self.remote_assigned {
+            surfaces.push(bloom_signer_api::SurfaceDescriptor {
+                identity: remote_identity,
+                identity_digest: remote_reference.identity_digest,
+                lifecycle: bloom_signer_api::SurfaceLifecycle::Active,
+                lifecycle_revision: DecimalU64::new(1),
+            });
+        }
+        Ok(bloom_signer_api::SurfaceStatus {
+            surfaces,
+            installation_id: None,
+            installation_admin_key_sha256: None,
+            desired_mode: if self.remote_enabled {
+                bloom_signer_api::ExposureMode::RemoteEnabled
+            } else {
+                bloom_signer_api::ExposureMode::LocalhostOnly
+            },
+            desired_revision: DecimalU64::new(u64::from(self.remote_enabled)),
+            effective_mode: if self.remote_ready {
+                bloom_signer_api::ExposureMode::RemoteEnabled
+            } else {
+                bloom_signer_api::ExposureMode::LocalhostOnly
+            },
+            effective_revision: DecimalU64::new(u64::from(self.remote_ready)),
+            remote_tls_ready: self.remote_ready,
+            remote_routing_ready: self.remote_ready,
+        })
+    }
+
     fn prepare_approval(
         &self,
         request: CeremonyPrepareRequest,
@@ -1575,6 +1715,8 @@ impl CeremonySigner for MockSigner {
             .lock()
             .insert(request.activation_operation_id.clone());
         let mut contribution = SignerCeremonyContribution {
+            surface: request.surface.clone(),
+            credential_authority_generation: DecimalU64::new(0),
             ceremony_id: Digest32::from_bytes(
                 sha2::Sha256::digest(request.activation_operation_id.to_bytes()).into(),
             ),
@@ -1593,6 +1735,7 @@ impl CeremonySigner for MockSigner {
         };
         contribution.signer_signature = Base64UrlBytes::from_bytes(&[8; 64]);
         let challenge = CeremonyChallenge {
+            surface: request.surface,
             schema: Token::new("bloom.ceremony.challenge.v1").unwrap(),
             ceremony_id: contribution.ceremony_id.clone(),
             ceremony_kind: bloom_signer_api::CeremonyKind::SealedApproval,
@@ -1653,6 +1796,8 @@ impl CeremonySigner for MockSigner {
             sha2::Sha256::digest(request.custody_operation_id.to_bytes()).into(),
         );
         let mut contribution = CustodySignerContribution {
+            surface: request.surface.clone(),
+            credential_authority_generation: DecimalU64::new(0),
             ceremony_id: ceremony_id.clone(),
             ceremony_kind: request.ceremony_kind,
             custody_operation_id: request.custody_operation_id.clone(),
@@ -1674,6 +1819,7 @@ impl CeremonySigner for MockSigner {
         // dropping or reconstruction observable in the relay test.
         contribution.signer_signature = Base64UrlBytes::from_bytes(&[9; 64]);
         let challenge = CeremonyChallenge {
+            surface: request.surface,
             schema: Token::new("bloom.ceremony.challenge.v1").unwrap(),
             ceremony_id,
             ceremony_kind: request.ceremony_kind,
@@ -1701,6 +1847,12 @@ impl CeremonySigner for MockSigner {
         request: CustodyCompleteRequest,
         _now_ms: u64,
     ) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
+        if let Some(code) = self.completion_error {
+            return Err(bloom_signer_api::ProtocolError::new(
+                code,
+                "distinct internal recovery reason that must not reach browser",
+            ));
+        }
         if self.reject_completion {
             return Err(bloom_signer_api::ProtocolError::new(
                 bloom_signer_api::ProtocolErrorCode::UnauthenticatedPeer,
@@ -1709,6 +1861,8 @@ impl CeremonySigner for MockSigner {
         }
         self.completions.fetch_add(1, Ordering::SeqCst);
         Ok(CustodyResult {
+            surface: Some(bloom_signer_api::legacy_local_surface()),
+            credential_authority_generation: Some(DecimalU64::new(0)),
             ceremony_kind: request.ceremony_kind,
             custody_operation_id: request.custody_operation_id,
             public_status: request.ceremony_kind.successful_terminal_state().unwrap(),
@@ -1758,6 +1912,17 @@ impl CeremonySigner for MockSigner {
     }
 
     fn cancel(&self, operation_id: &OperationId) -> Result<(), bloom_signer_api::ProtocolError> {
+        if self
+            .completed_custody
+            .lock()
+            .as_ref()
+            .is_some_and(|(completed, _)| completed == operation_id)
+        {
+            return Err(bloom_signer_api::ProtocolError::new(
+                bloom_signer_api::ProtocolErrorCode::OperationIdConflict,
+                "completed ceremonies cannot be cancelled",
+            ));
+        }
         self.cancellations.fetch_add(1, Ordering::SeqCst);
         if self.cancellation_fails.load(Ordering::SeqCst) {
             // The operation stays pending: the Signer still holds the wallet's
@@ -1787,6 +1952,13 @@ impl CeremonySigner for MockSigner {
         &self,
         operation_id: &OperationId,
     ) -> Result<SignerCeremonyStatus, bloom_signer_api::ProtocolError> {
+        if let Some((completed_operation, result)) = self.completed_custody.lock().as_ref() {
+            if completed_operation == operation_id {
+                return Ok(SignerCeremonyStatus::CompletedCustody(Box::new(
+                    result.clone(),
+                )));
+            }
+        }
         Ok(if self.pending.lock().contains(operation_id) {
             SignerCeremonyStatus::Pending
         } else {
@@ -1803,6 +1975,7 @@ fn try_prepare(
 ) -> Result<CustodyPrepareResponse, ProtocolError> {
     broker.prepare_custody(
         CustodyPrepareRequest {
+            surface: bloom_signer_api::legacy_local_surface(),
             ceremony_kind: CeremonyKind::WalletDelete,
             custody_operation_id: operation_id,
             wallet_id,
@@ -1839,6 +2012,7 @@ fn try_register(
 ) -> Result<CustodyPrepareResponse, ProtocolError> {
     broker.prepare_custody(
         CustodyPrepareRequest {
+            surface: bloom_signer_api::legacy_local_surface(),
             ceremony_kind: CeremonyKind::WalletRegistration,
             custody_operation_id: operation_id,
             wallet_id: Some(wallet_id),
@@ -1880,6 +2054,7 @@ async fn prepare_scoped_approval(
     match MachineBrokerService::dispatch(
         broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id,
             terms: terms.clone(),
             canonical_plan_facts_digest: digest("e7"),
@@ -1944,6 +2119,7 @@ async fn complete_scoped_ceremony(
         serde_json::from_value(session["signer_contribution"].clone()).unwrap();
     let assertion = authenticator.assertion(&challenge.canonical_bytes().unwrap(), sign_count);
     let aad = LocalPrfHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: contribution.ceremony_id.clone(),
         signer_nonce: contribution.signer_nonce.clone(),
         approval_id: terms.approval_id().unwrap(),
@@ -2181,6 +2357,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let registration = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::WalletRegistrationPrepare(bloom_broker_api::CustodyPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             ceremony_kind: bloom_broker_api::CeremonyKind::WalletRegistration,
             custody_operation_id: registration_operation.clone(),
             wallet_id: Some(Token::new("quiet-lilac").unwrap()),
@@ -2242,6 +2419,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let attestation = authenticator.attestation(&first_challenge.canonical_bytes().unwrap());
     let assertion = authenticator.assertion(&second_challenge.canonical_bytes().unwrap(), 1);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: registration_operation,
@@ -2416,6 +2594,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         ProtocolErrorCode::OperationIdConflict
     );
     let premature = CustodyResult {
+        surface: Some(bloom_signer_api::legacy_local_surface()),
+        credential_authority_generation: Some(DecimalU64::new(0)),
         ceremony_kind: CeremonyKind::PolicyUpdate,
         custody_operation_id: update.operation_id.clone(),
         public_status: bloom_signer_api::CeremonyState::Succeeded,
@@ -2473,6 +2653,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         serde_json::from_value(session["signer_contribution"].clone()).unwrap();
     let assertion = authenticator.assertion(&challenge.canonical_bytes().unwrap(), 2);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::PolicyUpdate,
         custody_operation_id: update.operation_id.clone(),
@@ -2607,6 +2788,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let derive_prepared = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::KeyDerivePrepare(bloom_broker_api::CustodyPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             ceremony_kind: bloom_broker_api::CeremonyKind::KeyDerive,
             custody_operation_id: derive_operation.clone(),
             wallet_id: Some(wallet_id.clone()),
@@ -2680,6 +2862,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         serde_json::from_value(derive_session["signer_contribution"].clone()).unwrap();
     let derive_assertion = authenticator.assertion(&derive_challenge.canonical_bytes().unwrap(), 3);
     let derive_aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: derive_contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::KeyDerive,
         custody_operation_id: derive_operation.clone(),
@@ -2805,6 +2988,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let approval_prepared = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: approval_operation.clone(),
             terms: approval_terms.clone(),
             canonical_plan_facts_digest: digest("d4"),
@@ -2853,6 +3037,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let approval_assertion =
         authenticator.assertion(&approval_challenge.canonical_bytes().unwrap(), 4);
     let approval_aad = LocalPrfHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: approval_contribution.ceremony_id.clone(),
         signer_nonce: approval_contribution.signer_nonce.clone(),
         approval_id: approval_terms.approval_id().unwrap(),
@@ -2936,6 +3121,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let exact_prepared = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: exact_approval_operation.clone(),
             terms: exact_terms.clone(),
             canonical_plan_facts_digest: digest("e7"),
@@ -2983,6 +3169,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         serde_json::from_value(exact_session["signer_contribution"].clone()).unwrap();
     let exact_assertion = authenticator.assertion(&exact_challenge.canonical_bytes().unwrap(), 5);
     let exact_aad = LocalPrfHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: exact_contribution.ceremony_id.clone(),
         signer_nonce: exact_contribution.signer_nonce.clone(),
         approval_id: exact_terms.approval_id().unwrap(),
@@ -3165,6 +3352,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             MachineBrokerService::dispatch(
                 &broker,
                 MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                    surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                     operation_id: operation(&format!("{:02x}", 0xc0 + index)),
                     terms: denied_terms,
                     canonical_plan_facts_digest: digest("c9"),
@@ -3974,6 +4162,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         MachineBrokerService::dispatch(
             &restarted_scoped_broker,
             MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 operation_id: operation("dc"),
                 terms: expired_terms,
                 canonical_plan_facts_digest: digest("dd"),
@@ -4174,6 +4363,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
     let conflicting = broker
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletDelete,
                 custody_operation_id: operation("01"),
                 wallet_id: Some(Token::new("wallet-1").unwrap()),
@@ -4194,6 +4384,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
         broker
             .prepare_custody(
                 CustodyPrepareRequest {
+                    surface: bloom_signer_api::legacy_local_surface(),
                     ceremony_kind: CeremonyKind::WalletDelete,
                     custody_operation_id: operation("02"),
                     wallet_id: Some(Token::new("wallet-1").unwrap()),
@@ -4225,6 +4416,7 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
         broker
             .prepare_custody(
                 CustodyPrepareRequest {
+                    surface: bloom_signer_api::legacy_local_surface(),
                     ceremony_kind: CeremonyKind::WalletDelete,
                     custody_operation_id: operation("03"),
                     wallet_id: Some(Token::new("wallet-1").unwrap()),
@@ -4270,6 +4462,7 @@ async fn legacy_passkey_prepare_renders_only_digest_bound_public_migration_terms
     let response = broker
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletImport,
                 custody_operation_id: operation_id,
                 wallet_id: None,
@@ -4651,6 +4844,7 @@ async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() 
         custody_operation_id: operation("92"),
     };
     let request = CustodyPrepareRequest {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_kind: CeremonyKind::KeyDerive,
         custody_operation_id: scope.custody_operation_id.clone(),
         wallet_id: Some(scope.wallet_id.clone()),
@@ -4785,6 +4979,645 @@ async fn machine_asserted_reusable_plan_carries_primary_surface_warning() {
     assert!(plan.contains("limits are asserted by the named Petal"));
     assert!(plan.contains("compromised Petal or Machine"));
     assert!(plan.contains("full remaining capacity"));
+}
+
+#[tokio::test]
+async fn remote_fragment_is_single_use_and_cookie_is_ceremony_scoped() {
+    let signer = Arc::new(MockSigner::with_remote_surface());
+    let broker = CeremonyBroker::new(signer);
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let selected = broker
+        .select_surface(bloom_broker_api::CeremonySurfaceSelection::Default)
+        .unwrap();
+    let origin = selected.identity.origin.clone();
+    for invalid in [
+        "https://relay.bloom.directory",
+        "http://abcdefghijklmnopqrstuv2345.relay.bloom.directory",
+        "https://ABCDEFGHIJKLMNOP.relay.bloom.directory",
+        "https://abcdefghijklmnopqrstuv2345.relay.bloom.directory:443",
+        "https://abcdefghijklmnopqrstuv2345.relay.bloom.directory.evil.example",
+    ] {
+        assert!(broker.for_remote_origin(invalid).is_err(), "{invalid}");
+    }
+    let prepared = broker
+        .prepare_custody(
+            CustodyPrepareRequest {
+                surface: selected.reference(),
+                ceremony_kind: CeremonyKind::WalletDelete,
+                custody_operation_id: operation("ac"),
+                wallet_id: Some(Token::new("remote-wallet").unwrap()),
+                key_ref: None,
+                exact_terms_digest: digest("33"),
+                expected_input_class: Token::new("policy-document").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_requests: Vec::new(),
+            },
+            now_ms,
+        )
+        .unwrap();
+    assert!(
+        prepared
+            .ceremony_url
+            .starts_with(&format!("{origin}/ceremony/#cap="))
+    );
+    let capability = prepared.ceremony_url.split("#cap=").nth(1).unwrap();
+    let host = origin.strip_prefix("https://").unwrap();
+    let app = broker.for_remote_origin(&origin).unwrap().router();
+    let root = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(root.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        root.headers()[header::LOCATION],
+        "https://bloom.directory/#"
+    );
+    let asset = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/assets/style.css"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asset.status(), StatusCode::OK);
+    let conflicting_authority = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/"))
+                .header(header::HOST, "sibling.relay.bloom.directory")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conflicting_authority.status(), StatusCode::FORBIDDEN);
+    let matching_authority = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/"))
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(matching_authority.status(), StatusCode::SEE_OTHER);
+    let duplicate_host = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/"))
+                .header(header::HOST, host)
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_host.status(), StatusCode::FORBIDDEN);
+    let missing_authority = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri("/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_authority.status(), StatusCode::FORBIDDEN);
+    let wrong_authority = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri("https://sibling.relay.bloom.directory/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_authority.status(), StatusCode::FORBIDDEN);
+    let http1_missing_host = app
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(http1_missing_host.status(), StatusCode::FORBIDDEN);
+    let health = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/bloom/relay-health")
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::NO_CONTENT);
+    let wrong_host_health = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/bloom/relay-health")
+                .header(header::HOST, "sibling.relay.bloom.directory")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_host_health.status(), StatusCode::NOT_FOUND);
+    let exchange_request = || {
+        Request::builder()
+            .version(Version::HTTP_2)
+            .method("POST")
+            .uri(format!("{origin}/api/session/exchange"))
+            .header(header::ORIGIN, &origin)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("sec-fetch-site", "same-origin")
+            .body(Body::from(
+                serde_json::json!({"capability": capability}).to_string(),
+            ))
+            .unwrap()
+    };
+    let exchange = app.clone().oneshot(exchange_request()).await.unwrap();
+    assert_eq!(exchange.status(), StatusCode::OK);
+    let cookie = exchange.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert!(
+        exchange.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .contains("Secure; HttpOnly; SameSite=Strict; Path=/")
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&exchange.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let ceremony_id = body["ceremony_id"].as_str().unwrap();
+    let csrf = body["csrf"].as_str().unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(exchange_request())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let read = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/api/session/{ceremony_id}"))
+                .header(header::COOKIE, "__Host-bloom-ceremony-old=unrelated")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+    let pending_result = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/api/session/{ceremony_id}/result"))
+                .header(header::COOKIE, "__Host-bloom-ceremony-old=unrelated")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending_result.status(), StatusCode::CONFLICT);
+    let duplicate_current_cookie = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/api/session/{ceremony_id}"))
+                .header(header::COOKIE, &cookie)
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_current_cookie.status(), StatusCode::FORBIDDEN);
+    let duplicate_different_cookie = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/api/session/{ceremony_id}"))
+                .header(header::COOKIE, &cookie)
+                .header(
+                    header::COOKIE,
+                    format!("__Host-bloom-ceremony-{ceremony_id}={}", "a".repeat(43)),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_different_cookie.status(), StatusCode::FORBIDDEN);
+    let duplicate_current_cookie_joined = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("{origin}/api/session/{ceremony_id}"))
+                .header(header::COOKIE, format!("{cookie}; {cookie}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        duplicate_current_cookie_joined.status(),
+        StatusCode::FORBIDDEN
+    );
+    let cross_host = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/session/{ceremony_id}"))
+                .header(header::HOST, "localhost:18734")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_host.status(), StatusCode::FORBIDDEN);
+    let mutation = |proof: Option<&str>| {
+        let mut request = Request::builder()
+            .version(Version::HTTP_2)
+            .method("POST")
+            .uri(format!("{origin}/api/session/{ceremony_id}/cancel"))
+            .header(header::ORIGIN, &origin)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("sec-fetch-site", "same-origin")
+            .header(header::COOKIE, "__Host-bloom-ceremony-old=unrelated")
+            .header(header::COOKIE, &cookie);
+        if let Some(proof) = proof {
+            request = request.header("x-bloom-csrf", proof);
+        }
+        request.body(Body::empty()).unwrap()
+    };
+    assert_eq!(
+        app.clone().oneshot(mutation(None)).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.oneshot(mutation(Some(csrf))).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[test]
+fn assigned_remote_outage_never_silently_changes_default_to_local() {
+    let pending = CeremonyBroker::new(Arc::new(MockSigner::with_remote_unassigned()));
+    assert_eq!(
+        pending
+            .select_surface(bloom_broker_api::CeremonySurfaceSelection::Default)
+            .unwrap()
+            .identity
+            .surface_id
+            .as_str(),
+        "local"
+    );
+    assert!(
+        pending
+            .select_surface(bloom_broker_api::CeremonySurfaceSelection::Remote)
+            .is_err()
+    );
+
+    let degraded = CeremonyBroker::new(Arc::new(MockSigner::with_remote_degraded()));
+    assert!(
+        degraded
+            .select_surface(bloom_broker_api::CeremonySurfaceSelection::Default)
+            .is_err()
+    );
+    assert!(
+        degraded
+            .select_surface(bloom_broker_api::CeremonySurfaceSelection::Remote)
+            .is_err()
+    );
+    assert_eq!(
+        degraded
+            .select_surface(bloom_broker_api::CeremonySurfaceSelection::Local)
+            .unwrap()
+            .identity
+            .surface_id
+            .as_str(),
+        "local"
+    );
+
+    let disabled = CeremonyBroker::new(Arc::new(MockSigner::with_remote_disabled()));
+    assert_eq!(
+        disabled
+            .select_surface(bloom_broker_api::CeremonySurfaceSelection::Default)
+            .unwrap()
+            .identity
+            .surface_id
+            .as_str(),
+        "local"
+    );
+    assert!(
+        disabled
+            .select_surface(bloom_broker_api::CeremonySurfaceSelection::Remote)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn bare_root_redirects_while_ceremonies_remain_available_and_public_recovery_is_absent() {
+    let remote = "https://abcdefghijklmnopqrstuv2345.relay.bloom.directory";
+    let host = remote.strip_prefix("https://").unwrap();
+    let broker = CeremonyBroker::new(Arc::new(MockSigner::with_remote_surface()));
+    let remote_app = broker.for_remote_origin(remote).unwrap().router();
+    for (app, expected_host) in [(remote_app, host), (broker.router(), "localhost:18734")] {
+        for uri in ["/", "/?cap=untrusted"] {
+            let root = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::HOST, expected_host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(root.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                root.headers()[header::LOCATION],
+                "https://bloom.directory/#"
+            );
+            assert!(
+                root.into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .is_empty()
+            );
+        }
+        let wrong_host = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::HOST, "unapproved.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_host.status(), StatusCode::FORBIDDEN);
+        let resume = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ceremony/")
+                    .header(header::HOST, expected_host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resume.status(), StatusCode::OK);
+        let public = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/recovery/bootstrap")
+                    .header(header::HOST, expected_host)
+                    .header(
+                        header::ORIGIN,
+                        if expected_host == host {
+                            remote
+                        } else {
+                            "http://localhost:18734"
+                        },
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::from(
+                        r#"{"wallet_id":"candidate-wallet","recovery_id":"recovery-test"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn browser_recovery_completion_hides_distinct_signer_failures() {
+    let mut responses = Vec::new();
+    for code in [
+        bloom_signer_api::ProtocolErrorCode::BackendInvalidRequest,
+        bloom_signer_api::ProtocolErrorCode::UnauthenticatedPeer,
+    ] {
+        let signer = Arc::new(MockSigner {
+            completion_error: Some(code),
+            ..MockSigner::new()
+        });
+        let broker = CeremonyBroker::new(signer);
+        let prepared = broker
+            .prepare_custody(
+                CustodyPrepareRequest {
+                    surface: broker
+                        .select_surface(bloom_broker_api::CeremonySurfaceSelection::Local)
+                        .unwrap()
+                        .reference(),
+                    ceremony_kind: CeremonyKind::WalletRecovery,
+                    custody_operation_id: operation("e1"),
+                    wallet_id: Some(Token::new("candidate-wallet").unwrap()),
+                    key_ref: None,
+                    exact_terms_digest: digest("e2"),
+                    expected_input_class: Token::new("recovery-factor-v1").unwrap(),
+                    browser_output_recipient_key: None,
+                    petal_key_scope: None,
+                    legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_requests: Vec::new(),
+                },
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap();
+        let app = broker.router();
+        let token = url_token(&prepared.ceremony_url);
+        let session = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session")
+                    .header(header::HOST, "localhost:18734")
+                    .header("x-bloom-ceremony-token", &token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.status(), StatusCode::OK);
+        let projection: serde_json::Value =
+            serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let ceremony_id = projection["ceremony_id"].as_str().unwrap();
+        let response = app.oneshot(Request::builder()
+            .method("POST")
+            .uri(format!("/api/session/{ceremony_id}/complete"))
+            .header(header::HOST, "localhost:18734")
+            .header(header::ORIGIN, "http://localhost:18734")
+            .header("x-bloom-ceremony-token", token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("sec-fetch-site", "same-origin")
+            .body(Body::from(serde_json::json!({
+                "proof": {"kind": "recovery_credential_change",
+                    "new_credential_attestation": {
+                        "credential_id": "Y3JlZA",
+                        "client_data_json": "e30",
+                        "attestation_object": "YXR0",
+                        "transports": []
+                    },
+                    "new_credential_prf_assertion": null},
+                "encrypted_input": null,
+                "public_binding_digest": projection["signer_contribution"]["review_manifest_digest"]
+            }).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(!String::from_utf8_lossy(&body).contains("distinct internal"));
+        responses.push(body);
+    }
+    assert_eq!(responses[0], responses[1]);
+}
+
+#[test]
+fn explicit_cross_surface_prepare_binds_existing_origins_and_operation() {
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let unavailable = CeremonyBroker::new(Arc::new(MockSigner::new()));
+    let request = bloom_broker_api::CeremonyCrossSurfacePrepareRequest {
+        operation_id: operation("dc"),
+        wallet_id: Token::new("cross-wallet").unwrap(),
+        destination: bloom_broker_api::CeremonySurfaceSelection::Remote,
+    };
+    let unavailable_error = unavailable
+        .prepare_cross_surface(request.clone(), now_ms)
+        .unwrap_err();
+    assert_eq!(
+        unavailable_error.code,
+        ProtocolErrorCode::ServiceUnavailable,
+        "{unavailable_error:?}"
+    );
+
+    let broker = CeremonyBroker::new(Arc::new(MockSigner::with_remote_surface()));
+    let prepared = broker
+        .prepare_cross_surface(request.clone(), now_ms)
+        .unwrap();
+    assert_eq!(prepared.operation_id, request.operation_id);
+    assert_eq!(prepared.state, CeremonyState::AwaitingUser);
+    assert!(
+        prepared
+            .destination_url
+            .starts_with("https://abcdefghijklmnopqrstuv2345.relay.bloom.directory/ceremony/#cap=")
+    );
+    assert_eq!(
+        broker
+            .prepare_cross_surface(request.clone(), now_ms)
+            .unwrap(),
+        prepared
+    );
+    let mut changed = request;
+    changed.destination = bloom_broker_api::CeremonySurfaceSelection::Local;
+    assert_eq!(
+        broker
+            .prepare_cross_surface(changed, now_ms)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::OperationIdConflict
+    );
+    let status = broker.public_status(&prepared.operation_id).unwrap();
+    assert_eq!(status.ceremony_id, prepared.ceremony_id);
+
+    // `Default` resolves to the effective hosted surface like other ceremonies.
+    let defaulted = bloom_broker_api::CeremonyCrossSurfacePrepareRequest {
+        operation_id: operation("dd"),
+        wallet_id: Token::new("default-wallet").unwrap(),
+        destination: bloom_broker_api::CeremonySurfaceSelection::Default,
+    };
+    assert!(
+        broker
+            .prepare_cross_surface(defaulted, now_ms)
+            .unwrap()
+            .destination_url
+            .starts_with("https://abcdefghijklmnopqrstuv2345.relay.bloom.directory/")
+    );
+
+    // A wallet with no passkey that could approve never reaches AWAITING_USER:
+    // the refusal happens at prepare and leaves no ceremony behind.
+    let broker = CeremonyBroker::new(Arc::new(MockSigner {
+        passkey_surfaces: Vec::new(),
+        ..MockSigner::with_remote_surface()
+    }));
+    let refused = bloom_broker_api::CeremonyCrossSurfacePrepareRequest {
+        operation_id: operation("de"),
+        wallet_id: Token::new("main").unwrap(),
+        destination: bloom_broker_api::CeremonySurfaceSelection::Remote,
+    };
+    let error = broker.prepare_cross_surface(refused, now_ms).unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::ApprovalNotFound);
+    assert!(
+        error
+            .message
+            .contains("main has no active passkey that can approve"),
+        "{error:?}"
+    );
+    assert!(broker.public_status(&operation("de")).is_err());
 }
 
 #[tokio::test]
@@ -5057,9 +5890,35 @@ fn ceremony_endpoint_formats_host_origin_and_urls_without_sockets() {
     assert_eq!(port80.origin(), "http://localhost");
     assert!(CeremonyEndpoint::new(0).is_err());
     assert_eq!(CeremonyEndpoint::new(28_735).unwrap().port(), 28_735);
+    // The hosted-relay upstream defaults to the installed port and moves with
+    // configuration, so a second Triad can serve a relay surface beside it.
+    assert_eq!(default.remote_upstream_port(), 18_735);
+    assert_eq!(
+        default.remote_upstream_addr(),
+        "127.0.0.1:18735".parse().unwrap()
+    );
+    let candidate = CeremonyEndpoint::new(28_735)
+        .unwrap()
+        .with_remote_upstream_port(38_735)
+        .unwrap();
+    assert_eq!(candidate.remote_upstream_port(), 38_735);
+    assert_eq!(
+        candidate.remote_upstream_addr(),
+        "127.0.0.1:38735".parse().unwrap()
+    );
+    assert_eq!(candidate.origin(), "http://localhost:28735");
+    assert!(default.with_remote_upstream_port(0).is_err());
+    assert!(
+        CeremonyEndpoint::new(28_735)
+            .unwrap()
+            .with_remote_upstream_port(28_735)
+            .is_err(),
+        "the relay upstream must never share the ceremony port"
+    );
     // Out-of-range JSON values never reach the endpoint: the protected
-    // config declares `ceremony_port` as `Option<u16>`, so serde rejects
-    // non-integers and values above 65535 while parsing.
+    // config declares `ceremony_port` and `remote_upstream_port` as
+    // `Option<u16>`, so serde rejects non-integers and values above 65535
+    // while parsing.
 }
 
 #[test]
@@ -5150,7 +6009,7 @@ async fn paired_loopback_servers_validate_serve_both_families_and_shutdown() {
             let mut response = String::new();
             stream.read_to_string(&mut response).await.unwrap();
             assert!(
-                response.starts_with("HTTP/1.1 200"),
+                response.starts_with("HTTP/1.1 303"),
                 "{address}: {response}"
             );
         }
@@ -5188,6 +6047,7 @@ fn ac18_forced_ceremony_audit_write_failure_rolls_back_session() {
     .unwrap();
     let operation_id = operation("30");
     let request = CustodyPrepareRequest {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_kind: CeremonyKind::WalletDelete,
         custody_operation_id: operation_id.clone(),
         wallet_id: Some(Token::new("wallet-audit-rollback").unwrap()),
@@ -5243,6 +6103,7 @@ fn ac18_populated_ceremony_migration_is_atomic_idempotent_and_retains_source() {
     legacy_broker
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletDelete,
                 custody_operation_id: operation_id.clone(),
                 wallet_id: Some(Token::new("wallet-migrated").unwrap()),
@@ -5398,6 +6259,294 @@ fn ac18_populated_ceremony_migration_is_atomic_idempotent_and_retains_source() {
 }
 
 #[test]
+fn schema1_release_state_migrates_pending_and_preserves_completed_receipt() {
+    const SCHEMA1_BROKER_COMMIT: &str = "dd2add2b9d41540521d08c77d19fb467a2d8029e";
+    const FIXTURE_SHA256: &str = "27772833a792ddcfb1d1493fa56bd6c7efdd06bcbc2b12edd749aea2dc8bb825";
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("broker-journal.sqlite");
+    let fixture = fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/schema1/broker-journal.sqlite"
+    ))
+    .unwrap();
+    assert_eq!(hex::encode(sha2::Sha256::digest(&fixture)), FIXTURE_SHA256);
+    fs::write(&journal_path, fixture).unwrap();
+
+    let source = rusqlite::Connection::open(&journal_path).unwrap();
+    assert_eq!(
+        source
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        source
+            .query_row("SELECT COUNT(*) FROM policies", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "the {SCHEMA1_BROKER_COMMIT} fixture must remain populated authority state"
+    );
+    let completed_jcs_before: String = source
+        .query_row(
+            "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
+            [operation("e1").as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(source);
+
+    let journal =
+        Arc::new(BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let authority = BrokerAuthority::open(
+        directory.path().join("authority.sqlite"),
+        journal.clone(),
+        BTreeMap::new(),
+        Token::new("installer-key").unwrap(),
+        SigningKey::from_bytes(&[5; 32]).verifying_key(),
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]).verifying_key(),
+        Token::new("signer-revocation-key").unwrap(),
+        SigningKey::from_bytes(&[4; 32]).verifying_key(),
+        AssuranceRegistry::compiled(Vec::new()).unwrap(),
+    )
+    .unwrap();
+    let policy = authority
+        .policy_snapshot(&Token::new("quiet-lilac").unwrap())
+        .expect("current startup must preserve schema-1 authority state");
+    assert_eq!(policy.wallet_id.as_str(), "quiet-lilac");
+
+    let pending_operation = operation("31");
+    let completed_operation = operation("e1");
+    let signer = Arc::new(MockSigner::new());
+    signer.pending.lock().insert(pending_operation.clone());
+    let migrated = CeremonyBroker::open(
+        directory.path().join("ceremony.sqlite"),
+        signer.clone(),
+        journal.clone(),
+    )
+    .unwrap();
+    assert_eq!(signer.cancellations.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        migrated.status(&pending_operation),
+        Some(CeremonyState::Expired),
+        "a schema-1 pending operation must be invalidated during current startup"
+    );
+    assert!(
+        migrated
+            .public_status(&pending_operation)
+            .unwrap()
+            .ceremony_url
+            .is_none(),
+        "migration must not revive the old browser capability"
+    );
+    assert!(matches!(
+        try_prepare(
+            &migrated,
+            pending_operation.clone(),
+            Some(Token::new("schema1-pending-wallet").unwrap()),
+            60_000,
+        )
+        .unwrap_err()
+        .code,
+        ProtocolErrorCode::CeremonyReplay | ProtocolErrorCode::OperationIdConflict
+    ));
+    assert_eq!(
+        migrated.status(&completed_operation),
+        Some(CeremonyState::Completed)
+    );
+    let receipt_digest = migrated
+        .public_status(&completed_operation)
+        .unwrap()
+        .receipt_digest
+        .expect("schema-1 completed receipt digest must survive migration");
+    drop(migrated);
+
+    let reopened = CeremonyBroker::open(
+        directory.path().join("ceremony.sqlite"),
+        Arc::new(MockSigner::new()),
+        journal,
+    )
+    .unwrap();
+    assert_eq!(
+        reopened
+            .public_status(&completed_operation)
+            .unwrap()
+            .receipt_digest,
+        Some(receipt_digest),
+        "receipt identity must remain stable after the migrated store reopens"
+    );
+    let migrated_store = rusqlite::Connection::open(&journal_path).unwrap();
+    assert_eq!(
+        migrated_store
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        2
+    );
+    let completed_jcs_after: String = migrated_store
+        .query_row(
+            "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
+            [completed_operation.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        completed_jcs_after, completed_jcs_before,
+        "migration must retain the exact signed completed projection"
+    );
+}
+
+#[test]
+fn schema1_receipt_reconciliation_preserves_committed_and_awaiting_delivery() {
+    let completed_operation = operation("e1");
+    let fixture = fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/schema1/broker-journal.sqlite"
+    ))
+    .unwrap();
+    let prepare = |state: &str, expires_at_ms: Option<u64>| {
+        let directory = tempfile::tempdir().unwrap();
+        let journal_path = directory.path().join("broker-journal.sqlite");
+        fs::write(&journal_path, &fixture).unwrap();
+        let database = rusqlite::Connection::open(&journal_path).unwrap();
+        let completed_jcs: String = database
+            .query_row(
+                "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
+                [completed_operation.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let completed_value: serde_json::Value = serde_json::from_str(&completed_jcs).unwrap();
+        assert!(completed_value["projection"]["signer_contribution"]["surface"].is_null());
+        let receipt_value = completed_value["terminal_result"].clone();
+        let receipt: CustodyResult = serde_json::from_value(receipt_value.clone()).unwrap();
+        database
+            .execute(
+                "UPDATE ceremony_sessions
+                 SET session_jcs=json_set(session_jcs, '$.state', ?1, '$.terminal_at_ms', NULL)
+                 WHERE operation_id=?2",
+                [state, completed_operation.as_str()],
+            )
+            .unwrap();
+        if let Some(expires_at_ms) = expires_at_ms {
+            database
+                .execute(
+                    "UPDATE ceremony_sessions
+                     SET session_jcs=json_set(session_jcs, '$.expires_at_ms', ?1)
+                     WHERE operation_id=?2",
+                    rusqlite::params![expires_at_ms as i64, completed_operation.as_str()],
+                )
+                .unwrap();
+        }
+        drop(database);
+        (directory, journal_path, receipt_value, receipt)
+    };
+
+    let (commit_directory, commit_path, receipt_value, receipt) = prepare("VERIFYING", None);
+    let journal =
+        Arc::new(BrokerJournal::open(&commit_path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let signer = Arc::new(MockSigner::new());
+    *signer.completed_custody.lock() = Some((completed_operation.clone(), receipt));
+    let committed = CeremonyBroker::open(
+        commit_directory.path().join("ceremony.sqlite"),
+        signer.clone(),
+        journal,
+    )
+    .unwrap();
+    assert_eq!(signer.cancellations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        committed.status(&completed_operation),
+        Some(CeremonyState::WalletCommitted),
+        "a Signer receipt committed before Broker persistence must be recovered"
+    );
+    drop(committed);
+
+    let committed_store = rusqlite::Connection::open(&commit_path).unwrap();
+    let committed_jcs: String = committed_store
+        .query_row(
+            "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
+            [completed_operation.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&committed_jcs).unwrap()["terminal_result"],
+        receipt_value,
+        "reconciliation must retain the exact schema-1 receipt"
+    );
+    drop(committed_store);
+
+    let (wallet_directory, wallet_path, wallet_receipt_value, wallet_receipt) =
+        prepare("WALLET_COMMITTED", None);
+    let wallet_journal =
+        Arc::new(BrokerJournal::open(&wallet_path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let wallet_signer = Arc::new(MockSigner::new());
+    *wallet_signer.completed_custody.lock() = Some((completed_operation.clone(), wallet_receipt));
+    let wallet = CeremonyBroker::open(
+        wallet_directory.path().join("ceremony.sqlite"),
+        wallet_signer.clone(),
+        wallet_journal,
+    )
+    .unwrap();
+    assert_eq!(wallet_signer.cancellations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        wallet.status(&completed_operation),
+        Some(CeremonyState::WalletCommitted)
+    );
+    let wallet_jcs: String = rusqlite::Connection::open(&wallet_path)
+        .unwrap()
+        .query_row(
+            "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
+            [completed_operation.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&wallet_jcs).unwrap()["terminal_result"],
+        wallet_receipt_value
+    );
+
+    let (awaiting_directory, awaiting_path, awaiting_receipt_value, awaiting_receipt) =
+        prepare("AWAITING_RECOVERY_ACK", Some(9_999_999_999_999));
+    let awaiting_journal =
+        Arc::new(BrokerJournal::open(&awaiting_path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let awaiting_signer = Arc::new(MockSigner::new());
+    *awaiting_signer.completed_custody.lock() =
+        Some((completed_operation.clone(), awaiting_receipt));
+    let awaiting = CeremonyBroker::open(
+        awaiting_directory.path().join("ceremony.sqlite"),
+        awaiting_signer.clone(),
+        awaiting_journal,
+    )
+    .unwrap();
+    assert_eq!(awaiting_signer.cancellations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        awaiting.status(&completed_operation),
+        Some(CeremonyState::AwaitingRecoveryAck),
+        "an undelivered schema-1 receipt must remain available after startup"
+    );
+    assert!(
+        awaiting
+            .public_status(&completed_operation)
+            .unwrap()
+            .receipt_digest
+            .is_some()
+    );
+    let awaiting_jcs: String = rusqlite::Connection::open(&awaiting_path)
+        .unwrap()
+        .query_row(
+            "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
+            [completed_operation.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&awaiting_jcs).unwrap()["terminal_result"],
+        awaiting_receipt_value
+    );
+}
+
+#[test]
 fn ac18_ceremony_status_survives_latched_audit_tamper_while_new_sessions_fail() {
     let directory = tempfile::tempdir().unwrap();
     let journal_path = directory.path().join("journal.sqlite");
@@ -5449,6 +6598,7 @@ fn ac18_ceremony_status_survives_latched_audit_tamper_while_new_sessions_fail() 
         restarted
             .prepare_custody(
                 CustodyPrepareRequest {
+                    surface: bloom_signer_api::legacy_local_surface(),
                     ceremony_kind: CeremonyKind::WalletDelete,
                     custody_operation_id: operation("3a"),
                     wallet_id: Some(Token::new("wallet-audit-new").unwrap()),
@@ -5500,6 +6650,7 @@ fn restart_expires_nonterminal_session_and_persists_only_token_hash() {
     let error = restarted
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletDelete,
                 custody_operation_id: operation("31"),
                 wallet_id: Some(Token::new("wallet-restart").unwrap()),
@@ -5898,6 +7049,7 @@ fn zero_effective_time_fails_closed_before_anonymous_creation_quota() {
         broker
             .prepare_custody(
                 CustodyPrepareRequest {
+                    surface: bloom_signer_api::legacy_local_surface(),
                     ceremony_kind: CeremonyKind::WalletRegistration,
                     custody_operation_id: operation_id.clone(),
                     wallet_id: Some(Token::new(format!("wallet-b{index}")).unwrap()),
@@ -5921,6 +7073,7 @@ fn zero_effective_time_fails_closed_before_anonymous_creation_quota() {
     let error = broker
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletRegistration,
                 custody_operation_id: operation("bf"),
                 wallet_id: Some(Token::new("wallet-bf").unwrap()),
@@ -5960,6 +7113,7 @@ fn cancellation_backoff_reports_remaining_cooldown_and_resets_after_expiry() {
     let error = broker
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletDelete,
                 custody_operation_id: operation("c2"),
                 wallet_id: Some(wallet.clone()),
@@ -6061,6 +7215,27 @@ fn automatic_expiry_does_not_impose_cancellation_backoff() {
 }
 
 #[test]
+fn status_sweeps_an_elapsed_ceremony_before_reporting_it() {
+    let signer = Arc::new(MockSigner::new());
+    let broker = CeremonyBroker::new(signer);
+    let wallet = Token::new("wallet-status-expiry").unwrap();
+    prepare(&broker, operation("e1"), Some(wallet), 10_000);
+
+    let live = broker
+        .current_public_status(&operation("e1"), 10_001)
+        .unwrap();
+    assert_eq!(live.state, CeremonyState::AwaitingUser);
+    assert!(live.ceremony_url.is_some());
+
+    // Nobody opened the page, so only the status request can observe expiry.
+    let elapsed = broker
+        .current_public_status(&operation("e1"), live.expires_at_ms.get() + 1)
+        .unwrap();
+    assert_eq!(elapsed.state, CeremonyState::Expired);
+    assert!(elapsed.ceremony_url.is_none());
+}
+
+#[test]
 fn requested_wallet_ids_still_count_as_new_registration_attempts() {
     let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
     let engine = Arc::new(
@@ -6089,6 +7264,7 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
         broker
             .prepare_custody(
                 CustodyPrepareRequest {
+                    surface: bloom_signer_api::legacy_local_surface(),
                     ceremony_kind: CeremonyKind::WalletRegistration,
                     custody_operation_id: operation_id.clone(),
                     wallet_id: Some(Token::new(format!("wallet-d{index}")).unwrap()),
@@ -6114,6 +7290,7 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
         broker
             .prepare_custody(
                 CustodyPrepareRequest {
+                    surface: bloom_signer_api::legacy_local_surface(),
                     ceremony_kind: CeremonyKind::WalletRegistration,
                     custody_operation_id: operation("df"),
                     wallet_id: Some(Token::new("wallet-df").unwrap()),
@@ -6148,6 +7325,7 @@ async fn bip39_import_session_projects_the_authoritative_signer_profile() {
     let response = broker
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletImport,
                 custody_operation_id: operation("40"),
                 wallet_id: Some(Token::new("imported-wallet").unwrap()),
@@ -6211,6 +7389,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
     let prepared = broker
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletRegistration,
                 custody_operation_id: operation_id.clone(),
                 wallet_id: Some(Token::new("quiet-lilac").unwrap()),
@@ -6264,6 +7443,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
     let attestation = authenticator.attestation(&first_challenge.canonical_bytes().unwrap());
     let assertion = authenticator.assertion(&second_challenge.canonical_bytes().unwrap(), 1);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation_id,
@@ -6321,6 +7501,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
     let export = broker
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletExport,
                 custody_operation_id: export_operation.clone(),
                 wallet_id: contribution.wallet_id.clone(),
@@ -6378,6 +7559,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         serde_json::from_value(projection["challenges"][0]["binding"].clone()).unwrap();
     let export_assertion = authenticator.assertion(&export_challenge.canonical_bytes().unwrap(), 2);
     let export_aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: export_contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletExport,
         custody_operation_id: export_operation.clone(),
@@ -6457,6 +7639,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
     assert_eq!(recovered_result, export_result);
     let export_contribution_digest = export_contribution.digest().unwrap();
     let output_aad = CustodyOutputHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: export_contribution.ceremony_id,
         ceremony_kind: CeremonyKind::WalletExport,
         custody_operation_id: export_operation,
@@ -6698,6 +7881,7 @@ async fn two_differently_configured_brokers_isolate_ceremony_origin() {
     let prepared = broker_d
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletRegistration,
                 custody_operation_id: operation_id.clone(),
                 wallet_id: Some(Token::new("wallet-iso-default").unwrap()),
@@ -6759,6 +7943,7 @@ async fn two_differently_configured_brokers_isolate_ceremony_origin() {
     let attestation = authenticator.attestation(&first_challenge.canonical_bytes().unwrap());
     let assertion = authenticator.assertion(&second_challenge.canonical_bytes().unwrap(), 1);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation_id,
@@ -6805,4 +7990,325 @@ async fn two_differently_configured_brokers_isolate_ceremony_origin() {
         .await
         .unwrap();
     assert_eq!(completed.status(), StatusCode::OK);
+}
+
+/// Answers the four cross-surface Signer calls with fixed, self-consistent
+/// values and delegates every other method to [`MockSigner`], so a test can
+/// drive the paired-enrollment HTTP routes without WebAuthn material.
+struct CrossSurfaceSigner {
+    inner: MockSigner,
+    pairing: parking_lot::Mutex<Option<bloom_signer_api::CrossSurfacePairing>>,
+    reported_capability: parking_lot::Mutex<Option<bloom_signer_api::Base64UrlBytes>>,
+}
+
+impl CrossSurfaceSigner {
+    fn new() -> Self {
+        Self {
+            inner: MockSigner::new(),
+            pairing: parking_lot::Mutex::new(None),
+            reported_capability: parking_lot::Mutex::new(None),
+        }
+    }
+
+    fn challenge(
+        pairing: &bloom_signer_api::CrossSurfacePairing,
+        phase: CeremonyPhase,
+    ) -> CeremonyChallenge {
+        CeremonyChallenge {
+            surface: pairing.destination_surface.clone(),
+            schema: Token::new("bloom.ceremony.challenge.v1").unwrap(),
+            ceremony_id: pairing.pairing_id.clone(),
+            ceremony_kind: CeremonyKind::CredentialAdd,
+            operation_id: pairing.operation_id.clone(),
+            signer_nonce: pairing.destination_challenge.clone(),
+            review_manifest_digest: pairing.exact_terms_digest.clone(),
+            signer_contribution_digest: pairing.pairing_id.clone(),
+            exact_terms_digest: pairing.exact_terms_digest.clone(),
+            phase,
+        }
+    }
+}
+
+impl CeremonySigner for CrossSurfaceSigner {
+    fn surface_status(
+        &self,
+    ) -> Result<bloom_signer_api::SurfaceStatus, bloom_signer_api::ProtocolError> {
+        self.inner.surface_status()
+    }
+
+    fn credential_list_public(
+        &self,
+        request: bloom_signer_api::WalletRequest,
+    ) -> Result<Vec<bloom_signer_api::CredentialPublic>, bloom_signer_api::ProtocolError> {
+        self.inner.credential_list_public(request)
+    }
+
+    fn cross_surface_pair_start(
+        &self,
+        request: bloom_signer_api::CrossSurfacePairStartRequest,
+    ) -> Result<bloom_signer_api::CrossSurfacePairing, bloom_signer_api::ProtocolError> {
+        let pairing = bloom_signer_api::CrossSurfacePairing {
+            pairing_id: digest("c1"),
+            destination_surface: request.destination_surface,
+            operation_id: request.operation_id,
+            exact_terms_digest: request.exact_terms_digest,
+            destination_hpke_public_key: request.destination_hpke_public_key,
+            destination_challenge: digest("c2"),
+            confirmation_code: "123456".into(),
+            expires_at_ms: request.expires_at_ms,
+        };
+        *self.pairing.lock() = Some(pairing.clone());
+        Ok(pairing)
+    }
+
+    fn cross_surface_prepare_source(
+        &self,
+        request: bloom_signer_api::CrossSurfacePrepareSourceRequest,
+    ) -> Result<bloom_signer_api::CrossSurfaceSourcePrepared, bloom_signer_api::ProtocolError> {
+        let pairing = self.pairing.lock().clone().unwrap();
+        let bytes = |fill: u8| bloom_signer_api::Base64UrlBytes::from_bytes(&[fill; 32]);
+        Ok(bloom_signer_api::CrossSurfaceSourcePrepared {
+            source_challenge: Self::challenge(&pairing, CeremonyPhase::Approve),
+            destination_challenges: vec![
+                Self::challenge(&pairing, CeremonyPhase::RegisterCredential),
+                Self::challenge(&pairing, CeremonyPhase::ConfirmPrf),
+            ],
+            pairing,
+            source_surface: request.source_surface,
+            wallet_id: request.wallet_id,
+            source_credentials: Vec::new(),
+            source_prf_inputs: Vec::new(),
+            destination_user_handle: bytes(3),
+            destination_prf_salt: bytes(4),
+            source_hpke_recipient_key: bytes(5),
+            destination_hpke_recipient_key: bytes(6),
+            credential_authority_generation: DecimalU64::new(1),
+            destination_existing_credentials: vec![bytes(1)],
+            signer_signature: bloom_signer_api::Base64UrlBytes::from_bytes(&[7; 64]),
+        })
+    }
+
+    fn cross_surface_complete_source(
+        &self,
+        request: bloom_signer_api::CrossSurfaceCompleteSourceRequest,
+    ) -> Result<bloom_signer_api::CrossSurfaceHandoff, bloom_signer_api::ProtocolError> {
+        let pairing = self.pairing.lock().clone().unwrap();
+        Ok(bloom_signer_api::CrossSurfaceHandoff {
+            pairing_id: request.pairing_id,
+            encrypted_capability: bloom_signer_api::HpkeEnvelope {
+                kem_output: bloom_signer_api::Base64UrlBytes::from_bytes(&[8; 32]),
+                ciphertext: bloom_signer_api::Base64UrlBytes::from_bytes(&[9; 48]),
+            },
+            expires_at_ms: pairing.expires_at_ms,
+        })
+    }
+
+    fn cross_surface_already_registered(
+        &self,
+        request: bloom_signer_api::CrossSurfaceAlreadyRegisteredRequest,
+    ) -> Result<bloom_signer_api::CeremonyPublicStatus, bloom_signer_api::ProtocolError> {
+        let pairing = self.pairing.lock().clone().unwrap();
+        *self.reported_capability.lock() = Some(request.capability);
+        Ok(bloom_signer_api::CeremonyPublicStatus {
+            ceremony_id: request.pairing_id,
+            ceremony_kind: CeremonyKind::CredentialAdd,
+            operation_id: request.operation_id,
+            state: bloom_signer_api::CeremonyState::AlreadyRegistered,
+            expires_at_ms: pairing.expires_at_ms,
+            ceremony_url: None,
+            receipt_digest: None,
+        })
+    }
+
+    fn prepare_approval(
+        &self,
+        request: CeremonyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<SignerPreparedApproval, bloom_signer_api::ProtocolError> {
+        self.inner.prepare_approval(request, now_ms)
+    }
+
+    fn complete_approval(
+        &self,
+        request: CeremonyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<SignerActivationReceipt, bloom_signer_api::ProtocolError> {
+        self.inner.complete_approval(request, now_ms)
+    }
+
+    fn prepare_custody(
+        &self,
+        request: CustodyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
+        self.inner.prepare_custody(request, now_ms)
+    }
+
+    fn complete_custody(
+        &self,
+        request: CustodyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
+        self.inner.complete_custody(request, now_ms)
+    }
+
+    fn bind_custody_output_recipient(
+        &self,
+        operation_id: &OperationId,
+        recipient_key: bloom_signer_api::Base64UrlBytes,
+        now_ms: u64,
+    ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
+        self.inner
+            .bind_custody_output_recipient(operation_id, recipient_key, now_ms)
+    }
+
+    fn cancel(&self, operation_id: &OperationId) -> Result<(), bloom_signer_api::ProtocolError> {
+        self.inner.cancel(operation_id)
+    }
+
+    fn status(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<SignerCeremonyStatus, bloom_signer_api::ProtocolError> {
+        self.inner.status(operation_id)
+    }
+}
+
+#[tokio::test]
+async fn destination_reports_an_already_registered_device_over_http() {
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let signer = Arc::new(CrossSurfaceSigner::new());
+    let broker = CeremonyBroker::new(signer.clone());
+    let prepared = broker
+        .prepare_cross_surface(
+            bloom_broker_api::CeremonyCrossSurfacePrepareRequest {
+                operation_id: operation("e1"),
+                wallet_id: Token::new("main").unwrap(),
+                destination: bloom_broker_api::CeremonySurfaceSelection::Local,
+            },
+            now_ms,
+        )
+        .unwrap();
+    let app = broker.router();
+    let call = |method: &str, uri: String, token: &str, body: Option<serde_json::Value>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "localhost:18734")
+            .header("x-bloom-ceremony-token", token);
+        if body.is_some() {
+            request = request
+                .header(header::ORIGIN, "http://localhost:18734")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin");
+        }
+        let request = request
+            .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+            .unwrap();
+        let app = app.clone();
+        async move {
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+            )
+        }
+    };
+    let destination_token = url_token(&prepared.destination_url);
+    let destination_id = prepared.ceremony_id.to_string();
+    let capability = serde_json::json!({
+        "capability": bloom_signer_api::Base64UrlBytes::from_bytes(&[10; 32]),
+    });
+
+    // Before the existing passkey approves there is no handoff, so the
+    // destination cannot claim a match.
+    let (status, _) = call(
+        "POST",
+        format!("/api/cross/{destination_id}/pair"),
+        &destination_token,
+        Some(serde_json::json!({
+            "destination_hpke_public_key": bloom_signer_api::Base64UrlBytes::from_bytes(&[2; 32]),
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        "POST",
+        format!("/api/cross/{destination_id}/already-registered"),
+        &destination_token,
+        Some(capability.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "no handoff yet");
+    assert!(signer.reported_capability.lock().is_none());
+
+    // The existing passkey approves on the source page.
+    let (_, paired) = call(
+        "POST",
+        format!("/api/cross/{destination_id}/pair"),
+        &destination_token,
+        Some(serde_json::json!({
+            "destination_hpke_public_key": bloom_signer_api::Base64UrlBytes::from_bytes(&[2; 32]),
+        })),
+    )
+    .await;
+    let source_token = url_token(paired["source_url"].as_str().unwrap());
+    let (status, source) = call("GET", "/api/session".into(), &source_token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let source_id = source["ceremony_id"].as_str().unwrap().to_owned();
+    let (status, _) = call(
+        "POST",
+        format!("/api/cross/{source_id}/authorize"),
+        &source_token,
+        Some(serde_json::json!({
+            "authority_assertion": {
+                "credential_id": "AQ", "authenticator_data": "Ag",
+                "client_data_json": "Aw", "signature": "BA", "user_handle": null
+            },
+            "encrypted_authority_prf": {"kem_output": "BQ", "ciphertext": "Bg"},
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The destination's provider already holds a wallet passkey: Signer is
+    // told with the handoff capability and the ceremony ends, unchanged.
+    let (status, body) = call(
+        "POST",
+        format!("/api/cross/{destination_id}/already-registered"),
+        &destination_token,
+        Some(capability.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, serde_json::json!({"state": "already_registered"}));
+    assert_eq!(
+        signer
+            .reported_capability
+            .lock()
+            .as_ref()
+            .map(|c| c.encoded().to_owned()),
+        capability["capability"].as_str().map(str::to_owned)
+    );
+    let status_view = broker.public_status(&operation("e1")).unwrap();
+    assert_eq!(status_view.state, CeremonyState::AlreadyRegistered);
+    assert!(status_view.ceremony_url.is_none());
+    assert!(status_view.receipt_digest.is_none());
+
+    // The terminal session no longer accepts its token.
+    let (status, _) = call(
+        "POST",
+        format!("/api/cross/{destination_id}/already-registered"),
+        &destination_token,
+        Some(capability),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

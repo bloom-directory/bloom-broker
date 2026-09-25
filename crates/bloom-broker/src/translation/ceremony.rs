@@ -56,6 +56,7 @@ pub(crate) fn state_to_machine(value: south::CeremonyState) -> north::CeremonySt
         south::CeremonyState::Cancelled => north::CeremonyState::Cancelled,
         south::CeremonyState::Expired => north::CeremonyState::Expired,
         south::CeremonyState::Failed => north::CeremonyState::Failed,
+        south::CeremonyState::AlreadyRegistered => north::CeremonyState::AlreadyRegistered,
     }
 }
 
