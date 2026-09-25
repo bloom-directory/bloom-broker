@@ -1707,10 +1707,16 @@ impl BrokerAuthority {
         record: &ProvenanceRecord,
     ) -> Result<Digest32, AuthorityError> {
         let _barrier = self.lock_authorization_barrier()?;
+        ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![record.clone()],
+        }
+        .validate_shape()
+        .map_err(storage)?;
         let digest = Digest32::from_bytes(
             Sha256::digest(serde_jcs::to_vec(record).map_err(storage)?).into(),
         );
-        verify_provenance(record, &self.installer_key_id, &self.installer_key, &digest)?;
+        verify_catalog_provenance(record, &self.installer_key_id, &self.installer_key, &digest)?;
         let subject_jcs = serde_jcs::to_string(&record.subject).map_err(storage)?;
         let record_jcs = serde_jcs::to_string(record).map_err(storage)?;
         let mut connection = self.lock_for_mutation()?;
@@ -1746,7 +1752,7 @@ impl BrokerAuthority {
         let mut verified = Vec::with_capacity(catalog.records.len());
         for record in &catalog.records {
             let record_digest = record.digest().map_err(storage)?;
-            verify_provenance(
+            verify_catalog_provenance(
                 record,
                 &self.installer_key_id,
                 &self.installer_key,
@@ -3573,6 +3579,22 @@ fn verify_provenance(
     key: &VerifyingKey,
     expected_digest: &Digest32,
 ) -> Result<(), AuthorityError> {
+    verify_catalog_provenance(record, expected_key_id, key, expected_digest)?;
+    if record.operation_classes.is_empty() {
+        return Err(denied(
+            "PROVENANCE_INVALID",
+            "lineage-only provenance cannot authorize an operation",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_catalog_provenance(
+    record: &ProvenanceRecord,
+    expected_key_id: &Token,
+    key: &VerifyingKey,
+    expected_digest: &Digest32,
+) -> Result<(), AuthorityError> {
     if &record.installer_key_id != expected_key_id {
         return Err(denied(
             "PROVENANCE_KEY_MISMATCH",
@@ -3594,8 +3616,10 @@ fn verify_provenance(
         ));
     }
     let mut classes = BTreeSet::new();
+    let lineage_only =
+        matches!(record.subject, ProvenanceSubject::Petal { .. }) && record.petal_lineage.is_some();
     if matches!(&record.subject, ProvenanceSubject::Petal { route, .. } if route.is_empty())
-        || record.operation_classes.is_empty()
+        || (record.operation_classes.is_empty() && !lineage_only)
         || record
             .operation_classes
             .iter()
@@ -4018,6 +4042,43 @@ fn denied(code: &'static str, message: impl Into<String>) -> AuthorityError {
 
 fn storage(error: impl ToString) -> AuthorityError {
     AuthorityError::Storage(error.to_string())
+}
+
+#[cfg(test)]
+mod lineage_only_provenance_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn lineage_only_record_cannot_authorize_an_operation() {
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        let key_id = Token::new("installer-key").unwrap();
+        let mut record = ProvenanceRecord {
+            subject: ProvenanceSubject::Petal {
+                package_hash: Digest32::new("00".repeat(32)).unwrap(),
+                route: "r000001".into(),
+            },
+            publisher: Token::new("bloom-release-pins").unwrap(),
+            petal_lineage: Some(bloom_broker_api::PetalLineageMembership {
+                lineage_id: "pln1_6etojfshqyk6bzm257kzv7noj3perfz4siioiuhj74xosznyzhka".into(),
+                release_sequence: bloom_broker_api::DecimalU64::new(1),
+                predecessor_package_hashes: vec![],
+                controller_key_id: key_id.clone(),
+                controller_signature: Base64UrlBytes::from_bytes(&[1; 64]),
+                active: true,
+            }),
+            operation_classes: vec![],
+            installer_key_id: key_id.clone(),
+            installer_signature: Base64UrlBytes::from_bytes(&[]),
+        };
+        let mut message = PROVENANCE_RECORD_SIGNATURE_DOMAIN.to_vec();
+        message.extend_from_slice(&record.unsigned_canonical_bytes().unwrap());
+        record.installer_signature = Base64UrlBytes::from_bytes(&signing.sign(&message).to_bytes());
+        let digest = record.digest().unwrap();
+        let error = verify_provenance(&record, &key_id, &signing.verifying_key(), &digest)
+            .expect_err("a lineage-only record grants no operation class");
+        assert!(error.to_string().contains("PROVENANCE_INVALID"), "{error}");
+    }
 }
 
 #[cfg(test)]

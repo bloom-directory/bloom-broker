@@ -896,6 +896,43 @@ fn initial_policy_adoption_requires_outer_receipt_and_does_not_poison_key_pin() 
 }
 
 #[test]
+fn lineage_only_petal_record_loads_but_cannot_prepare_approval() {
+    let harness = Harness::new();
+    let mut record = harness.provenance();
+    record.subject = ProvenanceSubject::Petal {
+        package_hash: digest(9),
+        route: "__lineage__".into(),
+    };
+    record.operation_classes.clear();
+    record.installer_signature = Base64UrlBytes::from_bytes(&[]);
+    sign_zeroed(
+        &mut record,
+        |value| &mut value.installer_signature,
+        PROVENANCE_DOMAIN,
+        &harness.installer_key,
+    );
+    let catalog = ProvenanceCatalog {
+        schema: PROVENANCE_CATALOG_SCHEMA.into(),
+        records: vec![record.clone()],
+    };
+    catalog.validate_shape().unwrap();
+    harness
+        .authority
+        .synchronize_provenance_catalog(&catalog)
+        .expect("lineage-only catalog record loads");
+    harness
+        .authority
+        .install_provenance(&record)
+        .expect("single-record install also accepts lineage-only metadata");
+    let terms = petal_terms(&harness, &record);
+    let error = harness
+        .authority
+        .prepare_approval(&terms, &digest(7))
+        .expect_err("no operation class may be approved");
+    assert!(error_code(error).contains("PROVENANCE_INVALID"));
+}
+
+#[test]
 fn petal_scoped_key_is_frozen_to_installer_provenance_and_petal_approvals() {
     let harness = Harness::new();
     let provenance = harness.provenance();
