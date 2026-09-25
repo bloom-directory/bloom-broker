@@ -149,7 +149,11 @@ pub fn address_family(chain: &Token) -> Option<AddressFamily> {
         }
         // Every other chain Bloom transacts on today is EVM. An unknown name
         // returns None and fails closed at the call site rather than guessing.
-        "arbitrum" | "arc" | "avalanche" | "base" | "bsc" | "ethereum" | "gnosis"
+        // Machine's shipped chain list, plus `robinhood`, which policies name.
+        // `anvil` is the local development node and is EVM like the rest: a
+        // destination there should follow the same case rule, not fall back to
+        // exact spelling because the name was missing here.
+        "anvil" | "arbitrum" | "arc" | "avalanche" | "base" | "bsc" | "ethereum" | "gnosis"
         | "hyperliquid" | "linea" | "optimism" | "polygon" | "robinhood" | "tempo" => {
             Some(AddressFamily::Evm)
         }
@@ -179,6 +183,31 @@ pub fn parse_destination(
         },
     };
     Ok(PolicyTarget::Address(address))
+}
+
+/// The value a destination is compared by.
+///
+/// Decoding only ever *adds* matches. Where the chain is unknown to this build,
+/// or the spelling does not decode, the entry compares verbatim — which is what
+/// every chain did before this module existed — so nothing that was allowed
+/// yesterday is refused today. A policy naming `localnet`, or carrying a
+/// placeholder like `0xrecipient`, keeps behaving exactly as it did.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Comparable {
+    Decoded(PolicyTarget),
+    Literal(String),
+}
+
+/// Reduces one `(chain, destination)` pair to the value it is compared by.
+///
+/// A pure function of its inputs, so two identical spellings always reduce
+/// alike: exact-match behaviour survives by construction rather than through a
+/// fallback branch repeated at each call site.
+pub fn comparable(chain: &Token, destination: &str) -> Comparable {
+    match parse_destination(chain, destination) {
+        Ok(target) => Comparable::Decoded(target),
+        Err(_) => Comparable::Literal(destination.to_owned()),
+    }
 }
 
 fn malformed(family: AddressFamily, reason: impl Into<String>) -> DestinationError {
@@ -549,6 +578,47 @@ mod tests {
         assert_eq!(
             parse("some-future-chain", "petal:near-intents"),
             PolicyTarget::PetalClass("near-intents".into())
+        );
+    }
+
+    /// Decoding widens what matches; it must never narrow it. Chains this
+    /// build cannot decode, and placeholder spellings that are not addresses
+    /// at all, have to keep comparing exactly as they did before.
+    #[test]
+    fn undecodable_entries_still_compare_by_exact_spelling() {
+        for (chain_name, text) in [
+            ("localnet", "whatever-this-is"),
+            ("ethereum", "0xrecipient"),
+        ] {
+            let c = chain(chain_name);
+            assert!(matches!(comparable(&c, text), Comparable::Literal(_)));
+            assert_eq!(comparable(&c, text), comparable(&c, text));
+            assert_ne!(comparable(&c, text), comparable(&c, "something-else"));
+        }
+    }
+
+    /// The two rules that pull opposite ways, stated against the value the
+    /// Broker actually compares.
+    #[test]
+    fn comparable_follows_each_chain_case_rule() {
+        let eth = chain("ethereum");
+        assert_eq!(
+            comparable(&eth, "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+            comparable(&eth, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+            "EIP-55 case is a checksum, not an address"
+        );
+
+        // Both of these are valid 32-byte Solana addresses; they differ only
+        // in case, and they are two different accounts.
+        let sol = chain("solana");
+        let mixed = "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8";
+        let lower = "cktruq2mttgrgkxjtyksdkhjudc2c4tgdzyb98oezy8";
+        assert!(matches!(comparable(&sol, mixed), Comparable::Decoded(_)));
+        assert!(matches!(comparable(&sol, lower), Comparable::Decoded(_)));
+        assert_ne!(
+            comparable(&sol, mixed),
+            comparable(&sol, lower),
+            "base58 case is data, so lowercasing names a different account"
         );
     }
 

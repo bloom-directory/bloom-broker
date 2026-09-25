@@ -1734,6 +1734,102 @@ fn native_solana_destination_refusal_names_the_conflicting_policy_chain() {
     assert!(error.contains("only matches the declared chain \"solana\""));
 }
 
+/// Letter case means different things on different chains, and the Broker has
+/// to read each chain's own rule rather than compare strings. EIP-55 spells a
+/// checksum in case, so the mixed-case and lowercase forms of one EVM account
+/// are one destination. Base58 spells data in case, so two Solana spellings
+/// are two accounts. A string comparison gets exactly one of these right.
+#[test]
+fn destination_case_is_read_by_each_chains_own_rule() {
+    const EVM_CHECKSUMMED: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    const EVM_LOWERCASE: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    // Two valid 32-byte Solana addresses that differ only in case.
+    const SOLANA_MIXED: &str = "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8";
+    const SOLANA_LOWERCASE: &str = "cktruq2mttgrgkxjtyksdkhjudc2c4tgdzyb98oezy8";
+
+    let harness = Harness::new();
+    let provenance = harness.provenance();
+    let mut policy: CanonicalWalletPolicy =
+        serde_json::from_slice(&harness.policy_snapshot(1).canonical_policy.decode()).unwrap();
+    policy.allowed_destinations.extend([
+        PolicyDestination {
+            chain: token("ethereum"),
+            destination: EVM_CHECKSUMMED.into(),
+        },
+        // Stored the other way round, so this cannot pass by lowercasing the
+        // claim and comparing against a policy that is lowercase already.
+        PolicyDestination {
+            chain: token("base"),
+            destination: EVM_LOWERCASE.into(),
+        },
+        PolicyDestination {
+            chain: token("solana"),
+            destination: SOLANA_MIXED.into(),
+        },
+    ]);
+    let snapshot = signed_policy_snapshot(&harness, 2, &policy);
+    harness.authority.install_policy(&snapshot).unwrap();
+
+    let mut terms = petal_terms(&harness, &provenance);
+    terms.policy_version = snapshot.version.clone();
+    terms.policy_digest = snapshot.policy_digest.clone();
+    // Four authorizations, so the approval needs headroom in the limits this
+    // test is not about.
+    terms.limits.max_operations = DecimalU64::new(8);
+    terms.limits.max_signatures = DecimalU64::new(8);
+    terms.limits.value_limits = vec![
+        value_limit("ethereum", "token", "1000"),
+        value_limit("ethereum", "eth", "1000"),
+    ];
+    harness.activate(&terms, Some(&provenance));
+
+    let declaring = |operation_id, chain: &str, destination: &str| {
+        let mut input = petal_input(
+            &terms,
+            &provenance,
+            operation_id,
+            CryptoSuite::Secp256k1Sha256Recoverable,
+        );
+        input
+            .request
+            .petal_use_claim
+            .as_mut()
+            .unwrap()
+            .declared_destinations = vec![DeclaredDestination {
+            chain: token(chain),
+            destination: destination.into(),
+        }];
+        bind_operation_digest(&mut input, &terms);
+        input
+    };
+
+    // One EVM account in two spellings, in both storage directions.
+    harness
+        .authority
+        .authorize(&declaring(operation(91), "ethereum", EVM_LOWERCASE))
+        .expect("the lowercase spelling of a checksummed policy entry is the same account");
+    harness
+        .authority
+        .authorize(&declaring(operation(92), "base", EVM_CHECKSUMMED))
+        .expect("and the checksummed spelling of a lowercase policy entry is too");
+
+    // Two Solana accounts that differ only in case stay two accounts.
+    let error = error_code(
+        harness
+            .authority
+            .authorize(&declaring(operation(93), "solana", SOLANA_LOWERCASE))
+            .unwrap_err(),
+    );
+    assert!(error.contains("DESTINATION_NOT_ALLOWED"), "{error}");
+
+    // ...and the spelling the policy does carry is still allowed, so the
+    // refusal above is about the case and not about Solana in general.
+    harness
+        .authority
+        .authorize(&declaring(operation(94), "solana", SOLANA_MIXED))
+        .expect("the exact policy spelling is allowed");
+}
+
 #[test]
 fn concurrent_renewal_has_one_atomic_winner_and_never_reactivates_predecessor() {
     let harness = Harness::new();
