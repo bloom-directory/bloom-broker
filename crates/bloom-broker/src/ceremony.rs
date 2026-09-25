@@ -27,10 +27,11 @@ use bloom_broker_api::{
 use bloom_signer_api::{
     Base64UrlBytes, CeremonyChallenge, CeremonyCompleteRequest, CeremonyKind,
     CeremonyPrepareRequest, CeremonyState, CeremonyWebAuthnOptions,
-    CrossSurfaceCompleteDestinationRequest, CrossSurfaceCompleteSourceRequest, CrossSurfaceHandoff,
-    CrossSurfacePairStartRequest, CrossSurfacePairing, CrossSurfacePrepareSourceRequest,
-    CrossSurfaceSourcePrepared, CustodyCompleteRequest, CustodyPrepareRequest, CustodyResult,
-    CustodySignerContribution, DecimalU64, Digest32, ExposureMode, HpkeEnvelope, OperationId,
+    CrossSurfaceAlreadyRegisteredRequest, CrossSurfaceCompleteDestinationRequest,
+    CrossSurfaceCompleteSourceRequest, CrossSurfaceHandoff, CrossSurfacePairStartRequest,
+    CrossSurfacePairing, CrossSurfacePrepareSourceRequest, CrossSurfaceSourcePrepared,
+    CustodyCompleteRequest, CustodyPrepareRequest, CustodyResult, CustodySignerContribution,
+    DecimalU64, Digest32, ExposureMode, HpkeEnvelope, OperationId,
     PolicyUpdateCeremonyCompleteRequest, PolicyUpdateCeremonyPrepareRequest,
     ProtocolError as SignerProtocolError, ProtocolErrorCode as SignerProtocolErrorCode,
     SignerActivationReceipt, SignerCeremonyContribution, SignerCeremonyStatus,
@@ -543,6 +544,29 @@ pub trait CeremonySigner: Send + Sync {
         ))
     }
 
+    fn cross_surface_already_registered(
+        &self,
+        _request: CrossSurfaceAlreadyRegisteredRequest,
+    ) -> Result<bloom_signer_api::CeremonyPublicStatus, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "cross-surface existing-passkey outcome unavailable",
+        ))
+    }
+
+    /// Public credential projection for one wallet. Broker uses it only to
+    /// choose which surface can approve a passkey addition; Signer still
+    /// enforces eligibility when it prepares the approving leg.
+    fn credential_list_public(
+        &self,
+        _request: bloom_signer_api::WalletRequest,
+    ) -> Result<Vec<bloom_signer_api::CredentialPublic>, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "credential listing unavailable",
+        ))
+    }
+
     fn prepare_approval(
         &self,
         request: CeremonyPrepareRequest,
@@ -914,6 +938,12 @@ struct CrossPairBody {
 struct CrossAuthorizeBody {
     authority_assertion: bloom_signer_api::WebAuthnAssertion,
     encrypted_authority_prf: HpkeEnvelope,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrossAlreadyRegisteredBody {
+    capability: Base64UrlBytes,
 }
 
 #[derive(Deserialize)]
@@ -1376,19 +1406,9 @@ impl CeremonyBroker {
         now_ms: u64,
     ) -> Result<CeremonyCrossSurfacePrepareResponse, ProtocolError> {
         self.expire_sessions(now_ms)?;
-        if request.destination == CeremonySurfaceSelection::Default {
-            return Err(protocol(
-                ProtocolErrorCode::MalformedFrame,
-                "cross-surface destination must be local or remote",
-            ));
-        }
+        // `Default` resolves like every other ceremony: the hosted surface
+        // when it is effective, otherwise localhost.
         let destination = self.select_surface(request.destination)?;
-        let source_selection = if request.destination == CeremonySurfaceSelection::Local {
-            CeremonySurfaceSelection::Remote
-        } else {
-            CeremonySurfaceSelection::Local
-        };
-        let source = self.select_surface(source_selection)?;
         let request_digest = digest(&request)?;
         let _guard = self.inner.creation_admission.lock();
         if let Some(ceremony_id) = self
@@ -1414,6 +1434,7 @@ impl CeremonyBroker {
                 expires_at_ms: DecimalU64::new(session.expires_at_ms),
             });
         }
+        let source = self.select_approving_surface(&request.wallet_id, &destination)?;
         self.enforce_creation_bounds(Some(&request.wallet_id), false, now_ms)?;
         let destination_surface = destination.reference();
         let source_surface = source.reference();
@@ -1437,7 +1458,7 @@ impl CeremonyBroker {
             ceremony_id: ceremony_id.clone(),
             review_manifest: Some(serde_json::json!({
                 "schema": "bloom.cross_surface_add_review.v1",
-                "title": "Add a passkey on another origin",
+                "title": "Add a wallet passkey",
                 "wallet_name": request.wallet_id,
                 "source_origin": source.identity.origin.clone(),
                 "destination_origin": destination.identity.origin.clone(),
@@ -1484,6 +1505,44 @@ impl CeremonyBroker {
             destination_url: url,
             expires_at_ms: DecimalU64::new(expires_at_ms),
         })
+    }
+
+    /// Choose the surface whose existing passkey approves a new one.
+    ///
+    /// A wallet passkey on the destination's own surface is preferred: that
+    /// approval link opens on any device holding one, whereas a localhost
+    /// link only opens on the Bloom host. Otherwise the other surface
+    /// approves, which is the original cross-surface addition. With neither,
+    /// no approval can ever succeed, so the ceremony is refused here instead
+    /// of reaching `AWAITING_USER` and failing on the user's device.
+    fn select_approving_surface(
+        &self,
+        wallet_id: &Token,
+        destination: &SurfaceDescriptor,
+    ) -> Result<SurfaceDescriptor, ProtocolError> {
+        let credentials = self
+            .inner
+            .signer
+            .credential_list_public(bloom_signer_api::WalletRequest {
+                wallet_id: wallet_id.clone(),
+            })
+            .map_err(signer_error_to_machine)?;
+        let other = if destination.identity.surface_id.as_str() == "local" {
+            CeremonySurfaceSelection::Remote
+        } else {
+            CeremonySurfaceSelection::Local
+        };
+        approving_surface(&credentials, destination, self.select_surface(other).ok()).ok_or_else(
+            || {
+                protocol(
+                    ProtocolErrorCode::ApprovalNotFound,
+                    format!(
+                        "wallet {} has no active passkey that can approve adding another",
+                        wallet_id.as_str()
+                    ),
+                )
+            },
+        )
     }
 
     fn pair_cross_surface(
@@ -1808,6 +1867,63 @@ impl CeremonyBroker {
             .lock()
             .insert(ceremony_id.to_owned(), committed);
         self.finalize_committed_session(ceremony_id, now_ms)
+    }
+
+    /// The destination's passkey provider already holds one of the wallet's
+    /// passkeys for this surface, so WebAuthn refused to create another.
+    /// Signer verifies the handoff capability and records the terminal
+    /// outcome; the destination session ends as `ALREADY_REGISTERED` with no
+    /// credential change.
+    fn already_registered_cross_surface(
+        &self,
+        ceremony_id: &str,
+        body: CrossAlreadyRegisteredBody,
+        now_ms: u64,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let _guard = self.inner.creation_admission.lock();
+        let destination = self
+            .inner
+            .sessions
+            .lock()
+            .get(ceremony_id)
+            .cloned()
+            .ok_or_else(not_found)?;
+        let flow = destination
+            .cross_surface
+            .as_ref()
+            .filter(|flow| flow.role == CrossSurfaceRole::Destination)
+            .ok_or_else(kind_mismatch)?;
+        if destination.state != CeremonyState::AwaitingUser
+            || destination.expires_at_ms <= now_ms
+            || flow.handoff.is_none()
+        {
+            return Err(replay());
+        }
+        let pairing = flow.pairing.as_ref().ok_or_else(not_found)?;
+        let status = self
+            .inner
+            .signer
+            .cross_surface_already_registered(CrossSurfaceAlreadyRegisteredRequest {
+                pairing_id: pairing.pairing_id.clone(),
+                operation_id: destination.operation_id.clone(),
+                capability: body.capability,
+            })
+            .map_err(signer_error_to_machine)?;
+        if status.state != CeremonyState::AlreadyRegistered
+            || status.operation_id != destination.operation_id
+            || status.ceremony_id != pairing.pairing_id
+        {
+            return Err(operation_conflict());
+        }
+        let mut done = destination;
+        done.state = CeremonyState::AlreadyRegistered;
+        latch_terminal(&mut done, now_ms);
+        self.persist_session(&done)?;
+        self.inner
+            .sessions
+            .lock()
+            .insert(ceremony_id.to_owned(), done);
+        Ok(serde_json::json!({"state": "already_registered"}))
     }
 
     /// [`Self::prepare_custody`] with a broker-authored review JSON the
@@ -2359,6 +2475,10 @@ impl CeremonyBroker {
             .route(
                 "/api/cross/{ceremony_id}/finish",
                 post(cross_surface_finish),
+            )
+            .route(
+                "/api/cross/{ceremony_id}/already-registered",
+                post(cross_surface_already_registered),
             )
             .layer(DefaultBodyLimit::max(MAX_CEREMONY_BODY_BYTES))
             .layer(middleware::from_fn(security_headers))
@@ -3786,6 +3906,24 @@ async fn cross_surface_finish(
     }
 }
 
+async fn cross_surface_already_registered(
+    State(broker): State<CeremonyBroker>,
+    Path(ceremony_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<CrossAlreadyRegisteredBody>,
+) -> Response {
+    if broker
+        .authorize_browser(&ceremony_id, &headers, true)
+        .is_err()
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match broker.already_registered_cross_surface(&ceremony_id, body, unix_time_ms()) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(error)).into_response(),
+    }
+}
+
 async fn acknowledge_result(
     State(broker): State<CeremonyBroker>,
     Path(ceremony_id): Path<String>,
@@ -4484,6 +4622,25 @@ fn token_for(session: &BrowserSession) -> Base64UrlBytes {
 /// Stamp when a session reached its terminal state and destroy the launch
 /// token material. Every terminal state latches identically: no terminal
 /// session may keep a usable bearer token, whichever state ended it.
+/// The destination's own surface approves when the wallet has an active
+/// passkey there; otherwise the other usable surface does, if it has one.
+fn approving_surface(
+    credentials: &[bloom_signer_api::CredentialPublic],
+    destination: &SurfaceDescriptor,
+    other: Option<SurfaceDescriptor>,
+) -> Option<SurfaceDescriptor> {
+    let has_passkey_on = |surface: &SurfaceRef| {
+        credentials.iter().any(|credential| {
+            credential.state == bloom_signer_api::CredentialState::Active
+                && &credential.surface == surface
+        })
+    };
+    if has_passkey_on(&destination.reference()) {
+        return Some(destination.clone());
+    }
+    other.filter(|other| has_passkey_on(&other.reference()))
+}
+
 fn latch_terminal(session: &mut BrowserSession, now_ms: u64) {
     session.terminal_at_ms = Some(now_ms);
     session.token = None;
@@ -4499,6 +4656,7 @@ fn is_terminal(state: CeremonyState) -> bool {
             | CeremonyState::Cancelled
             | CeremonyState::Expired
             | CeremonyState::Failed
+            | CeremonyState::AlreadyRegistered
     )
 }
 
@@ -4536,6 +4694,7 @@ fn ceremony_state_name(state: CeremonyState) -> &'static str {
         CeremonyState::Cancelled => "cancelled",
         CeremonyState::Expired => "expired",
         CeremonyState::Failed => "failed",
+        CeremonyState::AlreadyRegistered => "already_registered",
     }
 }
 
@@ -5370,6 +5529,70 @@ mod remote_storage_tests {
         guard_ceremony_storage_version(&connection).unwrap();
         connection.pragma_update(None, "user_version", 3).unwrap();
         assert!(guard_ceremony_storage_version(&connection).is_err());
+    }
+}
+
+#[cfg(test)]
+mod approving_surface_tests {
+    use super::*;
+
+    fn descriptor(identity: bloom_signer_api::SurfaceIdentity) -> SurfaceDescriptor {
+        let reference = identity.reference().unwrap();
+        SurfaceDescriptor {
+            identity,
+            identity_digest: reference.identity_digest,
+            lifecycle: SurfaceLifecycle::Active,
+            lifecycle_revision: DecimalU64::new(0),
+        }
+    }
+
+    fn passkey(
+        surface: &SurfaceDescriptor,
+        state: bloom_signer_api::CredentialState,
+    ) -> bloom_signer_api::CredentialPublic {
+        bloom_signer_api::CredentialPublic {
+            credential_id: Base64UrlBytes::from_bytes(&[1; 16]),
+            wallet_id: Token::new("main").unwrap(),
+            surface: surface.reference(),
+            created_at_ms: DecimalU64::new(1),
+            state,
+        }
+    }
+
+    #[test]
+    fn same_surface_is_preferred_then_the_other_surface_then_nothing() {
+        use bloom_signer_api::CredentialState::{Active, Revoked};
+        let local = descriptor(bloom_signer_api::SurfaceIdentity::local(0));
+        let remote = descriptor(
+            bloom_signer_api::SurfaceIdentity::remote(
+                "abcdefghijklmnopqrstuv2345.relay.bloom.directory",
+                1,
+            )
+            .unwrap(),
+        );
+        let chosen = |credentials: &[bloom_signer_api::CredentialPublic],
+                      other: Option<&SurfaceDescriptor>| {
+            approving_surface(credentials, &remote, other.cloned())
+                .map(|surface| surface.identity.surface_id.as_str().to_owned())
+        };
+        // A phone joining a wallet whose passkeys are remote.
+        assert_eq!(
+            chosen(
+                &[passkey(&remote, Active), passkey(&local, Active)],
+                Some(&local)
+            )
+            .as_deref(),
+            Some("remote")
+        );
+        // Only a localhost passkey: the original cross-surface addition.
+        assert_eq!(
+            chosen(&[passkey(&local, Active)], Some(&local)).as_deref(),
+            Some("local")
+        );
+        // Revoked passkeys and an unusable other surface approve nothing.
+        assert_eq!(chosen(&[passkey(&remote, Revoked)], Some(&local)), None);
+        assert_eq!(chosen(&[passkey(&local, Active)], None), None);
+        assert_eq!(chosen(&[], Some(&local)), None);
     }
 }
 

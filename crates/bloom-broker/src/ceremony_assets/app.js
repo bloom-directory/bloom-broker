@@ -740,6 +740,11 @@ async function createCredential(session, phase) {
       displayName: "Bloom wallet"
     },
     pubKeyCredParams: [{type: "public-key", alg: -7}],
+    // A provider that already holds one of these refuses with
+    // InvalidStateError instead of overwriting it under the shared user handle.
+    excludeCredentials: (options.exclude_credentials || []).map(id => ({
+      type: "public-key", id: decodeUrl(id)
+    })),
     timeout: 120000,
     authenticatorSelection: {
       residentKey: "required",
@@ -799,6 +804,7 @@ function crossSurfaceOptions(prepared, destination) {
       .map(binding => ({binding, challenge: encodeUrl(te.encode(canonicalJson(binding)))})),
     webauthn_options: {
       allowed_credentials: destination ? [] : prepared.source_prf_inputs,
+      exclude_credentials: destination ? (prepared.destination_existing_credentials || []) : [],
       registration_user_handle: prepared.destination_user_handle,
       registration_prf_salt: prepared.destination_prf_salt
     }
@@ -825,9 +831,36 @@ function validateCrossPrepared(session, prepared, pairingId) {
       !/^[0-9a-f]{64}$/.test(prepared.pairing?.pairing_id || "") ||
       !/^[0-9]{6}$/.test(prepared.pairing?.confirmation_code || "") ||
       !Number.isFinite(Number(prepared.pairing.expires_at_ms)) ||
-      Number(prepared.pairing.expires_at_ms) <= Date.now()) {
+      Number(prepared.pairing.expires_at_ms) <= Date.now() ||
+      (prepared.destination_existing_credentials !== undefined &&
+        (!Array.isArray(prepared.destination_existing_credentials) ||
+          !prepared.destination_existing_credentials.every(id =>
+            typeof id === "string" && /^[A-Za-z0-9_-]{1,1366}$/.test(id))))) {
     throw new Error("Paired enrollment binding changed");
   }
+}
+async function finishAlreadyRegistered(session, state) {
+  const wallet = session.cross_surface.wallet_id;
+  try {
+    await mutate(`/api/cross/${ceremonyId}/already-registered`, {
+      capability: encodeUrl(state.capability)
+    });
+  } catch (_) {
+    // The browser reported a wallet passkey on this device either way. If Bloom did
+    // not record it, its request simply expires with nothing enrolled.
+  }
+  if (crossSurfaceState === state) stopCrossSurface();
+  clearInterval(expiryTimer);
+  clearSessionToken();
+  approve.hidden = true;
+  cancel.hidden = true;
+  markDone(`This device can already approve for ${wallet}`);
+  statusNode.textContent = "Nothing to add.";
+  reviewNode.replaceChildren(
+    el("h3", {class: "result-title ok"}, `This device can already approve for ${wallet}`),
+    el("p", {class: "summary"}, `Your passkey provider already has a passkey for ${wallet}, so there's nothing to add. This usually means your passkeys sync between your devices (for example through iCloud Keychain, Google Password Manager or 1Password), or you registered this device earlier.`),
+    el("p", {class: "summary"}, "You can close this page. Nothing has changed.")
+  );
 }
 async function loadCrossSurface(session) {
   const cross = session.cross_surface;
@@ -854,13 +887,16 @@ async function loadCrossSurface(session) {
     Math.min(state.expiresAt - Date.now(), 10 * 60 * 1000));
   for (const fields of [recoveryFields, exportFields, importFields, genericFields]) fields.hidden = true;
   document.getElementById("page-title").textContent = "Add a wallet passkey";
-  document.getElementById("page-lede").textContent = "Approve with an existing passkey, then enroll one on the destination.";
-  panelTitle.textContent = cross.role === "source" ? "Authorize the destination" : "Prepare the destination";
+  document.getElementById("page-lede").textContent = "Approve with a passkey this wallet already has, then create one on the new device.";
+  panelTitle.textContent = cross.role === "source" ? "Approve the new device" : "Prepare this device";
   panelKicker.textContent = "Paired enrollment";
+  const sameSite = cross.source_origin === cross.destination_origin;
   const facts = el("dl", {class: "facts"},
     el("dt", {}, "Wallet"), el("dd", {}, cross.wallet_id),
-    el("dt", {}, "Existing passkey"), el("dd", {}, cross.source_origin),
-    el("dt", {}, "New passkey"), el("dd", {}, cross.destination_origin));
+    ...(sameSite
+      ? [el("dt", {}, "Site"), el("dd", {}, cross.destination_origin)]
+      : [el("dt", {}, "Existing passkey"), el("dd", {}, cross.source_origin),
+        el("dt", {}, "New passkey"), el("dd", {}, cross.destination_origin)]));
   const instructions = el("p", {class: "summary"});
   const step = el("div");
   const expiry = el("p", {class: "expiry"});
@@ -883,14 +919,14 @@ async function loadCrossSurface(session) {
   if (cross.role === "source") {
     const prepared = cross.source_prepared;
     validateCrossPrepared(session, prepared);
-    instructions.textContent = "Compare this code with the destination tab. Continue only if you opened that tab and both origins and codes match.";
+    instructions.textContent = "Compare this code with the one on the new device. Continue only if you started this there and the codes match.";
     step.append(el("p", {}, el("strong", {}, prepared.pairing.confirmation_code)));
     const confirmed = el("input", {type: "checkbox"});
-    step.append(el("label", {}, confirmed, " I opened the destination and the code matches"));
-    approve.textContent = "Authorize with existing passkey";
+    step.append(el("label", {}, confirmed, " I started this on the new device and the code matches"));
+    approve.textContent = "Approve with existing passkey";
     approve.disabled = true;
     confirmed.onchange = () => { approve.disabled = !confirmed.checked || crossSurfaceState !== state; };
-    statusNode.textContent = "Check the destination before authorizing.";
+    statusNode.textContent = "Check the code on the new device before approving.";
     approve.onclick = async () => {
       if (!confirmed.checked) return;
       approve.disabled = true;
@@ -909,14 +945,14 @@ async function loadCrossSurface(session) {
         await mutate(`/api/cross/${ceremonyId}/authorize`, {
           authority_assertion: assertionJson(credential), encrypted_authority_prf: encrypted
         });
-        terminate("Authorized. Return to the destination tab to create the new passkey. It is not active yet.");
+        terminate("Approved. Finish on the new device, where its passkey is created. Nothing is active until then.");
       } catch (error) { fail(error); }
       finally { prf?.fill(0); }
     };
     return;
   }
-  instructions.textContent = "Keep this tab open. Bloom will give you a link for the existing passkey's origin.";
-  statusNode.textContent = "Prepare this tab to receive the authorization.";
+  instructions.textContent = "Keep this page open. Next you get a link to approve with a passkey this wallet already has.";
+  statusNode.textContent = "Prepare this device to receive the approval.";
   approve.textContent = "Prepare enrollment";
   approve.disabled = false;
   approve.onclick = async () => {
@@ -938,11 +974,28 @@ async function loadCrossSurface(session) {
       }
       state.expiresAt = Math.min(state.expiresAt, Number(started.expires_at_ms));
       if (!Number.isFinite(state.expiresAt)) throw new Error("Invalid pairing expiry");
+      const hostOnly = cross.source_origin.startsWith("http://localhost:");
+      const linkActions = el("div", {class: "result-actions"});
+      if (typeof navigator.share === "function") {
+        const share = el("button", {type: "button"}, "Share link");
+        share.onclick = () => { navigator.share({url: sourceUrl.href}).catch(() => {}); };
+        linkActions.append(share);
+      }
+      if (navigator.clipboard?.writeText) {
+        const copy = el("button", {type: "button"}, "Copy link");
+        copy.onclick = () => {
+          navigator.clipboard.writeText(sourceUrl.href)
+            .then(() => { copy.textContent = "Copied"; })
+            .catch(() => {});
+        };
+        linkActions.append(copy);
+      }
       step.replaceChildren(el("p", {}, el("strong", {}, started.confirmation_code)),
-        el("a", {href: sourceUrl.href, target: "_blank", rel: "noopener noreferrer"}, "Open existing-passkey approval"),
-        el("p", {}, cross.source_origin.startsWith("http://localhost:")
+        el("a", {href: sourceUrl.href, target: "_blank", rel: "noopener noreferrer"}, "Open approval link"),
+        linkActions,
+        el("p", {}, hostOnly
           ? "Open this link in a browser on your Bloom host. Compare the code before approving."
-          : "Open this link where your existing passkey is available. Compare the code before approving."));
+          : `Open this link on a device that already has a passkey for ${cross.wallet_id}, such as the one you first set it up on. Compare the code before approving.`));
       statusNode.textContent = "Waiting for your existing passkey approval…";
       const poll = async () => {
         try {
@@ -979,7 +1032,20 @@ async function loadCrossSurface(session) {
             try {
               requireCrossSurface(state);
               const options = crossSurfaceOptions(prepared, true);
-              const created = await createCredential(options, 0);
+              let created;
+              try {
+                created = await createCredential(options, 0);
+              } catch (error) {
+                // WebAuthn's signal that this provider already holds one of
+                // the excluded wallet passkeys. That is a finished outcome,
+                // not a failure: this device can already approve.
+                if (error?.name === "InvalidStateError" &&
+                    options.webauthn_options.exclude_credentials.length > 0) {
+                  await finishAlreadyRegistered(session, state);
+                  return;
+                }
+                throw error;
+              }
               // Both attestation and a fresh assertion are mandatory on this leg.
               newPrf = await ensureNewCredentialPrf(options, created, 1, true);
               if (newPrf.prf.length !== 32) throw new Error("Invalid passkey PRF");

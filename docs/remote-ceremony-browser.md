@@ -69,13 +69,25 @@ durable operation ID and protected pending replacement. No recurring admin
 key use is required. Failure leaves the hosted surface pending or degraded
 while explicit local ceremonies remain available.
 
-Cross-surface passkey enrollment uses Signer's four typed two-leg operations.
-Broker creates a destination session and an auxiliary source session on the
-opposite Signer-approved origin. The source passkey authorizes the exact wallet,
-operation, terms, and destination; Signer encrypts a one-use handoff to the
-destination tab's pre-registered HPKE key. Destination enrollment requires its
-own fresh passkey attestation and PRF assertion. Broker stores neither WKEK nor
-the handoff plaintext and returns only Signer's signed final receipt.
+Adding a passkey on another device uses Signer's typed two-leg operations.
+Machine names only the destination surface (remote by default). At prepare,
+Broker reads the wallet's public credentials and chooses the approving surface:
+the destination's own surface when the wallet has an active passkey there,
+otherwise the other surface; with neither, prepare fails with
+`APPROVAL_NOT_FOUND` and no ceremony is created. Broker creates a destination
+session and an auxiliary source session on the approving origin, which may be
+the same origin. The source passkey authorizes the exact wallet, operation,
+terms, and destination; Signer encrypts a one-use handoff to the destination
+tab's pre-registered HPKE key. Destination enrollment requires its own fresh
+passkey attestation and PRF assertion. Broker stores neither WKEK nor the
+handoff plaintext and returns only Signer's signed final receipt.
+
+The destination passes the wallet's existing passkeys on its surface as
+WebAuthn `excludeCredentials`, so a synced copy is never overwritten under the
+shared user handle. When the browser answers `InvalidStateError`, the page
+reports it with the handoff capability; Signer records `ALREADY_REGISTERED`,
+nothing is enrolled, and the page tells the user this device can already
+approve for the wallet.
 
 The bare `/` route redirects to `https://bloom.directory/#` with HTTP 303; the
 explicit empty fragment prevents an old launch capability from following the

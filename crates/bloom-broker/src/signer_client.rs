@@ -449,6 +449,26 @@ impl CeremonySigner for BrokerSignerClient {
         }
     }
 
+    fn cross_surface_already_registered(
+        &self,
+        request: bloom_signer_api::CrossSurfaceAlreadyRegisteredRequest,
+    ) -> Result<bloom_signer_api::CeremonyPublicStatus, ProtocolError> {
+        match self.request(BrokerSignerRequest::CrossSurfaceAlreadyRegistered(request))? {
+            BrokerSignerResponse::CrossSurfaceAlreadyRegistered(value) => Ok(value),
+            _ => Err(response_mismatch("cross_surface.already_registered")),
+        }
+    }
+
+    fn credential_list_public(
+        &self,
+        request: bloom_signer_api::WalletRequest,
+    ) -> Result<Vec<bloom_signer_api::CredentialPublic>, ProtocolError> {
+        match self.request(BrokerSignerRequest::CredentialListPublic(request))? {
+            BrokerSignerResponse::CredentialListPublic(value) => Ok(value),
+            _ => Err(response_mismatch("credential.list_public")),
+        }
+    }
+
     fn prepare_approval(
         &self,
         request: bloom_signer_api::CeremonyPrepareRequest,

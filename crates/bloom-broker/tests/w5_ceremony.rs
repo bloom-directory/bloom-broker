@@ -1082,6 +1082,8 @@ struct MockSigner {
     completion_error: Option<bloom_signer_api::ProtocolErrorCode>,
     sensitive_result: bool,
     cancellation_fails: AtomicBool,
+    /// Surfaces holding one active passkey for every wallet.
+    passkey_surfaces: Vec<&'static str>,
 }
 
 struct RealSigner {
@@ -1158,6 +1160,7 @@ fn custody_result_to_machine(value: &CustodyResult) -> bloom_broker_api::Custody
             bloom_signer_api::CeremonyState::Cancelled => CeremonyState::Cancelled,
             bloom_signer_api::CeremonyState::Expired => CeremonyState::Expired,
             bloom_signer_api::CeremonyState::Failed => CeremonyState::Failed,
+            bloom_signer_api::CeremonyState::AlreadyRegistered => CeremonyState::AlreadyRegistered,
         }
     }
     fn key(value: &bloom_signer_api::KeyRef) -> KeyRef {
@@ -1563,6 +1566,7 @@ impl MockSigner {
             completion_error: None,
             sensitive_result: false,
             cancellation_fails: AtomicBool::new(false),
+            passkey_surfaces: vec!["local"],
         }
     }
 
@@ -1635,6 +1639,28 @@ impl MockSigner {
 }
 
 impl CeremonySigner for MockSigner {
+    fn credential_list_public(
+        &self,
+        request: bloom_signer_api::WalletRequest,
+    ) -> Result<Vec<bloom_signer_api::CredentialPublic>, bloom_signer_api::ProtocolError> {
+        let status = self.surface_status()?;
+        Ok(status
+            .surfaces
+            .iter()
+            .filter(|surface| {
+                self.passkey_surfaces
+                    .contains(&surface.identity.surface_id.as_str())
+            })
+            .map(|surface| bloom_signer_api::CredentialPublic {
+                credential_id: bloom_signer_api::Base64UrlBytes::from_bytes(&[1; 16]),
+                wallet_id: request.wallet_id.clone(),
+                surface: surface.reference(),
+                created_at_ms: DecimalU64::new(1),
+                state: bloom_signer_api::CredentialState::Active,
+            })
+            .collect())
+    }
+
     fn surface_status(
         &self,
     ) -> Result<bloom_signer_api::SurfaceStatus, bloom_signer_api::ProtocolError> {
@@ -5557,6 +5583,41 @@ fn explicit_cross_surface_prepare_binds_existing_origins_and_operation() {
     );
     let status = broker.public_status(&prepared.operation_id).unwrap();
     assert_eq!(status.ceremony_id, prepared.ceremony_id);
+
+    // `Default` resolves to the effective hosted surface like other ceremonies.
+    let defaulted = bloom_broker_api::CeremonyCrossSurfacePrepareRequest {
+        operation_id: operation("dd"),
+        wallet_id: Token::new("default-wallet").unwrap(),
+        destination: bloom_broker_api::CeremonySurfaceSelection::Default,
+    };
+    assert!(
+        broker
+            .prepare_cross_surface(defaulted, now_ms)
+            .unwrap()
+            .destination_url
+            .starts_with("https://abcdefghijklmnopqrstuv2345.relay.bloom.directory/")
+    );
+
+    // A wallet with no passkey that could approve never reaches AWAITING_USER:
+    // the refusal happens at prepare and leaves no ceremony behind.
+    let broker = CeremonyBroker::new(Arc::new(MockSigner {
+        passkey_surfaces: Vec::new(),
+        ..MockSigner::with_remote_surface()
+    }));
+    let refused = bloom_broker_api::CeremonyCrossSurfacePrepareRequest {
+        operation_id: operation("de"),
+        wallet_id: Token::new("main").unwrap(),
+        destination: bloom_broker_api::CeremonySurfaceSelection::Remote,
+    };
+    let error = broker.prepare_cross_surface(refused, now_ms).unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::ApprovalNotFound);
+    assert!(
+        error
+            .message
+            .contains("main has no active passkey that can approve"),
+        "{error:?}"
+    );
+    assert!(broker.public_status(&operation("de")).is_err());
 }
 
 #[tokio::test]

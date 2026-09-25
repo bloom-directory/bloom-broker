@@ -306,6 +306,12 @@ pub enum CeremonyState {
     Expired,
     #[serde(rename = "FAILED")]
     Failed,
+    /// Terminal passkey addition that changed nothing: the new device's
+    /// passkey provider already held one of the wallet's passkeys for that
+    /// site (a synced copy or an earlier registration). The device can already
+    /// approve for the wallet; there is nothing to retry.
+    #[serde(rename = "ALREADY_REGISTERED")]
+    AlreadyRegistered,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

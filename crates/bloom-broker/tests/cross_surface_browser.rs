@@ -135,6 +135,37 @@ process.stdout.write(JSON.stringify({{ok: true}}));
 }
 
 #[test]
+fn destination_registration_excludes_the_wallets_existing_passkeys() {
+    let output = run_browser(&format!(
+        r#"
+const assert = require("node:assert/strict");
+const prepared = {prepared};
+prepared.destination_existing_credentials = ["AQID", "BAUG"];
+const session = {{operation_id: prepared.pairing.operation_id, cross_surface: {{wallet_id: "main"}}}};
+validateCrossPrepared(session, prepared, prepared.pairing.pairing_id);
+for (const bad of [["not base64!"], "AQID", [7]]) {{
+  const changed = structuredClone(prepared);
+  changed.destination_existing_credentials = bad;
+  assert.throws(() => validateCrossPrepared(session, changed, prepared.pairing.pairing_id));
+}}
+assert.deepEqual(crossSurfaceOptions(prepared, false).webauthn_options.exclude_credentials, []);
+let excluded = null;
+Object.defineProperty(globalThis, "navigator", {{value: {{credentials: {{create: async request => {{
+  excluded = request.publicKey.excludeCredentials.map(item => [item.type, [...new Uint8Array(item.id)]]);
+  throw new DOMException("already registered", "InvalidStateError");
+}}}}}}}});
+await assert.rejects(createCredential(crossSurfaceOptions(prepared, true), 0), {{name: "InvalidStateError"}});
+process.stdout.write(JSON.stringify({{excluded}}));
+"#,
+        prepared = prepared(),
+    ));
+    assert_eq!(
+        output,
+        json!({"excluded": [["public-key", [1, 2, 3]], ["public-key", [4, 5, 6]]]})
+    );
+}
+
+#[test]
 fn remote_reload_uses_scoped_cookie_reference_without_reexchanging_capability() {
     let output = run_browser(
         r#"
