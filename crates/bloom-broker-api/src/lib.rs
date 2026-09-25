@@ -27,6 +27,8 @@ pub use methods::*;
 pub use petal_key::*;
 pub use policy::*;
 pub use provenance::*;
+pub mod address;
+
 pub use revocation::*;
 pub use service::*;
 pub use signing::*;
