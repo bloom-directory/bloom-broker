@@ -7991,3 +7991,324 @@ async fn two_differently_configured_brokers_isolate_ceremony_origin() {
         .unwrap();
     assert_eq!(completed.status(), StatusCode::OK);
 }
+
+/// Answers the four cross-surface Signer calls with fixed, self-consistent
+/// values and delegates every other method to [`MockSigner`], so a test can
+/// drive the paired-enrollment HTTP routes without WebAuthn material.
+struct CrossSurfaceSigner {
+    inner: MockSigner,
+    pairing: parking_lot::Mutex<Option<bloom_signer_api::CrossSurfacePairing>>,
+    reported_capability: parking_lot::Mutex<Option<bloom_signer_api::Base64UrlBytes>>,
+}
+
+impl CrossSurfaceSigner {
+    fn new() -> Self {
+        Self {
+            inner: MockSigner::new(),
+            pairing: parking_lot::Mutex::new(None),
+            reported_capability: parking_lot::Mutex::new(None),
+        }
+    }
+
+    fn challenge(
+        pairing: &bloom_signer_api::CrossSurfacePairing,
+        phase: CeremonyPhase,
+    ) -> CeremonyChallenge {
+        CeremonyChallenge {
+            surface: pairing.destination_surface.clone(),
+            schema: Token::new("bloom.ceremony.challenge.v1").unwrap(),
+            ceremony_id: pairing.pairing_id.clone(),
+            ceremony_kind: CeremonyKind::CredentialAdd,
+            operation_id: pairing.operation_id.clone(),
+            signer_nonce: pairing.destination_challenge.clone(),
+            review_manifest_digest: pairing.exact_terms_digest.clone(),
+            signer_contribution_digest: pairing.pairing_id.clone(),
+            exact_terms_digest: pairing.exact_terms_digest.clone(),
+            phase,
+        }
+    }
+}
+
+impl CeremonySigner for CrossSurfaceSigner {
+    fn surface_status(
+        &self,
+    ) -> Result<bloom_signer_api::SurfaceStatus, bloom_signer_api::ProtocolError> {
+        self.inner.surface_status()
+    }
+
+    fn credential_list_public(
+        &self,
+        request: bloom_signer_api::WalletRequest,
+    ) -> Result<Vec<bloom_signer_api::CredentialPublic>, bloom_signer_api::ProtocolError> {
+        self.inner.credential_list_public(request)
+    }
+
+    fn cross_surface_pair_start(
+        &self,
+        request: bloom_signer_api::CrossSurfacePairStartRequest,
+    ) -> Result<bloom_signer_api::CrossSurfacePairing, bloom_signer_api::ProtocolError> {
+        let pairing = bloom_signer_api::CrossSurfacePairing {
+            pairing_id: digest("c1"),
+            destination_surface: request.destination_surface,
+            operation_id: request.operation_id,
+            exact_terms_digest: request.exact_terms_digest,
+            destination_hpke_public_key: request.destination_hpke_public_key,
+            destination_challenge: digest("c2"),
+            confirmation_code: "123456".into(),
+            expires_at_ms: request.expires_at_ms,
+        };
+        *self.pairing.lock() = Some(pairing.clone());
+        Ok(pairing)
+    }
+
+    fn cross_surface_prepare_source(
+        &self,
+        request: bloom_signer_api::CrossSurfacePrepareSourceRequest,
+    ) -> Result<bloom_signer_api::CrossSurfaceSourcePrepared, bloom_signer_api::ProtocolError> {
+        let pairing = self.pairing.lock().clone().unwrap();
+        let bytes = |fill: u8| bloom_signer_api::Base64UrlBytes::from_bytes(&[fill; 32]);
+        Ok(bloom_signer_api::CrossSurfaceSourcePrepared {
+            source_challenge: Self::challenge(&pairing, CeremonyPhase::Approve),
+            destination_challenges: vec![
+                Self::challenge(&pairing, CeremonyPhase::RegisterCredential),
+                Self::challenge(&pairing, CeremonyPhase::ConfirmPrf),
+            ],
+            pairing,
+            source_surface: request.source_surface,
+            wallet_id: request.wallet_id,
+            source_credentials: Vec::new(),
+            source_prf_inputs: Vec::new(),
+            destination_user_handle: bytes(3),
+            destination_prf_salt: bytes(4),
+            source_hpke_recipient_key: bytes(5),
+            destination_hpke_recipient_key: bytes(6),
+            credential_authority_generation: DecimalU64::new(1),
+            destination_existing_credentials: vec![bytes(1)],
+            signer_signature: bloom_signer_api::Base64UrlBytes::from_bytes(&[7; 64]),
+        })
+    }
+
+    fn cross_surface_complete_source(
+        &self,
+        request: bloom_signer_api::CrossSurfaceCompleteSourceRequest,
+    ) -> Result<bloom_signer_api::CrossSurfaceHandoff, bloom_signer_api::ProtocolError> {
+        let pairing = self.pairing.lock().clone().unwrap();
+        Ok(bloom_signer_api::CrossSurfaceHandoff {
+            pairing_id: request.pairing_id,
+            encrypted_capability: bloom_signer_api::HpkeEnvelope {
+                kem_output: bloom_signer_api::Base64UrlBytes::from_bytes(&[8; 32]),
+                ciphertext: bloom_signer_api::Base64UrlBytes::from_bytes(&[9; 48]),
+            },
+            expires_at_ms: pairing.expires_at_ms,
+        })
+    }
+
+    fn cross_surface_already_registered(
+        &self,
+        request: bloom_signer_api::CrossSurfaceAlreadyRegisteredRequest,
+    ) -> Result<bloom_signer_api::CeremonyPublicStatus, bloom_signer_api::ProtocolError> {
+        let pairing = self.pairing.lock().clone().unwrap();
+        *self.reported_capability.lock() = Some(request.capability);
+        Ok(bloom_signer_api::CeremonyPublicStatus {
+            ceremony_id: request.pairing_id,
+            ceremony_kind: CeremonyKind::CredentialAdd,
+            operation_id: request.operation_id,
+            state: bloom_signer_api::CeremonyState::AlreadyRegistered,
+            expires_at_ms: pairing.expires_at_ms,
+            ceremony_url: None,
+            receipt_digest: None,
+        })
+    }
+
+    fn prepare_approval(
+        &self,
+        request: CeremonyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<SignerPreparedApproval, bloom_signer_api::ProtocolError> {
+        self.inner.prepare_approval(request, now_ms)
+    }
+
+    fn complete_approval(
+        &self,
+        request: CeremonyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<SignerActivationReceipt, bloom_signer_api::ProtocolError> {
+        self.inner.complete_approval(request, now_ms)
+    }
+
+    fn prepare_custody(
+        &self,
+        request: CustodyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
+        self.inner.prepare_custody(request, now_ms)
+    }
+
+    fn complete_custody(
+        &self,
+        request: CustodyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
+        self.inner.complete_custody(request, now_ms)
+    }
+
+    fn bind_custody_output_recipient(
+        &self,
+        operation_id: &OperationId,
+        recipient_key: bloom_signer_api::Base64UrlBytes,
+        now_ms: u64,
+    ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
+        self.inner
+            .bind_custody_output_recipient(operation_id, recipient_key, now_ms)
+    }
+
+    fn cancel(&self, operation_id: &OperationId) -> Result<(), bloom_signer_api::ProtocolError> {
+        self.inner.cancel(operation_id)
+    }
+
+    fn status(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<SignerCeremonyStatus, bloom_signer_api::ProtocolError> {
+        self.inner.status(operation_id)
+    }
+}
+
+#[tokio::test]
+async fn destination_reports_an_already_registered_device_over_http() {
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let signer = Arc::new(CrossSurfaceSigner::new());
+    let broker = CeremonyBroker::new(signer.clone());
+    let prepared = broker
+        .prepare_cross_surface(
+            bloom_broker_api::CeremonyCrossSurfacePrepareRequest {
+                operation_id: operation("e1"),
+                wallet_id: Token::new("main").unwrap(),
+                destination: bloom_broker_api::CeremonySurfaceSelection::Local,
+            },
+            now_ms,
+        )
+        .unwrap();
+    let app = broker.router();
+    let call = |method: &str, uri: String, token: &str, body: Option<serde_json::Value>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "localhost:18734")
+            .header("x-bloom-ceremony-token", token);
+        if body.is_some() {
+            request = request
+                .header(header::ORIGIN, "http://localhost:18734")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin");
+        }
+        let request = request
+            .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+            .unwrap();
+        let app = app.clone();
+        async move {
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+            )
+        }
+    };
+    let destination_token = url_token(&prepared.destination_url);
+    let destination_id = prepared.ceremony_id.to_string();
+    let capability = serde_json::json!({
+        "capability": bloom_signer_api::Base64UrlBytes::from_bytes(&[10; 32]),
+    });
+
+    // Before the existing passkey approves there is no handoff, so the
+    // destination cannot claim a match.
+    let (status, _) = call(
+        "POST",
+        format!("/api/cross/{destination_id}/pair"),
+        &destination_token,
+        Some(serde_json::json!({
+            "destination_hpke_public_key": bloom_signer_api::Base64UrlBytes::from_bytes(&[2; 32]),
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        "POST",
+        format!("/api/cross/{destination_id}/already-registered"),
+        &destination_token,
+        Some(capability.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "no handoff yet");
+    assert!(signer.reported_capability.lock().is_none());
+
+    // The existing passkey approves on the source page.
+    let (_, paired) = call(
+        "POST",
+        format!("/api/cross/{destination_id}/pair"),
+        &destination_token,
+        Some(serde_json::json!({
+            "destination_hpke_public_key": bloom_signer_api::Base64UrlBytes::from_bytes(&[2; 32]),
+        })),
+    )
+    .await;
+    let source_token = url_token(paired["source_url"].as_str().unwrap());
+    let (status, source) = call("GET", "/api/session".into(), &source_token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let source_id = source["ceremony_id"].as_str().unwrap().to_owned();
+    let (status, _) = call(
+        "POST",
+        format!("/api/cross/{source_id}/authorize"),
+        &source_token,
+        Some(serde_json::json!({
+            "authority_assertion": {
+                "credential_id": "AQ", "authenticator_data": "Ag",
+                "client_data_json": "Aw", "signature": "BA", "user_handle": null
+            },
+            "encrypted_authority_prf": {"kem_output": "BQ", "ciphertext": "Bg"},
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The destination's provider already holds a wallet passkey: Signer is
+    // told with the handoff capability and the ceremony ends, unchanged.
+    let (status, body) = call(
+        "POST",
+        format!("/api/cross/{destination_id}/already-registered"),
+        &destination_token,
+        Some(capability.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, serde_json::json!({"state": "already_registered"}));
+    assert_eq!(
+        signer
+            .reported_capability
+            .lock()
+            .as_ref()
+            .map(|c| c.encoded().to_owned()),
+        capability["capability"].as_str().map(str::to_owned)
+    );
+    let status_view = broker.public_status(&operation("e1")).unwrap();
+    assert_eq!(status_view.state, CeremonyState::AlreadyRegistered);
+    assert!(status_view.ceremony_url.is_none());
+    assert!(status_view.receipt_digest.is_none());
+
+    // The terminal session no longer accepts its token.
+    let (status, _) = call(
+        "POST",
+        format!("/api/cross/{destination_id}/already-registered"),
+        &destination_token,
+        Some(capability),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
