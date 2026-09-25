@@ -6,6 +6,12 @@
 //! string comparison answers a question about spelling when the question is
 //! about identity.
 //!
+//! Decoding is equally what keeps distinct accounts *apart*. A Cosmos HRP and
+//! a Bitcoin output script carry identity, not decoration: `cosmos1…` and
+//! `cosmosvaloper1…` over one key are different destinations, and so are the
+//! P2PKH and P2WPKH addresses over one hash160. Comparing payloads alone would
+//! quietly merge them, which is the more dangerous direction of the same bug.
+//!
 //! Stored entries are never rewritten. A policy is JCS-canonicalised and
 //! signed, and its bytes feed the digests a ceremony binds, so canonicalising
 //! on write would invalidate every existing signature. Only interpretation
@@ -18,14 +24,22 @@
 
 use std::fmt;
 
+use bech32::{Bech32, Hrp, primitives::decode::CheckedHrpstring};
 use bloom_rpc_wire::Token;
 use thiserror::Error;
 
 /// How a chain spells an address.
+///
+/// This is narrower than the `chain_family` on [`crate::wallet_account`],
+/// which names a *key* family (`evm` is secp256k1, `solana` is ed25519). Two
+/// chains can share a key family and still encode addresses nothing alike —
+/// EVM and Cosmos are both secp256k1 — so the two stay separate concepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddressFamily {
     Evm,
     Solana,
+    Cosmos,
+    Bitcoin,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -51,6 +65,19 @@ pub enum ChainAddress {
     /// as destinations. Validating ed25519 membership here would refuse every
     /// PDA and every associated token account.
     Solana([u8; 32]),
+    /// bech32, compared as `(hrp, payload)` because the prefix is part of the
+    /// identity: `cosmos1…` is an account and `cosmosvaloper1…` is a validator
+    /// operator, over the very same key.
+    Cosmos {
+        hrp: String,
+        payload: Vec<u8>,
+    },
+    /// The output script the address pays to, not the hash inside it. One
+    /// hash160 has both a P2PKH and a P2WPKH spelling that spend under
+    /// different rules, so they must not compare equal.
+    Bitcoin {
+        script_pubkey: Vec<u8>,
+    },
 }
 
 /// An entry in `allowed_destinations`. Not every entry is an address.
@@ -71,6 +98,17 @@ impl fmt::Display for PolicyTarget {
             Self::Address(ChainAddress::Solana(bytes)) => {
                 f.write_str(&bs58::encode(bytes).into_string())
             }
+            Self::Address(ChainAddress::Cosmos { hrp, payload }) => {
+                let hrp = Hrp::parse(hrp).map_err(|_| fmt::Error)?;
+                f.write_str(&bech32::encode::<Bech32>(hrp, payload).map_err(|_| fmt::Error)?)
+            }
+            // Deliberately not re-encoded as an address. The script *is* the
+            // decoded identity, and a reverse mapping would be a second
+            // implementation of the forward one, free to drift from it, for
+            // the sake of a diagnostic string.
+            Self::Address(ChainAddress::Bitcoin { script_pubkey }) => {
+                write!(f, "script:{}", hex::encode(script_pubkey))
+            }
         }
     }
 }
@@ -78,15 +116,37 @@ impl fmt::Display for PolicyTarget {
 /// The prefix marking a Petal-chosen destination rather than a fixed account.
 pub const PETAL_DESTINATION_PREFIX: &str = "petal:";
 
+/// Cosmos payloads are 20 bytes for a secp256k1 account and 32 for module and
+/// interchain accounts. The bound is a sanity limit rather than either of
+/// those: a length no chain uses simply never matches a real destination, so
+/// pinning the set here would only refuse chains before they arrive.
+const COSMOS_MAX_PAYLOAD_BYTES: usize = 64;
+
+/// Bitcoin mainnet only. Testnet and regtest are different chains and belong
+/// under their own `chain` names — accepting `tb1…` here would let a testnet
+/// address sit in a mainnet policy and read as allowed.
+const BITCOIN_MAINNET_HRP: &str = "bc";
+const BITCOIN_P2PKH_VERSION: u8 = 0x00;
+const BITCOIN_P2SH_VERSION: u8 = 0x05;
+
 /// Which spelling rules a chain uses.
 ///
-/// Chains are named rather than identified by CAIP-2 today. Under CAIP-2 this
-/// function would collapse into reading the namespace (`eip155:*` is EVM,
-/// `solana:*` is Solana), so the mapping is isolated here: adopting CAIP-2
-/// changes this body and nothing that calls it.
+/// A plain name rather than a CAIP-2 identifier, because `Token` cannot hold
+/// one: its alphabet is `[a-z0-9._/-]`, with no `:`. CAIP-2 already lives in
+/// this crate as the `caip2: String` on `ChainAccountProjection`, which is the
+/// shape adopting it here would take too — a wire-visible type change to a
+/// field inside the signed policy snapshot. It would also not remove this
+/// table, only add to it: existing signatures cover the spelling `base`, so
+/// the mapping would have to stay for as long as any policy signed today does.
 pub fn address_family(chain: &Token) -> Option<AddressFamily> {
     match chain.as_str() {
+        "bitcoin" => Some(AddressFamily::Bitcoin),
         "solana" => Some(AddressFamily::Solana),
+        // Bech32 chains are listed by name even though the HRP identifies the
+        // chain, because HRPs are reused across a chain's own testnets.
+        "celestia" | "cosmos" | "dydx" | "injective" | "neutron" | "noble" | "osmosis" => {
+            Some(AddressFamily::Cosmos)
+        }
         // Every other chain Bloom transacts on today is EVM. An unknown name
         // returns None and fails closed at the call site rather than guessing.
         "arbitrum" | "arc" | "avalanche" | "base" | "bsc" | "ethereum" | "gnosis"
@@ -110,6 +170,13 @@ pub fn parse_destination(
     let address = match family {
         AddressFamily::Evm => ChainAddress::Evm(evm_address(destination)?),
         AddressFamily::Solana => ChainAddress::Solana(solana_address(destination)?),
+        AddressFamily::Cosmos => {
+            let (hrp, payload) = cosmos_address(destination)?;
+            ChainAddress::Cosmos { hrp, payload }
+        }
+        AddressFamily::Bitcoin => ChainAddress::Bitcoin {
+            script_pubkey: bitcoin_script_pubkey(destination)?,
+        },
     };
     Ok(PolicyTarget::Address(address))
 }
@@ -155,9 +222,99 @@ fn solana_address(value: &str) -> Result<[u8; 32], DestinationError> {
     })
 }
 
+/// bech32 with the original checksum, which is what the Cosmos SDK emits.
+/// bech32m is rejected rather than tolerated: it is a different encoding, and
+/// a string carrying it is not an address any Cosmos chain issued.
+///
+/// The HRP is returned lowercased. bech32 forbids mixed case, so an all-upper
+/// string is the same address as its lowercase form, but the *prefix itself*
+/// distinguishes roles on one key and is therefore part of what is compared.
+fn cosmos_address(value: &str) -> Result<(String, Vec<u8>), DestinationError> {
+    let parsed = CheckedHrpstring::new::<Bech32>(value)
+        .map_err(|e| malformed(AddressFamily::Cosmos, e.to_string()))?;
+    let payload: Vec<u8> = parsed.byte_iter().collect();
+    if payload.is_empty() || payload.len() > COSMOS_MAX_PAYLOAD_BYTES {
+        return Err(malformed(
+            AddressFamily::Cosmos,
+            format!(
+                "expected 1-{COSMOS_MAX_PAYLOAD_BYTES} bytes, got {}",
+                payload.len()
+            ),
+        ));
+    }
+    Ok((parsed.hrp().to_lowercase(), payload))
+}
+
+/// The output script the address pays to.
+///
+/// Bitcoin has no single address encoding: base58check covers P2PKH and P2SH,
+/// bech32 covers segwit v0, and bech32m covers v1 taproot. They are not
+/// interchangeable spellings of one identity the way EIP-55 case is — each
+/// names a different script with different spending rules — so the script is
+/// what gets compared and the address form is merely how it was written down.
+fn bitcoin_script_pubkey(value: &str) -> Result<Vec<u8>, DestinationError> {
+    // `segwit::decode` applies BIP-350 itself: v0 must carry a bech32
+    // checksum, v1 and later bech32m, and the program length is checked
+    // against the version. Falling through on failure keeps the base58 forms
+    // reachable without having to sniff the encoding first.
+    if let Ok((hrp, version, program)) = bech32::segwit::decode(value) {
+        if hrp.to_lowercase() != BITCOIN_MAINNET_HRP {
+            return Err(malformed(
+                AddressFamily::Bitcoin,
+                format!(
+                    "expected a mainnet address (hrp \"{BITCOIN_MAINNET_HRP}\"), got \"{}\"",
+                    hrp.to_lowercase()
+                ),
+            ));
+        }
+        // OP_0 is 0x00; versions 1..=16 are OP_1..OP_16 at 0x51..=0x60.
+        let opcode = match version.to_u8() {
+            0 => 0x00,
+            v => 0x50 + v,
+        };
+        let mut script = Vec::with_capacity(2 + program.len());
+        script.push(opcode);
+        script.push(program.len() as u8);
+        script.extend_from_slice(&program);
+        return Ok(script);
+    }
+
+    let decoded = bs58::decode(value)
+        .with_check(None)
+        .into_vec()
+        .map_err(|_| {
+            malformed(
+                AddressFamily::Bitcoin,
+                "expected a mainnet bech32 (bc1…) or base58check address",
+            )
+        })?;
+    let (version, hash) = decoded
+        .split_first()
+        .ok_or_else(|| malformed(AddressFamily::Bitcoin, "address payload is empty"))?;
+    if hash.len() != 20 {
+        return Err(malformed(
+            AddressFamily::Bitcoin,
+            format!("expected a 20-byte hash, got {}", hash.len()),
+        ));
+    }
+    match *version {
+        // OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+        BITCOIN_P2PKH_VERSION => Ok([&[0x76, 0xa9, 0x14], hash, &[0x88, 0xac]].concat()),
+        // OP_HASH160 <20> OP_EQUAL
+        BITCOIN_P2SH_VERSION => Ok([&[0xa9, 0x14], hash, &[0x87]].concat()),
+        other => Err(malformed(
+            AddressFamily::Bitcoin,
+            format!("unknown mainnet address version byte {other:#04x}"),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// hash160 of the secp256k1 generator point, the BIP-173 test vector.
+    const HASH160: &str = "751e76e8199196d454941c45d1b3a323f1433bd6";
 
     fn chain(name: &str) -> Token {
         Token::new(name).expect("valid chain token")
@@ -165,6 +322,15 @@ mod tests {
 
     fn parse(name: &str, destination: &str) -> PolicyTarget {
         parse_destination(&chain(name), destination).expect("destination decodes")
+    }
+
+    fn script(name: &str, destination: &str) -> String {
+        match parse(name, destination) {
+            PolicyTarget::Address(ChainAddress::Bitcoin { script_pubkey }) => {
+                hex::encode(script_pubkey)
+            }
+            other => panic!("expected a Bitcoin script, got {other:?}"),
+        }
     }
 
     /// The whole point. EIP-55 encodes a checksum in letter case, so tooling
@@ -220,12 +386,149 @@ mod tests {
         );
     }
 
-    /// 32 bytes on one chain must never equal 32 bytes on another.
+    /// The Cosmos counterpart of the EVM case rule: bech32 forbids mixed case,
+    /// so an all-uppercase string is the same address written differently.
+    #[test]
+    fn cosmos_case_is_only_spelling() {
+        assert_eq!(
+            parse("cosmos", "cosmos1w508d6qejxtdg4y5r3zarvary0c5xw7k6ah60c"),
+            parse("cosmos", "COSMOS1W508D6QEJXTDG4Y5R3ZARVARY0C5XW7K6AH60C"),
+        );
+    }
+
+    /// ...and the rule that pulls the other way. One key yields an account
+    /// address and a validator operator address that differ *only* in prefix.
+    /// They authorise different things, so comparing the payload alone would
+    /// let a policy naming the account also permit the operator.
+    #[test]
+    fn cosmos_prefix_is_part_of_the_identity() {
+        let account = parse("cosmos", "cosmos1w508d6qejxtdg4y5r3zarvary0c5xw7k6ah60c");
+        let operator = parse(
+            "cosmos",
+            "cosmosvaloper1w508d6qejxtdg4y5r3zarvary0c5xw7klfr0rt",
+        );
+        assert_ne!(account, operator, "prefix distinguishes the two roles");
+        let (
+            PolicyTarget::Address(ChainAddress::Cosmos { payload: a, .. }),
+            PolicyTarget::Address(ChainAddress::Cosmos { payload: b, .. }),
+        ) = (&account, &operator)
+        else {
+            panic!("expected Cosmos addresses");
+        };
+        assert_eq!(a, b, "and they really are the same 20 bytes underneath");
+    }
+
+    /// Module and interchain accounts are 32 bytes rather than 20. Pinning the
+    /// length to 20 would refuse them.
+    #[test]
+    fn cosmos_accepts_both_account_widths() {
+        parse("osmosis", "osmo1w508d6qejxtdg4y5r3zarvary0c5xw7kjxy2e2");
+        parse(
+            "cosmos",
+            "cosmos1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs5u086e",
+        );
+    }
+
+    /// bech32m is a different encoding, not a lenient spelling of bech32. A
+    /// Cosmos chain never issues one, and a corrupted checksum must not decode
+    /// to *some* address.
+    #[test]
+    fn cosmos_rejects_bech32m_and_broken_checksums() {
+        for bad in [
+            // Valid bech32m, which no Cosmos chain emits.
+            "abc14w46h2at4w46h2at4w46h2at4w46h2at958ngu",
+            // One character of the payload changed.
+            "cosmos1w508d6qejxtdg4y5r3zarvary0c5xw7k6ah60d",
+            "cosmos1",
+            "not-bech32",
+        ] {
+            assert!(
+                parse_destination(&chain("cosmos"), bad).is_err(),
+                "{bad} must not decode"
+            );
+        }
+    }
+
+    /// The Bitcoin counterpart of the Cosmos prefix rule, and the reason this
+    /// family compares scripts. One hash160 has a P2PKH spelling and a P2WPKH
+    /// spelling; they spend under different rules and are not one destination.
+    #[test]
+    fn bitcoin_address_forms_over_one_hash_are_different_destinations() {
+        let p2pkh = script("bitcoin", "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH");
+        let p2wpkh = script("bitcoin", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+        assert_eq!(p2pkh, format!("76a914{HASH160}88ac"));
+        assert_eq!(p2wpkh, format!("0014{HASH160}"));
+        assert_ne!(p2pkh, p2wpkh);
+    }
+
+    #[test]
+    fn bitcoin_covers_p2sh_and_taproot() {
+        assert_eq!(
+            script("bitcoin", "3CNHUhP3uyB9EUtRLsmvFUmvGdjGdkTxJw"),
+            format!("a914{HASH160}87"),
+        );
+        assert_eq!(
+            script(
+                "bitcoin",
+                "bc1py3m7vwnghyne9gnvcjw82j7gqt2rafgdmlmwmqnn3hvcmdm09rjqcgrtxs"
+            ),
+            "51202477e63a68b92792a26cc49c754bc802d43ea50ddff6ed82738dd98db76f28e4",
+        );
+    }
+
+    /// A testnet address decodes perfectly well — that is exactly why it has
+    /// to be refused here rather than left to look like a mainnet one.
+    #[test]
+    fn bitcoin_refuses_other_networks_on_the_mainnet_chain() {
+        for bad in [
+            // Same witness program as the mainnet vector above, on testnet.
+            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+            // Same hash160 as the P2PKH vector above, testnet version byte.
+            "mrCDrCybB6J1vRfbwM5hemdJz73FwDBC8r",
+        ] {
+            assert!(
+                parse_destination(&chain("bitcoin"), bad).is_err(),
+                "{bad} must not decode on mainnet"
+            );
+        }
+    }
+
+    /// Bytes on one chain must never equal bytes on another.
     #[test]
     fn families_cannot_collide() {
-        let solana = ChainAddress::Solana([7; 32]);
-        let evm = ChainAddress::Evm([7; 20]);
-        assert_ne!(PolicyTarget::Address(solana), PolicyTarget::Address(evm));
+        let targets = [
+            ChainAddress::Solana([7; 32]),
+            ChainAddress::Evm([7; 20]),
+            ChainAddress::Cosmos {
+                hrp: "cosmos".into(),
+                payload: vec![7; 20],
+            },
+            ChainAddress::Bitcoin {
+                script_pubkey: vec![7; 20],
+            },
+        ];
+        for (i, a) in targets.iter().enumerate() {
+            for b in &targets[i + 1..] {
+                assert_ne!(
+                    PolicyTarget::Address(a.clone()),
+                    PolicyTarget::Address(b.clone())
+                );
+            }
+        }
+    }
+
+    /// Two bech32 chains are two destinations even though the HRP alone would
+    /// already tell them apart — `chain` stays the scoping key because HRPs
+    /// are reused between a chain and its testnets.
+    #[test]
+    fn cosmos_chains_do_not_share_destinations() {
+        assert_ne!(
+            parse("osmosis", "osmo1w508d6qejxtdg4y5r3zarvary0c5xw7kjxy2e2"),
+            parse(
+                "celestia",
+                "celestia1w508d6qejxtdg4y5r3zarvary0c5xw7kthx244"
+            ),
+        );
     }
 
     /// `allowed_destinations` is a union: concrete accounts and Petal classes.
@@ -260,13 +563,25 @@ mod tests {
     }
 
     #[test]
-    fn display_round_trips_each_variant() {
+    fn display_round_trips_each_decodable_spelling() {
         for (chain_name, text) in [
             ("base", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
             ("solana", "11111111111111111111111111111111"),
+            ("cosmos", "cosmos1w508d6qejxtdg4y5r3zarvary0c5xw7k6ah60c"),
             ("base", "petal:near-intents"),
         ] {
             assert_eq!(parse(chain_name, text).to_string(), text);
         }
+    }
+
+    /// Bitcoin is the exception: the decoded identity is a script, and showing
+    /// it is more use in a diagnostic than echoing back whichever of the four
+    /// address forms happened to be written.
+    #[test]
+    fn display_shows_the_bitcoin_script() {
+        assert_eq!(
+            parse("bitcoin", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").to_string(),
+            format!("script:0014{HASH160}"),
+        );
     }
 }

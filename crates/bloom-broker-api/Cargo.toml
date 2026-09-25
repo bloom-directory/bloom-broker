@@ -10,7 +10,7 @@ bloom-rpc-wire.workspace = true
 # Address decoders: `PolicyDestination` is compared by decoded bytes, so this
 # crate carries the per-chain decoding rules both Broker and Machine share.
 bech32.workspace = true
-bs58.workspace = true
+bs58 = { workspace = true, features = ["check"] }
 hex.workspace = true
 serde.workspace = true
 serde_jcs.workspace = true
