@@ -116,8 +116,13 @@ impl ProvenanceCatalog {
             let subject = serde_jcs::to_vec(&record.subject).map_err(|error| {
                 ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string())
             })?;
+            // A Petal lineage record may carry private-state succession
+            // without granting any operation class. Approval verification
+            // still rejects an empty class list.
+            let lineage_only = matches!(record.subject, ProvenanceSubject::Petal { .. })
+                && record.petal_lineage.is_some();
             if !subjects.insert(subject)
-                || record.operation_classes.is_empty()
+                || (record.operation_classes.is_empty() && !lineage_only)
                 || record
                     .operation_classes
                     .iter()
@@ -213,6 +218,35 @@ mod tests {
             catalog.validate_shape().unwrap_err().code,
             ProtocolErrorCode::ProvenanceMismatch
         );
+    }
+
+    #[test]
+    fn only_petal_lineage_records_may_have_no_operation_classes() {
+        let petal = ProvenanceSubject::Petal {
+            package_hash: Digest32::new("00".repeat(32)).unwrap(),
+            route: "r000001".into(),
+        };
+        let mut record = record(petal);
+        record.operation_classes.clear();
+        let mut catalog = ProvenanceCatalog {
+            schema: PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![record],
+        };
+        assert!(catalog.validate_shape().is_err());
+        catalog.records[0].petal_lineage = Some(PetalLineageMembership {
+            lineage_id: "pln1_6etojfshqyk6bzm257kzv7noj3perfz4siioiuhj74xosznyzhka".into(),
+            release_sequence: DecimalU64::new(1),
+            predecessor_package_hashes: vec![],
+            controller_key_id: Token::new("installer-key").unwrap(),
+            controller_signature: Base64UrlBytes::from_bytes(&[1; 64]),
+            active: true,
+        });
+        catalog.validate_shape().unwrap();
+        catalog.records[0].subject = ProvenanceSubject::Cli {
+            client_id: Token::new("cli").unwrap(),
+            command_class: Token::new("read").unwrap(),
+        };
+        assert!(catalog.validate_shape().is_err());
     }
 
     #[test]
