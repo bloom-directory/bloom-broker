@@ -247,7 +247,7 @@ fn worker(
                 bloom_signer_api::SIGNER_API_CURRENT,
                 bloom_signer_api::SIGNER_API_RANGE,
                 request,
-                30_000,
+                120_000,
                 sender_head,
                 move |peer_head| {
                     persist_response_checkpoint(
