@@ -62,6 +62,9 @@ pub struct ServiceCapabilities {
     pub schemas: Vec<Token>,
     pub backends: Vec<BackendPublicCapability>,
     pub assurance_verifiers: Vec<VerifierPublicCapability>,
+    /// Present only when a clear-signing catalog is stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_signing: Option<crate::ClearSigningStatus>,
     pub frame_max_bytes: DecimalU64,
 }
 
@@ -104,10 +107,26 @@ pub struct ApprovalPrepareRequest {
     /// preimage from each envelope and binds it to the exact selector.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub safe_review_payloads: Vec<Base64UrlBytes>,
+    /// The review mode the caller requires for this whole batch. Omitted
+    /// means `clear` in a wallet that has clear signing enabled, and leaves
+    /// the previous envelope behavior in one that has not. A peer that does
+    /// not understand this field rejects the frame rather than ignoring it,
+    /// so a required mode can never be silently dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_review_mode: Option<ReviewMode>,
     #[serde(default)]
     pub petal_use_claim: Option<PetalUseClaim>,
     #[serde(default)]
     pub system_use_claim: Option<SystemUseClaim>,
+}
+
+/// One mode for the whole batch. There is no mixed badge, no automatic
+/// split, and no downgrade from `clear` to `opaque_exact`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewMode {
+    Clear,
+    OpaqueExact,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

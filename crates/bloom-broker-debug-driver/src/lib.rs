@@ -22,14 +22,22 @@ use sha2::{Digest as _, Sha256};
 
 type BloomKem = X25519HkdfSha256;
 
+/// Default ceremony origin used by existing callers and tests.
+pub const DEFAULT_CEREMONY_ORIGIN: &str = "http://localhost:18734";
+
 pub struct VirtualAuthenticator {
     signing_key: SigningKey,
     credential_id: Base64UrlBytes,
     user_handle: Base64UrlBytes,
+    origin: String,
 }
 
 impl VirtualAuthenticator {
     pub fn generate() -> Self {
+        Self::generate_with_origin(DEFAULT_CEREMONY_ORIGIN)
+    }
+
+    pub fn generate_with_origin(origin: &str) -> Self {
         let mut credential_id = [0_u8; 32];
         let mut user_handle = [0_u8; 32];
         SysRng
@@ -42,6 +50,7 @@ impl VirtualAuthenticator {
             signing_key: SigningKey::generate(),
             credential_id: Base64UrlBytes::from_bytes(&credential_id),
             user_handle: Base64UrlBytes::from_bytes(&user_handle),
+            origin: origin.to_owned(),
         }
     }
 
@@ -50,6 +59,10 @@ impl VirtualAuthenticator {
     /// material. Domain-separated hashes keep the credential ID and user
     /// handle independent from the signing scalar.
     pub fn from_seed(seed: &[u8]) -> Self {
+        Self::from_seed_with_origin(seed, DEFAULT_CEREMONY_ORIGIN)
+    }
+
+    pub fn from_seed_with_origin(seed: &[u8], origin: &str) -> Self {
         let credential_id =
             Sha256::digest([b"bloom-debug-driver-credential/v1".as_slice(), seed].concat());
         let user_handle = Sha256::digest([b"bloom-debug-driver-user/v1".as_slice(), seed].concat());
@@ -72,7 +85,12 @@ impl VirtualAuthenticator {
             signing_key,
             credential_id: Base64UrlBytes::from_bytes(&credential_id),
             user_handle: Base64UrlBytes::from_bytes(&user_handle),
+            origin: origin.to_owned(),
         }
+    }
+
+    pub fn origin(&self) -> &str {
+        &self.origin
     }
 
     pub fn credential(&self, sign_count: u32) -> WebAuthnCredential {
@@ -99,7 +117,7 @@ impl VirtualAuthenticator {
     }
 
     pub fn assertion(&self, challenge: &[u8], sign_count: u32) -> WebAuthnAssertion {
-        let client_data = client_data("webauthn.get", challenge);
+        let client_data = client_data("webauthn.get", challenge, &self.origin);
         let authenticator_data = authenticator_data(0x05, sign_count);
         let mut message = authenticator_data.clone();
         message.extend_from_slice(&Sha256::digest(&client_data));
@@ -132,6 +150,7 @@ impl VirtualAuthenticator {
             client_data_json: Base64UrlBytes::from_bytes(&client_data(
                 "webauthn.create",
                 challenge,
+                &self.origin,
             )),
             attestation_object: Base64UrlBytes::from_bytes(&encoded),
             transports: vec![Token::new("internal").expect("static transport token")],
@@ -184,11 +203,11 @@ pub fn seal_hpke(
     })
 }
 
-fn client_data(kind: &str, challenge: &[u8]) -> Vec<u8> {
+fn client_data(kind: &str, challenge: &[u8], origin: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "type": kind,
         "challenge": Base64UrlBytes::from_bytes(challenge),
-        "origin": "http://localhost:18734",
+        "origin": origin,
         "crossOrigin": false
     }))
     .expect("client data serializes")
@@ -214,7 +233,26 @@ fn driver_error() -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
-    use super::VirtualAuthenticator;
+    use super::{DEFAULT_CEREMONY_ORIGIN, VirtualAuthenticator};
+
+    #[test]
+    fn instance_origin_is_stamped_into_client_data() {
+        let alternate = "http://localhost:28735";
+        let authenticator = VirtualAuthenticator::from_seed_with_origin(b"origin-probe", alternate);
+        assert_eq!(authenticator.origin(), alternate);
+        let assertion = authenticator.assertion(b"challenge", 1);
+        let client_data: serde_json::Value =
+            serde_json::from_slice(&assertion.client_data_json.decode()).unwrap();
+        assert_eq!(client_data["origin"], alternate);
+        let attestation = authenticator.attestation(b"challenge");
+        let attestation_data: serde_json::Value =
+            serde_json::from_slice(&attestation.client_data_json.decode()).unwrap();
+        assert_eq!(attestation_data["origin"], alternate);
+        assert_eq!(
+            VirtualAuthenticator::from_seed(b"origin-probe").origin(),
+            DEFAULT_CEREMONY_ORIGIN
+        );
+    }
 
     #[test]
     fn seeded_authenticator_is_repeatable_and_domain_separated() {

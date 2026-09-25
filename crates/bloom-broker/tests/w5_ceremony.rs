@@ -7,10 +7,11 @@ use bloom_broker::{
     authority::{AssuranceRegistry, BrokerAuthority, canonical_policy_authority_diff},
     ceremony::{
         CEREMONY_ADDR_V4, CEREMONY_OWNER_HEADER, CEREMONY_OWNER_VALUE, CeremonyBroker,
-        CeremonyCompletionObserver, CeremonyLimits, CeremonySigner, ReviewManifestContext,
+        CeremonyCompletionObserver, CeremonyEndpoint, CeremonyLimits, CeremonySigner,
+        ReviewManifestContext,
     },
     clock::BrokerClock,
-    journal::{AuditSigner, BrokerJournal},
+    journal::{AuditSigner, BrokerJournal, FrozenReview, NewApprovalRecord},
     service::BrokerRpcService,
     signer_client::BrokerSignerClient,
 };
@@ -61,7 +62,29 @@ use std::sync::{
 };
 use tower::ServiceExt as _;
 
-static CANONICAL_LISTENERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static EPHEMERAL_PORT_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Bind IPv4 on port 0, hold it, bind IPv6 on the same selected port, and
+/// return the held pair plus its explicit nonzero endpoint. Retries selection
+/// if the second bind collides. Test setup only, never 18734.
+fn ephemeral_endpoint_pair() -> (
+    std::net::TcpListener,
+    std::net::TcpListener,
+    CeremonyEndpoint,
+) {
+    loop {
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral IPv4");
+        let port = v4.local_addr().expect("ephemeral v4 port").port();
+        assert_ne!(port, 0);
+        assert_ne!(port, 18_734);
+        let endpoint = CeremonyEndpoint::new(port).expect("ephemeral port valid");
+        match std::net::TcpListener::bind(endpoint.addr_v6()) {
+            Ok(v6) => return (v4, v6, endpoint),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("bind ephemeral IPv6: {error}"),
+        }
+    }
+}
 
 fn test_time_source() -> &'static str {
     #[cfg(target_os = "linux")]
@@ -249,7 +272,7 @@ fn custody_manifest_is_rendered_on_the_primary_review_surface() {
     let script = format!(
         r#"
 class Node {{
-  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
   setAttribute() {{}}
   append(...children) {{ this.children.push(...children); }}
   replaceChildren(...children) {{ this.children = children; }}
@@ -258,6 +281,7 @@ const nodes = {{}};
 globalThis.document = {{
   getElementById: id => nodes[id] ||= new Node(id),
   createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
   createTextNode: text => String(text)
 }};
 globalThis.location = {{hash: "", search: "", pathname: "/"}};
@@ -281,7 +305,7 @@ renderReview({{
     canonical_plan: `Remove a passkey\n\nOperation     ${{operation}}`
   }}
 }});
-const rendered = allText(nodes.review);
+const rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
 if (nodes["page-title"].textContent !== "Remove a passkey from a wallet" ||
     !rendered.includes("This credential stops being an authority") ||
     !rendered.includes(operation)) {{
@@ -310,7 +334,7 @@ fn evm_manifest_is_rendered_as_primary_review_facts() {
     let script = format!(
         r#"
 class Node {{
-  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
   setAttribute() {{}}
   append(...children) {{ this.children.push(...children); }}
   replaceChildren(...children) {{ this.children = children; }}
@@ -319,6 +343,7 @@ const nodes = {{}};
 globalThis.document = {{
   getElementById: id => nodes[id] ||= new Node(id),
   createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
   createTextNode: text => String(text)
 }};
 globalThis.location = {{hash: "", search: "", pathname: "/"}};
@@ -354,11 +379,11 @@ renderReview(session({{
   payload_keccak: "0xabc",
   calldata_bytes: "0"
 }}));
-let rendered = allText(nodes.review);
+let rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
 for (const expected of ["0x2222222222222222222222222222222222222222", "0.0003 ETH",
-  "Base", "Gas limit", "Maximum fee rate", "1.5 Gwei", "Priority fee cap",
-  "Exact envelope checked", "Contract execution effects are not verified",
-  "Calldata", "None — plain transfer"]) {{
+  "Base", "Maximum fee rate", "1.5 Gwei", "Priority fee cap",
+  "Transaction destination, value and bytes checked", "Contract behavior not verified",
+  "Data", "None — plain transfer"]) {{
   if (!rendered.includes(expected)) throw new Error(`missing ${{expected}}: ${{rendered}}`);
 }}
 for (const stale of ["Native value (wei)", "per gas (wei)", "Some("]) {{
@@ -376,7 +401,7 @@ renderReview(session({{
   payload_keccak: "0xdef",
   calldata_bytes: "0"
 }}));
-rendered = allText(nodes.review);
+rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
 if (!rendered.includes("300000000000000 raw native units on evm-999999") ||
     rendered.includes("0.0003 ETH") || rendered.includes("0.0003 POL")) {{
   throw new Error(`unknown chain invented asset metadata: ${{rendered}}`);
@@ -394,8 +419,9 @@ renderReview(session({{
   payload_keccak: "0x47e9",
   calldata_bytes: "1234", calldata_keccak: "0x1234"
 }}));
-rendered = allText(nodes.review);
-for (const expected of ["Approve one contract call", "1,234 bytes", "0x1234"]) {{
+rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
+// An uninterpretable call says so, and still discloses the exact input.
+for (const expected of ["Approve a call Bloom cannot read", "1,234 bytes", "0x1234"]) {{
   if (!rendered.includes(expected)) throw new Error(`contract call not disclosed ${{expected}}: ${{rendered}}`);
 }}
 
@@ -412,8 +438,8 @@ renderReview(session({{
   payload_keccak: "0xbeef",
   calldata_bytes: "5", calldata_keccak: "0xcafe"
 }}));
-rendered = allText(nodes.review);
-for (const expected of ["Deploy one contract", "Deploy contract (CREATE)", "5 bytes", "0xcafe"]) {{
+rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
+for (const expected of ["Deploy a contract", "Initcode", "5 bytes", "0xcafe"]) {{
   if (!rendered.includes(expected)) throw new Error(`creation not disclosed ${{expected}}: ${{rendered}}`);
 }}
 
@@ -463,6 +489,117 @@ for (const expected of ["Approve one Safe transaction", "ERC-20 transfer",
 }
 
 #[test]
+fn policy_page_states_the_numeric_chain_exact_opt_in_scope() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  setAttribute() {{}}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+renderReview({{
+  ceremony_kind: "policy_update",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "wallet-primary"}},
+  review_manifest: {{
+    schema: "bloom.review-manifest.v1",
+    authority_diff: {{
+      added_destinations: [
+        {{chain: "evm-31337", destination: "exact"}},
+        {{chain: "anvil", destination: "0x000000000000000000000000000000000000dEaD"}}
+      ],
+      removed_destinations: [
+        {{chain: "evm-1", destination: "exact"}}
+      ]
+    }}
+  }}
+}});
+const rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
+for (const expected of [
+  "Allow exact transactions on evm-31337",
+  "any address through the deployment workflow, including contract creation",
+  "every transaction still needs its own approval",
+  "Allow sending to",
+  "0x000000000000000000000000000000000000dEaD",
+  "Stop allowing exact transactions on evm-1"
+]) {{
+  if (!rendered.includes(expected)) throw new Error(`missing ${{expected}}: ${{rendered}}`);
+}}
+// The old label understated the grant by calling it only a deploy permission.
+for (const stale of ["Allow deploying contracts on", "Stop allowing contract deployment on"]) {{
+  if (rendered.includes(stale)) throw new Error(`stale policy wording ${{stale}}: ${{rendered}}`);
+}}
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn browser_cancel_disables_approve_before_awaiting_and_reports_the_outcome() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let start = asset
+        .find("cancel.onclick = async () => {")
+        .expect("asset must install a cancel handler");
+    let end = asset[start..]
+        .find("\n  };")
+        .map(|offset| &asset[start..start + offset]);
+    let handler = end.expect("cancel handler must close");
+    // A slow cancel response must not leave an approve button live next to a
+    // ceremony being cancelled: both buttons disable before the first await.
+    let first_await = handler.find("await").expect("handler awaits the cancel");
+    let approve_off = handler
+        .find("approve.disabled = true;")
+        .expect("handler disables approve");
+    assert!(
+        approve_off < first_await,
+        "approve must be disabled before the cancel request is awaited"
+    );
+    for (needle, why) in [
+        (
+            "statusNode.textContent = \"Cancelling…\";",
+            "immediate feedback",
+        ),
+        ("Cancelled — nothing was signed", "terminal outcome message"),
+        ("cancel.hidden = true;", "buttons removed on success"),
+    ] {
+        assert!(
+            handler.contains(needle),
+            "cancel handler must provide {why}: {needle}"
+        );
+    }
+}
+
+#[test]
 fn key_derive_primary_review_explains_the_session_without_internal_scope_json() {
     let asset = include_str!("../src/ceremony_assets/app.js");
     let executable = asset
@@ -472,7 +609,7 @@ fn key_derive_primary_review_explains_the_session_without_internal_scope_json() 
     let script = format!(
         r#"
 class Node {{
-  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
   setAttribute() {{}}
   append(...children) {{ this.children.push(...children); }}
   replaceChildren(...children) {{ this.children = children; }}
@@ -481,6 +618,7 @@ const nodes = {{}};
 globalThis.document = {{
   getElementById: id => nodes[id] ||= new Node(id),
   createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
   createTextNode: text => String(text)
 }};
 globalThis.location = {{hash: "", search: "", pathname: "/"}};
@@ -554,7 +692,7 @@ fn reusable_pumpfun_approval_is_plain_language_with_raw_grants_collapsed() {
     let script = format!(
         r#"
 class Node {{
-  constructor(name) {{ this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
   setAttribute() {{}}
   append(...children) {{ this.children.push(...children); }}
   replaceChildren(...children) {{ this.children = children; }}
@@ -563,6 +701,7 @@ const nodes = {{}};
 globalThis.document = {{
   getElementById: id => nodes[id] ||= new Node(id),
   createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
   createTextNode: text => String(text)
 }};
 globalThis.location = {{hash: "", search: "", pathname: "/"}};
@@ -863,8 +1002,10 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
         "href=\"/assets/style.css\"",
         "href=\"/assets/bloom-primary.svg\"",
         "src=\"/assets/bloom-primary.svg\"",
-        "Signed local review",
-        "Review before continuing",
+        // The shell carries structure and controls; every word of the review
+        // comes from the renderer, so no marketing copy is asserted here.
+        "id=\"panel-title\"",
+        "id=\"action-expiry\"",
         "id=\"status\"",
         "id=\"review\"",
         "id=\"approve\"",
@@ -881,12 +1022,32 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
         !shell.contains("<style>"),
         "the ceremony shell must not contain CSP-blocked inline styles"
     );
+    // The desktop introduction column is gone: one review column, and no
+    // reassurance competing with the decision.
+    for removed in [
+        "class=\"layout\"",
+        "class=\"intro\"",
+        "trust-item",
+        "Nothing leaves this computer",
+    ] {
+        assert!(
+            !shell.contains(removed),
+            "the ceremony shell still carries {removed}"
+        );
+    }
 
     let stylesheet = include_str!("../src/ceremony_assets/style.css");
     for required in [
-        "--paper:#f4efe6",
-        ".layout{display:grid",
+        // One centred column with a documented measure, the stable component
+        // hooks a theme may target, and the narrow-width behaviour.
+        "--ceremony-width:840px",
+        "--ceremony-accent:",
+        ".ceremony-intent{",
+        ".ceremony-party{",
+        ".ceremony-warning{",
+        ".ceremony-actions{",
         "@media(max-width:560px)",
+        "@media(prefers-reduced-motion:reduce)",
     ] {
         assert!(
             stylesheet.contains(required),
@@ -2019,6 +2180,7 @@ async fn prepare_scoped_approval(
     match MachineBrokerService::dispatch(
         broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            requested_review_mode: None,
             operation_id,
             terms: terms.clone(),
             canonical_plan_facts_digest: digest("e7"),
@@ -2957,6 +3119,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let stale_policy_error = MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            requested_review_mode: None,
             evm_review_payloads: vec![Base64UrlBytes::from_bytes(&creation)],
             safe_review_payloads: Vec::new(),
             operation_id: operation("d9"),
@@ -3024,6 +3187,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         MachineBrokerService::dispatch(
             &broker,
             MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                requested_review_mode: None,
                 evm_review_payloads: Vec::new(),
                 safe_review_payloads: envelope
                     .map(|bytes| vec![Base64UrlBytes::from_bytes(&bytes)])
@@ -3100,6 +3264,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let approval_prepared = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            requested_review_mode: None,
             evm_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
             operation_id: approval_operation.clone(),
@@ -3233,6 +3398,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let exact_prepared = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            requested_review_mode: None,
             safe_review_payloads: Vec::new(),
             operation_id: exact_approval_operation.clone(),
             terms: exact_terms.clone(),
@@ -3464,6 +3630,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             MachineBrokerService::dispatch(
                 &broker,
                 MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                    requested_review_mode: None,
                     evm_review_payloads: Vec::new(),
                     safe_review_payloads: Vec::new(),
                     operation_id: operation(&format!("{:02x}", 0xc0 + index)),
@@ -3834,11 +4001,14 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     restarted_journal
         .create_approval_record(
             &raced_approval_id,
-            &raced_terms_jcs,
-            &digest("ee"),
-            None,
-            None,
-            None,
+            &NewApprovalRecord {
+                terms_jcs: &raced_terms_jcs,
+                review_manifest_digest: &digest("ee"),
+                approved_claim_digest: None,
+                provenance_jcs: None,
+                renewal_of: None,
+                review: &FrozenReview::legacy(),
+            },
         )
         .unwrap();
     assert!(
@@ -4275,6 +4445,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         MachineBrokerService::dispatch(
             &restarted_scoped_broker,
             MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                requested_review_mode: None,
                 evm_review_payloads: Vec::new(),
                 safe_review_payloads: Vec::new(),
                 operation_id: operation("dc"),
@@ -5158,7 +5329,11 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         "text/css; charset=utf-8"
     );
     let stylesheet_body = stylesheet.into_body().collect().await.unwrap().to_bytes();
-    assert!(stylesheet_body.starts_with(b":root{"));
+    assert_eq!(
+        stylesheet_body.as_ref(),
+        include_bytes!("../src/ceremony_assets/style.css"),
+        "the route must serve the complete compiled-in default stylesheet"
+    );
     let logo = app
         .clone()
         .oneshot(
@@ -5180,6 +5355,79 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
         logo_body.as_ref(),
         include_bytes!("../src/ceremony_assets/bloom-primary.svg")
     );
+    // Bundled token artwork. Only the reviewed names exist, and the route is
+    // a fixed match rather than a path lookup, so no other file is reachable
+    // through it and a request for one is a plain 404.
+    for (name, bytes) in [
+        (
+            "usdc.svg",
+            include_bytes!("../src/ceremony_assets/tokens/usdc.svg").as_slice(),
+        ),
+        (
+            "dai.svg",
+            include_bytes!("../src/ceremony_assets/tokens/dai.svg").as_slice(),
+        ),
+    ] {
+        let artwork = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assets/tokens/{name}"))
+                    .header(header::HOST, "localhost:18734")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(artwork.status(), StatusCode::OK, "{name} must be served");
+        assert_eq!(
+            artwork.headers()[header::CONTENT_TYPE],
+            "image/svg+xml; charset=utf-8"
+        );
+        let body = artwork.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), bytes, "{name} must be the compiled-in file");
+    }
+    for name in [
+        "unknown.svg",
+        "usdc.svg.bak",
+        "style.css",
+        "..%2Fstyle.css",
+        "%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+    ] {
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assets/tokens/{name}"))
+                    .header(header::HOST, "localhost:18734")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.status(),
+            StatusCode::NOT_FOUND,
+            "{name} must not resolve through the token artwork route"
+        );
+    }
+    let wrong_host_artwork = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/assets/tokens/usdc.svg")
+                .header(header::HOST, "attacker.invalid:18734")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        wrong_host_artwork.status(),
+        StatusCode::FORBIDDEN,
+        "token artwork must enforce the same Host check as every other asset"
+    );
+
     let unknown_token = Base64UrlBytes::from_bytes(&[99; 32]);
     let unknown = app
         .clone()
@@ -5337,18 +5585,34 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
 
 #[tokio::test]
 async fn prebound_canonical_listener_is_a_fatal_no_fallback_failure() {
-    let _guard = CANONICAL_LISTENERS.lock().await;
-    let listener = match std::net::TcpListener::bind(CEREMONY_ADDR_V4) {
-        Ok(listener) => Some(listener),
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
-        Err(error) => panic!("cannot establish canonical-listener precondition: {error}"),
-    };
-    let error = CeremonyBroker::bind_canonical_loopback()
+    let _guard = EPHEMERAL_PORT_GUARD.lock().await;
+    let (held_v4, held_v6, endpoint) = ephemeral_endpoint_pair();
+    // A second bind while the first pair is still held must fail; never
+    // close-probe-and-assume.
+    let error = CeremonyBroker::bind_canonical_loopback_for(endpoint)
         .map(|(v4, _)| v4)
         .unwrap_err();
     assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
-    assert!(error.message.contains("18734"));
-    drop(listener);
+    assert!(error.message.contains(&endpoint.port().to_string()));
+    drop(held_v4);
+    drop(held_v6);
+}
+
+#[test]
+fn ceremony_endpoint_formats_host_origin_and_urls_without_sockets() {
+    let default = CeremonyEndpoint::default();
+    assert_eq!(default.port(), 18_734);
+    assert_eq!(default.host(), "localhost:18734");
+    assert_eq!(default.origin(), "http://localhost:18734");
+    assert_eq!(default.addr_v4(), CEREMONY_ADDR_V4);
+    let port80 = CeremonyEndpoint::new(80).unwrap();
+    assert_eq!(port80.host(), "localhost");
+    assert_eq!(port80.origin(), "http://localhost");
+    assert!(CeremonyEndpoint::new(0).is_err());
+    assert_eq!(CeremonyEndpoint::new(28_735).unwrap().port(), 28_735);
+    // Out-of-range JSON values never reach the endpoint: the protected
+    // config declares `ceremony_port` as `Option<u16>`, so serde rejects
+    // non-integers and values above 65535 while parsing.
 }
 
 #[test]
@@ -5371,10 +5635,32 @@ fn login_session_disconnect_terminalizes_every_live_browser_session() {
 #[tokio::test]
 async fn paired_loopback_servers_validate_serve_both_families_and_shutdown() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    let _guard = CANONICAL_LISTENERS.lock().await;
+    let _guard = EPHEMERAL_PORT_GUARD.lock().await;
     let signer = Arc::new(MockSigner::new());
-    let broker = CeremonyBroker::new(signer);
-    let (v4, v6) = CeremonyBroker::bind_canonical_loopback().unwrap();
+    // Select a free port (never 18734), then bind the pair through the
+    // product helper. Retries on a lost race; the held-pair collision case
+    // is covered by the prebound test above.
+    let (broker, endpoint, v4, v6) = loop {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral IPv4");
+        let port = probe.local_addr().expect("ephemeral port").port();
+        drop(probe);
+        if port == 0 || port == 18_734 {
+            continue;
+        }
+        let endpoint = CeremonyEndpoint::new(port).expect("ephemeral port valid");
+        match CeremonyBroker::bind_canonical_loopback_for(endpoint) {
+            Ok((v4, v6)) => {
+                break (
+                    CeremonyBroker::new_with_endpoint(signer.clone(), endpoint),
+                    endpoint,
+                    v4,
+                    v6,
+                );
+            }
+            Err(error) if error.message.contains("already in use") => continue,
+            Err(error) => panic!("bind ephemeral pair: {error}"),
+        }
+    };
     for (first, second) in [
         (
             std::net::TcpListener::bind("0.0.0.0:0").unwrap(),
@@ -5401,10 +5687,17 @@ async fn paired_loopback_servers_validate_serve_both_families_and_shutdown() {
         let _ = stopped.await;
     });
     let client = async {
-        for address in ["127.0.0.1:18734", "[::1]:18734"] {
-            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let host = endpoint.host();
+        for address in [
+            endpoint.addr_v4().to_string(),
+            endpoint.addr_v6().to_string(),
+        ] {
+            let mut stream = tokio::net::TcpStream::connect(&address).await.unwrap();
             stream
-                .write_all(b"GET / HTTP/1.1\r\nHost: localhost:18734\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
                 .await
                 .unwrap();
             let mut response = String::new();
@@ -6764,4 +7057,996 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         .await
         .unwrap();
     assert_eq!(replay_after_ack.status(), StatusCode::FORBIDDEN);
+}
+
+/// Bundled token artwork is chosen by chain id and full contract address, and
+/// by nothing else. The attack this defends against is a lookalike token:
+/// same name, same ticker, one hex digit different. If a familiar logo could
+/// be obtained with publisher-supplied text, or with the right address on the
+/// wrong chain, the picture would manufacture confidence the wallet has not
+/// earned. The logo is decorative; the address stays the identity.
+#[test]
+fn token_artwork_is_selected_by_chain_and_contract_and_nothing_else() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = "";
+                       this.attrs = {{}}; this.hidden = false; }}
+  setAttribute(key, value) {{ this.attrs[key] = value; }}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+  replaceWith(node) {{ this.replacedWith = node; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+
+const USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+const DAI = "0x6B175474E89094C44Da98b954EedeAC495271d0F";
+const src = node => node.attrs && node.attrs.src;
+const isGeneric = node => node.tagName === "SVG" || src(node) === undefined;
+
+// The two reviewed deployments resolve, in either hex case: an address is
+// not case-sensitive and the renderer must not depend on how it arrived.
+for (const address of [USDC, USDC.toLowerCase(), USDC.toUpperCase().replace("0X", "0x")]) {{
+  const icon = tokenReviewIcon("1", address);
+  if (src(icon) !== "/assets/tokens/usdc.svg") {{
+    throw new Error(`USDC artwork missing for ${{address}}: ${{src(icon)}}`);
+  }}
+}}
+if (src(tokenReviewIcon("1", DAI)) !== "/assets/tokens/dai.svg") {{
+  throw new Error("DAI artwork missing");
+}}
+
+// A lookalike contract must not borrow a familiar mark. These differ from
+// USDC by a single hex digit at each end.
+for (const lookalike of [
+  "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB49",
+  "0xB0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+  "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB4",
+  "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB480"
+]) {{
+  if (!isGeneric(tokenReviewIcon("1", lookalike))) {{
+    throw new Error(`a lookalike contract received real artwork: ${{lookalike}}`);
+  }}
+}}
+
+// The same address on another chain is another deployment, and this bundle
+// speaks only for Ethereum. USDC exists at different addresses elsewhere.
+for (const chain of ["8453", "137", "42161", "31337", "10", "", null, undefined]) {{
+  if (!isGeneric(tokenReviewIcon(chain, USDC))) {{
+    throw new Error(`USDC artwork leaked onto chain ${{chain}}`);
+  }}
+}}
+
+// Nothing a publisher writes can reach the selection. A catalog naming an
+// arbitrary contract "USDC" gets the generic icon.
+for (const hostile of ["usdc", "USDC", "dai", "1:usdc", "../usdc.svg", "usdc.svg",
+                       "/assets/tokens/usdc.svg", "__proto__", "constructor", "toString"]) {{
+  if (!isGeneric(tokenReviewIcon("1", hostile))) {{
+    throw new Error(`artwork selected from publisher text: ${{hostile}}`);
+  }}
+}}
+// Inherited object properties must not resolve as entries either.
+if (!isGeneric(tokenReviewIcon("constructor", "prototype"))) {{
+  throw new Error("prototype chain leaked into artwork selection");
+}}
+
+// Artwork is decorative: it carries no alternative text that could be read
+// as an identity, and the wrapper is hidden from assistive technology.
+const usdcIcon = tokenReviewIcon("1", USDC);
+if (usdcIcon.attrs.alt !== "") throw new Error("artwork must have empty alt text");
+
+// An image that fails to load falls back to the generic icon rather than
+// leaving an empty frame where an identity cue belongs.
+if (typeof usdcIcon.onerror !== "function") {{
+  throw new Error("artwork has no load-failure fallback");
+}}
+usdcIcon.onerror();
+if (!usdcIcon.replacedWith || !isGeneric(usdcIcon.replacedWith)) {{
+  throw new Error("a failed artwork load did not fall back to the generic icon");
+}}
+"#
+    );
+    let mut child = std::process::Command::new("node")
+        .arg("--input-type=module")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(script.as_bytes())
+        .expect("write script");
+    let output = child.wait_with_output().expect("run node");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Upgradeability is one fact about one contract. It used to arrive twice —
+/// once from the verifier's per-call `warnings` and once from the page's walk
+/// over the selected catalog entries — so a single-entry review printed the
+/// same sentence and the same timestamp in two consecutive paragraphs. The
+/// catalog entries are now the only source, and the observation moves into
+/// the details section where the rest of the provenance already lives.
+#[test]
+fn the_upgradeable_warning_is_stated_once_per_contract_and_keeps_its_timestamp_in_details() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = "";
+                       this.attrs = {{}}; this.hidden = false; }}
+  setAttribute(key, value) {{ this.attrs[key] = value; }}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+  replaceWith(node) {{ this.replacedWith = node; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+function count(haystack, needle) {{
+  let seen = 0;
+  let at = haystack.indexOf(needle);
+  while (at !== -1) {{ seen += 1; at = haystack.indexOf(needle, at + needle.length); }}
+  return seen;
+}}
+const SECOND = "0x1111111111111111111111111111111111111111";
+// `name` picks the preview; `addresses` become the upgradeable entries.
+function render(name, addresses) {{
+  const session = previewSession(name);
+  const plan = JSON.parse(session.review_manifest.canonical_plan);
+  const clear = plan.evm_review.clear_signing;
+  const template = clear.entries[0];
+  clear.entries = clear.entries.map(entry => ({{...entry, upgradeable: false}}));
+  for (const [index, address] of addresses.entries()) {{
+    if (index < clear.entries.length) {{
+      clear.entries[index] = {{...clear.entries[index], contract_address: address, upgradeable: true}};
+    }} else {{
+      clear.entries.push({{...template, contract_address: address, upgradeable: true}});
+    }}
+  }}
+  session.review_manifest.canonical_plan = JSON.stringify(plan);
+  renderReview(session);
+  const children = nodes.review.children;
+  const details = children.filter(child => child?.name === "details");
+  return {{
+    primary: allText({{textContent: "", innerHTML: "", children:
+      children.filter(child => child?.name !== "details")}}),
+    details: details.map(allText).join(" ")
+  }};
+}}
+const TOKEN = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
+const SENTENCE = "Upgradeable contract — its behavior can change.";
+
+// One affected contract: the exact short sentence, once, and nothing of the
+// long form it replaced anywhere on the page.
+let view = render("transfer", [TOKEN]);
+if (count(view.primary, SENTENCE) !== 1) {{
+  throw new Error(`one upgradeable contract produced ${{count(view.primary, SENTENCE)}} warnings: ${{view.primary}}`);
+}}
+for (const stale of ["can be upgraded", "The publisher observed it at"]) {{
+  if (`${{view.primary}} ${{view.details}}`.includes(stale)) {{
+    throw new Error(`the superseded wording survived: ${{stale}}`);
+  }}
+}}
+// The decision does not carry a timestamp; the details section does, once.
+if (/\d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}} UTC/.test(view.primary)) {{
+  throw new Error(`an observation timestamp is still beside the decision: ${{view.primary}}`);
+}}
+if (count(view.details, "the publisher observed this deployment at") !== 1) {{
+  throw new Error(`the observation is not stated exactly once in details: ${{view.details}}`);
+}}
+if (!view.details.includes(TOKEN)) {{
+  throw new Error("details do not say which contract is upgradeable");
+}}
+
+// Two affected contracts: two warnings, each naming its own deployment, so
+// they are not two identical lines the reader cannot tell apart.
+view = render("transfer", [TOKEN, SECOND]);
+if (count(view.primary, "its behavior can change.") !== 2) {{
+  throw new Error(`two upgradeable contracts did not produce two warnings: ${{view.primary}}`);
+}}
+if (count(view.primary, SENTENCE) !== 0) {{
+  throw new Error("an unqualified sentence appeared while several contracts were affected");
+}}
+for (const address of [TOKEN, SECOND]) {{
+  const short = `${{address.slice(0, 6)}}…${{address.slice(-4)}}`;
+  if (!view.primary.includes(`Upgradeable contract ${{short}} — its behavior can change.`)) {{
+    throw new Error(`no warning names ${{short}}: ${{view.primary}}`);
+  }}
+}}
+
+// A contract the publisher did not mark upgradeable says nothing at all.
+view = render("transfer", []);
+if (view.primary.includes("Upgradeable") || view.details.includes("Upgradeable")) {{
+  throw new Error(`a direct deployment was described as upgradeable: ${{view.primary}}`);
+}}
+
+// Removing the duplicate must not remove the warnings that come from the
+// call itself. The allowance advisory is one of those and is unrelated.
+view = render("allowance-finite", [TOKEN]);
+if (count(view.primary, SENTENCE) !== 1) {{
+  throw new Error("the upgradeable warning is missing from an allowance review");
+}}
+if (!view.primary.includes("not added to any existing allowance")) {{
+  throw new Error("a call warning was lost with the duplicate");
+}}
+if (!view.primary.includes("can move your tokens later without another approval")) {{
+  throw new Error("the allowance advisory was lost with the duplicate");
+}}
+"#
+    );
+    let mut child = std::process::Command::new("node")
+        .arg("--input-type=module")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(script.as_bytes())
+        .expect("write script");
+    let output = child.wait_with_output().expect("run node");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The review's semantics come from the typed intent Broker froze, not from
+/// anything a publisher controls. These assertions are the boundary: rename
+/// every label, reverse the field order, put markup in the names, and the
+/// heading, the roles and the classification must not move.
+#[test]
+fn the_clear_signed_review_reads_its_meaning_only_from_the_typed_intent() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = "";
+                       this.attrs = {{}}; this.hidden = false; }}
+  setAttribute(key, value) {{ this.attrs[key] = value; }}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+function find(node, predicate) {{
+  if (typeof node === "string") return null;
+  if (predicate(node)) return node;
+  for (const child of node.children) {{
+    const hit = find(child, predicate);
+    if (hit) return hit;
+  }}
+  return null;
+}}
+function show(name) {{
+  const session = previewSession(name);
+  renderReview(session);
+  const root = {{textContent: "", innerHTML: "", children: nodes.review.children}};
+  const intent = find(root, n => String(n.className || "").includes("ceremony-intent"));
+  const details = nodes.review.children.filter(child => child?.name === "details");
+  return {{
+    all: allText(root),
+    primary: allText({{textContent: "", innerHTML: "", children:
+      nodes.review.children.filter(child => child?.name !== "details")}}),
+    technical: details.map(allText).join(" "),
+    heading: allText(nodes["panel-title"])
+      .replace(/\s+/g, " ").trim(),
+    action: nodes["panel-title"].attrs["data-action"],
+    magnitude: nodes["panel-title"].attrs["data-magnitude"],
+    roles: [].concat(...nodes.review.children.map(function collect(n) {{
+      if (typeof n === "string") return [];
+      const here = String(n.className || "").includes("ceremony-party") && n.attrs?.["data-role"]
+        ? [n.attrs["data-role"]] : [];
+      return here.concat(...n.children.map(collect));
+    }})),
+    button: nodes.approve.textContent
+  }};
+}}
+
+// A transfer names the amount and the recipient, and the recipient is a
+// recipient — never the contract, never a generic "To".
+let view = show("transfer");
+if (view.heading !== "Requested transfer") throw new Error(`transfer heading: ${{view.heading}}`);
+if (view.primary.includes(view.heading)) throw new Error("action title was printed twice");
+if (!view.primary.includes("−250 BDT") || !view.primary.includes("+250 BDT")) {{
+  throw new Error("requested sender/recipient movements are missing");
+}}
+if (!view.technical.includes("Contract behavior has not been verified")) {{
+  throw new Error("the interpretation limitation disappeared from details");
+}}
+if (!allText(nodes["page-title"]).includes("Chain ID 31337")) {{
+  throw new Error("the exact EVM chain is missing from the primary context");
+}}
+if (!view.primary.includes("BDT — Bloom Demo Token")) {{
+  throw new Error("the token's full name is missing from the primary review");
+}}
+if (view.action !== "transfer") throw new Error(`transfer action: ${{view.action}}`);
+if (!view.roles.includes("recipient")) throw new Error(`transfer roles: ${{view.roles}}`);
+if (view.roles.includes("spender")) throw new Error("a transfer must not name a spender");
+if (view.button !== "Approve transfer") throw new Error(`transfer button: ${{view.button}}`);
+// Identity is the address. A name may accompany it and must never stand in.
+if (!view.primary.includes("0x9fE46736679d2d9a65F0992F2272dE9f3c7fa6e0")) {{
+  throw new Error("the recipient address is not on the page");
+}}
+if (!view.primary.includes("0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512")) {{
+  throw new Error("the token contract address is not on the page");
+}}
+// The envelope's zero native value must not read as the thing being sent.
+if (view.primary.includes("  0 ETH")) throw new Error(`primary showed the native zero: ${{view.primary}}`);
+// The potential cost stays with the decision, labelled as a ceiling.
+if (!view.primary.includes("Gas fee") ||
+    !view.primary.includes("Up to 0.000199 ETH")) {{
+  throw new Error(`the execution gas ceiling is not visible: ${{view.primary}}`);
+}}
+if (!view.technical.includes("0.000198510751634520 ETH")) {{
+  throw new Error("the exact execution cap disappeared");
+}}
+for (const [input, expected] of [
+  ["0.999999999 ETH", "1 ETH"],
+  ["0.000000001 ETH", "0.000001 ETH"],
+  ["9007199254740993.1234567 ETH", "9007199254740993.123457 ETH"],
+  ["1.2345000 ETH", "1.2345 ETH"]
+]) {{
+  if (compactFeeCap(input) !== expected) throw new Error(`fee rounded incorrectly: ${{input}}`);
+}}
+// A chain whose units Bloom cannot authenticate must say the cost cannot be
+// shown. Silently dropping the row would read as "no fee".
+const noUnits = previewSession("transfer");
+const unitless = JSON.parse(noUnits.review_manifest.canonical_plan);
+delete unitless.evm_review.payloads[0].maximum_execution_gas_fee_display;
+noUnits.review_manifest.canonical_plan = JSON.stringify(unitless);
+renderReview(noUnits);
+const shown = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
+if (!shown.includes("Cannot be shown")) {{
+  throw new Error(`an unpriceable fee vanished instead of saying so: ${{shown}}`);
+}}
+renderReview(previewSession("transfer"));
+if (view.primary.includes("3.03 gwei")) throw new Error("gas rates leaked into the primary facts");
+if (!view.technical.includes("3.03 gwei")) throw new Error("gas rates are missing from technical details");
+for (const detail of ["5f2a1c6b8d4e0937ab55c1e8d0f34721aa9c6b5e4d3f2a1908b7c6d5e4f302915", "65410"]) {{
+  if (view.primary.includes(detail)) throw new Error(`primary exposed ${{detail}}`);
+  if (!view.technical.includes(detail)) throw new Error(`technical details omitted ${{detail}}`);
+}}
+
+// A finite allowance states the cap and that it is a total, and the
+// counterparty is a spender.
+view = show("allowance-finite");
+if (!view.heading.includes("to spend up to 100 BDT")) throw new Error(`finite heading: ${{view.heading}}`);
+if (view.magnitude !== "finite") throw new Error(`finite magnitude: ${{view.magnitude}}`);
+if (!view.roles.includes("spender")) throw new Error(`finite roles: ${{view.roles}}`);
+if (view.button !== "Approve allowance") throw new Error(`finite button: ${{view.button}}`);
+if (!view.primary.includes("not added to any existing allowance")) {{
+  throw new Error("the total-not-increment warning is not visible");
+}}
+
+// Zero is a revocation, not a cap of zero.
+view = show("allowance-zero");
+if (!view.heading.includes("allowance to zero")) throw new Error(`zero heading: ${{view.heading}}`);
+if (view.magnitude !== "zero") throw new Error(`zero magnitude: ${{view.magnitude}}`);
+if (view.heading.includes("spend up to")) throw new Error("zero read as a spending cap");
+
+// Unlimited says so in the heading, and does not lead with the U256 maximum.
+view = show("allowance-unlimited");
+if (view.heading !== "Allow unlimited BDT spending") throw new Error(`unlimited heading: ${{view.heading}}`);
+if (view.magnitude !== "unlimited") throw new Error(`unlimited magnitude: ${{view.magnitude}}`);
+if (view.heading.includes("115792089")) throw new Error("the U256 maximum led the heading");
+// Deciding must never require reading the raw integer.
+if (view.primary.includes("115792089")) throw new Error("the U256 maximum is still a primary fact");
+if (!view.technical.includes("115792089")) throw new Error("the exact maximum left technical details");
+if (!view.primary.includes("all your current and future BDT")) throw new Error("the unlimited warning is not visible");
+const unfamiliar = previewSession("allowance-unlimited");
+const unfamiliarPlan = JSON.parse(unfamiliar.review_manifest.canonical_plan);
+unfamiliarPlan.evm_review.payloads[0].contract_call.warnings.push("A new warning the renderer does not recognise");
+unfamiliar.review_manifest.canonical_plan = JSON.stringify(unfamiliarPlan);
+renderReview(unfamiliar);
+const unfamiliarPrimary = nodes.review.children.filter(child => child.name !== "details").map(allText).join(" ");
+if (!unfamiliarPrimary.includes("A new warning the renderer does not recognise")) {{
+  throw new Error("grouping warnings hid an unfamiliar warning");
+}}
+// The exact value is still recoverable, at full precision, further down.
+if (!view.all.includes("115792089237316195423570985008687907853269984665640564039457584007913129639")) {{
+  throw new Error("the exact maximum lost precision");
+}}
+
+// An uninterpretable call says so instead of drawing a transfer.
+view = show("deposit-native-opaque");
+if (!view.primary.includes("Native value sent") || !view.primary.includes("1 ETH")) {{
+  throw new Error("an opaque payable call hid the native value it sends");
+}}
+for (const name of ["deposit-static", "stake-static", "operator-approval"]) {{
+  view = show(name);
+  if (view.action !== "call") throw new Error(`generic function became a transfer: ${{name}}`);
+  if (view.primary.includes("Requested movements")) throw new Error(`invented balance changes: ${{name}}`);
+}}
+view = show("opaque-call");
+if (!view.primary.includes("0xa9059cbb")) throw new Error("opaque calldata is not visible");
+if (view.action !== "opaque") throw new Error(`opaque action: ${{view.action}}`);
+if (!view.primary.includes("cannot say what")) throw new Error(`opaque detail: ${{view.primary}}`);
+view = show("operator-approval");
+if (!view.primary.includes("Function arguments") ||
+    !view.primary.includes("setApprovalForAll(address operator, bool approved)") ||
+    !view.primary.includes("true")) throw new Error("generic call arguments lost their function context");
+
+// A batch keeps every member, in order, under one approval.
+view = show("batch");
+if (view.action !== "batch") throw new Error(`batch action: ${{view.action}}`);
+if (allText(nodes["page-title"]).includes("Wallet settings")) {{
+  throw new Error("a transaction batch was labelled as wallet settings");
+}}
+if (!view.primary.includes("Transaction 1") || !view.primary.includes("Transaction 2")) {{
+  throw new Error("batch members are not listed in order");
+}}
+if (view.primary.indexOf("Transaction 1") > view.primary.indexOf("Transaction 2")) {{
+  throw new Error("batch members are out of order");
+}}
+if (view.button !== "Approve all transactions") throw new Error(`batch button: ${{view.button}}`);
+if (!view.roles.includes("spender") || !view.roles.includes("recipient")) {{
+  throw new Error("batch members lost their distinct spender and recipient roles");
+}}
+
+// Markup in a publisher's name is text, not markup, and does not reach innerHTML.
+view = show("long-identity");
+if (view.all.includes("<script>alert(1)</script>") === false) {{
+  throw new Error("the publisher name was dropped rather than shown inertly");
+}}
+if (nodes.review.children.some(function live(n) {{
+  if (typeof n === "string") return false;
+  return String(n.innerHTML || "").includes("<script>") || n.children.some(live);
+}})) {{
+  throw new Error("publisher text reached innerHTML");
+}}
+
+// Relabelling and reordering every descriptor field cannot move the meaning.
+const renamed = previewSession("transfer");
+const plan = JSON.parse(renamed.review_manifest.canonical_plan);
+const call = plan.evm_review.payloads[0].contract_call;
+call.fields = call.fields.slice().reverse().map((field, index) => Object.assign({{}}, field, {{
+  label: index === 0 ? "Beneficiary" : "Quantity of value"
+}}));
+call.intent = "Totally different publisher story";
+renamed.review_manifest.canonical_plan = JSON.stringify(plan);
+renderReview(renamed);
+const relabelled = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
+if (nodes["panel-title"].textContent !== "Requested transfer") {{
+  throw new Error(`relabelling changed the heading: ${{relabelled}}`);
+}}
+if (!relabelled.includes("Beneficiary")) {{
+  throw new Error("the publisher's own label stopped being shown beside its argument");
+}}
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A preview is a drawing, not a ceremony. Removing the buttons is the
+/// cosmetic half; this is the half that matters — a preview name reaches no
+/// session, no approval operation and no completion path, and the whole
+/// preview surface exists only in a developer-harness build.
+#[tokio::test]
+async fn a_preview_name_reaches_no_session_and_cannot_be_completed() {
+    let signer = Arc::new(MockSigner::new());
+    let broker = CeremonyBroker::new(signer);
+    let app = broker.router();
+    let get = |uri: &str, token: Option<&str>| {
+        let mut builder = Request::builder()
+            .uri(uri.to_owned())
+            .header(header::HOST, "localhost:18734");
+        if let Some(token) = token {
+            builder = builder.header("x-bloom-ceremony-token", token);
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+
+    // Only harness builds serve previews. Release builds must refuse them.
+    let page = app
+        .clone()
+        .oneshot(get("/preview/transfer", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.status(),
+        if cfg!(feature = "triad-dev-harness") {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        }
+    );
+
+    // Every approval path refuses a preview name. It is not a token, so it
+    // resolves to nothing: there is no session to read and none to complete.
+    for name in ["transfer", "allowance-unlimited", "batch", "index"] {
+        let session = app
+            .clone()
+            .oneshot(get("/api/session", Some(name)))
+            .await
+            .unwrap();
+        assert_ne!(
+            session.status(),
+            StatusCode::OK,
+            "preview name `{name}` resolved to a session"
+        );
+        let by_id = app
+            .clone()
+            .oneshot(get(&format!("/api/session/{name}"), Some(name)))
+            .await
+            .unwrap();
+        assert_ne!(
+            by_id.status(),
+            StatusCode::OK,
+            "preview name `{name}` resolved to a session by id"
+        );
+        let complete = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/session/{name}/complete"))
+                    .header(header::HOST, "localhost:18734")
+                    .header("x-bloom-ceremony-token", name)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("origin", "http://localhost:18734")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            complete.status(),
+            StatusCode::OK,
+            "preview name `{name}` completed a ceremony"
+        );
+    }
+}
+
+/// Enabling unlimited allowances is an authority change, so the page has to
+/// show it as current → proposed and say what it does and does not grant.
+/// An empty diff for a real widening is the defect this guards.
+#[test]
+fn the_policy_page_shows_the_clear_signing_authority_change() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = "";
+                       this.attrs = {{}}; this.hidden = false; }}
+  setAttribute(key, value) {{ this.attrs[key] = value; }}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+renderReview(previewSession("policy-unlimited"));
+const rendered = allText({{textContent: "", innerHTML: "", children: [nodes["panel-title"], ...nodes.review.children]}});
+for (const phrase of ["Allow requests for unlimited token spending", "blocked → allowed",
+                      "does not move tokens or grant a spender an allowance", "Each request will still need your approval",
+                      "applies to all supported tokens", "will name its token and spender"]) {{
+  if (!rendered.includes(phrase)) throw new Error(`policy page omitted ${{phrase}}: ${{rendered}}`);
+}}
+if (nodes.approve.textContent !== "Approve policy change") {{
+  throw new Error(`policy button: ${{nodes.approve.textContent}}`);
+}}
+const blocked = previewSession("policy-unlimited");
+const change = blocked.review_manifest.authority_diff.clear_signing;
+[change.before, change.after] = [change.after, change.before];
+renderReview(blocked);
+if (nodes["panel-title"].textContent !== "Block requests for unlimited token spending") {{
+  throw new Error("disabling unlimited requests was labelled as enabling them");
+}}
+// A verifier re-pin is authority too: it decides which build may describe
+// calls for this wallet at all.
+const repin = previewSession("policy-unlimited");
+repin.review_manifest.authority_diff = {{clear_signing: {{
+  before: {{unlimited_allowance_allowed: false,
+           verifier: {{verifier_digest: "77f7d9d939a496a16a9e5d517bb57c8e8eea397751dabdac5f923e0f2e91cc20"}}}},
+  after: {{unlimited_allowance_allowed: false,
+          verifier: {{verifier_digest: "e12e0cbb6873ab1c2ef89cb2e7e41333d0238b574a4629f36ba6b16f21b38beb"}}}}
+}}}};
+renderReview(repin);
+const pinned = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
+for (const phrase of ["Pinned verifier", "77f7d9d9", "e12e0cbb", "stops being able to describe"]) {{
+  if (!pinned.includes(phrase)) throw new Error(`verifier re-pin omitted ${{phrase}}: ${{pinned}}`);
+}}
+"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Two differently configured Brokers in one process isolate Host, Origin,
+/// generated URLs, and completion: each mints URLs under its own origin,
+/// refuses the other's Host/Origin, and the default broker still completes a
+/// real registration through its router with the software authenticator.
+/// Alternate-port real-Signer completion awaits the Signer ceremony_port
+/// change (pinned Signer still pins `http://localhost:18734`), so the
+/// alternate instance proves routing isolation while completion there runs
+/// through the mock-backed router path below at the Host/Origin layer.
+#[tokio::test]
+async fn two_differently_configured_brokers_isolate_ceremony_origin() {
+    let (_a_v4, _a_v6, endpoint_a) = ephemeral_endpoint_pair();
+    let (_b_v4, _b_v6, endpoint_b) = ephemeral_endpoint_pair();
+    assert_ne!(endpoint_a, endpoint_b);
+    assert_ne!(endpoint_a.port(), 18_734);
+    assert_ne!(endpoint_b.port(), 18_734);
+
+    let broker_a = CeremonyBroker::new_with_endpoint(Arc::new(MockSigner::new()), endpoint_a);
+    let broker_b = CeremonyBroker::new_with_endpoint(Arc::new(MockSigner::new()), endpoint_b);
+
+    // Router auth enforces expiry against the real clock, so prepare with
+    // real wall-clock time (as the browser path does).
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let prepared_a = prepare(
+        &broker_a,
+        operation("a1"),
+        Some(Token::new("wallet-iso-a").unwrap()),
+        now_ms,
+    );
+    let prepared_b = prepare(
+        &broker_b,
+        operation("b1"),
+        Some(Token::new("wallet-iso-b").unwrap()),
+        now_ms,
+    );
+    assert!(
+        prepared_a
+            .ceremony_url
+            .starts_with(&format!("{}/ceremony/", endpoint_a.origin())),
+        "broker A must mint its own origin URL: {}",
+        prepared_a.ceremony_url
+    );
+    assert!(
+        prepared_b
+            .ceremony_url
+            .starts_with(&format!("{}/ceremony/", endpoint_b.origin())),
+        "broker B must mint its own origin URL: {}",
+        prepared_b.ceremony_url
+    );
+    // public_status serves the same instance URL while awaiting the user.
+    let status_a = broker_a.public_status(&operation("a1")).unwrap();
+    assert_eq!(
+        status_a.ceremony_url.as_deref(),
+        Some(prepared_a.ceremony_url.as_str())
+    );
+
+    let token_a = url_token(&prepared_a.ceremony_url);
+    let app_a = broker_a.clone().router();
+
+    // Correct Host succeeds.
+    let ok = app_a
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, endpoint_a.host())
+                .header("x-bloom-ceremony-token", &token_a)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    // Wrong Host values fail: the other instance, an attacker host, and IP
+    // literals never authenticate.
+    for wrong_host in [
+        endpoint_b.host(),
+        "localhost:18734".to_owned(),
+        "attacker.invalid:18734".to_owned(),
+        format!("127.0.0.1:{}", endpoint_a.port()),
+        format!("[::1]:{}", endpoint_a.port()),
+    ] {
+        let denied = app_a
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session")
+                    .header(header::HOST, wrong_host.clone())
+                    .header("x-bloom-ceremony-token", &token_a)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            denied.status(),
+            StatusCode::FORBIDDEN,
+            "wrong Host {wrong_host} must be refused"
+        );
+    }
+
+    // Static assets enforce the same instance Host.
+    let asset_ok = app_a
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/assets/app.js")
+                .header(header::HOST, endpoint_a.host())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asset_ok.status(), StatusCode::OK);
+    let asset_denied = app_a
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/assets/app.js")
+                .header(header::HOST, endpoint_b.host())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asset_denied.status(), StatusCode::FORBIDDEN);
+
+    // A token minted by B is unknown to A even with A's correct Host.
+    let token_b = url_token(&prepared_b.ceremony_url);
+    let cross = app_a
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, endpoint_a.host())
+                .header("x-bloom-ceremony-token", &token_b)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross.status(), StatusCode::FORBIDDEN);
+
+    // Mutations with the wrong Origin fail on the alternate instance.
+    let ceremony_id_a = broker_a
+        .public_status(&operation("a1"))
+        .unwrap()
+        .ceremony_id
+        .to_string();
+    let wrong_origin = app_a
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/session/{ceremony_id_a}/cancel"))
+                .header(header::HOST, endpoint_a.host())
+                .header(header::ORIGIN, endpoint_b.origin())
+                .header("x-bloom-ceremony-token", &token_a)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_origin.status(), StatusCode::FORBIDDEN);
+
+    // The software authenticator signs the instance origin it is given.
+    let driver = VirtualAuthenticator::from_seed_with_origin(b"iso-seed", &endpoint_a.origin());
+    let probe = driver.assertion(b"iso-challenge", 1);
+    let client_data: serde_json::Value =
+        serde_json::from_slice(&probe.client_data_json.decode()).unwrap();
+    assert_eq!(client_data["origin"], endpoint_a.origin());
+
+    // Real Signer completion still works on the default broker in the same
+    // process, through its router, with the default-origin authenticator.
+    let broker_d = CeremonyBroker::new(real_ceremony_signer());
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let operation_id = operation("c1");
+    let prepared = broker_d
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::WalletRegistration,
+                custody_operation_id: operation_id.clone(),
+                wallet_id: Some(Token::new("wallet-iso-default").unwrap()),
+                key_ref: None,
+                exact_terms_digest: digest("51"),
+                expected_input_class: Token::new("passkey-prf").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1),
+                derivation_requests: Vec::new(),
+            },
+            now_ms,
+        )
+        .unwrap();
+    assert!(
+        prepared
+            .ceremony_url
+            .starts_with("http://localhost:18734/ceremony/"),
+        "default broker keeps the default origin: {}",
+        prepared.ceremony_url
+    );
+    let ceremony_id = broker_d
+        .public_status(&operation_id)
+        .unwrap()
+        .ceremony_id
+        .to_string();
+    let token = url_token(&prepared.ceremony_url);
+    let app = broker_d.router();
+    let session_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/session/{ceremony_id}"))
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", &token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session_response.status(), StatusCode::OK);
+    let session: serde_json::Value = serde_json::from_slice(
+        &session_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    let first_challenge: CeremonyChallenge =
+        serde_json::from_value(session["challenges"][0]["binding"].clone()).unwrap();
+    let second_challenge: CeremonyChallenge =
+        serde_json::from_value(session["challenges"][1]["binding"].clone()).unwrap();
+    let contribution: CustodySignerContribution =
+        serde_json::from_value(session["signer_contribution"].clone()).unwrap();
+    let authenticator = VirtualAuthenticator::generate();
+    let attestation = authenticator.attestation(&first_challenge.canonical_bytes().unwrap());
+    let assertion = authenticator.assertion(&second_challenge.canonical_bytes().unwrap(), 1);
+    let aad = CustodyHpkeAad {
+        ceremony_id: contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::WalletRegistration,
+        custody_operation_id: operation_id,
+        signer_nonce: contribution.signer_nonce.clone(),
+        signer_contribution_digest: contribution.digest().unwrap(),
+        wallet_id: contribution.wallet_id.clone(),
+        key_ref: None,
+        credential_id: Some(attestation.credential_id.clone()),
+        expected_input_class: Token::new("passkey-prf").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let envelope = seal_hpke(
+        &contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &authenticator.deterministic_prf(),
+    )
+    .unwrap();
+    let completed = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/session/{ceremony_id}/complete"))
+                .header(header::HOST, "localhost:18734")
+                .header(header::ORIGIN, "http://localhost:18734")
+                .header("x-bloom-ceremony-token", token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "proof": {
+                            "kind": "registration",
+                            "attestation": attestation,
+                            "prf_assertion": assertion
+                        },
+                        "encrypted_input": envelope,
+                        "public_binding_digest": digest("51")
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
 }

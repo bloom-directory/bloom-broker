@@ -147,6 +147,117 @@ pub struct OperationSnapshot {
     pub kind: String,
 }
 
+/// Which review the owner approved, frozen with the approval record.
+///
+/// The kind is what tells a legacy approval — one prepared before clear
+/// signing existed, or by a wallet that does not enable it — apart from a
+/// clear approval whose evidence was lost or deleted. Without it, absent
+/// evidence reads the same in both cases and a signature stops being
+/// explainable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewKind {
+    /// No clear-signing policy applied: the envelope review the owner saw
+    /// before this feature existed.
+    Legacy,
+    /// Clear signing is enabled, but this batch carries no contract call —
+    /// native sends and deployments keep the exact envelope review.
+    Native,
+    /// The owner deliberately approved a payload Bloom did not explain,
+    /// under a policy that permits it.
+    OpaqueExact,
+    /// Every contract call in the batch was read from a signed description.
+    /// Evidence is required and rechecked before every signature.
+    Clear,
+}
+
+impl ReviewKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "LEGACY",
+            Self::Native => "NATIVE",
+            Self::OpaqueExact => "OPAQUE_EXACT",
+            Self::Clear => "CLEAR",
+        }
+    }
+
+    /// Unknown text is read as clear, not legacy: a record written by a newer
+    /// build names a review this one cannot reproduce, and refusing to sign
+    /// is the safe reading of a kind we do not understand.
+    pub fn from_stored(value: &str) -> Self {
+        match value {
+            "LEGACY" => Self::Legacy,
+            "NATIVE" => Self::Native,
+            "OPAQUE_EXACT" => Self::OpaqueExact,
+            _ => Self::Clear,
+        }
+    }
+
+    pub const fn requires_clear_signing_evidence(self) -> bool {
+        matches!(self, Self::Clear)
+    }
+}
+
+/// What Broker's own verified review concluded, ready to be frozen with the
+/// approval record it is prepared alongside.
+///
+/// Machine never supplies this. It is derived from the review Broker
+/// rendered, so an approval cannot claim a reading Broker did not produce.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrozenReview {
+    pub kind: ReviewKind,
+    evidence_jcs: Option<String>,
+}
+
+impl FrozenReview {
+    pub const fn legacy() -> Self {
+        Self {
+            kind: ReviewKind::Legacy,
+            evidence_jcs: None,
+        }
+    }
+
+    /// A review that needs no clear-signing evidence. Refused for a kind
+    /// that does: a clear review with no evidence would persist the exact
+    /// state this record exists to exclude.
+    pub fn without_evidence(kind: ReviewKind) -> Result<Self, String> {
+        if kind.requires_clear_signing_evidence() {
+            return Err("review kind and clear-signing evidence disagree".into());
+        }
+        Ok(Self {
+            kind,
+            evidence_jcs: None,
+        })
+    }
+
+    pub fn with_evidence<T: serde::Serialize>(
+        kind: ReviewKind,
+        evidence: &T,
+    ) -> Result<Self, String> {
+        if !kind.requires_clear_signing_evidence() {
+            return Err("review kind and clear-signing evidence disagree".into());
+        }
+        Ok(Self {
+            kind,
+            evidence_jcs: Some(serde_jcs::to_string(evidence).map_err(|error| error.to_string())?),
+        })
+    }
+
+    pub fn evidence_jcs(&self) -> Option<&str> {
+        self.evidence_jcs.as_deref()
+    }
+}
+
+/// Everything an approval record freezes at preparation, in one argument so
+/// the fields are named at the call site instead of counted.
+pub struct NewApprovalRecord<'a> {
+    pub terms_jcs: &'a str,
+    pub review_manifest_digest: &'a Digest32,
+    pub approved_claim_digest: Option<&'a Digest32>,
+    pub provenance_jcs: Option<&'a str>,
+    pub renewal_of: Option<&'a Digest32>,
+    pub review: &'a FrozenReview,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalRecord {
     pub terms_jcs: String,
@@ -156,6 +267,15 @@ pub struct ApprovalRecord {
     pub renewal_of: Option<String>,
     pub activation_operation_id: Option<String>,
     pub ceremony_grant_jcs: Option<String>,
+    /// Which review the owner was shown, frozen with the approval. Broker
+    /// derives it from its own verified review, never from a Machine
+    /// assertion, and it is what says whether clear-signing evidence is
+    /// required for this approval to authorize a signature.
+    pub review_kind: String,
+    /// The frozen clear-signing evidence, present exactly when `review_kind`
+    /// is the clear kind. It is written once, in the transaction that creates
+    /// the record, and never updated.
+    pub clear_signing_evidence_jcs: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -331,7 +451,9 @@ impl BrokerJournal {
                 provenance_jcs TEXT,
                 renewal_of TEXT REFERENCES approvals(approval_id),
                 activation_operation_id TEXT UNIQUE,
-                ceremony_grant_jcs TEXT
+                ceremony_grant_jcs TEXT,
+                review_kind TEXT NOT NULL DEFAULT 'LEGACY',
+                clear_signing_evidence_jcs TEXT
             );
             CREATE TABLE IF NOT EXISTS operations (
                 operation_id TEXT PRIMARY KEY,
@@ -413,6 +535,21 @@ impl BrokerJournal {
                 [],
             )?;
         }
+        // Approvals prepared before clear signing existed carry no review
+        // kind. They are legacy by construction: nothing could have frozen
+        // clear-signing evidence for them, so requiring none is exact.
+        ensure_column(
+            &connection,
+            "approval_metadata",
+            "review_kind",
+            "TEXT NOT NULL DEFAULT 'LEGACY'",
+        )?;
+        ensure_column(
+            &connection,
+            "approval_metadata",
+            "clear_signing_evidence_jcs",
+            "TEXT",
+        )?;
         ensure_column(&connection, "reservations", "observed_utc_ms", "TEXT")?;
         ensure_column(
             &connection,
@@ -637,12 +774,10 @@ impl BrokerJournal {
     pub fn create_approval_record(
         &self,
         approval_id: &Digest32,
-        terms_jcs: &str,
-        review_manifest_digest: &Digest32,
-        approved_claim_digest: Option<&Digest32>,
-        provenance_jcs: Option<&str>,
-        renewal_of: Option<&Digest32>,
+        new: &NewApprovalRecord<'_>,
     ) -> Result<(), JournalError> {
+        let review_manifest_digest = new.review_manifest_digest;
+        let review_kind = new.review.kind.as_str();
         let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         transaction.execute(
@@ -652,15 +787,17 @@ impl BrokerJournal {
         transaction.execute(
             "INSERT INTO approval_metadata(
                 approval_id, terms_jcs, review_manifest_digest, approved_claim_digest,
-                provenance_jcs, renewal_of
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                provenance_jcs, renewal_of, review_kind, clear_signing_evidence_jcs
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 approval_id.as_str(),
-                terms_jcs,
+                new.terms_jcs,
                 review_manifest_digest.as_str(),
-                approved_claim_digest.map(Digest32::as_str),
-                provenance_jcs,
-                renewal_of.map(Digest32::as_str)
+                new.approved_claim_digest.map(Digest32::as_str),
+                new.provenance_jcs,
+                new.renewal_of.map(Digest32::as_str),
+                review_kind,
+                new.review.evidence_jcs()
             ],
         )?;
         self.append_audit_transaction(
@@ -669,7 +806,8 @@ impl BrokerJournal {
             &serde_json::json!({
                 "approval_id": approval_id,
                 "state": ApprovalLifecycleState::AwaitingCeremony,
-                "review_manifest_digest": review_manifest_digest
+                "review_manifest_digest": review_manifest_digest,
+                "review_kind": review_kind
             }),
             self.audit_signer.as_ref(),
         )?;
@@ -688,7 +826,8 @@ impl BrokerJournal {
             .query_row(
                 "SELECT terms_jcs, review_manifest_digest, approved_claim_digest,
                         provenance_jcs, renewal_of,
-                        activation_operation_id, ceremony_grant_jcs
+                        activation_operation_id, ceremony_grant_jcs,
+                        review_kind, clear_signing_evidence_jcs
                  FROM approval_metadata WHERE approval_id = ?1",
                 [approval_id.as_str()],
                 |row| {
@@ -700,6 +839,8 @@ impl BrokerJournal {
                         renewal_of: row.get(4)?,
                         activation_operation_id: row.get(5)?,
                         ceremony_grant_jcs: row.get(6)?,
+                        review_kind: row.get(7)?,
+                        clear_signing_evidence_jcs: row.get(8)?,
                     })
                 },
             )
@@ -712,7 +853,8 @@ impl BrokerJournal {
         let mut statement = connection.prepare(
             "SELECT approval_id, terms_jcs, review_manifest_digest, approved_claim_digest,
                     provenance_jcs, renewal_of,
-                    activation_operation_id, ceremony_grant_jcs
+                    activation_operation_id, ceremony_grant_jcs,
+                    review_kind, clear_signing_evidence_jcs
              FROM approval_metadata ORDER BY approval_id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -726,6 +868,8 @@ impl BrokerJournal {
                     renewal_of: row.get(5)?,
                     activation_operation_id: row.get(6)?,
                     ceremony_grant_jcs: row.get(7)?,
+                    review_kind: row.get(8)?,
+                    clear_signing_evidence_jcs: row.get(9)?,
                 },
             ))
         })?;

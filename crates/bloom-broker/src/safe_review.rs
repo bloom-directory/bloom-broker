@@ -623,6 +623,7 @@ mod tests {
         ApprovalPrepareRequest {
             operation_id: OperationId::from_bytes([2; 32]),
             canonical_plan_facts_digest: digest.clone(),
+            requested_review_mode: None,
             evm_review_payloads: vec![],
             safe_review_payloads: vec![Base64UrlBytes::from_bytes(&review)],
             petal_use_claim: None,
@@ -680,6 +681,7 @@ mod tests {
                 destination: "exact".into(),
             }],
             required_verifiers: vec![],
+            clear_signing: None,
         }
     }
 
