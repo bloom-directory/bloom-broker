@@ -416,9 +416,9 @@ dependencies = [
  "bloom-broker-api",
  "bloom-broker-debug-driver",
  "bloom-platform-containment",
- "bloom-relay-admin-client 0.1.0 (git+https://github.com/bloom-directory/bloom-relay.git?rev=e6d15ee7373cd459f4d76a9b0c4bf2a198b90bec)",
+ "bloom-relay-admin-client 0.1.0 (git+https://github.com/bloom-directory/bloom-relay.git?rev=0f3123580737b57dd98b70ffe69cdf2e4f73498c)",
  "bloom-relay-client",
- "bloom-relay-protocol 0.1.0 (git+https://github.com/bloom-directory/bloom-relay.git?rev=e6d15ee7373cd459f4d76a9b0c4bf2a198b90bec)",
+ "bloom-relay-protocol 0.1.0 (git+https://github.com/bloom-directory/bloom-relay.git?rev=0f3123580737b57dd98b70ffe69cdf2e4f73498c)",
  "bloom-service-activation",
  "bloom-service-observability",
  "bloom-signer",
@@ -510,6 +510,23 @@ dependencies = [
 [[package]]
 name = "bloom-relay-admin-client"
 version = "0.1.0"
+source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=0f3123580737b57dd98b70ffe69cdf2e4f73498c#0f3123580737b57dd98b70ffe69cdf2e4f73498c"
+dependencies = [
+ "base64 0.22.1",
+ "bloom-relay-protocol 0.1.0 (git+https://github.com/bloom-directory/bloom-relay.git?rev=0f3123580737b57dd98b70ffe69cdf2e4f73498c)",
+ "rand 0.8.8",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "thiserror",
+ "ureq",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "bloom-relay-admin-client"
+version = "0.1.0"
 source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=6c8771b66b618cd13b7cad3e0cd850af2982b5aa#6c8771b66b618cd13b7cad3e0cd850af2982b5aa"
 dependencies = [
  "base64 0.22.1",
@@ -525,28 +542,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-relay-admin-client"
-version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=e6d15ee7373cd459f4d76a9b0c4bf2a198b90bec#e6d15ee7373cd459f4d76a9b0c4bf2a198b90bec"
-dependencies = [
- "base64 0.22.1",
- "bloom-relay-protocol 0.1.0 (git+https://github.com/bloom-directory/bloom-relay.git?rev=e6d15ee7373cd459f4d76a9b0c4bf2a198b90bec)",
- "rand 0.8.8",
- "serde",
- "serde_jcs",
- "serde_json",
- "thiserror",
- "ureq",
- "uuid",
- "zeroize",
-]
-
-[[package]]
 name = "bloom-relay-client"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=e6d15ee7373cd459f4d76a9b0c4bf2a198b90bec#e6d15ee7373cd459f4d76a9b0c4bf2a198b90bec"
+source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=0f3123580737b57dd98b70ffe69cdf2e4f73498c#0f3123580737b57dd98b70ffe69cdf2e4f73498c"
 dependencies = [
- "bloom-relay-protocol 0.1.0 (git+https://github.com/bloom-directory/bloom-relay.git?rev=e6d15ee7373cd459f4d76a9b0c4bf2a198b90bec)",
+ "bloom-relay-protocol 0.1.0 (git+https://github.com/bloom-directory/bloom-relay.git?rev=0f3123580737b57dd98b70ffe69cdf2e4f73498c)",
  "bytes",
  "futures-util",
  "h2",
@@ -563,7 +563,7 @@ dependencies = [
 [[package]]
 name = "bloom-relay-protocol"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=6c8771b66b618cd13b7cad3e0cd850af2982b5aa#6c8771b66b618cd13b7cad3e0cd850af2982b5aa"
+source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=0f3123580737b57dd98b70ffe69cdf2e4f73498c#0f3123580737b57dd98b70ffe69cdf2e4f73498c"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -578,7 +578,7 @@ dependencies = [
 [[package]]
 name = "bloom-relay-protocol"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=e6d15ee7373cd459f4d76a9b0c4bf2a198b90bec#e6d15ee7373cd459f4d76a9b0c4bf2a198b90bec"
+source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=6c8771b66b618cd13b7cad3e0cd850af2982b5aa#6c8771b66b618cd13b7cad3e0cd850af2982b5aa"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
