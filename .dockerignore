@@ -1,0 +1,12 @@
+# Everything is excluded by default; the Dockerfile opts the build inputs back
+# in, so new top-level files can never silently enlarge the build context.
+*
+
+!Cargo.toml
+!Cargo.lock
+!crates
+
+# Build output and editor noise inside the crate tree.
+crates/**/target
+**/*.rs.bk
+**/.DS_Store
