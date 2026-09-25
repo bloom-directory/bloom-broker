@@ -533,6 +533,38 @@ fn ac18_forced_authority_audit_write_failure_rolls_back_quota_effect() {
     );
 }
 
+/// Authority state lives in the journal; the legacy store exists only as a
+/// migration source. Creating an empty one puts a plausible-looking but always
+/// empty database exactly where someone debugging authority state looks first.
+#[test]
+fn a_home_with_nothing_to_migrate_grows_no_legacy_authority_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("journal.sqlite");
+    let legacy_path = directory.path().join("authority.sqlite");
+
+    let journal =
+        Arc::new(BrokerJournal::open(&journal_path, Arc::new(TestAuditSigner)).expect("journal"));
+    let authority = BrokerAuthority::open(
+        &legacy_path,
+        journal,
+        BTreeMap::new(),
+        token("installer-key"),
+        SigningKey::from_bytes(&[2; 32]).verifying_key(),
+        token("ceremony-key"),
+        SigningKey::from_bytes(&[3; 32]).verifying_key(),
+        token("revocation-key"),
+        SigningKey::from_bytes(&[4; 32]).verifying_key(),
+        AssuranceRegistry::compiled(vec![]).unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        !legacy_path.exists(),
+        "opening a fresh home must not create an empty legacy authority store"
+    );
+    drop(authority);
+}
+
 #[test]
 fn ac18_authority_reads_survive_latched_audit_tamper_while_mutations_fail() {
     let directory = tempfile::tempdir().unwrap();

@@ -449,8 +449,18 @@ impl BrokerAuthority {
         revocation_key: VerifyingKey,
         assurance: AssuranceRegistry,
     ) -> Result<Self, AuthorityError> {
+        // Only open the legacy authority store when it is actually there.
+        // `Connection::open` creates the file, and a home with nothing to
+        // migrate would otherwise grow an empty `authority.db` sitting exactly
+        // where someone debugging authority state looks first — the real
+        // tables live in the journal.
+        let legacy = path
+            .as_ref()
+            .exists()
+            .then(|| Connection::open(path))
+            .transpose()?;
         Self::from_connection(
-            Connection::open(path)?,
+            legacy,
             journal,
             policy_keys,
             installer_key_id,
@@ -476,7 +486,7 @@ impl BrokerAuthority {
         assurance: AssuranceRegistry,
     ) -> Result<Self, AuthorityError> {
         Self::from_connection(
-            Connection::open_in_memory()?,
+            None,
             journal,
             policy_keys,
             installer_key_id,
@@ -491,7 +501,7 @@ impl BrokerAuthority {
 
     #[allow(clippy::too_many_arguments)]
     fn from_connection(
-        legacy_connection: Connection,
+        legacy_connection: Option<Connection>,
         journal: Arc<BrokerJournal>,
         policy_keys: BTreeMap<String, (Token, VerifyingKey)>,
         installer_key_id: Token,
@@ -571,7 +581,9 @@ impl BrokerAuthority {
             );
             ",
             )?;
-            migrate_legacy_authority(&mut connection, &legacy_connection, &journal)?;
+            if let Some(legacy) = &legacy_connection {
+                migrate_legacy_authority(&mut connection, legacy, &journal)?;
+            }
         }
         let mut policy_keys = policy_keys;
         {
