@@ -343,6 +343,75 @@ fn entry_summary(index: usize, to: Address, value: U256, data: &[u8]) -> String 
     }
 }
 
+/// One ABI word that must hold an address and nothing above it.
+fn word_as_address(word: &[u8]) -> Result<Address, ProtocolError> {
+    if word[..12].iter().any(|byte| *byte != 0) {
+        return Err(invalid("Safe owner change carries a malformed address"));
+    }
+    Ok(Address::from_slice(&word[12..]))
+}
+
+/// The four Safe self-calls that change who may sign and how many must. Every
+/// other self-call stays refused: enabling a module, or setting a guard or
+/// fallback handler, hands the Safe to code Broker cannot review.
+///
+/// The `prevOwner` argument only locates an entry in the Safe's owner list,
+/// so it is checked for shape and not shown.
+fn owner_change(envelope: &Envelope, value: U256, data: &[u8]) -> Result<String, ProtocolError> {
+    let refused =
+        || invalid("Safe self-calls other than owner and threshold changes are not supported");
+    if !value.is_zero() || data.len() < 4 || (data.len() - 4) % 32 != 0 {
+        return Err(refused());
+    }
+    let words: Vec<&[u8]> = data[4..].chunks(32).collect();
+    let selector = |signature: &str| data[..4] == keccak256(signature).as_slice()[..4];
+    let signer = address(&envelope.owner, "owner")?;
+    let removes_signer = |removed: Address| {
+        if removed == signer {
+            "\nWarning: this removes this Bloom wallet from the Safe's owners"
+        } else {
+            ""
+        }
+    };
+    let threshold = |word: &[u8]| {
+        let threshold = U256::from_be_slice(word);
+        if threshold.is_zero() {
+            return Err(invalid("Safe threshold must be at least 1"));
+        }
+        Ok(threshold)
+    };
+    if selector("addOwnerWithThreshold(address,uint256)") && words.len() == 2 {
+        Ok(format!(
+            "Action: Add Safe owner\nNew owner: {}\nNew threshold: {}",
+            word_as_address(words[0])?,
+            threshold(words[1])?
+        ))
+    } else if selector("removeOwner(address,address,uint256)") && words.len() == 3 {
+        word_as_address(words[0])?;
+        let removed = word_as_address(words[1])?;
+        Ok(format!(
+            "Action: Remove Safe owner\nOwner removed: {removed}\nNew threshold: {}{}",
+            threshold(words[2])?,
+            removes_signer(removed)
+        ))
+    } else if selector("swapOwner(address,address,address)") && words.len() == 3 {
+        word_as_address(words[0])?;
+        let removed = word_as_address(words[1])?;
+        Ok(format!(
+            "Action: Replace Safe owner\nOwner removed: {removed}\nNew owner: {}{}",
+            word_as_address(words[2])?,
+            removes_signer(removed)
+        ))
+    } else if selector("changeThreshold(uint256)") && words.len() == 1 {
+        Ok(format!(
+            "Action: Change Safe threshold\nNew threshold: {}",
+            threshold(words[0])?
+        ))
+    } else {
+        Err(refused())
+    }
+}
+
 fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
     let safe = address(&envelope.safe_address, "safe_address")?;
     let to = address(&envelope.safe_tx.to, "safe_tx.to")?;
@@ -354,9 +423,7 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
                 if value.is_zero() && data.is_empty() {
                     return Ok("Action: Reject competing Safe transaction\nValue: 0".into());
                 }
-                return Err(invalid(
-                    "Safe self-calls and configuration changes are not supported",
-                ));
+                return owner_change(envelope, value, &data);
             }
             if data.len() == 68 && data[..4] == [0xa9, 0x05, 0x9c, 0xbb] {
                 let recipient = Address::from_slice(&data[16..36]);
@@ -877,6 +944,92 @@ mod tests {
         value["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(calldata)));
         let parsed: Envelope = serde_json::from_value(value).unwrap();
         assert!(classify(&parsed).is_err());
+    }
+
+    #[test]
+    fn owner_and_threshold_changes_are_decoded_and_other_self_calls_refused() {
+        let base: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        let signer = "0x3000000000000000000000000000000000000000";
+        let other = "0x7000000000000000000000000000000000000000";
+        let word = |value: &str| {
+            let mut word = [0_u8; 32];
+            word[12..].copy_from_slice(address(value, "test").unwrap().as_slice());
+            word.to_vec()
+        };
+        let number = |value: u64| U256::from(value).to_be_bytes::<32>().to_vec();
+        let self_call = |signature: &str, words: Vec<Vec<u8>>, value: &str| {
+            let mut data = keccak256(signature).as_slice()[..4].to_vec();
+            data.extend(words.into_iter().flatten());
+            let mut envelope = base.clone();
+            envelope["safe_tx"]["to"] = envelope["safe_address"].clone();
+            envelope["safe_tx"]["value"] = serde_json::json!(value);
+            envelope["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(data)));
+            classify(&serde_json::from_value::<Envelope>(envelope).unwrap())
+        };
+        let checksum = |value: &str| address(value, "test").unwrap().to_string();
+
+        let added = self_call(
+            "addOwnerWithThreshold(address,uint256)",
+            vec![word(other), number(2)],
+            "0",
+        )
+        .unwrap();
+        assert_eq!(
+            added,
+            format!(
+                "Action: Add Safe owner\nNew owner: {}\nNew threshold: 2",
+                checksum(other)
+            )
+        );
+        let removed = self_call(
+            "removeOwner(address,address,uint256)",
+            vec![word(other), word(signer), number(1)],
+            "0",
+        )
+        .unwrap();
+        assert!(removed.contains(&format!("Owner removed: {}", checksum(signer))));
+        assert!(removed.contains("removes this Bloom wallet"));
+        let swapped = self_call(
+            "swapOwner(address,address,address)",
+            vec![word(signer), word(other), word(signer)],
+            "0",
+        )
+        .unwrap();
+        assert!(swapped.contains(&format!("Owner removed: {}", checksum(other))));
+        assert!(swapped.contains(&format!("New owner: {}", checksum(signer))));
+        assert!(!swapped.contains("Warning"));
+        assert!(
+            self_call("changeThreshold(uint256)", vec![number(3)], "0")
+                .unwrap()
+                .contains("New threshold: 3")
+        );
+
+        // Shape: no value, exact argument count, clean address words, threshold >= 1.
+        let add = "addOwnerWithThreshold(address,uint256)";
+        assert!(self_call(add, vec![word(other), number(2)], "1").is_err());
+        assert!(self_call(add, vec![word(other)], "0").is_err());
+        assert!(self_call(add, vec![word(other), number(2), number(0)], "0").is_err());
+        assert!(self_call(add, vec![vec![1; 32], number(2)], "0").is_err());
+        assert!(self_call(add, vec![word(other), number(0)], "0").is_err());
+        assert!(self_call("changeThreshold(uint256)", vec![number(0)], "0").is_err());
+
+        // Anything that hands the Safe to other code stays refused.
+        for signature in [
+            "enableModule(address)",
+            "setGuard(address)",
+            "setFallbackHandler(address)",
+            "setModuleGuard(address)",
+        ] {
+            assert!(self_call(signature, vec![word(other)], "0").is_err());
+        }
+        assert!(
+            self_call(
+                "disableModule(address,address)",
+                vec![word(other), word(other)],
+                "0"
+            )
+            .is_err()
+        );
     }
 
     fn multisend_entry(to: &str, value: u64, data: &[u8]) -> Vec<u8> {
