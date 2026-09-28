@@ -85,8 +85,13 @@ pub enum ChainAddress {
 pub enum PolicyTarget {
     Address(ChainAddress),
     /// `petal:<name>` — a destination chosen by the named Petal rather than a
-    /// fixed account. Matched case-insensitively, and carried lowercased here
-    /// so equality is byte-wise like every other variant.
+    /// fixed account.
+    ///
+    /// Carried verbatim. The rest of this module folds spellings together
+    /// because a chain's encoding says they name one account; a Petal class
+    /// is an opaque identifier with no such rule behind it. Folding its case
+    /// would let a policy signed yesterday authorize a class it never named,
+    /// with no ceremony, no review manifest and no new signature.
     PetalClass(String),
 }
 
@@ -138,6 +143,15 @@ const BITCOIN_P2SH_VERSION: u8 = 0x05;
 /// field inside the signed policy snapshot. It would also not remove this
 /// table, only add to it: existing signatures cover the spelling `base`, so
 /// the mapping would have to stay for as long as any policy signed today does.
+///
+/// This table has to track the chain catalog Machine ships, and nothing here
+/// enforces that: the two live in separate repositories, and `bloom` depends
+/// on this crate rather than the reverse, so there is no list to compare
+/// against from inside these tests. A chain Machine supports but this table
+/// omits keeps working — [`comparable`] falls back to its exact spelling —
+/// but it silently misses the canonicalisation every listed chain gets, which
+/// is inconsistent rather than unsafe. A shared source of truth is the real
+/// fix and is not in this crate's gift.
 pub fn address_family(chain: &Token) -> Option<AddressFamily> {
     match chain.as_str() {
         "bitcoin" => Some(AddressFamily::Bitcoin),
@@ -147,12 +161,12 @@ pub fn address_family(chain: &Token) -> Option<AddressFamily> {
         "celestia" | "cosmos" | "dydx" | "injective" | "neutron" | "noble" | "osmosis" => {
             Some(AddressFamily::Cosmos)
         }
-        // Every other chain Bloom transacts on today is EVM. An unknown name
-        // returns None and fails closed at the call site rather than guessing.
         // Machine's shipped chain list, plus `robinhood`, which policies name.
         // `anvil` is the local development node and is EVM like the rest: a
         // destination there should follow the same case rule, not fall back to
-        // exact spelling because the name was missing here.
+        // exact spelling because the name was missing here. An unrecognised
+        // name returns None and is then compared verbatim, which is what the
+        // Broker did for every chain before this module existed.
         "anvil" | "arbitrum" | "arc" | "avalanche" | "base" | "bsc" | "ethereum" | "gnosis"
         | "hyperliquid" | "linea" | "optimism" | "polygon" | "robinhood" | "tempo" => {
             Some(AddressFamily::Evm)
@@ -167,7 +181,7 @@ pub fn parse_destination(
     destination: &str,
 ) -> Result<PolicyTarget, DestinationError> {
     if let Some(name) = destination.strip_prefix(PETAL_DESTINATION_PREFIX) {
-        return Ok(PolicyTarget::PetalClass(name.to_ascii_lowercase()));
+        return Ok(PolicyTarget::PetalClass(name.to_owned()));
     }
     let family =
         address_family(chain).ok_or_else(|| DestinationError::UnknownChain(chain.to_string()))?;
@@ -569,15 +583,29 @@ mod tests {
             parse("solana", "petal:near-intents"),
             PolicyTarget::PetalClass("near-intents".into())
         );
-        assert_eq!(
-            parse("base", "petal:NEAR-Intents"),
-            PolicyTarget::PetalClass("near-intents".into()),
-            "petal classes match case-insensitively"
-        );
         // Even on a chain this build cannot decode addresses for.
         assert_eq!(
             parse("some-future-chain", "petal:near-intents"),
             PolicyTarget::PetalClass("near-intents".into())
+        );
+    }
+
+    /// Petal classes are compared exactly, unlike every address family here.
+    /// Case-folding them would not canonicalise an encoding, it would widen
+    /// authority: a signed policy naming `petal:Foo` would start admitting
+    /// claims for `petal:foo` with no policy update behind the change. Do not
+    /// "fix" this to match the address rules above.
+    #[test]
+    fn petal_class_case_is_not_folded() {
+        assert_eq!(
+            parse("base", "petal:NEAR-Intents"),
+            PolicyTarget::PetalClass("NEAR-Intents".into()),
+            "the class is carried verbatim"
+        );
+        assert_ne!(
+            comparable(&chain("base"), "petal:NEAR-Intents"),
+            comparable(&chain("base"), "petal:near-intents"),
+            "and two spellings stay two classes"
         );
     }
 

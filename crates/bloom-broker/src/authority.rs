@@ -455,11 +455,20 @@ impl BrokerAuthority {
         // migrate would otherwise grow an empty `authority.db` sitting exactly
         // where someone debugging authority state looks first — the real
         // tables live in the journal.
-        let legacy = path
-            .as_ref()
-            .exists()
-            .then(|| Connection::open(path))
-            .transpose()?;
+        //
+        // `try_exists` rather than `exists`, which reports false for a
+        // permission error or an unreadable mount just as it does for a file
+        // that is not there. An upgrade whose legacy store is present but
+        // unreachable has to fail here; skipping the migration would bring the
+        // Broker up without the authority state it was supposed to carry over.
+        let legacy_path = path.as_ref();
+        let present = legacy_path.try_exists().map_err(|error| {
+            AuthorityError::Storage(format!(
+                "cannot tell whether the legacy authority store at {} exists: {error}",
+                legacy_path.display()
+            ))
+        })?;
+        let legacy = present.then(|| Connection::open(legacy_path)).transpose()?;
         Self::from_connection(
             legacy,
             journal,
