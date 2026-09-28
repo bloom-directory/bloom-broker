@@ -3016,15 +3016,24 @@ impl CeremonyBroker {
                     now_ms,
                 ));
             }
-            if sessions.values().any(|session| {
+            if let Some(live) = sessions.values().find(|session| {
                 session.wallet_id.as_ref() == Some(wallet_id)
                     && !is_terminal(session.state)
                     && session.expires_at_ms > now_ms
             }) {
-                return Err(protocol(
-                    ProtocolErrorCode::QuotaExceeded,
-                    "wallet already has a live ceremony",
-                ));
+                // One live ceremony per wallet is a time-based bound like the
+                // others: the wallet admits one creation once the live
+                // ceremony ends, at the latest when it expires. Reporting it
+                // as `QUOTA_EXCEEDED` read as Broker request exhaustion, which
+                // Machine backs off from for every call.
+                let remaining_ms = live.expires_at_ms.saturating_sub(now_ms);
+                let message =
+                    format!("wallet already has a live ceremony; retry after {remaining_ms} ms");
+                let lifetime_ms = live.expires_at_ms.saturating_sub(live.created_at_ms);
+                return Err(match RateLimitDetails::new(remaining_ms, 1, lifetime_ms) {
+                    Some(details) => ProtocolError::rate_limited(message, details),
+                    None => protocol(ProtocolErrorCode::CeremonyRateLimited, message),
+                });
             }
             let mut backoffs = self.inner.cancellation_backoff.lock();
             if backoffs

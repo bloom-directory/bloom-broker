@@ -4380,29 +4380,33 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
         )
         .unwrap_err();
     assert_eq!(conflicting.code, ProtocolErrorCode::OperationIdConflict);
-    assert_eq!(
-        broker
-            .prepare_custody(
-                CustodyPrepareRequest {
-                    surface: bloom_signer_api::legacy_local_surface(),
-                    ceremony_kind: CeremonyKind::WalletDelete,
-                    custody_operation_id: operation("02"),
-                    wallet_id: Some(Token::new("wallet-1").unwrap()),
-                    key_ref: None,
-                    exact_terms_digest: digest("33"),
-                    expected_input_class: Token::new("policy-document").unwrap(),
-                    browser_output_recipient_key: None,
-                    petal_key_scope: None,
-                    legacy_passkey_migration: None,
-                    wallet_seed_profile: None,
-                    derivation_requests: Vec::new(),
-                },
-                1_001,
-            )
-            .unwrap_err()
-            .code,
-        ProtocolErrorCode::QuotaExceeded
-    );
+    let live = broker
+        .prepare_custody(
+            CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
+                ceremony_kind: CeremonyKind::WalletDelete,
+                custody_operation_id: operation("02"),
+                wallet_id: Some(Token::new("wallet-1").unwrap()),
+                key_ref: None,
+                exact_terms_digest: digest("33"),
+                expected_input_class: Token::new("policy-document").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_requests: Vec::new(),
+            },
+            1_001,
+        )
+        .unwrap_err();
+    // A live ceremony is a time-based bound, not Broker request exhaustion:
+    // the wallet admits one creation once the ceremony ends or expires.
+    assert_eq!(live.code, ProtocolErrorCode::CeremonyRateLimited);
+    let details = live
+        .rate_limit
+        .expect("live ceremony refusal carries a retry hint");
+    assert_eq!(details.limit, 1);
+    assert_eq!(details.retry_after_ms, details.window_ms - 1);
     assert_eq!(
         broker.status(&operation("01")),
         Some(CeremonyState::AwaitingUser)
