@@ -240,16 +240,7 @@ impl ClearSigningEvidence {
                     ),
                 ));
             }
-            let observed = frozen.observed_at_ms.parse::<u64>().unwrap_or(0);
-            if now_ms > observed.saturating_add(maximum_observation_age_ms) {
-                return Err(ReviewError::new(
-                    ReviewReason::EvidenceExpired,
-                    format!(
-                        "the publisher's observation of {} is older than wallet policy allows",
-                        frozen.contract_address
-                    ),
-                ));
-            }
+            frozen.check_observation_age(now_ms, maximum_observation_age_ms)?;
         }
         Ok(())
     }
