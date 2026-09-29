@@ -583,7 +583,7 @@ function describeTransfer(manifest) {
     const network = chainLabel(safe.chain);
     const facts = [
       ["Safe", safe.safe, true],
-      ["Action", safe.action.join("\n")],
+      ["Action", safe.action.map((line, index) => index ? line : line.replace(/^Action: /, "")).join("\n")],
       ["Destination", safe.destination, true],
       ["Value", safe.value_display],
       ["Network", network],

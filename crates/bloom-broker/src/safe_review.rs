@@ -329,20 +329,26 @@ fn dynamic_bytes(
     Ok(&data[offset + 32..end])
 }
 
+/// A native amount in the chain's own unit, from the shared asset table.
+fn native(value: U256, chain: &str) -> String {
+    crate::evm_review::native_value_display(&value.to_string(), chain)
+}
+
 /// One disclosed line per call-only batch entry, decoded the same way a
 /// top-level call is.
-fn entry_summary(index: usize, to: Address, value: U256, data: &[u8]) -> String {
+fn entry_summary(chain: &str, index: usize, to: Address, value: U256, data: &[u8]) -> String {
     if data.len() == 68 && data[..4] == [0xa9, 0x05, 0x9c, 0xbb] {
         format!(
-            "  {index}. ERC-20 transfer token={to} recipient={} amount (base units)={}",
-            Address::from_slice(&data[16..36]),
-            U256::from_be_slice(&data[36..68])
+            "{index}. ERC-20 transfer of {} base units of token {to} to {}",
+            U256::from_be_slice(&data[36..68]),
+            Address::from_slice(&data[16..36])
         )
     } else if data.is_empty() {
-        format!("  {index}. Native transfer recipient={to} value (wei)={value}")
+        format!("{index}. Send {} to {to}", native(value, chain))
     } else {
         format!(
-            "  {index}. Contract call to={to} value (wei)={value} selector=0x{} calldata keccak256={:#x}",
+            "{index}. Contract call to {to} with {}, selector 0x{}, calldata keccak256 {:#x}",
+            native(value, chain),
             hex::encode(&data[..data.len().min(4)]),
             keccak256(data)
         )
@@ -452,6 +458,9 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
                 return Err(invalid("Safe delegatecall transaction value must be zero"));
             }
             let chain = uint(&envelope.chain_id, "chain_id")?;
+            let chain_name = u64::try_from(chain)
+                .map(crate::evm_review::chain_name)
+                .unwrap_or_else(|_| format!("evm-{chain}"));
             if !LIBRARY_CHAINS.iter().any(|id| U256::from(*id) == chain) {
                 return Err(invalid(
                     "Safe delegatecalls are refused on this chain because Broker has no verified Safe library deployment for it",
@@ -504,6 +513,7 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
                     calls += 1;
                     // Every entry is disclosed; a batch must not hide a call.
                     entries.push(entry_summary(
+                        &chain_name,
                         calls,
                         destination,
                         call_value,
@@ -515,7 +525,8 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
                     return Err(invalid("MultiSendCallOnly batch is empty"));
                 }
                 Ok(format!(
-                    "Action: Call-only batch\nCalls: {calls}\nTotal native value (wei): {total}\n{}\nPacked calls keccak256: {:#x}",
+                    "Action: Call-only batch\nCalls: {calls}\nTotal native value: {}\n{}\nPacked calls keccak256: {:#x}",
+                    native(total, &chain_name),
                     entries.join("\n"),
                     keccak256(packed)
                 ))
@@ -548,7 +559,8 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
                     return Err(invalid("contract deployment initcode is empty"));
                 }
                 let mut result = format!(
-                    "Action: Deploy contract ({kind})\nDeployment value (wei): {deployment_value}\nInitcode keccak256: {:#x}",
+                    "Action: Deploy contract ({kind})\nDeployment value: {}\nInitcode keccak256: {:#x}",
+                    native(deployment_value, &chain_name),
                     keccak256(initcode)
                 );
                 if let Some(salt) = salt {
@@ -950,7 +962,7 @@ mod tests {
         assert!(
             classify(&parsed)
                 .unwrap()
-                .contains("Deployment value (wei): 9")
+                .contains("Deployment value: 0.000000000000000009 ETH")
         );
 
         calldata.extend_from_slice(&[0; 32]);
@@ -1107,12 +1119,12 @@ mod tests {
         // A batch must not be a cheaper way to hide a call than sending it
         // directly: every destination and amount is disclosed.
         assert!(action.contains("Calls: 2"));
-        assert!(action.contains("Total native value (wei): 5"));
+        assert!(action.contains("Total native value: 0.000000000000000005 ETH"));
         assert!(action.contains(
-            "1. ERC-20 transfer token=0x5000000000000000000000000000000000000000 recipient=0x4000000000000000000000000000000000000000 amount (base units)=7"
+            "1. ERC-20 transfer of 7 base units of token 0x5000000000000000000000000000000000000000 to 0x4000000000000000000000000000000000000000"
         ));
         assert!(action.contains(
-            "2. Native transfer recipient=0x6000000000000000000000000000000000000000 value (wei)=3"
+            "2. Send 0.000000000000000003 ETH to 0x6000000000000000000000000000000000000000"
         ));
     }
 
