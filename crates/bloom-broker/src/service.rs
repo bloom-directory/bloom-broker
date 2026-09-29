@@ -189,9 +189,15 @@ impl BrokerRpcService {
             Request::SealedApprovalRenew(request) => Ok(Response::SealedApprovalRenew(
                 self.renew_approval(request).await?,
             )),
-            Request::SealedApprovalStatus(request) => Ok(Response::SealedApprovalStatus(
-                self.approval_public_status(&request.id)?,
-            )),
+            Request::SealedApprovalStatus(request) => {
+                // Ceremonies expire only when something sweeps them. A
+                // status read is such a moment, so an overdue ceremony
+                // never reads as still awaiting the owner.
+                self.ceremony.expire_sessions(self.clock.now_ms(false)?)?;
+                Ok(Response::SealedApprovalStatus(
+                    self.approval_public_status(&request.id)?,
+                ))
+            }
             Request::SealedApprovalList(request) => {
                 let mut statuses = self
                     .authority
@@ -701,7 +707,8 @@ impl BrokerRpcService {
             Request::CeremonyStatus(request) => {
                 let operation_id = OperationId::new(request.id.as_str().to_owned())?;
                 Ok(Response::CeremonyStatus(
-                    self.ceremony.public_status(&operation_id)?,
+                    self.ceremony
+                        .public_status_as_of(&operation_id, self.clock.now_ms(false)?)?,
                 ))
             }
             Request::CeremonyCancel(request) => {
@@ -2303,14 +2310,18 @@ fn jcs_digest(value: &impl serde::Serialize) -> Result<Digest32, ProtocolError> 
 }
 
 fn authority_error(error: AuthorityError) -> ProtocolError {
-    let error_kind = match &error {
-        AuthorityError::Journal(_) => "journal",
-        AuthorityError::Storage(_) => "storage",
-        AuthorityError::Denied { .. } => "denied",
+    let (error_kind, denial_code, reason) = match &error {
+        AuthorityError::Journal(_) => ("journal", "", ""),
+        AuthorityError::Storage(_) => ("storage", "", ""),
+        AuthorityError::Denied { code, message } => ("denied", *code, message.as_str()),
     };
+    // Several denial codes reach the Machine as CLAIM_INVALID, so the code
+    // and its reason are logged here, where an operator can find them.
     tracing::warn!(
         event = "broker.authority_rejected",
         error_kind,
+        denial_code,
+        reason,
         "Broker authority rejected an operation"
     );
     match error {
