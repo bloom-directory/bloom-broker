@@ -1137,6 +1137,19 @@ impl CeremonyBroker {
             .map(|session| state_to_machine(session.state))
     }
 
+    /// The ceremony's status as of `now_ms`. Ceremonies expire only when
+    /// something sweeps them, so this sweeps first: an overdue ceremony
+    /// reads as expired rather than as still awaiting the owner, and a
+    /// Machine polling it can retire it and prepare a fresh one.
+    pub fn public_status_as_of(
+        &self,
+        operation_id: &OperationId,
+        now_ms: u64,
+    ) -> Result<BrokerCeremonyPublicStatus, ProtocolError> {
+        self.expire_sessions(now_ms)?;
+        self.public_status(operation_id)
+    }
+
     pub fn public_status(
         &self,
         operation_id: &OperationId,
