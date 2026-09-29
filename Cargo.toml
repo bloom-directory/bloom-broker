@@ -46,7 +46,7 @@ ciborium = "0.2"
 config = { version = "0.15", default-features = false, features = ["json"] }
 hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
 chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
-bip32 = { version = "0.5", features = ["secp256k1"] }
+bip32 = { version = "0.6", features = ["secp256k1"] }
 k256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 memchr = "2"
 hkdf = "0.13"
