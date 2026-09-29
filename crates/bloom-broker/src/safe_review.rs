@@ -245,9 +245,15 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
     Ok(())
 }
 
+/// Chains where every library below was read from the chain and found to hold
+/// the canonical Safe runtime code. The chain ID is an EIP-712 domain member,
+/// so the signature cannot be replayed on a chain outside this list, where the
+/// same address could hold other code.
+const LIBRARY_CHAINS: &[u64] = &[1, 10, 100, 137, 8453, 42161];
+
 /// Official Safe libraries a delegatecall may enter. `safe_tx.to` is bound by
-/// the selector, so this is a real constraint. Only addresses are pinned:
-/// code hashes and versions would be checked against Petal-reported values.
+/// the selector, so this is a real constraint. Addresses are pinned per chain
+/// in `LIBRARY_CHAINS`; a Petal-reported code hash is not trusted.
 struct Library {
     kind: &'static str,
     address: &'static str,
@@ -444,6 +450,12 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
         1 => {
             if value != U256::ZERO {
                 return Err(invalid("Safe delegatecall transaction value must be zero"));
+            }
+            let chain = uint(&envelope.chain_id, "chain_id")?;
+            if !LIBRARY_CHAINS.iter().any(|id| U256::from(*id) == chain) {
+                return Err(invalid(
+                    "Safe delegatecalls are refused on this chain because Broker has no verified Safe library deployment for it",
+                ));
             }
             let target = format!("{to:#x}");
             let library = LIBRARIES
@@ -933,6 +945,7 @@ mod tests {
         value["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(&calldata)));
         value["library_code_hash"] =
             serde_json::json!("0x2b3060c55fcb8275653e99ad511a71f67ba76934ed66a7d74d6e68b52afff889");
+        value["chain_id"] = serde_json::json!("8453");
         let parsed: Envelope = serde_json::from_value(value.clone()).unwrap();
         assert!(
             classify(&parsed)
@@ -1076,6 +1089,18 @@ mod tests {
             serde_json::json!(format!("0x{}", hex::encode(multisend_calldata(&packed))));
         value["library_code_hash"] =
             serde_json::json!("0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939");
+
+        // The same address on a chain Broker has not verified may hold other
+        // code, and the Petal's code hash cannot vouch for it.
+        let unverified: Envelope = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            classify(&unverified)
+                .unwrap_err()
+                .message
+                .contains("no verified Safe library deployment")
+        );
+
+        value["chain_id"] = serde_json::json!("8453");
         let parsed: Envelope = serde_json::from_value(value).unwrap();
         let action = classify(&parsed).unwrap();
 
