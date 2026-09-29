@@ -287,6 +287,19 @@ fn republishing_an_old_observation_does_not_make_it_fresh() {
 }
 
 #[test]
+fn a_future_observation_is_not_fresh_evidence() {
+    let mut selected = SelectedEntry::of(&erc20_entry());
+    selected.observed_at_ms = (NOW_MS + 1).to_string();
+    assert_eq!(
+        selected
+            .check_observation_age(NOW_MS, 86_400_000)
+            .unwrap_err()
+            .reason,
+        ReviewReason::CatalogRejected
+    );
+}
+
+#[test]
 fn permitted_expiry_is_the_smallest_of_catalog_and_observation_bounds() {
     let digest = Digest32::from_bytes([5; 32]);
     let accepted = accepted_erc20();
