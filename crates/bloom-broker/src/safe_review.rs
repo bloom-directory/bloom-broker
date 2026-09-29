@@ -2,7 +2,7 @@
 
 use std::str::FromStr;
 
-use alloy::primitives::{Address, B256, U256, keccak256};
+use alloy::primitives::{Address, U256, keccak256};
 use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalSelector, CanonicalWalletPolicy, CryptoSuite, DeclaredFee,
     Digest32, ProtocolError, ProtocolErrorCode,
@@ -245,104 +245,6 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
     Ok(())
 }
 
-/// Official Safe libraries a delegatecall may enter. `safe_tx.to` is bound by
-/// the selector, so this is a real constraint. Only addresses are pinned:
-/// code hashes and versions would be checked against Petal-reported values.
-struct Library {
-    kind: &'static str,
-    address: &'static str,
-}
-
-const LIBRARIES: &[Library] = &[
-    // MultiSendCallOnly, Safe 1.3.0 (two deployments), 1.4.1, and 1.5.0.
-    Library {
-        kind: "MultiSendCallOnly",
-        address: "0x40a2accbd92bca938b02010e17a5b8929b49130d",
-    },
-    Library {
-        kind: "MultiSendCallOnly",
-        address: "0xa1dabef33b3b82c7814b6d82a79e50f4ac44102b",
-    },
-    Library {
-        kind: "MultiSendCallOnly",
-        address: "0x9641d764fc13c8b624c04430c7356c1c7c8102e2",
-    },
-    Library {
-        kind: "MultiSendCallOnly",
-        address: "0xa83c336b20401af773b6219ba5027174338d1836",
-    },
-    // CreateCall, Safe 1.3.0 (two deployments), 1.4.1, and 1.5.0.
-    Library {
-        kind: "CreateCall",
-        address: "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4",
-    },
-    Library {
-        kind: "CreateCall",
-        address: "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d",
-    },
-    Library {
-        kind: "CreateCall",
-        address: "0x9b35af71d77eaf8d7e40252370304687390a1a52",
-    },
-    Library {
-        kind: "CreateCall",
-        address: "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4",
-    },
-];
-
-fn dynamic_bytes(
-    data: &[u8],
-    head_words: usize,
-    offset_word: usize,
-) -> Result<&[u8], ProtocolError> {
-    if data.len() < head_words * 32 {
-        return Err(invalid("delegatecall ABI data is truncated"));
-    }
-    let offset = U256::from_be_slice(&data[offset_word * 32..offset_word * 32 + 32])
-        .try_into()
-        .map_err(|_| invalid("delegatecall ABI offset is too large"))?;
-    if offset != head_words * 32 || offset + 32 > data.len() {
-        return Err(invalid("delegatecall ABI offset is invalid"));
-    }
-    let length: usize = U256::from_be_slice(&data[offset..offset + 32])
-        .try_into()
-        .map_err(|_| invalid("delegatecall ABI length is too large"))?;
-    let end = offset
-        .checked_add(32)
-        .and_then(|start| start.checked_add(length))
-        .ok_or_else(|| invalid("delegatecall ABI length overflow"))?;
-    let padded_end = end
-        .checked_add(31)
-        .map(|value| value / 32 * 32)
-        .ok_or_else(|| invalid("delegatecall ABI padding overflow"))?;
-    if padded_end != data.len() || data[end..].iter().any(|byte| *byte != 0) {
-        return Err(invalid(
-            "delegatecall ABI bytes are truncated or noncanonical",
-        ));
-    }
-    Ok(&data[offset + 32..end])
-}
-
-/// One disclosed line per call-only batch entry, decoded the same way a
-/// top-level call is.
-fn entry_summary(index: usize, to: Address, value: U256, data: &[u8]) -> String {
-    if data.len() == 68 && data[..4] == [0xa9, 0x05, 0x9c, 0xbb] {
-        format!(
-            "  {index}. ERC-20 transfer token={to} recipient={} amount (base units)={}",
-            Address::from_slice(&data[16..36]),
-            U256::from_be_slice(&data[36..68])
-        )
-    } else if data.is_empty() {
-        format!("  {index}. Native transfer recipient={to} value (wei)={value}")
-    } else {
-        format!(
-            "  {index}. Contract call to={to} value (wei)={value} selector=0x{} calldata keccak256={:#x}",
-            hex::encode(&data[..data.len().min(4)]),
-            keccak256(data)
-        )
-    }
-}
-
 fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
     let safe = address(&envelope.safe_address, "safe_address")?;
     let to = address(&envelope.safe_tx.to, "safe_tx.to")?;
@@ -374,113 +276,9 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
                 ))
             }
         }
-        1 => {
-            if value != U256::ZERO {
-                return Err(invalid("Safe delegatecall transaction value must be zero"));
-            }
-            let target = format!("{to:#x}");
-            let library = LIBRARIES
-                .iter()
-                .find(|entry| entry.address == target)
-                .ok_or_else(|| invalid("delegatecall target is not an official Safe library"))?;
-            if data.len() < 4 {
-                return Err(invalid("Safe library calldata is truncated"));
-            }
-            if library.kind == "MultiSendCallOnly" {
-                if data[..4] != keccak256("multiSend(bytes)").as_slice()[..4] {
-                    return Err(invalid("unexpected MultiSendCallOnly selector"));
-                }
-                let packed = dynamic_bytes(&data[4..], 1, 0)?;
-                let mut cursor = 0;
-                let mut calls = 0usize;
-                let mut total = U256::ZERO;
-                let mut entries = Vec::new();
-                while cursor < packed.len() {
-                    if calls == 32 || packed.len() - cursor < 85 {
-                        return Err(invalid("MultiSendCallOnly batch is malformed or too large"));
-                    }
-                    if packed[cursor] != 0 {
-                        return Err(invalid("MultiSendCallOnly contains a delegatecall"));
-                    }
-                    let destination = Address::from_slice(&packed[cursor + 1..cursor + 21]);
-                    if destination == safe {
-                        return Err(invalid("MultiSendCallOnly contains a Safe self-call"));
-                    }
-                    let call_value = U256::from_be_slice(&packed[cursor + 21..cursor + 53]);
-                    let length: usize = U256::from_be_slice(&packed[cursor + 53..cursor + 85])
-                        .try_into()
-                        .map_err(|_| invalid("MultiSend call data length is too large"))?;
-                    let data_start = cursor
-                        .checked_add(85)
-                        .ok_or_else(|| invalid("MultiSend call data length overflow"))?;
-                    let next = data_start
-                        .checked_add(length)
-                        .ok_or_else(|| invalid("MultiSend call data length overflow"))?;
-                    if next > packed.len() {
-                        return Err(invalid("MultiSend call data is truncated"));
-                    }
-                    total = total
-                        .checked_add(call_value)
-                        .ok_or_else(|| invalid("MultiSend native value overflow"))?;
-                    calls += 1;
-                    // Every entry is disclosed; a batch must not hide a call.
-                    entries.push(entry_summary(
-                        calls,
-                        destination,
-                        call_value,
-                        &packed[data_start..next],
-                    ));
-                    cursor = next;
-                }
-                if calls == 0 {
-                    return Err(invalid("MultiSendCallOnly batch is empty"));
-                }
-                Ok(format!(
-                    "Action: Call-only batch\nCalls: {calls}\nTotal native value (wei): {total}\n{}\nPacked calls keccak256: {:#x}",
-                    entries.join("\n"),
-                    keccak256(packed)
-                ))
-            } else {
-                let create = keccak256("performCreate(uint256,bytes)");
-                let create2 = keccak256("performCreate2(uint256,bytes,bytes32)");
-                let deployment_value = if data.len() >= 36 {
-                    U256::from_be_slice(&data[4..36])
-                } else {
-                    return Err(invalid("CreateCall calldata is truncated"));
-                };
-                let (kind, initcode, salt) = if data[..4] == create.as_slice()[..4] {
-                    if data.len() < 68 {
-                        return Err(invalid("CreateCall calldata is truncated"));
-                    }
-                    ("CREATE", dynamic_bytes(&data[4..], 2, 1)?, None)
-                } else if data[..4] == create2.as_slice()[..4] {
-                    if data.len() < 100 {
-                        return Err(invalid("CreateCall CREATE2 calldata is truncated"));
-                    }
-                    (
-                        "CREATE2",
-                        dynamic_bytes(&data[4..], 3, 1)?,
-                        Some(B256::from_slice(&data[68..100])),
-                    )
-                } else {
-                    return Err(invalid("unexpected CreateCall selector"));
-                };
-                if initcode.is_empty() {
-                    return Err(invalid("contract deployment initcode is empty"));
-                }
-                let mut result = format!(
-                    "Action: Deploy contract ({kind})\nDeployment value (wei): {deployment_value}\nInitcode keccak256: {:#x}",
-                    keccak256(initcode)
-                );
-                if let Some(salt) = salt {
-                    result.push_str(&format!(
-                        "\nSalt: {salt:#x}\nPredicted address: {}",
-                        safe.create2(salt, keccak256(initcode))
-                    ));
-                }
-                Ok(result)
-            }
-        }
+        1 => Err(invalid(
+            "Safe delegatecalls are not supported because Broker cannot authenticate target code",
+        )),
         _ => Err(invalid("unsupported Safe operation")),
     }
 }
@@ -852,93 +650,6 @@ mod tests {
     }
 
     #[test]
-    fn create_review_discloses_endowment_and_requires_canonical_abi() {
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        let mut calldata = keccak256("performCreate(uint256,bytes)").as_slice()[..4].to_vec();
-        calldata.extend_from_slice(&U256::from(9).to_be_bytes::<32>());
-        calldata.extend_from_slice(&U256::from(64).to_be_bytes::<32>());
-        calldata.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
-        calldata.push(0);
-        calldata.extend_from_slice(&[0; 31]);
-        value["safe_tx"]["to"] = serde_json::json!("0x9b35af71d77eaf8d7e40252370304687390a1a52");
-        value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["operation"] = serde_json::json!(1);
-        value["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(&calldata)));
-        value["library_code_hash"] =
-            serde_json::json!("0x2b3060c55fcb8275653e99ad511a71f67ba76934ed66a7d74d6e68b52afff889");
-        let parsed: Envelope = serde_json::from_value(value.clone()).unwrap();
-        assert!(
-            classify(&parsed)
-                .unwrap()
-                .contains("Deployment value (wei): 9")
-        );
-
-        calldata.extend_from_slice(&[0; 32]);
-        value["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(calldata)));
-        let parsed: Envelope = serde_json::from_value(value).unwrap();
-        assert!(classify(&parsed).is_err());
-    }
-
-    fn multisend_entry(to: &str, value: u64, data: &[u8]) -> Vec<u8> {
-        let mut out = vec![0_u8];
-        out.extend_from_slice(address(to, "to").unwrap().as_slice());
-        out.extend_from_slice(&U256::from(value).to_be_bytes::<32>());
-        out.extend_from_slice(&U256::from(data.len()).to_be_bytes::<32>());
-        out.extend_from_slice(data);
-        out
-    }
-
-    fn multisend_calldata(packed: &[u8]) -> Vec<u8> {
-        let mut data = keccak256("multiSend(bytes)").as_slice()[..4].to_vec();
-        data.extend_from_slice(&U256::from(32).to_be_bytes::<32>());
-        data.extend_from_slice(&U256::from(packed.len()).to_be_bytes::<32>());
-        data.extend_from_slice(packed);
-        data.resize(4 + 64 + packed.len().div_ceil(32) * 32, 0);
-        data
-    }
-
-    #[test]
-    fn call_only_batches_disclose_every_entry() {
-        let mut erc20 = vec![0xa9, 0x05, 0x9c, 0xbb];
-        erc20.extend_from_slice(&[0; 12]);
-        erc20.extend_from_slice(
-            address("0x4000000000000000000000000000000000000000", "to")
-                .unwrap()
-                .as_slice(),
-        );
-        erc20.extend_from_slice(&U256::from(7).to_be_bytes::<32>());
-
-        let mut packed = multisend_entry("0x5000000000000000000000000000000000000000", 2, &erc20);
-        packed.extend(multisend_entry(
-            "0x6000000000000000000000000000000000000000",
-            3,
-            &[],
-        ));
-
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["safe_tx"]["to"] = serde_json::json!("0x9641d764fc13c8b624c04430c7356c1c7c8102e2");
-        value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["operation"] = serde_json::json!(1);
-        value["safe_tx"]["data"] =
-            serde_json::json!(format!("0x{}", hex::encode(multisend_calldata(&packed))));
-        value["library_code_hash"] =
-            serde_json::json!("0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939");
-        let parsed: Envelope = serde_json::from_value(value).unwrap();
-        let action = classify(&parsed).unwrap();
-
-        // A batch must not be a cheaper way to hide a call than sending it
-        // directly: every destination and amount is disclosed.
-        assert!(action.contains("Calls: 2"));
-        assert!(action.contains("Total native value (wei): 5"));
-        assert!(action.contains(
-            "1. ERC-20 transfer token=0x5000000000000000000000000000000000000000 recipient=0x4000000000000000000000000000000000000000 amount (base units)=7"
-        ));
-        assert!(action.contains(
-            "2. Native transfer recipient=0x6000000000000000000000000000000000000000 value (wei)=3"
-        ));
-    }
-
-    #[test]
     fn unverifiable_safe_state_is_reported_separately_from_the_rebuilt_transaction() {
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
         let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
@@ -965,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_refunds_and_delegatecalls_outside_the_official_safe_libraries() {
+    fn rejects_refunds_and_every_delegatecall() {
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
 
         // Refund fields are EIP-712 members, so the digest binds them and this
@@ -975,22 +686,18 @@ mod tests {
         let canonical = serde_jcs::to_vec(&value).unwrap();
         assert!(review(&request(canonical), &policy(), from).is_err());
 
-        // `safe_tx.to` is an EIP-712 member too, so restricting a delegatecall
-        // to the official libraries constrains the transaction rather than the
-        // Petal's description of it.
+        // An address and Petal-reported code hash cannot authenticate the code
+        // another chain will execute in the Safe's storage context.
         let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
         value["safe_tx"]["operation"] = serde_json::json!(1);
         value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["data"] = serde_json::json!("0xdeadbeef");
-        value["safe_tx"]["to"] = serde_json::json!("0x4000000000000000000000000000000000000000");
-        let canonical = serde_jcs::to_vec(&value).unwrap();
-        assert!(review(&request(canonical), &policy(), from).is_err());
-
-        // Reaching an official library is not enough; the call into it must
-        // still decode.
+        value["safe_tx"]["data"] = serde_json::json!("0x8d80ff0a");
         value["safe_tx"]["to"] = serde_json::json!("0x9641d764fc13c8b624c04430c7356c1c7c8102e2");
+        value["library_code_hash"] =
+            serde_json::json!("0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939");
         let canonical = serde_jcs::to_vec(&value).unwrap();
-        assert!(review(&request(canonical), &policy(), from).is_err());
+        let error = review(&request(canonical), &policy(), from).unwrap_err();
+        assert!(error.message.contains("cannot authenticate target code"));
     }
 
     #[test]
