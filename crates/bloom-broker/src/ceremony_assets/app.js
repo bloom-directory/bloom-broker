@@ -371,7 +371,7 @@ function describeTransfer(manifest) {
     // second time. They stay in technical details, where the exact bytes are.
     // The one exception is native value riding along with a contract call:
     // that is a second thing being moved and nothing else says so.
-    const decoded = Boolean(payload.contract_call);
+    const decoded = Boolean(payload.contract_call || payload.safe_call);
     const movesNative = !/^0(\.0+)?(\s|$)/.test(String(payload.value_display || "0"));
     technical.push([label(payload.destination ? "Transaction to" : "Action"),
       payload.destination || "Deploy contract (CREATE)", Boolean(payload.destination)]);
@@ -412,6 +412,15 @@ function describeTransfer(manifest) {
   // A clear-signed call puts the contract's own reading first: what moves,
   // to whom, in which token. The envelope facts stay underneath — they are
   // what was actually signed, and the description never replaces them.
+  const safeCallIntent = lines => {
+    const action = String(lines[0] || "").replace(/^Action: /, "");
+    const will = lines.find(line => line.startsWith("The Safe will: "));
+    return {action: "safe", eyebrow: "Safe",
+      heading: will ? `${action}: ${will.slice(15).toLowerCase()}` : action,
+      detail: "Read from the exact transaction bytes. Bloom did not check that the " +
+        "destination is a Safe, and does not verify what the call's code does.",
+      relation: "calls"};
+  };
   const appendCallFacts = (facts, technical, payload, prefix) => {
     const call = payload.contract_call;
     const label = name => prefix ? `${prefix} ${name.toLowerCase()}` : name;
@@ -445,6 +454,15 @@ function describeTransfer(manifest) {
       const technicalStart = technical.length;
       const prefix = evmPayloads.length > 1 ? `Transaction ${index + 1}` : "";
       if (payload.contract_call) appendCallFacts(facts, technical, payload, prefix);
+      // Broker's own reading of a Safe call: one fact per line, labelled.
+      for (const line of (payload.safe_call || []).slice(1)) {
+        if (line.startsWith("Warning: ")) continue;
+        const at = line.indexOf(": ");
+        const name = at > 0 ? line.slice(0, at) : "Step";
+        const value = at > 0 ? line.slice(at + 2) : line;
+        facts.push([prefix ? `${prefix} ${name.toLowerCase()}` : name, value,
+          /^0x[0-9a-fA-F]{40}$/.test(value)]);
+      }
       appendEnvelopeFacts(facts, technical, payload, prefix);
       for (const row of facts.slice(factStart)) row[3] = payload.chain_id;
       for (const row of technical.slice(technicalStart)) row[3] = payload.chain_id;
@@ -452,6 +470,11 @@ function describeTransfer(manifest) {
     // Every mandatory warning, in the order the verifier produced it, kept
     // visible rather than folded into the fact list or the details section.
     const warnings = [];
+    for (const payload of evmPayloads) {
+      for (const line of payload.safe_call || []) {
+        if (line.startsWith("Warning: ")) warnings.push(line.slice(9));
+      }
+    }
     for (const payload of calls) {
       for (const warning of payload.contract_call.warnings || []) warnings.push(warning);
     }
@@ -490,6 +513,7 @@ function describeTransfer(manifest) {
             chainId: payload.chain_id,
             intent: payload.contract_call
               ? callIntent(payload.contract_call)
+              : payload.safe_call ? safeCallIntent(payload.safe_call)
               : {action: payload.destination ? "send" : "deploy",
                  eyebrow: payload.destination ? "Native transfer" : "Contract creation",
                  heading: payload.destination
@@ -509,6 +533,8 @@ function describeTransfer(manifest) {
         }
       : first.contract_call
         ? callIntent(first.contract_call)
+        : first.safe_call
+        ? safeCallIntent(first.safe_call)
         : first.destination
           ? (first.calldata_keccak
             ? {action: "opaque", eyebrow: "Contract call", heading: "Approve a call Bloom cannot read",

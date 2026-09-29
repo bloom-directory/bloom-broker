@@ -369,7 +369,7 @@ fn word_as_address(word: &[u8]) -> Result<Address, ProtocolError> {
 ///
 /// The `prevOwner` argument only locates an entry in the Safe's owner list,
 /// so it is checked for shape and not shown.
-fn owner_change(envelope: &Envelope, value: U256, data: &[u8]) -> Result<String, ProtocolError> {
+fn owner_change(signer: Address, value: U256, data: &[u8]) -> Result<String, ProtocolError> {
     let refused =
         || invalid("Safe self-calls other than owner and threshold changes are not supported");
     if !value.is_zero() || data.len() < 4 || (data.len() - 4) % 32 != 0 {
@@ -377,7 +377,6 @@ fn owner_change(envelope: &Envelope, value: U256, data: &[u8]) -> Result<String,
     }
     let words: Vec<&[u8]> = data[4..].chunks(32).collect();
     let selector = |signature: &str| data[..4] == keccak256(signature).as_slice()[..4];
-    let signer = address(&envelope.owner, "owner")?;
     let removes_signer = |removed: Address| {
         if removed == signer {
             "\nWarning: this removes this Bloom wallet from the Safe's owners"
@@ -425,17 +424,35 @@ fn owner_change(envelope: &Envelope, value: U256, data: &[u8]) -> Result<String,
 }
 
 fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
-    let safe = address(&envelope.safe_address, "safe_address")?;
-    let to = address(&envelope.safe_tx.to, "safe_tx.to")?;
-    let value = uint(&envelope.safe_tx.value, "safe_tx.value")?;
-    let data = bytes(&envelope.safe_tx.data, "safe_tx.data")?;
-    match envelope.safe_tx.operation {
+    classify_call(
+        uint(&envelope.chain_id, "chain_id")?,
+        address(&envelope.safe_address, "safe_address")?,
+        address(&envelope.owner, "owner")?,
+        address(&envelope.safe_tx.to, "safe_tx.to")?,
+        uint(&envelope.safe_tx.value, "safe_tx.value")?,
+        &bytes(&envelope.safe_tx.data, "safe_tx.data")?,
+        envelope.safe_tx.operation,
+    )
+}
+
+/// Read one Safe transaction. `signer` is the Bloom wallet approving, so a
+/// change that removes it can say so.
+fn classify_call(
+    chain: U256,
+    safe: Address,
+    signer: Address,
+    to: Address,
+    value: U256,
+    data: &[u8],
+    operation: u8,
+) -> Result<String, ProtocolError> {
+    match operation {
         0 => {
             if to == safe {
                 if value.is_zero() && data.is_empty() {
                     return Ok("Action: Reject competing Safe transaction\nValue: 0".into());
                 }
-                return owner_change(envelope, value, &data);
+                return owner_change(signer, value, data);
             }
             if data.len() == 68 && data[..4] == [0xa9, 0x05, 0x9c, 0xbb] {
                 let recipient = Address::from_slice(&data[16..36]);
@@ -449,7 +466,7 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
                 Ok(format!(
                     "Action: Contract call\nCalldata selector: 0x{}\nCalldata keccak256: {:#x}",
                     hex::encode(&data[..data.len().min(4)]),
-                    keccak256(&data)
+                    keccak256(data)
                 ))
             }
         }
@@ -457,7 +474,6 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
             if value != U256::ZERO {
                 return Err(invalid("Safe delegatecall transaction value must be zero"));
             }
-            let chain = uint(&envelope.chain_id, "chain_id")?;
             let chain_name = u64::try_from(chain)
                 .map(crate::evm_review::chain_name)
                 .unwrap_or_else(|_| format!("evm-{chain}"));
@@ -666,6 +682,169 @@ pub(crate) fn review(
             library_code_hash: envelope.library_code_hash,
         },
     }))
+}
+
+fn word(data: &[u8], index: usize) -> Option<&[u8]> {
+    data.get(index.checked_mul(32)?..index.checked_mul(32)?.checked_add(32)?)
+}
+
+fn word_usize(data: &[u8], index: usize) -> Option<usize> {
+    U256::from_be_slice(word(data, index)?).try_into().ok()
+}
+
+fn address_at(data: &[u8], index: usize) -> Option<Address> {
+    word_as_address(word(data, index)?).ok()
+}
+
+/// ABI `bytes` whose offset sits in head word `index`.
+fn tail_bytes(data: &[u8], index: usize) -> Option<&[u8]> {
+    let offset = word_usize(data, index)?;
+    if offset % 32 != 0 {
+        return None;
+    }
+    let length = word_usize(data, offset / 32)?;
+    data.get(offset.checked_add(32)?..offset.checked_add(32)?.checked_add(length)?)
+}
+
+/// Safe proxy factories whose `createProxyWithNonce` Broker reads: 1.3.0 (two
+/// deployments), 1.4.1 and 1.5.0.
+const FACTORIES: &[&str] = &[
+    "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2",
+    "0xc22834581ebc8527d974f8a1c97e1bea4ef910bc",
+    "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67",
+    "0x14f2982d601c9458f93bd70b218933a6f8165e7b",
+];
+
+/// What a native transaction that calls a Safe or a Safe factory does, read
+/// from the exact bytes being signed. `None` leaves the call to the ordinary
+/// envelope review. Broker reads no chain state, so it cannot tell whether the
+/// destination really is a Safe; the page says so.
+pub(crate) fn outer_call(
+    chain: u64,
+    from: Address,
+    to: Address,
+    value: U256,
+    input: &[u8],
+) -> Option<Vec<String>> {
+    let (selector, data) = input.split_at_checked(4)?;
+    let is = |signature: &str| selector == &keccak256(signature).as_slice()[..4];
+    let chain_name = crate::evm_review::chain_name(chain);
+    let mut lines = Vec::new();
+    if is(
+        "execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)",
+    ) {
+        let inner_to = address_at(data, 0)?;
+        let inner_value = U256::from_be_slice(word(data, 1)?);
+        let inner_data = tail_bytes(data, 2)?;
+        let operation = u8::try_from(U256::from_be_slice(word(data, 3)?)).ok()?;
+        let signatures = tail_bytes(data, 9)?;
+        if signatures.len() % 65 != 0 {
+            return None;
+        }
+        lines.push("Action: Execute a Safe transaction".to_owned());
+        lines.push(format!("Safe: {to}"));
+        match classify_call(
+            U256::from(chain),
+            to,
+            from,
+            inner_to,
+            inner_value,
+            inner_data,
+            operation,
+        ) {
+            Ok(action) => {
+                for (index, line) in action.lines().enumerate() {
+                    match (index, line.strip_prefix("Action: ")) {
+                        (0, Some(action)) => lines.push(format!("The Safe will: {action}")),
+                        _ => lines.push(line.to_owned()),
+                    }
+                }
+                if inner_data.is_empty() && operation == 0 && inner_to != to {
+                    lines.push(format!("Amount: {}", native(inner_value, &chain_name)));
+                }
+            }
+            Err(error) => {
+                lines.push("The Safe will: make a call Bloom cannot read".to_owned());
+                lines.push(format!("Reason: {}", error.message));
+                lines.push(format!("Call target: {inner_to}"));
+                lines.push(format!("Call value: {}", native(inner_value, &chain_name)));
+            }
+        }
+        lines.push(format!(
+            "Owner signatures attached: {}",
+            signatures.len() / 65
+        ));
+        let refund = (4..=6)
+            .any(|index| word(data, index).is_none_or(|word| word.iter().any(|byte| *byte != 0)));
+        if refund {
+            lines.push("Warning: the Safe pays a gas refund for this execution".to_owned());
+        }
+        if !value.is_zero() {
+            lines.push(format!(
+                "Warning: this also sends {} to the Safe",
+                native(value, &chain_name)
+            ));
+        }
+        return Some(lines);
+    }
+    if is("createProxyWithNonce(address,bytes,uint256)")
+        && FACTORIES.contains(&format!("{to:#x}").as_str())
+    {
+        let singleton = address_at(data, 0)?;
+        let initializer = tail_bytes(data, 1)?;
+        let salt = U256::from_be_slice(word(data, 2)?);
+        let (selector, setup) = initializer.split_at_checked(4)?;
+        if selector
+            != &keccak256("setup(address[],uint256,address,bytes,address,address,uint256,address)")
+                .as_slice()[..4]
+        {
+            return None;
+        }
+        let owners_at = word_usize(setup, 0)?;
+        if owners_at % 32 != 0 {
+            return None;
+        }
+        let count = word_usize(setup, owners_at / 32)?;
+        if count == 0 || count > 64 {
+            return None;
+        }
+        let owners = (0..count)
+            .map(|index| address_at(setup, owners_at / 32 + 1 + index))
+            .collect::<Option<Vec<_>>>()?;
+        let threshold = U256::from_be_slice(word(setup, 1)?);
+        let setup_target = address_at(setup, 2)?;
+        let setup_data = tail_bytes(setup, 3)?;
+        let fallback = address_at(setup, 4)?;
+        let payment = U256::from_be_slice(word(setup, 6)?);
+        lines.push("Action: Create a Safe".to_owned());
+        lines.push(format!("Signatures required: {threshold} of {count}"));
+        for (index, owner) in owners.iter().enumerate() {
+            let mine = if *owner == from { " (this wallet)" } else { "" };
+            lines.push(format!("Owner {}: {owner}{mine}", index + 1));
+        }
+        lines.push(format!("Safe implementation: {singleton}"));
+        lines.push(format!("Fallback handler: {fallback}"));
+        lines.push(format!("Salt nonce: {salt}"));
+        if !owners.contains(&from) {
+            lines.push("Warning: this wallet is not an owner of the new Safe".to_owned());
+        }
+        if setup_target != Address::ZERO || !setup_data.is_empty() {
+            lines.push(format!(
+                "Warning: setup runs extra code at {setup_target} that Bloom cannot read"
+            ));
+        }
+        if !payment.is_zero() {
+            lines.push("Warning: the new Safe makes a payment during setup".to_owned());
+        }
+        if !value.is_zero() {
+            lines.push(format!(
+                "Warning: this also sends {} to the factory",
+                native(value, &chain_name)
+            ));
+        }
+        return Some(lines);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1152,6 +1331,68 @@ mod tests {
                 .unwrap()
                 .contains("Broker-verified")
         );
+    }
+
+    // Inputs of transactions that ran on Base: a Safe creation, and three
+    // executions of that Safe.
+    const SAFE: &str = "0xaefda71ded59b48920131d03454893ec2ad93e88";
+    const WALLET: &str = "0x8d4fafba75a9dc50b4b296211509e856d2c6d081";
+    const FACTORY: &str = "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67";
+
+    fn outer(to: &str, input: &str) -> Option<String> {
+        outer_call(
+            8453,
+            address(WALLET, "wallet").unwrap(),
+            address(to, "to").unwrap(),
+            U256::ZERO,
+            &hex::decode(input.trim_start_matches("0x")).unwrap(),
+        )
+        .map(|lines| lines.join("\n"))
+    }
+
+    #[test]
+    fn a_call_that_executes_a_safe_transaction_says_what_the_safe_will_do() {
+        let send = outer(SAFE, "0x6a7612020000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d081000000000000000000000000000000000000000000000000000009184e72a00000000000000000000000000000000000000000000000000000000000000001400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000160000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000411fca12a0c7a67fc6ca9ca271335af2680fae0ce704f5c75fe373ddce47674df33a341f86acbc619d6db40b37ef330f3f2dd47897f0551799f28f20ef7288d69b1b00000000000000000000000000000000000000000000000000000000000000").unwrap();
+        assert!(
+            send.starts_with("Action: Execute a Safe transaction"),
+            "{send}"
+        );
+        assert!(send.contains("The Safe will: Native transfer"), "{send}");
+        assert!(send.contains("Amount: 0.00001 ETH"), "{send}");
+        assert!(send.contains("Owner signatures attached: 1"), "{send}");
+        assert!(!send.contains("Warning"), "{send}");
+
+        let batch = outer(SAFE, "0x6a7612020000000000000000000000009641d764fc13c8b624c04430c7356c1c7c8102e20000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002c000000000000000000000000000000000000000000000000000000000000001448d80ff0a000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000ee008d4fafba75a9dc50b4b296211509e856d2c6d0810000000000000000000000000000000000000000000000000000048c27395000000000000000000000000000000000000000000000000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda0291300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000044a9059cbb0000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d0810000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000041387df176124ae8ab24202005fda4428eff86fcd8d9636ec9239aa8646e414ec75fc7a978870c915eb4e85c7f237e6b5fb6167bde0a1b4dad73a3820b055283f91c00000000000000000000000000000000000000000000000000000000000000").unwrap();
+        assert!(batch.contains("The Safe will: Call-only batch"), "{batch}");
+        assert!(batch.contains("1. Send 0.000005 ETH to"), "{batch}");
+        assert!(
+            batch.contains("2. ERC-20 transfer of 0 base units"),
+            "{batch}"
+        );
+
+        let remove = outer(SAFE, "0x6a761202000000000000000000000000aefda71ded59b48920131d03454893ec2ad93e880000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001e00000000000000000000000000000000000000000000000000000000000000064f8dc5dd9000000000000000000000000000000000000000000000000000000000000000100000000000000000000000043d2fdfed480f95b8848840031546e30a60c0a5f000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008200bcff01bcd29252f7a7d20e0fd09d28da5cf5d0f8d4a0165a15e4e62a9e83862f1c20464a3b2cee24762885ff9b86a060d999eb18e74dacdb3256ca919e17121bf5e7e63c173815be4ee254ae96388767b18a7df6c69191bb9bfd9734106efc7b737b98399b57d8847a2f5de37e3ac14b5a3f33bd6d3347f92fa6ac2eec6e80d01c000000000000000000000000000000000000000000000000000000000000").unwrap();
+        assert!(
+            remove.contains("The Safe will: Remove Safe owner"),
+            "{remove}"
+        );
+        assert!(remove.contains("New threshold: 1"), "{remove}");
+        assert!(remove.contains("Owner signatures attached: 2"), "{remove}");
+    }
+
+    #[test]
+    fn a_call_that_creates_a_safe_names_its_owners_and_threshold() {
+        let input = "0x1688f0b900000000000000000000000029fcb43b46531bca003ddc8fcb67ffe91900c762000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000013528400000000000000000000000000000000000000000000000000000000000000164b63e800d0000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000fd0732dc9e303f09fcef3a7388ad10a83459ec9900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d081000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+        let create = outer(FACTORY, input).unwrap();
+        assert!(create.starts_with("Action: Create a Safe"), "{create}");
+        assert!(create.contains("Signatures required: 1 of 1"), "{create}");
+        assert!(create.contains("(this wallet)"), "{create}");
+        assert!(!create.contains("Warning"), "{create}");
+
+        // The same bytes sent anywhere but a Safe factory are not read as one.
+        assert!(outer(SAFE, input).is_none());
+        // Truncated input falls back to the ordinary review.
+        assert!(outer(FACTORY, &input[..input.len() - 64]).is_none());
+        assert!(outer(SAFE, "0x6a761202").is_none());
     }
 
     #[test]

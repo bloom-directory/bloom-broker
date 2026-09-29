@@ -67,6 +67,11 @@ pub struct EvmReviewPayload {
     /// an explicitly opaque batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract_call: Option<ClearSignedCall>,
+    /// Broker's own reading of a call to a Safe or a Safe factory, one fact
+    /// per line, decoded from the transaction input. It describes what the
+    /// bytes ask for; whether the destination is a Safe is not verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe_call: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -489,6 +494,12 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
                 &chain_name,
             ),
             contract_call: None,
+            safe_call: match tx.kind() {
+                TxKind::Call(to) => {
+                    crate::safe_review::outer_call(chain, from, to, tx.value(), input)
+                }
+                TxKind::Create => None,
+            },
         },
         call,
     ))
