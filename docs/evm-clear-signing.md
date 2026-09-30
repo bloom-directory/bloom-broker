@@ -193,10 +193,16 @@ surface: no network fetch, no refresh command, no second audit family. A
 snapshot no enrolled wallet trusts is logged and not installed; Broker still
 starts, because wallets that never enabled clear signing are unaffected.
 
-`broker.capabilities` reports the stored catalog's identity, sequence, content
-digest, expiry, entry count, oldest observation and the compiled verifier's
-digest. Per-wallet trust is in the wallet's policy, which `policy.read`
-already returns.
+Broker stores one catalog per catalog identity, so a wallet that pins
+`bloom-tokens` and a wallet that pins `staging-catalog` do not evict each
+other, and the sequence watermark that refuses a rollback is per identity too.
+A wallet reads only the catalog its policy pins; another identity's snapshot
+reads to it the same as having none.
+
+`broker.capabilities` reports, for each stored catalog, its identity,
+sequence, content digest, expiry, entry count, oldest observation and the
+compiled verifier's digest. Per-wallet trust is in the wallet's policy, which
+`policy.read` already returns.
 
 ## Publishing a catalog
 
@@ -204,18 +210,28 @@ already returns.
 Broker runs, hashes each flattened descriptor, sorts the entries and signs:
 
 ```sh
+# The pinned ERC-7730 v2 schema commit and digest this build requires.
 bloom-clear-signing-catalog schema-pin
+# Validate the sources against that schema and write the report `build` needs.
+publish/validate-descriptors.sh erc7730-v2.schema.json descriptor.json > report.json
 bloom-clear-signing-catalog build source.json \
-  --key publisher.hex --key-id publisher-1 --out catalog.json
+  --key publisher.hex --key-id publisher-1 \
+  --schema-report report.json --out catalog.json
 bloom-clear-signing-catalog verify catalog.json \
   --key-id publisher-1 --public-key <hex>
 ```
 
+Schema validation is a required step, not an optional one: `build` refuses to
+publish without a report that names the pinned schema commit and digest and
+covers every descriptor file the build reads by SHA-256, including every file
+reached through `includes`. Validation itself is upstream JSON Schema tooling
+rather than ours, which is why it is a separate script and a report rather
+than a flag.
+
 A catalog that builds is one Broker can read: a descriptor instruction outside
-the subset fails at publication rather than in front of an owner. Validating
-the *source* document against the full upstream schema remains the publisher's
-job with upstream tooling; Bloom's admission is narrower for everything Bloom
-displays.
+the subset fails at publication rather than in front of an owner. Bloom's
+admission is narrower than the schema for everything Bloom displays, so both
+checks run and neither replaces the other.
 
 ## Durable-state compatibility
 

@@ -437,8 +437,30 @@ pub fn is_canonical_address(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// Characters a signed label or token name may not carry, because they change
+/// what the approval screen reads without changing what it says.
+///
+/// `char::is_control` covers Cc only, so it misses the line and paragraph
+/// separators (Zl, Zp) — which break a label across lines exactly as a control
+/// character would — and the format characters (Cf), which include the
+/// bidirectional overrides already listed here plus the zero-width and
+/// invisible ones that let two different names render identically. These
+/// strings are short, human-readable labels, so none of this range has an
+/// honest use in one.
 pub(crate) fn is_control_or_bidi(character: char) -> bool {
     character.is_control()
         || matches!(character,
-            '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            // Zl and Zp: line and paragraph separators.
+            '\u{2028}' | '\u{2029}'
+            // Cf: soft hyphen, Arabic letter mark, the zero-width and
+            // bidirectional formatting range, the invisible operators, the
+            // deprecated and interlinear annotation marks, and the BOM.
+            | '\u{00ad}' | '\u{0600}'..='\u{0605}' | '\u{061c}' | '\u{06dd}'
+            | '\u{070f}' | '\u{08e2}' | '\u{180e}'
+            | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}'
+            | '\u{feff}' | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}' | '\u{110cd}' | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}' | '\u{e0020}'..='\u{e007f}')
 }

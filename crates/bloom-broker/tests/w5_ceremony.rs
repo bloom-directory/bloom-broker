@@ -7905,3 +7905,82 @@ async fn two_differently_configured_brokers_isolate_ceremony_origin() {
         .unwrap();
     assert_eq!(completed.status(), StatusCode::OK);
 }
+
+/// The clear-signing trusted publisher keys are the root of trust for every
+/// contract description Broker will later read calldata against, so rotating
+/// them is the largest authority a policy update can move. `describePolicy`
+/// enumerated the clear-signing fields it renders and left `trusted_keys` out,
+/// so a keys-only rotation reached the owner as "No rule changes are proposed."
+/// under an "Approve policy change" button.
+#[test]
+fn a_trusted_publisher_key_rotation_is_named_on_the_policy_page() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+globalThis.document = {{getElementById: () => ({{}})}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+{executable}
+const settings = keys => ({{
+  catalog_id: "bloom-tokens",
+  trusted_keys: keys,
+  signature_threshold: 1,
+  maximum_observation_age_ms: "86400000",
+  opaque_exact_allowed: false,
+  unlimited_allowance_allowed: false,
+  verifier: {{verifier_id: "bloom-evm-clear-signing", verifier_digest: "{}"}}
+}});
+const oldKey = {{key_id: "publisher-1", verifying_key: "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE"}};
+const newKey = {{key_id: "publisher-1", verifying_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg"}};
+
+// Nothing else differs: only the Ed25519 verifying key behind the same id.
+const diff = clear_signing => describePolicy({{authority_diff: {{clear_signing}}}});
+const rotation = diff({{before: settings([oldKey]), after: settings([newKey])}});
+if (/No rule changes are proposed/.test(rotation.sentence)) {{
+  throw new Error("a trusted-key rotation was rendered as no change: " + rotation.sentence);
+}}
+const rotationFacts = JSON.stringify(rotation.facts);
+for (const needle of ["Stop trusting descriptions signed by", "Trust descriptions signed by"]) {{
+  if (!rotationFacts.includes(needle)) throw new Error("missing " + needle + " in " + rotationFacts);
+}}
+if (!rotation.intent) throw new Error("a key rotation must produce an action card");
+
+// Adding a second publisher is an addition only, and must still be named.
+const added = diff({{before: settings([oldKey]), after: settings([oldKey, {{key_id: "publisher-2", verifying_key: "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M"}}])}});
+if (!JSON.stringify(added.facts).includes("publisher-2")) {{
+  throw new Error("adding a publisher was not named: " + JSON.stringify(added.facts));
+}}
+
+// A clear-signing change this page cannot describe must not read as no change.
+const opaque = diff({{before: settings([oldKey]), after: settings([oldKey])}});
+if (/No rule changes are proposed/.test(opaque.sentence)) {{
+  throw new Error("an undescribable clear-signing change claimed nothing changed");
+}}
+if (!/cannot describe/.test(opaque.sentence)) {{
+  throw new Error("expected the undescribable-change wording, got: " + opaque.sentence);
+}}
+
+// A policy update with no clear-signing section keeps its existing wording.
+const none = describePolicy({{authority_diff: {{}}}});
+if (!/No rule changes are proposed/.test(none.sentence)) {{
+  throw new Error("an empty diff must still read as no change: " + none.sentence);
+}}
+process.stdout.write("trusted-keys-ok");
+"#,
+        "0".repeat(64)
+    );
+    let output = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "trusted-keys-ok");
+}

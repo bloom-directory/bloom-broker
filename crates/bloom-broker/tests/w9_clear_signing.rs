@@ -499,7 +499,11 @@ fn stored(harness: &Harness) -> Option<AcceptedCatalog> {
     let trusted = bloom_broker::authority::trusted_catalog_keys(settings).unwrap();
     harness
         .authority
-        .clear_signing_catalog(&trusted, usize::from(settings.signature_threshold))
+        .clear_signing_catalog(
+            &settings.catalog_id,
+            &trusted,
+            usize::from(settings.signature_threshold),
+        )
         .unwrap()
 }
 
@@ -509,7 +513,7 @@ fn a_catalog_installs_only_for_a_wallet_that_already_trusts_its_publisher() {
     harness.install_policy(1, None);
     // No wallet has enabled clear signing: nothing to install against.
     assert!(!install(&harness, &catalog(1, vec![entry()], 5)).unwrap());
-    assert!(harness.authority.clear_signing_status().unwrap().is_none());
+    assert!(harness.authority.clear_signing_status().unwrap().is_empty());
 
     harness.install_policy(2, Some(clear_signing_policy(5)));
     assert!(install(&harness, &catalog(1, vec![entry()], 5)).unwrap());
@@ -544,12 +548,7 @@ fn sequence_moves_forward_only_and_equal_sequences_must_be_identical() {
     install(&harness, &catalog(8, vec![], 5)).unwrap();
     assert!(stored(&harness).unwrap().entry(1, TOKEN_ADDRESS).is_none());
     assert_eq!(
-        harness
-            .authority
-            .clear_signing_status()
-            .unwrap()
-            .unwrap()
-            .sequence,
+        harness.authority.clear_signing_status().unwrap()[0].sequence,
         "8"
     );
 }
@@ -566,7 +565,7 @@ fn stored_bytes_stop_authorizing_when_the_wallet_rotates_its_trust() {
     harness.install_policy(2, Some(clear_signing_policy(6)));
     assert!(stored(&harness).is_none());
     // The operator can still see what is stored, which is how they notice.
-    assert!(harness.authority.clear_signing_status().unwrap().is_some());
+    assert!(!harness.authority.clear_signing_status().unwrap().is_empty());
 }
 
 #[test]
@@ -904,12 +903,7 @@ fn a_restart_keeps_the_sequence_watermark_and_the_frozen_review() {
     }
     let harness = Harness::open(Some(directory.path()));
     assert_eq!(
-        harness
-            .authority
-            .clear_signing_status()
-            .unwrap()
-            .unwrap()
-            .sequence,
+        harness.authority.clear_signing_status().unwrap()[0].sequence,
         "4"
     );
     // The frozen review survived the restart, so the approval still signs.
@@ -1044,4 +1038,58 @@ fn an_outdated_verifier_pin_does_not_strand_the_wallet() {
         .authority
         .install_policy(&snapshot)
         .expect("re-presenting the stored snapshot must stay readable");
+}
+
+/// `catalog_id` is documented as "the one catalog identity this wallet accepts
+/// descriptions from", and the owner approves it through a policy ceremony.
+/// It was compared only where a catalog is installed, so a wallet read
+/// contract calls against whichever catalog was stored last as long as a
+/// publisher it trusted had signed it.
+#[test]
+fn a_catalog_the_wallet_did_not_pin_describes_nothing_for_it() {
+    let harness = Harness::open(None);
+    harness.install_policy(2, Some(clear_signing_policy(5)));
+    assert!(install(&harness, &catalog(8, vec![entry()], 5)).unwrap());
+    assert!(
+        stored(&harness).is_some(),
+        "the pinned catalog is readable for this wallet"
+    );
+
+    // Same publisher, same threshold, different catalog identity. Installing
+    // it directly is what a second enrolled wallet's startup would do.
+    let mut other = catalog(9, vec![entry()], 5);
+    other.catalog_id = token("staging-catalog");
+    let mut message = CATALOG_SIGNATURE_DOMAIN.to_vec();
+    message.extend_from_slice(&other.unsigned_canonical_bytes().unwrap());
+    other.signatures = vec![CatalogSignature {
+        key_id: token("publisher-1"),
+        signature: Base64UrlBytes::from_bytes(&publisher(5).sign(&message).to_bytes()),
+    }];
+    let settings = clear_signing_policy(5);
+    let trusted = bloom_broker::authority::trusted_catalog_keys(&settings).unwrap();
+    harness
+        .authority
+        .install_clear_signing_catalog(
+            &other,
+            serde_jcs::to_vec(&other).unwrap().len(),
+            &trusted,
+            1,
+        )
+        .expect("a trusted publisher's other catalog installs for the wallets that pin it");
+
+    // The wallet pins `bloom-tokens`, so the substituted catalog describes
+    // nothing for it -- and, crucially, its own catalog is still there.
+    let mine = stored(&harness).expect("the pinned catalog must survive another one's install");
+    assert_eq!(mine.catalog.catalog_id.as_str(), "bloom-tokens");
+    assert_eq!(mine.catalog.sequence.as_str(), "8");
+
+    // Both are visible to the operator, one row each.
+    let status = harness.authority.clear_signing_status().unwrap();
+    let ids: Vec<&str> = status.iter().map(|row| row.catalog_id.as_str()).collect();
+    assert_eq!(ids, vec!["bloom-tokens", "staging-catalog"]);
+
+    // The sequence watermark is per identity, so a catalog stored at a high
+    // sequence under one identity cannot wedge another at a low one.
+    assert!(install(&harness, &catalog(9, vec![entry()], 5)).unwrap());
+    assert_eq!(stored(&harness).unwrap().catalog.sequence.as_str(), "9");
 }

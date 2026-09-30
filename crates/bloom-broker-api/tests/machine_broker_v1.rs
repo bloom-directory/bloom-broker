@@ -102,7 +102,7 @@ fn capabilities() -> ServiceCapabilities {
             verifier_id: token("webauthn"),
             verifier_digest: digest(13),
         }],
-        clear_signing: None,
+        clear_signing: Vec::new(),
         frame_max_bytes: DecimalU64::new(FRAME_MAX_BYTES as u64),
     }
 }

@@ -777,9 +777,38 @@ function describePolicy(manifest) {
         "Reviews are accepted only from the build whose verifier sources hash to the new value. " +
         "A different build stops being able to describe calls for this wallet."]);
     }
+    // The trusted publisher keys are the root of trust for every description
+    // Bloom will later read calldata against, so a rotation is the largest
+    // authority change this diff can carry and has to be named key by key.
+    const keyLabel = k => `${k?.key_id || "unnamed"} (${shortDigest(k?.verifying_key) || "no key"})`;
+    const keyIdentity = k => `${k?.key_id || ""}\u0000${k?.verifying_key || ""}`;
+    const keysBefore = Array.isArray(clearBefore?.trusted_keys) ? clearBefore.trusted_keys : [];
+    const keysAfter = Array.isArray(clearAfter?.trusted_keys) ? clearAfter.trusted_keys : [];
+    const idsBefore = new Set(keysBefore.map(keyIdentity));
+    const idsAfter = new Set(keysAfter.map(keyIdentity));
+    const addedKeys = keysAfter.filter(k => !idsBefore.has(keyIdentity(k)));
+    const removedKeys = keysBefore.filter(k => !idsAfter.has(keyIdentity(k)));
+    for (const k of addedKeys) lines.push(["Trust descriptions signed by", keyLabel(k), true]);
+    for (const k of removedKeys) lines.push(["Stop trusting descriptions signed by", keyLabel(k), true]);
+    if (addedKeys.length) {
+      intentLines.push(["Trusted publisher",
+        "A new publisher becomes able to describe any contract call for this wallet. " +
+        "Every future approval screen for a contract call is written from descriptions it signs."]);
+    }
+    if (removedKeys.length && !addedKeys.length) {
+      intentLines.push(["Trusted publisher",
+        "Descriptions signed by the named publisher stop being accepted. Contract calls that only " +
+        "it described can no longer be read, and will be refused rather than approved unread."]);
+    }
   }
+  // A clear-signing change that produced no line is a change this page cannot
+  // describe. Saying nothing changed would be a lie, so say that instead.
+  const clearSigningUndescribed = Boolean(diff.clear_signing) && lines.length === 0;
   const n = lines.length;
-  const sentence = n === 0
+  const sentence = clearSigningUndescribed
+    ? "This updates the clear-signing settings in a way this page cannot describe. " +
+      "Do not approve it; check \"What your passkey signs\" below and report it."
+    : n === 0
     ? "No rule changes are proposed."
     : `Change <strong>${n} rule${n === 1 ? "" : "s"}</strong> for this wallet. Nothing moves; after approval Bloom applies the new rules to future transactions.`;
   const intent = n === 0 ? null : {

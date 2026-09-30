@@ -62,9 +62,10 @@ pub struct ServiceCapabilities {
     pub schemas: Vec<Token>,
     pub backends: Vec<BackendPublicCapability>,
     pub assurance_verifiers: Vec<VerifierPublicCapability>,
-    /// Present only when a clear-signing catalog is stored.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clear_signing: Option<crate::ClearSigningStatus>,
+    /// One entry per stored clear-signing catalog, ordered by catalog identity.
+    /// Empty when none is stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clear_signing: Vec<crate::ClearSigningStatus>,
     pub frame_max_bytes: DecimalU64,
 }
 
