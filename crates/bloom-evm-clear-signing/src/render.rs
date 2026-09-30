@@ -12,7 +12,8 @@ use alloy_primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AcceptedCatalog, ActionClass, AdmittedFormat, CatalogEntry, LeafType, ReviewError, ReviewReason,
+    AcceptedCatalog, ActionClass, AdmittedFormat, AdmittedFunction, CatalogEntry, LeafType,
+    ReviewError, ReviewReason,
 };
 
 pub const TRANSFER_SIGNATURE: &str = "transfer(address,uint256)";
@@ -141,6 +142,15 @@ pub struct SelectedEntry {
     pub implementation_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<TokenIdentity>,
+    /// The functions the entry admitted when the review was frozen.
+    ///
+    /// The descriptor digest covers how a call is displayed; this covers
+    /// whether the call was describable at all. Withdrawing a function, or
+    /// moving it to another action class, changes what the same descriptor
+    /// authorizes, and `recheck`'s `current != frozen` comparison can only see
+    /// that if the projection carries it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admitted_functions: Vec<AdmittedFunction>,
 }
 
 impl SelectedEntry {
@@ -168,6 +178,7 @@ impl SelectedEntry {
                 name: metadata.name.clone(),
                 decimals: metadata.decimals,
             }),
+            admitted_functions: entry.admitted_functions.clone(),
         }
     }
 }
@@ -571,8 +582,16 @@ fn raw_value(value: &DynSolValue) -> Result<String, ReviewError> {
 /// is that the value is not a valid encoding of the declared type, so it is
 /// refused rather than displayed as the low 64 bits.
 ///
-/// Address padding, noncanonical booleans and oversized `bytesN` do not
-/// survive the round trip, so they are refused before this point.
+/// A `bytesN` word is the same story from the other end. Alloy detokenizes
+/// every fixed-bytes leaf as the full 32-byte word and tokenizes the same word
+/// back, so a `bytes4` carrying 28 trailing nonzero bytes round-trips
+/// byte-identically while `raw_value` displays only the declared prefix. Those
+/// bytes are part of what the passkey signs and would appear nowhere on screen,
+/// which is exactly the invariant this crate exists to hold, so the tail is
+/// required to be zero.
+///
+/// Address padding and noncanonical booleans do not survive the round trip, so
+/// they are refused before this point.
 fn check_leaf(path: &str, declared: &LeafType, value: &DynSolValue) -> Result<(), ReviewError> {
     match (declared, value) {
         (LeafType::Uint(bits), DynSolValue::Uint(value, width)) => {
@@ -586,7 +605,14 @@ fn check_leaf(path: &str, declared: &LeafType, value: &DynSolValue) -> Result<()
         (LeafType::Address, DynSolValue::Address(_)) | (LeafType::Bool, DynSolValue::Bool(_)) => {
             Ok(())
         }
-        (LeafType::FixedBytes(size), DynSolValue::FixedBytes(_, width)) if width == size => Ok(()),
+        (LeafType::FixedBytes(size), DynSolValue::FixedBytes(word, width)) if width == size => {
+            if word.0[*size..].iter().any(|byte| *byte != 0) {
+                return Err(invalid(format!(
+                    "argument `{path}` is a bytes{size} word with nonzero trailing bytes"
+                )));
+            }
+            Ok(())
+        }
         _ => Err(invalid(format!(
             "argument `{path}` decoded as a different type than the description declares"
         ))),

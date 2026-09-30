@@ -799,7 +799,11 @@ impl BrokerRpcService {
         let trusted = crate::authority::trusted_catalog_keys(settings).map_err(authority_error)?;
         let catalog = self
             .authority
-            .clear_signing_catalog(&trusted, usize::from(settings.signature_threshold))
+            .clear_signing_catalog(
+                &settings.catalog_id,
+                &trusted,
+                usize::from(settings.signature_threshold),
+            )
             .map_err(authority_error)?;
         Ok(crate::evm_review::ClearSigningContext {
             catalog,
@@ -932,7 +936,9 @@ impl BrokerRpcService {
                     return Err(ProtocolError::new(
                         ProtocolErrorCode::ClaimInvalid,
                         format!(
-                            "POLICY_DENIED: clear-signing evidence permits approval only until                              {permitted}; regenerate the terms with an expiry at or before that.                              {}",
+                            "POLICY_DENIED: clear-signing evidence permits approval only until \
+                             {permitted}; regenerate the terms with an expiry at or before that. \
+                             {}",
                             bloom_evm_clear_signing::ReviewReason::PolicyDenied.owner_action()
                         ),
                     ));
