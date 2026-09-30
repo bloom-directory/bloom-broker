@@ -4030,7 +4030,9 @@ fn destination_policy_violation(
         declared.destination,
         declared.chain.as_str()
     );
-    let conflicting: Vec<&str> = allowed
+    let declared_target = address::comparable(&declared.chain, &declared.destination);
+    // A set, so a policy that lists one entry twice names its chain once.
+    let conflicting: BTreeSet<&str> = allowed
         .iter()
         .filter(|entry| {
             // Same spelling, or the same account spelled differently. This is
@@ -4038,8 +4040,7 @@ fn destination_policy_violation(
             // arm still reports chains whose addresses nothing here decodes.
             entry.chain != declared.chain
                 && (entry.destination == declared.destination
-                    || address::comparable(&entry.chain, &entry.destination)
-                        == address::comparable(&declared.chain, &declared.destination))
+                    || address::comparable(&entry.chain, &entry.destination) == declared_target)
         })
         .map(|entry| entry.chain.as_str())
         .collect();

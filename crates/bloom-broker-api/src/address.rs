@@ -127,9 +127,26 @@ pub const PETAL_DESTINATION_PREFIX: &str = "petal:";
 /// pinning the set here would only refuse chains before they arrive.
 const COSMOS_MAX_PAYLOAD_BYTES: usize = 64;
 
+/// 32 bytes of base58 is 32–44 characters. The bound sits in front of the
+/// decode because base58 decoding is quadratic in its input: without it, a
+/// destination string at the wire codec's ceiling (`JSON_MAX_STRING_BYTES`,
+/// 256 KiB) costs the Broker about fifteen seconds of CPU on the
+/// authorization path before the 32-byte check ever runs, and a Petal
+/// controls that string.
+const SOLANA_MAX_BASE58_CHARS: usize = 44;
+
+/// A 25-byte base58check payload (version, hash160, checksum) is 25–35
+/// characters. Same reasoning as [`SOLANA_MAX_BASE58_CHARS`].
+const BITCOIN_MAX_BASE58CHECK_CHARS: usize = 35;
+
 /// Bitcoin mainnet only. Testnet and regtest are different chains and belong
-/// under their own `chain` names — accepting `tb1…` here would let a testnet
-/// address sit in a mainnet policy and read as allowed.
+/// under their own `chain` names.
+///
+/// What this buys is narrower than it looks. A `tb1…` string never decodes
+/// to the script of any mainnet address, so it can never *match* a mainnet
+/// entry by decoded value. It still compares verbatim through
+/// [`comparable`]'s literal fallback: a policy that literally holds `tb1q…`
+/// matches a claim declaring `tb1q…`, exactly as before this module existed.
 const BITCOIN_MAINNET_HRP: &str = "bc";
 const BITCOIN_P2PKH_VERSION: u8 = 0x00;
 const BITCOIN_P2SH_VERSION: u8 = 0x05;
@@ -254,6 +271,15 @@ fn evm_address(value: &str) -> Result<[u8; 20], DestinationError> {
 /// 32 bytes of base58. Case carries data here, unlike EVM, so the string is
 /// decoded exactly as written.
 fn solana_address(value: &str) -> Result<[u8; 32], DestinationError> {
+    if value.len() > SOLANA_MAX_BASE58_CHARS {
+        return Err(malformed(
+            AddressFamily::Solana,
+            format!(
+                "expected at most {SOLANA_MAX_BASE58_CHARS} characters, got {}",
+                value.len()
+            ),
+        ));
+    }
     let bytes = bs58::decode(value)
         .into_vec()
         .map_err(|e| malformed(AddressFamily::Solana, e.to_string()))?;
@@ -283,6 +309,23 @@ fn cosmos_address(value: &str) -> Result<(String, Vec<u8>), DestinationError> {
                 "expected 1-{COSMOS_MAX_PAYLOAD_BYTES} bytes, got {}",
                 payload.len()
             ),
+        ));
+    }
+    // `byte_iter` discards an incomplete trailing group without checking
+    // that its bits are zero, and the general bech32 path never validates
+    // padding — only the segwit path does. So a data part one character
+    // longer than canonical decodes to the very same bytes for every value
+    // of that trailing group, each under its own valid checksum: distinct
+    // strings the Cosmos SDK rejects, all matching one signed policy entry.
+    // The width check above cannot catch it — the decoded width is right.
+    // Requiring the input to be the canonical spelling of what it decodes
+    // to does.
+    let canonical = bech32::encode::<Bech32>(parsed.hrp(), &payload)
+        .map_err(|e| malformed(AddressFamily::Cosmos, e.to_string()))?;
+    if canonical != value.to_ascii_lowercase() {
+        return Err(malformed(
+            AddressFamily::Cosmos,
+            "address is not the canonical spelling of its payload",
         ));
     }
     Ok((parsed.hrp().to_lowercase(), payload))
@@ -322,6 +365,15 @@ fn bitcoin_script_pubkey(value: &str) -> Result<Vec<u8>, DestinationError> {
         return Ok(script);
     }
 
+    if value.len() > BITCOIN_MAX_BASE58CHECK_CHARS {
+        return Err(malformed(
+            AddressFamily::Bitcoin,
+            format!(
+                "expected at most {BITCOIN_MAX_BASE58CHECK_CHARS} characters, got {}",
+                value.len()
+            ),
+        ));
+    }
     let decoded = bs58::decode(value)
         .with_check(None)
         .into_vec()
@@ -647,6 +699,72 @@ mod tests {
             comparable(&sol, mixed),
             comparable(&sol, lower),
             "base58 case is data, so lowercasing names a different account"
+        );
+    }
+
+    /// base58 decoding is quadratic, and the wire codec allows a 256 KiB
+    /// string. The length bound has to run *before* the decode, or a Petal
+    /// can spend seconds of Broker CPU on the gate for every money-moving
+    /// claim. No valid address is anywhere near the bound.
+    #[test]
+    fn over_length_base58_is_refused_before_it_is_decoded() {
+        let sol = chain("solana");
+        let just_over = "1".repeat(SOLANA_MAX_BASE58_CHARS + 1);
+        let err = parse_destination(&sol, &just_over).unwrap_err();
+        assert!(err.to_string().contains("at most 44"), "{err}");
+        // The wire ceiling. If the guard were after the decode this test
+        // would take on the order of fifteen seconds.
+        let huge = "1".repeat(256 * 1024);
+        assert!(parse_destination(&sol, &huge).is_err());
+
+        let btc = chain("bitcoin");
+        let just_over = "1".repeat(BITCOIN_MAX_BASE58CHECK_CHARS + 1);
+        let err = parse_destination(&btc, &just_over).unwrap_err();
+        assert!(err.to_string().contains("at most 35"), "{err}");
+        assert!(parse_destination(&btc, &"1".repeat(256 * 1024)).is_err());
+    }
+
+    /// The three variants below carry valid checksums and decode to the
+    /// same twenty bytes as the canonical address, because bech32's byte
+    /// iterator drops an incomplete trailing group without looking at it.
+    /// None of them is an address the Cosmos SDK would accept, and each
+    /// would have matched a policy entry holding the canonical form.
+    #[test]
+    fn cosmos_non_canonical_spellings_are_refused() {
+        let cosmos = chain("cosmos");
+        let canonical = "cosmos1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3pahzj0";
+        parse("cosmos", canonical);
+        for spelling in [
+            "cosmos1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3qqpk8nn",
+            "cosmos1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3pahzjwp",
+            "cosmos1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3znyhyq7",
+        ] {
+            let err = parse_destination(&cosmos, spelling).unwrap_err();
+            assert!(
+                err.to_string().contains("canonical"),
+                "{spelling} must be refused as non-canonical, got {err}"
+            );
+        }
+        // A 32-byte payload has four padding bits and is fine when canonical.
+        parse(
+            "cosmos",
+            "cosmos1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs5u086e",
+        );
+    }
+
+    /// A testnet address on the mainnet chain is not decoded, so it falls
+    /// back to exact spelling — the same behaviour every chain had before
+    /// this module. What the mainnet-only rule guarantees is only that it
+    /// can never decode to a mainnet script and match by value.
+    #[test]
+    fn a_testnet_bitcoin_address_stays_literal() {
+        let btc = chain("bitcoin");
+        let testnet = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+        assert!(matches!(comparable(&btc, testnet), Comparable::Literal(_)));
+        assert_ne!(
+            comparable(&btc, testnet),
+            comparable(&btc, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"),
+            "same witness program, but testnet never matches a mainnet script"
         );
     }
 
