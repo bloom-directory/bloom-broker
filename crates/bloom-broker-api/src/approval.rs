@@ -9,6 +9,30 @@ use crate::{
 
 const APPROVAL_DOMAIN: &[u8] = b"bloom-sealed-approval-terms/v1";
 
+/// Petal operation class whose owner signature is an opaque EIP-712 preimage,
+/// reviewable only through the Safe envelope Broker rebuilds it from. Broker
+/// refuses an exact approval from a package declaring this class without one.
+///
+/// The gate is keyed on this name, and the name comes from the package's
+/// installer-signed provenance record, so it constrains a package that
+/// declares it and not one that does not. A Safe petal packaged under
+/// `transaction.confirm` — the generic class this repository's own provenance
+/// examples use — signs the same preimage with no envelope, no safeTxHash
+/// rebuild and no Safe facts on screen. Nothing here can detect that: an
+/// exact approval carries 32-byte hashes, and a `safeTxHash` is not
+/// distinguishable from any other keccak.
+///
+/// Closing it properly means Broker owning the mapping from package to class
+/// rather than reading it from the package. Inverting the default instead —
+/// requiring some review envelope for every Petal-subject exact approval —
+/// would refuse every petal that legitimately signs an exact payload today,
+/// which is why `subject_is_native_evm_transaction` excludes Petal subjects.
+/// That is a Petal-contract decision, not a local one. Until it is made, the
+/// Machine side is the other half of this: it refuses to sign a Safe payload
+/// except through this class, so a mis-packaged Safe petal cannot get a
+/// signature there either.
+pub const SAFE_CONFIRM_OPERATION_CLASS: &str = "safe.transaction.confirm";
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApprovalSubject {
