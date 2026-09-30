@@ -475,3 +475,42 @@ fn withdrawing_or_changing_the_named_token_invalidates_the_frozen_review() {
     assert_eq!(error.reason, ReviewReason::ReviewChanged);
     assert!(error.detail.contains(TOKEN), "{error}");
 }
+
+#[test]
+fn a_fixed_bytes_word_with_nonzero_trailing_bytes_is_refused() {
+    // A `bytes4` occupies a whole word, and alloy keeps all 32 bytes of it
+    // through decode and re-encode, so the round trip cannot see the 28 bytes
+    // the declared type does not cover. They are signed, and `raw_value`
+    // prints only the declared prefix, so they have to be refused here or they
+    // would be approved without ever appearing on screen.
+    let descriptor = serde_json::json!({
+        "context": {"contract": {"deployments": [{"chainId": CHAIN_ID, "address": TOKEN}]}},
+        "display": {"formats": {"settle(bytes4 tag)": {
+            "fields": [{"path": "tag", "label": "Tag", "format": "raw", "visible": "always"}]
+        }}}
+    });
+    let functions = vec![AdmittedFunction {
+        signature: "settle(bytes4 tag)".into(),
+        action_class: ActionClass::Other,
+    }];
+    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
+    sign(&mut catalog, &[(1, "publisher-1")]);
+    let catalog = accept(&catalog).unwrap();
+
+    let mut clean = [0u8; 32];
+    clean[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+    let ok = calldata("settle(bytes4 tag)", &[U256::from_be_bytes(clean)]);
+    let (call, _) = review_call(&catalog, &context(&ok, false)).unwrap();
+    assert_eq!(field(&call, "Tag").value, "0xdeadbeef");
+
+    let mut dirty = [0xaau8; 32];
+    dirty[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+    let hidden = calldata("settle(bytes4 tag)", &[U256::from_be_bytes(dirty)]);
+    // The bytes still round-trip, so only the explicit tail check refuses them.
+    assert_eq!(
+        review_call(&catalog, &context(&hidden, false))
+            .unwrap_err()
+            .reason,
+        ReviewReason::InvalidPayload
+    );
+}

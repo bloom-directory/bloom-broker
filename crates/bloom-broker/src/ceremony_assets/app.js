@@ -607,9 +607,17 @@ function describeTransfer(manifest) {
   const safe = plan.safe_review;
   if (safe) {
     const network = chainLabel(safe.chain);
+    // Broker's mandatory warnings are lines inside `action`. Left there they
+    // render as part of a fact value, in the same weight as the Safe nonce,
+    // while the EVM branch puts the identical strings through the warning
+    // banner. Split them out so both ceremonies style them the one way.
+    const safeWarnings = safe.action
+      .filter(line => line.startsWith("Warning: "))
+      .map(line => line.slice(9));
+    const safeAction = safe.action.filter(line => !line.startsWith("Warning: "));
     const facts = [
       ["Safe", safe.safe, true],
-      ["Action", safe.action.map((line, index) => index ? line : line.replace(/^Action: /, "")).join("\n")],
+      ["Action", safeAction.map((line, index) => index ? line : line.replace(/^Action: /, "")).join("\n")],
       ["Destination", safe.destination, true],
       ["Value", safe.value_display],
       ["Network", network],
@@ -627,8 +635,8 @@ function describeTransfer(manifest) {
         `Fallback handler ${safe.reported.fallback_handler}`,
       ].join("\n")],
     ];
-    const sentence = `Approve one Safe transaction on <strong>${escapeHtml(network)}</strong>: ${escapeHtml(safe.action[0].replace(/^Action: /, ""))}.`;
-    return {sentence, facts, willVerify: true};
+    const sentence = `Approve one Safe transaction on <strong>${escapeHtml(network)}</strong>: ${escapeHtml(safeAction[0].replace(/^Action: /, ""))}.`;
+    return {sentence, facts, warnings: safeWarnings, willVerify: true};
   }
   if (!claim) return null;
   const debits = claim.declared_debits || [];
@@ -829,9 +837,38 @@ function describePolicy(manifest) {
         "Reviews are accepted only from the build whose verifier sources hash to the new value. " +
         "A different build stops being able to describe calls for this wallet."]);
     }
+    // The trusted publisher keys are the root of trust for every description
+    // Bloom will later read calldata against, so a rotation is the largest
+    // authority change this diff can carry and has to be named key by key.
+    const keyLabel = k => `${k?.key_id || "unnamed"} (${shortDigest(k?.verifying_key) || "no key"})`;
+    const keyIdentity = k => `${k?.key_id || ""}\u0000${k?.verifying_key || ""}`;
+    const keysBefore = Array.isArray(clearBefore?.trusted_keys) ? clearBefore.trusted_keys : [];
+    const keysAfter = Array.isArray(clearAfter?.trusted_keys) ? clearAfter.trusted_keys : [];
+    const idsBefore = new Set(keysBefore.map(keyIdentity));
+    const idsAfter = new Set(keysAfter.map(keyIdentity));
+    const addedKeys = keysAfter.filter(k => !idsBefore.has(keyIdentity(k)));
+    const removedKeys = keysBefore.filter(k => !idsAfter.has(keyIdentity(k)));
+    for (const k of addedKeys) lines.push(["Trust descriptions signed by", keyLabel(k), true]);
+    for (const k of removedKeys) lines.push(["Stop trusting descriptions signed by", keyLabel(k), true]);
+    if (addedKeys.length) {
+      intentLines.push(["Trusted publisher",
+        "A new publisher becomes able to describe any contract call for this wallet. " +
+        "Every future approval screen for a contract call is written from descriptions it signs."]);
+    }
+    if (removedKeys.length && !addedKeys.length) {
+      intentLines.push(["Trusted publisher",
+        "Descriptions signed by the named publisher stop being accepted. Contract calls that only " +
+        "it described can no longer be read, and will be refused rather than approved unread."]);
+    }
   }
+  // A clear-signing change that produced no line is a change this page cannot
+  // describe. Saying nothing changed would be a lie, so say that instead.
+  const clearSigningUndescribed = Boolean(diff.clear_signing) && lines.length === 0;
   const n = lines.length;
-  const sentence = n === 0
+  const sentence = clearSigningUndescribed
+    ? "This updates the clear-signing settings in a way this page cannot describe. " +
+      "Do not approve it; check \"What your passkey signs\" below and report it."
+    : n === 0
     ? "No rule changes are proposed."
     : `Change <strong>${n} rule${n === 1 ? "" : "s"}</strong> for this wallet. Nothing moves; after approval Bloom applies the new rules to future transactions.`;
   const intent = n === 0 ? null : {
@@ -1090,6 +1127,15 @@ function renderReview(session) {
     }
   } else {
     parts.push(el("p", {class: "summary", html: summaryHtml}));
+    // A review with no intent card still has Broker's mandatory warnings to
+    // show -- a Safe transaction that removes this wallet from the owners, or
+    // lowers the threshold to one. They belong in the warning banner, styled
+    // like every other warning, rather than inside a fact value.
+    if (transfer?.warnings?.length) {
+      const warningGroup = el("aside", {class: "ceremony-warning", "aria-label": "Risks and consequences"});
+      for (const warning of transfer.warnings) warningGroup.append(el("p", {}, warning));
+      parts.push(warningGroup);
+    }
   }
   parts.push(facts);
   for (const [index, payload] of (transfer?.payloads || []).entries()) {

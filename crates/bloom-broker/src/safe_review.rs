@@ -5,7 +5,7 @@ use std::str::FromStr;
 use alloy::primitives::{Address, B256, U256, keccak256};
 use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalSelector, CanonicalWalletPolicy, CryptoSuite, DeclaredFee,
-    Digest32, ProtocolError, ProtocolErrorCode,
+    Digest32, ProtocolError, ProtocolErrorCode, ReviewMode,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -105,6 +105,57 @@ fn uint(value: &str, field: &str) -> Result<U256, ProtocolError> {
         )));
     }
     U256::from_str(value).map_err(|_| invalid(format!("{field} is too large")))
+}
+
+/// A 32-byte hash as a Petal reports it.
+///
+/// Broker cannot verify these against a chain, but a hash has a shape, and a
+/// field with a checkable shape is checked: the value is rendered into the
+/// ceremony, so accepting arbitrary text here means accepting whatever a
+/// Petal puts on the approval screen.
+fn code_hash(value: &str, field: &str) -> Result<(), ProtocolError> {
+    let digits = value
+        .strip_prefix("0x")
+        .ok_or_else(|| invalid(format!("{field} must be 0x-prefixed hex")))?;
+    if digits.len() != 64 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid(format!(
+            "{field} must be a 0x-prefixed 32-byte hash"
+        )));
+    }
+    Ok(())
+}
+
+/// A Safe version as a Petal reports it: `major.minor.patch`, optionally with
+/// a short alphanumeric suffix such as `1.3.0+L2`. Short and printable, for
+/// the same reason as `code_hash`.
+fn safe_version(value: &str) -> Result<(), ProtocolError> {
+    let invalid_version = || invalid("safe_version must look like 1.4.1, with an optional +suffix");
+    if value.is_empty() || value.len() > 16 {
+        return Err(invalid_version());
+    }
+    let (core, suffix) = match value.split_once('+') {
+        Some((core, suffix)) => (core, Some(suffix)),
+        None => (value, None),
+    };
+    if let Some(suffix) = suffix
+        && (suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    {
+        return Err(invalid_version());
+    }
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3 {
+        return Err(invalid_version());
+    }
+    for part in parts {
+        if part.is_empty()
+            || part.len() > 3
+            || (part.len() > 1 && part.starts_with('0'))
+            || !part.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(invalid_version());
+        }
+    }
+    Ok(())
 }
 
 fn bytes(value: &str, field: &str) -> Result<Vec<u8>, ProtocolError> {
@@ -207,9 +258,16 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
     // Petal-reported fields outside the EIP-712 preimage are bounded for
     // display only: a pinned table could refuse an honest Petal and not a
     // dishonest one. A pre-1.3.0 domain separator fails the selector check.
+    // Bounded still means checked, though -- every one of these is rendered
+    // into the ceremony, so each is held to the shape its own type has.
     address(&envelope.singleton, "singleton")?;
     address(&envelope.guard, "guard")?;
     address(&envelope.fallback_handler, "fallback_handler")?;
+    safe_version(&envelope.safe_version)?;
+    code_hash(&envelope.singleton_code_hash, "singleton_code_hash")?;
+    if let Some(hash) = &envelope.library_code_hash {
+        code_hash(hash, "library_code_hash")?;
+    }
     if envelope.owners.len() > MAX_OWNERS || envelope.modules.len() > MAX_MODULES {
         return Err(invalid(
             "Safe owner or module count is outside supported bounds",
@@ -245,56 +303,233 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
     Ok(())
 }
 
-/// Chains where every library below was read from the chain and found to hold
-/// the canonical Safe runtime code. The chain ID is an EIP-712 domain member,
-/// so the signature cannot be replayed on a chain outside this list, where the
-/// same address could hold other code.
-const LIBRARY_CHAINS: &[u64] = &[1, 10, 100, 137, 8453, 42161];
+/// Chains on which every deployment in [`DEPLOYMENTS`] was read and found to
+/// hold the code its `code_hash` names.
+///
+/// The chain ID is an EIP-712 domain member, so a signature cannot be replayed
+/// onto a chain outside this list, where the same address could hold other
+/// code. Adding a chain means reading every address on it -- which is what
+/// `safe_deployments_hold_the_pinned_code` does, so the list cannot grow
+/// ahead of the evidence.
+const VERIFIED_CHAINS: &[u64] = &[1, 10, 100, 137, 8453, 42161];
 
-/// Official Safe libraries a delegatecall may enter. `safe_tx.to` is bound by
-/// the selector, so this is a real constraint. Addresses are pinned per chain
-/// in `LIBRARY_CHAINS`; a Petal-reported code hash is not trusted.
-struct Library {
-    kind: &'static str,
-    address: &'static str,
+/// What a Safe deployment is, and what Broker will accept it as.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// A `delegatecall` may enter it. `safe_tx.to` is bound by the selector,
+    /// so this is a real constraint on the executing code.
+    Library,
+    /// `createProxyWithNonce` on it is read as Safe creation.
+    Factory,
+    /// A proxy may name it as the implementation it delegates to forever.
+    Singleton,
+    /// A new Safe may name it as its fallback handler.
+    FallbackHandler,
 }
 
-const LIBRARIES: &[Library] = &[
-    // MultiSendCallOnly, Safe 1.3.0 (two deployments), 1.4.1, and 1.5.0.
-    Library {
+/// One canonical Safe deployment.
+///
+/// `code_hash` is keccak-256 of the deployed runtime code, which is what makes
+/// the address list checkable rather than asserted: the addresses alone say
+/// only that somebody wrote them down. The hash is not read at approval time
+/// -- Broker performs no chain access -- but it is what the ignored RPC test
+/// compares, so a wrong address or a chain that does not actually carry the
+/// deployment fails a test instead of silently widening what a delegatecall
+/// may enter.
+struct Deployment {
+    role: Role,
+    kind: &'static str,
+    version: &'static str,
+    address: &'static str,
+    /// Read only by `safe_deployments_hold_the_pinned_code`. Approval-time
+    /// code is offline and compares nothing; this is the recorded evidence
+    /// that the addresses above are what they claim to be.
+    #[cfg_attr(not(test), allow(dead_code))]
+    code_hash: &'static str,
+}
+
+/// Canonical Safe deployments, from `@safe-global/safe-deployments`.
+///
+/// The 1.3.0 entries come in a canonical and an EIP-155 pair: the same
+/// bytecode at two addresses, because it was deployed two ways. Later
+/// versions have a single address.
+const DEPLOYMENTS: &[Deployment] = &[
+    Deployment {
+        role: Role::Library,
         kind: "MultiSendCallOnly",
+        version: "1.3.0",
         address: "0x40a2accbd92bca938b02010e17a5b8929b49130d",
+        code_hash: "0xa9865ac2d9c7a1591619b188c4d88167b50df6cc0c5327fcbd1c8c75f7c066ad",
     },
-    Library {
+    Deployment {
+        role: Role::Library,
         kind: "MultiSendCallOnly",
+        version: "1.3.0-eip155",
         address: "0xa1dabef33b3b82c7814b6d82a79e50f4ac44102b",
+        code_hash: "0xa9865ac2d9c7a1591619b188c4d88167b50df6cc0c5327fcbd1c8c75f7c066ad",
     },
-    Library {
+    Deployment {
+        role: Role::Library,
         kind: "MultiSendCallOnly",
+        version: "1.4.1",
         address: "0x9641d764fc13c8b624c04430c7356c1c7c8102e2",
+        code_hash: "0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939",
     },
-    Library {
+    Deployment {
+        role: Role::Library,
         kind: "MultiSendCallOnly",
+        version: "1.5.0",
         address: "0xa83c336b20401af773b6219ba5027174338d1836",
+        code_hash: "0xcdbdcec38d2f1c7d961b0029ff8416b7e86e9974d6f0e9c9580c7d17fcfb6663",
     },
-    // CreateCall, Safe 1.3.0 (two deployments), 1.4.1, and 1.5.0.
-    Library {
+    Deployment {
+        role: Role::Library,
         kind: "CreateCall",
+        version: "1.3.0",
         address: "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4",
+        code_hash: "0x8155d988823a4f6f1bcbc76a64af8e510c4ce68819290d43cf24956bd24dee82",
     },
-    Library {
+    Deployment {
+        role: Role::Library,
         kind: "CreateCall",
+        version: "1.3.0-eip155",
         address: "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d",
+        code_hash: "0x8155d988823a4f6f1bcbc76a64af8e510c4ce68819290d43cf24956bd24dee82",
     },
-    Library {
+    Deployment {
+        role: Role::Library,
         kind: "CreateCall",
+        version: "1.4.1",
         address: "0x9b35af71d77eaf8d7e40252370304687390a1a52",
+        code_hash: "0x2b3060c55fcb8275653e99ad511a71f67ba76934ed66a7d74d6e68b52afff889",
     },
-    Library {
+    Deployment {
+        role: Role::Library,
         kind: "CreateCall",
+        version: "1.5.0",
         address: "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4",
+        code_hash: "0x6b7d8d29bdf7004c4617d95041923774f3f7e74b056bff55c1861c9ec92ce54f",
+    },
+    Deployment {
+        role: Role::Factory,
+        kind: "SafeProxyFactory",
+        version: "1.3.0",
+        address: "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2",
+        code_hash: "0x337d7f54be11b6ed55fef7b667ea5488db53db8320a05d1146aa4bd169a39a9b",
+    },
+    Deployment {
+        role: Role::Factory,
+        kind: "SafeProxyFactory",
+        version: "1.3.0-eip155",
+        address: "0xc22834581ebc8527d974f8a1c97e1bea4ef910bc",
+        code_hash: "0x337d7f54be11b6ed55fef7b667ea5488db53db8320a05d1146aa4bd169a39a9b",
+    },
+    Deployment {
+        role: Role::Factory,
+        kind: "SafeProxyFactory",
+        version: "1.4.1",
+        address: "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67",
+        code_hash: "0x50c3cdc4074750a7a974204a716c999edd37482f907608d960b2b025ee0b3317",
+    },
+    Deployment {
+        role: Role::Factory,
+        kind: "SafeProxyFactory",
+        version: "1.5.0",
+        address: "0x14f2982d601c9458f93bd70b218933a6f8165e7b",
+        code_hash: "0x967dae4cda22b0c9ef7f31b010bdc1ceb0af9904b0c3dc060b5302e4c18a4529",
+    },
+    Deployment {
+        role: Role::Singleton,
+        kind: "Safe",
+        version: "1.3.0",
+        address: "0xd9db270c1b5e3bd161e8c8503c55ceabee709552",
+        code_hash: "0xbba688fbdb21ad2bb58bc320638b43d94e7d100f6f3ebaab0a4e4de6304b1c2e",
+    },
+    Deployment {
+        role: Role::Singleton,
+        kind: "Safe",
+        version: "1.3.0-eip155",
+        address: "0x69f4d1788e39c87893c980c06edf4b7f686e2938",
+        code_hash: "0xbba688fbdb21ad2bb58bc320638b43d94e7d100f6f3ebaab0a4e4de6304b1c2e",
+    },
+    Deployment {
+        role: Role::Singleton,
+        kind: "SafeL2",
+        version: "1.3.0",
+        address: "0x3e5c63644e683549055b9be8653de26e0b4cd36e",
+        code_hash: "0x21842597390c4c6e3c1239e434a682b054bd9548eee5e9b1d6a4482731023c0f",
+    },
+    Deployment {
+        role: Role::Singleton,
+        kind: "SafeL2",
+        version: "1.3.0-eip155",
+        address: "0xfb1bffc9d739b8d520daf37df666da4c687191ea",
+        code_hash: "0x21842597390c4c6e3c1239e434a682b054bd9548eee5e9b1d6a4482731023c0f",
+    },
+    Deployment {
+        role: Role::Singleton,
+        kind: "Safe",
+        version: "1.4.1",
+        address: "0x41675c099f32341bf84bfc5382af534df5c7461a",
+        code_hash: "0x1fe2df852ba3299d6534ef416eefa406e56ced995bca886ab7a553e6d0c5e1c4",
+    },
+    Deployment {
+        role: Role::Singleton,
+        kind: "SafeL2",
+        version: "1.4.1",
+        address: "0x29fcb43b46531bca003ddc8fcb67ffe91900c762",
+        code_hash: "0xb1f926978a0f44a2c0ec8fe822418ae969bd8c3f18d61e5103100339894f81ff",
+    },
+    Deployment {
+        role: Role::Singleton,
+        kind: "Safe",
+        version: "1.5.0",
+        address: "0xff51a5898e281db6dfc7855790607438df2ca44b",
+        code_hash: "0xdda019cbd7c867a533a2a86e5c53434fdc50b13122b5a5ddb4a8df61b31c20f2",
+    },
+    Deployment {
+        role: Role::Singleton,
+        kind: "SafeL2",
+        version: "1.5.0",
+        address: "0xedd160febbd92e350d4d398fb636302fccd67c7e",
+        code_hash: "0x180193227186ccb85316c94db1f0d156ed932b14712cfaac78901899178572dc",
+    },
+    Deployment {
+        role: Role::FallbackHandler,
+        kind: "CompatibilityFallbackHandler",
+        version: "1.3.0",
+        address: "0xf48f2b2d2a534e402487b3ee7c18c33aec0fe5e4",
+        code_hash: "0x03e69f7ce809e81687c69b19a7d7cca45b6d551ffdec73d9bb87178476de1abf",
+    },
+    Deployment {
+        role: Role::FallbackHandler,
+        kind: "CompatibilityFallbackHandler",
+        version: "1.3.0-eip155",
+        address: "0x017062a1de2fe6b99be3d9d37841fed19f573804",
+        code_hash: "0x03e69f7ce809e81687c69b19a7d7cca45b6d551ffdec73d9bb87178476de1abf",
+    },
+    Deployment {
+        role: Role::FallbackHandler,
+        kind: "CompatibilityFallbackHandler",
+        version: "1.4.1",
+        address: "0xfd0732dc9e303f09fcef3a7388ad10a83459ec99",
+        code_hash: "0x7c6007a5d711cea8dfd5d91f5940ec29c7f200fe511eb1fc1397b367af3c42f9",
+    },
+    Deployment {
+        role: Role::FallbackHandler,
+        kind: "CompatibilityFallbackHandler",
+        version: "1.5.0",
+        address: "0x3efcbb83a4a7afcb4f68d501e2c2203a38be77f4",
+        code_hash: "0x3c6a85bcf7b563daa624b884b4e9a1b9fa5371edde7be945d998071a48f28bbc",
     },
 ];
+
+/// The canonical deployment at `address`, if Broker accepts it as `role`.
+fn deployment(role: Role, address: &str) -> Option<&'static Deployment> {
+    DEPLOYMENTS
+        .iter()
+        .find(|entry| entry.role == role && entry.address == address)
+}
 
 fn dynamic_bytes(
     data: &[u8],
@@ -363,13 +598,28 @@ fn word_as_address(word: &[u8]) -> Result<Address, ProtocolError> {
     Ok(Address::from_slice(&word[12..]))
 }
 
+/// The Safe's current signing configuration, as the Petal reports it.
+///
+/// Unverified -- the envelope discloses it separately for that reason -- but a
+/// threshold change is unreadable without a baseline, so the reading uses it
+/// and says that is where it came from.
+struct SafeSigners {
+    threshold: U256,
+    owners: usize,
+}
+
 /// The four Safe self-calls that change who may sign and how many must. Every
 /// other self-call stays refused: enabling a module, or setting a guard or
 /// fallback handler, hands the Safe to code Broker cannot review.
 ///
 /// The `prevOwner` argument only locates an entry in the Safe's owner list,
 /// so it is checked for shape and not shown.
-fn owner_change(signer: Address, value: U256, data: &[u8]) -> Result<String, ProtocolError> {
+fn owner_change(
+    signer: Address,
+    value: U256,
+    data: &[u8],
+    current: Option<&SafeSigners>,
+) -> Result<String, ProtocolError> {
     let refused =
         || invalid("Safe self-calls other than owner and threshold changes are not supported");
     if !value.is_zero() || data.len() < 4 || (data.len() - 4) % 32 != 0 {
@@ -391,18 +641,45 @@ fn owner_change(signer: Address, value: U256, data: &[u8]) -> Result<String, Pro
         }
         Ok(threshold)
     };
+    // A bare "New threshold: 1" reads identically whether it leaves the Safe
+    // as it was or drops it from 3-of-4 to 1-of-4, which is the difference
+    // between a no-op and handing the Safe to any single owner. The current
+    // values come from the Petal and Broker cannot verify them, so the line
+    // says where the comparison came from and stays silent without it.
+    let describe_threshold = |new: U256, owners: i64| -> String {
+        let Some(current) = current else {
+            return format!("New threshold: {new} (Bloom has no current threshold to compare)");
+        };
+        let count = (current.owners as i64 + owners).max(0);
+        let mut line = format!(
+            "New threshold: {new} of {count} owners (reported now: {} of {})",
+            current.threshold, current.owners
+        );
+        if new < current.threshold {
+            line.push_str(&format!(
+                "\nWarning: this lowers the signatures the Safe requires, from {} to {new}",
+                current.threshold
+            ));
+        }
+        if new == U256::from(1u8) && count > 1 {
+            line.push_str(
+                "\nWarning: any single owner will then be able to move the Safe's funds alone",
+            );
+        }
+        line
+    };
     if selector("addOwnerWithThreshold(address,uint256)") && words.len() == 2 {
         Ok(format!(
-            "Action: Add Safe owner\nNew owner: {}\nNew threshold: {}",
+            "Action: Add Safe owner\nNew owner: {}\n{}",
             word_as_address(words[0])?,
-            threshold(words[1])?
+            describe_threshold(threshold(words[1])?, 1)
         ))
     } else if selector("removeOwner(address,address,uint256)") && words.len() == 3 {
         word_as_address(words[0])?;
         let removed = word_as_address(words[1])?;
         Ok(format!(
-            "Action: Remove Safe owner\nOwner removed: {removed}\nNew threshold: {}{}",
-            threshold(words[2])?,
+            "Action: Remove Safe owner\nOwner removed: {removed}\n{}{}",
+            describe_threshold(threshold(words[2])?, -1),
             removes_signer(removed)
         ))
     } else if selector("swapOwner(address,address,address)") && words.len() == 3 {
@@ -415,44 +692,71 @@ fn owner_change(signer: Address, value: U256, data: &[u8]) -> Result<String, Pro
         ))
     } else if selector("changeThreshold(uint256)") && words.len() == 1 {
         Ok(format!(
-            "Action: Change Safe threshold\nNew threshold: {}",
-            threshold(words[0])?
+            "Action: Change Safe threshold\n{}",
+            describe_threshold(threshold(words[0])?, 0)
         ))
     } else {
         Err(refused())
     }
 }
 
+/// The heading `classify` uses when it could read nothing about the inner
+/// call beyond its selector and hash. Named rather than spelled out at each
+/// use so the wallet-policy gate can ask whether the reading was opaque
+/// instead of re-deriving the question from the rendered text.
+pub(crate) const OPAQUE_ACTION: &str = "Action: Contract call";
+
 fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
-    classify_call(
-        uint(&envelope.chain_id, "chain_id")?,
-        address(&envelope.safe_address, "safe_address")?,
-        address(&envelope.owner, "owner")?,
-        address(&envelope.safe_tx.to, "safe_tx.to")?,
-        uint(&envelope.safe_tx.value, "safe_tx.value")?,
-        &bytes(&envelope.safe_tx.data, "safe_tx.data")?,
-        envelope.safe_tx.operation,
-    )
+    let current = SafeSigners {
+        threshold: uint(&envelope.threshold, "threshold")?,
+        owners: envelope.owners.len(),
+    };
+    classify_call(&SafeCall {
+        chain: uint(&envelope.chain_id, "chain_id")?,
+        safe: address(&envelope.safe_address, "safe_address")?,
+        signer: address(&envelope.owner, "owner")?,
+        to: address(&envelope.safe_tx.to, "safe_tx.to")?,
+        value: uint(&envelope.safe_tx.value, "safe_tx.value")?,
+        data: &bytes(&envelope.safe_tx.data, "safe_tx.data")?,
+        operation: envelope.safe_tx.operation,
+        current: Some(&current),
+    })
 }
 
 /// Read one Safe transaction. `signer` is the Bloom wallet approving, so a
 /// change that removes it can say so.
-fn classify_call(
+/// One Safe transaction to read, as the bytes being signed describe it.
+struct SafeCall<'a> {
     chain: U256,
     safe: Address,
     signer: Address,
     to: Address,
     value: U256,
-    data: &[u8],
+    data: &'a [u8],
     operation: u8,
-) -> Result<String, ProtocolError> {
+    /// The Safe's reported current signing configuration, when there is one.
+    /// Absent on the execution path, where Broker reads no chain state.
+    current: Option<&'a SafeSigners>,
+}
+
+fn classify_call(call: &SafeCall<'_>) -> Result<String, ProtocolError> {
+    let SafeCall {
+        chain,
+        safe,
+        signer,
+        to,
+        value,
+        data,
+        operation,
+        current,
+    } = *call;
     match operation {
         0 => {
             if to == safe {
                 if value.is_zero() && data.is_empty() {
                     return Ok("Action: Reject competing Safe transaction\nValue: 0".into());
                 }
-                return owner_change(signer, value, data);
+                return owner_change(signer, value, data, current);
             }
             if data.len() == 68 && data[..4] == [0xa9, 0x05, 0x9c, 0xbb] {
                 let recipient = Address::from_slice(&data[16..36]);
@@ -464,7 +768,7 @@ fn classify_call(
                 Ok(format!("Action: Native transfer\nRecipient: {to}"))
             } else {
                 Ok(format!(
-                    "Action: Contract call\nCalldata selector: 0x{}\nCalldata keccak256: {:#x}",
+                    "{OPAQUE_ACTION}\nCalldata selector: 0x{}\nCalldata keccak256: {:#x}",
                     hex::encode(&data[..data.len().min(4)]),
                     keccak256(data)
                 ))
@@ -477,15 +781,14 @@ fn classify_call(
             let chain_name = u64::try_from(chain)
                 .map(crate::evm_review::chain_name)
                 .unwrap_or_else(|_| format!("evm-{chain}"));
-            if !LIBRARY_CHAINS.iter().any(|id| U256::from(*id) == chain) {
-                return Err(invalid(
-                    "Safe delegatecalls are refused on this chain because Broker has no verified Safe library deployment for it",
-                ));
+            if !VERIFIED_CHAINS.iter().any(|id| U256::from(*id) == chain) {
+                return Err(invalid(concat!(
+                    "Safe delegatecalls are refused on this chain because Broker has no ",
+                    "verified Safe library deployment for it",
+                )));
             }
             let target = format!("{to:#x}");
-            let library = LIBRARIES
-                .iter()
-                .find(|entry| entry.address == target)
+            let library = deployment(Role::Library, &target)
                 .ok_or_else(|| invalid("delegatecall target is not an official Safe library"))?;
             if data.len() < 4 {
                 return Err(invalid("Safe library calldata is truncated"));
@@ -647,7 +950,13 @@ pub(crate) fn review(
             "wallet policy must allow destination exact on {chain_policy} for Safe signing"
         )));
     }
-    let action = classify(&envelope)?.lines().map(str::to_owned).collect();
+    let rendered = classify(&envelope)?;
+    // The wallet's clear-signing settings are authority over what the owner
+    // can be asked to approve, and they are not about how the bytes reach the
+    // chain. A payload Bloom cannot explain is refused when it is sent
+    // directly, so wrapping it in a SafeTx must not be a way around that.
+    apply_clear_signing_policy(policy, request.requested_review_mode, &rendered)?;
+    let action = rendered.lines().map(str::to_owned).collect();
     let chain_name = u64::try_from(chain)
         .map(crate::evm_review::chain_name)
         .unwrap_or(chain_policy);
@@ -706,15 +1015,6 @@ fn tail_bytes(data: &[u8], index: usize) -> Option<&[u8]> {
     data.get(offset.checked_add(32)?..offset.checked_add(32)?.checked_add(length)?)
 }
 
-/// Safe proxy factories whose `createProxyWithNonce` Broker reads: 1.3.0 (two
-/// deployments), 1.4.1 and 1.5.0.
-const FACTORIES: &[&str] = &[
-    "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2",
-    "0xc22834581ebc8527d974f8a1c97e1bea4ef910bc",
-    "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67",
-    "0x14f2982d601c9458f93bd70b218933a6f8165e7b",
-];
-
 /// What a native transaction that calls a Safe or a Safe factory does, read
 /// from the exact bytes being signed. `None` leaves the call to the ordinary
 /// envelope review. Broker reads no chain state, so it cannot tell whether the
@@ -743,15 +1043,20 @@ pub(crate) fn outer_call(
         }
         lines.push("Action: Execute a Safe transaction".to_owned());
         lines.push(format!("Safe: {to}"));
-        match classify_call(
-            U256::from(chain),
-            to,
-            from,
-            inner_to,
-            inner_value,
-            inner_data,
+        match classify_call(&SafeCall {
+            chain: U256::from(chain),
+            safe: to,
+            signer: from,
+            to: inner_to,
+            value: inner_value,
+            data: inner_data,
             operation,
-        ) {
+            // Executing someone else's signed Safe transaction: Broker reads
+            // no chain state, so there is no current owner set to compare a
+            // threshold change against, and the line says so rather than
+            // printing a naked number.
+            current: None,
+        }) {
             Ok(action) => {
                 for (index, line) in action.lines().enumerate() {
                     match (index, line.strip_prefix("Action: ")) {
@@ -759,7 +1064,14 @@ pub(crate) fn outer_call(
                         _ => lines.push(line.to_owned()),
                     }
                 }
-                if inner_data.is_empty() && operation == 0 && inner_to != to {
+                // Any non-zero inner value leaves the Safe, whether or not
+                // the call also carries calldata. Showing it only for a bare
+                // transfer meant a payable call moved funds with no amount
+                // anywhere on the page.
+                // A bare transfer shows its amount even when zero, because
+                // "Amount: 0" is the whole content of that transaction.
+                let bare_transfer = inner_data.is_empty() && operation == 0 && inner_to != to;
+                if !inner_value.is_zero() || bare_transfer {
                     lines.push(format!("Amount: {}", native(inner_value, &chain_name)));
                 }
             }
@@ -774,10 +1086,33 @@ pub(crate) fn outer_call(
             "Owner signatures attached: {}",
             signatures.len() / 65
         ));
-        let refund = (4..=6)
-            .any(|index| word(data, index).is_none_or(|word| word.iter().any(|byte| *byte != 0)));
-        if refund {
+        // Only a non-zero `gasPrice` makes the Safe pay a refund. `safeTxGas`
+        // and `baseGas` are execution bounds, so warning on them fired on
+        // ordinary transactions and said nothing about what was actually paid.
+        // When it does fire, the three facts that decide the loss are the
+        // token, the price, and who receives it.
+        let gas_price = word(data, 6).map(U256::from_be_slice).unwrap_or_default();
+        if !gas_price.is_zero() {
+            let gas_token = address_at(data, 7).unwrap_or(Address::ZERO);
+            let receiver = address_at(data, 8).unwrap_or(Address::ZERO);
             lines.push("Warning: the Safe pays a gas refund for this execution".to_owned());
+            lines.push(format!(
+                "Refund token: {}",
+                if gas_token == Address::ZERO {
+                    format!("native {chain_name}")
+                } else {
+                    format!("{gas_token}")
+                }
+            ));
+            lines.push(format!("Refund gas price: {gas_price}"));
+            lines.push(format!(
+                "Refund paid to: {}",
+                if receiver == Address::ZERO {
+                    "whoever executes this transaction".to_owned()
+                } else {
+                    format!("{receiver}")
+                }
+            ));
         }
         if !value.is_zero() {
             lines.push(format!(
@@ -788,9 +1123,19 @@ pub(crate) fn outer_call(
         return Some(lines);
     }
     if is("createProxyWithNonce(address,bytes,uint256)")
-        && FACTORIES.contains(&format!("{to:#x}").as_str())
+        && deployment(Role::Factory, &format!("{to:#x}")).is_some()
     {
         let singleton = address_at(data, 0)?;
+        // The singleton is the code the proxy delegates to for the rest of its
+        // life, and `SafeProxyFactory` accepts any non-zero address for it. An
+        // attacker-chosen implementation that exposes this `setup` selector
+        // decodes exactly like a real one, so without this check the page
+        // would assert "Create a Safe / Owner 1: (this wallet)" for a contract
+        // whose whole behaviour is chosen by someone else -- and funds sent to
+        // the predicted address, which is normal Safe practice, would be
+        // theirs. Returning `None` puts the call back on the honest "Bloom
+        // cannot read this" path it took before this reading existed.
+        let implementation = deployment(Role::Singleton, &format!("{singleton:#x}"))?;
         let initializer = tail_bytes(data, 1)?;
         let salt = U256::from_be_slice(word(data, 2)?);
         let (selector, setup) = initializer.split_at_checked(4)?;
@@ -822,8 +1167,22 @@ pub(crate) fn outer_call(
             let mine = if *owner == from { " (this wallet)" } else { "" };
             lines.push(format!("Owner {}: {owner}{mine}", index + 1));
         }
-        lines.push(format!("Safe implementation: {singleton}"));
-        lines.push(format!("Fallback handler: {fallback}"));
+        lines.push(format!(
+            "Safe implementation: {singleton} ({} {})",
+            implementation.kind, implementation.version
+        ));
+        // A fallback handler answers for the Safe on every call it does not
+        // implement, so an unknown one is the same handover `owner_change`
+        // refuses `setFallbackHandler` for. Zero means no handler.
+        if fallback == Address::ZERO {
+            lines.push("Fallback handler: none".to_owned());
+        } else {
+            let handler = deployment(Role::FallbackHandler, &format!("{fallback:#x}"))?;
+            lines.push(format!(
+                "Fallback handler: {fallback} ({} {})",
+                handler.kind, handler.version
+            ));
+        }
         lines.push(format!("Salt nonce: {salt}"));
         if !owners.contains(&from) {
             lines.push("Warning: this wallet is not an owner of the new Safe".to_owned());
@@ -845,6 +1204,65 @@ pub(crate) fn outer_call(
         return Some(lines);
     }
     None
+}
+
+/// The Safe equivalent of `evm_review::apply_review_mode`.
+///
+/// The native path decides three things from `policy.clear_signing`: that an
+/// unreadable call needs an explicit `OpaqueExact` request, that the request
+/// is only honored when the wallet allows it, and that a mode a wallet cannot
+/// serve is refused rather than dropped. A Safe transaction is the same
+/// decision about the same calldata, so it gets the same three.
+fn apply_clear_signing_policy(
+    policy: &CanonicalWalletPolicy,
+    requested: Option<ReviewMode>,
+    rendered: &str,
+) -> Result<(), ProtocolError> {
+    let opaque = rendered
+        .lines()
+        .any(|line| line.trim_start().starts_with(OPAQUE_ACTION));
+    let Some(settings) = policy.clear_signing.as_ref() else {
+        // An incapable wallet refuses a required mode rather than ignoring it,
+        // exactly as the native path does.
+        if requested.is_some() {
+            return Err(invalid("clear signing is not enabled for this wallet"));
+        }
+        return Ok(());
+    };
+    settings.validate()?;
+    match requested {
+        Some(ReviewMode::OpaqueExact) => {
+            if !settings.opaque_exact_allowed {
+                return Err(invalid(
+                    "wallet policy does not allow approving payloads Bloom cannot explain",
+                ));
+            }
+            Ok(())
+        }
+        // Broker reads a Safe transaction from the exact bytes rather than
+        // from a publisher's catalog, so `Clear` is not a mode this path can
+        // serve. Saying so beats returning an unread review under its name.
+        Some(ReviewMode::Clear) if opaque => Err(invalid(concat!(
+            "Bloom cannot read this Safe transaction's inner call, so it cannot be ",
+            "clear-signed; approve it as an exact payload if wallet policy allows that",
+        ))),
+        Some(ReviewMode::Clear) | None => {
+            if opaque && !settings.opaque_exact_allowed {
+                return Err(invalid(
+                    "wallet policy does not allow approving payloads Bloom cannot explain",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Whether a prepared Safe review read its inner call, for the frozen record.
+pub(crate) fn is_opaque(review: &SafeReview) -> bool {
+    review
+        .action
+        .iter()
+        .any(|line| line.trim_start().starts_with(OPAQUE_ACTION))
 }
 
 #[cfg(test)]
@@ -1107,6 +1525,238 @@ mod tests {
         assert!(review(&request, &policy(), from).is_err());
     }
 
+    fn clear_signing_policy(opaque_exact_allowed: bool) -> CanonicalWalletPolicy {
+        CanonicalWalletPolicy {
+            clear_signing: Some(ClearSigningPolicy {
+                catalog_id: token("bloom-tokens"),
+                trusted_keys: vec![CatalogTrustedKey {
+                    key_id: token("publisher-1"),
+                    verifying_key: Base64UrlBytes::from_bytes(&[7; 32]),
+                }],
+                signature_threshold: 1,
+                maximum_observation_age_ms: 86_400_000,
+                opaque_exact_allowed,
+                unlimited_allowance_allowed: false,
+                verifier: RequiredVerifier {
+                    verifier_id: token(EVM_CLEAR_SIGNING_VERIFIER_ID),
+                    verifier_digest: Digest32::from_bytes(EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES),
+                },
+            }),
+            ..policy()
+        }
+    }
+
+    /// An owner who set `opaque_exact_allowed: false` said "do not ask me to
+    /// approve payloads Bloom cannot explain". The native path enforced that
+    /// and the Safe path did not, so the same undescribable calldata that is
+    /// refused when sent directly was approvable wrapped in a SafeTx, with
+    /// the owner shown a selector and a keccak.
+    #[test]
+    fn an_unreadable_safe_call_obeys_the_wallets_opaque_payload_setting() {
+        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        value["safe_tx"]["value"] = serde_json::json!("0");
+        value["safe_tx"]["data"] = serde_json::json!("0xdeadbeef00112233");
+        let opaque = serde_jcs::to_vec(&value).unwrap();
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+
+        // No clear-signing policy: unchanged, the envelope review stands.
+        let plan = review(&request(opaque.clone()), &policy(), from)
+            .unwrap()
+            .unwrap();
+        assert!(is_opaque(&plan), "{:?}", plan.action);
+
+        // Clear signing on, opaque payloads refused: this must not prepare.
+        let error = review(&request(opaque.clone()), &clear_signing_policy(false), from)
+            .expect_err("an unreadable Safe call must obey the wallet's setting");
+        assert!(error.to_string().contains("cannot explain"), "{}", error);
+
+        // Clear signing on, opaque payloads permitted: prepares, and the
+        // frozen record has to be able to say it was not read.
+        let plan = review(&request(opaque), &clear_signing_policy(true), from)
+            .unwrap()
+            .unwrap();
+        assert!(is_opaque(&plan));
+
+        // A call Bloom *can* read is unaffected by the setting.
+        let readable = review(&request(envelope()), &clear_signing_policy(false), from)
+            .unwrap()
+            .unwrap();
+        assert!(!is_opaque(&readable), "{:?}", readable.action);
+    }
+
+    /// A requested mode the Safe path cannot serve was dropped rather than
+    /// refused, so a Machine asking for a clear reading got an unread one
+    /// under that name.
+    #[test]
+    fn a_review_mode_the_safe_path_cannot_serve_is_refused_not_dropped() {
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        value["safe_tx"]["value"] = serde_json::json!("0");
+        value["safe_tx"]["data"] = serde_json::json!("0xdeadbeef00112233");
+        let opaque = serde_jcs::to_vec(&value).unwrap();
+
+        // A wallet with no clear-signing policy cannot honor any mode.
+        let mut asked = request(envelope());
+        asked.requested_review_mode = Some(ReviewMode::Clear);
+        let error = review(&asked, &policy(), from).expect_err("an incapable wallet refuses");
+        assert!(error.to_string().contains("not enabled"), "{error}");
+
+        // Clear was asked for and the inner call cannot be read.
+        let mut asked = request(opaque.clone());
+        asked.requested_review_mode = Some(ReviewMode::Clear);
+        let error = review(&asked, &clear_signing_policy(true), from)
+            .expect_err("an unreadable call cannot be clear-signed");
+        assert!(error.to_string().contains("cannot read"), "{error}");
+
+        // OpaqueExact is honored only where the wallet allows it.
+        let mut asked = request(opaque);
+        asked.requested_review_mode = Some(ReviewMode::OpaqueExact);
+        assert!(review(&asked, &clear_signing_policy(false), from).is_err());
+        assert!(review(&asked, &clear_signing_policy(true), from).is_ok());
+    }
+
+    /// Three envelope fields are rendered into the ceremony and none of them
+    /// had a shape check, so a Petal could put arbitrary text on the approval
+    /// screen. Broker cannot verify them against a chain; it can still
+    /// require a hash to be a hash.
+    #[test]
+    fn petal_reported_version_and_code_hashes_must_have_their_own_shape() {
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+        for (field, bad) in [
+            ("safe_version", serde_json::json!("1.4.1; see attached")),
+            ("safe_version", serde_json::json!("")),
+            ("safe_version", serde_json::json!("1.4")),
+            ("safe_version", serde_json::json!("01.4.1")),
+            ("singleton_code_hash", serde_json::json!("not a hash")),
+            ("singleton_code_hash", serde_json::json!("0xabcd")),
+            ("library_code_hash", serde_json::json!("0xzz")),
+        ] {
+            let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+            value[field] = bad.clone();
+            let bytes = serde_jcs::to_vec(&value).unwrap();
+            assert!(
+                review(&request(bytes), &policy(), from).is_err(),
+                "{field} = {bad} must be refused"
+            );
+        }
+
+        // The shapes an honest Petal reports are all still accepted.
+        for version in ["1.3.0", "1.4.1", "1.5.0", "1.3.0+L2"] {
+            let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+            value["safe_version"] = serde_json::json!(version);
+            let bytes = serde_jcs::to_vec(&value).unwrap();
+            review(&request(bytes), &policy(), from)
+                .unwrap_or_else(|error| panic!("{version} must be accepted: {error}"));
+        }
+    }
+
+    /// The evidence behind [`DEPLOYMENTS`] and [`VERIFIED_CHAINS`].
+    ///
+    /// Everything else here runs offline, and Broker itself never reads a
+    /// chain. But the delegatecall allowlist, the factory list and the
+    /// singleton check are all claims about what code lives at an address on
+    /// six chains, and a comment asserting it is not evidence. This reads
+    /// every address on every chain and compares keccak-256 of the deployed
+    /// runtime code against the pinned `code_hash`, so the claim is
+    /// falsifiable and adding a chain or a Safe version cannot outrun it.
+    ///
+    /// Ignored because it needs network. `curl` rather than an HTTP crate:
+    /// Broker has no HTTP dependency and should not gain one for a test.
+    ///
+    /// ```sh
+    /// BLOOM_SAFE_RPC_1=https://ethereum-rpc.publicnode.com \
+    /// BLOOM_SAFE_RPC_10=https://optimism-rpc.publicnode.com \
+    /// BLOOM_SAFE_RPC_100=https://gnosis-rpc.publicnode.com \
+    /// BLOOM_SAFE_RPC_137=https://polygon-bor-rpc.publicnode.com \
+    /// BLOOM_SAFE_RPC_8453=https://mainnet.base.org \
+    /// BLOOM_SAFE_RPC_42161=https://arbitrum-one-rpc.publicnode.com \
+    ///   cargo test -p bloom-broker safe_deployments_hold_the_pinned_code -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "reads six public RPC endpoints; set BLOOM_SAFE_RPC_<chain_id>"]
+    fn safe_deployments_hold_the_pinned_code() {
+        fn rpc(url: &str, address: &str) -> Result<Vec<u8>, String> {
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"eth_getCode","params":["{address}","latest"]}}"#
+            );
+            let output = std::process::Command::new("curl")
+                .args([
+                    "-sS",
+                    "--max-time",
+                    "30",
+                    "-X",
+                    "POST",
+                    url,
+                    "-H",
+                    "content-type: application/json",
+                    "--data",
+                    &body,
+                ])
+                .output()
+                .map_err(|error| format!("curl is required for this test: {error}"))?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+            }
+            let text = String::from_utf8_lossy(&output.stdout).into_owned();
+            let marker = "\"result\":\"0x";
+            let start = text
+                .find(marker)
+                .ok_or_else(|| format!("no result in response: {text}"))?
+                + marker.len();
+            let hex = text[start..]
+                .split('"')
+                .next()
+                .ok_or_else(|| format!("truncated result: {text}"))?;
+            hex::decode(hex).map_err(|error| format!("result is not hex: {error}"))
+        }
+
+        let mut missing = Vec::new();
+        let mut endpoints = Vec::new();
+        for chain in VERIFIED_CHAINS {
+            match std::env::var(format!("BLOOM_SAFE_RPC_{chain}")) {
+                Ok(url) if !url.trim().is_empty() => endpoints.push((*chain, url)),
+                _ => missing.push(format!("BLOOM_SAFE_RPC_{chain}")),
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "every verified chain needs an endpoint, or the evidence is partial; missing: {}",
+            missing.join(" ")
+        );
+
+        let mut wrong = Vec::new();
+        for (chain, url) in &endpoints {
+            for entry in DEPLOYMENTS {
+                match rpc(url, entry.address) {
+                    Ok(code) if code.is_empty() => wrong.push(format!(
+                        "chain {chain}: {} {} at {} has no code",
+                        entry.kind, entry.version, entry.address
+                    )),
+                    Ok(code) => {
+                        let actual = format!("{:#x}", keccak256(&code));
+                        if actual != entry.code_hash {
+                            wrong.push(format!(
+                                "chain {chain}: {} {} at {} holds {actual}, pinned {}",
+                                entry.kind, entry.version, entry.address, entry.code_hash
+                            ));
+                        }
+                    }
+                    Err(error) => wrong.push(format!(
+                        "chain {chain}: reading {} failed: {error}",
+                        entry.address
+                    )),
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "a pinned Safe deployment is not what this table says it is. Until every line \
+             here is explained, a delegatecall allowlist and a singleton check built on it \
+             are not verified:\n{}",
+            wrong.join("\n")
+        );
+    }
+
     #[test]
     fn permits_only_the_canonical_same_nonce_rejection_self_call() {
         let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
@@ -1178,13 +1828,19 @@ mod tests {
             "0",
         )
         .unwrap();
+        // The envelope reports a 1-of-1 Safe, so the new threshold is shown
+        // against that baseline: "2" alone would read the same whether it
+        // raised the requirement or left it alone.
         assert_eq!(
             added,
             format!(
-                "Action: Add Safe owner\nNew owner: {}\nNew threshold: 2",
+                "Action: Add Safe owner\nNew owner: {}\nNew threshold: 2 of 2 owners \
+                 (reported now: 1 of 1)",
                 checksum(other)
             )
         );
+        // Raising the requirement carries no warning.
+        assert!(!added.contains("Warning"));
         let removed = self_call(
             "removeOwner(address,address,uint256)",
             vec![word(other), word(signer), number(1)],
@@ -1205,7 +1861,40 @@ mod tests {
         assert!(
             self_call("changeThreshold(uint256)", vec![number(3)], "0")
                 .unwrap()
-                .contains("New threshold: 3")
+                .contains("New threshold: 3 of 1 owners (reported now: 1 of 1)")
+        );
+
+        // A reduction has to be unmistakable. This Safe is 1-of-1, so build a
+        // 3-of-4 baseline and drop it to 1: before, the page said only
+        // "New threshold: 1", which reads the same as no change at all.
+        let mut multi = base.clone();
+        multi["threshold"] = serde_json::json!("3");
+        multi["owners"] = serde_json::json!([
+            signer,
+            other,
+            "0x8000000000000000000000000000000000000000",
+            "0x9000000000000000000000000000000000000000"
+        ]);
+        let lowered = {
+            let mut data = keccak256("changeThreshold(uint256)").as_slice()[..4].to_vec();
+            data.extend(number(1));
+            let mut envelope = multi.clone();
+            envelope["safe_tx"]["to"] = envelope["safe_address"].clone();
+            envelope["safe_tx"]["value"] = serde_json::json!("0");
+            envelope["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(data)));
+            classify(&serde_json::from_value::<Envelope>(envelope).unwrap()).unwrap()
+        };
+        assert!(
+            lowered.contains("New threshold: 1 of 4 owners (reported now: 3 of 4)"),
+            "{lowered}"
+        );
+        assert!(
+            lowered.contains("lowers the signatures the Safe requires, from 3 to 1"),
+            "{lowered}"
+        );
+        assert!(
+            lowered.contains("any single owner will then be able to move"),
+            "{lowered}"
         );
 
         // Shape: no value, exact argument count, clean address words, threshold >= 1.
@@ -1393,6 +2082,138 @@ mod tests {
         // Truncated input falls back to the ordinary review.
         assert!(outer(FACTORY, &input[..input.len() - 64]).is_none());
         assert!(outer(SAFE, "0x6a761202").is_none());
+    }
+
+    /// The proxy delegates to its singleton forever, and `SafeProxyFactory`
+    /// accepts any non-zero address for it. Without a check the page asserted
+    /// "Action: Create a Safe / Signatures required: 1 of 1 / Owner 1: (this
+    /// wallet)" -- with no warning -- for a proxy whose entire behaviour was
+    /// chosen by whoever supplied the singleton. Funds sent to the predicted
+    /// address, which is ordinary Safe practice, would be theirs.
+    #[test]
+    fn creating_a_safe_needs_a_known_implementation_and_fallback_handler() {
+        let input = "0x1688f0b900000000000000000000000029fcb43b46531bca003ddc8fcb67ffe91900c762000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000013528400000000000000000000000000000000000000000000000000000000000000164b63e800d0000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000fd0732dc9e303f09fcef3a7388ad10a83459ec9900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d081000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+
+        // The canonical case names the version it recognised.
+        let create = outer(FACTORY, input).unwrap();
+        assert!(
+            create.contains(
+                "Safe implementation: 0x29fcB43b46531BcA003ddC8FCB67FFE91900C762 (SafeL2 1.4.1)"
+            ),
+            "{create}"
+        );
+        assert!(
+            create.contains("Fallback handler: 0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99 (CompatibilityFallbackHandler 1.4.1)"),
+            "{create}"
+        );
+
+        // An implementation Bloom does not know is not a Safe it can describe.
+        // Falling back to `None` puts the call on the honest "cannot read"
+        // path it took before this reading existed.
+        let swapped = input.replacen(
+            "29fcb43b46531bca003ddc8fcb67ffe91900c762",
+            "4000000000000000000000000000000000000000",
+            1,
+        );
+        assert!(
+            outer(FACTORY, &swapped).is_none(),
+            "an unknown singleton must not render as a Safe: {:?}",
+            outer(FACTORY, &swapped)
+        );
+
+        // A fallback handler answers for the Safe on every call it does not
+        // implement, so an unknown one is the handover `setFallbackHandler`
+        // is refused for.
+        let handler = input.replacen(
+            "fd0732dc9e303f09fcef3a7388ad10a83459ec99",
+            "4000000000000000000000000000000000000000",
+            1,
+        );
+        assert!(
+            outer(FACTORY, &handler).is_none(),
+            "unknown fallback handler"
+        );
+
+        // Every other canonical singleton is accepted, so the check is a
+        // table lookup and not a single hardcoded address.
+        for (address, label) in [
+            ("d9db270c1b5e3bd161e8c8503c55ceabee709552", "Safe 1.3.0"),
+            ("41675c099f32341bf84bfc5382af534df5c7461a", "Safe 1.4.1"),
+            ("ff51a5898e281db6dfc7855790607438df2ca44b", "Safe 1.5.0"),
+        ] {
+            let swapped = input.replacen("29fcb43b46531bca003ddc8fcb67ffe91900c762", address, 1);
+            let create = outer(FACTORY, &swapped)
+                .unwrap_or_else(|| panic!("{label} is a canonical singleton"));
+            assert!(create.contains(&format!("({label})")), "{create}");
+        }
+    }
+
+    /// Two facts the execution review left off the page.
+    #[test]
+    fn executing_a_safe_transaction_shows_its_value_and_any_real_refund() {
+        // A call that carries both calldata and native value: the amount was
+        // printed only when the calldata was empty, so a payable call moved
+        // funds with no amount anywhere on the page.
+        //
+        // execTransaction has ten head words, so the two dynamic arguments
+        // start at 320 and 384.
+        let address_word = |value: &str| {
+            let mut word = [0_u8; 32];
+            word[12..].copy_from_slice(address(value, "test").unwrap().as_slice());
+            word.to_vec()
+        };
+        let number = |value: u64| U256::from(value).to_be_bytes::<32>().to_vec();
+        let build = |safe_tx_gas: u64, gas_price: u64| {
+            let mut input = keccak256(
+                "execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)",
+            )
+            .as_slice()[..4]
+            .to_vec();
+            input.extend(address_word(WALLET)); // to
+            input.extend(number(1_000_000_000_000_000)); // value
+            input.extend(number(320)); // data offset
+            input.extend(number(0)); // operation: call
+            input.extend(number(safe_tx_gas));
+            input.extend(number(0)); // baseGas
+            input.extend(number(gas_price));
+            input.extend(number(0)); // gasToken: native
+            input.extend(number(0)); // refundReceiver: the executor
+            input.extend(number(384)); // signatures offset
+            input.extend(number(4)); // data length
+            let mut payload = [0_u8; 32];
+            payload[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+            input.extend(payload);
+            input.extend(number(65)); // signatures length
+            input.extend([7_u8; 65]);
+            input.extend([0_u8; 31]);
+            format!("0x{}", hex::encode(input))
+        };
+
+        let paying = outer(SAFE, &build(0, 0)).unwrap();
+        assert!(paying.contains("The Safe will: Contract call"), "{paying}");
+        assert!(paying.contains("Amount: 0.001 ETH"), "{paying}");
+
+        // safeTxGas alone is an execution bound, not a refund. Warning on it
+        // fired on ordinary transactions and said nothing about what was paid.
+        let bounded = outer(SAFE, &build(100_000, 0)).unwrap();
+        assert!(!bounded.contains("gas refund"), "{bounded}");
+
+        // A non-zero gasPrice is a real refund, and the three facts that
+        // decide the loss have to be on the page.
+        let refunding = outer(SAFE, &build(0, 7)).unwrap();
+        assert!(
+            refunding.contains("Warning: the Safe pays a gas refund"),
+            "{refunding}"
+        );
+        assert!(
+            refunding.contains("Refund token: native base"),
+            "{refunding}"
+        );
+        assert!(refunding.contains("Refund gas price: 7"), "{refunding}");
+        assert!(
+            refunding.contains("Refund paid to: whoever executes this transaction"),
+            "{refunding}"
+        );
     }
 
     #[test]

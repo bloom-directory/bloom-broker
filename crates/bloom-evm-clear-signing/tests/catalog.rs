@@ -406,3 +406,107 @@ fn the_catalog_identity_a_wallet_trusts_is_part_of_the_frozen_review() {
         ReviewReason::ReviewChanged
     );
 }
+
+/// A signed token name is rendered verbatim on the approval screen, so a
+/// character that rewrites the line without changing the text is as good as a
+/// control character. `char::is_control` is category Cc only: it misses the
+/// line and paragraph separators and every format character except the
+/// bidirectional overrides that were listed by hand.
+#[test]
+fn invisible_and_line_breaking_characters_are_refused_in_a_token_name() {
+    let trust = [trusted(1, "publisher-1")];
+    for (what, injected) in [
+        ("line separator", "Real\u{2028}Fake Token"),
+        ("paragraph separator", "Real\u{2029}Fake Token"),
+        ("zero-width space", "Te\u{200b}ther"),
+        ("zero-width non-joiner", "Te\u{200c}ther"),
+        ("zero-width joiner", "Te\u{200d}ther"),
+        ("soft hyphen", "Te\u{00ad}ther"),
+        ("word joiner", "Te\u{2060}ther"),
+        ("byte order mark", "Tether\u{feff}"),
+        ("arabic letter mark", "Tether\u{061c}"),
+        ("invisible times", "Tether\u{2062}"),
+        ("interlinear annotation", "Tether\u{fff9}"),
+        ("language tag", "Tether\u{e0001}"),
+        // Already covered before this change; kept so the set cannot regress.
+        ("left-to-right mark", "Tether\u{200e}"),
+        ("right-to-left override", "Tether\u{202e}"),
+        ("null", "Tether\u{0}"),
+    ] {
+        let mut entry = erc20_entry();
+        entry.token_metadata.as_mut().unwrap().name = injected.into();
+        let mut candidate = catalog(vec![entry]);
+        sign(&mut candidate, &[(1, "publisher-1")]);
+        let size = serde_jcs::to_vec(&candidate).unwrap().len();
+        assert_eq!(
+            candidate.accept(size, &trust, 1).unwrap_err().reason,
+            ReviewReason::CatalogRejected,
+            "a token name carrying a {what} must be refused"
+        );
+    }
+
+    // An ordinary name with non-ASCII letters is still accepted: the rule is
+    // about characters that hide themselves, not about scripts.
+    let mut entry = erc20_entry();
+    entry.token_metadata.as_mut().unwrap().name = "Tether Über Ünïcødé".into();
+    let mut candidate = catalog(vec![entry]);
+    sign(&mut candidate, &[(1, "publisher-1")]);
+    let size = serde_jcs::to_vec(&candidate).unwrap().len();
+    candidate
+        .accept(size, &trust, 1)
+        .expect("an ordinary non-ASCII token name is not unsafe");
+}
+
+/// The descriptor digest says how a call is displayed; `admitted_functions`
+/// says whether it could be described at all. A publisher that withdraws a
+/// function, or moves it to another action class, has changed what the entry
+/// authorizes, so a review frozen before that must stop signing -- exactly as
+/// it does when the descriptor or the code hash changes.
+#[test]
+fn withdrawing_or_reclassifying_an_admitted_function_invalidates_a_frozen_review() {
+    let digest = Digest32::from_bytes([9; 32]);
+    let accepted = accepted_erc20();
+    let frozen = evidence(&accepted, &digest);
+
+    // Unchanged: the frozen review still signs.
+    frozen
+        .recheck(Some(&accepted), &digest, NOW_MS, 86_400_000)
+        .expect("nothing changed");
+
+    for (what, mutate) in [
+        (
+            // `approve` is withdrawn while `transfer`, the reviewed call, and
+            // the descriptor both stay exactly as they were. Nothing else in
+            // the projection moves, so only this field can catch it.
+            "withdrawn",
+            Box::new(|entry: &mut CatalogEntry| {
+                entry
+                    .admitted_functions
+                    .retain(|function| !function.signature.starts_with("approve"));
+            }) as Box<dyn Fn(&mut CatalogEntry)>,
+        ),
+        (
+            "reclassified",
+            Box::new(|entry: &mut CatalogEntry| {
+                for function in &mut entry.admitted_functions {
+                    function.action_class = ActionClass::Other;
+                }
+            }),
+        ),
+    ] {
+        let mut entry = erc20_entry();
+        mutate(&mut entry);
+        let mut changed = catalog(vec![entry]);
+        changed.sequence = DecimalU64::new(8);
+        sign(&mut changed, &[(1, "publisher-1")]);
+        let changed = accept(&changed).unwrap();
+        assert_eq!(
+            frozen
+                .recheck(Some(&changed), &digest, NOW_MS, 86_400_000)
+                .unwrap_err()
+                .reason,
+            ReviewReason::ReviewChanged,
+            "a {what} admitted function must invalidate the frozen review"
+        );
+    }
+}

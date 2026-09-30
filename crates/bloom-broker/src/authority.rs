@@ -619,9 +619,13 @@ impl BrokerAuthority {
                 expires_at_ms TEXT NOT NULL,
                 custody_receipt_digest TEXT NOT NULL
             );
+            -- One row per catalog identity, not one row for the Broker. A
+            -- Broker serves several wallets and each pins its own catalog_id,
+            -- so a shared row would let one wallet's install evict another's
+            -- catalog, and a shared sequence watermark would then refuse to
+            -- put the evicted one back.
             CREATE TABLE IF NOT EXISTS clear_signing_catalog (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                catalog_id TEXT NOT NULL,
+                catalog_id TEXT PRIMARY KEY,
                 sequence TEXT NOT NULL,
                 content_digest TEXT NOT NULL,
                 catalog_jcs TEXT NOT NULL
@@ -1850,8 +1854,9 @@ impl BrokerAuthority {
         let transaction = connection.transaction()?;
         let current: Option<(String, String)> = transaction
             .query_row(
-                "SELECT sequence, content_digest FROM clear_signing_catalog WHERE id = 1",
-                [],
+                "SELECT sequence, content_digest FROM clear_signing_catalog
+                 WHERE catalog_id = ?1",
+                params![catalog.catalog_id.as_str()],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
@@ -1873,10 +1878,9 @@ impl BrokerAuthority {
             }
         }
         transaction.execute(
-            "INSERT INTO clear_signing_catalog(id, catalog_id, sequence, content_digest, catalog_jcs)
-             VALUES (1, ?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET
-                catalog_id=excluded.catalog_id,
+            "INSERT INTO clear_signing_catalog(catalog_id, sequence, content_digest, catalog_jcs)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(catalog_id) DO UPDATE SET
                 sequence=excluded.sequence,
                 content_digest=excluded.content_digest,
                 catalog_jcs=excluded.catalog_jcs",
@@ -1959,16 +1963,27 @@ impl BrokerAuthority {
     /// The stored catalog, re-accepted under the trust the caller's wallet
     /// policy pins. Stored bytes are not trusted on their own: a policy that
     /// rotated its keys stops accepting the snapshot it used to accept.
+    /// The stored catalog, as the wallet whose policy pins `catalog_id`,
+    /// `trusted` and `threshold` sees it.
+    ///
+    /// `catalog_id` is a pin the wallet's owner approved, so it is spent here
+    /// rather than only where a catalog is installed. Broker keeps one catalog
+    /// row, and a second enrolled wallet can name a different catalog, so
+    /// without this check a wallet would read contract calls against whichever
+    /// catalog was installed last as long as a publisher it trusts signed it.
+    /// A catalog the wallet did not pin reads the same as having none: the call
+    /// is refused as undescribable rather than described by the wrong source.
     pub fn clear_signing_catalog(
         &self,
+        catalog_id: &Token,
         trusted: &[TrustedCatalogKey],
         threshold: usize,
     ) -> Result<Option<AcceptedCatalog>, AuthorityError> {
         let connection = self.lock()?;
         let stored: Option<String> = connection
             .query_row(
-                "SELECT catalog_jcs FROM clear_signing_catalog WHERE id = 1",
-                [],
+                "SELECT catalog_jcs FROM clear_signing_catalog WHERE catalog_id = ?1",
+                params![catalog_id.as_str()],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
@@ -1977,6 +1992,9 @@ impl BrokerAuthority {
             return Ok(None);
         };
         let catalog: ClearSigningCatalog = serde_json::from_str(&stored).map_err(storage)?;
+        if &catalog.catalog_id != catalog_id {
+            return Ok(None);
+        }
         match catalog.accept(stored.len(), trusted, threshold) {
             Ok(accepted) => Ok(Some(accepted)),
             // Not a storage failure: the wallet no longer trusts what is
@@ -2062,8 +2080,11 @@ impl BrokerAuthority {
             )
         })?;
         let trusted = trusted_catalog_keys(settings)?;
-        let catalog =
-            self.clear_signing_catalog(&trusted, usize::from(settings.signature_threshold))?;
+        let catalog = self.clear_signing_catalog(
+            &settings.catalog_id,
+            &trusted,
+            usize::from(settings.signature_threshold),
+        )?;
         evidence
             .recheck(
                 catalog.as_ref(),
@@ -2625,38 +2646,52 @@ impl BrokerAuthority {
     }
 
     /// The operator-visible clear-signing status: what is stored, how long it
-    /// is valid, and which profiles this build can read. Per-wallet trust is
-    /// deliberately absent — that lives in the wallet's policy, which
-    /// `policy.read` already returns.
-    pub fn clear_signing_status(&self) -> Result<Option<ClearSigningStatus>, AuthorityError> {
+    /// is valid, and which profiles this build can read. One entry per stored
+    /// catalog identity, ordered by identity, because a Broker holds one
+    /// catalog per identity its wallets pin. Per-wallet trust is deliberately
+    /// absent — that lives in the wallet's policy, which `policy.read` already
+    /// returns.
+    pub fn clear_signing_status(&self) -> Result<Vec<ClearSigningStatus>, AuthorityError> {
         let connection = self.lock()?;
-        let stored: Option<(String, String, String, String)> = connection
-            .query_row(
-                "SELECT catalog_id, sequence, content_digest, catalog_jcs
-                 FROM clear_signing_catalog WHERE id = 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
-            .optional()?;
+        let mut statement = connection.prepare(
+            "SELECT catalog_id, sequence, content_digest, catalog_jcs
+             FROM clear_signing_catalog ORDER BY catalog_id",
+        )?;
+        let stored: Vec<(String, String, String, String)> = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        drop(statement);
         drop(connection);
-        let Some((catalog_id, sequence, content_digest, stored)) = stored else {
-            return Ok(None);
-        };
-        let catalog: ClearSigningCatalog = serde_json::from_str(&stored).map_err(storage)?;
+        stored
+            .into_iter()
+            .map(|(catalog_id, sequence, content_digest, stored)| {
+                self.clear_signing_status_row(catalog_id, sequence, content_digest, &stored)
+            })
+            .collect()
+    }
+
+    fn clear_signing_status_row(
+        &self,
+        catalog_id: String,
+        sequence: String,
+        content_digest: String,
+        stored: &str,
+    ) -> Result<ClearSigningStatus, AuthorityError> {
+        let catalog: ClearSigningCatalog = serde_json::from_str(stored).map_err(storage)?;
         let oldest_observation_ms = catalog
             .entries
             .iter()
             .map(|entry| entry.observed_at_ms.get())
             .min()
             .unwrap_or_default();
-        Ok(Some(ClearSigningStatus {
+        Ok(ClearSigningStatus {
             catalog_id,
             sequence,
             content_digest,
@@ -2669,7 +2704,7 @@ impl BrokerAuthority {
             )
             .as_str()
             .to_owned(),
-        }))
+        })
     }
 
     pub fn wallet_ids(&self) -> Result<Vec<Token>, AuthorityError> {
@@ -4449,7 +4484,9 @@ fn enforce_state_floor(connection: &Connection) -> Result<(), AuthorityError> {
         .optional()?;
     match floor {
         Some(floor) if floor > BROKER_STATE_VERSION => Err(AuthorityError::Storage(format!(
-            "this Broker interprets durable state version {BROKER_STATE_VERSION}, but the store              requires at least {floor}; run a build that understands the stored wallet policy              instead of downgrading, which would have to drop a security field to proceed"
+            "this Broker interprets durable state version {BROKER_STATE_VERSION}, but the store \
+             requires at least {floor}; run a build that understands the stored wallet policy \
+             instead of downgrading, which would have to drop a security field to proceed"
         ))),
         _ => Ok(()),
     }
