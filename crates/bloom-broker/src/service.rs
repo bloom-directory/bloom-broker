@@ -986,11 +986,25 @@ impl BrokerRpcService {
         // Freeze what Broker itself concluded, alongside the record that
         // authorizes signing. There is no second write to lose: an approval
         // record either exists with its review, or does not exist at all.
-        let review_kind = review_policy
-            .as_ref()
-            .map_or(crate::journal::ReviewKind::Legacy, |policy| {
-                crate::evm_review::review_kind(context.evm_review.as_ref(), policy)
-            });
+        let review_kind =
+            review_policy
+                .as_ref()
+                .map_or(crate::journal::ReviewKind::Legacy, |policy| {
+                    match (&context.safe_review, &policy.clear_signing) {
+                        // A Safe review is read from the exact bytes rather than from
+                        // a catalog, so it is never `Clear`. It still has to record
+                        // whether the inner call was read, or nothing downstream can
+                        // tell an opaque Safe approval from a fully read one.
+                        (Some(review), Some(_)) => {
+                            if crate::safe_review::is_opaque(review) {
+                                crate::journal::ReviewKind::OpaqueExact
+                            } else {
+                                crate::journal::ReviewKind::Native
+                            }
+                        }
+                        _ => crate::evm_review::review_kind(context.evm_review.as_ref(), policy),
+                    }
+                });
         let frozen_review = match context
             .evm_review
             .as_ref()

@@ -5,7 +5,7 @@ use std::str::FromStr;
 use alloy::primitives::{Address, B256, U256, keccak256};
 use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalSelector, CanonicalWalletPolicy, CryptoSuite, DeclaredFee,
-    Digest32, ProtocolError, ProtocolErrorCode,
+    Digest32, ProtocolError, ProtocolErrorCode, ReviewMode,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -105,6 +105,57 @@ fn uint(value: &str, field: &str) -> Result<U256, ProtocolError> {
         )));
     }
     U256::from_str(value).map_err(|_| invalid(format!("{field} is too large")))
+}
+
+/// A 32-byte hash as a Petal reports it.
+///
+/// Broker cannot verify these against a chain, but a hash has a shape, and a
+/// field with a checkable shape is checked: the value is rendered into the
+/// ceremony, so accepting arbitrary text here means accepting whatever a
+/// Petal puts on the approval screen.
+fn code_hash(value: &str, field: &str) -> Result<(), ProtocolError> {
+    let digits = value
+        .strip_prefix("0x")
+        .ok_or_else(|| invalid(format!("{field} must be 0x-prefixed hex")))?;
+    if digits.len() != 64 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid(format!(
+            "{field} must be a 0x-prefixed 32-byte hash"
+        )));
+    }
+    Ok(())
+}
+
+/// A Safe version as a Petal reports it: `major.minor.patch`, optionally with
+/// a short alphanumeric suffix such as `1.3.0+L2`. Short and printable, for
+/// the same reason as `code_hash`.
+fn safe_version(value: &str) -> Result<(), ProtocolError> {
+    let invalid_version = || invalid("safe_version must look like 1.4.1, with an optional +suffix");
+    if value.is_empty() || value.len() > 16 {
+        return Err(invalid_version());
+    }
+    let (core, suffix) = match value.split_once('+') {
+        Some((core, suffix)) => (core, Some(suffix)),
+        None => (value, None),
+    };
+    if let Some(suffix) = suffix
+        && (suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    {
+        return Err(invalid_version());
+    }
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3 {
+        return Err(invalid_version());
+    }
+    for part in parts {
+        if part.is_empty()
+            || part.len() > 3
+            || (part.len() > 1 && part.starts_with('0'))
+            || !part.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(invalid_version());
+        }
+    }
+    Ok(())
 }
 
 fn bytes(value: &str, field: &str) -> Result<Vec<u8>, ProtocolError> {
@@ -207,9 +258,16 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
     // Petal-reported fields outside the EIP-712 preimage are bounded for
     // display only: a pinned table could refuse an honest Petal and not a
     // dishonest one. A pre-1.3.0 domain separator fails the selector check.
+    // Bounded still means checked, though -- every one of these is rendered
+    // into the ceremony, so each is held to the shape its own type has.
     address(&envelope.singleton, "singleton")?;
     address(&envelope.guard, "guard")?;
     address(&envelope.fallback_handler, "fallback_handler")?;
+    safe_version(&envelope.safe_version)?;
+    code_hash(&envelope.singleton_code_hash, "singleton_code_hash")?;
+    if let Some(hash) = &envelope.library_code_hash {
+        code_hash(hash, "library_code_hash")?;
+    }
     if envelope.owners.len() > MAX_OWNERS || envelope.modules.len() > MAX_MODULES {
         return Err(invalid(
             "Safe owner or module count is outside supported bounds",
@@ -343,6 +401,12 @@ fn entry_summary(index: usize, to: Address, value: U256, data: &[u8]) -> String 
     }
 }
 
+/// The heading `classify` uses when it could read nothing about the inner
+/// call beyond its selector and hash. Named rather than spelled out at each
+/// use so the wallet-policy gate can ask whether the reading was opaque
+/// instead of re-deriving the question from the rendered text.
+pub(crate) const OPAQUE_ACTION: &str = "Action: Contract call";
+
 fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
     let safe = address(&envelope.safe_address, "safe_address")?;
     let to = address(&envelope.safe_tx.to, "safe_tx.to")?;
@@ -368,7 +432,7 @@ fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
                 Ok(format!("Action: Native transfer\nRecipient: {to}"))
             } else {
                 Ok(format!(
-                    "Action: Contract call\nCalldata selector: 0x{}\nCalldata keccak256: {:#x}",
+                    "{OPAQUE_ACTION}\nCalldata selector: 0x{}\nCalldata keccak256: {:#x}",
                     hex::encode(&data[..data.len().min(4)]),
                     keccak256(&data)
                 ))
@@ -540,7 +604,13 @@ pub(crate) fn review(
             "wallet policy must allow destination exact on {chain_policy} for Safe signing"
         )));
     }
-    let action = classify(&envelope)?.lines().map(str::to_owned).collect();
+    let rendered = classify(&envelope)?;
+    // The wallet's clear-signing settings are authority over what the owner
+    // can be asked to approve, and they are not about how the bytes reach the
+    // chain. A payload Bloom cannot explain is refused when it is sent
+    // directly, so wrapping it in a SafeTx must not be a way around that.
+    apply_clear_signing_policy(policy, request.requested_review_mode, &rendered)?;
+    let action = rendered.lines().map(str::to_owned).collect();
     let chain_name = u64::try_from(chain)
         .map(crate::evm_review::chain_name)
         .unwrap_or(chain_policy);
@@ -575,6 +645,64 @@ pub(crate) fn review(
             library_code_hash: envelope.library_code_hash,
         },
     }))
+}
+
+/// The Safe equivalent of `evm_review::apply_review_mode`.
+///
+/// The native path decides three things from `policy.clear_signing`: that an
+/// unreadable call needs an explicit `OpaqueExact` request, that the request
+/// is only honored when the wallet allows it, and that a mode a wallet cannot
+/// serve is refused rather than dropped. A Safe transaction is the same
+/// decision about the same calldata, so it gets the same three.
+fn apply_clear_signing_policy(
+    policy: &CanonicalWalletPolicy,
+    requested: Option<ReviewMode>,
+    rendered: &str,
+) -> Result<(), ProtocolError> {
+    let opaque = rendered
+        .lines()
+        .any(|line| line.trim_start().starts_with(OPAQUE_ACTION));
+    let Some(settings) = policy.clear_signing.as_ref() else {
+        // An incapable wallet refuses a required mode rather than ignoring it,
+        // exactly as the native path does.
+        if requested.is_some() {
+            return Err(invalid("clear signing is not enabled for this wallet"));
+        }
+        return Ok(());
+    };
+    settings.validate()?;
+    match requested {
+        Some(ReviewMode::OpaqueExact) => {
+            if !settings.opaque_exact_allowed {
+                return Err(invalid(
+                    "wallet policy does not allow approving payloads Bloom cannot explain",
+                ));
+            }
+            Ok(())
+        }
+        // Broker reads a Safe transaction from the exact bytes rather than
+        // from a publisher's catalog, so `Clear` is not a mode this path can
+        // serve. Saying so beats returning an unread review under its name.
+        Some(ReviewMode::Clear) if opaque => Err(invalid(
+            "Bloom cannot read this Safe transaction's inner call, so it cannot be              clear-signed; approve it as an exact payload if wallet policy allows that",
+        )),
+        Some(ReviewMode::Clear) | None => {
+            if opaque && !settings.opaque_exact_allowed {
+                return Err(invalid(
+                    "wallet policy does not allow approving payloads Bloom cannot explain",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Whether a prepared Safe review read its inner call, for the frozen record.
+pub(crate) fn is_opaque(review: &SafeReview) -> bool {
+    review
+        .action
+        .iter()
+        .any(|line| line.trim_start().starts_with(OPAQUE_ACTION))
 }
 
 #[cfg(test)]
@@ -835,6 +963,131 @@ mod tests {
         let mut request = request;
         request.safe_review_payloads[0] = Base64UrlBytes::from_bytes(&changed);
         assert!(review(&request, &policy(), from).is_err());
+    }
+
+    fn clear_signing_policy(opaque_exact_allowed: bool) -> CanonicalWalletPolicy {
+        CanonicalWalletPolicy {
+            clear_signing: Some(ClearSigningPolicy {
+                catalog_id: token("bloom-tokens"),
+                trusted_keys: vec![CatalogTrustedKey {
+                    key_id: token("publisher-1"),
+                    verifying_key: Base64UrlBytes::from_bytes(&[7; 32]),
+                }],
+                signature_threshold: 1,
+                maximum_observation_age_ms: 86_400_000,
+                opaque_exact_allowed,
+                unlimited_allowance_allowed: false,
+                verifier: RequiredVerifier {
+                    verifier_id: token(EVM_CLEAR_SIGNING_VERIFIER_ID),
+                    verifier_digest: Digest32::from_bytes(EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES),
+                },
+            }),
+            ..policy()
+        }
+    }
+
+    /// An owner who set `opaque_exact_allowed: false` said "do not ask me to
+    /// approve payloads Bloom cannot explain". The native path enforced that
+    /// and the Safe path did not, so the same undescribable calldata that is
+    /// refused when sent directly was approvable wrapped in a SafeTx, with
+    /// the owner shown a selector and a keccak.
+    #[test]
+    fn an_unreadable_safe_call_obeys_the_wallets_opaque_payload_setting() {
+        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        value["safe_tx"]["value"] = serde_json::json!("0");
+        value["safe_tx"]["data"] = serde_json::json!("0xdeadbeef00112233");
+        let opaque = serde_jcs::to_vec(&value).unwrap();
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+
+        // No clear-signing policy: unchanged, the envelope review stands.
+        let plan = review(&request(opaque.clone()), &policy(), from)
+            .unwrap()
+            .unwrap();
+        assert!(is_opaque(&plan), "{:?}", plan.action);
+
+        // Clear signing on, opaque payloads refused: this must not prepare.
+        let error = review(&request(opaque.clone()), &clear_signing_policy(false), from)
+            .expect_err("an unreadable Safe call must obey the wallet's setting");
+        assert!(error.to_string().contains("cannot explain"), "{}", error);
+
+        // Clear signing on, opaque payloads permitted: prepares, and the
+        // frozen record has to be able to say it was not read.
+        let plan = review(&request(opaque), &clear_signing_policy(true), from)
+            .unwrap()
+            .unwrap();
+        assert!(is_opaque(&plan));
+
+        // A call Bloom *can* read is unaffected by the setting.
+        let readable = review(&request(envelope()), &clear_signing_policy(false), from)
+            .unwrap()
+            .unwrap();
+        assert!(!is_opaque(&readable), "{:?}", readable.action);
+    }
+
+    /// A requested mode the Safe path cannot serve was dropped rather than
+    /// refused, so a Machine asking for a clear reading got an unread one
+    /// under that name.
+    #[test]
+    fn a_review_mode_the_safe_path_cannot_serve_is_refused_not_dropped() {
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        value["safe_tx"]["value"] = serde_json::json!("0");
+        value["safe_tx"]["data"] = serde_json::json!("0xdeadbeef00112233");
+        let opaque = serde_jcs::to_vec(&value).unwrap();
+
+        // A wallet with no clear-signing policy cannot honor any mode.
+        let mut asked = request(envelope());
+        asked.requested_review_mode = Some(ReviewMode::Clear);
+        let error = review(&asked, &policy(), from).expect_err("an incapable wallet refuses");
+        assert!(error.to_string().contains("not enabled"), "{error}");
+
+        // Clear was asked for and the inner call cannot be read.
+        let mut asked = request(opaque.clone());
+        asked.requested_review_mode = Some(ReviewMode::Clear);
+        let error = review(&asked, &clear_signing_policy(true), from)
+            .expect_err("an unreadable call cannot be clear-signed");
+        assert!(error.to_string().contains("cannot read"), "{error}");
+
+        // OpaqueExact is honored only where the wallet allows it.
+        let mut asked = request(opaque);
+        asked.requested_review_mode = Some(ReviewMode::OpaqueExact);
+        assert!(review(&asked, &clear_signing_policy(false), from).is_err());
+        assert!(review(&asked, &clear_signing_policy(true), from).is_ok());
+    }
+
+    /// Three envelope fields are rendered into the ceremony and none of them
+    /// had a shape check, so a Petal could put arbitrary text on the approval
+    /// screen. Broker cannot verify them against a chain; it can still
+    /// require a hash to be a hash.
+    #[test]
+    fn petal_reported_version_and_code_hashes_must_have_their_own_shape() {
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+        for (field, bad) in [
+            ("safe_version", serde_json::json!("1.4.1; see attached")),
+            ("safe_version", serde_json::json!("")),
+            ("safe_version", serde_json::json!("1.4")),
+            ("safe_version", serde_json::json!("01.4.1")),
+            ("singleton_code_hash", serde_json::json!("not a hash")),
+            ("singleton_code_hash", serde_json::json!("0xabcd")),
+            ("library_code_hash", serde_json::json!("0xzz")),
+        ] {
+            let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+            value[field] = bad.clone();
+            let bytes = serde_jcs::to_vec(&value).unwrap();
+            assert!(
+                review(&request(bytes), &policy(), from).is_err(),
+                "{field} = {bad} must be refused"
+            );
+        }
+
+        // The shapes an honest Petal reports are all still accepted.
+        for version in ["1.3.0", "1.4.1", "1.5.0", "1.3.0+L2"] {
+            let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+            value["safe_version"] = serde_json::json!(version);
+            let bytes = serde_jcs::to_vec(&value).unwrap();
+            review(&request(bytes), &policy(), from)
+                .unwrap_or_else(|error| panic!("{version} must be accepted: {error}"));
+        }
     }
 
     #[test]
