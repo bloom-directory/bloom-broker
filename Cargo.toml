@@ -18,6 +18,7 @@ bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runti
 bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "97b9ac7e47ee682e59804d04f6288419f3598a58" }
 bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "97b9ac7e47ee682e59804d04f6288419f3598a58" }
 bloom-solana-verify = { path = "crates/bloom-solana-verify" }
+bech32 = "0.11"
 bs58 = "0.5"
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
 bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
