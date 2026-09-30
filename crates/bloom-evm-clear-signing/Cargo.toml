@@ -1,0 +1,23 @@
+[package]
+name = "bloom-evm-clear-signing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded ERC-7730 descriptor reader and strict EVM calldata review for Bloom"
+
+[dependencies]
+alloy-dyn-abi.workspace = true
+alloy-json-abi.workspace = true
+alloy-primitives.workspace = true
+bloom-broker-api = { path = "../bloom-broker-api" }
+ed25519-dalek.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+tempfile = "3"
