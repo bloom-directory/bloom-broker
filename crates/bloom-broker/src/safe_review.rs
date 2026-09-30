@@ -683,9 +683,10 @@ fn apply_clear_signing_policy(
         // Broker reads a Safe transaction from the exact bytes rather than
         // from a publisher's catalog, so `Clear` is not a mode this path can
         // serve. Saying so beats returning an unread review under its name.
-        Some(ReviewMode::Clear) if opaque => Err(invalid(
-            "Bloom cannot read this Safe transaction's inner call, so it cannot be              clear-signed; approve it as an exact payload if wallet policy allows that",
-        )),
+        Some(ReviewMode::Clear) if opaque => Err(invalid(concat!(
+            "Bloom cannot read this Safe transaction's inner call, so it cannot be ",
+            "clear-signed; approve it as an exact payload if wallet policy allows that",
+        ))),
         Some(ReviewMode::Clear) | None => {
             if opaque && !settings.opaque_exact_allowed {
                 return Err(invalid(
