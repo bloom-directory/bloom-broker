@@ -46,10 +46,7 @@ use bloom_triad_local_transport::{
     load_identity_and_manifest,
 };
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
-use rustls::{
-    ClientConfig as RustlsClientConfig, RootCertStore,
-    pki_types::{CertificateDer, pem::PemObject},
-};
+use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::{
@@ -1012,10 +1009,12 @@ impl RemoteRuntime {
         }
         let control_ca = remote_material::read_control_ca(&config.control_ca_path, broker_uid)
             .map_err(std::io::Error::other)?;
-        let certificate =
-            CertificateDer::from_pem_slice(&control_ca).map_err(std::io::Error::other)?;
         let mut roots = RootCertStore::empty();
-        roots.add(certificate).map_err(std::io::Error::other)?;
+        for certificate in
+            remote_material::control_roots(&control_ca).map_err(std::io::Error::other)?
+        {
+            roots.add(certificate).map_err(std::io::Error::other)?;
+        }
         let mut tls_config = RustlsClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();

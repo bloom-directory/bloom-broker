@@ -17,7 +17,10 @@ use instant_acme::{
 };
 use rustls::{
     crypto::aws_lc_rs,
-    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+    pki_types::{
+        CertificateDer, PrivateKeyDer,
+        pem::{PemObject, SectionKind},
+    },
     sign::CertifiedKey,
 };
 use serde::{Deserialize, Serialize};
@@ -175,10 +178,27 @@ fn read_protected(path: &Path, uid: u32) -> Result<Vec<u8>, Failure> {
     Ok(bytes)
 }
 
+/// The pinned relay control roots: a PEM bundle of one or more certificates.
 pub(super) fn read_control_ca(path: &Path, uid: u32) -> Result<Vec<u8>, Failure> {
     let bytes = read_protected(path, uid)?;
-    CertificateDer::from_pem_slice(&bytes)?;
+    control_roots(&bytes)?;
     Ok(bytes)
+}
+
+/// Every certificate in a control CA bundle. Any malformed or non-certificate
+/// item fails the whole bundle rather than silently narrowing the roots.
+pub(super) fn control_roots(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, Failure> {
+    let mut roots = Vec::new();
+    for item in <(SectionKind, Vec<u8>)>::pem_slice_iter(pem) {
+        match item? {
+            (SectionKind::Certificate, der) => roots.push(CertificateDer::from(der)),
+            _ => return Err("relay control CA bundle holds a non-certificate item".into()),
+        }
+    }
+    if roots.is_empty() {
+        return Err("relay control CA bundle holds no certificate".into());
+    }
+    Ok(roots)
 }
 
 fn atomic_private(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
@@ -560,7 +580,7 @@ mod tests {
 
     struct StagingInputs {
         control_ca: Vec<u8>,
-        receipt_public_key: [u8; 32],
+        receipt_public_keys: Vec<[u8; 32]>,
     }
 
     impl StagingInputs {
@@ -576,21 +596,29 @@ mod tests {
                 .ok_or("BLOOM_RELAY_SMOKE_RECEIPT_PUBLIC_KEY_FILE is required")?;
             let control_ca = read_control_ca(Path::new(&control_ca_path), uid)?;
             let encoded = read_protected(Path::new(&receipt_key_path), uid)?;
-            let encoded = std::str::from_utf8(&encoded)?.trim();
-            if encoded.len() != 64
-                || !encoded
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                return Err("relay receipt public key must be 64 lowercase hex characters".into());
+            // One pinned key per line: the current key and its successor.
+            let receipt_public_keys = std::str::from_utf8(&encoded)?
+                .split_whitespace()
+                .map(|encoded| {
+                    if encoded.len() != 64
+                        || !encoded
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    {
+                        return Err("relay receipt public key must be 64 lowercase hex characters");
+                    }
+                    let decoded = hex::decode(encoded).map_err(|_| "invalid hex")?;
+                    decoded
+                        .try_into()
+                        .map_err(|_| "relay receipt public key must be exactly 32 bytes")
+                })
+                .collect::<Result<Vec<[u8; 32]>, _>>()?;
+            if receipt_public_keys.is_empty() {
+                return Err("no relay receipt public key is pinned".into());
             }
-            let decoded = hex::decode(encoded)?;
-            let receipt_public_key = decoded
-                .try_into()
-                .map_err(|_| "relay receipt public key must be exactly 32 bytes")?;
             Ok(Self {
                 control_ca,
-                receipt_public_key,
+                receipt_public_keys,
             })
         }
 
@@ -791,7 +819,7 @@ mod tests {
         let receipt = enroll(
             inputs.enrollment(),
             admin_key.verifying_key().as_bytes(),
-            &inputs.receipt_public_key,
+            &inputs.receipt_public_keys,
             Uuid::new_v4(),
             admin_signer(&admin_key),
         )?;
@@ -836,6 +864,18 @@ mod tests {
             )
             .into()),
         }
+    }
+
+    #[test]
+    fn control_roots_load_every_certificate_or_fail() {
+        let bundle = include_bytes!("../tests/fixtures/relay/isrg-roots.pem");
+        assert_eq!(control_roots(bundle).unwrap().len(), 2);
+        assert!(control_roots(b"").is_err());
+        let mut with_key = bundle.to_vec();
+        with_key.extend_from_slice(
+            b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n-----END PRIVATE KEY-----\n",
+        );
+        assert!(control_roots(&with_key).is_err());
     }
 
     #[test]
