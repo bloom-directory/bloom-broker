@@ -10,7 +10,7 @@ use std::{
 };
 
 use bloom_relay_client::{DnsChallengeClient, renew_scoped_credential};
-use bloom_relay_protocol::{CertificateMetadata, ChallengeLease, CredentialIssueReceipt, Scope};
+use bloom_relay_protocol::{CertificateMetadata, CredentialIssueReceipt, Scope};
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt,
     NewAccount, NewOrder, OrderStatus, RetryPolicy,
@@ -374,19 +374,23 @@ async fn maintain_certificate_with_policy(
     {
         return Err("DNS credential is unavailable or expired".into());
     }
-    let dns = DnsChallengeClient::new(ca, installation_id, metadata.generation, dns_credential)?;
+    let dns = DnsChallengeClient::new(ca, installation_id, dns_credential)?;
     let mut order = account
         .new_order(&NewOrder::new(&[Identifier::Dns(hostname.to_owned())]))
         .await?;
-    let mut leases = Vec::new();
-    let operation = async {
+    // DNS-01 values are ensured, not leased: the relay keeps each published
+    // for five minutes after the last ensure, so a restarted Broker simply
+    // ensures the same value again (Let's Encrypt returns the same pending
+    // authorization) and an abandoned one lapses on its own.
+    let mut values = Vec::new();
+    {
         let mut authorizations = order.authorizations();
         while let Some(result) = authorizations.next().await {
             let mut authz = result?;
             match authz.status {
                 AuthorizationStatus::Valid => continue,
                 AuthorizationStatus::Pending => {}
-                _ => return Err::<(), Failure>("ACME authorization is not pending".into()),
+                _ => return Err("ACME authorization is not pending".into()),
             }
             let mut challenge = authz
                 .challenge(ChallengeType::Dns01)
@@ -394,63 +398,74 @@ async fn maintain_certificate_with_policy(
             if challenge.identifier().to_string() != hostname {
                 return Err("ACME challenge identifier differs from assigned hostname".into());
             }
-            let lease_id = Uuid::new_v4();
-            dns.create(ChallengeLease {
-                operation_id: lease_id,
-                txt_value: challenge.key_authorization().dns_value(),
-                expires_at_ms: now_ms()?.saturating_add(15 * 60 * 1000),
-            })
-            .await?;
-            leases.push(lease_id);
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
-            loop {
-                if dns.ready(lease_id).await? {
-                    break;
-                }
+            let value = challenge.key_authorization().dns_value();
+            let mut ensured = dns.ensure(&value).await?;
+            let mut last_ensure = tokio::time::Instant::now();
+            let deadline = last_ensure + Duration::from_secs(180);
+            while !dns.ready(&value, ensured.revision).await? {
                 if tokio::time::Instant::now() >= deadline {
-                    return Err("DNS-01 lease did not propagate in time".into());
+                    return Err("DNS-01 challenge did not propagate in time".into());
+                }
+                if last_ensure.elapsed() >= CHALLENGE_REFRESH {
+                    ensured = dns.ensure(&value).await?;
+                    last_ensure = tokio::time::Instant::now();
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
             challenge.set_ready().await?;
+            values.push(value);
         }
-        if order.poll_ready(&RetryPolicy::default()).await? != OrderStatus::Ready {
-            return Err("ACME order was not ready".into());
-        }
-        let key = Zeroizing::new(order.finalize().await?);
-        let cert = order.poll_certificate(&RetryPolicy::default()).await?;
-        let info = certificate_info(cert.as_bytes(), hostname, now_ms()?)?;
-        validate_key_match(cert.as_bytes(), key.as_bytes())?;
-        dns.report_certificate(CertificateMetadata {
+    }
+    // Keep the values published until the CA has validated them.
+    let retry = RetryPolicy::default();
+    let validated = tokio::select! {
+        status = order.poll_ready(&retry) => status?,
+        () = keep_challenges_alive(&dns, &values) => unreachable!("keep-alive never ends"),
+    };
+    if validated != OrderStatus::Ready {
+        return Err("ACME order was not ready".into());
+    }
+    let key = Zeroizing::new(order.finalize().await?);
+    let cert = order.poll_certificate(&RetryPolicy::default()).await?;
+    let info = certificate_info(cert.as_bytes(), hostname, now_ms()?)?;
+    validate_key_match(cert.as_bytes(), key.as_bytes())?;
+    dns.report_certificate(CertificateMetadata {
+        hostname: hostname.to_owned(),
+        acme_account_uri: account.id().to_owned(),
+        key_fingerprint: info.spki_sha256,
+        lineage: Uuid::new_v4().to_string(),
+        not_before_ms: info.not_before_ms,
+        not_after_ms: info.not_after_ms,
+    })
+    .await?;
+    // The old valid pair remains intact until this one protected bundle
+    // has been validated, fsync'd, and atomically renamed into place.
+    publish_bundle(
+        &config.bundle_path,
+        &PublishedTlsBundle {
+            version: 1,
             hostname: hostname.to_owned(),
-            acme_account_uri: account.id().to_owned(),
-            key_fingerprint: info.spki_sha256,
-            lineage: Uuid::new_v4().to_string(),
-            not_before_ms: info.not_before_ms,
-            not_after_ms: info.not_after_ms,
-        })
-        .await?;
-        // The old valid pair remains intact until this one protected bundle
-        // has been validated, fsync'd, and atomically renamed into place.
-        publish_bundle(
-            &config.bundle_path,
-            &PublishedTlsBundle {
-                version: 1,
-                hostname: hostname.to_owned(),
-                cert_pem: cert,
-                key_pem: key.to_string(),
-            },
-            now_ms()?,
-        )?;
-        Ok(())
-    }
-    .await;
-    for lease_id in leases {
-        if let Err(error) = dns.delete(lease_id).await {
-            tracing::warn!(event = "broker.acme_lease_delete_failed", %error);
+            cert_pem: cert,
+            key_pem: key.to_string(),
+        },
+        now_ms()?,
+    )?;
+    Ok(())
+}
+
+/// How often a published DNS-01 value is ensured again; well inside the
+/// relay's five-minute lifetime.
+const CHALLENGE_REFRESH: Duration = Duration::from_secs(120);
+
+async fn keep_challenges_alive(dns: &DnsChallengeClient, values: &[String]) {
+    loop {
+        tokio::time::sleep(CHALLENGE_REFRESH).await;
+        for value in values {
+            if let Err(error) = dns.ensure(value).await {
+                tracing::warn!(event = "broker.acme_challenge_refresh_failed", %error);
+            }
         }
     }
-    operation
 }
 
 pub(super) async fn ensure_acme_account(
