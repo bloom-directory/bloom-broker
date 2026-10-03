@@ -866,6 +866,7 @@ async fn serve_remote_tls_reconciled(
                     {
                         let material_config = config.clone();
                         let worker = tokio::spawn(async move {
+                            let mut fast_rounds = FAST_CERTIFICATE_ROUNDS;
                             loop {
                                 if let Err(error) = remote_material::ensure_acme_account(
                                     &material_config,
@@ -897,7 +898,17 @@ async fn serve_remote_tls_reconciled(
                                         tracing::warn!(event = "broker.remote_certificate_pending", %error);
                                     }
                                 }
-                                tokio::time::sleep(Duration::from_secs(60)).await;
+                                let published = remote_material::load_published_bundle(
+                                    &material_config.bundle_path,
+                                    &name,
+                                    broker_uid,
+                                )
+                                .is_ok();
+                                tokio::time::sleep(material_round_pause(
+                                    desired_remote && !published,
+                                    &mut fast_rounds,
+                                ))
+                                .await;
                             }
                         });
                         material_worker = Some((key, worker));
@@ -2088,9 +2099,47 @@ fn compiled_assurance_registry()
     AssuranceRegistry::compiled(vec![SolanaSystemTransferVerifier::compiled()])
 }
 
+/// Certificate rounds right after provisioning run every 10 s, so the first
+/// certificate follows the relay's DNS readiness within seconds; bounded, so
+/// a long outage settles back to the 60 s maintenance cadence instead of
+/// creating ACME orders every 10 s.
+const FAST_CERTIFICATE_ROUNDS: u32 = 30;
+
+fn material_round_pause(awaiting_certificate: bool, fast_rounds: &mut u32) -> Duration {
+    if awaiting_certificate && *fast_rounds > 0 {
+        *fast_rounds -= 1;
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(60)
+    }
+}
+
 #[cfg(test)]
 mod startup_failure_tests {
     use super::*;
+
+    #[test]
+    fn certificate_rounds_are_fast_until_a_certificate_exists_then_bounded() {
+        let mut fast = 2;
+        assert_eq!(
+            material_round_pause(true, &mut fast),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            material_round_pause(false, &mut fast),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            material_round_pause(true, &mut fast),
+            Duration::from_secs(10)
+        );
+        // The fast budget is spent: a long outage settles to the normal cadence.
+        assert_eq!(
+            material_round_pause(true, &mut fast),
+            Duration::from_secs(60)
+        );
+        assert_eq!(fast, 0);
+    }
     use bloom_broker_api::{ApprovalLifecycleState, BootEpoch, ReadinessState};
     use tracing_subscriber::prelude::*;
 
