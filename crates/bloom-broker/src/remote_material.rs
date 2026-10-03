@@ -110,6 +110,15 @@ impl Drop for PublishedTlsBundle {
     }
 }
 
+/// The relay refused because the installation's serving DNS is not ready yet
+/// (409): a prerequisite, not an ACME failure, so the caller may retry soon.
+pub(super) fn relay_not_ready(error: &Failure) -> bool {
+    matches!(
+        error.downcast_ref::<bloom_relay_client::ClientError>(),
+        Some(bloom_relay_client::ClientError::Refused(409))
+    )
+}
+
 pub(super) fn load_published_bundle(
     path: &Path,
     hostname: &str,
@@ -879,6 +888,18 @@ mod tests {
             )
             .into()),
         }
+    }
+
+    #[test]
+    fn only_a_relay_409_counts_as_not_ready() {
+        let not_ready: Failure = Box::new(bloom_relay_client::ClientError::Refused(409));
+        let unauthorized: Failure = Box::new(bloom_relay_client::ClientError::Refused(401));
+        let transport: Failure = Box::new(bloom_relay_client::ClientError::Transport);
+        let acme: Failure = "ACME order was not ready".into();
+        assert!(relay_not_ready(&not_ready));
+        assert!(!relay_not_ready(&unauthorized));
+        assert!(!relay_not_ready(&transport));
+        assert!(!relay_not_ready(&acme));
     }
 
     #[test]
