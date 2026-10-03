@@ -110,13 +110,22 @@ impl Drop for PublishedTlsBundle {
     }
 }
 
-/// The relay refused because the installation's serving DNS is not ready yet
-/// (409): a prerequisite, not an ACME failure, so the caller may retry soon.
+/// The relay refused the first DNS-01 ensure of a round with 409: its serving
+/// DNS is not ready yet. Raised before any ACME validation, so the caller may
+/// retry soon; any other failure (including later relay 409s) is not this.
+#[derive(Debug)]
+pub(super) struct RelayNotReady;
+
+impl std::fmt::Display for RelayNotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("relay is not ready for DNS-01 yet (HTTP 409); retrying shortly")
+    }
+}
+
+impl std::error::Error for RelayNotReady {}
+
 pub(super) fn relay_not_ready(error: &Failure) -> bool {
-    matches!(
-        error.downcast_ref::<bloom_relay_client::ClientError>(),
-        Some(bloom_relay_client::ClientError::Refused(409))
-    )
+    error.downcast_ref::<RelayNotReady>().is_some()
 }
 
 pub(super) fn load_published_bundle(
@@ -408,7 +417,15 @@ async fn maintain_certificate_with_policy(
                 return Err("ACME challenge identifier differs from assigned hostname".into());
             }
             let value = challenge.key_authorization().dns_value();
-            let mut ensured = dns.ensure(&value).await?;
+            // Before anything is sent to the CA: a 409 here means the relay's
+            // serving DNS is not ready yet (or its value set is full), so the
+            // worker may retry soon without spending ACME validations.
+            let mut ensured = dns.ensure(&value).await.map_err(|error| -> Failure {
+                match error {
+                    bloom_relay_client::ClientError::Refused(409) => Box::new(RelayNotReady),
+                    other => Box::new(other),
+                }
+            })?;
             let mut last_ensure = tokio::time::Instant::now();
             let deadline = last_ensure + Duration::from_secs(180);
             while !dns.ready(&value, ensured.revision).await? {
@@ -891,14 +908,16 @@ mod tests {
     }
 
     #[test]
-    fn only_a_relay_409_counts_as_not_ready() {
-        let not_ready: Failure = Box::new(bloom_relay_client::ClientError::Refused(409));
+    fn only_the_pre_validation_relay_refusal_counts_as_not_ready() {
+        let not_ready: Failure = Box::new(RelayNotReady);
+        // A 409 from any other relay call (for example reporting an issued
+        // certificate) must not speed up rounds: it could repeat issuance.
+        let later_conflict: Failure = Box::new(bloom_relay_client::ClientError::Refused(409));
         let unauthorized: Failure = Box::new(bloom_relay_client::ClientError::Refused(401));
-        let transport: Failure = Box::new(bloom_relay_client::ClientError::Transport);
         let acme: Failure = "ACME order was not ready".into();
         assert!(relay_not_ready(&not_ready));
+        assert!(!relay_not_ready(&later_conflict));
         assert!(!relay_not_ready(&unauthorized));
-        assert!(!relay_not_ready(&transport));
         assert!(!relay_not_ready(&acme));
     }
 
