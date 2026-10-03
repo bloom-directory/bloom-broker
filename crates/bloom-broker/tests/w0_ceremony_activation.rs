@@ -4,18 +4,19 @@
 //! `FileDescriptorName=` values (one per loopback family) and passes both
 //! descriptors to the Broker through `Sockets=`/`LISTEN_FDS`. The Broker
 //! must therefore consume those two descriptors and never bind the
-//! canonical addresses itself — a second bind can only ever fail with
-//! `EADDRINUSE`, and the canonical bind helpers have deliberately no
-//! fallback port, so the service would exit.
+//! configured addresses itself — a second bind can only ever fail with
+//! `EADDRINUSE`, and the bind helpers have deliberately no fallback port,
+//! so the service would exit.
 //!
 //! The inherited-listener cases run the real acquisition in a child process
 //! with genuine descriptors while the parent still holds both addresses. If
 //! the Broker attempted its own bind, the children could not succeed: the
 //! parent's listeners prove the ports are already taken.
 //!
-//! Every test that needs the canonical addresses holds them for the
-//! duration of the children, so the addresses are held once and released
-//! once rather than raced between tests.
+//! Ordinary socket tests never claim 18734: each run selects an ephemeral
+//! IPv4 port, holds it, binds IPv6 on the same port (retrying on collision),
+//! and passes the resulting endpoint to activation children alongside their
+//! inherited descriptors.
 
 #![cfg(target_os = "linux")]
 
@@ -25,16 +26,45 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Stdio};
 
-use bloom_broker::ceremony::{
-    CEREMONY_ADDR_V4, CEREMONY_ADDR_V6, CEREMONY_LOOPBACK_ADDRS, CeremonyBroker,
-};
+use bloom_broker::ceremony::{CeremonyBroker, CeremonyEndpoint};
 
 const CHILD_MODE: &str = "BLOOM_CEREMONY_ACTIVATION_CHILD";
+const CHILD_PORT: &str = "BLOOM_CEREMONY_TEST_PORT";
 const ACTIVATION_NAME_V4: &str = "broker-ceremony-ipv4";
 const ACTIVATION_NAME_V6: &str = "broker-ceremony-ipv6";
 const EXIT_REFUSED: i32 = 72;
 /// The single test the child re-exec must run so it reaches `run_child`.
 const CHILD_TEST: &str = "linux_ceremony_listeners_are_inherited_and_never_rebound";
+
+/// Bind IPv4 on port 0, hold it, bind IPv6 on the same port, and return the
+/// held pair plus its explicit nonzero endpoint. Retries if the IPv6 bind
+/// collides. Test setup only, not a product port allocator.
+fn ephemeral_endpoint_pair() -> (TcpListener, TcpListener, CeremonyEndpoint) {
+    loop {
+        let v4 = TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+            .expect("bind ephemeral IPv4 loopback");
+        let port = v4.local_addr().expect("ephemeral v4 address").port();
+        assert_ne!(port, 0, "ephemeral bind must select a nonzero port");
+        assert_ne!(
+            port, 18_734,
+            "ephemeral test pair must not claim the installed ceremony port"
+        );
+        let endpoint = CeremonyEndpoint::new(port).expect("ephemeral port is valid");
+        match TcpListener::bind(endpoint.addr_v6()) {
+            Ok(v6) => return (v4, v6, endpoint),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("bind ephemeral IPv6 loopback: {error}"),
+        }
+    }
+}
+
+fn child_endpoint() -> CeremonyEndpoint {
+    let port: u16 = std::env::var(CHILD_PORT)
+        .expect("activation child requires a test port")
+        .parse()
+        .expect("activation child port is numeric");
+    CeremonyEndpoint::new(port).expect("activation child port is valid")
+}
 
 /// `dup` the listener so the child can move the copy to descriptor 3.
 fn duplicate(raw: i32) -> OwnedFd {
@@ -56,6 +86,7 @@ fn spawn_child(
     v6: &TcpListener,
     names: &str,
     count: &str,
+    port: u16,
 ) -> std::process::Output {
     let v4_copy = duplicate(v4.as_raw_fd());
     let v6_copy = duplicate(v6.as_raw_fd());
@@ -65,6 +96,7 @@ fn spawn_child(
         .arg("--exact")
         .arg("--nocapture")
         .env(CHILD_MODE, mode)
+        .env(CHILD_PORT, port.to_string())
         .env("LISTEN_FDS", count)
         .env("LISTEN_FDNAMES", names)
         .stdout(Stdio::piped())
@@ -103,9 +135,11 @@ fn spawn_child(
 /// The child half: run the real acquisition and report what happened.
 fn run_child(mode: &str) -> ! {
     unsafe { std::env::set_var("LISTEN_PID", std::process::id().to_string()) };
+    let endpoint = child_endpoint();
     let result = CeremonyBroker::acquire_canonical_loopback_listeners(
         ACTIVATION_NAME_V4,
         ACTIVATION_NAME_V6,
+        endpoint,
     );
     match (mode, result) {
         ("inherit", Ok((v4, v6))) => {
@@ -136,31 +170,30 @@ fn linux_ceremony_listeners_are_inherited_and_never_rebound() {
         run_child(&mode);
     }
 
-    // Hold both canonical addresses for the whole test. Every child below
+    // Hold both configured addresses for the whole test. Every child below
     // runs while they are held, so any attempt to bind either would fail.
-    let held_v4 = TcpListener::bind(CEREMONY_ADDR_V4)
-        .expect("the test must own the canonical IPv4 address before the children run");
-    let held_v6 = TcpListener::bind(CEREMONY_ADDR_V6)
-        .expect("the test must own the canonical IPv6 address before the children run");
+    let (held_v4, held_v6, endpoint) = ephemeral_endpoint_pair();
+    let expected_v4 = endpoint.addr_v4();
+    let expected_v6 = endpoint.addr_v6();
 
-    // The verifier accepts a listener that really is on the canonical IPv4
+    // The verifier accepts a listener that really is on the configured IPv4
     // address.
     let checked = CeremonyBroker::require_canonical_loopback_listener(
         duplicate(held_v4.as_raw_fd()).into(),
-        CEREMONY_ADDR_V4,
+        expected_v4,
     )
-    .expect("the canonical IPv4 address must be accepted");
-    assert_eq!(checked.local_addr().unwrap(), CEREMONY_ADDR_V4);
+    .expect("the configured IPv4 address must be accepted");
+    assert_eq!(checked.local_addr().unwrap(), expected_v4);
     drop(checked);
 
     // A descriptor on any other address is refused, and the refusal names
-    // every canonical loopback address so the operator can see what would
-    // have been accepted.
+    // the observed and expected addresses.
     let wrong = TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
         .expect("bind an ephemeral listener");
     let observed = wrong.local_addr().unwrap();
-    assert!(!CEREMONY_LOOPBACK_ADDRS.contains(&observed));
-    let refused = CeremonyBroker::require_canonical_loopback_listener(wrong, CEREMONY_ADDR_V4)
+    assert_ne!(observed, expected_v4);
+    assert_ne!(observed, expected_v6);
+    let refused = CeremonyBroker::require_canonical_loopback_listener(wrong, expected_v4)
         .expect_err("a listener on another address must never be served");
     assert!(
         refused.message.contains(&observed.to_string()),
@@ -168,13 +201,42 @@ fn linux_ceremony_listeners_are_inherited_and_never_rebound() {
         refused.message
     );
     assert!(
-        refused.message.contains(&CEREMONY_ADDR_V6.to_string())
-            || refused.message.contains("[::1]:18734"),
-        "the refusal must list a canonical loopback address: {}",
+        refused.message.contains(&expected_v4.to_string()),
+        "the refusal must name the expected address: {}",
         refused.message
     );
 
-    // The load-bearing case: the child acquires BOTH canonical listeners
+    // Swapped families are refused even though both addresses are loopback.
+    let swapped = CeremonyBroker::require_canonical_loopback_listener(
+        duplicate(held_v6.as_raw_fd()).into(),
+        expected_v4,
+    )
+    .expect_err("swapped loopback families must never be served");
+    assert!(
+        swapped.message.contains(&expected_v4.to_string()),
+        "the refusal must name the expected address: {}",
+        swapped.message
+    );
+
+    // Wildcards are refused. Bind the wildcard on an ephemeral port so the
+    // bind always succeeds and the rejection assertion always executes (the
+    // configured loopback listeners stay held by the parent throughout).
+    let wildcard = TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+        .expect("bind an ephemeral wildcard listener");
+    let observed = wildcard.local_addr().unwrap();
+    assert!(
+        observed.ip().is_unspecified(),
+        "the probe must be a wildcard address: {observed}"
+    );
+    let refused = CeremonyBroker::require_canonical_loopback_listener(wildcard, expected_v4)
+        .expect_err("a wildcard listener must never be served");
+    assert!(
+        refused.message.contains(&observed.to_string()),
+        "the refusal must name the observed address: {}",
+        refused.message
+    );
+
+    // The load-bearing case: the child acquires BOTH configured listeners
     // while the parent still holds them. Success is only possible by
     // consuming both inherited descriptors, because binding would return
     // EADDRINUSE.
@@ -184,6 +246,7 @@ fn linux_ceremony_listeners_are_inherited_and_never_rebound() {
         &held_v6,
         &format!("{ACTIVATION_NAME_V4}:{ACTIVATION_NAME_V6}"),
         "2",
+        endpoint.port(),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -192,8 +255,8 @@ fn linux_ceremony_listeners_are_inherited_and_never_rebound() {
         "the Broker must consume both inherited listeners while the addresses are held.\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
-        stdout.contains(&format!("INHERITED {CEREMONY_ADDR_V4} {CEREMONY_ADDR_V6}")),
-        "the child must report both canonical addresses.\nstdout: {stdout}\nstderr: {stderr}"
+        stdout.contains(&format!("INHERITED {expected_v4} {expected_v6}")),
+        "the child must report both configured addresses.\nstdout: {stdout}\nstderr: {stderr}"
     );
 
     // Fail-closed cases. None of these may fall back to binding, which the
@@ -218,7 +281,7 @@ fn linux_ceremony_listeners_are_inherited_and_never_rebound() {
             "a name/count disagreement",
         ),
     ] {
-        let output = spawn_child(mode, &held_v4, &held_v6, names, count);
+        let output = spawn_child(mode, &held_v4, &held_v6, names, count, endpoint.port());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             output.status.code(),
@@ -237,14 +300,18 @@ fn a_service_with_no_inherited_descriptors_refuses_rather_than_binding() {
     if std::env::var(CHILD_MODE).is_ok() {
         return;
     }
-    // No LISTEN_FDS at all: the canonical addresses are free here, so a
+    // No LISTEN_FDS at all: the configured addresses are free here, so a
     // Broker that fell back to binding would succeed. It must not.
+    let (_held_v4, _held_v6, endpoint) = ephemeral_endpoint_pair();
+    // Hold the pair while the child runs so the port cannot be recycled; the
+    // child has no descriptors and must refuse without binding.
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .arg(CHILD_TEST)
         .arg("--exact")
         .arg("--nocapture")
         .env(CHILD_MODE, "no-activation")
+        .env(CHILD_PORT, endpoint.port().to_string())
         .env_remove("LISTEN_FDS")
         .env_remove("LISTEN_FDNAMES")
         .env_remove("LISTEN_PID")
