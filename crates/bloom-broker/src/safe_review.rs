@@ -524,8 +524,16 @@ const DEPLOYMENTS: &[Deployment] = &[
     },
 ];
 
-/// The canonical deployment at `address`, if Broker accepts it as `role`.
-fn deployment(role: Role, address: &str) -> Option<&'static Deployment> {
+/// The canonical deployment at `address`, if Broker accepts it as `role` on
+/// `chain`.
+///
+/// An address is evidence only on a chain where its code was read, so the
+/// chain is part of the lookup: on any other chain the same address can hold
+/// code someone else chose, and nothing may be recognised by identity there.
+fn deployment(chain: U256, role: Role, address: &str) -> Option<&'static Deployment> {
+    if !VERIFIED_CHAINS.iter().any(|id| U256::from(*id) == chain) {
+        return None;
+    }
     DEPLOYMENTS
         .iter()
         .find(|entry| entry.role == role && entry.address == address)
@@ -788,7 +796,7 @@ fn classify_call(call: &SafeCall<'_>) -> Result<String, ProtocolError> {
                 )));
             }
             let target = format!("{to:#x}");
-            let library = deployment(Role::Library, &target)
+            let library = deployment(chain, Role::Library, &target)
                 .ok_or_else(|| invalid("delegatecall target is not an official Safe library"))?;
             if data.len() < 4 {
                 return Err(invalid("Safe library calldata is truncated"));
@@ -1123,7 +1131,7 @@ pub(crate) fn outer_call(
         return Some(lines);
     }
     if is("createProxyWithNonce(address,bytes,uint256)")
-        && deployment(Role::Factory, &format!("{to:#x}")).is_some()
+        && deployment(U256::from(chain), Role::Factory, &format!("{to:#x}")).is_some()
     {
         let singleton = address_at(data, 0)?;
         // The singleton is the code the proxy delegates to for the rest of its
@@ -1135,7 +1143,11 @@ pub(crate) fn outer_call(
         // the predicted address, which is normal Safe practice, would be
         // theirs. Returning `None` puts the call back on the honest "Bloom
         // cannot read this" path it took before this reading existed.
-        let implementation = deployment(Role::Singleton, &format!("{singleton:#x}"))?;
+        let implementation = deployment(
+            U256::from(chain),
+            Role::Singleton,
+            &format!("{singleton:#x}"),
+        )?;
         let initializer = tail_bytes(data, 1)?;
         let salt = U256::from_be_slice(word(data, 2)?);
         let (selector, setup) = initializer.split_at_checked(4)?;
@@ -1160,7 +1172,9 @@ pub(crate) fn outer_call(
         let setup_target = address_at(setup, 2)?;
         let setup_data = tail_bytes(setup, 3)?;
         let fallback = address_at(setup, 4)?;
+        let payment_token = address_at(setup, 5)?;
         let payment = U256::from_be_slice(word(setup, 6)?);
+        let payment_receiver = address_at(setup, 7)?;
         lines.push("Action: Create a Safe".to_owned());
         lines.push(format!("Signatures required: {threshold} of {count}"));
         for (index, owner) in owners.iter().enumerate() {
@@ -1177,7 +1191,11 @@ pub(crate) fn outer_call(
         if fallback == Address::ZERO {
             lines.push("Fallback handler: none".to_owned());
         } else {
-            let handler = deployment(Role::FallbackHandler, &format!("{fallback:#x}"))?;
+            let handler = deployment(
+                U256::from(chain),
+                Role::FallbackHandler,
+                &format!("{fallback:#x}"),
+            )?;
             lines.push(format!(
                 "Fallback handler: {fallback} ({} {})",
                 handler.kind, handler.version
@@ -1192,8 +1210,27 @@ pub(crate) fn outer_call(
                 "Warning: setup runs extra code at {setup_target} that Bloom cannot read"
             ));
         }
+        // `setup` pays `payment` out of the new Safe's own balance -- funds
+        // already sent to the predicted address -- so the amount, the asset
+        // and the receiver are the three facts that decide what leaves it.
+        // A zero receiver is Safe's `tx.origin`, which is this wallet.
         if !payment.is_zero() {
             lines.push("Warning: the new Safe makes a payment during setup".to_owned());
+            lines.push(if payment_token == Address::ZERO {
+                format!("Setup payment: {}", native(payment, &chain_name))
+            } else {
+                format!("Setup payment: {payment} base units of token {payment_token}")
+            });
+            lines.push(if payment_receiver == Address::ZERO {
+                format!("Setup payment paid to: {from} (this wallet, as transaction origin)")
+            } else {
+                let mine = if payment_receiver == from {
+                    " (this wallet)"
+                } else {
+                    ""
+                };
+                format!("Setup payment paid to: {payment_receiver}{mine}")
+            });
         }
         if !value.is_zero() {
             lines.push(format!(
@@ -2029,8 +2066,12 @@ mod tests {
     const FACTORY: &str = "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67";
 
     fn outer(to: &str, input: &str) -> Option<String> {
+        outer_on(8453, to, input)
+    }
+
+    fn outer_on(chain: u64, to: &str, input: &str) -> Option<String> {
         outer_call(
-            8453,
+            chain,
             address(WALLET, "wallet").unwrap(),
             address(to, "to").unwrap(),
             U256::ZERO,
@@ -2146,6 +2187,100 @@ mod tests {
                 .unwrap_or_else(|| panic!("{label} is a canonical singleton"));
             assert!(create.contains(&format!("({label})")), "{create}");
         }
+    }
+
+    const CREATE_SAFE: &str = "0x1688f0b900000000000000000000000029fcb43b46531bca003ddc8fcb67ffe91900c762000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000013528400000000000000000000000000000000000000000000000000000000000000164b63e800d0000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000fd0732dc9e303f09fcef3a7388ad10a83459ec9900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d081000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+
+    /// The deployment table is evidence only where its code was read. On any
+    /// other chain the factory, singleton and fallback addresses can hold code
+    /// someone else chose, so a byte-for-byte canonical creation must not be
+    /// described as a Safe there.
+    #[test]
+    fn a_canonical_safe_creation_on_an_unverified_chain_is_not_read_as_one() {
+        assert!(outer_on(8453, FACTORY, CREATE_SAFE).is_some());
+        for chain in [31337, 11155111, 56] {
+            assert!(
+                !VERIFIED_CHAINS.contains(&chain),
+                "{chain} is meant to be unverified"
+            );
+            assert_eq!(
+                outer_on(chain, FACTORY, CREATE_SAFE),
+                None,
+                "chain {chain} must fall back to the ordinary review"
+            );
+        }
+    }
+
+    /// `setup` pays out of the new Safe's balance, so the page names the
+    /// amount, the asset and who receives it, not just that a payment exists.
+    #[test]
+    fn a_setup_payment_names_its_amount_asset_and_receiver() {
+        let fallback = "fd0732dc9e303f09fcef3a7388ad10a83459ec99";
+        let zero = "0".repeat(64);
+        let tail = format!("{fallback}{zero}{zero}{zero}");
+        assert!(CREATE_SAFE.contains(&tail));
+        let address_word = |value: &str| format!("{:0>64}", value);
+        let with_payment = |token: &str, amount: &str, receiver: &str| {
+            CREATE_SAFE.replacen(
+                &tail,
+                &format!(
+                    "{fallback}{}{}{}",
+                    address_word(token),
+                    address_word(amount),
+                    address_word(receiver)
+                ),
+                1,
+            )
+        };
+
+        // Native payment to a zero receiver: Safe pays `tx.origin`.
+        let native_payment = outer(FACTORY, &with_payment("0", "5", "0")).unwrap();
+        assert!(
+            native_payment.contains("Warning: the new Safe makes a payment during setup"),
+            "{native_payment}"
+        );
+        assert!(
+            native_payment.contains("Setup payment: 0.000000000000000005 ETH"),
+            "{native_payment}"
+        );
+        assert!(
+            native_payment.contains(
+                "Setup payment paid to: 0x8d4faFBA75a9dC50B4b296211509E856d2c6D081 (this wallet, as transaction origin)"
+            ),
+            "{native_payment}"
+        );
+
+        // Token payment to someone else.
+        let token_payment = outer(
+            FACTORY,
+            &with_payment(
+                "833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                "f4240",
+                "4000000000000000000000000000000000000000",
+            ),
+        )
+        .unwrap();
+        assert!(
+            token_payment.contains(
+                "Setup payment: 1000000 base units of token 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+            ),
+            "{token_payment}"
+        );
+        assert!(
+            token_payment
+                .lines()
+                .any(|line| line
+                    == "Setup payment paid to: 0x4000000000000000000000000000000000000000"),
+            "{token_payment}"
+        );
+        assert!(
+            !token_payment.contains("(this wallet, as"),
+            "{token_payment}"
+        );
+
+        // No payment, no payment lines.
+        let none = outer(FACTORY, CREATE_SAFE).unwrap();
+        assert!(!none.contains("Setup payment"), "{none}");
     }
 
     /// Two facts the execution review left off the page.
