@@ -351,16 +351,9 @@ fn apply_review_mode(
         // Every entry the reading depended on, including a token an argument
         // named, is held to the same observation age.
         for entry in selected {
-            let observed = entry.observed_at_ms.parse::<u64>().unwrap_or(0);
-            if context.now_ms > observed.saturating_add(settings.maximum_observation_age_ms) {
-                return Err(denied(
-                    ReviewReason::EvidenceExpired,
-                    format!(
-                        "the publisher's observation of {} is older than wallet policy allows",
-                        entry.contract_address
-                    ),
-                ));
-            }
+            entry
+                .check_observation_age(context.now_ms, settings.maximum_observation_age_ms)
+                .map_err(review_error)?;
             if !entries.contains(&entry) {
                 entries.push(entry);
             }
@@ -1232,7 +1225,7 @@ mod mode_tests {
     const NOW_MS: u64 = 1_750_000_000_000;
     const TRANSFER: &str = "transfer(address _to, uint256 _value)";
 
-    fn accepted_catalog() -> AcceptedCatalog {
+    fn accepted_catalog_at(observed_at_ms: u64) -> AcceptedCatalog {
         let descriptor = serde_json::json!({
             "context": {"contract": {"deployments": [{"chainId": 31337, "address": TOKEN_ADDRESS}]}},
             "display": {"formats": {TRANSFER: {
@@ -1267,7 +1260,7 @@ mod mode_tests {
                 }),
                 upgradeable: false,
                 implementation_hash: None,
-                observed_at_ms: DecimalU64::new(NOW_MS - 500),
+                observed_at_ms: DecimalU64::new(observed_at_ms),
             }],
             signatures: Vec::new(),
         };
@@ -1289,6 +1282,10 @@ mod mode_tests {
                 1,
             )
             .unwrap()
+    }
+
+    fn accepted_catalog() -> AcceptedCatalog {
+        accepted_catalog_at(NOW_MS - 500)
     }
 
     fn enabled_context() -> ClearSigningContext {
@@ -1500,6 +1497,29 @@ mod mode_tests {
         let error = review(&request, &policy, Address::ZERO, &enabled_context()).unwrap_err();
         assert!(
             error.message.contains("EVIDENCE_EXPIRED"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn a_future_observation_cannot_authorize_a_review() {
+        let request = batch(&[call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 1))]);
+        let error = review(
+            &request,
+            &enabled_policy(),
+            Address::ZERO,
+            &ClearSigningContext {
+                catalog: Some(accepted_catalog_at(NOW_MS + 1)),
+                verifier_digest: Digest32::from_bytes(
+                    bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES,
+                ),
+                now_ms: NOW_MS,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("later than trusted time"),
             "{}",
             error.message
         );
