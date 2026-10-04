@@ -115,6 +115,7 @@ from the environment.
 | `BLOOM_EDGE_MANIFEST` | `/etc/bloom/edge-manifest.json` |
 | `BLOOM_AUTHORITY_EDGE_HISTORY` | `/etc/bloom/authority-edge-history.json` |
 | `BLOOM_BROKER_AUDIT_CHECKPOINT_DIR` | `/var/db/bloom/broker/audit-checkpoints` |
+| `BLOOM_BROKER_RELAY_STATE_DIR` | Broker configuration directory; when `remote_tls` is omitted, selects the directory for the relay TLS bundle, control CA, and tunnel/DNS credentials. Must be absolute. |
 | `BLOOM_SESSION_SOCKET` | `/var/run/bloom/session/session.sock` |
 | `BLOOM_BROKER_SOCKET`, `BLOOM_BROKER_CONTROL_SOCKET` | No default; both are required by the service profile. |
 | `BLOOM_BROKER_STARTUP_STATUS` | No default; when set, Broker writes a startup-conflict diagnostic there. |
@@ -242,6 +243,40 @@ negotiated range moves as a unit instead. Broker accepts **1.4 only**
 
 Upgrading a 1.3 Machine is therefore required, not optional; a 1.3 peer does not
 degrade to a subset of functionality, it fails to connect at all.
+
+## Opt-in ACME staging lifecycle probe
+
+The ignored `remote_material::tests::letsencrypt_staging_issuance_and_renewal`
+test exercises Broker's real DNS-01 issuance and atomic renewal path against a
+disposable Relay allocation and Let's Encrypt staging. It does not start Broker,
+Signer, Machine, or an installed Triad, and it does not bind a local ceremony
+port. The allocation is permanently tombstoned when the test retires it.
+
+Run it only against a reviewed disposable Relay deployment configured to accept
+Let's Encrypt staging account URIs, with public enrollment temporarily admitting
+the runner and both serving and challenge DNS workers healthy. The two input
+files must be regular owner-only files: the pinned Relay control CA PEM and the
+Relay receipt verification key as 64 lowercase hexadecimal characters.
+
+```sh
+BLOOM_BROKER_ACME_STAGING_SMOKE=1 \
+BLOOM_RELAY_SMOKE_CONTROL_CA_FILE=/restricted/control-ca.pem \
+BLOOM_RELAY_SMOKE_RECEIPT_PUBLIC_KEY_FILE=/restricted/receipt-public-key.hex \
+cargo test -p bloom-broker --bin bloom-broker --locked \
+  remote_material::tests::letsencrypt_staging_issuance_and_renewal \
+  -- --ignored --exact --nocapture
+```
+
+The test creates the ACME account and all private material in a mode `0700`
+temporary directory, publishes only the account URI and certificate metadata,
+forces a second order through a private test-only renewal threshold, and attempts
+signed retirement after success, failure, or a handled Ctrl-C. Let's Encrypt's
+[staging environment](https://letsencrypt.org/docs/staging-environment/) uses
+separate accounts and untrusted test roots. The probe checks the staging account
+URI and issuer and never installs those roots into a system or application trust
+store. Abrupt process termination can prevent immediate retirement; DNS leases
+remain bounded by Relay expiry. Before concluding an interrupted run, the operator
+must verify signed retirement, DNS cleanup, and the permanent hostname tombstone.
 
 ## Durable-clock recovery and repair
 

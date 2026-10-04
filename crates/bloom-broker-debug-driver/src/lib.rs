@@ -5,13 +5,13 @@
 //! exercise the same public contracts as a browser.
 
 use bloom_signer_api::{
-    Base64UrlBytes, DecimalU64, HpkeEnvelope, ProtocolError, ProtocolErrorCode, Token,
+    Base64UrlBytes, DecimalU64, HpkeEnvelope, ProtocolError, ProtocolErrorCode, RpId, Token,
     WebAuthnAssertion, WebAuthnAttestation, WebAuthnCredential,
 };
 use ciborium::value::{Integer, Value};
 use hpke::{
-    Deserializable, Kem as KemTrait, OpModeS, Serializable, aead::ChaCha20Poly1305,
-    kdf::HkdfSha256, kem::X25519HkdfSha256, setup_sender,
+    Deserializable, Kem as KemTrait, OpModeR, OpModeS, Serializable, aead::ChaCha20Poly1305,
+    kdf::HkdfSha256, kem::X25519HkdfSha256, setup_receiver, setup_sender,
 };
 use p256::{
     ecdsa::{SigningKey, signature::Signer as _},
@@ -21,6 +21,47 @@ use rand::{TryRng as _, rngs::SysRng};
 use sha2::{Digest as _, Sha256};
 
 type BloomKem = X25519HkdfSha256;
+
+/// Browser-owned, one-use recipient for Signer's sensitive custody result.
+pub struct BrowserResultRecipient {
+    private_key: <BloomKem as KemTrait>::PrivateKey,
+    public_key: Base64UrlBytes,
+}
+
+impl BrowserResultRecipient {
+    pub fn generate() -> Self {
+        let (private_key, public_key) = BloomKem::gen_keypair();
+        Self {
+            private_key,
+            public_key: Base64UrlBytes::from_bytes(&public_key.to_bytes()),
+        }
+    }
+
+    pub fn public_key(&self) -> &Base64UrlBytes {
+        &self.public_key
+    }
+
+    pub fn open(
+        &self,
+        envelope: &HpkeEnvelope,
+        info: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, ProtocolError> {
+        let encapped =
+            <BloomKem as KemTrait>::EncappedKey::from_bytes(&envelope.kem_output.decode())
+                .map_err(|_| driver_error())?;
+        let mut context = setup_receiver::<ChaCha20Poly1305, HkdfSha256, BloomKem>(
+            &OpModeR::Base,
+            &self.private_key,
+            &encapped,
+            info,
+        )
+        .map_err(|_| driver_error())?;
+        context
+            .open(&envelope.ciphertext.decode(), aad)
+            .map_err(|_| driver_error())
+    }
+}
 
 /// Default ceremony origin used by existing callers and tests.
 pub const DEFAULT_CEREMONY_ORIGIN: &str = "http://localhost:18734";
@@ -95,12 +136,13 @@ impl VirtualAuthenticator {
 
     pub fn credential(&self, sign_count: u32) -> WebAuthnCredential {
         WebAuthnCredential {
+            surface: bloom_signer_api::legacy_local_surface(),
             credential_id: self.credential_id.clone(),
             cose_public_key: Base64UrlBytes::from_bytes(
                 &self.cose_public_key().expect("generated key encodes"),
             ),
             user_handle: self.user_handle.clone(),
-            rp_id: Token::new("localhost").expect("static RP token"),
+            rp_id: RpId::new("localhost").expect("static RP ID"),
             prf_salt: Base64UrlBytes::from_bytes(&Sha256::digest(
                 [
                     b"bloom-debug-driver-salt/v1".as_slice(),
@@ -117,8 +159,18 @@ impl VirtualAuthenticator {
     }
 
     pub fn assertion(&self, challenge: &[u8], sign_count: u32) -> WebAuthnAssertion {
-        let client_data = client_data("webauthn.get", challenge, &self.origin);
-        let authenticator_data = authenticator_data(0x05, sign_count);
+        self.assertion_for(challenge, sign_count, &self.origin, "localhost")
+    }
+
+    pub fn assertion_for(
+        &self,
+        challenge: &[u8],
+        sign_count: u32,
+        origin: &str,
+        rp_id: &str,
+    ) -> WebAuthnAssertion {
+        let client_data = client_data("webauthn.get", challenge, origin);
+        let authenticator_data = authenticator_data(0x05, sign_count, rp_id);
         let mut message = authenticator_data.clone();
         message.extend_from_slice(&Sha256::digest(&client_data));
         let signature: p256::ecdsa::Signature = self.signing_key.sign(&message);
@@ -132,7 +184,16 @@ impl VirtualAuthenticator {
     }
 
     pub fn attestation(&self, challenge: &[u8]) -> WebAuthnAttestation {
-        let mut auth_data = authenticator_data(0x45, 0);
+        self.attestation_for(challenge, &self.origin, "localhost")
+    }
+
+    pub fn attestation_for(
+        &self,
+        challenge: &[u8],
+        origin: &str,
+        rp_id: &str,
+    ) -> WebAuthnAttestation {
+        let mut auth_data = authenticator_data(0x45, 0, rp_id);
         auth_data.extend_from_slice(&[0_u8; 16]);
         let credential_id = self.credential_id.decode();
         auth_data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
@@ -150,7 +211,7 @@ impl VirtualAuthenticator {
             client_data_json: Base64UrlBytes::from_bytes(&client_data(
                 "webauthn.create",
                 challenge,
-                &self.origin,
+                origin,
             )),
             attestation_object: Base64UrlBytes::from_bytes(&encoded),
             transports: vec![Token::new("internal").expect("static transport token")],
@@ -213,8 +274,8 @@ fn client_data(kind: &str, challenge: &[u8], origin: &str) -> Vec<u8> {
     .expect("client data serializes")
 }
 
-fn authenticator_data(flags: u8, sign_count: u32) -> Vec<u8> {
-    let mut data = Sha256::digest(b"localhost").to_vec();
+fn authenticator_data(flags: u8, sign_count: u32, rp_id: &str) -> Vec<u8> {
+    let mut data = Sha256::digest(rp_id.as_bytes()).to_vec();
     data.push(flags);
     data.extend_from_slice(&sign_count.to_be_bytes());
     data
@@ -233,7 +294,9 @@ fn driver_error() -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_CEREMONY_ORIGIN, VirtualAuthenticator};
+    use super::{BrowserResultRecipient, DEFAULT_CEREMONY_ORIGIN, VirtualAuthenticator, seal_hpke};
+    use bloom_signer_api::Base64UrlBytes;
+    use sha2::{Digest as _, Sha256};
 
     #[test]
     fn instance_origin_is_stamped_into_client_data() {
@@ -263,5 +326,59 @@ mod tests {
         assert_eq!(first.deterministic_prf(), replay.deterministic_prf());
         assert_ne!(first.credential(0), other.credential(0));
         assert_ne!(first.deterministic_prf(), other.deterministic_prf());
+    }
+
+    #[test]
+    fn browser_result_recipient_opens_only_its_bound_envelope() {
+        let recipient = BrowserResultRecipient::generate();
+        let envelope = seal_hpke(
+            recipient.public_key(),
+            b"bloom-custody-output/v1",
+            b"typed-aad",
+            b"private recovery record",
+        )
+        .unwrap();
+        assert_eq!(
+            recipient
+                .open(&envelope, b"bloom-custody-output/v1", b"typed-aad")
+                .unwrap(),
+            b"private recovery record"
+        );
+        assert!(
+            recipient
+                .open(&envelope, b"bloom-custody-output/v1", b"wrong-aad")
+                .is_err()
+        );
+        assert!(
+            BrowserResultRecipient::generate()
+                .open(&envelope, b"bloom-custody-output/v1", b"typed-aad")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_proofs_bind_the_exact_https_origin_and_rp_id() {
+        let authenticator = VirtualAuthenticator::from_seed(b"remote-matrix-seed");
+        let hostname = "5ixwab6amyu7e42fjobm3myxqe.relay.bloom.directory";
+        let origin = format!("https://{hostname}");
+        let assertion = authenticator.assertion_for(b"challenge", 7, &origin, hostname);
+        let client: serde_json::Value =
+            serde_json::from_slice(&assertion.client_data_json.decode()).unwrap();
+        assert_eq!(client["origin"], origin);
+        assert_eq!(client["crossOrigin"], false);
+        assert_eq!(
+            client["challenge"],
+            Base64UrlBytes::from_bytes(b"challenge").encoded()
+        );
+        assert_eq!(
+            &assertion.authenticator_data.decode()[..32],
+            Sha256::digest(hostname.as_bytes()).as_slice()
+        );
+
+        let attestation = authenticator.attestation_for(b"registration", &origin, hostname);
+        let client: serde_json::Value =
+            serde_json::from_slice(&attestation.client_data_json.decode()).unwrap();
+        assert_eq!(client["origin"], origin);
+        assert_eq!(client["type"], "webauthn.create");
     }
 }

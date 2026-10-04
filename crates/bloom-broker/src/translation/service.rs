@@ -38,6 +38,10 @@ pub(crate) fn credential_to_machine(value: south::CredentialPublic) -> north::Cr
     north::CredentialPublic {
         credential_id: value.credential_id,
         wallet_id: value.wallet_id,
+        surface: Some(north::CeremonySurfaceRef {
+            surface_id: value.surface.surface_id,
+            identity_digest: value.surface.identity_digest,
+        }),
         created_at_ms: value.created_at_ms,
         state: match value.state {
             south::CredentialState::Active => north::CredentialState::Active,
@@ -139,6 +143,7 @@ mod tests {
         let credential = credential_to_machine(south::CredentialPublic {
             credential_id: south::Base64UrlBytes::from_bytes(&[7]),
             wallet_id: south::Token::new("wallet-8").unwrap(),
+            surface: south::legacy_local_surface(),
             created_at_ms: south::DecimalU64::new(9),
             state: south::CredentialState::Revoked,
         });
