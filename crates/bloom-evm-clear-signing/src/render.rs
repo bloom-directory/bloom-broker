@@ -181,6 +181,36 @@ impl SelectedEntry {
             admitted_functions: entry.admitted_functions.clone(),
         }
     }
+
+    /// Enforce the wallet's observation-age bound in both directions. A future
+    /// timestamp is not fresh evidence: it describes an observation that has
+    /// not happened under Broker's trusted clock.
+    pub fn check_observation_age(
+        &self,
+        now_ms: u64,
+        maximum_age_ms: u64,
+    ) -> Result<(), ReviewError> {
+        let observed = self.observed_at_ms.parse::<u64>().unwrap_or(0);
+        if observed > now_ms {
+            return Err(ReviewError::new(
+                ReviewReason::CatalogRejected,
+                format!(
+                    "the publisher's observation of {} is later than trusted time",
+                    self.contract_address
+                ),
+            ));
+        }
+        if now_ms > observed.saturating_add(maximum_age_ms) {
+            return Err(ReviewError::new(
+                ReviewReason::EvidenceExpired,
+                format!(
+                    "the publisher's observation of {} is older than wallet policy allows",
+                    self.contract_address
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn unsupported(message: impl Into<String>) -> ReviewError {
