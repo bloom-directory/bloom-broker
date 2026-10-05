@@ -3702,6 +3702,9 @@ async fn exchange_remote_fragment(
     let mut response = Json(serde_json::json!({
         "ceremony_id": ceremony_id,
         "csrf": csrf_value,
+        // Reuse the exact public projection served by read_session. Never
+        // serialize the internal BrowserSession snapshot into this response.
+        "session": snapshot.projection,
     }))
     .into_response();
     let set_cookie = format!(

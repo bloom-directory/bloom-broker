@@ -120,6 +120,9 @@ function fmtRemaining(ms) {
   return m < 60 ? `${m}m ${s % 60}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 let expiryTimer = null;
+// Once this page observes a terminal outcome, late async failures cannot
+// reopen approval. The server remains authoritative for all mutations.
+let approvalTerminal = false;
 function startExpiry(session, node) {
   const expiresAt = Number(session.expires_at_ms ||
     session.signer_contribution?.expires_at_ms ||
@@ -131,6 +134,7 @@ function startExpiry(session, node) {
       : `Time left: ${fmtRemaining(left)}`;
     node.className = left <= 0 ? "expired" : (left < 60000 ? "expiry soon" : "expiry");
     if (left <= 0) {
+      approvalTerminal = true;
       approve.disabled = true;
       statusNode.textContent = "This ceremony has expired. Nothing was changed.";
       clearInterval(expiryTimer);
@@ -517,6 +521,7 @@ function reportCeremonyError(error, fallback = "Ceremony failed") {
 }
 
 function reportApprovalFailure(error) {
+  if (approvalTerminal) return;
   const missingPrf = error?.name === "NotSupportedError" ||
     (typeof error?.message === "string" && error.message.includes("required PRF output"));
   reportCeremonyError(error, missingPrf
@@ -1082,10 +1087,24 @@ async function loadCrossSurface(session) {
   };
 }
 
+function requireLiveApproval(session) {
+  const expiresAt = Number(session.expires_at_ms ||
+    session.signer_contribution?.expires_at_ms ||
+    session.review_manifest?.expires_at_ms);
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+    approvalTerminal = true;
+  }
+  if (approvalTerminal) {
+    approve.disabled = true;
+    throw new Error("This ceremony is no longer available. Open a fresh link from Bloom.");
+  }
+}
+
 async function load() {
   await cryptoSelfTest();
   await purgeExpiredBrowserState();
   let sessionPath = "/api/session";
+  let session;
   if (remoteCeremony) {
     let exchanged;
     if (token) {
@@ -1098,6 +1117,9 @@ async function load() {
       token = "";
       if (!exchange.ok) throw new Error("Ceremony is unavailable");
       exchanged = await exchange.json();
+      // Only a fresh, authenticated exchange supplies this projection. Never
+      // reuse a stored projection on reload; it may describe a completed flow.
+      session = exchanged.session;
       exchanged.expires_at = Date.now() + 25 * 60 * 1000;
     } else {
       try { exchanged = JSON.parse(browserSessionStorage()?.getItem("bloom.ceremony.remote-session.v1") || "null"); }
@@ -1123,9 +1145,11 @@ async function load() {
   } else if (token.length !== 43) {
     throw new Error("Invalid ceremony URL");
   }
-  const response = await fetch(sessionPath, {headers: authHeaders, credentials: "same-origin"});
-  if (!response.ok) throw new Error("Ceremony is unavailable");
-  let session = await response.json();
+  if (!session) {
+    const response = await fetch(sessionPath, {headers: authHeaders, credentials: "same-origin"});
+    if (!response.ok) throw new Error("Ceremony is unavailable");
+    session = await response.json();
+  }
   if (ceremonyId && ceremonyId !== session.ceremony_id) {
     throw new Error("Ceremony identity changed");
   }
@@ -1176,12 +1200,20 @@ async function load() {
     genericInput.placeholder =
       '{"namespace_id":"...","grant":{...},"authority_signature":"..."}';
   }
+  requireLiveApproval(session);
   approve.disabled = false;
-  approve.onclick = () => run(session).catch(reportApprovalFailure);
+  approve.onclick = () => run(session).catch(error => {
+    // Timers can be throttled while the authenticator is open.
+    try { requireLiveApproval(session); }
+    catch (_) { return; }
+    reportApprovalFailure(error);
+  });
   cancel.onclick = async () => {
     cancel.disabled = true;
     try {
       await mutate(`/api/session/${ceremonyId}/cancel`, {});
+      approvalTerminal = true;
+      approve.disabled = true;
       await clearBrowserState(ceremonyId);
       statusNode.textContent = "Cancelled. You may close this tab.";
       approve.disabled = true;
@@ -1234,6 +1266,7 @@ async function cryptoSelfTest() {
 }
 
 async function run(session) {
+  requireLiveApproval(session);
   approve.disabled = true;
   statusNode.textContent = "Waiting for passkey verification…";
   const kind = session.ceremony_kind;
@@ -1366,6 +1399,7 @@ async function run(session) {
       decodeUrl(recipient), te.encode(info), te.encode(canonicalJson(aad)), secret
     );
   }
+  requireLiveApproval(session);
   let result;
   try {
     result = await mutate(`/api/session/${ceremonyId}/complete`, {
@@ -1384,6 +1418,8 @@ async function run(session) {
 }
 
 async function finishBrowserResult(session, result) {
+  approvalTerminal = true;
+  approve.disabled = true;
   const contribution = session.signer_contribution;
   statusNode.textContent = "Completed.";
   clearInterval(expiryTimer);

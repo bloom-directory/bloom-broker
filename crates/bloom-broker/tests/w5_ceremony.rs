@@ -703,7 +703,9 @@ process.stdout.write("browser-error-feedback-ok");
         String::from_utf8_lossy(&output.stdout),
         "browser-error-feedback-ok"
     );
-    assert!(asset.contains("approve.onclick = () => run(session).catch(reportApprovalFailure)"));
+    assert!(asset.contains("approve.onclick = () => run(session).catch(error => {"));
+    assert!(asset.contains("try { requireLiveApproval(session); }"));
+    assert!(asset.contains("reportApprovalFailure(error);"));
     assert!(asset.contains("Cancellation failed. Please try again."));
     assert!(asset.contains("This link couldn’t be opened"));
 }
@@ -5211,6 +5213,12 @@ async fn remote_fragment_is_single_use_and_cookie_is_ceremony_scoped() {
         .await
         .unwrap();
     assert_eq!(read.status(), StatusCode::OK);
+    let projection: serde_json::Value =
+        serde_json::from_slice(&read.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    // The exchange may embed only the existing browser-safe projection, never
+    // BrowserSession (which also contains internal authorization material).
+    assert_eq!(body["session"], projection);
+    assert_eq!(body.as_object().unwrap().len(), 3);
     let pending_result = app
         .clone()
         .oneshot(
