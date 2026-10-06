@@ -590,7 +590,7 @@ fn entry_summary(chain: &str, index: usize, to: Address, value: U256, data: &[u8
         format!("{index}. Send {} to {to}", native(value, chain))
     } else {
         format!(
-            "{index}. Contract call to {to} with {}, selector 0x{}, calldata keccak256 {:#x}",
+            "{index}. {OPAQUE_ENTRY}{to} with {}, selector 0x{}, calldata keccak256 {:#x}",
             native(value, chain),
             hex::encode(&data[..data.len().min(4)]),
             keccak256(data)
@@ -713,6 +713,23 @@ fn owner_change(
 /// use so the wallet-policy gate can ask whether the reading was opaque
 /// instead of re-deriving the question from the rendered text.
 pub(crate) const OPAQUE_ACTION: &str = "Action: Contract call";
+
+/// What follows the index of a batch entry Bloom could not read.
+const OPAQUE_ENTRY: &str = "Contract call to ";
+
+/// Whether a rendered line is a call Bloom read no further than its selector
+/// and hash: the whole transaction, or any one entry of a call-only batch.
+/// Both gates ask this one question, so a batch cannot hide what a direct
+/// call would have to disclose.
+fn is_opaque_line(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with(OPAQUE_ACTION)
+        || line.split_once(". ").is_some_and(|(index, rest)| {
+            !index.is_empty()
+                && index.bytes().all(|byte| byte.is_ascii_digit())
+                && rest.starts_with(OPAQUE_ENTRY)
+        })
+}
 
 fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
     let current = SafeSigners {
@@ -1255,9 +1272,7 @@ fn apply_clear_signing_policy(
     requested: Option<ReviewMode>,
     rendered: &str,
 ) -> Result<(), ProtocolError> {
-    let opaque = rendered
-        .lines()
-        .any(|line| line.trim_start().starts_with(OPAQUE_ACTION));
+    let opaque = rendered.lines().any(is_opaque_line);
     let Some(settings) = policy.clear_signing.as_ref() else {
         // An incapable wallet refuses a required mode rather than ignoring it,
         // exactly as the native path does.
@@ -1296,10 +1311,7 @@ fn apply_clear_signing_policy(
 
 /// Whether a prepared Safe review read its inner call, for the frozen record.
 pub(crate) fn is_opaque(review: &SafeReview) -> bool {
-    review
-        .action
-        .iter()
-        .any(|line| line.trim_start().starts_with(OPAQUE_ACTION))
+    review.action.iter().any(|line| is_opaque_line(line))
 }
 
 #[cfg(test)]
@@ -2031,6 +2043,52 @@ mod tests {
         assert!(action.contains(
             "2. Send 0.000000000000000003 ETH to 0x6000000000000000000000000000000000000000"
         ));
+    }
+
+    /// Wrapping an unreadable call in a MultiSendCallOnly batch rendered it as
+    /// a numbered entry, which the opacity gates did not recognise: a wallet
+    /// that refuses payloads Bloom cannot explain prepared it anyway, and the
+    /// journal recorded it as read.
+    #[test]
+    fn an_unreadable_batch_entry_obeys_the_wallets_opaque_payload_setting() {
+        let mut packed = multisend_entry(
+            "0x6000000000000000000000000000000000000000",
+            0,
+            &[0xde, 0xad, 0xbe, 0xef, 0x00, 0x11],
+        );
+        packed.extend(multisend_entry(
+            "0x6000000000000000000000000000000000000000",
+            3,
+            &[],
+        ));
+        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        value["safe_tx"]["to"] = serde_json::json!("0x9641d764fc13c8b624c04430c7356c1c7c8102e2");
+        value["safe_tx"]["value"] = serde_json::json!("0");
+        value["safe_tx"]["operation"] = serde_json::json!(1);
+        value["safe_tx"]["data"] =
+            serde_json::json!(format!("0x{}", hex::encode(multisend_calldata(&packed))));
+        value["library_code_hash"] =
+            serde_json::json!("0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939");
+        value["chain_id"] = serde_json::json!("8453");
+        let batch = serde_jcs::to_vec(&value).unwrap();
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+        // Safe libraries are only verified on some chains; Base is one of them.
+        let on_base = |opaque_exact_allowed| CanonicalWalletPolicy {
+            allowed_destinations: vec![PolicyDestination {
+                chain: token("evm-8453"),
+                destination: "exact".into(),
+            }],
+            ..clear_signing_policy(opaque_exact_allowed)
+        };
+
+        let error = review(&request(batch.clone()), &on_base(false), from)
+            .expect_err("an unreadable batch entry must obey the wallet's setting");
+        assert!(error.to_string().contains("cannot explain"), "{}", error);
+
+        let plan = review(&request(batch), &on_base(true), from)
+            .unwrap()
+            .unwrap();
+        assert!(is_opaque(&plan), "{:?}", plan.action);
     }
 
     #[test]
