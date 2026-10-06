@@ -1146,7 +1146,15 @@ impl CeremonyBroker {
         operation_id: &OperationId,
         now_ms: u64,
     ) -> Result<BrokerCeremonyPublicStatus, ProtocolError> {
-        self.expire_sessions(now_ms)?;
+        // The sweep is best-effort: a status read stays live (AC-18) even when
+        // the journal is latched or some other overdue session cannot be swept.
+        if let Err(error) = self.expire_sessions(now_ms) {
+            tracing::warn!(
+                event = "ceremony.status_sweep_failed",
+                protocol_error_code = error.code.as_str(),
+                "Broker answered ceremony status without sweeping overdue sessions"
+            );
+        }
         self.public_status(operation_id)
     }
 

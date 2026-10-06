@@ -706,10 +706,13 @@ impl BrokerRpcService {
             }
             Request::CeremonyStatus(request) => {
                 let operation_id = OperationId::new(request.id.as_str().to_owned())?;
-                Ok(Response::CeremonyStatus(
-                    self.ceremony
-                        .public_status_as_of(&operation_id, self.clock.now_ms(false)?)?,
-                ))
+                // The durable clock refuses while the audit journal is latched;
+                // status must stay readable then, just without the sweep.
+                let status = match self.clock.now_ms(false) {
+                    Ok(now_ms) => self.ceremony.public_status_as_of(&operation_id, now_ms)?,
+                    Err(_) => self.ceremony.public_status(&operation_id)?,
+                };
+                Ok(Response::CeremonyStatus(status))
             }
             Request::CeremonyCancel(request) => {
                 let operation_id = OperationId::new(request.id.as_str().to_owned())?;
