@@ -746,7 +746,7 @@ function describePolicy(manifest) {
   // it permits: none of them grants anyone an allowance by itself.
   const CLEAR_SIGNING_SETTINGS = [
     ["unlimited_allowance_allowed", "Unlimited-allowance requests",
-     "A request with no spending cap is refused outright.",
+     "A request to approve the maximum possible amount is refused. A large finite amount is still shown with its exact value.",
      "This wallet setting applies to all supported tokens. Each request will still need your approval " +
      "and will name its token and spender. This setting does not move tokens or grant a spender an allowance."],
     ["opaque_exact_allowed", "Requests Bloom cannot describe",

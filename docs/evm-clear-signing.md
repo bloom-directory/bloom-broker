@@ -180,6 +180,13 @@ After the policy commits, the staged allowance is reprepared and gets its own
 ordinary exact approval ceremony. These are two different authorizations, and
 the second is never automatic.
 
+The rule is narrow. It matches only canonical `approve(address,uint256)` with
+the exact U256 maximum. A requester can ask for one less, and that is shown as
+a finite allowance with its exact amount, not refused. Other calls that grant
+spending power, such as `increaseAllowance`, `setApprovalForAll` or Permit2's
+`approve`, are not recognised as allowances: a publisher that admits one signs
+it as `other`, which gets no allowance warning and no unlimited gate.
+
 Demonstrated so far: the default denial, against real services on a
 disposable chain, with the message above. The enabling ceremony and the
 reprepared allowance that follows it have been implemented but not yet
