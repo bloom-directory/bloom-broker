@@ -315,6 +315,15 @@ impl Harness {
     }
 
     fn authorize(&self, terms: &SealedApprovalTerms, payload: &[u8]) -> Result<(), String> {
+        self.authorize_at(terms, payload, NOW_MS)
+    }
+
+    fn authorize_at(
+        &self,
+        terms: &SealedApprovalTerms,
+        payload: &[u8],
+        reserved_at_ms: u64,
+    ) -> Result<(), String> {
         let approval_id = terms.approval_id().unwrap();
         let operation_id = OperationId::from_bytes(
             Sha256::digest(format!("sign:{}", approval_id.as_str())).into(),
@@ -335,8 +344,8 @@ impl Harness {
                 claim_assurance_evidence: None,
                 provenance: self.system_provenance().subject,
             },
-            reserved_at_ms: NOW_MS,
-            observed_utc_ms: Some(NOW_MS),
+            reserved_at_ms,
+            observed_utc_ms: Some(reserved_at_ms),
             monotonic_anchor_ns: 1_000_000,
             clock_boot_epoch: BootEpoch::from_bytes([1; 16]),
         };
@@ -879,6 +888,30 @@ fn a_withdrawal_committed_before_the_decision_blocks_the_frozen_review() {
         .unwrap();
     harness.activate(&opaque_terms, &opaque).unwrap();
     harness.authorize(&opaque_terms, b"opaque-payload").unwrap();
+}
+
+#[test]
+fn evidence_that_goes_stale_after_activation_cannot_sign() {
+    let harness = Harness::open(None);
+    let mut policy = clear_signing_policy(5);
+    // The entry was observed 1 s before NOW and may be used for 10 s.
+    policy.maximum_observation_age_ms = 10_000;
+    harness.install_policy(1, Some(policy));
+    install(&harness, &catalog(1, vec![entry()], 5)).unwrap();
+    let payload = b"clear-payload";
+    let (terms, approval) = prepared_clear_approval(&harness, payload);
+    harness.activate(&terms, &approval).unwrap();
+
+    // Signing is judged at the moment it is reserved, not when the terms were
+    // issued: 40 s later the approval is still valid but its evidence is not.
+    assert!(
+        harness
+            .authorize_at(&terms, payload, NOW_MS + 40_000)
+            .is_err()
+    );
+    harness
+        .authorize_at(&terms, payload, NOW_MS + 5_000)
+        .unwrap();
 }
 
 #[test]
