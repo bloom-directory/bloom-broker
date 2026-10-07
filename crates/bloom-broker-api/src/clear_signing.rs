@@ -96,8 +96,13 @@ impl ClearSigningPolicy {
             .iter()
             .map(|key| key.key_id.clone())
             .collect();
-        if !all_unique(&key_ids) {
-            return invalid("trusted key identities must be distinct");
+        let verifying_keys: Vec<_> = self
+            .trusted_keys
+            .iter()
+            .map(|key| key.verifying_key.decode())
+            .collect();
+        if !all_unique(&key_ids) || !all_unique(&verifying_keys) {
+            return invalid("trusted key identities and verifying keys must be distinct");
         }
         if self
             .trusted_keys
@@ -171,6 +176,14 @@ mod tests {
             .trusted_keys
             .push(duplicated.trusted_keys[0].clone());
         assert!(duplicated.validate().is_err());
+
+        // One verifying key under a second name is still one key.
+        let mut renamed = policy();
+        let mut alias = renamed.trusted_keys[0].clone();
+        alias.key_id = Token::new("publisher-2").unwrap();
+        renamed.trusted_keys.push(alias);
+        renamed.signature_threshold = 2;
+        assert!(renamed.validate().is_err());
 
         let mut short_key = policy();
         short_key.trusted_keys[0].verifying_key = Base64UrlBytes::from_bytes(&[7; 31]);

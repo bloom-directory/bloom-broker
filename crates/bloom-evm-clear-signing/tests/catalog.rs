@@ -117,6 +117,13 @@ fn a_threshold_counts_distinct_trusted_keys_not_signatures() {
         ReviewReason::CatalogRejected
     );
 
+    // One key trusted under two names, signing under both, is still one key.
+    let aliased = [trusted(1, "publisher-1"), trusted(1, "publisher-2")];
+    let mut renamed = catalog(vec![erc20_entry()]);
+    sign(&mut renamed, &[(1, "publisher-1"), (1, "publisher-2")]);
+    assert!(renamed.accept(size, &aliased, 2).is_err());
+    renamed.accept(size, &aliased, 1).unwrap();
+
     // A threshold no key set can satisfy is refused rather than lowered.
     let mut single = catalog(vec![erc20_entry()]);
     sign(&mut single, &[(1, "publisher-1")]);
