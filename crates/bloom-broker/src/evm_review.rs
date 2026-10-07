@@ -322,6 +322,38 @@ fn apply_review_mode(
                 "wallet policy does not allow approving payloads Bloom cannot explain",
             ));
         }
+        // Opaque is for calls Bloom cannot read. A call it can read keeps its
+        // reading and its refusals: the requester cannot opt out of them.
+        let catalog = context
+            .catalog
+            .as_ref()
+            .filter(|catalog| catalog.check_validity(context.now_ms).is_ok());
+        for (payload, call) in review.payloads.iter().zip(calls) {
+            let (Some(catalog), Some(call)) = (catalog, call) else {
+                continue;
+            };
+            match review_call(
+                catalog,
+                &CallContext {
+                    chain_id: call.chain_id,
+                    to: call.to,
+                    value: call.value,
+                    calldata: &call.calldata,
+                    native: native_units(&payload.chain),
+                    unlimited_allowance_allowed: settings.unlimited_allowance_allowed,
+                },
+            ) {
+                Err(error) if error.reason == ReviewReason::UnsupportedCall => {}
+                Err(error) => return Err(review_error(error)),
+                Ok(_) => {
+                    return Err(denied(
+                        ReviewReason::PolicyDenied,
+                        "Bloom can read this call, so it cannot be approved unread; \
+                         request a clear-signed review",
+                    ));
+                }
+            }
+        }
         return Ok(());
     }
     let mut entries: Vec<SelectedEntry> = Vec::new();
@@ -622,6 +654,48 @@ pub(crate) mod tests {
             .unwrap()
             .expect("review with payloads yields a review")
     }
+    #[test]
+    fn a_payload_other_than_the_approved_one_is_refused() {
+        let approved = TxEip1559 {
+            chain_id: 31337,
+            to: TxKind::Call(Address::repeat_byte(2)),
+            ..Default::default()
+        };
+        let other = TxEip1559 {
+            value: alloy::primitives::U256::from(1),
+            ..approved.clone()
+        };
+        let mut req = request(&approved.encoded_for_signing());
+        req.evm_review_payloads = vec![Base64UrlBytes::from_bytes(&other.encoded_for_signing())];
+        let error = review(&req, &policy(), Address::ZERO, &no_clear_signing()).unwrap_err();
+        assert!(
+            error.message.contains("differs from the approved selector"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn a_transaction_without_replay_protection_is_refused() {
+        let legacy = TxLegacy {
+            chain_id: None,
+            to: TxKind::Call(Address::repeat_byte(2)),
+            ..Default::default()
+        };
+        let error = review(
+            &request(&legacy.encoded_for_signing()),
+            &policy(),
+            Address::ZERO,
+            &no_clear_signing(),
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("replay-protected chain ID"),
+            "{}",
+            error.message
+        );
+    }
+
     #[test]
     fn verifies_both_preimages_and_renders_creation_without_claiming_ownership() {
         let modern = TxEip1559 {
@@ -1223,6 +1297,7 @@ mod mode_tests {
     const RECIPIENT: &str = "0x2222222222222222222222222222222222222222";
     const NOW_MS: u64 = 1_750_000_000_000;
     const TRANSFER: &str = "transfer(address _to, uint256 _value)";
+    const APPROVE: &str = "approve(address _spender, uint256 _value)";
 
     fn accepted_catalog_at(observed_at_ms: u64) -> AcceptedCatalog {
         let descriptor = serde_json::json!({
@@ -1231,6 +1306,13 @@ mod mode_tests {
                 "intent": "Send",
                 "fields": [
                     {"path": "_to", "label": "To", "format": "addressName", "visible": "always"},
+                    {"path": "_value", "label": "Amount", "format": "tokenAmount",
+                     "params": {"tokenPath": "@.to"}, "visible": "always"}
+                ]
+            }, APPROVE: {
+                "intent": "Approve",
+                "fields": [
+                    {"path": "_spender", "label": "Spender", "format": "addressName", "visible": "always"},
                     {"path": "_value", "label": "Amount", "format": "tokenAmount",
                      "params": {"tokenPath": "@.to"}, "visible": "always"}
                 ]
@@ -1245,10 +1327,16 @@ mod mode_tests {
             entries: vec![CatalogEntry {
                 chain_id: DecimalU64::new(31337),
                 contract_address: TOKEN_ADDRESS.into(),
-                admitted_functions: vec![AdmittedFunction {
-                    signature: TRANSFER.into(),
-                    action_class: ActionClass::Transfer,
-                }],
+                admitted_functions: vec![
+                    AdmittedFunction {
+                        signature: TRANSFER.into(),
+                        action_class: ActionClass::Transfer,
+                    },
+                    AdmittedFunction {
+                        signature: APPROVE.into(),
+                        action_class: ActionClass::Allowance,
+                    },
+                ],
                 descriptor_digest: Some(descriptor_digest(&descriptor).unwrap()),
                 flattened_descriptor: Some(descriptor),
                 runtime_code_hash: None,
@@ -1322,12 +1410,16 @@ mod mode_tests {
     }
 
     fn transfer_calldata(to: &str, amount: u64) -> Vec<u8> {
-        let function = bloom_evm_clear_signing::parse_function(TRANSFER).unwrap();
+        address_amount_calldata(TRANSFER, to, U256::from(amount))
+    }
+
+    fn address_amount_calldata(signature: &str, to: &str, amount: U256) -> Vec<u8> {
+        let function = bloom_evm_clear_signing::parse_function(signature).unwrap();
         let mut encoded = function.selector().to_vec();
         encoded.extend_from_slice(
             &U256::from_be_slice(to.parse::<Address>().unwrap().as_slice()).to_be_bytes::<32>(),
         );
-        encoded.extend_from_slice(&U256::from(amount).to_be_bytes::<32>());
+        encoded.extend_from_slice(&amount.to_be_bytes::<32>());
         encoded
     }
 
@@ -1443,6 +1535,57 @@ mod mode_tests {
         // the evidence block is absent.
         assert!(review.payloads[0].contract_call.is_none());
         assert!(review.clear_signing.is_none());
+    }
+
+    #[test]
+    fn a_readable_call_cannot_be_downgraded_to_opaque() {
+        let mut policy = enabled_policy();
+        policy.clear_signing.as_mut().unwrap().opaque_exact_allowed = true;
+        let mut request = batch(&[call(
+            TOKEN_ADDRESS,
+            address_amount_calldata(APPROVE, RECIPIENT, U256::MAX),
+        )]);
+        request.requested_review_mode = Some(ReviewMode::OpaqueExact);
+        // Unlimited and refused: asking for an opaque review does not skip it.
+        let error = review(&request, &policy, Address::ZERO, &enabled_context()).unwrap_err();
+        assert!(error.message.contains("POLICY_DENIED"), "{}", error.message);
+
+        // Readable and allowed: still not approvable unread.
+        let mut request = batch(&[call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 1))]);
+        request.requested_review_mode = Some(ReviewMode::OpaqueExact);
+        let error = review(&request, &policy, Address::ZERO, &enabled_context()).unwrap_err();
+        assert!(
+            error.message.contains("cannot be approved unread"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn an_unlimited_allowance_is_refused_unless_policy_allows_it() {
+        let request = batch(&[call(
+            TOKEN_ADDRESS,
+            address_amount_calldata(APPROVE, RECIPIENT, U256::MAX),
+        )]);
+        let error = review(
+            &request,
+            &enabled_policy(),
+            Address::ZERO,
+            &enabled_context(),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("POLICY_DENIED"), "{}", error.message);
+
+        let mut policy = enabled_policy();
+        policy
+            .clear_signing
+            .as_mut()
+            .unwrap()
+            .unlimited_allowance_allowed = true;
+        let review = review(&request, &policy, Address::ZERO, &enabled_context())
+            .unwrap()
+            .unwrap();
+        assert!(review.payloads[0].contract_call.is_some());
     }
 
     #[test]

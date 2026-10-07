@@ -148,8 +148,11 @@ calls; native sends and deployments keep their existing exact envelope review.
 One member Bloom cannot describe blocks the whole batch — there is no split,
 no mixed badge and no downgrade. `opaque_exact` must be requested explicitly,
 needs `opaque_exact_allowed`, and carries the inability-to-explain warning in
-the signed manifest. A wallet without the extension refuses a requested mode
-rather than ignoring it.
+the signed manifest. It covers only calls Bloom cannot read: a batch member
+the current catalog describes is refused under `opaque_exact`, and one the
+catalog would refuse (such as an unlimited allowance) is refused for that
+reason, so requesting `opaque_exact` cannot skip a refusal. A wallet without
+the extension refuses a requested mode rather than ignoring it.
 
 Approval expiry is capped at
 
