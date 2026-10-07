@@ -81,6 +81,16 @@ impl MachineSignOperationIdentity {
     }
 }
 
+/// What happened to an operator-supplied clear-signing catalog at startup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CatalogInstall {
+    Installed,
+    /// No enrolled wallet pins this catalog id.
+    NotPinned,
+    /// Every pinning wallet refused it; the stored catalog is unchanged.
+    Rejected(String),
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyAuthorityDiff {
@@ -1852,15 +1862,16 @@ impl BrokerAuthority {
             .map_err(|error| denied("CLEAR_SIGNING_CATALOG_REJECTED", error.to_string()))?;
         let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
-        let current: Option<(String, String)> = transaction
+        let catalog_jcs = serde_jcs::to_string(catalog).map_err(storage)?;
+        let current: Option<(String, String, String)> = transaction
             .query_row(
-                "SELECT sequence, content_digest FROM clear_signing_catalog
+                "SELECT sequence, content_digest, catalog_jcs FROM clear_signing_catalog
                  WHERE catalog_id = ?1",
                 params![catalog.catalog_id.as_str()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        if let Some((sequence, digest)) = current {
+        if let Some((sequence, digest, stored_jcs)) = current {
             let stored: u64 = sequence.parse().unwrap_or(0);
             let incoming = catalog.sequence.get();
             if incoming < stored
@@ -1871,9 +1882,11 @@ impl BrokerAuthority {
                     "catalog sequence rolls back or reuses a sequence with different content",
                 ));
             }
-            if incoming == stored {
-                // Same sequence, same content: an idempotent retry, not a
-                // second installation to journal.
+            if incoming == stored && stored_jcs == catalog_jcs {
+                // Same sequence, same bytes: an idempotent retry, not a
+                // second installation to journal. Same content with new
+                // signatures (a key rotation or a co-signature) falls through
+                // and replaces the stored signatures.
                 return Ok(accepted);
             }
         }
@@ -1888,7 +1901,7 @@ impl BrokerAuthority {
                 catalog.catalog_id.as_str(),
                 catalog.sequence.as_str(),
                 accepted.content_digest.as_str(),
-                serde_jcs::to_string(catalog).map_err(storage)?
+                catalog_jcs
             ],
         )?;
         self.journal.append_external_audit(
@@ -1914,11 +1927,15 @@ impl BrokerAuthority {
     /// names its catalog, and every review re-verifies it against the trust
     /// of the wallet actually being reviewed. A wallet that later rotates its
     /// keys stops accepting the stored bytes without anything being deleted.
+    ///
+    /// A snapshot every pinning wallet refuses (after a key rotation, or a
+    /// rolled-back file) is reported as `Rejected`, not as an error: Broker
+    /// keeps starting for every wallet. Only storage failures are errors.
     pub fn install_clear_signing_catalog_for_enrolled_wallets(
         &self,
         catalog: &ClearSigningCatalog,
         encoded_bytes: usize,
-    ) -> Result<bool, AuthorityError> {
+    ) -> Result<CatalogInstall, AuthorityError> {
         let mut last_error = None;
         for settings in self.enrolled_clear_signing_policies()? {
             if settings.catalog_id != catalog.catalog_id {
@@ -1931,14 +1948,15 @@ impl BrokerAuthority {
                 &trusted,
                 usize::from(settings.signature_threshold),
             ) {
-                Ok(_) => return Ok(true),
-                Err(error) => last_error = Some(error),
+                Ok(_) => return Ok(CatalogInstall::Installed),
+                Err(error @ AuthorityError::Denied { .. }) => last_error = Some(error),
+                Err(error) => return Err(error),
             }
         }
-        match last_error {
-            Some(error) => Err(error),
-            None => Ok(false),
-        }
+        Ok(match last_error {
+            Some(error) => CatalogInstall::Rejected(error.to_string()),
+            None => CatalogInstall::NotPinned,
+        })
     }
 
     fn enrolled_clear_signing_policies(&self) -> Result<Vec<ClearSigningPolicy>, AuthorityError> {

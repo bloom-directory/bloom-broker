@@ -5,7 +5,8 @@
 use bloom_broker::{
     authority::{
         AssuranceRegistry, AuthorizationInput, BrokerAuthority, CanonicalWalletPolicy,
-        CeremonyApprovalGrant, ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject,
+        CatalogInstall, CeremonyApprovalGrant, ProvenanceOperationClass, ProvenanceRecord,
+        ProvenanceSubject,
     },
     journal::{AuditSigner, BrokerJournal, FrozenReview, ReviewKind},
 };
@@ -487,10 +488,15 @@ fn catalog(sequence: u64, entries: Vec<CatalogEntry>, seed: u8) -> ClearSigningC
 
 fn install(harness: &Harness, catalog: &ClearSigningCatalog) -> Result<bool, String> {
     let bytes = serde_jcs::to_vec(catalog).unwrap().len();
-    harness
+    match harness
         .authority
         .install_clear_signing_catalog_for_enrolled_wallets(catalog, bytes)
-        .map_err(|error| error.to_string())
+        .unwrap()
+    {
+        CatalogInstall::Installed => Ok(true),
+        CatalogInstall::NotPinned => Ok(false),
+        CatalogInstall::Rejected(reason) => Err(reason),
+    }
 }
 
 fn stored(harness: &Harness) -> Option<AcceptedCatalog> {
@@ -566,6 +572,16 @@ fn stored_bytes_stop_authorizing_when_the_wallet_rotates_its_trust() {
     assert!(stored(&harness).is_none());
     // The operator can still see what is stored, which is how they notice.
     assert!(!harness.authority.clear_signing_status().unwrap().is_empty());
+
+    // Restarting with the old file is a rejection Broker reports and starts
+    // through, not a startup failure.
+    let error = install(&harness, &catalog(1, vec![entry()], 5)).unwrap_err();
+    assert!(error.contains("CATALOG_REJECTED"), "{error}");
+
+    // The publisher re-signs the same snapshot with the new key. The new
+    // signatures replace the old ones, so the stored bytes authorize again.
+    assert!(install(&harness, &catalog(1, vec![entry()], 6)).unwrap());
+    assert!(stored(&harness).unwrap().entry(1, TOKEN_ADDRESS).is_some());
 }
 
 #[test]

@@ -1636,7 +1636,7 @@ fn install_clear_signing_catalog(
                 format!("parse clear-signing catalog: {error}"),
             )
         })?;
-    let installed = authority
+    let outcome = authority
         .install_clear_signing_catalog_for_enrolled_wallets(&catalog, bytes.len())
         .map_err(|error| ProtocolError::new(ProtocolErrorCode::ClaimInvalid, error.to_string()))?;
     tracing::info!(
@@ -1644,7 +1644,7 @@ fn install_clear_signing_catalog(
         catalog_id = catalog.catalog_id.as_str(),
         sequence = catalog.sequence.as_str(),
         entries = catalog.entries.len(),
-        installed,
+        outcome = ?outcome,
         "Broker read the operator's clear-signing catalog"
     );
     Ok(())

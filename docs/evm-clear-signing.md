@@ -191,7 +191,11 @@ demonstrated with an owner approval.
 snapshot. Replacing that file and restarting Broker is the whole import
 surface: no network fetch, no refresh command, no second audit family. A
 snapshot no enrolled wallet trusts is logged and not installed; Broker still
-starts, because wallets that never enabled clear signing are unaffected.
+starts, because wallets that never enabled clear signing are unaffected. The
+same holds for a snapshot every pinning wallet refuses, such as an old file after
+a publisher key rotation or a rolled-back sequence: the stored catalog stays as
+it was and the log names the reason. After a rotation, re-signing the same
+sequence with the new key replaces the stored signatures.
 
 Broker stores one catalog per catalog identity, so a wallet that pins
 `bloom-tokens` and a wallet that pins `staging-catalog` do not evict each
