@@ -1414,7 +1414,15 @@ async function run(session) {
     if (!recovered.ok) throw error;
     result = await recovered.json();
   }
-  return finishBrowserResult(session, result);
+  try {
+    return await finishBrowserResult(session, result);
+  } catch (error) {
+    // Completion is terminal for approval, not proof that output recovery or
+    // acknowledgement succeeded. Keep the saved recipient and report failure
+    // here: the late-passkey guard must not hide this distinct result error.
+    reportCeremonyError(error,
+      "Ceremony completed, but the result could not be recovered or acknowledged. Keep this tab open.");
+  }
 }
 
 async function finishBrowserResult(session, result) {

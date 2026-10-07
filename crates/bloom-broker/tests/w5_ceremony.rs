@@ -5172,8 +5172,58 @@ async fn remote_fragment_is_single_use_and_cookie_is_ceremony_scoped() {
             ))
             .unwrap()
     };
-    let exchange = app.clone().oneshot(exchange_request()).await.unwrap();
+    // An exchange now carries review data: hostile or incomplete browser
+    // metadata must neither disclose that projection nor consume the link.
+    for (name, replacement) in [
+        ("origin", None),
+        ("origin", Some("https://sibling.relay.bloom.directory")),
+        ("sec-fetch-site", None),
+        ("sec-fetch-site", Some("cross-site")),
+        ("host", Some("sibling.relay.bloom.directory")),
+        ("content-type", Some("application/json; charset=utf-8")),
+    ] {
+        let mut request = exchange_request();
+        request.headers_mut().remove(name);
+        if let Some(value) = replacement {
+            request.headers_mut().insert(name, value.parse().unwrap());
+        }
+        let denied = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN, "{name}");
+        assert!(!denied.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(denied.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(
+            denied
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty()
+        );
+    }
+    let (first, second) = tokio::join!(
+        app.clone().oneshot(exchange_request()),
+        app.clone().oneshot(exchange_request())
+    );
+    let (first, second) = (first.unwrap(), second.unwrap());
+    let (exchange, denied) = if first.status() == StatusCode::OK {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert!(!denied.headers().contains_key(header::SET_COOKIE));
+    assert!(
+        denied
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
     assert_eq!(exchange.status(), StatusCode::OK);
+    assert_eq!(exchange.headers()[header::CACHE_CONTROL], "no-store");
     let cookie = exchange.headers()[header::SET_COOKIE]
         .to_str()
         .unwrap()
