@@ -288,6 +288,24 @@ pub(crate) fn review(
         request.requested_review_mode,
         clear_signing,
     )?;
+    if let Some(evidence) = &review.clear_signing
+        && let Some(settings) = &policy.clear_signing
+    {
+        // Cap the approval before a ceremony exists. Returning the permitted
+        // instant lets Machine regenerate terms under the existing
+        // operation-conflict rules instead of guessing.
+        let permitted = evidence.permitted_expiry_ms(settings.maximum_observation_age_ms);
+        if request.terms.expires_at_ms.get() > permitted {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                format!(
+                    "POLICY_DENIED: clear-signing evidence permits approval only until \
+                     {permitted}; regenerate the terms with an expiry at or before that. {}",
+                    ReviewReason::PolicyDenied.owner_action()
+                ),
+            ));
+        }
+    }
     Ok(Some(review))
 }
 
@@ -1486,6 +1504,35 @@ mod mode_tests {
             evidence.permitted_expiry_ms(86_400_000),
             NOW_MS - 500 + 86_400_000
         );
+    }
+
+    #[test]
+    fn an_approval_cannot_outlive_its_evidence() {
+        // The entry was observed at NOW_MS - 500 and may be used for one day.
+        let permitted = NOW_MS - 500 + 86_400_000;
+        let mut request = batch(&[call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 1))]);
+        request.terms.expires_at_ms = DecimalU64::new(permitted + 1);
+        let error = review(
+            &request,
+            &enabled_policy(),
+            Address::ZERO,
+            &enabled_context(),
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains(&format!("only until {permitted}")),
+            "{}",
+            error.message
+        );
+
+        request.terms.expires_at_ms = DecimalU64::new(permitted);
+        review(
+            &request,
+            &enabled_policy(),
+            Address::ZERO,
+            &enabled_context(),
+        )
+        .unwrap();
     }
 
     #[test]

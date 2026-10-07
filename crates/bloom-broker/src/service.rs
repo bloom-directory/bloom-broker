@@ -877,26 +877,6 @@ impl BrokerRpcService {
             context.evm_review =
                 crate::evm_review::review(&request, &policy, from, &clear_signing)?;
             review_policy = Some(policy.clone());
-            if let Some(review) = &context.evm_review
-                && let Some(evidence) = &review.clear_signing
-                && let Some(settings) = &policy.clear_signing
-            {
-                // Cap the approval before a ceremony exists. Returning the
-                // permitted instant lets Machine regenerate terms under the
-                // existing operation-conflict rules instead of guessing.
-                let permitted = evidence.permitted_expiry_ms(settings.maximum_observation_age_ms);
-                if request.terms.expires_at_ms.get() > permitted {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::ClaimInvalid,
-                        format!(
-                            "POLICY_DENIED: clear-signing evidence permits approval only until \
-                             {permitted}; regenerate the terms with an expiry at or before that. \
-                             {}",
-                            bloom_evm_clear_signing::ReviewReason::PolicyDenied.owner_action()
-                        ),
-                    ));
-                }
-            }
         }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
             ApprovalSelector::Exact {
