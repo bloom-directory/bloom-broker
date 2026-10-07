@@ -1,0 +1,126 @@
+{
+  "suite": "real-browser-service-boundary",
+  "cases": [
+    {
+      "mode": "remote",
+      "operation_id": "995c509de38ebab467fc9d7ce87eb0b9183ae7c99f5fd4b434de6e285cf167b3",
+      "terminal_action": "cancel",
+      "served_app_sha256": "2fd09cfc7ed450a42c630263185672753674a823976f33a9c660cf73b858d07d",
+      "fresh_api": [
+        {
+          "method": "POST",
+          "path": "/api/session/exchange",
+          "status": 200
+        },
+        {
+          "method": "GET",
+          "path": "/api/session/7c5cc39a51b295a04d6df965275e1e13d895b960e731d89b68f0327899f665a9/result",
+          "status": 409
+        },
+        {
+          "method": "POST",
+          "path": "/api/session/7c5cc39a51b295a04d6df965275e1e13d895b960e731d89b68f0327899f665a9/output-key",
+          "status": 200
+        }
+      ],
+      "fresh_review_passed": true,
+      "one_use_second_context_passed": true,
+      "reload_api": [
+        {
+          "method": "GET",
+          "path": "/api/session/7c5cc39a51b295a04d6df965275e1e13d895b960e731d89b68f0327899f665a9",
+          "status": 200
+        },
+        {
+          "method": "GET",
+          "path": "/api/session/7c5cc39a51b295a04d6df965275e1e13d895b960e731d89b68f0327899f665a9/result",
+          "status": 409
+        },
+        {
+          "method": "POST",
+          "path": "/api/session/7c5cc39a51b295a04d6df965275e1e13d895b960e731d89b68f0327899f665a9/output-key",
+          "status": 200
+        }
+      ],
+      "reload_retained_session_passed": true,
+      "terminal_machine_status": {
+        "identity": {
+          "kind": "custody",
+          "operation_id": "995c509de38ebab467fc9d7ce87eb0b9183ae7c99f5fd4b434de6e285cf167b3",
+          "ceremony_kind": "wallet_registration"
+        },
+        "ceremony_state": {
+          "kind": "custody",
+          "state": "CANCELLED"
+        },
+        "ceremony_expires_at_ms": null,
+        "review_manifest_digest": null,
+        "receipt_digest": null,
+        "last_error": null
+      },
+      "cancel_passed": true
+    },
+    {
+      "mode": "remote",
+      "operation_id": "43d0b5168922e22a41c5bd45e84181b344adbf6801872171b912d94d3fed4b6d",
+      "terminal_action": "expiry",
+      "served_app_sha256": "2fd09cfc7ed450a42c630263185672753674a823976f33a9c660cf73b858d07d",
+      "fresh_api": [
+        {
+          "method": "POST",
+          "path": "/api/session/exchange",
+          "status": 200
+        },
+        {
+          "method": "GET",
+          "path": "/api/session/73b77966f8c2d7e5b3fe86ea7bacf5150a4409ad7d7d9753fb99367eb3d9e771/result",
+          "status": 409
+        },
+        {
+          "method": "POST",
+          "path": "/api/session/73b77966f8c2d7e5b3fe86ea7bacf5150a4409ad7d7d9753fb99367eb3d9e771/output-key",
+          "status": 200
+        }
+      ],
+      "fresh_review_passed": true,
+      "one_use_second_context_passed": true,
+      "reload_api": [
+        {
+          "method": "GET",
+          "path": "/api/session/73b77966f8c2d7e5b3fe86ea7bacf5150a4409ad7d7d9753fb99367eb3d9e771",
+          "status": 200
+        },
+        {
+          "method": "GET",
+          "path": "/api/session/73b77966f8c2d7e5b3fe86ea7bacf5150a4409ad7d7d9753fb99367eb3d9e771/result",
+          "status": 409
+        },
+        {
+          "method": "POST",
+          "path": "/api/session/73b77966f8c2d7e5b3fe86ea7bacf5150a4409ad7d7d9753fb99367eb3d9e771/output-key",
+          "status": 200
+        }
+      ],
+      "reload_retained_session_passed": true,
+      "expiry": {
+        "status": "passed",
+        "machine_confirmed": true
+      }
+    }
+  ],
+  "complete": true,
+  "scope": "Disposable wallet registration/review/cancel only; no passkey invocation or wallet completion",
+  "surfaces": {
+    "desired_mode": "remote_enabled",
+    "desired_revision": "0",
+    "effective_mode": "remote_enabled",
+    "effective_revision": "0",
+    "local_origin": "http://localhost:28749",
+    "remote_origin": "https://bidjlrxtkhkdqy3q72e3wpnrti.relay.bloom.directory",
+    "remote_tls_ready": true,
+    "remote_routing_ready": true,
+    "stage": "enabled"
+  },
+  "browser_version": "153.0.8010.12",
+  "local_asset_verified": true
+}
