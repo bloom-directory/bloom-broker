@@ -1378,7 +1378,7 @@ impl CeremonyBroker {
             created_at_ms: now_ms,
             origin,
         })?;
-        let url = session_url(&session);
+        let url = new_session_url(&session)?;
         self.insert_session(ceremony_id.clone(), session)?;
         Ok(SealedApprovalPrepareResponse {
             approval_id: request
@@ -1423,14 +1423,14 @@ impl CeremonyBroker {
             if session.request_digest != request_digest || session.cross_surface.is_none() {
                 return Err(operation_conflict());
             }
-            if session.state != CeremonyState::AwaitingUser || session.token.is_none() {
+            if session.state != CeremonyState::AwaitingUser {
                 return Err(replay());
             }
             return Ok(CeremonyCrossSurfacePrepareResponse {
                 operation_id: request.operation_id,
                 ceremony_id: session.projection.ceremony_id.clone(),
                 state: BrokerCeremonyState::AwaitingUser,
-                destination_url: session_url(session),
+                destination_url: session_url(session).ok_or_else(launch_capability_consumed)?,
                 expires_at_ms: DecimalU64::new(session.expires_at_ms),
             });
         }
@@ -1496,7 +1496,7 @@ impl CeremonyBroker {
             source_prepared: None,
             handoff: None,
         });
-        let url = session_url(&session);
+        let url = new_session_url(&session)?;
         self.insert_session(ceremony_id.clone(), session)?;
         Ok(CeremonyCrossSurfacePrepareResponse {
             operation_id: request.operation_id,
@@ -1575,13 +1575,14 @@ impl CeremonyBroker {
                 .get(source_id.as_str())
                 .cloned()
                 .ok_or_else(not_found)?;
-            if pairing.destination_hpke_public_key != body.destination_hpke_public_key
-                || source.token.is_none()
-            {
+            if pairing.destination_hpke_public_key != body.destination_hpke_public_key {
                 return Err(operation_conflict());
             }
+            // The source tab's own launch capability is single-use too: a
+            // repeated pair cannot republish it once that tab exchanged it.
+            let source_url = session_url(&source).ok_or_else(operation_conflict)?;
             return Ok(serde_json::json!({
-                "source_url": session_url(&source),
+                "source_url": source_url,
                 "confirmation_code": pairing.confirmation_code,
                 "pairing_id": pairing.pairing_id,
                 "expires_at_ms": pairing.expires_at_ms,
@@ -2017,7 +2018,7 @@ impl CeremonyBroker {
             created_at_ms: now_ms,
             origin,
         })?;
-        let url = session_url(&session);
+        let url = new_session_url(&session)?;
         self.insert_session(ceremony_id, session)?;
         Ok(CustodyPrepareResponse {
             ceremony_kind: kind_to_machine(request.ceremony_kind),
@@ -2092,7 +2093,7 @@ impl CeremonyBroker {
         let response = PolicyUpdatePrepareResponse {
             operation_id: request.update.operation_id,
             ceremony_kind: BrokerCeremonyKind::PolicyUpdate,
-            ceremony_url: session_url(&session),
+            ceremony_url: new_session_url(&session)?,
             ceremony_expires_at_ms: DecimalU64::new(expires_at_ms),
             review_manifest_digest: request.broker_validation_receipt.review_manifest_digest,
         };
@@ -2128,10 +2129,13 @@ impl CeremonyBroker {
         }
         let manifest: PolicyUpdateReviewManifest =
             serde_json::from_value(session.projection.review_manifest.clone()?).ok()?;
+        let Some(ceremony_url) = session_url(session) else {
+            return Some(Err(launch_capability_consumed()));
+        };
         Some(Ok(PolicyUpdatePrepareResponse {
             operation_id: update.operation_id.clone(),
             ceremony_kind: BrokerCeremonyKind::PolicyUpdate,
-            ceremony_url: session_url(session),
+            ceremony_url,
             ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             review_manifest_digest: manifest.digest().ok()?,
         }))
@@ -2171,7 +2175,7 @@ impl CeremonyBroker {
             None => None,
         };
         let ceremony_url = if session.state == CeremonyState::AwaitingUser {
-            session.token.as_ref().map(|_| session_url(session))
+            session.token.as_ref().and_then(|_| session_url(session))
         } else {
             None
         };
@@ -2226,10 +2230,9 @@ impl CeremonyBroker {
             if manifest_approval_id != approval_id.as_str() {
                 return None;
             }
-            session
-                .token
-                .as_ref()
-                .map(|_| (session_url(session), DecimalU64::new(session.expires_at_ms)))
+            session.token.as_ref().and_then(|_| {
+                session_url(session).map(|url| (url, DecimalU64::new(session.expires_at_ms)))
+            })
         }))
     }
 
@@ -2358,10 +2361,20 @@ impl CeremonyBroker {
             latch_terminal(&mut snapshot, now_ms);
             (session.wallet_id.clone(), snapshot)
         };
-        self.inner
-            .signer
-            .cancel(operation_id)
-            .map_err(signer_error_to_machine)?;
+        // A Signer that no longer holds this operation has nothing left to
+        // release, which is the state cancelling asks for. Reporting that as a
+        // failed cancel left the Broker session non-terminal, and a live
+        // session occupies the wallet's one-ceremony slot: every later prepare
+        // answered `CEREMONY_RATE_LIMITED` until the session expired on its
+        // own, and cancelling again could not clear it either. Any other
+        // rejection still fails closed, because the Signer operation may well
+        // still be pending there.
+        if let Err(error) = self.inner.signer.cancel(operation_id) {
+            let error = signer_error_to_machine(error);
+            if error.code != ProtocolErrorCode::ApprovalNotFound {
+                return Err(error);
+            }
+        }
         // Both tabs belong to one operation. Leaving its auxiliary source live
         // would strand the wallet's admission slot after a successful cancel.
         let auxiliary = self
@@ -3104,10 +3117,13 @@ impl CeremonyBroker {
         }
         let manifest: ReviewManifest =
             serde_json::from_value(session.projection.review_manifest.clone()?).ok()?;
+        let Some(ceremony_url) = session_url(session) else {
+            return Some(Err(launch_capability_consumed()));
+        };
         Some(Ok(SealedApprovalPrepareResponse {
             approval_id: manifest.approval_id.clone(),
             state: ApprovalPrepareState::AwaitingCeremony,
-            ceremony_url: session_url(session),
+            ceremony_url,
             ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             review_manifest_digest: digest(&manifest).ok()?,
         }))
@@ -3129,11 +3145,14 @@ impl CeremonyBroker {
         }
         let contribution: CustodySignerContribution =
             serde_json::from_value(session.projection.signer_contribution.clone()).ok()?;
+        let Some(ceremony_url) = session_url(session) else {
+            return Some(Err(launch_capability_consumed()));
+        };
         Some(Ok(CustodyPrepareResponse {
             ceremony_kind: kind_to_machine(session.ceremony_kind),
             custody_operation_id: operation_id.clone(),
             state: CustodyPrepareState::AwaitingUser,
-            ceremony_url: session_url(session),
+            ceremony_url,
             ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             signer_contribution_digest: contribution.digest().ok()?,
         }))
@@ -3154,10 +3173,13 @@ impl CeremonyBroker {
         if is_terminal(session.state) {
             return Some(Err(replay()));
         }
+        let Some(ceremony_url) = session_url(session) else {
+            return Some(Err(launch_capability_consumed()));
+        };
         Some(Ok(PolicyUpdatePrepareResponse {
             operation_id: operation_id.clone(),
             ceremony_kind: BrokerCeremonyKind::PolicyUpdate,
-            ceremony_url: session_url(session),
+            ceremony_url,
             ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             review_manifest_digest: review_manifest_digest.clone(),
         }))
@@ -4612,20 +4634,32 @@ fn require_exact_header_name(
 /// Launch URL for a session on its own origin. Local surfaces are plain
 /// HTTP on this Broker's ceremony port and carry the token in the path; the
 /// hosted relay is HTTPS and carries a one-use capability in the fragment.
-fn session_url(session: &BrowserSession) -> String {
-    let token = token_for(session);
-    if session.origin.starts_with("http://") {
+///
+/// `None` once the launch capability is gone — the hosted page exchanged it
+/// for a ceremony cookie, or a terminal latch destroyed it. A session without
+/// its capability has no launch URL at all, and returning one built from an
+/// empty token would hand the caller a dead `#cap=` fragment that every
+/// exchange attempt rejects.
+fn session_url(session: &BrowserSession) -> Option<String> {
+    let token = session.token.as_ref()?;
+    Some(if session.origin.starts_with("http://") {
         format!("{}/ceremony/{}", session.origin, token.encoded())
     } else {
         format!("{}/ceremony/#cap={}", session.origin, token.encoded())
-    }
+    })
 }
 
-fn token_for(session: &BrowserSession) -> Base64UrlBytes {
-    session
-        .token
-        .clone()
-        .unwrap_or_else(|| Base64UrlBytes::from_bytes(&[]))
+/// Launch URL for a session Broker just minted, which always holds the
+/// capability [`CeremonyBroker::new_session`] generated for it. An absent
+/// token here is an internal inconsistency rather than a consumed link, so it
+/// fails closed instead of reporting a launch URL that cannot be opened.
+fn new_session_url(session: &BrowserSession) -> Result<String, ProtocolError> {
+    session_url(session).ok_or_else(|| {
+        protocol(
+            ProtocolErrorCode::ServiceUnavailable,
+            "new ceremony session carries no launch capability",
+        )
+    })
 }
 
 /// Stamp when a session reached its terminal state and destroy the launch
@@ -5011,6 +5045,19 @@ fn replay() -> ProtocolError {
     protocol(
         ProtocolErrorCode::CeremonyReplay,
         "ceremony is terminal and its launch URL cannot be revived",
+    )
+}
+
+/// A hosted launch capability is single-use: the first-party page exchanges it
+/// for the ceremony cookie and Broker destroys it. A later prepare retry has
+/// no launch URL left to return, and minting a replacement would hand a second
+/// tab the ceremony the first one is already holding. The retry says so
+/// explicitly instead; the ceremony itself is still live and the caller
+/// follows it by status.
+fn launch_capability_consumed() -> ProtocolError {
+    protocol(
+        ProtocolErrorCode::CeremonyReplay,
+        "ceremony launch capability was already exchanged for a browser session; follow the live ceremony by status",
     )
 }
 
