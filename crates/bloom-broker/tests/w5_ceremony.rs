@@ -1082,6 +1082,9 @@ struct MockSigner {
     completion_error: Option<bloom_signer_api::ProtocolErrorCode>,
     sensitive_result: bool,
     cancellation_fails: AtomicBool,
+    /// A Signer that no longer holds the operation at all, which answers the
+    /// documented `APPROVAL_NOT_FOUND` rather than the transient outage above.
+    cancellation_forgotten: bool,
     /// Surfaces holding one active passkey for every wallet.
     passkey_surfaces: Vec<&'static str>,
 }
@@ -1566,7 +1569,18 @@ impl MockSigner {
             completion_error: None,
             sensitive_result: false,
             cancellation_fails: AtomicBool::new(false),
+            cancellation_forgotten: false,
             passkey_surfaces: vec!["local"],
+        }
+    }
+
+    /// A Signer that has already let go of the prepared operation — expired or
+    /// failed closed before the browser ever paired — and so answers the
+    /// documented `APPROVAL_NOT_FOUND` to a cancel.
+    fn forgetting_prepared_operations() -> Self {
+        Self {
+            cancellation_forgotten: true,
+            ..Self::new()
         }
     }
 
@@ -1933,6 +1947,15 @@ impl CeremonySigner for MockSigner {
             ));
         }
         self.pending.lock().remove(operation_id);
+        if self.cancellation_forgotten {
+            // Nothing was left to release, and the Signer says so rather than
+            // reporting a release it never performed. The operation is gone
+            // either way, which is the state the cancel asked for.
+            return Err(bloom_signer_api::ProtocolError::new(
+                bloom_signer_api::ProtocolErrorCode::ApprovalNotFound,
+                "mock signer no longer holds this operation",
+            ));
+        }
         Ok(())
     }
 
@@ -4633,6 +4656,58 @@ async fn cancelling_a_ceremony_that_already_died_succeeds_instead_of_stranding_t
         broker.status(&operation_id),
         Some(CeremonyState::Expired),
         "cancel is a no-op here and must not relabel how the ceremony actually ended"
+    );
+}
+
+#[test]
+fn cancelling_an_operation_the_signer_already_forgot_frees_the_wallets_ceremony_slot() {
+    let signer = Arc::new(MockSigner::forgetting_prepared_operations());
+    let broker = CeremonyBroker::new(signer.clone());
+    let wallet = Token::new("wallet-cancel-forgotten").unwrap();
+    let operation_id = operation("c6");
+    prepare(&broker, operation_id.clone(), Some(wallet.clone()), 10_000);
+
+    // The Signer answers the documented `APPROVAL_NOT_FOUND`: it let the
+    // operation go before the cancel arrived, so there is nothing left to
+    // release — which is precisely the state the caller asked for.
+    broker
+        .cancel(&operation_id, 10_000)
+        .expect("a Signer with nothing left to release is a cancel that succeeded");
+    assert_eq!(signer.cancellations.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        broker.status(&operation_id),
+        Some(CeremonyState::Cancelled),
+        "the cancel must latch terminal; a live session keeps holding the wallet's slot"
+    );
+    // Terminal and clean: cancelling again is a no-op success rather than a
+    // second attempt at a release, so it adds no further backoff strike.
+    broker
+        .cancel(&operation_id, 10_001)
+        .expect("a cancelled ceremony is already what a repeated cancel asks for");
+    assert_eq!(
+        signer.cancellations.load(Ordering::SeqCst),
+        1,
+        "the repeated cancel must not reach the Signer again"
+    );
+
+    // Only the one-cancellation cooldown stands between the wallet and its
+    // next ceremony now. While this cancel failed, the session stayed live
+    // and every later prepare was refused for the whole session lifetime
+    // with `wallet already has a live ceremony`, with no way to clear it.
+    let cooling = try_prepare(&broker, operation("c7"), Some(wallet.clone()), 10_002).unwrap_err();
+    assert_eq!(cooling.code, ProtocolErrorCode::CeremonyRateLimited);
+    assert_eq!(
+        cooling.message, "wallet ceremony is in cancellation backoff; retry after 1998 ms",
+        "the only remaining refusal must be the cancellation cooldown, not a live session"
+    );
+
+    // Same operation retried once the cooldown elapses, which is how Machine
+    // follows a rate-limited prepare.
+    prepare(&broker, operation("c7"), Some(wallet), 12_000);
+    assert_eq!(
+        broker.status(&operation("c7")),
+        Some(CeremonyState::AwaitingUser),
+        "the wallet must be able to start a fresh ceremony after the cooldown"
     );
 }
 
