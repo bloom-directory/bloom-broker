@@ -2009,6 +2009,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn threshold_one_warning_does_not_trust_the_reported_owner_count() {
+        let mut data = keccak256("changeThreshold(uint256)").as_slice()[..4].to_vec();
+        data.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
+        let reported = SafeSigners {
+            threshold: U256::from(1),
+            owners: 1,
+        };
+        for current in [Some(&reported), None] {
+            let action = owner_change(Address::ZERO, U256::ZERO, &data, current).unwrap();
+            assert!(action.contains("any single owner will then be able to move"));
+        }
+    }
+
     fn multisend_entry(to: &str, value: u64, data: &[u8]) -> Vec<u8> {
         let mut out = vec![0_u8];
         out.extend_from_slice(address(to, "to").unwrap().as_slice());
