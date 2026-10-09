@@ -884,7 +884,7 @@ fn write_startup_failure(
         }
         fs::remove_file(&temporary)?;
     }
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
@@ -1668,7 +1668,7 @@ fn install_clear_signing_catalog(
 /// only root or Broker's own account may be able to write it.
 fn load_theme_css(path: &Path, broker_uid: u32) -> Result<String, ProtocolError> {
     const THEME_MAX_BYTES: u64 = 64 * 1024;
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
