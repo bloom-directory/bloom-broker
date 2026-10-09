@@ -1270,6 +1270,31 @@ mod tests {
     }
 
     #[test]
+    fn impossible_reported_owner_sets_and_thresholds_are_refused() {
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+        for threshold in ["0", "2"] {
+            let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+            value["threshold"] = serde_json::json!(threshold);
+            let request = request(serde_jcs::to_vec(&value).unwrap());
+            assert!(
+                review(&request, &policy(), from)
+                    .unwrap_err()
+                    .message
+                    .contains("threshold must be between")
+            );
+        }
+        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        value["owners"] = serde_json::json!([from.to_string(), from.to_string()]);
+        let request = request(serde_jcs::to_vec(&value).unwrap());
+        assert!(
+            review(&request, &policy(), from)
+                .unwrap_err()
+                .message
+                .contains("owners must be distinct")
+        );
+    }
+
+    #[test]
     fn call_only_batches_disclose_every_entry() {
         let mut erc20 = vec![0xa9, 0x05, 0x9c, 0xbb];
         erc20.extend_from_slice(&[0; 12]);
