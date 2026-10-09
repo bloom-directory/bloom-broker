@@ -1152,34 +1152,6 @@ pub(crate) fn outer_call(
             "Signature data slots (not verified owner signatures): {}",
             signatures.len() / 65
         ));
-        // Only a non-zero `gasPrice` makes the Safe pay a refund. `safeTxGas`
-        // and `baseGas` are execution bounds, so warning on them fired on
-        // ordinary transactions and said nothing about what was actually paid.
-        // When it does fire, the three facts that decide the loss are the
-        // token, the price, and who receives it.
-        let gas_price = word(data, 6).map(U256::from_be_slice).unwrap_or_default();
-        if !gas_price.is_zero() {
-            let gas_token = address_at(data, 7).unwrap_or(Address::ZERO);
-            let receiver = address_at(data, 8).unwrap_or(Address::ZERO);
-            lines.push("Warning: the Safe pays a gas refund for this execution".to_owned());
-            lines.push(format!(
-                "Refund token: {}",
-                if gas_token == Address::ZERO {
-                    format!("native {chain_name}")
-                } else {
-                    format!("{gas_token}")
-                }
-            ));
-            lines.push(format!("Refund gas price: {gas_price}"));
-            lines.push(format!(
-                "Refund paid to: {}",
-                if receiver == Address::ZERO {
-                    "whoever executes this transaction".to_owned()
-                } else {
-                    format!("{receiver}")
-                }
-            ));
-        }
         if !value.is_zero() {
             lines.push(format!(
                 "Warning: this also sends {} to the Safe",

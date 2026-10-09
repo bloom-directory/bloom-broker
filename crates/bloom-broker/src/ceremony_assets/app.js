@@ -470,9 +470,10 @@ function describeTransfer(manifest) {
     // Every mandatory warning, in the order the verifier produced it, kept
     // visible rather than folded into the fact list or the details section.
     const warnings = [];
-    for (const payload of evmPayloads) {
+    for (const [index, payload] of evmPayloads.entries()) {
       for (const line of payload.safe_call || []) {
-        if (line.startsWith("Warning: ")) warnings.push(line.slice(9));
+        if (line.startsWith("Warning: ")) warnings.push(
+          (evmPayloads.length > 1 ? `Transaction ${index + 1}: ` : "") + line.slice(9));
       }
     }
     for (const payload of calls) {
