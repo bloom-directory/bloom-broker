@@ -24,8 +24,8 @@ pub const EVM_CLEAR_SIGNING_VERIFIER_ID: &str = "evm-clear-signing-v1";
 /// A changed verifier is a changed identity, so a wallet that pinned this
 /// digest stops accepting reviews from a build whose sources moved.
 pub const EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES: [u8; 32] = [
-    0xb1, 0x4d, 0x53, 0xa0, 0x78, 0x3e, 0x83, 0x5f, 0xc9, 0xc2, 0xee, 0x06, 0xdb, 0xe4, 0xa5, 0x97,
-    0x18, 0x6e, 0xd7, 0x54, 0x23, 0xf6, 0x05, 0x62, 0x08, 0x50, 0x12, 0xb8, 0x0b, 0xef, 0x02, 0x72,
+    0x30, 0x2d, 0x2b, 0xd0, 0xe2, 0xf0, 0xb1, 0x5d, 0xe8, 0xaa, 0x6e, 0x09, 0x07, 0x13, 0xff, 0xd7,
+    0x6a, 0xd1, 0x4e, 0x9b, 0xe9, 0xe4, 0x89, 0xfe, 0x27, 0x8d, 0xb2, 0xf8, 0xa3, 0x4b, 0xa7, 0x35,
 ];
 
 pub const DEFAULT_MAXIMUM_OBSERVATION_AGE_MS: u64 = 24 * 60 * 60 * 1000;
@@ -96,8 +96,13 @@ impl ClearSigningPolicy {
             .iter()
             .map(|key| key.key_id.clone())
             .collect();
-        if !all_unique(&key_ids) {
-            return invalid("trusted key identities must be distinct");
+        let verifying_keys: Vec<_> = self
+            .trusted_keys
+            .iter()
+            .map(|key| key.verifying_key.decode())
+            .collect();
+        if !all_unique(&key_ids) || !all_unique(&verifying_keys) {
+            return invalid("trusted key identities and verifying keys must be distinct");
         }
         if self
             .trusted_keys
@@ -171,6 +176,14 @@ mod tests {
             .trusted_keys
             .push(duplicated.trusted_keys[0].clone());
         assert!(duplicated.validate().is_err());
+
+        // One verifying key under a second name is still one key.
+        let mut renamed = policy();
+        let mut alias = renamed.trusted_keys[0].clone();
+        alias.key_id = Token::new("publisher-2").unwrap();
+        renamed.trusted_keys.push(alias);
+        renamed.signature_threshold = 2;
+        assert!(renamed.validate().is_err());
 
         let mut short_key = policy();
         short_key.trusted_keys[0].verifying_key = Base64UrlBytes::from_bytes(&[7; 31]);

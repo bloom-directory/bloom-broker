@@ -475,6 +475,29 @@ for (const expected of ["Approve one Safe transaction", "ERC-20 transfer",
   "Threshold 2 of 2 owners"]) {{
   if (!rendered.includes(expected)) throw new Error(`Safe review not disclosed ${{expected}}: ${{rendered}}`);
 }}
+
+// A batch member Bloom could not read is never shown as a plain send, and a
+// batch spanning two networks is not headed with the first one alone.
+const unread = (chain_id, chain) => ({{
+  chain_id, chain,
+  sender: "0x1111111111111111111111111111111111111111",
+  destination: "0x0909090909090909090909090909090909090909",
+  value: "0", value_display: "0 ETH",
+  nonce: "3", gas_limit: "60000",
+  fee: {{kind: "legacy", gas_price: "1000000000", gas_price_display: "1 Gwei"}},
+  payload_keccak: "0x47e9",
+  calldata_bytes: "68", calldata_keccak: "0x1234", calldata_hex: "0x095ea7b3"
+}});
+const batch = session(unread("1", "ethereum"));
+batch.review_manifest.canonical_plan = JSON.stringify({{evm_review: {{payloads: [
+  unread("1", "ethereum"), unread("8453", "base")]}}}});
+renderReview(batch);
+rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
+if (!rendered.includes("Approve a call Bloom cannot read") || rendered.includes("Send 0 ETH") ||
+    rendered.includes("transactions on Ethereum") ||
+    !rendered.includes("Approve 2 transactions on more than one network")) {{
+  throw new Error(`unread batch misdescribed: ${{rendered}}`);
+}}
 "#
     );
     let output = Command::new("node")
@@ -550,6 +573,37 @@ for (const expected of [
 // The old label understated the grant by calling it only a deploy permission.
 for (const stale of ["Allow deploying contracts on", "Stop allowing contract deployment on"]) {{
   if (rendered.includes(stale)) throw new Error(`stale policy wording ${{stale}}: ${{rendered}}`);
+}}
+
+// Without clear signing nothing is refused for being unreadable or
+// unlimited, so switching it off loosens the wallet and switching it on
+// tightens it. Each direction must say so.
+const strict = {{
+  catalog_id: "bloom-evm", signature_threshold: 2, maximum_observation_age_ms: 3600000,
+  unlimited_allowance_allowed: false, opaque_exact_allowed: false,
+  verifier: {{verifier_digest: "ab".repeat(32)}},
+  trusted_keys: [{{key_id: "publisher-1", verifying_key: "cd".repeat(32)}}]
+}};
+function renderClearSigning(before, after) {{
+  renderReview({{
+    ceremony_kind: "policy_update",
+    expires_at_ms: Date.now() + 60000,
+    signer_contribution: {{wallet_id: "wallet-primary"}},
+    review_manifest: {{schema: "bloom.review-manifest.v1",
+      authority_diff: {{clear_signing: {{before, after}}}}}}
+  }});
+  return [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
+}}
+const off = renderClearSigning(strict, null);
+if (!off.includes("on → off") || !off.includes("no longer refused") ||
+    off.includes("→ blocked") || off.includes("refused rather than approved unread")) {{
+  throw new Error(`disabling clear signing misdescribed: ${{off}}`);
+}}
+const on = renderClearSigning(null, strict);
+for (const expected of ["off → on", "Unlimited-allowance requests", "allowed → blocked",
+  "Descriptions come from catalog", "none → bloom-evm", "Publisher signatures required",
+  "none → 2", "Oldest usable observation", "none → 3600000", "publisher-1"]) {{
+  if (!on.includes(expected)) throw new Error(`enabling clear signing missing ${{expected}}: ${{on}}`);
 }}
 "#
     );
