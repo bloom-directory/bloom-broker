@@ -409,6 +409,26 @@ async fn run_with_paths(
     );
     let startup_status_path = std::env::var_os("BLOOM_BROKER_STARTUP_STATUS").map(PathBuf::from);
     let mut config = load_config(&config_path)?;
+    match (
+        std::env::var_os("BLOOM_CHECKOUT_INTAKE_SOCKET"),
+        std::env::var_os("BLOOM_CHECKOUT_UID"),
+    ) {
+        (None, None) => {}
+        (Some(path), Some(uid)) => {
+            let uid = uid
+                .to_str()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|v| *v != 0)
+                .ok_or("invalid checkout service UID")?;
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err("checkout intake path must be absolute".into());
+            }
+            config.checkout_uid = Some(uid);
+            config.checkout_socket_path = Some(path);
+        }
+        _ => return Err("checkout intake and UID must be configured together".into()),
+    }
     // Merge and validate admission limits before any durable state is opened,
     // so a mistyped quota fails startup instead of silently widening
     // admission. The four values are non-secret, so the effective policy is
