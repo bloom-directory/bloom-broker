@@ -3251,6 +3251,14 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     authority.install_provenance(&safe_provenance).unwrap();
     let safe_terms = SealedApprovalTerms {
         key_ref: parent_key.clone(),
+        provenance_digest: safe_provenance.digest().unwrap(),
+        limits: ApprovalLimits {
+            max_operations: DecimalU64::new(1),
+            max_signatures: DecimalU64::new(1),
+            operation_rate_limits: Vec::new(),
+            signature_rate_limits: Vec::new(),
+            value_limits: Vec::new(),
+        },
         subject: ApprovalSubject::Petal {
             package_hash: safe_package.clone(),
             route: safe_route.into(),
@@ -3306,6 +3314,31 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     assert!(
         reusable.message.contains("require exact approval"),
         "{reusable:?}"
+    );
+    let route_grant = safe_prepare(
+        SealedApprovalTerms {
+            selector: ApprovalSelector::Petal {
+                package_hash: safe_package.clone(),
+                route: safe_route.into(),
+                allowed_operation_classes: vec![Token::new("exchange-order").unwrap()],
+                route_grants: vec![bloom_broker_api::PetalRouteGrant {
+                    route: "/petals/safe/other-confirm".into(),
+                    allowed_operation_classes: vec![
+                        Token::new(bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS).unwrap(),
+                    ],
+                    provenance_digest: safe_provenance.digest().unwrap(),
+                }],
+                required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+            },
+            ..safe_terms.clone()
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        route_grant.message.contains("require exact approval"),
+        "{route_grant:?}"
     );
     let envelope = serde_jcs::to_vec(&serde_json::json!({
         "schema": "bloom.safe.review.v1", "chain_id": "31337",
