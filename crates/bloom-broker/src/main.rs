@@ -348,6 +348,35 @@ async fn run_with_paths(
     );
     let terminal_span = service_span.clone();
     let result = async move {
+        // A monitor restart can race with removal of the installed sentinel.
+        // Resolve that startup prerequisite before opening authority state or
+        // waiting on Signer readiness. No request can have been accepted yet.
+        let startup_session = if let Some(wait) = session_startup_wait(
+            cfg!(target_os = "macos"),
+            cfg!(feature = "triad-dev-harness")
+                && std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some(),
+        ) {
+            match connect_authenticated_session(
+                &session_socket_path,
+                &identity,
+                &session_acl,
+                Some(wait),
+            )
+            .await?
+            {
+                Some(stream) => Some(stream),
+                None => {
+                    tracing::info!(
+                        event = "broker.session_startup_abandoned",
+                        reason = "session_unavailable",
+                        "Broker startup ended before the login sentinel became available"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
         tracing::info!(
             event = "broker.ceremony_limits_configured",
             maximum_concurrent_sessions = ceremony_limits.maximum_concurrent_sessions(),
@@ -627,8 +656,14 @@ async fn run_with_paths(
         if config.maximum_connections == 0 || config.control_maximum_connections == 0 {
             return Err("Broker connection quotas must be nonzero".into());
         }
-        let mut session_stream =
-            connect_authenticated_session(&session_socket_path, &identity, &session_acl).await?;
+        let mut session_stream = match startup_session {
+            Some(stream) => stream,
+            None => {
+                connect_authenticated_session(&session_socket_path, &identity, &session_acl, None)
+                    .await?
+                    .ok_or("unbounded session startup unexpectedly ended")?
+            }
+        };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut rpc_shutdown = shutdown_rx.clone();
         let mut control_shutdown = shutdown_rx.clone();
@@ -1368,23 +1403,55 @@ fn log_control_rpc_completion(
     );
 }
 
+fn session_startup_wait(macos: bool, developer_profile: bool) -> Option<Duration> {
+    (macos && !developer_profile).then_some(Duration::from_secs(3))
+}
+
 async fn connect_authenticated_session(
     path: &Path,
     identity: &LocalIdentity,
     session_acl: &PeerAcl,
-) -> Result<UnixStream, ProtocolError> {
+    startup_wait: Option<Duration>,
+) -> Result<Option<UnixStream>, ProtocolError> {
+    let deadline = startup_wait.map(|wait| tokio::time::Instant::now() + wait);
     loop {
-        match UnixStream::connect(path).await {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Ok(None);
+        }
+        let connected = if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, UnixStream::connect(path))
+                .await
+                .map_err(|_| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "login-session connection exceeded the startup deadline",
+                    )
+                })?
+        } else {
+            UnixStream::connect(path).await
+        };
+        match connected {
             Ok(mut stream) => {
-                bloom_triad_local_transport::authenticate_client(
+                let authenticate = bloom_triad_local_transport::authenticate_client(
                     &mut stream,
                     identity,
                     session_acl,
                     bloom_service_activation::SESSION_PROTOCOL_CURRENT,
                     bloom_service_activation::SESSION_PROTOCOL_RANGE,
-                )
-                .await?;
-                return Ok(stream);
+                );
+                if let Some(deadline) = deadline {
+                    tokio::time::timeout_at(deadline, authenticate)
+                        .await
+                        .map_err(|_| {
+                            ProtocolError::new(
+                                ProtocolErrorCode::ServiceUnavailable,
+                                "login-session authentication exceeded the startup deadline",
+                            )
+                        })??;
+                } else {
+                    authenticate.await?;
+                }
+                return Ok(Some(stream));
             }
             Err(error)
                 if matches!(
@@ -1392,7 +1459,8 @@ async fn connect_authenticated_session(
                     ErrorKind::NotFound | ErrorKind::ConnectionRefused
                 ) =>
             {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                let retry_at = tokio::time::Instant::now() + Duration::from_millis(500);
+                tokio::time::sleep_until(deadline.map_or(retry_at, |end| end.min(retry_at))).await;
             }
             Err(error) => {
                 return Err(ProtocolError::new(
@@ -1821,6 +1889,181 @@ mod startup_failure_tests {
     use super::*;
     use bloom_broker_api::{ApprovalLifecycleState, BootEpoch, ReadinessState};
     use tracing_subscriber::prelude::*;
+
+    fn session_identity(service: &str, seed: u8) -> LocalIdentity {
+        LocalIdentity {
+            service_id: Token::new(service).unwrap(),
+            boot_epoch: BootEpoch::from_bytes([seed; 16]),
+            application_key_id: Token::new(format!("{service}-app")).unwrap(),
+            signing_key: Arc::new(SigningKey::from_bytes(&[seed; 32])),
+        }
+    }
+
+    fn session_peer(identity: &LocalIdentity, uid: u32) -> PeerAcl {
+        PeerAcl {
+            effective_uid: uid,
+            service_id: identity.service_id.clone(),
+            boot_epoch: identity.boot_epoch.clone(),
+            application_key_id: identity.application_key_id.clone(),
+            application_public_key: identity.signing_key.verifying_key().to_bytes(),
+        }
+    }
+
+    #[test]
+    fn session_startup_deadline_applies_only_to_installed_macos() {
+        assert_eq!(
+            session_startup_wait(true, false),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(session_startup_wait(true, true), None);
+        assert_eq!(session_startup_wait(false, false), None);
+        assert_eq!(session_startup_wait(false, true), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_and_refused_sessions_end_startup_cleanly_at_the_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.sock");
+        let uid = fs::metadata(directory.path()).unwrap().uid();
+        let broker = session_identity("bloom-broker", 71);
+        let session = session_identity("bloom-session", 72);
+        for refused in [false, true] {
+            if refused {
+                drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+            }
+            let started = tokio::time::Instant::now();
+            assert!(
+                connect_authenticated_session(
+                    &path,
+                    &broker,
+                    &session_peer(&session, uid),
+                    Some(Duration::from_secs(3)),
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+            assert_eq!(started.elapsed(), Duration::from_secs(3));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_returning_session_authenticates_before_startup_deadline_and_keeps_its_channel() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.sock");
+        let uid = fs::metadata(directory.path()).unwrap().uid();
+        let broker = session_identity("bloom-broker", 73);
+        let session = session_identity("bloom-session", 74);
+        let broker_acl = session_peer(&broker, uid);
+        let session_acl = session_peer(&session, uid);
+        let client_path = path.clone();
+        let client = tokio::spawn(async move {
+            connect_authenticated_session(
+                &client_path,
+                &broker,
+                &session_acl,
+                Some(Duration::from_secs(2)),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let listener = UnixListener::bind(&path).unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        bloom_triad_local_transport::authenticate_server(
+            &mut server,
+            &session,
+            &broker_acl,
+            bloom_service_activation::SESSION_PROTOCOL_CURRENT,
+            bloom_service_activation::SESSION_PROTOCOL_RANGE,
+        )
+        .await
+        .unwrap();
+        let mut client = client.await.unwrap().unwrap().unwrap();
+        // The deadline ends at authentication, never an accepted session's
+        // lifetime or the time allowed to drain an accepted operation.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        server.write_all(b"x").await.unwrap();
+        assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_session_appearing_after_abandonment_cannot_resume_the_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.sock");
+        let uid = fs::metadata(directory.path()).unwrap().uid();
+        let broker = session_identity("bloom-broker", 75);
+        let session = session_identity("bloom-session", 76);
+        assert!(
+            connect_authenticated_session(
+                &path,
+                &broker,
+                &session_peer(&session, uid),
+                Some(Duration::from_millis(30)),
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let listener = UnixListener::bind(&path).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_session_remains_a_fatal_authentication_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.sock");
+        let uid = fs::metadata(directory.path()).unwrap().uid();
+        let broker = session_identity("bloom-broker", 77);
+        let session = session_identity("bloom-session", 78);
+        let broker_acl = session_peer(&broker, uid);
+        let wrong_acl = session_peer(&session_identity("bloom-session", 79), uid);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = tokio::spawn(async move {
+            connect_authenticated_session(&path, &broker, &wrong_acl, Some(Duration::from_secs(1)))
+                .await
+        });
+        let (mut server, _) = listener.accept().await.unwrap();
+        let _ = bloom_triad_local_transport::authenticate_server(
+            &mut server,
+            &session,
+            &broker_acl,
+            bloom_service_activation::SESSION_PROTOCOL_CURRENT,
+            bloom_service_activation::SESSION_PROTOCOL_RANGE,
+        )
+        .await;
+        let error = client.await.unwrap().unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::UnauthenticatedPeer);
+    }
+
+    #[tokio::test]
+    async fn a_connected_but_silent_session_is_not_clean_absence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.sock");
+        let uid = fs::metadata(directory.path()).unwrap().uid();
+        let broker = session_identity("bloom-broker", 80);
+        let session = session_identity("bloom-session", 81);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = tokio::spawn(async move {
+            connect_authenticated_session(
+                &path,
+                &broker,
+                &session_peer(&session, uid),
+                Some(Duration::from_millis(30)),
+            )
+            .await
+        });
+        let (_server, _) = listener.accept().await.unwrap();
+        let error = client.await.unwrap().unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+        assert!(error.message.contains("authentication"));
+    }
 
     #[test]
     fn a_theme_others_can_write_or_substitute_is_refused() {
