@@ -562,7 +562,62 @@ function reportCeremonyError(error, fallback = "Ceremony failed") {
   statusNode.textContent = fallback;
 }
 
+// Raised before any passkey prompt, so the link stays usable.
+class CardFieldError extends Error {}
+
+function cardFieldsInput(session) {
+  const value = id => document.getElementById(id).value.trim();
+  if (session.ceremony_kind === "card_add") {
+    const number = value("card-number").replace(/[\s-]/g, "");
+    let sum = 0;
+    [...number].reverse().forEach((digit, i) => {
+      const n = Number(digit) * (i % 2 ? 2 : 1);
+      sum += n > 9 ? n - 9 : n;
+    });
+    if (!/^\d{12,19}$/.test(number) || sum % 10 !== 0) {
+      throw new CardFieldError("Check the card number. It doesn't look valid.");
+    }
+    const month = Number(value("card-month"));
+    let year = Number(value("card-year"));
+    if (!/^\d{1,2}$/.test(value("card-month")) || month < 1 || month > 12) {
+      throw new CardFieldError("Enter the expiry month as 1 to 12.");
+    }
+    if (/^\d{2}$/.test(value("card-year"))) year += 2000;
+    const now = new Date();
+    if (!/^\d{2}(\d{2})?$/.test(value("card-year")) ||
+        year * 12 + month < now.getUTCFullYear() * 12 + now.getUTCMonth() + 1) {
+      throw new CardFieldError("Check the expiry year. The card looks expired.");
+    }
+    const name = value("card-name");
+    if (!name) throw new CardFieldError("Enter the name on the card.");
+    return {card: {number, expiry_month: month, expiry_year: year, name}};
+  }
+  if (session.review_manifest.card_effect.kind === "checkout") {
+    const cvc = value("card-cvc");
+    if (!/^\d{3,4}$/.test(cvc)) throw new CardFieldError("Enter the three or four digit CVC.");
+    return {cvc};
+  }
+  return {};
+}
+
+// After the passkey approves a card request, Signer has consumed the link.
+function reportCardFailure(session, error) {
+  console.error("Bloom card ceremony failed", error);
+  const action = session.ceremony_kind === "card_add" ? "Card not saved"
+    : session.ceremony_kind === "card_delete" ? "Card not deleted" : "Not approved";
+  const reason = error?.message === "invalid card details"
+    ? "Signer rejected the card details." : (error?.message || "Signer refused the request.");
+  statusNode.textContent = `${action}. ${reason} This link is used up; ask your agent for a new one.`;
+  clearInterval(expiryTimer);
+  for (const node of [approve, cancel, cardFields, cardCvcFields]) node.hidden = true;
+}
+
 function reportApprovalFailure(error) {
+  if (error instanceof CardFieldError) {
+    statusNode.textContent = error.message;
+    approve.disabled = false;
+    return;
+  }
   const missingPrf = error?.name === "NotSupportedError" ||
     (typeof error?.message === "string" && error.message.includes("required PRF output"));
   reportCeremonyError(error, missingPrf
@@ -1296,6 +1351,7 @@ async function run(session) {
   let credentialId = null;
 
   if (kind.startsWith("card_")) {
+    const cardInput = cardFieldsInput(session);
     let prf;
     if (session.webauthn_options.registration_user_handle) {
       const created = await createCredential(session, 0);
@@ -1311,18 +1367,7 @@ async function run(session) {
       if (!prf) throw new Error("This passkey did not return required PRF output");
       proof = {kind: "assertion", assertion: assertionJson(assertion)};
     }
-    const input = {credential_prf: encodeUrl(prf)};
-    if (kind === "card_add") {
-      input.card = {
-        number: document.getElementById("card-number").value.replace(/[\s-]/g, ""),
-        expiry_month: Number(document.getElementById("card-month").value),
-        expiry_year: Number(document.getElementById("card-year").value),
-        name: document.getElementById("card-name").value.trim()
-      };
-    } else if (session.review_manifest.card_effect.kind === "checkout") {
-      input.cvc = document.getElementById("card-cvc").value;
-      if (!/^\d{3,4}$/.test(input.cvc)) throw new Error("Enter a three or four digit CVC");
-    }
+    const input = {credential_prf: encodeUrl(prf), ...cardInput};
     secret = te.encode(canonicalJson(input));
     prf.fill(0);
     for (const field of [...cardFields.querySelectorAll("input"), ...cardCvcFields.querySelectorAll("input")]) field.value = "";
@@ -1456,7 +1501,10 @@ async function run(session) {
     const recovered = await fetch(`/api/session/${ceremonyId}/result`, {
       headers: authHeaders
     });
-    if (!recovered.ok) throw error;
+    if (!recovered.ok) {
+      if (kind.startsWith("card_")) return reportCardFailure(session, error);
+      throw error;
+    }
     result = await recovered.json();
   }
   return finishBrowserResult(session, result);
@@ -1464,7 +1512,7 @@ async function run(session) {
 
 async function finishBrowserResult(session, result) {
   if (session.ceremony_kind.startsWith("card_")) {
-    statusNode.textContent = session.review_manifest.card_effect.kind === "manual_checkout" ? "Private view authorized. No saved card was released." : session.ceremony_kind === "card_checkout" ? "Approved. Checkout is continuing; the outcome is reported by the merchant." : "Completed.";
+    statusNode.textContent = session.review_manifest.card_effect.kind === "manual_checkout" ? "Private view authorized. No saved card was released." : session.ceremony_kind === "card_checkout" ? "Approved. Checkout is continuing; the outcome is reported by the merchant." : session.ceremony_kind === "card_add" ? "Card saved. You can close this page." : "Card deleted. You can close this page.";
     clearInterval(expiryTimer);
     cardFields.hidden = true;
     cardCvcFields.hidden = true;
