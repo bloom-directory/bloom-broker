@@ -5319,6 +5319,27 @@ async fn unreadable_safe_call_carries_a_signed_inability_to_explain_disclosure()
             .as_str()
             .is_some_and(|signature| !signature.is_empty())
     );
+    let mut unsigned = projection["review_manifest"].clone();
+    let signature: Base64UrlBytes = serde_json::from_value(
+        unsigned
+            .as_object_mut()
+            .unwrap()
+            .remove("broker_signature")
+            .unwrap(),
+    )
+    .unwrap();
+    let signature = ed25519_dalek::Signature::from_slice(&signature.decode()).unwrap();
+    SigningKey::from_bytes(&[32; 32])
+        .verifying_key()
+        .verify(
+            &[
+                b"bloom-broker-review-manifest/v1".as_slice(),
+                serde_jcs::to_vec(&unsigned).unwrap().as_slice(),
+            ]
+            .concat(),
+            &signature,
+        )
+        .unwrap();
 }
 
 #[tokio::test]
