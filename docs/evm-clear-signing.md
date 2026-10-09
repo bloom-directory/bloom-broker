@@ -148,8 +148,11 @@ calls; native sends and deployments keep their existing exact envelope review.
 One member Bloom cannot describe blocks the whole batch — there is no split,
 no mixed badge and no downgrade. `opaque_exact` must be requested explicitly,
 needs `opaque_exact_allowed`, and carries the inability-to-explain warning in
-the signed manifest. A wallet without the extension refuses a requested mode
-rather than ignoring it.
+the signed manifest. It covers only calls Bloom cannot read: a batch member
+a currently valid catalog describes is refused under `opaque_exact`, and one the
+catalog would refuse (such as an unlimited allowance) is refused for that
+reason, so requesting `opaque_exact` cannot skip a refusal. A wallet without
+the extension refuses a requested mode rather than ignoring it.
 
 Approval expiry is capped at
 
@@ -168,6 +171,11 @@ extends an approval, and a signature already produced cannot be recalled.
 
 ## Unlimited allowances
 
+Safe approval freezes its chain opt-in and opaque review permission when prepared.
+Signing rechecks the approval's policy binding, but does not separately re-evaluate
+those Safe-specific permissions through the clear-signing catalog recheck. Retire
+pending approvals when changing those permissions.
+
 Denied by default. A maximum-U256 request explains the denial and names one
 action: change the wallet policy. That is **one existing wallet-policy
 ceremony** — setting `unlimited_allowance_allowed` in the canonical policy
@@ -180,6 +188,13 @@ After the policy commits, the staged allowance is reprepared and gets its own
 ordinary exact approval ceremony. These are two different authorizations, and
 the second is never automatic.
 
+The rule is narrow. It matches only canonical `approve(address,uint256)` with
+the exact U256 maximum. A requester can ask for one less, and that is shown as
+a finite allowance with its exact amount, not refused. Other calls that grant
+spending power, such as `increaseAllowance`, `setApprovalForAll` or Permit2's
+`approve`, are not recognised as allowances: a publisher that admits one signs
+it as `other`, which gets no allowance warning and no unlimited gate.
+
 Demonstrated so far: the default denial, against real services on a
 disposable chain, with the message above. The enabling ceremony and the
 reprepared allowance that follows it have been implemented but not yet
@@ -191,7 +206,11 @@ demonstrated with an owner approval.
 snapshot. Replacing that file and restarting Broker is the whole import
 surface: no network fetch, no refresh command, no second audit family. A
 snapshot no enrolled wallet trusts is logged and not installed; Broker still
-starts, because wallets that never enabled clear signing are unaffected.
+starts, because wallets that never enabled clear signing are unaffected. The
+same holds for a snapshot every pinning wallet refuses, such as an old file after
+a publisher key rotation or a rolled-back sequence: the stored catalog stays as
+it was and the log names the reason. After a rotation, re-signing the same
+sequence with the new key replaces the stored signatures.
 
 Broker stores one catalog per catalog identity, so a wallet that pins
 `bloom-tokens` and a wallet that pins `staging-catalog` do not evict each
@@ -244,3 +263,9 @@ instead: its strict decoder rejects the unknown `clear_signing` field while
 loading the policy. That is fail-closed rather than silent, but it is a
 different message, and rollback is never made to work by dropping the field.
 The same rule applies to backup and restore.
+
+An expired catalog cannot explain calls, so an explicitly requested opaque review
+may proceed when wallet policy permits it. A refused signed catalog leaves Broker
+running; an unsafe or unreadable unsigned theme stops startup because it controls
+what the owner sees. Theme and catalog files are opened without following symlinks,
+and permissions are checked on the same file handle that is read.

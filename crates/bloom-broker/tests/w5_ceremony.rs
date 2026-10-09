@@ -475,6 +475,29 @@ for (const expected of ["Approve one Safe transaction", "ERC-20 transfer",
   "Threshold 2 of 2 owners"]) {{
   if (!rendered.includes(expected)) throw new Error(`Safe review not disclosed ${{expected}}: ${{rendered}}`);
 }}
+
+// A batch member Bloom could not read is never shown as a plain send, and a
+// batch spanning two networks is not headed with the first one alone.
+const unread = (chain_id, chain) => ({{
+  chain_id, chain,
+  sender: "0x1111111111111111111111111111111111111111",
+  destination: "0x0909090909090909090909090909090909090909",
+  value: "0", value_display: "0 ETH",
+  nonce: "3", gas_limit: "60000",
+  fee: {{kind: "legacy", gas_price: "1000000000", gas_price_display: "1 Gwei"}},
+  payload_keccak: "0x47e9",
+  calldata_bytes: "68", calldata_keccak: "0x1234", calldata_hex: "0x095ea7b3"
+}});
+const batch = session(unread("1", "ethereum"));
+batch.review_manifest.canonical_plan = JSON.stringify({{evm_review: {{payloads: [
+  unread("1", "ethereum"), unread("8453", "base")]}}}});
+renderReview(batch);
+rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
+if (!rendered.includes("Approve a call Bloom cannot read") || rendered.includes("Send 0 ETH") ||
+    rendered.includes("transactions on Ethereum") ||
+    !rendered.includes("Approve 2 transactions on more than one network")) {{
+  throw new Error(`unread batch misdescribed: ${{rendered}}`);
+}}
 "#
     );
     let output = Command::new("node")
@@ -550,6 +573,37 @@ for (const expected of [
 // The old label understated the grant by calling it only a deploy permission.
 for (const stale of ["Allow deploying contracts on", "Stop allowing contract deployment on"]) {{
   if (rendered.includes(stale)) throw new Error(`stale policy wording ${{stale}}: ${{rendered}}`);
+}}
+
+// Without clear signing nothing is refused for being unreadable or
+// unlimited, so switching it off loosens the wallet and switching it on
+// tightens it. Each direction must say so.
+const strict = {{
+  catalog_id: "bloom-evm", signature_threshold: 2, maximum_observation_age_ms: 3600000,
+  unlimited_allowance_allowed: false, opaque_exact_allowed: false,
+  verifier: {{verifier_digest: "ab".repeat(32)}},
+  trusted_keys: [{{key_id: "publisher-1", verifying_key: "cd".repeat(32)}}]
+}};
+function renderClearSigning(before, after) {{
+  renderReview({{
+    ceremony_kind: "policy_update",
+    expires_at_ms: Date.now() + 60000,
+    signer_contribution: {{wallet_id: "wallet-primary"}},
+    review_manifest: {{schema: "bloom.review-manifest.v1",
+      authority_diff: {{clear_signing: {{before, after}}}}}}
+  }});
+  return [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
+}}
+const off = renderClearSigning(strict, null);
+if (!off.includes("on → off") || !off.includes("no longer refused") ||
+    off.includes("→ blocked") || off.includes("refused rather than approved unread")) {{
+  throw new Error(`disabling clear signing misdescribed: ${{off}}`);
+}}
+const on = renderClearSigning(null, strict);
+for (const expected of ["off → on", "Unlimited-allowance requests", "allowed → blocked",
+  "Descriptions come from catalog", "none → bloom-evm", "Publisher signatures required",
+  "none → 2", "Oldest usable observation", "none → 3600000", "publisher-1"]) {{
+  if (!on.includes(expected)) throw new Error(`enabling clear signing missing ${{expected}}: ${{on}}`);
 }}
 "#
     );
@@ -2662,6 +2716,13 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     proposed_policy
         .allowed_petal_packages
         .push(petal_package.clone());
+    proposed_policy.allowed_petal_packages.push(digest("d5"));
+    proposed_policy
+        .allowed_destinations
+        .push(PolicyDestination {
+            chain: Token::new("evm-31337").unwrap(),
+            destination: "exact".into(),
+        });
     proposed_policy
         .allowed_destinations
         .push(PolicyDestination {
@@ -3170,6 +3231,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     sign_provenance(&mut safe_provenance, &installer_key);
     authority.install_provenance(&safe_provenance).unwrap();
     let safe_terms = SealedApprovalTerms {
+        key_ref: parent_key.clone(),
         subject: ApprovalSubject::Petal {
             package_hash: safe_package.clone(),
             route: safe_route.into(),
@@ -3255,11 +3317,110 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         "{wrong_subject:?}"
     );
     // The envelope names another owner than the Signer-held key.
-    let wrong_owner = safe_prepare(safe_terms, Some(envelope)).await.unwrap_err();
+    let wrong_owner = safe_prepare(safe_terms.clone(), Some(envelope.clone()))
+        .await
+        .unwrap_err();
     assert!(
         wrong_owner.message.contains("owner differs"),
         "{wrong_owner:?}"
     );
+    // A valid review goes through the real Broker/Signer boundary and its
+    // decoded facts and disclosure survive into the signed review manifest.
+    let public = match MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::KeyGetPublic(bloom_broker_api::KeyRequest {
+            key_ref: parent_key.clone(),
+        }),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::KeyGetPublic(public) => public,
+        other => panic!("unexpected public key response: {other:?}"),
+    };
+    let public = public.canonical_public_key.decode();
+    use k256::elliptic_curve::sec1::ToEncodedPoint as _;
+    use k256::pkcs8::DecodePublicKey as _;
+    let public = k256::PublicKey::from_public_key_der(&public)
+        .unwrap()
+        .to_encoded_point(false);
+    let owner = alloy::primitives::Address::from_raw_public_key(&public.as_bytes()[1..]);
+    let mut valid: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+    valid["owner"] = serde_json::json!(owner.to_string());
+    valid["owners"] = serde_json::json!([owner.to_string()]);
+    let word = |n: u64| alloy::primitives::U256::from(n).to_be_bytes::<32>();
+    let address_word = |address: &str| {
+        let mut result = [0u8; 32];
+        result[12..].copy_from_slice(
+            address
+                .parse::<alloy::primitives::Address>()
+                .unwrap()
+                .as_slice(),
+        );
+        result
+    };
+    let mut domain =
+        alloy::primitives::keccak256("EIP712Domain(uint256 chainId,address verifyingContract)")
+            .to_vec();
+    domain.extend_from_slice(&word(31337));
+    domain.extend_from_slice(&address_word(valid["safe_address"].as_str().unwrap()));
+    let mut transaction = alloy::primitives::keccak256("SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)").to_vec();
+    transaction.extend_from_slice(&address_word(valid["safe_tx"]["to"].as_str().unwrap()));
+    transaction.extend_from_slice(&word(7));
+    transaction.extend_from_slice(alloy::primitives::keccak256([]).as_slice());
+    for _ in 0..6 {
+        transaction.extend_from_slice(&word(0));
+    }
+    transaction.extend_from_slice(&word(4));
+    let mut preimage = vec![0x19, 0x01];
+    preimage.extend_from_slice(alloy::primitives::keccak256(domain).as_slice());
+    preimage.extend_from_slice(alloy::primitives::keccak256(transaction).as_slice());
+    let response = safe_prepare(
+        SealedApprovalTerms {
+            selector: ApprovalSelector::Exact {
+                ordered_payload_digests: vec![Digest32::from_bytes(
+                    sha2::Sha256::digest(&preimage).into(),
+                )],
+                ordered_hashes: vec![Digest32::from_bytes(
+                    alloy::primitives::keccak256(&preimage).0,
+                )],
+            },
+            ..safe_terms
+        },
+        Some(serde_jcs::to_vec(&valid).unwrap()),
+    )
+    .await
+    .unwrap();
+    let response = match response {
+        MachineBrokerResponse::SealedApprovalPrepare(response) => response,
+        other => panic!("unexpected approval response: {other:?}"),
+    };
+    let session = broker
+        .ceremony()
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let projection: serde_json::Value =
+        serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let manifest = &projection["review_manifest"];
+    let plan: serde_json::Value =
+        serde_json::from_str(manifest["canonical_plan"].as_str().unwrap()).unwrap();
+    assert_eq!(plan["safe_review"]["owner"], owner.to_string());
+    assert_eq!(manifest["safe_review"], plan["safe_review"]);
+    assert!(plan["disclosures"].as_array().unwrap().iter().any(|value| {
+        value
+            .as_str()
+            .unwrap()
+            .contains("rebuilt the Safe transaction")
+    }));
     let approval_operation = operation("d3");
     let approval_prepared = match MachineBrokerService::dispatch(
         &broker,

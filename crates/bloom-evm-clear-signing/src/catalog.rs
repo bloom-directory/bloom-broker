@@ -232,8 +232,9 @@ impl ClearSigningCatalog {
         }
         let mut message = CATALOG_SIGNATURE_DOMAIN.to_vec();
         message.extend_from_slice(&self.unsigned_canonical_bytes()?);
-        // Count each *trusted key* once, not each signature: a publisher that
-        // repeats one key cannot reach a threshold of two.
+        // Count each *verifying key* once, not each signature or key id: a
+        // publisher that repeats one key, under one id or several, cannot
+        // reach a threshold of two.
         let mut satisfied = BTreeSet::new();
         for candidate in &self.signatures {
             let Some(key) = trusted
@@ -253,7 +254,7 @@ impl ClearSigningCatalog {
                 .verify(&message, &Signature::from_bytes(&bytes))
                 .is_ok()
             {
-                satisfied.insert(key.key_id.as_str().to_owned());
+                satisfied.insert(key.verifying_key.to_bytes());
             }
         }
         if satisfied.len() < threshold {

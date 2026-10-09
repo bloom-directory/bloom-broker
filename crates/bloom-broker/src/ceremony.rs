@@ -2182,7 +2182,7 @@ impl CeremonyBroker {
             manifest.petal_use_claim.as_ref(),
             manifest.system_use_claim.as_ref(),
             manifest.evm_review.as_ref(),
-            manifest.safe_review.is_some(),
+            manifest.safe_review.as_ref(),
         );
         let canonical_plan = canonical_review_plan(
             request,
@@ -2230,7 +2230,7 @@ impl CeremonyBroker {
             context.petal_use_claim.as_ref(),
             context.system_use_claim.as_ref(),
             context.evm_review.as_ref(),
-            context.safe_review.is_some(),
+            context.safe_review.as_ref(),
         );
         let canonical_plan = canonical_review_plan(
             request,
@@ -3440,11 +3440,11 @@ fn review_disclosures(
     claim: Option<&PetalUseClaim>,
     system_claim: Option<&SystemUseClaim>,
     evm_review: Option<&crate::evm_review::EvmReview>,
-    has_safe_review: bool,
+    safe_review: Option<&crate::safe_review::SafeReview>,
 ) -> Vec<String> {
     let mut disclosures = Vec::new();
     if evm_review.is_none()
-        && !has_safe_review
+        && safe_review.is_none()
         && (!request.exact_ordered_payload_digests.is_empty()
             || !request.exact_ordered_hashes.is_empty())
     {
@@ -3481,11 +3481,14 @@ fn review_disclosures(
             );
         }
     }
-    if has_safe_review {
+    if safe_review.is_some() {
         disclosures.push(
             "Bloom rebuilt the Safe transaction from the exact signing bytes. Bloom has not established the Safe's configuration or the execution effects of any call data."
                 .to_owned(),
         );
+    }
+    if safe_review.is_some_and(crate::safe_review::is_opaque) {
+        disclosures.push("Bloom cannot explain what the contract input data in this request does. Approving it authorizes exactly these bytes and nothing less.".to_owned());
     }
     let machine_asserted = matches!(assurance, Some(ClaimAssurance::MachineAsserted))
         || claim

@@ -497,7 +497,8 @@ function describeTransfer(manifest) {
         `${formatObserved(entry.observed_at_ms)}; its code may have changed since.`]);
     }
     const first = evmPayloads[0];
-    const network = chainLabel(first.chain);
+    const oneNetwork = evmPayloads.every(payload => String(payload.chain_id) === String(first.chain_id));
+    const network = oneNetwork ? chainLabel(first.chain) : "more than one network";
     // One approval covers the whole batch, so a batch never collapses into one
     // member's heading: it says how many actions it carries and lists them in
     // order, each with its own intent.
@@ -514,6 +515,10 @@ function describeTransfer(manifest) {
             intent: payload.contract_call
               ? callIntent(payload.contract_call)
               : payload.safe_call ? safeCallIntent(payload.safe_call)
+              : payload.destination && payload.calldata_keccak
+              ? {action: "opaque", eyebrow: "Contract call", heading: "Approve a call Bloom cannot read",
+                 detail: "No signed description is available. Bloom cannot say what this call does.",
+                 relation: "calls"}
               : {action: payload.destination ? "send" : "deploy",
                  eyebrow: payload.destination ? "Native transfer" : "Contract creation",
                  heading: payload.destination
@@ -595,7 +600,6 @@ function describeTransfer(manifest) {
       interpretation.push(["Verifier", `${clear.verifier_id} (${shortDigest(clear.verifier_digest)})`]);
       // The catalog commitment is already in the complete signed manifest.
     }
-    const oneNetwork = evmPayloads.every(payload => String(payload.chain_id) === String(first.chain_id));
     const networkIdentity = oneNetwork
       ? `EVM · ${network} · Chain ID ${first.chain_id}` : "EVM · Multiple networks";
     return {intent, payloads: evmPayloads, parties: parties.map(party => ({...party, chainId: first.chain_id})), assurance, interpretation, facts, technical, warnings, networkIdentity,
@@ -780,12 +784,12 @@ function describePolicy(manifest) {
   const isDeployGrant = d => d.destination === "exact" && String(d.chain || "").startsWith("evm-");
   for (const d of diff.added_destinations || []) {
     if (isDeployGrant(d)) lines.push([`Allow exact transactions on ${chainLabel(d.chain)}`,
-      "any address through the deployment workflow, including contract creation; every transaction still needs its own approval"]);
+      "any address through the deployment workflow, including contract creation, and Safe owner signing; every transaction still needs its own approval"]);
     else lines.push(["Allow sending to", dest(d), true]);
   }
   for (const d of diff.removed_destinations || []) {
     if (isDeployGrant(d)) lines.push([`Stop allowing exact transactions on ${chainLabel(d.chain)}`,
-      "deployment transactions need listed recipients again and contract creation is refused"]);
+      "deployment transactions need listed recipients again; contract creation and Safe owner signing are refused"]);
     else lines.push(["Stop allowing sending to", dest(d), true]);
   }
   for (const p of diff.added_petal_packages || []) lines.push(["Allow app (petal)", shortDigest(p), true]);
@@ -802,7 +806,7 @@ function describePolicy(manifest) {
   // it permits: none of them grants anyone an allowance by itself.
   const CLEAR_SIGNING_SETTINGS = [
     ["unlimited_allowance_allowed", "Unlimited-allowance requests",
-     "A request with no spending cap is refused outright.",
+     "A request to approve the maximum possible amount is refused. A large finite amount is still shown with its exact value.",
      "This wallet setting applies to all supported tokens. Each request will still need your approval " +
      "and will name its token and spender. This setting does not move tokens or grant a spender an allowance."],
     ["opaque_exact_allowed", "Requests Bloom cannot describe",
@@ -813,10 +817,18 @@ function describePolicy(manifest) {
   const clearBefore = diff.clear_signing?.before || null;
   const clearAfter = diff.clear_signing?.after || null;
   const intentLines = [];
-  if (clearBefore || clearAfter) {
+  // A wallet without clear signing reads no calldata and refuses nothing for
+  // it, so for the two refusals "off" means allowed, not blocked.
+  if (clearBefore && !clearAfter) {
+    lines.push(["Clear signing", "on → off"]);
+    intentLines.push(["Clear signing",
+      "Bloom stops reading contract calls for this wallet. Unlimited allowances and calls with no " +
+      "signed description are no longer refused: each is shown only as exact bytes for you to approve."]);
+  } else if (clearAfter) {
+    if (!clearBefore) lines.push(["Clear signing", "off → on"]);
     for (const [key, title, whenOff, whenOn] of CLEAR_SIGNING_SETTINGS) {
-      const was = Boolean(clearBefore?.[key]);
-      const now = Boolean(clearAfter?.[key]);
+      const was = clearBefore ? Boolean(clearBefore[key]) : true;
+      const now = Boolean(clearAfter[key]);
       if (was === now) continue;
       lines.push([title, `${was ? "allowed" : "blocked"} → ${now ? "allowed" : "blocked"}`]);
       intentLines.push([title, now ? whenOn : whenOff]);

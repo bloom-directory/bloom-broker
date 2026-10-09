@@ -279,7 +279,20 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
     for value in &envelope.modules {
         address(value, "modules[]")?;
     }
-    uint(&envelope.threshold, "threshold")?;
+    let threshold = uint(&envelope.threshold, "threshold")?;
+    let owners = envelope
+        .owners
+        .iter()
+        .map(|value| address(value, "owners[]"))
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    if threshold == U256::ZERO
+        || threshold > U256::from(owners.len())
+        || owners.len() != envelope.owners.len()
+    {
+        return Err(invalid(
+            "reported Safe owners must be distinct and threshold must be between one and owner count",
+        ));
+    }
 
     // `from` comes from the Signer-held key, so this is the one configuration
     // fact Broker can establish itself.
@@ -582,9 +595,10 @@ fn native(value: U256, chain: &str) -> String {
 fn entry_summary(chain: &str, index: usize, to: Address, value: U256, data: &[u8]) -> String {
     if data.len() == 68 && data[..4] == [0xa9, 0x05, 0x9c, 0xbb] {
         format!(
-            "{index}. ERC-20 transfer of {} base units of token {to} to {}",
+            "{index}. ERC-20 transfer of {} base units of token {to} to {} with native value {}",
             U256::from_be_slice(&data[36..68]),
-            Address::from_slice(&data[16..36])
+            Address::from_slice(&data[16..36]),
+            native(value, chain)
         )
     } else if data.is_empty() {
         format!("{index}. Send {} to {to}", native(value, chain))
@@ -835,7 +849,7 @@ fn classify_call(call: &SafeCall<'_>) -> Result<String, ProtocolError> {
                         return Err(invalid("MultiSendCallOnly contains a delegatecall"));
                     }
                     let destination = Address::from_slice(&packed[cursor + 1..cursor + 21]);
-                    if destination == safe {
+                    if destination == safe || destination == Address::ZERO {
                         return Err(invalid("MultiSendCallOnly contains a Safe self-call"));
                     }
                     let call_value = U256::from_be_slice(&packed[cursor + 21..cursor + 53]);
@@ -1006,13 +1020,21 @@ pub(crate) fn review(
         safe_tx_hash: format!("{:#x}", keccak256(&preimage)),
         reported: SafeReported {
             version: envelope.safe_version,
-            singleton: envelope.singleton,
+            singleton: address(&envelope.singleton, "singleton")?.to_string(),
             singleton_code_hash: envelope.singleton_code_hash,
-            owners: envelope.owners,
+            owners: envelope
+                .owners
+                .iter()
+                .map(|value| address(value, "owners[]").map(|address| address.to_string()))
+                .collect::<Result<_, _>>()?,
             threshold: envelope.threshold,
-            guard: envelope.guard,
-            modules: envelope.modules,
-            fallback_handler: envelope.fallback_handler,
+            guard: address(&envelope.guard, "guard")?.to_string(),
+            modules: envelope
+                .modules
+                .iter()
+                .map(|value| address(value, "modules[]").map(|address| address.to_string()))
+                .collect::<Result<_, _>>()?,
+            fallback_handler: address(&envelope.fallback_handler, "fallback_handler")?.to_string(),
             library_code_hash: envelope.library_code_hash,
         },
     }))
@@ -1299,9 +1321,9 @@ fn apply_clear_signing_policy(
             "clear-signed; approve it as an exact payload if wallet policy allows that",
         ))),
         Some(ReviewMode::Clear) | None => {
-            if opaque && !settings.opaque_exact_allowed {
+            if opaque {
                 return Err(invalid(
-                    "wallet policy does not allow approving payloads Bloom cannot explain",
+                    "Bloom cannot explain this Safe call; request an explicit opaque_exact review",
                 ));
             }
             Ok(())
@@ -1621,7 +1643,10 @@ mod tests {
 
         // Clear signing on, opaque payloads permitted: prepares, and the
         // frozen record has to be able to say it was not read.
-        let plan = review(&request(opaque), &clear_signing_policy(true), from)
+        let mut opaque_request = request(opaque);
+        assert!(review(&opaque_request, &clear_signing_policy(true), from).is_err());
+        opaque_request.requested_review_mode = Some(ReviewMode::OpaqueExact);
+        let plan = review(&opaque_request, &clear_signing_policy(true), from)
             .unwrap()
             .unwrap();
         assert!(is_opaque(&plan));
@@ -1993,6 +2018,75 @@ mod tests {
     }
 
     #[test]
+    fn version_150_batch_rejects_zero_and_explicit_safe_self_calls() {
+        for target in [ZERO, "0x1000000000000000000000000000000000000000"] {
+            let mut parsed: Envelope = serde_json::from_slice(&envelope()).unwrap();
+            parsed.chain_id = "8453".into();
+            parsed.safe_tx.to = "0xa83c336b20401af773b6219ba5027174338d1836".into();
+            parsed.safe_tx.operation = 1;
+            parsed.safe_tx.value = "0".into();
+            parsed.safe_tx.data = format!(
+                "0x{}",
+                hex::encode(multisend_calldata(&multisend_entry(
+                    target,
+                    0,
+                    &[0x61, 0x0b, 0x59, 0x25]
+                )))
+            );
+            assert!(
+                classify(&parsed)
+                    .unwrap_err()
+                    .message
+                    .contains("Safe self-call")
+            );
+        }
+    }
+
+    #[test]
+    fn safe_review_requires_exact_chain_opt_in_canonical_json_and_unmixed_payloads() {
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+        let mut blocked = policy();
+        blocked.allowed_destinations.clear();
+        assert!(
+            review(&request(envelope()), &blocked, from)
+                .unwrap_err()
+                .message
+                .contains("allow destination exact")
+        );
+        let mut noncanonical = request(envelope());
+        noncanonical.safe_review_payloads[0] = Base64UrlBytes::from_bytes(
+            &serde_json::to_vec_pretty(
+                &serde_json::from_slice::<serde_json::Value>(&envelope()).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            review(&noncanonical, &policy(), from)
+                .unwrap_err()
+                .message
+                .contains("canonical JCS")
+        );
+        let mut mixed = request(envelope());
+        mixed
+            .evm_review_payloads
+            .push(Base64UrlBytes::from_bytes(&[1]));
+        assert!(
+            review(&mixed, &policy(), from)
+                .unwrap_err()
+                .message
+                .contains("cannot be mixed")
+        );
+        let mut delegate: Envelope = serde_json::from_slice(&envelope()).unwrap();
+        delegate.safe_tx.operation = 1;
+        assert!(
+            classify(&delegate)
+                .unwrap_err()
+                .message
+                .contains("value must be zero")
+        );
+    }
+
+    #[test]
     fn call_only_batches_disclose_every_entry() {
         let mut erc20 = vec![0xa9, 0x05, 0x9c, 0xbb];
         erc20.extend_from_slice(&[0; 12]);
@@ -2085,7 +2179,9 @@ mod tests {
             .expect_err("an unreadable batch entry must obey the wallet's setting");
         assert!(error.to_string().contains("cannot explain"), "{}", error);
 
-        let plan = review(&request(batch), &on_base(true), from)
+        let mut opaque_request = request(batch);
+        opaque_request.requested_review_mode = Some(ReviewMode::OpaqueExact);
+        let plan = review(&opaque_request, &on_base(true), from)
             .unwrap()
             .unwrap();
         assert!(is_opaque(&plan), "{:?}", plan.action);

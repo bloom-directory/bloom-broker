@@ -5,7 +5,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::{ErrorKind, Write as _},
+    io::{ErrorKind, Read as _, Write as _},
     os::unix::fs::{MetadataExt, OpenOptionsExt as _, PermissionsExt as _, chown},
     path::{Path, PathBuf},
     sync::Arc,
@@ -550,9 +550,10 @@ async fn run_with_paths(
             }
         }
         if let Some(path) = &config.ceremony_theme_css_path {
-            let css = std::fs::read_to_string(path)
-                .map_err(|error| format!("read ceremony theme {}: {error}", path.display()))?;
-            bloom_broker::ceremony::install_owner_theme_css(css);
+            bloom_broker::ceremony::install_owner_theme_css(load_theme_css(
+                path,
+                broker_effective_uid,
+            )?);
         }
         let signer = BrokerSignerClient::connect_unix(
             &config.signer_socket_path,
@@ -1602,7 +1603,17 @@ fn install_clear_signing_catalog(
     authority: &BrokerAuthority,
     path: &Path,
 ) -> Result<(), ProtocolError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| {
+            ProtocolError::new(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                format!("open {}: {error}", path.display()),
+            )
+        })?;
+    let metadata = file.metadata().map_err(|error| {
         ProtocolError::new(
             ProtocolErrorCode::UnauthenticatedPeer,
             format!("inspect {}: {error}", path.display()),
@@ -1617,12 +1628,15 @@ fn install_clear_signing_catalog(
             "clear-signing catalog must be a non-symlink regular file not writable by group or other",
         ));
     }
-    let bytes = fs::read(path).map_err(|error| {
-        ProtocolError::new(
-            ProtocolErrorCode::UnauthenticatedPeer,
-            format!("read {}: {error}", path.display()),
-        )
-    })?;
+    let mut bytes = Vec::new();
+    file.take((bloom_evm_clear_signing::CATALOG_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ProtocolError::new(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                format!("read {}: {error}", path.display()),
+            )
+        })?;
     if bytes.len() > bloom_evm_clear_signing::CATALOG_MAX_BYTES {
         return Err(ProtocolError::new(
             ProtocolErrorCode::LimitExceededFrame,
@@ -1636,7 +1650,7 @@ fn install_clear_signing_catalog(
                 format!("parse clear-signing catalog: {error}"),
             )
         })?;
-    let installed = authority
+    let outcome = authority
         .install_clear_signing_catalog_for_enrolled_wallets(&catalog, bytes.len())
         .map_err(|error| ProtocolError::new(ProtocolErrorCode::ClaimInvalid, error.to_string()))?;
     tracing::info!(
@@ -1644,10 +1658,59 @@ fn install_clear_signing_catalog(
         catalog_id = catalog.catalog_id.as_str(),
         sequence = catalog.sequence.as_str(),
         entries = catalog.entries.len(),
-        installed,
+        outcome = ?outcome,
         "Broker read the operator's clear-signing catalog"
     );
     Ok(())
+}
+
+/// The theme can restyle the approval page, including hiding a warning, so
+/// only root or Broker's own account may be able to write it.
+fn load_theme_css(path: &Path, broker_uid: u32) -> Result<String, ProtocolError> {
+    const THEME_MAX_BYTES: u64 = 64 * 1024;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| {
+            ProtocolError::new(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                format!("open {}: {error}", path.display()),
+            )
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            format!("inspect {}: {error}", path.display()),
+        )
+    })?;
+    if !metadata.file_type().is_file()
+        || ![0, broker_uid].contains(&metadata.uid())
+        || metadata.mode() & 0o022 != 0
+        || metadata.len() > THEME_MAX_BYTES
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            "ceremony theme must be a non-symlink regular file of at most 64 KiB, owned by root \
+             or Broker's account and not writable by group or other",
+        ));
+    }
+    let mut css = String::new();
+    file.take(THEME_MAX_BYTES + 1)
+        .read_to_string(&mut css)
+        .map_err(|error| {
+            ProtocolError::new(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                format!("read {}: {error}", path.display()),
+            )
+        })?;
+    if css.len() as u64 > THEME_MAX_BYTES {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            "ceremony theme exceeds 64 KiB",
+        ));
+    }
+    Ok(css)
 }
 
 fn load_provenance_catalog(path: &Path) -> Result<ProvenanceCatalog, ProtocolError> {
@@ -1758,6 +1821,31 @@ mod startup_failure_tests {
     use super::*;
     use bloom_broker_api::{ApprovalLifecycleState, BootEpoch, ReadinessState};
     use tracing_subscriber::prelude::*;
+
+    #[test]
+    fn a_theme_others_can_write_or_substitute_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("theme.css");
+        fs::write(&path, "body { color: red; }").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let uid = fs::metadata(&path).unwrap().uid();
+        assert_eq!(load_theme_css(&path, uid).unwrap(), "body { color: red; }");
+        if uid != 0 {
+            // Owned by an account that is neither root nor Broker.
+            assert!(load_theme_css(&path, uid + 1).is_err());
+        }
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(load_theme_css(&path, uid).is_err());
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&path, vec![b' '; 64 * 1024 + 1]).unwrap();
+        assert!(load_theme_css(&path, uid).is_err());
+
+        let link = directory.path().join("link.css");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(load_theme_css(&link, uid).is_err());
+    }
 
     #[test]
     fn production_registry_contains_the_digest_pinned_solana_verifier() {
