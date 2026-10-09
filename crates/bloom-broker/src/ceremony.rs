@@ -5412,7 +5412,7 @@ fn custody_review_text(kind: CeremonyKind) -> (&'static str, &'static str) {
     match kind {
         CeremonyKind::CardAdd => (
             "Save a card",
-            "Save this card encrypted in Signer; CVC is never saved.",
+            "Save this card encrypted in Signer, replacing any saved card with the same ID; CVC is never saved.",
         ),
         CeremonyKind::CardDelete => (
             "Delete a card",

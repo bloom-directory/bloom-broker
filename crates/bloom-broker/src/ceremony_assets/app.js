@@ -24,7 +24,7 @@ const MNEMONIC_WORD_COUNTS = [12, 15, 18, 21, 24];
 // is signed or bound; the exact signed material stays available under
 // "Signed details" and is what the passkey attests to.
 const KINDS = {
-  card_add: {title: "Save a card", summary: "Save this card encrypted in Signer. CVC is never saved.", button: "Save with passkey"},
+  card_add: {title: "Save a card", summary: "Save this card encrypted in Signer. It replaces any saved card with the same ID. CVC is never saved.", button: "Save with passkey"},
   card_delete: {title: "Delete a card", summary: "Remove the saved card. Your card container remains enrolled.", button: "Delete with passkey"},
   card_checkout: {title: "Approve a purchase", summary: "Fill and submit this checkout once. Bloom cannot cap the merchant's actual charge.", button: "Approve purchase with passkey"},
   wallet_registration: {
