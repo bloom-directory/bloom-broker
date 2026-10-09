@@ -473,6 +473,7 @@ rendered = allText(nodes.review);
 for (const expected of ["Approve one Safe transaction", "ERC-20 transfer",
   "0x6000000000000000000000000000000000000000", "Token amount (base units): 123",
   "Safe nonce", "0x9565", "rebuilt from the exact signing bytes", "not verified",
+  "Reported by the Petal, not verified",
   "Threshold 2 of 2 owners"]) {{
   if (!rendered.includes(expected)) throw new Error(`Safe review not disclosed ${{expected}}: ${{rendered}}`);
 }}
