@@ -7,6 +7,21 @@
 //!
 //! [`compute`] recomputes it from the sources embedded at compile time; the
 //! test in Broker asserts it equals the published constant.
+//!
+//! # What the pin does not cover
+//!
+//! This digest covers catalog-driven clear signing: this crate's sources and
+//! the ABI decoder underneath them. It does not cover Broker's own renderings
+//! -- `evm_review.rs` and `safe_review.rs` -- which read a native EVM
+//! transaction or a Safe transaction from the exact bytes rather than from a
+//! publisher's catalog. Those produce security-bearing ceremony text too, and
+//! a wallet that pins this digest is not pinning them.
+//!
+//! That is deliberate: a catalog reading is a third party's description, which
+//! is what a wallet needs to pin, while Broker's own reading changes with
+//! Broker. Anyone adding a decoder should know which side of the line they
+//! are on. Extending the pin to cover Broker's renderings would mean a second
+//! digest with its own recompute-in-the-same-change test.
 
 use sha2::{Digest, Sha256};
 
