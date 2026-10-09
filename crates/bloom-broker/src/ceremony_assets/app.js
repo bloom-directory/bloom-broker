@@ -746,12 +746,12 @@ function describePolicy(manifest) {
   const isDeployGrant = d => d.destination === "exact" && String(d.chain || "").startsWith("evm-");
   for (const d of diff.added_destinations || []) {
     if (isDeployGrant(d)) lines.push([`Allow exact transactions on ${chainLabel(d.chain)}`,
-      "any address through the deployment workflow, including contract creation; every transaction still needs its own approval"]);
+      "any address through the deployment workflow, including contract creation, and Safe owner signing; every transaction still needs its own approval"]);
     else lines.push(["Allow sending to", dest(d), true]);
   }
   for (const d of diff.removed_destinations || []) {
     if (isDeployGrant(d)) lines.push([`Stop allowing exact transactions on ${chainLabel(d.chain)}`,
-      "deployment transactions need listed recipients again and contract creation is refused"]);
+      "deployment transactions need listed recipients again; contract creation and Safe owner signing are refused"]);
     else lines.push(["Stop allowing sending to", dest(d), true]);
   }
   for (const p of diff.added_petal_packages || []) lines.push(["Allow app (petal)", shortDigest(p), true]);

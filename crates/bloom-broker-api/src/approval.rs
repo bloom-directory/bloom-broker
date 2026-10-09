@@ -27,10 +27,9 @@ const APPROVAL_DOMAIN: &[u8] = b"bloom-sealed-approval-terms/v1";
 /// requiring some review envelope for every Petal-subject exact approval —
 /// would refuse every petal that legitimately signs an exact payload today,
 /// which is why `subject_is_native_evm_transaction` excludes Petal subjects.
-/// That is a Petal-contract decision, not a local one. Until it is made, the
-/// Machine side is the other half of this: it refuses to sign a Safe payload
-/// except through this class, so a mis-packaged Safe petal cannot get a
-/// signature there either.
+/// That is a Petal-contract decision, not a local one. Neither Machine nor
+/// Broker identifies a Safe preimage registered under another class. Registering
+/// the Safe Petal under this class is a release-trust requirement.
 pub const SAFE_CONFIRM_OPERATION_CLASS: &str = "safe.transaction.confirm";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

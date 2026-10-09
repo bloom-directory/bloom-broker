@@ -154,7 +154,7 @@ body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-f
 .facts{display:grid;grid-template-columns:var(--ceremony-label-width) minmax(0,1fr);gap:var(--ceremony-space-1) var(--ceremony-space-2);margin:0}
 .facts:empty{display:none}
 .facts dt{color:var(--ceremony-muted)}
-.facts dd{margin:0;overflow-wrap:anywhere}
+.facts dd{margin:0;overflow-wrap:anywhere;white-space:pre-line}
 .facts code{font:var(--ceremony-address-size)/1.5 var(--ceremony-font-mono)}
 
 details.ceremony-details,details.signed{margin:0}
