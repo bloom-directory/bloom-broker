@@ -582,6 +582,32 @@ function describeTransfer(manifest) {
             networkIcon: oneNetwork ? ({"1": "ethereum", "8453": "base", "31337": "test"}[first.chain_id] || "unknown") : "unknown",
             willVerify: true};
   }
+  const safe = plan.safe_review;
+  if (safe) {
+    const network = chainLabel(safe.chain);
+    const facts = [
+      ["Safe", safe.safe, true],
+      ["Action", safe.action.join("\n")],
+      ["Destination", safe.destination, true],
+      [safe.operation === "delegatecall" ? "Outer call value (batch or deployment values are shown above)" : "Value", safe.value_display],
+      ["Network", network],
+      ["Signing owner", safe.owner, true],
+      ["Safe nonce", safe.nonce],
+      ["Operation", safe.operation],
+      ["Safe transaction hash", safe.safe_tx_hash, true],
+      ["Bloom verification", "Safe transaction rebuilt from the exact signing bytes. Safe configuration and call execution effects are not verified."],
+      ["Reported by the Petal, not verified", [
+        `Safe version ${safe.reported.version}`,
+        `Threshold ${safe.reported.threshold} of ${safe.reported.owners.length} owners`,
+        `Singleton ${safe.reported.singleton}`,
+        `Guard ${safe.reported.guard}`,
+        `Modules ${safe.reported.modules.join(", ") || "none"}`,
+        `Fallback handler ${safe.reported.fallback_handler}`,
+      ].join("\n")],
+    ];
+    const sentence = `Approve one Safe transaction on <strong>${escapeHtml(network)}</strong>: ${escapeHtml(safe.action[0].replace(/^Action: /, ""))}.`;
+    return {sentence, facts, willVerify: true};
+  }
   if (!claim) return null;
   const debits = claim.declared_debits || [];
   const dests = claim.declared_destinations || [];
@@ -724,12 +750,12 @@ function describePolicy(manifest) {
   const isDeployGrant = d => d.destination === "exact" && String(d.chain || "").startsWith("evm-");
   for (const d of diff.added_destinations || []) {
     if (isDeployGrant(d)) lines.push([`Allow exact transactions on ${chainLabel(d.chain)}`,
-      "any address through the deployment workflow, including contract creation; every transaction still needs its own approval"]);
+      "any address through the deployment workflow, including contract creation, and Safe owner signing; every transaction still needs its own approval"]);
     else lines.push(["Allow sending to", dest(d), true]);
   }
   for (const d of diff.removed_destinations || []) {
     if (isDeployGrant(d)) lines.push([`Stop allowing exact transactions on ${chainLabel(d.chain)}`,
-      "deployment transactions need listed recipients again and contract creation is refused"]);
+      "deployment transactions need listed recipients again; contract creation and Safe owner signing are refused"]);
     else lines.push(["Stop allowing sending to", dest(d), true]);
   }
   for (const p of diff.added_petal_packages || []) lines.push(["Allow app (petal)", shortDigest(p), true]);

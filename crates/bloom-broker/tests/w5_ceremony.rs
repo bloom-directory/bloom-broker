@@ -443,6 +443,40 @@ for (const expected of ["Deploy a contract", "Initcode", "5 bytes", "0xcafe"]) {
   if (!rendered.includes(expected)) throw new Error(`creation not disclosed ${{expected}}: ${{rendered}}`);
 }}
 
+// A Safe review is the headline, with the Petal-reported state marked unverified.
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "wallet-primary"}},
+  review_manifest: {{
+    schema: "bloom.review-manifest.v1",
+    canonical_plan: JSON.stringify({{safe_review: {{
+      chain_id: "1", chain: "ethereum",
+      safe: "0x1000000000000000000000000000000000000000",
+      owner: "0x3000000000000000000000000000000000000000",
+      nonce: "4", operation: "call",
+      destination: "0x5000000000000000000000000000000000000000",
+      value: "0", value_display: "0 ETH",
+      action: ["Action: ERC-20 transfer", "Token: 0x5000000000000000000000000000000000000000",
+        "Recipient: 0x6000000000000000000000000000000000000000", "Token amount (base units): 123"],
+      safe_tx_hash: "0x9565",
+      reported: {{version: "1.4.1", singleton: "0x41", singleton_code_hash: "0x1f",
+        owners: ["0x3000000000000000000000000000000000000000", "0xaaaa"], threshold: "2",
+        guard: "0x0000000000000000000000000000000000000000", modules: [],
+        fallback_handler: "0x0000000000000000000000000000000000000000"}}
+    }}}}),
+    attributed_advisory_items: []
+  }}
+}});
+rendered = allText(nodes.review);
+for (const expected of ["Approve one Safe transaction", "ERC-20 transfer",
+  "0x6000000000000000000000000000000000000000", "Token amount (base units): 123",
+  "Safe nonce", "0x9565", "rebuilt from the exact signing bytes", "not verified",
+  "Reported by the Petal, not verified",
+  "Threshold 2 of 2 owners"]) {{
+  if (!rendered.includes(expected)) throw new Error(`Safe review not disclosed ${{expected}}: ${{rendered}}`);
+}}
+
 // A batch member Bloom could not read is never shown as a plain send, and a
 // batch spanning two networks is not headed with the first one alone.
 const unread = (chain_id, chain) => ({{
@@ -2208,6 +2242,7 @@ async fn prepare_scoped_approval(
             petal_use_claim: None,
             system_use_claim: None,
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
         }),
     )
     .await?
@@ -2682,6 +2717,13 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     proposed_policy
         .allowed_petal_packages
         .push(petal_package.clone());
+    proposed_policy.allowed_petal_packages.push(digest("d5"));
+    proposed_policy
+        .allowed_destinations
+        .push(PolicyDestination {
+            chain: Token::new("evm-31337").unwrap(),
+            destination: "exact".into(),
+        });
     proposed_policy
         .allowed_destinations
         .push(PolicyDestination {
@@ -3141,6 +3183,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
             requested_review_mode: None,
             evm_review_payloads: vec![Base64UrlBytes::from_bytes(&creation)],
+            safe_review_payloads: Vec::new(),
             operation_id: operation("d9"),
             terms: SealedApprovalTerms {
                 subject: ApprovalSubject::Cli {
@@ -3173,12 +3216,265 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             .contains("not bound to Broker's verified current policy"),
         "{stale_policy_error:?}"
     );
+    // A package declaring the Safe class signs opaque preimages: Broker refuses
+    // its exact approvals without an envelope and its reusable approvals.
+    let safe_package = digest("d5");
+    let safe_route = "/petals/safe/confirm";
+    let mut safe_provenance = petal_provenance.clone();
+    safe_provenance.subject = ProvenanceSubject::Petal {
+        package_hash: safe_package.clone(),
+        route: safe_route.into(),
+    };
+    safe_provenance.operation_classes = vec![ProvenanceOperationClass {
+        operation_class: Token::new(bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS).unwrap(),
+        fee_asset: None,
+    }];
+    sign_provenance(&mut safe_provenance, &installer_key);
+    authority.install_provenance(&safe_provenance).unwrap();
+    let safe_terms = SealedApprovalTerms {
+        key_ref: parent_key.clone(),
+        provenance_digest: safe_provenance.digest().unwrap(),
+        limits: ApprovalLimits {
+            max_operations: DecimalU64::new(1),
+            max_signatures: DecimalU64::new(1),
+            operation_rate_limits: Vec::new(),
+            signature_rate_limits: Vec::new(),
+            value_limits: Vec::new(),
+        },
+        subject: ApprovalSubject::Petal {
+            package_hash: safe_package.clone(),
+            route: safe_route.into(),
+            agent_id: None,
+        },
+        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+        selector: ApprovalSelector::Exact {
+            ordered_payload_digests: vec![digest("d6")],
+            ordered_hashes: vec![digest("d7")],
+        },
+        request_nonce: RequestNonce::from_bytes([0xd8; 16]),
+        ..approval_terms.clone()
+    };
+    let safe_prepare = |terms: SealedApprovalTerms, envelope: Option<Vec<u8>>| {
+        MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                requested_review_mode: None,
+                evm_review_payloads: Vec::new(),
+                safe_review_payloads: envelope
+                    .map(|bytes| vec![Base64UrlBytes::from_bytes(&bytes)])
+                    .unwrap_or_default(),
+                operation_id: operation("da"),
+                terms,
+                canonical_plan_facts_digest: digest("d4"),
+                petal_use_claim: None,
+                system_use_claim: None,
+            }),
+        )
+    };
+    let blind = safe_prepare(safe_terms.clone(), None).await.unwrap_err();
+    assert!(
+        blind.message.contains("requires the review envelope"),
+        "{blind:?}"
+    );
+    let reusable = safe_prepare(
+        SealedApprovalTerms {
+            selector: ApprovalSelector::Petal {
+                package_hash: safe_package.clone(),
+                route: safe_route.into(),
+                allowed_operation_classes: vec![
+                    Token::new(bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS).unwrap(),
+                ],
+                route_grants: Vec::new(),
+                required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+            },
+            ..safe_terms.clone()
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        reusable.message.contains("require exact approval"),
+        "{reusable:?}"
+    );
+    let route_grant = safe_prepare(
+        SealedApprovalTerms {
+            selector: ApprovalSelector::Petal {
+                package_hash: safe_package.clone(),
+                route: safe_route.into(),
+                allowed_operation_classes: vec![Token::new("exchange-order").unwrap()],
+                route_grants: vec![bloom_broker_api::PetalRouteGrant {
+                    route: "/petals/safe/other-confirm".into(),
+                    allowed_operation_classes: vec![
+                        Token::new(bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS).unwrap(),
+                    ],
+                    provenance_digest: safe_provenance.digest().unwrap(),
+                }],
+                required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+            },
+            ..safe_terms.clone()
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        route_grant.message.contains("require exact approval"),
+        "{route_grant:?}"
+    );
+    let envelope = serde_jcs::to_vec(&serde_json::json!({
+        "schema": "bloom.safe.review.v1", "chain_id": "31337",
+        "safe_address": "0x1000000000000000000000000000000000000000", "safe_version": "1.4.1",
+        "singleton": "0x41675c099f32341bf84bfc5382af534df5c7461a",
+        "singleton_code_hash": "0x1fe2df852ba3299d6534ef416eefa406e56ced995bca886ab7a553e6d0c5e1c4",
+        "owner": "0x3000000000000000000000000000000000000000",
+        "owners": ["0x3000000000000000000000000000000000000000"], "threshold": "1",
+        "guard": "0x0000000000000000000000000000000000000000", "modules": [],
+        "fallback_handler": "0x0000000000000000000000000000000000000000",
+        "safe_tx": {"to": "0x4000000000000000000000000000000000000000", "value": "7", "data": "0x",
+            "operation": 0, "safe_tx_gas": "0", "base_gas": "0", "gas_price": "0",
+            "gas_token": "0x0000000000000000000000000000000000000000",
+            "refund_receiver": "0x0000000000000000000000000000000000000000", "nonce": "4"}
+    }))
+    .unwrap();
+    let wrong_subject = safe_prepare(
+        SealedApprovalTerms {
+            subject: approval_terms.subject.clone(),
+            ..safe_terms.clone()
+        },
+        Some(envelope.clone()),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        wrong_subject.message.contains("Safe Petal subject"),
+        "{wrong_subject:?}"
+    );
+    // The envelope names another owner than the Signer-held key.
+    let wrong_owner = safe_prepare(safe_terms.clone(), Some(envelope.clone()))
+        .await
+        .unwrap_err();
+    assert!(
+        wrong_owner.message.contains("owner differs"),
+        "{wrong_owner:?}"
+    );
+    // A valid review goes through the real Broker/Signer boundary and its
+    // decoded facts and disclosure survive into the signed review manifest.
+    let public = match MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::KeyGetPublic(bloom_broker_api::KeyRequest {
+            key_ref: parent_key.clone(),
+        }),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::KeyGetPublic(public) => public,
+        other => panic!("unexpected public key response: {other:?}"),
+    };
+    let public = public.canonical_public_key.decode();
+    use k256::elliptic_curve::sec1::ToEncodedPoint as _;
+    use k256::pkcs8::DecodePublicKey as _;
+    let public = k256::PublicKey::from_public_key_der(&public)
+        .unwrap()
+        .to_encoded_point(false);
+    let owner = alloy::primitives::Address::from_raw_public_key(&public.as_bytes()[1..]);
+    let mut valid: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+    valid["owner"] = serde_json::json!(owner.to_string());
+    valid["owners"] = serde_json::json!([owner.to_string()]);
+    let word = |n: u64| alloy::primitives::U256::from(n).to_be_bytes::<32>();
+    let address_word = |address: &str| {
+        let mut result = [0u8; 32];
+        result[12..].copy_from_slice(
+            address
+                .parse::<alloy::primitives::Address>()
+                .unwrap()
+                .as_slice(),
+        );
+        result
+    };
+    let mut domain =
+        alloy::primitives::keccak256("EIP712Domain(uint256 chainId,address verifyingContract)")
+            .to_vec();
+    domain.extend_from_slice(&word(31337));
+    domain.extend_from_slice(&address_word(valid["safe_address"].as_str().unwrap()));
+    let mut transaction = alloy::primitives::keccak256("SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)").to_vec();
+    transaction.extend_from_slice(&address_word(valid["safe_tx"]["to"].as_str().unwrap()));
+    transaction.extend_from_slice(&word(7));
+    transaction.extend_from_slice(alloy::primitives::keccak256([]).as_slice());
+    for _ in 0..6 {
+        transaction.extend_from_slice(&word(0));
+    }
+    transaction.extend_from_slice(&word(4));
+    let mut preimage = vec![0x19, 0x01];
+    preimage.extend_from_slice(alloy::primitives::keccak256(domain).as_slice());
+    preimage.extend_from_slice(alloy::primitives::keccak256(transaction).as_slice());
+    let response = safe_prepare(
+        SealedApprovalTerms {
+            selector: ApprovalSelector::Exact {
+                ordered_payload_digests: vec![Digest32::from_bytes(
+                    sha2::Sha256::digest(&preimage).into(),
+                )],
+                ordered_hashes: vec![Digest32::from_bytes(
+                    alloy::primitives::keccak256(&preimage).0,
+                )],
+            },
+            ..safe_terms
+        },
+        Some(serde_jcs::to_vec(&valid).unwrap()),
+    )
+    .await
+    .unwrap();
+    let response = match response {
+        MachineBrokerResponse::SealedApprovalPrepare(response) => response,
+        other => panic!("unexpected approval response: {other:?}"),
+    };
+    let session = broker
+        .ceremony()
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let projection: serde_json::Value =
+        serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let manifest = &projection["review_manifest"];
+    let plan: serde_json::Value =
+        serde_json::from_str(manifest["canonical_plan"].as_str().unwrap()).unwrap();
+    assert_eq!(plan["safe_review"]["owner"], owner.to_string());
+    assert_eq!(manifest["safe_review"], plan["safe_review"]);
+    assert!(
+        plan["security_disclosures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| {
+                value
+                    .as_str()
+                    .unwrap()
+                    .contains("rebuilt the Safe transaction")
+            })
+    );
+    broker
+        .ceremony()
+        .cancel(&operation("da"), approval_now_ms)
+        .unwrap();
+    // Cancellation intentionally backs this wallet off for two seconds.
+    // Fast hosts must observe that guard before preparing its next ceremony.
+    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
     let approval_operation = operation("d3");
     let approval_prepared = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
             requested_review_mode: None,
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
             operation_id: approval_operation.clone(),
             terms: approval_terms.clone(),
             canonical_plan_facts_digest: digest("d4"),
@@ -3311,6 +3607,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
             requested_review_mode: None,
+            safe_review_payloads: Vec::new(),
             operation_id: exact_approval_operation.clone(),
             terms: exact_terms.clone(),
             canonical_plan_facts_digest: digest("e7"),
@@ -3543,6 +3840,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                 MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
                     requested_review_mode: None,
                     evm_review_payloads: Vec::new(),
+                    safe_review_payloads: Vec::new(),
                     operation_id: operation(&format!("{:02x}", 0xc0 + index)),
                     terms: denied_terms,
                     canonical_plan_facts_digest: digest("c9"),
@@ -4357,6 +4655,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
                 requested_review_mode: None,
                 evm_review_payloads: Vec::new(),
+                safe_review_payloads: Vec::new(),
                 operation_id: operation("dc"),
                 terms: expired_terms,
                 canonical_plan_facts_digest: digest("dd"),
@@ -4963,6 +5262,92 @@ async fn review_plan_formats_known_asset_base_units_without_hiding_raw_authority
     assert_eq!(plan["asset_amounts"][0]["display"], "0.01 USDC");
     assert_eq!(plan["asset_amounts"][0]["base_units"], "10000");
     assert_eq!(plan["asset_amounts"][0]["decimals"], 6);
+}
+
+#[tokio::test]
+async fn unreadable_safe_call_carries_a_signed_inability_to_explain_disclosure() {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        Arc::new(MockSigner::new()),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[32; 32]),
+    );
+    let safe = serde_json::from_value(serde_json::json!({
+        "chain_id":"1", "chain":"ethereum", "safe":"0x1000000000000000000000000000000000000000",
+        "owner":"0x3000000000000000000000000000000000000000", "nonce":"4", "operation":"call",
+        "destination":"0x4000000000000000000000000000000000000000", "value":"0", "value_display":"0 ETH",
+        "action":["Action: Contract call", "Calldata selector: 0xdeadbeef"], "safe_tx_hash":"0x1234",
+        "reported":{"version":"1.4.1", "singleton":"0x41", "singleton_code_hash":"0x1f",
+            "owners":["0x3000000000000000000000000000000000000000"], "threshold":"1",
+            "guard":"0x0000000000000000000000000000000000000000", "modules":[],
+            "fallback_handler":"0x0000000000000000000000000000000000000000", "library_code_hash":null}
+    })).unwrap();
+    let prepared = broker
+        .prepare_approval(
+            approval_request(),
+            ReviewManifestContext {
+                safe_review: Some(safe),
+                ..ReviewManifestContext::default()
+            },
+            now_ms,
+        )
+        .unwrap();
+    let session = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&prepared.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let projection: serde_json::Value =
+        serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let plan: serde_json::Value = serde_json::from_str(
+        projection["review_manifest"]["canonical_plan"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        plan["security_disclosures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str().unwrap().contains("Bloom cannot explain"))
+    );
+    assert!(
+        projection["review_manifest"]["broker_signature"]
+            .as_str()
+            .is_some_and(|signature| !signature.is_empty())
+    );
+    let mut unsigned = projection["review_manifest"].clone();
+    let signature: Base64UrlBytes = serde_json::from_value(
+        unsigned
+            .as_object_mut()
+            .unwrap()
+            .remove("broker_signature")
+            .unwrap(),
+    )
+    .unwrap();
+    let signature = ed25519_dalek::Signature::from_slice(&signature.decode()).unwrap();
+    SigningKey::from_bytes(&[32; 32])
+        .verifying_key()
+        .verify(
+            &[
+                b"bloom-broker-review-manifest/v1".as_slice(),
+                serde_jcs::to_vec(&unsigned).unwrap().as_slice(),
+            ]
+            .concat(),
+            &signature,
+        )
+        .unwrap();
 }
 
 #[tokio::test]

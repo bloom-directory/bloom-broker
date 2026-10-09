@@ -171,6 +171,11 @@ extends an approval, and a signature already produced cannot be recalled.
 
 ## Unlimited allowances
 
+Safe approval freezes its chain opt-in and opaque review permission when prepared.
+Signing rechecks the approval's policy binding, but does not separately re-evaluate
+those Safe-specific permissions through the clear-signing catalog recheck. Retire
+pending approvals when changing those permissions.
+
 Denied by default. A maximum-U256 request explains the denial and names one
 action: change the wallet policy. That is **one existing wallet-policy
 ceremony** — setting `unlimited_allowance_allowed` in the canonical policy
