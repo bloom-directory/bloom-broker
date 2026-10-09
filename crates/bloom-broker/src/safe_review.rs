@@ -1339,6 +1339,7 @@ mod tests {
             &[],
         ));
         let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        value["chain_id"] = serde_json::json!("8453");
         value["safe_tx"]["to"] = serde_json::json!("0x9641d764fc13c8b624c04430c7356c1c7c8102e2");
         value["safe_tx"]["value"] = serde_json::json!("0");
         value["safe_tx"]["operation"] = serde_json::json!(1);
@@ -1349,13 +1350,18 @@ mod tests {
         let batch = serde_jcs::to_vec(&value).unwrap();
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
 
-        let error = review(&request(batch.clone()), &clear_signing_policy(false), from)
+        let on_base = |allowed| {
+            let mut policy = clear_signing_policy(allowed);
+            policy.allowed_destinations[0].chain = token("evm-8453");
+            policy
+        };
+        let error = review(&request(batch.clone()), &on_base(false), from)
             .expect_err("an unreadable batch entry must obey the wallet's setting");
         assert!(error.to_string().contains("cannot explain"), "{}", error);
 
         let mut opaque_request = request(batch);
         opaque_request.requested_review_mode = Some(ReviewMode::OpaqueExact);
-        let plan = review(&opaque_request, &clear_signing_policy(true), from)
+        let plan = review(&opaque_request, &on_base(true), from)
             .unwrap()
             .unwrap();
         assert!(is_opaque(&plan), "{:?}", plan.action);
