@@ -2165,6 +2165,7 @@ mod tests {
             &[],
         ));
         let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        value["chain_id"] = serde_json::json!("8453");
         value["safe_tx"]["to"] = serde_json::json!("0x9641d764fc13c8b624c04430c7356c1c7c8102e2");
         value["safe_tx"]["value"] = serde_json::json!("0");
         value["safe_tx"]["operation"] = serde_json::json!(1);
