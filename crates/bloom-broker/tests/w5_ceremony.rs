@@ -368,6 +368,7 @@ async fn card_add_delete_and_expiry_use_real_signer_proofs() {
     use bloom_signer_api::CardEffect;
     let signer = real_ceremony_signer();
     let broker = CeremonyBroker::new(signer.clone());
+    let prepared_at = card_test_now();
     let prepared = broker
         .prepare_card(
             operation("91"),
@@ -375,10 +376,14 @@ async fn card_add_delete_and_expiry_use_real_signer_proofs() {
                 card_id: Token::new("card-one").unwrap(),
                 label: "Synthetic card".into(),
             },
-            card_test_now(),
+            prepared_at,
         )
         .unwrap();
     let session = card_session_json(&broker, &prepared).await;
+    assert_eq!(
+        session["expires_at_ms"].as_u64().unwrap(),
+        prepared_at + 120_000
+    );
     let handle: Base64UrlBytes =
         serde_json::from_value(session["webauthn_options"]["registration_user_handle"].clone())
             .unwrap();
@@ -1770,7 +1775,9 @@ impl CeremonySigner for RealSigner {
         request: bloom_signer_api::CardPrepareRequest,
         now_ms: u64,
     ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
-        self.service.prepare_card(request, now_ms)
+        // Real RPC samples Signer's clock after transport. Exercise that skew.
+        self.service
+            .prepare_card(request, now_ms.saturating_add(250))
     }
     fn complete_card(
         &self,
