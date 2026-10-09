@@ -149,7 +149,7 @@ One member Bloom cannot describe blocks the whole batch — there is no split,
 no mixed badge and no downgrade. `opaque_exact` must be requested explicitly,
 needs `opaque_exact_allowed`, and carries the inability-to-explain warning in
 the signed manifest. It covers only calls Bloom cannot read: a batch member
-the current catalog describes is refused under `opaque_exact`, and one the
+a currently valid catalog describes is refused under `opaque_exact`, and one the
 catalog would refuse (such as an unlimited allowance) is refused for that
 reason, so requesting `opaque_exact` cannot skip a refusal. A wallet without
 the extension refuses a requested mode rather than ignoring it.
@@ -258,3 +258,9 @@ instead: its strict decoder rejects the unknown `clear_signing` field while
 loading the policy. That is fail-closed rather than silent, but it is a
 different message, and rollback is never made to work by dropping the field.
 The same rule applies to backup and restore.
+
+An expired catalog cannot explain calls, so an explicitly requested opaque review
+may proceed when wallet policy permits it. A refused signed catalog leaves Broker
+running; an unsafe or unreadable unsigned theme stops startup because it controls
+what the owner sees. Theme and catalog files are opened without following symlinks,
+and permissions are checked on the same file handle that is read.

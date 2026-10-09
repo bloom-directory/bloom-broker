@@ -5,7 +5,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::{ErrorKind, Write as _},
+    io::{ErrorKind, Read as _, Write as _},
     os::unix::fs::{MetadataExt, OpenOptionsExt as _, PermissionsExt as _, chown},
     path::{Path, PathBuf},
     sync::Arc,
@@ -884,7 +884,7 @@ fn write_startup_failure(
         }
         fs::remove_file(&temporary)?;
     }
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
@@ -1603,7 +1603,17 @@ fn install_clear_signing_catalog(
     authority: &BrokerAuthority,
     path: &Path,
 ) -> Result<(), ProtocolError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| {
+            ProtocolError::new(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                format!("open {}: {error}", path.display()),
+            )
+        })?;
+    let metadata = file.metadata().map_err(|error| {
         ProtocolError::new(
             ProtocolErrorCode::UnauthenticatedPeer,
             format!("inspect {}: {error}", path.display()),
@@ -1618,12 +1628,15 @@ fn install_clear_signing_catalog(
             "clear-signing catalog must be a non-symlink regular file not writable by group or other",
         ));
     }
-    let bytes = fs::read(path).map_err(|error| {
-        ProtocolError::new(
-            ProtocolErrorCode::UnauthenticatedPeer,
-            format!("read {}: {error}", path.display()),
-        )
-    })?;
+    let mut bytes = Vec::new();
+    file.take((bloom_evm_clear_signing::CATALOG_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ProtocolError::new(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                format!("read {}: {error}", path.display()),
+            )
+        })?;
     if bytes.len() > bloom_evm_clear_signing::CATALOG_MAX_BYTES {
         return Err(ProtocolError::new(
             ProtocolErrorCode::LimitExceededFrame,
@@ -1655,7 +1668,17 @@ fn install_clear_signing_catalog(
 /// only root or Broker's own account may be able to write it.
 fn load_theme_css(path: &Path, broker_uid: u32) -> Result<String, ProtocolError> {
     const THEME_MAX_BYTES: u64 = 64 * 1024;
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| {
+            ProtocolError::new(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                format!("open {}: {error}", path.display()),
+            )
+        })?;
+    let metadata = file.metadata().map_err(|error| {
         ProtocolError::new(
             ProtocolErrorCode::UnauthenticatedPeer,
             format!("inspect {}: {error}", path.display()),
@@ -1672,12 +1695,22 @@ fn load_theme_css(path: &Path, broker_uid: u32) -> Result<String, ProtocolError>
              or Broker's account and not writable by group or other",
         ));
     }
-    fs::read_to_string(path).map_err(|error| {
-        ProtocolError::new(
+    let mut css = String::new();
+    file.take(THEME_MAX_BYTES + 1)
+        .read_to_string(&mut css)
+        .map_err(|error| {
+            ProtocolError::new(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                format!("read {}: {error}", path.display()),
+            )
+        })?;
+    if css.len() as u64 > THEME_MAX_BYTES {
+        return Err(ProtocolError::new(
             ProtocolErrorCode::UnauthenticatedPeer,
-            format!("read {}: {error}", path.display()),
-        )
-    })
+            "ceremony theme exceeds 64 KiB",
+        ));
+    }
+    Ok(css)
 }
 
 fn load_provenance_catalog(path: &Path) -> Result<ProvenanceCatalog, ProtocolError> {

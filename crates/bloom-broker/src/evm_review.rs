@@ -364,9 +364,9 @@ fn apply_review_mode(
                 Err(error) if error.reason == ReviewReason::UnsupportedCall => {}
                 Err(error) => return Err(review_error(error)),
                 Ok(_) => {
-                    return Err(denied(
-                        ReviewReason::PolicyDenied,
-                        "Bloom can read this call, so it cannot be approved unread; \
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ClaimInvalid,
+                        "POLICY_DENIED: Bloom can read this call, so it cannot be approved unread; \
                          request a clear-signed review",
                     ));
                 }
@@ -1602,7 +1602,8 @@ mod mode_tests {
         request.requested_review_mode = Some(ReviewMode::OpaqueExact);
         let error = review(&request, &policy, Address::ZERO, &enabled_context()).unwrap_err();
         assert!(
-            error.message.contains("cannot be approved unread"),
+            error.message.contains("cannot be approved unread")
+                && !error.message.contains("Change policy"),
             "{}",
             error.message
         );
