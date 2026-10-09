@@ -10,6 +10,8 @@ const exportFields = document.getElementById("export-fields");
 const importFields = document.getElementById("import-fields");
 const mnemonicInput = document.getElementById("mnemonic-input");
 const rawKeyInput = document.getElementById("raw-key-input");
+const cardFields = document.getElementById("card-fields");
+const cardCvcFields = document.getElementById("card-cvc-fields");
 const panelTitle = document.getElementById("panel-title");
 const panelKicker = document.getElementById("panel-kicker");
 
@@ -21,6 +23,9 @@ const MNEMONIC_WORD_COUNTS = [12, 15, 18, 21, 24];
 // is signed or bound; the exact signed material stays available under
 // "Signed details" and is what the passkey attests to.
 const KINDS = {
+  card_add: {title: "Save a card", summary: "Save this card encrypted in Signer. CVC is never saved.", button: "Save with passkey"},
+  card_delete: {title: "Delete a card", summary: "Remove the saved card. Your card container remains enrolled.", button: "Delete with passkey"},
+  card_checkout: {title: "Approve a purchase", summary: "Fill and submit this checkout once. Bloom cannot cap the merchant's actual charge.", button: "Approve purchase with passkey"},
   wallet_registration: {
     title: "Create a new wallet",
     summary: "A new wallet will be created on your Bloom host. You will set up a <strong>new passkey</strong> for it now — that passkey is what approves anything this wallet does.",
@@ -313,7 +318,41 @@ function planDisclosures(manifest) {
   } catch (_) { return []; }
 }
 
+function renderCardReview(session) {
+  const meta = KINDS[session.ceremony_kind];
+  document.getElementById("page-title").textContent = meta.title;
+  document.getElementById("page-lede").textContent = meta.summary;
+  panelTitle.textContent = "Check this request";
+  approve.textContent = meta.button;
+  const manifest = session.review_manifest;
+  const effect = manifest.card_effect;
+  const facts = el("dl", {class: "facts"});
+  const fact = (name, value) => facts.append(el("dt", {}, name), el("dd", {}, value));
+  if (manifest.card) fact("Card", `${manifest.card.label} · ${manifest.card.brand} ••${manifest.card.last4}`);
+  if (effect.kind === "add") fact("Label", effect.label);
+  if (effect.kind === "checkout") {
+    const payment = effect.facts;
+    fact("Website", el("strong", {}, payment.origin));
+    fact("Payment frames", payment.payment_frame_origins.join(", ") || "Main document");
+    const scale = new Intl.NumberFormat("en", {style: "currency", currency: payment.currency}).resolvedOptions().maximumFractionDigits;
+    const amount = payment.total_minor / (10 ** scale);
+    const money = value => new Intl.NumberFormat("en", {style: "currency", currency: payment.currency}).format(value);
+    fact("Total", `${money(amount)} (${payment.currency})`);
+    fact("Installments", `${payment.installments} × ${money(amount / payment.installments)} = ${money(amount)}`);
+    fact("Recurring charge", payment.recurring ? "Yes" : "No");
+    reviewNode.replaceChildren(facts, el("h3", {}, "Described by agent — not verified"), el("p", {}, effect.agent_description), el("p", {}, "Bloom reports the merchant's confirmation; it does not verify your bank charge."));
+  } else if (effect.kind === "manual_checkout") {
+    approve.textContent = "Open private view with passkey";
+    document.getElementById("page-lede").textContent = "Payment facts could not be verified. Open the private view to finish yourself. No saved card will be released and no automated payment is approved.";
+    reviewNode.replaceChildren(facts, el("h3", {}, "Described by agent — not verified"), el("p", {}, effect.agent_description));
+  } else reviewNode.replaceChildren(facts);
+  const expiry = el("p", {class: "expiry"});
+  reviewNode.append(expiry);
+  startExpiry(session, expiry);
+}
+
 function renderReview(session) {
+  if (session.ceremony_kind.startsWith("card_")) return renderCardReview(session);
   const kind = session.ceremony_kind;
   const meta = KINDS[kind] || {title: kind.replace(/_/g, " "), summary: "", button: "Continue with passkey"};
   const manifest = session.review_manifest;
@@ -1162,6 +1201,8 @@ async function load() {
     });
   }
   statusNode.textContent = "Check the details, then continue with your passkey.";
+  cardFields.hidden = session.ceremony_kind !== "card_add";
+  cardCvcFields.hidden = session.review_manifest?.card_effect?.kind !== "checkout";
   renderReview(session);
   recoveryFields.hidden = session.ceremony_kind !== "wallet_recovery";
   exportFields.hidden = session.ceremony_kind !== "wallet_export";
@@ -1247,7 +1288,37 @@ async function run(session) {
   let secret = null;
   let credentialId = null;
 
-  if (kind === "wallet_registration" || (kind === "wallet_import" && !legacyPasskeyImport)) {
+  if (kind.startsWith("card_")) {
+    let prf;
+    if (session.webauthn_options.registration_user_handle) {
+      const created = await createCredential(session, 0);
+      const confirmed = await ensureNewCredentialPrf(session, created, 1);
+      credentialId = encodeUrl(created.rawId);
+      prf = confirmed.prf;
+      proof = {kind: "registration", attestation: attestationJson(created), prf_assertion: confirmed.assertion};
+    } else {
+      const assertion = await getCredential(session, 0);
+      credentialId = encodeUrl(assertion.rawId);
+      prf = prfResult(assertion);
+      if (!prf) throw new Error("This passkey did not return required PRF output");
+      proof = {kind: "assertion", assertion: assertionJson(assertion)};
+    }
+    const input = {credential_prf: encodeUrl(prf)};
+    if (kind === "card_add") {
+      input.card = {
+        number: document.getElementById("card-number").value.replace(/[\s-]/g, ""),
+        expiry_month: Number(document.getElementById("card-month").value),
+        expiry_year: Number(document.getElementById("card-year").value),
+        name: document.getElementById("card-name").value.trim()
+      };
+    } else if (session.review_manifest.card_effect.kind === "checkout") {
+      input.cvc = document.getElementById("card-cvc").value;
+      if (!/^\d{3,4}$/.test(input.cvc)) throw new Error("Enter a three or four digit CVC");
+    }
+    secret = te.encode(canonicalJson(input));
+    prf.fill(0);
+    for (const field of [...cardFields.querySelectorAll("input"), ...cardCvcFields.querySelectorAll("input")]) field.value = "";
+  } else if (kind === "wallet_registration" || (kind === "wallet_import" && !legacyPasskeyImport)) {
     const created = await createCredential(session, 0);
     const prf = await ensureNewCredentialPrf(session, created, 1);
     credentialId = encodeUrl(created.rawId);
@@ -1384,6 +1455,21 @@ async function run(session) {
 }
 
 async function finishBrowserResult(session, result) {
+  if (session.ceremony_kind.startsWith("card_")) {
+    statusNode.textContent = session.review_manifest.card_effect.kind === "manual_checkout" ? "Private view authorized. No saved card was released." : session.ceremony_kind === "card_checkout" ? "Approved. Checkout is continuing; the outcome is reported by the merchant." : "Completed.";
+    clearInterval(expiryTimer);
+    cardFields.hidden = true;
+    cardCvcFields.hidden = true;
+    approve.hidden = true;
+    cancel.hidden = true;
+    if (result.challenge_url) {
+      const link = el("a", {href: result.challenge_url, target: "_blank", rel: "noopener noreferrer"}, "Open private checkout view");
+      reviewNode.append(el("p", {}, link));
+      window.open(result.challenge_url, "_blank", "noopener,noreferrer");
+    }
+    await clearBrowserState(ceremonyId);
+    return;
+  }
   const contribution = session.signer_contribution;
   statusNode.textContent = "Completed.";
   clearInterval(expiryTimer);

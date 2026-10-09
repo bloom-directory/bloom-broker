@@ -46,6 +46,19 @@
           <p>BIP-39 passphrases are not supported. Import the recovery phrase only.</p>
           <p>Encrypted directly to the Signer before it leaves this page.</p>
         </fieldset>
+        <fieldset id="card-fields" hidden>
+          <legend>Card to save</legend>
+          <label>Card number<input id="card-number" inputmode="numeric" autocomplete="off" maxlength="24"></label>
+          <label>Expiry month<input id="card-month" inputmode="numeric" autocomplete="off" maxlength="2"></label>
+          <label>Expiry year<input id="card-year" inputmode="numeric" autocomplete="off" maxlength="4"></label>
+          <label>Name on card<input id="card-name" autocomplete="off" maxlength="128"></label>
+          <p>Encrypted directly to Signer. Never enter card details in chat.</p>
+        </fieldset>
+        <fieldset id="card-cvc-fields" hidden>
+          <legend>Security code for this purchase</legend>
+          <label>CVC<input id="card-cvc" type="password" inputmode="numeric" autocomplete="off" maxlength="4"></label>
+          <p>Never saved. Approval fills and submits this checkout once.</p>
+        </fieldset>
         <fieldset id="generic-fields" hidden>
           <legend>Advanced input</legend>
           <p>This workflow needs a JSON object. It is encrypted directly to Signer.</p>

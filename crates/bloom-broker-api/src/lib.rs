@@ -1,6 +1,7 @@
 //! Broker-owned public Machine-to-Broker service contract.
 
 mod approval;
+mod cards;
 mod ceremony;
 mod claims;
 mod codec;
@@ -18,6 +19,7 @@ mod validation;
 mod wallet_account;
 
 pub use approval::*;
+pub use cards::*;
 pub use ceremony::*;
 pub use claims::*;
 pub use codec::*;

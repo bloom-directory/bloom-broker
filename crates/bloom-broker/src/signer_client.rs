@@ -390,6 +390,58 @@ fn journal_error(error: crate::journal::JournalError) -> ProtocolError {
 }
 
 impl CeremonySigner for BrokerSignerClient {
+    fn card_list(&self) -> Result<Vec<bloom_signer_api::CardPublic>, ProtocolError> {
+        match self.request(BrokerSignerRequest::CardList(Empty {}))? {
+            BrokerSignerResponse::CardList(value) => Ok(value),
+            _ => Err(response_mismatch("card.list")),
+        }
+    }
+    fn prepare_card(
+        &self,
+        request: bloom_signer_api::CardPrepareRequest,
+        _: u64,
+    ) -> Result<SignerPreparedCustody, ProtocolError> {
+        match self.request(BrokerSignerRequest::CardPrepare(request))? {
+            BrokerSignerResponse::CardPrepare(value) => Ok(value),
+            _ => Err(response_mismatch("card.prepare")),
+        }
+    }
+    fn complete_card(
+        &self,
+        request: CustodyCompleteRequest,
+        _: u64,
+    ) -> Result<CustodyResult, ProtocolError> {
+        match self.request(BrokerSignerRequest::CardComplete(request))? {
+            BrokerSignerResponse::CardComplete(value) => Ok(value),
+            _ => Err(response_mismatch("card.complete")),
+        }
+    }
+    fn card_status(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<bloom_signer_api::CardOperationStatus, ProtocolError> {
+        match self.request(BrokerSignerRequest::CardStatus(
+            bloom_signer_api::OperationRequest {
+                operation_id: operation_id.clone(),
+            },
+        ))? {
+            BrokerSignerResponse::CardStatus(value) => Ok(value),
+            _ => Err(response_mismatch("card.status")),
+        }
+    }
+    fn card_cancel(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<bloom_signer_api::CardOperationStatus, ProtocolError> {
+        match self.request(BrokerSignerRequest::CardCancel(
+            bloom_signer_api::OperationRequest {
+                operation_id: operation_id.clone(),
+            },
+        ))? {
+            BrokerSignerResponse::CardCancel(value) => Ok(value),
+            _ => Err(response_mismatch("card.cancel")),
+        }
+    }
     fn surface_status(&self) -> Result<SurfaceStatus, ProtocolError> {
         match self.request(BrokerSignerRequest::SurfaceStatus(Empty {}))? {
             BrokerSignerResponse::SurfaceStatus(status) => Ok(status),
@@ -522,7 +574,11 @@ impl CeremonySigner for BrokerSignerClient {
             CeremonyKind::AccountAllocate | CeremonyKind::AccountRetire => {
                 BrokerSignerRequest::KeyDerivePrepare(request)
             }
-            CeremonyKind::SealedApproval | CeremonyKind::PolicyUpdate => {
+            CeremonyKind::SealedApproval
+            | CeremonyKind::PolicyUpdate
+            | CeremonyKind::CardAdd
+            | CeremonyKind::CardDelete
+            | CeremonyKind::CardCheckout => {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::CeremonyKindMismatch,
                     "custody kind has no matching prepare method",
