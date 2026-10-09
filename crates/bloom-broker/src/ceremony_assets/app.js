@@ -12,6 +12,7 @@ const mnemonicInput = document.getElementById("mnemonic-input");
 const rawKeyInput = document.getElementById("raw-key-input");
 const cardFields = document.getElementById("card-fields");
 const cardCvcFields = document.getElementById("card-cvc-fields");
+const formError = document.getElementById("form-error");
 const panelTitle = document.getElementById("panel-title");
 const panelKicker = document.getElementById("panel-kicker");
 
@@ -565,39 +566,100 @@ function reportCeremonyError(error, fallback = "Ceremony failed") {
 // Raised before any passkey prompt, so the link stays usable.
 class CardFieldError extends Error {}
 
-function cardFieldsInput(session) {
-  const value = id => document.getElementById(id).value.trim();
-  if (session.ceremony_kind === "card_add") {
-    const number = value("card-number").replace(/[\s-]/g, "");
-    let sum = 0;
-    [...number].reverse().forEach((digit, i) => {
-      const n = Number(digit) * (i % 2 ? 2 : 1);
-      sum += n > 9 ? n - 9 : n;
-    });
-    if (!/^\d{12,19}$/.test(number) || sum % 10 !== 0) {
-      throw new CardFieldError("Check the card number. It doesn't look valid.");
+const CARD_BRANDS = [
+  {name: "Amex", pattern: /^3[47]/, lengths: [15], cvc: 4},
+  {name: "Visa", pattern: /^4/, lengths: [13, 16, 19], cvc: 3},
+  {name: "Mastercard", pattern: /^(5[1-5]|222[1-9]|22[3-9]|2[3-6]|27[01]|2720)/, lengths: [16], cvc: 3},
+  {name: "Discover", pattern: /^(6011|64[4-9]|65)/, lengths: [16, 17, 18, 19], cvc: 3},
+  {name: "Diners Club", pattern: /^(36|38|30[0-5])/, lengths: [14, 15, 16, 17, 18, 19], cvc: 3},
+  {name: "JCB", pattern: /^35(2[89]|[3-8])/, lengths: [16, 17, 18, 19], cvc: 3}
+];
+
+function luhnValid(number) {
+  let sum = 0;
+  [...number].reverse().forEach((digit, i) => {
+    const n = Number(digit) * (i % 2 ? 2 : 1);
+    sum += n > 9 ? n - 9 : n;
+  });
+  return sum % 10 === 0;
+}
+
+// Returns {value} or {error} per field; checked before any passkey prompt.
+const CARD_CHECKS = {
+  "card-number": raw => {
+    const number = raw.replace(/\D/g, "");
+    if (!number) return {error: "Enter the card number."};
+    const brand = CARD_BRANDS.find(b => b.pattern.test(number));
+    const lengths = brand ? brand.lengths : [12, 13, 14, 15, 16, 17, 18, 19];
+    if (!lengths.includes(number.length)) {
+      return {error: `${brand ? brand.name : "Card"} numbers are ${lengths.length > 1 ? `${lengths[0]} to ${lengths.at(-1)}` : lengths[0]} digits.`};
     }
-    const month = Number(value("card-month"));
-    let year = Number(value("card-year"));
-    if (!/^\d{1,2}$/.test(value("card-month")) || month < 1 || month > 12) {
-      throw new CardFieldError("Enter the expiry month as 1 to 12.");
-    }
-    if (/^\d{2}$/.test(value("card-year"))) year += 2000;
+    if (!luhnValid(number)) return {error: "This card number has a typo. Check the digits."};
+    return {value: number};
+  },
+  "card-expiry": raw => {
+    const match = /^(\d{2})\/(\d{2})$/.exec(raw);
+    if (!match) return {error: "Enter the expiry as MM/YY, for example 08/29."};
+    const month = Number(match[1]), year = 2000 + Number(match[2]);
+    if (month < 1 || month > 12) return {error: "The month must be 01 to 12."};
     const now = new Date();
-    if (!/^\d{2}(\d{2})?$/.test(value("card-year")) ||
-        year * 12 + month < now.getUTCFullYear() * 12 + now.getUTCMonth() + 1) {
-      throw new CardFieldError("Check the expiry year. The card looks expired.");
-    }
-    const name = value("card-name");
-    if (!name) throw new CardFieldError("Enter the name on the card.");
-    return {card: {number, expiry_month: month, expiry_year: year, name}};
+    if (year * 12 + month < now.getFullYear() * 12 + now.getMonth() + 1) return {error: "This card has expired."};
+    if (year > now.getFullYear() + 20) return {error: "Check the year. It is too far ahead."};
+    return {value: {month, year}};
+  },
+  "card-name": raw => raw ? {value: raw} : {error: "Enter the name as printed on the card."},
+  "card-cvc": raw => /^\d{3,4}$/.test(raw) ? {value: raw} : {error: "Enter the 3 or 4 digit security code."}
+};
+
+function checkCardField(id) {
+  const input = document.getElementById(id);
+  const result = CARD_CHECKS[id](input.value.trim());
+  input.setAttribute("aria-invalid", result.error ? "true" : "false");
+  document.getElementById(`${id}-error`).textContent = result.error || "";
+  return result;
+}
+
+function setupCardFields() {
+  const number = document.getElementById("card-number");
+  const expiry = document.getElementById("card-expiry");
+  number.addEventListener("input", () => {
+    const digits = number.value.replace(/\D/g, "").slice(0, 19);
+    const groups = /^3[47]/.test(digits) ? [4, 6, 5] : [4, 4, 4, 4, 3];
+    const parts = [];
+    let rest = digits;
+    for (const size of groups) if (rest) { parts.push(rest.slice(0, size)); rest = rest.slice(size); }
+    number.value = parts.join(" ");
+  });
+  expiry.addEventListener("input", event => {
+    let digits = expiry.value.replace(/\D/g, "").slice(0, 4);
+    if (digits.length === 1 && digits > "1") digits = `0${digits}`;
+    const deleting = event.inputType?.startsWith("delete");
+    expiry.value = digits.length > 2 || (digits.length === 2 && !deleting) ? `${digits.slice(0, 2)}/${digits.slice(2)}` : digits;
+  });
+  for (const id of Object.keys(CARD_CHECKS)) {
+    const input = document.getElementById(id);
+    input.addEventListener("blur", () => { if (input.value) checkCardField(id); });
+    input.addEventListener("input", () => {
+      if (input.getAttribute("aria-invalid") === "true") checkCardField(id);
+      formError.hidden = true;
+    });
   }
-  if (session.review_manifest.card_effect.kind === "checkout") {
-    const cvc = value("card-cvc");
-    if (!/^\d{3,4}$/.test(cvc)) throw new CardFieldError("Enter the three or four digit CVC.");
-    return {cvc};
+}
+
+function cardFieldsInput(session) {
+  const ids = session.ceremony_kind === "card_add" ? ["card-number", "card-expiry", "card-name"]
+    : session.review_manifest.card_effect.kind === "checkout" ? ["card-cvc"] : [];
+  const results = Object.fromEntries(ids.map(id => [id, checkCardField(id)]));
+  const invalid = ids.find(id => results[id].error);
+  if (invalid) {
+    document.getElementById(invalid).focus();
+    throw new CardFieldError("Fix the highlighted field to continue.");
   }
-  return {};
+  if (session.ceremony_kind === "card_add") {
+    const {month, year} = results["card-expiry"].value;
+    return {card: {number: results["card-number"].value, expiry_month: month, expiry_year: year, name: results["card-name"].value}};
+  }
+  return ids.length ? {cvc: results["card-cvc"].value} : {};
 }
 
 // After the passkey approves a card request, Signer has consumed the link.
@@ -607,22 +669,31 @@ function reportCardFailure(session, error) {
     : session.ceremony_kind === "card_delete" ? "Card not deleted" : "Not approved";
   const reason = error?.message === "invalid card details"
     ? "Signer rejected the card details." : (error?.message || "Signer refused the request.");
-  statusNode.textContent = `${action}. ${reason} This link is used up; ask your agent for a new one.`;
+  statusNode.textContent = `${action}.`;
+  formError.textContent = `${action}. ${reason} This link is used up; ask your agent for a new one.`;
+  formError.hidden = false;
   clearInterval(expiryTimer);
   for (const node of [approve, cancel, cardFields, cardCvcFields]) node.hidden = true;
 }
 
 function reportApprovalFailure(error) {
   if (error instanceof CardFieldError) {
-    statusNode.textContent = error.message;
+    formError.textContent = error.message;
+    formError.hidden = false;
+    statusNode.textContent = "Not sent. Nothing was saved or charged.";
     approve.disabled = false;
     return;
   }
   const missingPrf = error?.name === "NotSupportedError" ||
     (typeof error?.message === "string" && error.message.includes("required PRF output"));
-  reportCeremonyError(error, missingPrf
+  const message = missingPrf
     ? "This browser or passkey does not support the required PRF extension. Use a supported browser and passkey."
-    : "Passkey verification failed. Please try again.");
+    : error?.name === "NotAllowedError"
+      ? "The passkey prompt was cancelled or timed out. Nothing was sent. Try again."
+      : "Passkey verification failed. Please try again.";
+  reportCeremonyError(error, message);
+  formError.textContent = message;
+  formError.hidden = false;
   approve.disabled = false;
 }
 
@@ -1263,6 +1334,7 @@ async function load() {
     });
   }
   statusNode.textContent = "Check the details, then continue with your passkey.";
+  setupCardFields();
   cardFields.hidden = session.ceremony_kind !== "card_add";
   cardCvcFields.hidden = session.review_manifest?.card_effect?.kind !== "checkout";
   renderReview(session);
