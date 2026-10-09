@@ -155,6 +155,7 @@ async fn card_checkout_private_delivery_is_single_use_and_manual_has_no_release(
         serve_checkout_listener,
     };
     use bloom_signer_api::{CardEffect, CheckoutFacts};
+    use std::os::unix::fs::PermissionsExt;
     let broker = CeremonyBroker::new(real_ceremony_signer());
     let card_id = Token::new("private-card").unwrap();
     let added = broker
@@ -191,6 +192,7 @@ async fn card_checkout_private_delivery_is_single_use_and_manual_has_no_release(
     );
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("facts.sock");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o710)).unwrap();
     let listener = bind_checkout_intake(&socket).unwrap();
     let uid = fs::metadata(dir.path()).unwrap().uid();
     let service = tokio::spawn(serve_checkout_listener(broker.clone(), listener, uid));
@@ -347,6 +349,27 @@ async fn card_checkout_private_delivery_is_single_use_and_manual_has_no_release(
     .unwrap();
     assert!(output.is_empty());
     denied.abort();
+}
+
+#[tokio::test]
+async fn card_intake_reclaims_only_owned_stale_sockets() {
+    use bloom_broker::ceremony::bind_checkout_intake;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o710)).unwrap();
+    let socket = dir.path().join("facts.sock");
+    let listener = bind_checkout_intake(&socket).unwrap();
+    assert!(bind_checkout_intake(&socket).is_err());
+    drop(listener);
+    let replacement = bind_checkout_intake(&socket).unwrap();
+    drop(replacement);
+    fs::remove_file(&socket).unwrap();
+    fs::write(&socket, "preserved fixture file").unwrap();
+    assert!(bind_checkout_intake(&socket).is_err());
+    assert_eq!(
+        fs::read_to_string(&socket).unwrap(),
+        "preserved fixture file"
+    );
 }
 
 async fn card_intake(

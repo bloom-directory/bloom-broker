@@ -374,12 +374,11 @@ pub async fn serve_checkout_intake(
     serve_checkout_listener(broker, listener, checkout_uid).await
 }
 
-/// Bind before advertising service readiness. Never replace an existing path.
+/// Bind before readiness, rejecting live endpoints and substituted paths.
 pub fn bind_checkout_intake(path: &Path) -> std::io::Result<tokio::net::UnixListener> {
-    use std::os::unix::fs::PermissionsExt;
-    let listener = tokio::net::UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
-    Ok(listener)
+    let listener =
+        bloom_service_activation::bind_owned_unix_listener(path).map_err(std::io::Error::other)?;
+    tokio::net::UnixListener::from_std(listener)
 }
 
 pub async fn serve_checkout_listener(
