@@ -3232,6 +3232,13 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     authority.install_provenance(&safe_provenance).unwrap();
     let safe_terms = SealedApprovalTerms {
         key_ref: parent_key.clone(),
+        limits: ApprovalLimits {
+            max_operations: DecimalU64::new(1),
+            max_signatures: DecimalU64::new(1),
+            operation_rate_limits: Vec::new(),
+            signature_rate_limits: Vec::new(),
+            value_limits: Vec::new(),
+        },
         subject: ApprovalSubject::Petal {
             package_hash: safe_package.clone(),
             route: safe_route.into(),
