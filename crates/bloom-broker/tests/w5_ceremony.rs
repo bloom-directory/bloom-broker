@@ -335,7 +335,7 @@ fn evm_manifest_is_rendered_as_primary_review_facts() {
         r#"
 class Node {{
   constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
-  setAttribute() {{}}
+  setAttribute(name, value) {{ this[name] = value; }}
   append(...children) {{ this.children.push(...children); }}
   replaceChildren(...children) {{ this.children = children; }}
 }}
@@ -458,7 +458,8 @@ renderReview({{
       destination: "0x5000000000000000000000000000000000000000",
       value: "0", value_display: "0 ETH",
       action: ["Action: ERC-20 transfer", "Token: 0x5000000000000000000000000000000000000000",
-        "Recipient: 0x6000000000000000000000000000000000000000", "Token amount (base units): 123"],
+        "Recipient: 0x6000000000000000000000000000000000000000", "Token amount (base units): 123",
+        "Warning: this removes this Bloom wallet from the Safe's owners"],
       safe_tx_hash: "0x9565",
       reported: {{version: "1.4.1", singleton: "0x41", singleton_code_hash: "0x1f",
         owners: ["0x3000000000000000000000000000000000000000", "0xaaaa"], threshold: "2",
@@ -475,6 +476,24 @@ for (const expected of ["Approve one Safe transaction", "ERC-20 transfer",
   "Reported by the Petal, not verified",
   "Threshold 2 of 2 owners"]) {{
   if (!rendered.includes(expected)) throw new Error(`Safe review not disclosed ${{expected}}: ${{rendered}}`);
+}}
+const banners = node => !node || typeof node === "string" ? [] : [
+  ...(node.className === "ceremony-warning" ? [node] : []),
+  ...(node.children || []).flatMap(banners)
+];
+if (!banners(nodes.review).some(node => allText(node).includes("removes this Bloom wallet"))) {{
+  throw new Error("Safe owner removal warning missing from the warning banner");
+}}
+const setupWarning = session({{
+  chain_id: "8453", chain: "base", sender: "0x1111111111111111111111111111111111111111",
+  destination: "0x2222222222222222222222222222222222222222", value: "0", value_display: "0 ETH",
+  calldata_keccak: "0x1234", payload_keccak: "0x5678", nonce: "1", gas_limit: "100000",
+  fee: {{kind: "legacy", gas_price: "1", gas_price_display: "1 wei"}},
+  safe_call: ["Action: Create a Safe", "Warning: the new Safe makes a payment during setup"]
+}});
+renderReview(setupWarning);
+if (!banners(nodes.review).some(node => allText(node).includes("payment during setup"))) {{
+  throw new Error("Safe setup payment warning missing from the warning banner");
 }}
 
 // A batch member Bloom could not read is never shown as a plain send, and a
