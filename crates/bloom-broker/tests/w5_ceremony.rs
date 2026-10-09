@@ -3296,6 +3296,31 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         reusable.message.contains("require exact approval"),
         "{reusable:?}"
     );
+    let route_grant = safe_prepare(
+        SealedApprovalTerms {
+            selector: ApprovalSelector::Petal {
+                package_hash: safe_package.clone(),
+                route: safe_route.into(),
+                allowed_operation_classes: vec![Token::new("exchange-order").unwrap()],
+                route_grants: vec![bloom_broker_api::PetalRouteGrant {
+                    route: "/petals/safe/other-confirm".into(),
+                    allowed_operation_classes: vec![
+                        Token::new(bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS).unwrap(),
+                    ],
+                    provenance_digest: safe_provenance.digest().unwrap(),
+                }],
+                required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+            },
+            ..safe_terms.clone()
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        route_grant.message.contains("require exact approval"),
+        "{route_grant:?}"
+    );
     let envelope = serde_jcs::to_vec(&serde_json::json!({
         "schema": "bloom.safe.review.v1", "chain_id": "31337",
         "safe_address": "0x1000000000000000000000000000000000000000", "safe_version": "1.4.1",
