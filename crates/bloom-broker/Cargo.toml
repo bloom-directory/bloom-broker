@@ -38,12 +38,12 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 bloom-broker-debug-driver = { path = "../bloom-broker-debug-driver" }
 # The socket-activation regression hands a real descriptor to a child process
 # between fork and exec, which needs dup2/fcntl directly.
-libc = "0.2"
 bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "97b9ac7e47ee682e59804d04f6288419f3598a58" }
 bloom-signer-vectors.workspace = true
 futures = "0.3"
