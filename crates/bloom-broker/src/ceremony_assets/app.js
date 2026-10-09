@@ -417,8 +417,8 @@ function describeTransfer(manifest) {
     const will = lines.find(line => line.startsWith("The Safe will: "));
     return {action: "safe", eyebrow: "Safe",
       heading: will ? `${action}: ${will.slice(15).toLowerCase()}` : action,
-      detail: "Read from the exact transaction bytes. Bloom did not check that the " +
-        "destination is a Safe, and does not verify what the call's code does.",
+      detail: "Bloom decoded Safe-shaped calldata and cannot explain its execution effects. " +
+        "Bloom did not check that the destination is a Safe or what its code does.",
       relation: "calls"};
   };
   const appendCallFacts = (facts, technical, payload, prefix) => {

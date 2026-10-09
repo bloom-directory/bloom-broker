@@ -3,6 +3,16 @@
 use std::str::FromStr;
 
 use alloy::primitives::{Address, B256, U256, keccak256};
+use alloy::sol_types::{SolCall as _, sol};
+
+sol! {
+    function execTransaction(address to, uint256 value, bytes data, uint8 operation,
+        uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken,
+        address refundReceiver, bytes signatures);
+    function createProxyWithNonce(address singleton, bytes initializer, uint256 saltNonce);
+    function setup(address[] owners, uint256 threshold, address to, bytes data,
+        address fallbackHandler, address paymentToken, uint256 payment, address paymentReceiver);
+}
 use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalSelector, CanonicalWalletPolicy, CryptoSuite, DeclaredFee,
     Digest32, ProtocolError, ProtocolErrorCode, ReviewMode,
@@ -669,8 +679,15 @@ fn owner_change(
     // values come from the Petal and Broker cannot verify them, so the line
     // says where the comparison came from and stays silent without it.
     let describe_threshold = |new: U256, owners: i64| -> String {
+        let single_owner_warning = if new == U256::from(1u8) {
+            "\nWarning: any single owner will then be able to move the Safe's funds alone"
+        } else {
+            ""
+        };
         let Some(current) = current else {
-            return format!("New threshold: {new} (Bloom has no current threshold to compare)");
+            return format!(
+                "New threshold: {new} (Bloom has no current threshold to compare){single_owner_warning}"
+            );
         };
         let count = (current.owners as i64 + owners).max(0);
         let mut line = format!(
@@ -683,11 +700,7 @@ fn owner_change(
                 current.threshold
             ));
         }
-        if new == U256::from(1u8) && count > 1 {
-            line.push_str(
-                "\nWarning: any single owner will then be able to move the Safe's funds alone",
-            );
-        }
+        line.push_str(single_owner_warning);
         line
     };
     if selector("addOwnerWithThreshold(address,uint256)") && words.len() == 2 {
@@ -1080,6 +1093,12 @@ pub(crate) fn outer_call(
     if is(
         "execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)",
     ) {
+        let decoded = execTransactionCall::abi_decode(input).ok()?;
+        if decoded.abi_encode() != input || !decoded.gasPrice.is_zero() {
+            // The refund depends on execution gas, including baseGas. Without
+            // a verified maximum it must remain an unreadable call.
+            return None;
+        }
         let inner_to = address_at(data, 0)?;
         let inner_value = U256::from_be_slice(word(data, 1)?);
         let inner_data = tail_bytes(data, 2)?;
@@ -1130,7 +1149,7 @@ pub(crate) fn outer_call(
             }
         }
         lines.push(format!(
-            "Owner signatures attached: {}",
+            "Signature data slots (not verified owner signatures): {}",
             signatures.len() / 65
         ));
         // Only a non-zero `gasPrice` makes the Safe pay a refund. `safeTxGas`
@@ -1172,6 +1191,10 @@ pub(crate) fn outer_call(
     if is("createProxyWithNonce(address,bytes,uint256)")
         && deployment(U256::from(chain), Role::Factory, &format!("{to:#x}")).is_some()
     {
+        let decoded = createProxyWithNonceCall::abi_decode(input).ok()?;
+        if decoded.abi_encode() != input {
+            return None;
+        }
         let singleton = address_at(data, 0)?;
         // The singleton is the code the proxy delegates to for the rest of its
         // life, and `SafeProxyFactory` accepts any non-zero address for it. An
@@ -1188,6 +1211,10 @@ pub(crate) fn outer_call(
             &format!("{singleton:#x}"),
         )?;
         let initializer = tail_bytes(data, 1)?;
+        let decoded_setup = setupCall::abi_decode(initializer).ok()?;
+        if decoded_setup.abi_encode() != initializer {
+            return None;
+        }
         let salt = U256::from_be_slice(word(data, 2)?);
         let (selector, setup) = initializer.split_at_checked(4)?;
         if selector
@@ -1208,6 +1235,16 @@ pub(crate) fn outer_call(
             .map(|index| address_at(setup, owners_at / 32 + 1 + index))
             .collect::<Option<Vec<_>>>()?;
         let threshold = U256::from_be_slice(word(setup, 1)?);
+        if threshold.is_zero()
+            || threshold > U256::from(owners.len())
+            || owners
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != owners.len()
+        {
+            return None;
+        }
         let setup_target = address_at(setup, 2)?;
         let setup_data = tail_bytes(setup, 3)?;
         let fallback = address_at(setup, 4)?;
@@ -2243,7 +2280,10 @@ mod tests {
         );
         assert!(send.contains("The Safe will: Native transfer"), "{send}");
         assert!(send.contains("Amount: 0.00001 ETH"), "{send}");
-        assert!(send.contains("Owner signatures attached: 1"), "{send}");
+        assert!(
+            send.contains("Signature data slots (not verified owner signatures): 1"),
+            "{send}"
+        );
         assert!(!send.contains("Warning"), "{send}");
 
         let batch = outer(SAFE, "0x6a7612020000000000000000000000009641d764fc13c8b624c04430c7356c1c7c8102e20000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002c000000000000000000000000000000000000000000000000000000000000001448d80ff0a000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000ee008d4fafba75a9dc50b4b296211509e856d2c6d0810000000000000000000000000000000000000000000000000000048c27395000000000000000000000000000000000000000000000000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda0291300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000044a9059cbb0000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d0810000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000041387df176124ae8ab24202005fda4428eff86fcd8d9636ec9239aa8646e414ec75fc7a978870c915eb4e85c7f237e6b5fb6167bde0a1b4dad73a3820b055283f91c00000000000000000000000000000000000000000000000000000000000000").unwrap();
@@ -2260,7 +2300,10 @@ mod tests {
             "{remove}"
         );
         assert!(remove.contains("New threshold: 1"), "{remove}");
-        assert!(remove.contains("Owner signatures attached: 2"), "{remove}");
+        assert!(
+            remove.contains("Signature data slots (not verified owner signatures): 2"),
+            "{remove}"
+        );
     }
 
     #[test]
@@ -2487,21 +2530,20 @@ mod tests {
         let bounded = outer(SAFE, &build(100_000, 0)).unwrap();
         assert!(!bounded.contains("gas refund"), "{bounded}");
 
-        // A non-zero gasPrice is a real refund, and the three facts that
-        // decide the loss have to be on the page.
-        let refunding = outer(SAFE, &build(0, 7)).unwrap();
+        // No verified refund maximum: preserve the ordinary opaque review.
+        assert!(outer(SAFE, &build(0, 7)).is_none());
+        assert!(outer(SAFE, &build(100_000, 7)).is_none());
+        let mut noncanonical = hex::decode(build(0, 0).trim_start_matches("0x")).unwrap();
+        noncanonical.extend([0u8; 32]);
         assert!(
-            refunding.contains("Warning: the Safe pays a gas refund"),
-            "{refunding}"
-        );
-        assert!(
-            refunding.contains("Refund token: native base"),
-            "{refunding}"
-        );
-        assert!(refunding.contains("Refund gas price: 7"), "{refunding}");
-        assert!(
-            refunding.contains("Refund paid to: whoever executes this transaction"),
-            "{refunding}"
+            outer_call(
+                8453,
+                Address::ZERO,
+                address(SAFE, "safe").unwrap(),
+                U256::ZERO,
+                &noncanonical
+            )
+            .is_none()
         );
     }
 
