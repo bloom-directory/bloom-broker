@@ -3467,12 +3467,18 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         serde_json::from_str(manifest["canonical_plan"].as_str().unwrap()).unwrap();
     assert_eq!(plan["safe_review"]["owner"], owner.to_string());
     assert_eq!(manifest["safe_review"], plan["safe_review"]);
-    assert!(plan["disclosures"].as_array().unwrap().iter().any(|value| {
-        value
-            .as_str()
+    assert!(
+        plan["security_disclosures"]
+            .as_array()
             .unwrap()
-            .contains("rebuilt the Safe transaction")
-    }));
+            .iter()
+            .any(|value| {
+                value
+                    .as_str()
+                    .unwrap()
+                    .contains("rebuilt the Safe transaction")
+            })
+    );
     let approval_operation = operation("d3");
     let approval_prepared = match MachineBrokerService::dispatch(
         &broker,
