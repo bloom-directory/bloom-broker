@@ -1,6 +1,6 @@
 use crate::{
-    Base64UrlBytes, CeremonyKind, CustodyResult, DecimalU64, Digest32, OperationId, ProtocolError,
-    ProtocolErrorCode, Token,
+    Base64UrlBytes, CeremonyKind, ClearSigningPolicy, CustodyResult, DecimalU64, Digest32,
+    OperationId, ProtocolError, ProtocolErrorCode, Token,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -14,6 +14,11 @@ pub struct CanonicalWalletPolicy {
     pub allowed_petal_packages: Vec<Digest32>,
     pub allowed_destinations: Vec<PolicyDestination>,
     pub required_verifiers: Vec<RequiredVerifier>,
+    /// Absent on every policy written before clear signing existed, and
+    /// skipped when absent, so those documents keep their exact canonical
+    /// bytes and their existing envelope-review behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_signing: Option<ClearSigningPolicy>,
 }
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]

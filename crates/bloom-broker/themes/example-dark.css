@@ -1,0 +1,39 @@
+/* Example owner theme.
+ *
+ * Install it by naming the file in the Broker configuration:
+ *
+ *     "ceremony_theme_css_path": "/etc/bloom/ceremony-theme.css"
+ *
+ * Broker reads that one file once at startup and serves it at
+ * /assets/theme.css, after the default stylesheet. No path, name or query
+ * from a request reaches the filesystem, and a theme never arrives from a
+ * descriptor, a publisher, a dapp or a URL.
+ *
+ * There is no isolation between an owner theme and security-relevant
+ * presentation. This is trusted customization: CSS can move, cover, recolour,
+ * shrink or hide a warning, an address, an amount or a button, and so can
+ * alter the apparent meaning of the review without changing a byte of it.
+ * Broker does not and cannot prevent that. Verifying that review text is
+ * byte-identical under a theme demonstrates content preservation only — it
+ * says nothing about whether the result is visually safe to read.
+ *
+ * Redefining the documented custom properties is the supported path and is
+ * what this file does. The stable class names permit deeper changes. Treat an
+ * installed theme with the same care as any other code you run.
+ */
+:root{
+  --ceremony-bg:#14161a;
+  --ceremony-surface:#1c1f25;
+  --ceremony-text:#eef1f5;
+  --ceremony-muted:#9aa4b2;
+  --ceremony-border:#2c313a;
+  --ceremony-accent:#7aa2f7;
+  --ceremony-accent-deep:#a5c2ff;
+  --ceremony-warning:#e8b04b;
+  --ceremony-warning-surface:rgba(232,176,75,.12);
+  --ceremony-danger:#f07178;
+  --ceremony-danger-surface:#382329;
+  --ceremony-success:#8ac69b;
+  --ceremony-radius:10px;
+}
+button:not(.secondary){color:#10131a}
