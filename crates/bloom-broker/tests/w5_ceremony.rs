@@ -3484,6 +3484,9 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .ceremony()
         .cancel(&operation("da"), approval_now_ms)
         .unwrap();
+    // Cancellation intentionally backs this wallet off for two seconds.
+    // Fast hosts must observe that guard before preparing its next ceremony.
+    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
     let approval_operation = operation("d3");
     let approval_prepared = match MachineBrokerService::dispatch(
         &broker,
