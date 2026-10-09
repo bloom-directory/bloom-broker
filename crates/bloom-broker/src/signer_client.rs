@@ -765,6 +765,28 @@ mod tests {
 
     #[test]
     fn signer_worker_preserves_trusted_service_span_and_dispatcher() {
+        // Other parallel tests register this checkpoint callsite under the
+        // default no-op dispatcher. Run the captured-dispatch regression in
+        // its own process so tracing's global interest cache cannot race it.
+        const ISOLATED: &str = "BLOOM_ISOLATED_SIGNER_TRACING_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "signer_client::tests::signer_worker_preserves_trusted_service_span_and_dispatcher",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated trusted-span regression failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let _tracing_test = CHECKPOINT_TRACING_TEST_LOCK.lock().unwrap();
         let capture = bloom_service_observability::CapturedWriter::default();
         let subscriber = tracing_subscriber::registry().with(
