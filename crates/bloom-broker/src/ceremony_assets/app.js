@@ -343,7 +343,9 @@ function renderCardReview(session) {
     const amount = payment.total_minor / (10 ** scale);
     const money = value => new Intl.NumberFormat("en", {style: "currency", currency: payment.currency}).format(value);
     fact("Total", `${money(amount)} (${payment.currency})`);
-    fact("Installments", `${payment.installments} × ${money(amount / payment.installments)} = ${money(amount)}`);
+    fact("Installments", payment.total_minor % payment.installments === 0
+      ? `${payment.installments} × ${money(amount / payment.installments)} = ${money(amount)}`
+      : `${payment.installments} payments totaling ${money(amount)}; individual installment amounts were not verified`);
     fact("Recurring charge", payment.recurring ? "Yes" : "No");
     reviewNode.replaceChildren(facts, el("h3", {}, "Described by agent — not verified"), el("p", {}, effect.agent_description), el("p", {}, "Bloom reports the merchant's confirmation; it does not verify your bank charge."));
   } else if (effect.kind === "manual_checkout") {
