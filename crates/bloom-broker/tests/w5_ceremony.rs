@@ -5257,6 +5257,71 @@ async fn review_plan_formats_known_asset_base_units_without_hiding_raw_authority
 }
 
 #[tokio::test]
+async fn unreadable_safe_call_carries_a_signed_inability_to_explain_disclosure() {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        Arc::new(MockSigner::new()),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[32; 32]),
+    );
+    let safe: bloom_broker::safe_review::SafeReview = serde_json::from_value(serde_json::json!({
+        "chain_id":"1", "chain":"ethereum", "safe":"0x1000000000000000000000000000000000000000",
+        "owner":"0x3000000000000000000000000000000000000000", "nonce":"4", "operation":"call",
+        "destination":"0x4000000000000000000000000000000000000000", "value":"0", "value_display":"0 ETH",
+        "action":["Action: Contract call", "Calldata selector: 0xdeadbeef"], "safe_tx_hash":"0x1234",
+        "reported":{"version":"1.4.1", "singleton":"0x41", "singleton_code_hash":"0x1f",
+            "owners":["0x3000000000000000000000000000000000000000"], "threshold":"1",
+            "guard":"0x0000000000000000000000000000000000000000", "modules":[],
+            "fallback_handler":"0x0000000000000000000000000000000000000000", "library_code_hash":null}
+    })).unwrap();
+    let prepared = broker
+        .prepare_approval(
+            approval_request(),
+            ReviewManifestContext {
+                safe_review: Some(safe),
+                ..ReviewManifestContext::default()
+            },
+            now_ms,
+        )
+        .unwrap();
+    let session = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&prepared.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let projection: serde_json::Value =
+        serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let plan: serde_json::Value = serde_json::from_str(
+        projection["review_manifest"]["canonical_plan"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        plan["security_disclosures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str().unwrap().contains("Bloom cannot explain"))
+    );
+    assert!(
+        projection["review_manifest"]["broker_signature"]
+            .as_str()
+            .is_some_and(|signature| !signature.is_empty())
+    );
+}
+
+#[tokio::test]
 async fn review_plan_formats_an_approvals_spending_ceiling() {
     let signer = Arc::new(MockSigner::new());
     let now_ms: u64 = std::time::SystemTime::now()
