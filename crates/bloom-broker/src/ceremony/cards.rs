@@ -129,7 +129,7 @@ impl CeremonyBroker {
             || prepared.contribution.ceremony_kind != request.effect.ceremony_kind()
             || prepared.contribution.surface != request.surface
             || prepared.contribution.wallet_id.is_some()
-            || prepared.contribution.expires_at_ms.get() > now_ms.saturating_add(120_000)
+            || prepared.contribution.expires_at_ms.get() <= now_ms
         {
             return Err(operation_conflict());
         }
@@ -148,7 +148,13 @@ impl CeremonyBroker {
             .contribution
             .digest()
             .map_err(signer_error_to_machine)?;
-        let expires_at_ms = prepared.contribution.expires_at_ms.get();
+        // RPC peers sample time independently. Clamp the browser session to
+        // Broker's two-minute deadline instead of rejecting transport latency.
+        let expires_at_ms = prepared
+            .contribution
+            .expires_at_ms
+            .get()
+            .min(now_ms.saturating_add(120_000));
         let ceremony_id = prepared.contribution.ceremony_id.clone();
         let session = self.new_session(NewBrowserSession {
             operation_id: operation_id.clone(),
