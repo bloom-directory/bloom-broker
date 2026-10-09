@@ -25,6 +25,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if command == "assert-machine-secret-confinement" {
         return assert_machine_secret_confinement_command(args);
     }
+    if command == "assert-card-secret-confinement" {
+        let mut roots = Vec::new();
+        while let Some(flag) = args.next() {
+            if flag != "--artifact" {
+                return Err("card scanner accepts only --artifact PATH".into());
+            }
+            roots.push(PathBuf::from(
+                args.next().ok_or("--artifact requires a path")?,
+            ));
+        }
+        let (files, bytes) = artifact_scan::assert_card_secret_confinement(&roots)?;
+        println!(
+            "Card confinement passed: scanned {files} stable files ({bytes} bytes); synthetic card, name, expiry and contextual CVC markers absent"
+        );
+        return Ok(());
+    }
     if command != "complete" {
         return Err(format!("unsupported debug-driver command: {command}").into());
     }
