@@ -332,7 +332,12 @@ function renderCardReview(session) {
   if (effect.kind === "add") fact("Label", effect.label);
   if (effect.kind === "checkout") {
     const payment = effect.facts;
-    fact("Website", el("strong", {}, payment.origin));
+    const website = el("span");
+    const domain = manifest.registrable_domain;
+    const index = domain ? payment.origin.lastIndexOf(domain) : -1;
+    if (index >= 0) website.append(payment.origin.slice(0, index), el("strong", {}, domain), payment.origin.slice(index + domain.length));
+    else website.textContent = payment.origin;
+    fact("Website", website);
     fact("Payment frames", payment.payment_frame_origins.join(", ") || "Main document");
     const scale = new Intl.NumberFormat("en", {style: "currency", currency: payment.currency}).resolvedOptions().maximumFractionDigits;
     const amount = payment.total_minor / (10 ** scale);

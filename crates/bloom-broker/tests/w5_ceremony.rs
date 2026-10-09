@@ -317,22 +317,16 @@ async fn card_checkout_private_delivery_is_single_use_and_manual_has_no_release(
         .0,
         StatusCode::OK
     );
-    assert!(matches!(
-        card_intake(
-            &socket,
-            CheckoutIntakeRequest::Result {
-                operation_id: operation("a3")
-            }
-        )
-        .await,
-        CheckoutIntakeResponse::Result {
-            receipt: Some(CustodyResult {
-                encrypted_browser_result: None,
-                ..
-            }),
-            ..
-        }
-    ));
+    let manual_receipt = card_intake(
+        &socket,
+        CheckoutIntakeRequest::Result {
+            operation_id: operation("a3"),
+        },
+    )
+    .await;
+    assert!(matches!(manual_receipt, CheckoutIntakeResponse::Result {
+        receipt:Some(ref receipt),..
+    } if receipt.encrypted_browser_result.is_none()));
     service.abort();
     let denied_socket = dir.path().join("denied.sock");
     let listener = bind_checkout_intake(&denied_socket).unwrap();

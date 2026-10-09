@@ -53,7 +53,7 @@ pub enum CheckoutIntakeResponse {
     Prepared(CustodyPrepareResponse),
     Result {
         status: CardOperationStatus,
-        receipt: Option<CustodyResult>,
+        receipt: Option<Box<CustodyResult>>,
         output_aad: Option<CustodyOutputHpkeAad>,
     },
     Error {
@@ -134,7 +134,14 @@ impl CeremonyBroker {
             return Err(operation_conflict());
         }
         let kind = request.effect.ceremony_kind();
-        let review = serde_json::json!({"card_effect":request.effect, "card":card,
+        let domain = if let CardEffect::Checkout { facts, .. } = &request.effect {
+            url::Url::parse(&facts.origin)
+                .ok()
+                .and_then(|u| u.host_str().and_then(psl::domain_str).map(str::to_owned))
+        } else {
+            None
+        };
+        let review = serde_json::json!({"card_effect":request.effect, "card":card, "registrable_domain":domain,
             "heading":custody_review_text(kind).0, "body":custody_review_text(kind).1});
         let origin = self.origin_for_surface(&prepared.contribution.surface)?;
         let contribution_digest = prepared
@@ -215,7 +222,7 @@ impl CeremonyBroker {
                 let mut channels = self.inner.cards.channels.lock();
                 let channel = channels.get_mut(&operation_id);
                 let output_aad = channel.as_ref().map(|c| c.output_aad.clone());
-                let receipt = channel.and_then(|c| c.result.take());
+                let receipt = channel.and_then(|c| c.result.take()).map(Box::new);
                 Ok(CheckoutIntakeResponse::Result {
                     status,
                     receipt,

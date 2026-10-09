@@ -46,6 +46,7 @@ tracing.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
 url.workspace = true
+psl = "2"
 
 [dev-dependencies]
 bloom-broker-debug-driver = { path = "../bloom-broker-debug-driver" }
