@@ -1299,7 +1299,8 @@ async function run(session) {
     let prf;
     if (session.webauthn_options.registration_user_handle) {
       const created = await createCredential(session, 0);
-      const confirmed = await ensureNewCredentialPrf(session, created, 1);
+      // Signer requires the second assertion, even when creation returns PRF.
+      const confirmed = await ensureNewCredentialPrf(session, created, 1, true);
       credentialId = encodeUrl(created.rawId);
       prf = confirmed.prf;
       proof = {kind: "registration", attestation: attestationJson(created), prf_assertion: confirmed.assertion};
