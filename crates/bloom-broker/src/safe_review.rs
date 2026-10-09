@@ -6,6 +6,7 @@ use alloy::primitives::{Address, B256, U256, keccak256};
 use alloy::sol_types::{SolCall as _, sol};
 
 sol! {
+    #![sol(alloy_sol_types = alloy::sol_types)]
     function execTransaction(address to, uint256 value, bytes data, uint8 operation,
         uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken,
         address refundReceiver, bytes signatures);
