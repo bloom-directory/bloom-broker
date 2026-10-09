@@ -3460,6 +3460,10 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                     .contains("rebuilt the Safe transaction")
             })
     );
+    broker
+        .ceremony()
+        .cancel(&operation("da"), approval_now_ms)
+        .unwrap();
     let approval_operation = operation("d3");
     let approval_prepared = match MachineBrokerService::dispatch(
         &broker,
@@ -5267,7 +5271,7 @@ async fn unreadable_safe_call_carries_a_signed_inability_to_explain_disclosure()
         Token::new("broker-review-key").unwrap(),
         SigningKey::from_bytes(&[32; 32]),
     );
-    let safe: bloom_broker::safe_review::SafeReview = serde_json::from_value(serde_json::json!({
+    let safe = serde_json::from_value(serde_json::json!({
         "chain_id":"1", "chain":"ethereum", "safe":"0x1000000000000000000000000000000000000000",
         "owner":"0x3000000000000000000000000000000000000000", "nonce":"4", "operation":"call",
         "destination":"0x4000000000000000000000000000000000000000", "value":"0", "value_display":"0 ETH",
