@@ -589,7 +589,7 @@ function describeTransfer(manifest) {
       ["Safe", safe.safe, true],
       ["Action", safe.action.join("\n")],
       ["Destination", safe.destination, true],
-      ["Value", safe.value_display],
+      [safe.operation === "delegatecall" ? "Outer call value (batch or deployment values are shown above)" : "Value", safe.value_display],
       ["Network", network],
       ["Signing owner", safe.owner, true],
       ["Safe nonce", safe.nonce],
