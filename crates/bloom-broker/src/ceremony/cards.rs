@@ -16,12 +16,27 @@ struct Channel {
     result: Option<CustodyResult>,
     expires_at_ms: u64,
     output_aad: CustodyOutputHpkeAad,
+    /// Merchant page as checkout saw it, shown on the review page only. Kept
+    /// in memory: it can show the buyer's address and is not a bound fact.
+    order_preview: Option<Vec<u8>>,
 }
 impl CardChannels {
     pub(super) fn forget(&self, operation_id: &OperationId) {
         self.channels.lock().remove(operation_id);
     }
+    pub(super) fn order_preview(&self, operation_id: &OperationId) -> Option<Vec<u8>> {
+        self.channels
+            .lock()
+            .get(operation_id)?
+            .order_preview
+            .clone()
+    }
 }
+
+/// A JPEG screenshot of the merchant's order page, at most 1 MiB.
+const MAX_ORDER_PREVIEW_BYTES: usize = 1 << 20;
+/// One intake line carries the base64 preview plus small JSON fields.
+const MAX_INTAKE_LINE_BYTES: usize = 1_500_000;
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
@@ -33,6 +48,8 @@ pub enum CheckoutIntakeRequest {
         recipient_key: Base64UrlBytes,
         agent_description: String,
         challenge_url: String,
+        #[serde(default)]
+        order_preview: Option<Base64UrlBytes>,
     },
     Manual {
         operation_id: OperationId,
@@ -198,7 +215,14 @@ impl CeremonyBroker {
                 recipient_key,
                 agent_description,
                 challenge_url,
+                order_preview,
             } => {
+                let order_preview = order_preview.map(|preview| preview.decode());
+                if order_preview.as_ref().is_some_and(|jpeg| {
+                    jpeg.len() > MAX_ORDER_PREVIEW_BYTES || !jpeg.starts_with(&[0xff, 0xd8, 0xff])
+                }) {
+                    return Err(malformed("invalid order preview"));
+                }
                 // The principal owns this private capability. Never put it in a public projection.
                 let effect = CardEffect::Checkout {
                     card_id,
@@ -206,7 +230,13 @@ impl CeremonyBroker {
                     recipient_key,
                     agent_description,
                 };
-                self.prepare_checkout_channel(operation_id, effect, challenge_url, now_ms)
+                self.prepare_checkout_channel(
+                    operation_id,
+                    effect,
+                    challenge_url,
+                    order_preview,
+                    now_ms,
+                )
             }
             CheckoutIntakeRequest::Manual {
                 operation_id,
@@ -220,6 +250,7 @@ impl CeremonyBroker {
                     agent_description,
                 },
                 challenge_url,
+                None,
                 now_ms,
             ),
             CheckoutIntakeRequest::Result { operation_id } => {
@@ -251,6 +282,7 @@ impl CeremonyBroker {
         operation_id: OperationId,
         effect: CardEffect,
         challenge_url: String,
+        order_preview: Option<Vec<u8>>,
         now_ms: u64,
     ) -> Result<CheckoutIntakeResponse, ProtocolError> {
         let url = url::Url::parse(&challenge_url).map_err(|_| kind_mismatch())?;
@@ -299,6 +331,7 @@ impl CeremonyBroker {
             result: None,
             expires_at_ms: prepared.ceremony_expires_at_ms.get(),
             output_aad,
+            order_preview,
         });
         Ok(CheckoutIntakeResponse::Prepared(prepared))
     }
@@ -400,11 +433,11 @@ pub async fn serve_checkout_listener(
             let _slot = slot;
             let (input, mut output) = stream.into_split();
             let mut line = String::new();
-            let mut input = BufReader::new(input.take(16_385));
+            let mut input = BufReader::new(input.take(MAX_INTAKE_LINE_BYTES as u64 + 1));
             if !matches!(
                 tokio::time::timeout(Duration::from_secs(10), input.read_line(&mut line)).await,
                 Ok(Ok(_))
-            ) || line.len() > 16_384
+            ) || line.len() > MAX_INTAKE_LINE_BYTES
             {
                 return;
             }

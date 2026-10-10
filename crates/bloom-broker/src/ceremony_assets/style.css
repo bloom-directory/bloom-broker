@@ -38,3 +38,4 @@ button{font:600 15px/1.2 var(--sans);letter-spacing:0}button.secondary{font-weig
 #review{padding:26px 30px}
 .facts dd code{font-size:13px;line-height:1.5}
 .field-error{min-height:0;color:var(--error);font-size:12px}.field-error:empty{display:none}input[aria-invalid=true]{border-color:var(--error)}.form-error{margin:0;padding:14px 30px 0;color:var(--error);font-size:13px}
+.order-preview{margin:18px 0 0}.order-preview figcaption{color:var(--muted);font-size:13px;margin-bottom:8px}.order-preview-frame{max-height:60vh;overflow:auto;border:1px solid var(--rule);border-radius:10px;background:#fff}.order-preview-frame img{display:block;width:100%;height:auto}

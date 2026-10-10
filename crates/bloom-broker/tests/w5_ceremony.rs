@@ -198,6 +198,30 @@ async fn card_checkout_private_delivery_is_single_use_and_manual_has_no_release(
     let service = tokio::spawn(serve_checkout_listener(broker.clone(), listener, uid));
     let key = HpkeRecipient::generate();
     let challenge = "http://localhost:28740/private?token=test-capability";
+    let not_jpeg = card_intake(
+        &socket,
+        CheckoutIntakeRequest::Prepare {
+            operation_id: operation("a9"),
+            card_id: card_id.clone(),
+            facts: CheckoutFacts {
+                origin: "https://merchant.example".into(),
+                payment_frame_origins: vec!["https://js.stripe.com".into()],
+                total_minor: 399,
+                currency: "USD".into(),
+                installments: 1,
+                recurring: false,
+            },
+            recipient_key: key.public_key().clone(),
+            agent_description: "Unverified description".into(),
+            challenge_url: challenge.into(),
+            order_preview: Some(Base64UrlBytes::from_bytes(b"<svg/>")),
+        },
+    )
+    .await;
+    assert!(matches!(not_jpeg, CheckoutIntakeResponse::Error { .. }));
+    // A realistic full-page JPEG is far larger than the other intake fields.
+    let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe0];
+    jpeg.resize(900_000, 7);
     let prepared = match card_intake(
         &socket,
         CheckoutIntakeRequest::Prepare {
@@ -214,6 +238,7 @@ async fn card_checkout_private_delivery_is_single_use_and_manual_has_no_release(
             recipient_key: key.public_key().clone(),
             agent_description: "Unverified description".into(),
             challenge_url: challenge.into(),
+            order_preview: Some(Base64UrlBytes::from_bytes(&jpeg)),
         },
     )
     .await
@@ -222,6 +247,36 @@ async fn card_checkout_private_delivery_is_single_use_and_manual_has_no_release(
         _ => panic!("prepare rejected"),
     };
     let session = card_session_json(&broker, &prepared).await;
+    let preview_uri = format!(
+        "/api/session/{}/order-preview",
+        session["ceremony_id"].as_str().unwrap()
+    );
+    let preview = |token: Option<String>| {
+        let mut request = Request::builder()
+            .uri(&preview_uri)
+            .header(header::HOST, "localhost:18734");
+        if let Some(token) = token {
+            request = request.header("x-bloom-ceremony-token", token);
+        }
+        broker
+            .router()
+            .oneshot(request.body(Body::empty()).unwrap())
+    };
+    let shown = preview(Some(url_token(&prepared.ceremony_url)))
+        .await
+        .unwrap();
+    assert_eq!(shown.status(), StatusCode::OK);
+    assert_eq!(shown.headers()[header::CONTENT_TYPE], "image/jpeg");
+    let shown = axum::body::to_bytes(shown.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(shown.as_ref(), jpeg.as_slice());
+    assert_eq!(preview(None).await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert!(
+        !session
+            .to_string()
+            .contains(&Base64UrlBytes::from_bytes(&jpeg).encoded()[..64])
+    );
     let contribution: CustodySignerContribution =
         serde_json::from_value(session["signer_contribution"].clone()).unwrap();
     assert!(!session.to_string().contains("test-capability"));

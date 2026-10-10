@@ -2526,6 +2526,10 @@ impl CeremonyBroker {
             .route("/api/session/{ceremony_id}", get(read_session))
             .route("/api/session/{ceremony_id}/result", get(read_result))
             .route(
+                "/api/session/{ceremony_id}/order-preview",
+                get(read_order_preview),
+            )
+            .route(
                 "/api/session/{ceremony_id}/complete",
                 post(complete_session),
             )
@@ -3898,6 +3902,30 @@ async fn read_session_by_token(
     Json(&session.projection).into_response()
 }
 
+async fn read_order_preview(
+    State(broker): State<CeremonyBroker>,
+    Path(ceremony_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if broker.validate_served_host(&headers).is_err()
+        || broker
+            .authorize_browser(&ceremony_id, &headers, false)
+            .is_err()
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let operation_id = match broker.inner.sessions.lock().get(&ceremony_id) {
+        Some(session) if session.ceremony_kind == CeremonyKind::CardCheckout => {
+            session.operation_id.clone()
+        }
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    match broker.inner.cards.order_preview(&operation_id) {
+        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn read_result(
     State(broker): State<CeremonyBroker>,
     Path(ceremony_id): Path<String>,
@@ -4653,7 +4681,7 @@ fn apply_security_headers(response: &mut Response) {
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self'; img-src 'self' blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         ),
     );
     headers.insert(

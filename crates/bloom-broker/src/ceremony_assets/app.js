@@ -348,7 +348,17 @@ function renderCardReview(session) {
       ? `${payment.installments} × ${money(amount / payment.installments)} = ${money(amount)}`
       : `${payment.installments} payments totaling ${money(amount)}; individual installment amounts were not verified`);
     fact("Recurring charge", payment.recurring ? "Yes" : "No");
-    reviewNode.replaceChildren(facts, el("h3", {}, "Described by agent — not verified"), el("p", {}, effect.agent_description), el("p", {}, "Bloom reports the merchant's confirmation; it does not verify your bank charge."));
+    // The merchant's page as checkout saw it, so items, quantity and delivery
+    // details can be checked. Only the total above is bound to the approval.
+    const image = el("img", {alt: "Merchant checkout page"});
+    const preview = el("figure", {class: "order-preview", hidden: ""},
+      el("figcaption", {}, "Merchant's page as Bloom saw it. Check the items, quantity and delivery details."),
+      el("div", {class: "order-preview-frame"}, image));
+    fetch(`/api/session/${session.ceremony_id}/order-preview`, {headers: authHeaders, credentials: "same-origin"})
+      .then(response => response.ok ? response.blob() : null)
+      .then(blob => { if (blob?.type === "image/jpeg") { image.src = URL.createObjectURL(blob); preview.hidden = false; } })
+      .catch(() => {});
+    reviewNode.replaceChildren(facts, preview, el("h3", {}, "Described by agent — not verified"), el("p", {}, effect.agent_description), el("p", {}, "Bloom reports the merchant's confirmation; it does not verify your bank charge."));
   } else if (effect.kind === "manual_checkout") {
     approve.textContent = "Open private view with passkey";
     document.getElementById("page-lede").textContent = "Payment facts could not be verified. Open the private view to finish yourself. No saved card will be released and no automated payment is approved.";
