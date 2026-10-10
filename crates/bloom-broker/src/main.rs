@@ -94,6 +94,10 @@ struct BrokerConfig {
     ceremony_limits: Option<serde_json::Value>,
     #[serde(default)]
     ceremony_port: Option<u16>,
+    #[serde(default)]
+    checkout_socket_path: Option<PathBuf>,
+    #[serde(default)]
+    checkout_uid: Option<u32>,
     /// Optional loopback port for the hosted-relay upstream, so a second
     /// development Triad can serve a relay surface beside the installed one.
     /// Missing keeps the default 18735; an explicit integer 1 through 65535
@@ -405,6 +409,26 @@ async fn run_with_paths(
     );
     let startup_status_path = std::env::var_os("BLOOM_BROKER_STARTUP_STATUS").map(PathBuf::from);
     let mut config = load_config(&config_path)?;
+    match (
+        std::env::var_os("BLOOM_CHECKOUT_INTAKE_SOCKET"),
+        std::env::var_os("BLOOM_CHECKOUT_UID"),
+    ) {
+        (None, None) => {}
+        (Some(path), Some(uid)) => {
+            let uid = uid
+                .to_str()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|v| *v != 0)
+                .ok_or("invalid checkout service UID")?;
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err("checkout intake path must be absolute".into());
+            }
+            config.checkout_uid = Some(uid);
+            config.checkout_socket_path = Some(path);
+        }
+        _ => return Err("checkout intake and UID must be configured together".into()),
+    }
     // Merge and validate admission limits before any durable state is opened,
     // so a mistyped quota fails startup instead of silently widening
     // admission. The four values are non-secret, so the effective policy is
@@ -668,6 +692,26 @@ async fn run_with_paths(
             ceremony_endpoint,
         )?;
         let machine_journal = journal.clone();
+        let _checkout_intake = match (&config.checkout_socket_path, config.checkout_uid) {
+            (Some(path), Some(uid)) => {
+                let listener = bloom_broker::ceremony::bind_checkout_intake(path)?;
+                let ceremony = ceremony.clone();
+                Some(tokio::spawn(async move {
+                    if bloom_broker::ceremony::serve_checkout_listener(ceremony, listener, uid)
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!("checkout intake stopped");
+                    }
+                }))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(
+                    "checkout_socket_path and checkout_uid must be configured together".into(),
+                );
+            }
+        };
         let mut service = BrokerRpcService::new(
             authority,
             journal,

@@ -183,6 +183,44 @@ impl BrokerRpcService {
             self.require_network_containment()?;
         }
         match request {
+            Request::CardList(_) => Ok(Response::CardList(
+                serde_json::from_value(
+                    serde_json::to_value(self.ceremony.card_list()?).map_err(malformed)?,
+                )
+                .map_err(malformed)?,
+            )),
+            Request::CardAdd(request) => Ok(Response::CardAdd(self.ceremony.prepare_card(
+                request.operation_id,
+                bloom_signer_api::CardEffect::Add {
+                    card_id: request.card_id,
+                    label: request.label,
+                },
+                self.clock.now_ms(false)?,
+            )?)),
+            Request::CardDelete(request) => Ok(Response::CardDelete(self.ceremony.prepare_card(
+                request.operation_id,
+                bloom_signer_api::CardEffect::Delete {
+                    card_id: request.card_id,
+                },
+                self.clock.now_ms(false)?,
+            )?)),
+            Request::CardStatus(request) => Ok(Response::CardStatus(
+                serde_json::from_value(
+                    serde_json::to_value(self.ceremony.card_status(&request.operation_id)?)
+                        .map_err(malformed)?,
+                )
+                .map_err(malformed)?,
+            )),
+            Request::CardCancel(request) => Ok(Response::CardCancel(
+                serde_json::from_value(
+                    serde_json::to_value(
+                        self.ceremony
+                            .card_cancel(&request.operation_id, self.clock.now_ms(false)?)?,
+                    )
+                    .map_err(malformed)?,
+                )
+                .map_err(malformed)?,
+            )),
             Request::SystemHello(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::UnknownMethod,
                 "system.hello is consumed by the authenticated transport",

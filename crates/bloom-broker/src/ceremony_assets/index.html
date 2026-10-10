@@ -46,11 +46,24 @@
           <p>BIP-39 passphrases are not supported. Import the recovery phrase only.</p>
           <p>Encrypted directly to the Signer before it leaves this page.</p>
         </fieldset>
+        <fieldset id="card-fields" hidden>
+          <legend>Card to save</legend>
+          <label>Card number<input id="card-number" inputmode="numeric" autocomplete="off" maxlength="23" placeholder="1234 5678 9012 3456"><span class="field-error" id="card-number-error"></span></label>
+          <label>Expiry<input id="card-expiry" inputmode="numeric" autocomplete="off" maxlength="5" placeholder="MM/YY"><span class="field-error" id="card-expiry-error"></span></label>
+          <label>Name on card<input id="card-name" autocomplete="off" maxlength="128"><span class="field-error" id="card-name-error"></span></label>
+          <p>Encrypted directly to Signer. Never enter card details in chat.</p>
+        </fieldset>
+        <fieldset id="card-cvc-fields" hidden>
+          <legend>Security code for this purchase</legend>
+          <label>CVC<input id="card-cvc" type="password" inputmode="numeric" autocomplete="off" maxlength="4"><span class="field-error" id="card-cvc-error"></span></label>
+          <p>Never saved. Approval fills and submits this checkout once.</p>
+        </fieldset>
         <fieldset id="generic-fields" hidden>
           <legend>Advanced input</legend>
           <p>This workflow needs a JSON object. It is encrypted directly to Signer.</p>
           <textarea id="generic-input" rows="6" autocomplete="off" spellcheck="false"></textarea>
         </fieldset>
+        <p id="form-error" class="form-error" role="alert" hidden></p>
         <div class="actions"><button id="approve" type="button" disabled>Continue with passkey</button><button id="cancel" class="secondary" type="button">Cancel</button></div>
       </section>
     </div>

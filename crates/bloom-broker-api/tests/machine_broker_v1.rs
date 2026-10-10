@@ -268,6 +268,22 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
     };
     vec![
         MachineBrokerRequest::SystemHello(hello()),
+        MachineBrokerRequest::CardList(Empty {}),
+        MachineBrokerRequest::CardAdd(CardAddRequest {
+            operation_id: operation(1),
+            card_id: token("card-one"),
+            label: "Synthetic card".into(),
+        }),
+        MachineBrokerRequest::CardDelete(CardDeleteRequest {
+            operation_id: operation(2),
+            card_id: token("card-one"),
+        }),
+        MachineBrokerRequest::CardStatus(OperationRequest {
+            operation_id: operation(3),
+        }),
+        MachineBrokerRequest::CardCancel(OperationRequest {
+            operation_id: operation(4),
+        }),
         MachineBrokerRequest::BrokerReadiness(Empty {}),
         MachineBrokerRequest::BrokerCapabilities(Empty {}),
         MachineBrokerRequest::CeremonySurfaceStatus(Empty {}),
@@ -556,8 +572,37 @@ fn machine_responses() -> Vec<MachineBrokerResponse> {
         }),
         MachineBrokerResponse::CredentialReplacePrepare(custody_prepared.clone()),
         MachineBrokerResponse::CredentialRemovePrepare(custody_prepared.clone()),
+        MachineBrokerResponse::CardList(vec![CardPublic {
+            card_id: token("card-one"),
+            label: "Synthetic card".into(),
+            brand: "Card".into(),
+            last4: "4242".into(),
+        }]),
+        MachineBrokerResponse::CardAdd({
+            let mut p = custody_prepared.clone();
+            p.ceremony_kind = CeremonyKind::CardAdd;
+            p
+        }),
+        MachineBrokerResponse::CardDelete({
+            let mut p = custody_prepared.clone();
+            p.ceremony_kind = CeremonyKind::CardDelete;
+            p
+        }),
+        MachineBrokerResponse::CardStatus(CardOperationStatus {
+            operation_id: operation(3),
+            state: CardOperationState::Prepared,
+        }),
+        MachineBrokerResponse::CardCancel(CardOperationStatus {
+            operation_id: operation(4),
+            state: CardOperationState::Cancelled,
+        }),
         MachineBrokerResponse::RecoveryPrepare(custody_prepared),
         MachineBrokerResponse::CeremonyStatus(ceremony_status()),
+        MachineBrokerResponse::CeremonyStatus({
+            let mut s = ceremony_status();
+            s.ceremony_kind = CeremonyKind::CardCheckout;
+            s
+        }),
         MachineBrokerResponse::CeremonyCancel(ceremony_status()),
         MachineBrokerResponse::CustodyResult(custody_result()),
     ]
@@ -578,16 +623,16 @@ where
 
 #[test]
 fn every_machine_broker_variant_matches_frozen_v1_frames() {
-    assert_eq!(MachineBrokerMethod::ALL.len(), 45);
+    assert_eq!(MachineBrokerMethod::ALL.len(), 50);
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "950b2fc2235205a19fa41058e6c14fb00eba4730415e0545830322cf8d6780cb",
+        "134138dc77f19b49da6024ecc83aeed8b1539691d55eb86ab5ef0ea4fc0644eb",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "7889a9d1f237553511ddcf311543652f4c199aec2a8069950217e5a5feda9128",
+        "4c484a60f3e6159cd293aeb2ed40aa9e9fc72760e081dcde38b09bdc15e27992",
     );
 }
 
