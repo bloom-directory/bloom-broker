@@ -331,7 +331,7 @@ function renderCardReview(session) {
   const fact = (name, value) => facts.append(el("dt", {}, name), el("dd", {}, value));
   if (manifest.card) fact("Card", `${manifest.card.label} · ${manifest.card.brand} ••${manifest.card.last4}`);
   if (effect.kind === "add") fact("Label", effect.label);
-  if (effect.kind === "checkout") {
+  if (effect.kind === "checkout" || effect.kind === "site_checkout") {
     const payment = effect.facts;
     const website = el("span");
     const domain = manifest.registrable_domain;
@@ -339,7 +339,10 @@ function renderCardReview(session) {
     if (index >= 0) website.append(payment.origin.slice(0, index), el("strong", {}, domain), payment.origin.slice(index + domain.length));
     else website.textContent = payment.origin;
     fact("Website", website);
-    fact("Payment frames", payment.payment_frame_origins.join(", ") || "Main document");
+    if (effect.kind === "site_checkout") {
+      document.getElementById("page-lede").textContent = "Bloom clicks this shop's pay button once. The shop charges the payment method saved in your account there; no Bloom card is used. Bloom cannot cap the shop's actual charge.";
+      fact("Payment", "Your saved payment method at this shop");
+    } else fact("Payment frames", payment.payment_frame_origins.join(", ") || "Main document");
     const scale = new Intl.NumberFormat("en", {style: "currency", currency: payment.currency}).resolvedOptions().maximumFractionDigits;
     const amount = payment.total_minor / (10 ** scale);
     const money = value => new Intl.NumberFormat("en", {style: "currency", currency: payment.currency}).format(value);
@@ -359,6 +362,11 @@ function renderCardReview(session) {
       .then(blob => { if (blob?.type === "image/jpeg") { image.src = URL.createObjectURL(blob); preview.hidden = false; } })
       .catch(() => {});
     reviewNode.replaceChildren(facts, preview, el("h3", {}, "Described by agent — not verified"), el("p", {}, effect.agent_description), el("p", {}, "Bloom reports the merchant's confirmation; it does not verify your bank charge."));
+  } else if (effect.kind === "manual_checkout" && !effect.card_id) {
+    document.getElementById("page-title").textContent = "Take over Bloom's browser";
+    approve.textContent = "Open Bloom's browser with passkey";
+    document.getElementById("page-lede").textContent = "The agent needs you in Bloom's browser, for example to log in, enter a code or pass a check. This approval buys nothing and releases no card. Click Done there to hand the browser back.";
+    reviewNode.replaceChildren(facts, el("h3", {}, "Described by agent — not verified"), el("p", {}, effect.agent_description));
   } else if (effect.kind === "manual_checkout") {
     approve.textContent = "Open private view with passkey";
     document.getElementById("page-lede").textContent = "Payment facts could not be verified. Open the private view to finish yourself. No saved card will be released and no automated payment is approved.";
@@ -1594,14 +1602,15 @@ async function run(session) {
 
 async function finishBrowserResult(session, result) {
   if (session.ceremony_kind.startsWith("card_")) {
-    statusNode.textContent = session.review_manifest.card_effect.kind === "manual_checkout" ? "Private view authorized. No saved card was released." : session.ceremony_kind === "card_checkout" ? "Approved. Checkout is continuing; the outcome is reported by the merchant." : session.ceremony_kind === "card_add" ? "Card saved. You can close this page." : "Card deleted. You can close this page.";
+    const effect = session.review_manifest.card_effect;
+    statusNode.textContent = effect.kind === "manual_checkout" ? (effect.card_id ? "Private view authorized. No saved card was released." : "Bloom's browser is yours. Click Done there to hand it back.") : effect.kind === "site_checkout" ? "Approved. Bloom is placing the order with your saved payment method; the outcome is reported by the shop." : session.ceremony_kind === "card_checkout" ? "Approved. Checkout is continuing; the outcome is reported by the merchant." : session.ceremony_kind === "card_add" ? "Card saved. You can close this page." : "Card deleted. You can close this page.";
     clearInterval(expiryTimer);
     cardFields.hidden = true;
     cardCvcFields.hidden = true;
     approve.hidden = true;
     cancel.hidden = true;
     if (result.challenge_url) {
-      const link = el("a", {href: result.challenge_url, target: "_blank", rel: "noopener noreferrer"}, "Open private checkout view");
+      const link = el("a", {href: result.challenge_url, target: "_blank", rel: "noopener noreferrer"}, effect.kind === "manual_checkout" && !effect.card_id ? "Open Bloom's browser" : "Open private checkout view");
       reviewNode.append(el("p", {}, link));
       window.open(result.challenge_url, "_blank", "noopener,noreferrer");
     }

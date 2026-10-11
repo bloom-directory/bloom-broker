@@ -352,7 +352,7 @@ async fn card_checkout_private_delivery_is_single_use_and_manual_has_no_release(
         &socket,
         CheckoutIntakeRequest::Manual {
             operation_id: operation("a3"),
-            card_id,
+            card_id: Some(card_id),
             agent_description: "Manual review".into(),
             challenge_url: challenge.into(),
         },
@@ -404,6 +404,95 @@ async fn card_checkout_private_delivery_is_single_use_and_manual_has_no_release(
     .unwrap();
     assert!(output.is_empty());
     denied.abort();
+}
+
+/// Take-over and the merchant's saved payment method release no card.
+#[tokio::test]
+async fn card_takeover_and_site_checkout_release_no_card() {
+    use bloom_broker::ceremony::{
+        CheckoutIntakeRequest, CheckoutIntakeResponse, bind_checkout_intake,
+        serve_checkout_listener,
+    };
+    use bloom_signer_api::{CardEffect, CheckoutFacts};
+    use std::os::unix::fs::PermissionsExt;
+    let broker = CeremonyBroker::new(real_ceremony_signer());
+    let added = broker
+        .prepare_card(
+            operation("b1"),
+            CardEffect::Add {
+                card_id: Token::new("private-card").unwrap(),
+                label: "Test card".into(),
+            },
+            card_test_now(),
+        )
+        .unwrap();
+    let session = card_session_json(&broker, &added).await;
+    let auth = VirtualAuthenticator::generate_for_registration(
+        serde_json::from_value(session["webauthn_options"]["registration_user_handle"].clone())
+            .unwrap(),
+        "http://localhost:18734",
+    );
+    let prf = Base64UrlBytes::from_bytes(&auth.deterministic_prf());
+    let card = serde_json::json!({"credential_prf":prf,"card":{"number":"4242424242424242",
+        "expiry_month":12,"expiry_year":2034,"name":"Synthetic Card"}});
+    assert_eq!(
+        card_approve(&broker, &added, &auth, card, 1).await.0,
+        StatusCode::OK
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("facts.sock");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o710)).unwrap();
+    let listener = bind_checkout_intake(&socket).unwrap();
+    let uid = fs::metadata(dir.path()).unwrap().uid();
+    let service = tokio::spawn(serve_checkout_listener(broker.clone(), listener, uid));
+    let challenge = "http://localhost:28740/private?token=test-capability";
+    let requests = [
+        CheckoutIntakeRequest::Manual {
+            operation_id: operation("b4"),
+            card_id: None,
+            agent_description: "Log in to the shop".into(),
+            challenge_url: challenge.into(),
+        },
+        CheckoutIntakeRequest::Site {
+            operation_id: operation("b5"),
+            facts: CheckoutFacts {
+                origin: "https://merchant.example".into(),
+                payment_frame_origins: vec![],
+                total_minor: 4990,
+                currency: "CHF".into(),
+                installments: 1,
+                recurring: false,
+            },
+            agent_description: "Shop's saved card".into(),
+            challenge_url: challenge.into(),
+            order_preview: None,
+        },
+    ];
+    for (count, (id, request)) in (2..).zip(["b4", "b5"].into_iter().zip(requests)) {
+        let prepared = match card_intake(&socket, request).await {
+            CheckoutIntakeResponse::Prepared(prepared) => prepared,
+            CheckoutIntakeResponse::Error { message } => panic!("{id} rejected: {message}"),
+            _ => panic!("{id} rejected"),
+        };
+        let approved = card_approve(
+            &broker,
+            &prepared,
+            &auth,
+            serde_json::json!({"credential_prf":prf}),
+            count,
+        )
+        .await;
+        assert_eq!(approved.0, StatusCode::OK);
+        assert_eq!(approved.1["challenge_url"], challenge);
+        assert!(
+            matches!(card_intake(&socket, CheckoutIntakeRequest::Result {
+            operation_id: operation(id),
+        }).await, CheckoutIntakeResponse::Result {
+            receipt: Some(ref receipt), ..
+        } if receipt.encrypted_browser_result.is_none())
+        );
+    }
+    service.abort();
 }
 
 #[tokio::test]

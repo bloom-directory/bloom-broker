@@ -51,11 +51,22 @@ pub enum CheckoutIntakeRequest {
         #[serde(default)]
         order_preview: Option<Base64UrlBytes>,
     },
+    /// Without a card, the human takes over the browser for a login or code.
     Manual {
         operation_id: OperationId,
-        card_id: Token,
+        #[serde(default)]
+        card_id: Option<Token>,
         agent_description: String,
         challenge_url: String,
+    },
+    /// Pay with the payment method saved in the buyer's merchant account.
+    Site {
+        operation_id: OperationId,
+        facts: CheckoutFacts,
+        agent_description: String,
+        challenge_url: String,
+        #[serde(default)]
+        order_preview: Option<Base64UrlBytes>,
     },
     Result {
         operation_id: OperationId,
@@ -135,7 +146,7 @@ impl CeremonyBroker {
         let card = self
             .card_list()?
             .into_iter()
-            .find(|c| c.card_id == *request.effect.card_id());
+            .find(|c| Some(&c.card_id) == request.effect.card_id());
         let prepared = self
             .inner
             .signer
@@ -151,12 +162,13 @@ impl CeremonyBroker {
             return Err(operation_conflict());
         }
         let kind = request.effect.ceremony_kind();
-        let domain = if let CardEffect::Checkout { facts, .. } = &request.effect {
-            url::Url::parse(&facts.origin)
-                .ok()
-                .and_then(|u| u.host_str().and_then(psl::domain_str).map(str::to_owned))
-        } else {
-            None
+        let domain = match &request.effect {
+            CardEffect::Checkout { facts, .. } | CardEffect::SiteCheckout { facts, .. } => {
+                url::Url::parse(&facts.origin)
+                    .ok()
+                    .and_then(|u| u.host_str().and_then(psl::domain_str).map(str::to_owned))
+            }
+            _ => None,
         };
         let review = serde_json::json!({"card_effect":request.effect, "card":card, "registrable_domain":domain,
             "heading":custody_review_text(kind).0, "body":custody_review_text(kind).1});
@@ -217,12 +229,7 @@ impl CeremonyBroker {
                 challenge_url,
                 order_preview,
             } => {
-                let order_preview = order_preview.map(|preview| preview.decode());
-                if order_preview.as_ref().is_some_and(|jpeg| {
-                    jpeg.len() > MAX_ORDER_PREVIEW_BYTES || !jpeg.starts_with(&[0xff, 0xd8, 0xff])
-                }) {
-                    return Err(malformed("invalid order preview"));
-                }
+                let order_preview = order_preview_bytes(order_preview)?;
                 // The principal owns this private capability. Never put it in a public projection.
                 let effect = CardEffect::Checkout {
                     card_id,
@@ -253,6 +260,25 @@ impl CeremonyBroker {
                 None,
                 now_ms,
             ),
+            CheckoutIntakeRequest::Site {
+                operation_id,
+                facts,
+                agent_description,
+                challenge_url,
+                order_preview,
+            } => {
+                let order_preview = order_preview_bytes(order_preview)?;
+                self.prepare_checkout_channel(
+                    operation_id,
+                    CardEffect::SiteCheckout {
+                        facts,
+                        agent_description,
+                    },
+                    challenge_url,
+                    order_preview,
+                    now_ms,
+                )
+            }
             CheckoutIntakeRequest::Result { operation_id } => {
                 self.expire_sessions(now_ms)?;
                 let status = self.card_status(&operation_id)?;
@@ -335,6 +361,16 @@ impl CeremonyBroker {
         });
         Ok(CheckoutIntakeResponse::Prepared(prepared))
     }
+}
+
+fn order_preview_bytes(preview: Option<Base64UrlBytes>) -> Result<Option<Vec<u8>>, ProtocolError> {
+    let preview = preview.map(|preview| preview.decode());
+    if preview.as_ref().is_some_and(|jpeg| {
+        jpeg.len() > MAX_ORDER_PREVIEW_BYTES || !jpeg.starts_with(&[0xff, 0xd8, 0xff])
+    }) {
+        return Err(malformed("invalid order preview"));
+    }
+    Ok(preview)
 }
 
 pub(super) fn complete_card_session(
