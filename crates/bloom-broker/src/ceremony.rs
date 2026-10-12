@@ -2317,6 +2317,25 @@ impl CeremonyBroker {
         self.cancel_with_backoff(operation_id, now_ms, BackoffClock::Monotonic)
     }
 
+    fn cancel_signer_or_already_released(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<(), ProtocolError> {
+        match self
+            .inner
+            .signer
+            .cancel(operation_id)
+            .map_err(signer_error_to_machine)
+        {
+            Ok(())
+            | Err(ProtocolError {
+                code: ProtocolErrorCode::ApprovalNotFound,
+                ..
+            }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     fn cancel_with_backoff(
         &self,
         operation_id: &OperationId,
@@ -2369,12 +2388,7 @@ impl CeremonyBroker {
         // own, and cancelling again could not clear it either. Any other
         // rejection still fails closed, because the Signer operation may well
         // still be pending there.
-        if let Err(error) = self.inner.signer.cancel(operation_id) {
-            let error = signer_error_to_machine(error);
-            if error.code != ProtocolErrorCode::ApprovalNotFound {
-                return Err(error);
-            }
-        }
+        self.cancel_signer_or_already_released(operation_id)?;
         // Both tabs belong to one operation. Leaving its auxiliary source live
         // would strand the wallet's admission slot after a successful cancel.
         let auxiliary = self
@@ -2422,10 +2436,7 @@ impl CeremonyBroker {
                 continue;
             }
             if state == CeremonyState::AwaitingUser {
-                self.inner
-                    .signer
-                    .cancel(&operation_id)
-                    .map_err(signer_error_to_machine)?;
+                self.cancel_signer_or_already_released(&operation_id)?;
             }
             let snapshot = {
                 let sessions = self.inner.sessions.lock();
@@ -2673,10 +2684,7 @@ impl CeremonyBroker {
                     Some(serde_json::to_value(result).map_err(malformed)?),
                 ),
                 SignerCeremonyStatus::Pending => {
-                    self.inner
-                        .signer
-                        .cancel(&operation_id)
-                        .map_err(signer_error_to_machine)?;
+                    self.cancel_signer_or_already_released(&operation_id)?;
                     (CeremonyState::Expired, None)
                 }
                 SignerCeremonyStatus::Terminal(state) => (state, None),
@@ -3320,10 +3328,7 @@ impl CeremonyBroker {
                             Some(serde_json::to_value(result).map_err(malformed)?);
                     }
                     SignerCeremonyStatus::Pending => {
-                        self.inner
-                            .signer
-                            .cancel(&session.operation_id)
-                            .map_err(signer_error_to_machine)?;
+                        self.cancel_signer_or_already_released(&session.operation_id)?;
                         session.state = CeremonyState::Expired;
                     }
                     SignerCeremonyStatus::Terminal(state) => {

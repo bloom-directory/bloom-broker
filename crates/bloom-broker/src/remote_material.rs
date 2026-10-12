@@ -316,7 +316,10 @@ async fn renew_scope(
         atomic_private(&pending_path, &serde_json::to_vec(&pending)?)?;
     }
     let receipt = pending.receipt.as_ref().ok_or("missing renewal receipt")?;
-    if receipt.scope != scope || receipt.operation_id != pending.operation_id {
+    if receipt.version != 1
+        || receipt.scope != scope
+        || receipt.operation_id != pending.operation_id
+    {
         return Err("scoped renewal receipt mismatches pending operation".into());
     }
     // The replacement below writes the credential, then the metadata, then
@@ -1336,13 +1339,22 @@ mod tests {
         let live_until = now + 48 * 60 * 60 * 1000;
         let operation_id = Uuid::new_v4();
         let other_operation = Uuid::new_v4();
-        let rejected: [(&str, u64, Uuid, CredentialIssueReceipt); 6] = [
+        let rejected: [(&str, u64, Uuid, CredentialIssueReceipt); 7] = [
             (
                 "a receipt issued for the other scope",
                 7,
                 operation_id,
                 CredentialIssueReceipt {
                     scope: Scope::DnsChallenge,
+                    ..tunnel_receipt(8, operation_id, live_until)
+                },
+            ),
+            (
+                "a receipt with an unsupported protocol version",
+                7,
+                operation_id,
+                CredentialIssueReceipt {
+                    version: 2,
                     ..tunnel_receipt(8, operation_id, live_until)
                 },
             ),
