@@ -115,11 +115,10 @@ pub struct ApprovalPrepareRequest {
     pub petal_use_claim: Option<PetalUseClaim>,
     #[serde(default)]
     pub system_use_claim: Option<SystemUseClaim>,
-    /// What the Petal says this operation does, for the review page. The
-    /// Machine hashes these same bytes into `canonical_plan_facts_digest`, so
-    /// an approval prepared for one advisory cannot later sign a different
-    /// one.
-    #[serde(default)]
+    /// The Petal's bounded description of the operation for the owner review.
+    /// This is attributed app text, not independently verified economics or
+    /// an additional constraint on a reusable selector's future payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attributed_advisory: Option<crate::AttributedAdvisory>,
 }
 

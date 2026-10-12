@@ -3181,6 +3181,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let stale_policy_error = MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            attributed_advisory: None,
             requested_review_mode: None,
             evm_review_payloads: vec![Base64UrlBytes::from_bytes(&creation)],
             operation_id: operation("d9"),
@@ -4943,7 +4944,6 @@ async fn a_pumpfun_trade_projection_carries_its_review_to_the_page() {
 
     if let Ok(path) = std::env::var("BLOOM_CEREMONY_PROJECTION_OUT") {
         std::fs::write(&path, &bytes).unwrap();
-        std::fs::write(format!("{path}.token"), token).unwrap();
     }
 }
 

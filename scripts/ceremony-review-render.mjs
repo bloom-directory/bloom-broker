@@ -13,22 +13,22 @@
 //
 // Exits non-zero with a reason if the review is not on the page.
 
-import { chromium } from "/home/user/.local/share/mise/installs/npm-playwright/1.63.0/node_modules/playwright/index.mjs";
 import { createServer } from "node:http";
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const [projectionPath, outPrefix] = process.argv.slice(2);
+const [projectionPath, outPrefix, playwrightModule = "playwright", chromiumPath] = process.argv.slice(2);
 if (!projectionPath || !outPrefix) {
-  console.error("usage: ceremony-review-render.mjs <session.json> <out-prefix>");
+  console.error("usage: ceremony-review-render.mjs <session.json> <out-prefix> [playwright-module] [chromium-path]");
   process.exit(2);
 }
 
 const assets = join(dirname(fileURLToPath(import.meta.url)), "..", "crates", "bloom-broker", "src", "ceremony_assets");
 const read = name => readFileSync(join(assets, name));
 const projection = readFileSync(projectionPath);
-const token = readFileSync(`${projectionPath}.token`, "utf8").trim();
+// The local fixture serves a fixed projection; it needs no real ceremony token.
+const token = "review-fixture";
 // The attribution line the server prepends, then the Petal's own lines.
 const [attribution, ...expected] =
   JSON.parse(projection).review_manifest?.attributed_advisory_items ?? [];
@@ -59,9 +59,8 @@ const server = createServer((request, response) => {
 await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
 const base = `http://localhost:${server.address().port}`;
 
-const browser = await chromium.launch({
-  executablePath: "/home/user/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome",
-});
+const { chromium } = await import(playwrightModule);
+const browser = await chromium.launch(chromiumPath ? { executablePath: chromiumPath } : {});
 const failures = [];
 const seen = {};
 for (const [name, viewport] of [["desktop", { width: 1280, height: 900 }], ["narrow", { width: 390, height: 844 }]]) {
