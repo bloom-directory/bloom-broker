@@ -1880,6 +1880,11 @@ async fn approve_and_sign(
         .to_string();
     let token = url_token(&approve_prepared.ceremony_url);
     let session = get_session(stack.broker.as_ref(), &ceremony_id, &token).await;
+    assert_eq!(
+        session["review_manifest"]["attributed_advisory_items"],
+        serde_json::json!([])
+    );
+    println!("public owner review: {}", session["review_manifest"]);
     let challenge: CeremonyChallenge =
         serde_json::from_value(session["challenges"][0]["binding"].clone()).unwrap();
     let contribution: SignerCeremonyContribution =
