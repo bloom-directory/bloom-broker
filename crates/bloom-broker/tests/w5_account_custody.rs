@@ -1845,6 +1845,98 @@ fn sign_terms(
     }
 }
 
+/// Pump.fun's Machine path reads sealed_approval.status, not ceremony.status.
+/// Exercise that RPC against the real Broker and the release-pinned Signer,
+/// without Broker #88 or Signer #62.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_approval_status_expires_an_unopened_owner_ceremony() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut stack = account_stack(directory.path(), "e1").await;
+    let authenticator = VirtualAuthenticator::generate();
+    let wallet_id = Token::new("pump-expiry-audit").unwrap();
+    register_bip39_wallet(&mut stack, &wallet_id, &authenticator, None).await;
+    let provenance = system_provenance();
+    stack.authority.install_provenance(&provenance).unwrap();
+    let public = wallet_public(&stack, &wallet_id).await;
+    let accounts = wallet_accounts(&stack, &wallet_id).await;
+    let account = accounts
+        .accounts
+        .iter()
+        .find(|account| {
+            account
+                .supported_crypto_suites
+                .contains(&CryptoSuite::Ed25519Message)
+        })
+        .unwrap();
+    let mut terms = sign_terms(
+        &public,
+        account.key_ref.clone(),
+        b"expiry-audit",
+        &provenance,
+    );
+    terms.allowed_crypto_suites = vec![CryptoSuite::Ed25519Message];
+    terms.expires_at_ms = DecimalU64::new(now_plus(2));
+    let operation_id = stack.next_operation();
+    let prepared = match MachineBrokerService::dispatch(
+        stack.broker.as_ref(),
+        MachineBrokerRequest::SealedApprovalPrepare(bloom_broker_api::ApprovalPrepareRequest {
+            requested_review_mode: None,
+            operation_id: operation_id.clone(),
+            canonical_plan_facts_digest: terms.approval_digest().unwrap(),
+            terms,
+            evm_review_payloads: vec![],
+            petal_use_claim: None,
+            system_use_claim: None,
+        }),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::SealedApprovalPrepare(prepared) => prepared,
+        response => panic!("unexpected prepare response: {response:?}"),
+    };
+    let request = MachineBrokerRequest::SealedApprovalStatus(IdRequest {
+        id: prepared.approval_id.clone(),
+    });
+    let before = MachineBrokerService::dispatch(stack.broker.as_ref(), request.clone())
+        .await
+        .unwrap();
+    assert!(
+        matches!(before, MachineBrokerResponse::SealedApprovalStatus(ref status)
+        if status.state == bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
+            && status.ceremony_url.is_some())
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // No browser load, cancellation, new prepare, or restart performs a sweep.
+    assert_eq!(
+        stack
+            .broker
+            .ceremony()
+            .public_status(&operation_id)
+            .unwrap()
+            .state,
+        CeremonyState::AwaitingUser
+    );
+    let after = MachineBrokerService::dispatch(stack.broker.as_ref(), request)
+        .await
+        .unwrap();
+    assert!(
+        matches!(after, MachineBrokerResponse::SealedApprovalStatus(ref status)
+        if status.state == bloom_broker_api::ApprovalLifecycleState::Expired
+            && status.ceremony_url.is_none()),
+        "{after:?}"
+    );
+    assert_eq!(
+        stack
+            .broker
+            .ceremony()
+            .public_status(&operation_id)
+            .unwrap()
+            .state,
+        CeremonyState::Expired
+    );
+}
+
 /// Complete the browser SealedApproval ceremony that activates the backend and
 /// installs the approval, then dispatch `signing.sign` and return the result.
 async fn approve_and_sign(
