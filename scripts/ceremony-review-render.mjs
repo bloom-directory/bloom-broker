@@ -28,7 +28,7 @@ const assets = join(dirname(fileURLToPath(import.meta.url)), "..", "crates", "bl
 const read = name => readFileSync(join(assets, name));
 const projection = readFileSync(projectionPath);
 // The local fixture serves a fixed projection; it needs no real ceremony token.
-const token = "review-fixture";
+const token = "A".repeat(43);
 // The attribution line the server prepends, then the Petal's own lines.
 const [attribution, ...expected] =
   JSON.parse(projection).review_manifest?.attributed_advisory_items ?? [];
@@ -67,6 +67,9 @@ for (const [name, viewport] of [["desktop", { width: 1280, height: 900 }], ["nar
   const page = await browser.newPage({ viewport });
   const errors = [];
   page.on("pageerror", error => errors.push(String(error)));
+  page.on("console", message => {
+    if (message.type() === "error") errors.push(message.text());
+  });
   await page.goto(`${base}/ceremony/${token}`, { waitUntil: "networkidle" });
   await page.waitForSelector(".advisory", { timeout: 10_000 }).catch(() => {});
 
