@@ -83,6 +83,41 @@ process.stdout.write(JSON.stringify({{aad, envelope, canonical: canonicalJson(aa
 }
 
 #[test]
+fn completed_pre_surface_browser_result_keeps_its_legacy_aad() {
+    let recipient = HpkeRecipient::generate();
+    let output = run_browser(&format!(
+        r#"
+const session = {session};
+const contribution = {contribution};
+const aad = browserResultAad(session, contribution);
+const envelope = await hpkeSeal(decodeUrl({key}), te.encode("bloom-custody-output/v1"),
+  te.encode(canonicalJson(aad)), new Uint8Array([7, 8, 9]));
+process.stdout.write(JSON.stringify({{aad, canonical: canonicalJson(aad), envelope}}));
+"#,
+        key = serde_json::to_string(recipient.public_key()).unwrap(),
+        session = json!({"challenges": [{"binding": {
+            "exact_terms_digest": "11".repeat(32),
+            "signer_contribution_digest": "22".repeat(32)
+        }}]}),
+        contribution = json!({
+            "ceremony_id": "33".repeat(32),
+            "ceremony_kind": "wallet_export",
+            "custody_operation_id": "44".repeat(32)
+        }),
+    ));
+    assert!(output["aad"].get("surface").is_none());
+    let envelope: HpkeEnvelope = serde_json::from_value(output["envelope"].clone()).unwrap();
+    let plaintext = recipient
+        .open(
+            &envelope,
+            b"bloom-custody-output/v1",
+            output["canonical"].as_str().unwrap().as_bytes(),
+        )
+        .unwrap();
+    assert_eq!(plaintext.expose_to_backend(), &[7, 8, 9]);
+}
+
+#[test]
 fn browser_pairing_rejects_substitution_and_requires_fresh_destination_assertion() {
     let output = run_browser(&format!(
         r#"
