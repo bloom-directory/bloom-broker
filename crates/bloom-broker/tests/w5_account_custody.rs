@@ -1934,7 +1934,10 @@ async fn approve_and_sign(
             backend: terms.key_ref.backend.clone(),
             backend_instance: terms.key_ref.backend_instance.clone(),
             locator: terms.key_ref.locator.clone(),
-            key_spec: bloom_signer_api::KeySpec::Secp256k1,
+            key_spec: match terms.key_ref.key_spec {
+                KeySpec::Ed25519 => bloom_signer_api::KeySpec::Ed25519,
+                _ => bloom_signer_api::KeySpec::Secp256k1,
+            },
             public_key_fingerprint: terms.key_ref.public_key_fingerprint.clone(),
             derivation: match &terms.key_ref.derivation {
                 Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
@@ -1962,7 +1965,11 @@ async fn approve_and_sign(
                 None => None,
             },
         },
-        crypto_suite: bloom_signer_api::CryptoSuite::Secp256k1Sha256Recoverable,
+        crypto_suite: if terms.key_ref.key_spec == KeySpec::Ed25519 {
+            bloom_signer_api::CryptoSuite::Ed25519Message
+        } else {
+            bloom_signer_api::CryptoSuite::Secp256k1Sha256Recoverable
+        },
         ordered_payload_digests: vec![payload_hash.clone()],
         ordered_hashes: vec![payload_hash],
         petal_use_claim_digest: None,
@@ -1975,9 +1982,9 @@ async fn approve_and_sign(
         operation_digest: identity.digest().unwrap(),
         approval_id: terms.approval_id().unwrap(),
         key_ref: terms.key_ref.clone(),
-        crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
-        payloads: SigningPayloads::Single {
-            payload: Base64UrlBytes::from_bytes(payload),
+        crypto_suite: terms.allowed_crypto_suites[0],
+        payloads: SigningPayloads::Batch {
+            children: vec![Base64UrlBytes::from_bytes(payload)],
         },
         petal_use_claim: None,
         system_use_claim: None,
@@ -1989,12 +1996,12 @@ async fn approve_and_sign(
     };
     match MachineBrokerService::dispatch(
         stack.broker.as_ref(),
-        MachineBrokerRequest::SigningSign(sign_request),
+        MachineBrokerRequest::SigningSignBatch(sign_request),
     )
     .await
     .unwrap()
     {
-        MachineBrokerResponse::SigningSign(result) => result,
+        MachineBrokerResponse::SigningSignBatch(result) => result,
         response => panic!("unexpected signing response: {response:?}"),
     }
 }
@@ -2127,4 +2134,65 @@ async fn restored_wallet_signs_from_restored_derived_account_over_real_transport
         .to_public_key_der()
         .unwrap();
     assert_eq!(descriptor.canonical_public_key.decode(), spki.as_bytes());
+}
+
+/// A production local Ed25519 backend signs a batch of one over real
+/// Broker-Signer transport, without Signer #62 or Broker #88.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_services_sign_and_verify_two_single_ed25519_batches() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut stack = account_stack(directory.path(), "e1").await;
+    let authenticator = VirtualAuthenticator::generate();
+    let wallet_id = Token::new("pump-signing-audit").unwrap();
+    register_bip39_wallet(&mut stack, &wallet_id, &authenticator, None).await;
+    let provenance = system_provenance();
+    stack.authority.install_provenance(&provenance).unwrap();
+    let public = wallet_public(&stack, &wallet_id).await;
+    let accounts = wallet_accounts(&stack, &wallet_id).await;
+    let account = accounts
+        .accounts
+        .iter()
+        .find(|account| {
+            account
+                .supported_crypto_suites
+                .contains(&CryptoSuite::Ed25519Message)
+        })
+        .unwrap();
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(
+        &account.canonical_public_key.decode()[12..44]
+            .try_into()
+            .unwrap(),
+    )
+    .unwrap();
+    for (index, payload) in [
+        b"first-solana-message".as_slice(),
+        b"second-solana-message".as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut terms = sign_terms(&public, account.key_ref.clone(), payload, &provenance);
+        terms.allowed_crypto_suites = vec![CryptoSuite::Ed25519Message];
+        terms.request_nonce = RequestNonce::new(format!("{:02x}", index + 80).repeat(16)).unwrap();
+        let result = approve_and_sign(
+            &mut stack,
+            &authenticator,
+            &terms,
+            payload,
+            index as u32 + 2,
+        )
+        .await;
+        assert_eq!(result.signatures.len(), 1);
+        assert_eq!(
+            result.signatures[0].crypto_suite,
+            CryptoSuite::Ed25519Message
+        );
+        verifying
+            .verify_strict(
+                payload,
+                &ed25519_dalek::Signature::from_slice(&result.signatures[0].bytes.decode())
+                    .unwrap(),
+            )
+            .unwrap();
+    }
 }
