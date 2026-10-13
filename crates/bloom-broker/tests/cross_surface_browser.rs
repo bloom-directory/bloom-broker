@@ -2,7 +2,6 @@
 use bloom_signer::hpke::HpkeRecipient;
 use bloom_signer_api::{CrossSurfaceHpkeAad, HpkeEnvelope};
 use serde_json::json;
-use std::process::Command;
 
 fn browser_script(body: &str) -> String {
     let asset = include_str!("../src/ceremony_assets/app.js")
@@ -22,10 +21,7 @@ globalThis.history = {{replaceState: () => {{}}}};
 }
 
 fn run_browser(body: &str) -> serde_json::Value {
-    let output = Command::new("node")
-        .args(["-e", &browser_script(body)])
-        .output()
-        .expect("Node.js is required for shipped browser asset tests");
+    let output = run_node(&browser_script(body));
     assert!(
         output.status.success(),
         "{}",
@@ -383,4 +379,28 @@ process.stdout.write(JSON.stringify({ok:true}));
 "#,
     );
     assert_eq!(output, json!({"ok": true}));
+}
+
+/// Runs a CommonJS script in Node, fed on stdin: the shipped asset alone is
+/// larger than Linux's 128 KiB limit on a single `node -e` argument.
+fn run_node(script: &str) -> std::process::Output {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("node")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    let mut stdin = child.stdin.take().expect("node stdin");
+    let script = script.to_owned();
+    // Write from another thread so a chatty script cannot block on a full
+    // stdout pipe while its input is still being written.
+    let writer = std::thread::spawn(move || stdin.write_all(script.as_bytes()));
+    let output = child.wait_with_output().expect("node output");
+    writer
+        .join()
+        .expect("node stdin writer")
+        .expect("write node script");
+    output
 }

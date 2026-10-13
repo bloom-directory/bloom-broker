@@ -55,7 +55,6 @@ use sha2::Digest as _;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt as _;
-use std::process::Command;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -250,10 +249,7 @@ cryptoSelfTest().then(
 );
 "#
     );
-    let output = Command::new("node")
-        .args(["-e", &script])
-        .output()
-        .expect("Node.js is required to validate the shipped ceremony asset");
+    let output = run_node(&script);
     assert!(
         output.status.success(),
         "{}",
@@ -313,10 +309,7 @@ if (nodes["page-title"].textContent !== "Remove a passkey from a wallet" ||
 }}
 "#
     );
-    let output = Command::new("node")
-        .args(["-e", &script])
-        .output()
-        .expect("Node.js is required to validate the shipped ceremony asset");
+    let output = run_node(&script);
     assert!(
         output.status.success(),
         "{}",
@@ -467,10 +460,7 @@ if (!rendered.includes("Approve a call Bloom cannot read") || rendered.includes(
 }}
 "#
     );
-    let output = Command::new("node")
-        .args(["-e", &script])
-        .output()
-        .expect("Node.js is required to validate the shipped ceremony asset");
+    let output = run_node(&script);
     assert!(
         output.status.success(),
         "{}",
@@ -574,10 +564,7 @@ for (const expected of ["off â†’ on", "Unlimited-allowance requests", "allowed â
 }}
 "#
     );
-    let output = Command::new("node")
-        .args(["-e", &script])
-        .output()
-        .expect("Node.js is required to validate the shipped ceremony asset");
+    let output = run_node(&script);
     assert!(
         output.status.success(),
         "{}",
@@ -694,10 +681,7 @@ if (nodes.approve.textContent !== "Create temporary key") {{
 }}
 "#
     );
-    let output = Command::new("node")
-        .args(["-e", &script])
-        .output()
-        .expect("Node.js is required to validate the shipped ceremony asset");
+    let output = run_node(&script);
     assert!(
         output.status.success(),
         "{}",
@@ -808,10 +792,7 @@ if (!unbudgeted.includes("refuse any action that spends funds") || unbudgeted.in
 }}
 "#
     );
-    let output = Command::new("node")
-        .args(["-e", &script])
-        .output()
-        .expect("Node.js is required to validate the shipped ceremony asset");
+    let output = run_node(&script);
     assert!(
         output.status.success(),
         "{}",
@@ -863,10 +844,7 @@ for (const bad of ["", "0x1234", "zz".repeat(32), "0x" + "0".repeat(63)]) {{
 process.stdout.write("hex-normalization-ok");
 "#
     );
-    let output = Command::new("node")
-        .args(["-e", &script])
-        .output()
-        .expect("Node.js is required to validate the shipped ceremony asset");
+    let output = run_node(&script);
     assert!(
         output.status.success(),
         "{}",
@@ -938,10 +916,7 @@ if (token !== {token:?} || authHeaders["x-bloom-ceremony-token"] !== {token:?} |
 process.stdout.write("browser-reload-ok");
 "#
     );
-    let output = Command::new("node")
-        .args(["-e", &script])
-        .output()
-        .expect("Node.js is required to validate ceremony reload state");
+    let output = run_node(&script);
     assert!(
         output.status.success(),
         "{}",
@@ -991,10 +966,7 @@ if (logged.length !== 2 || logged[1][1] !== cancellationFailure) {{
 process.stdout.write("browser-error-feedback-ok");
 "#
     );
-    let output = Command::new("node")
-        .args(["-e", &script])
-        .output()
-        .expect("Node.js is required to validate ceremony error feedback");
+    let output = run_node(&script);
     assert!(
         output.status.success(),
         "{}",
@@ -8867,10 +8839,7 @@ if (!relabelled.includes("Beneficiary")) {{
 }}
 "#
     );
-    let output = Command::new("node")
-        .args(["-e", &script])
-        .output()
-        .expect("Node.js is required to validate the shipped ceremony asset");
+    let output = run_node(&script);
     assert!(
         output.status.success(),
         "{}",
@@ -9027,10 +8996,7 @@ for (const phrase of ["Pinned verifier", "77f7d9d9", "e12e0cbb", "stops being ab
 }}
 "#
     );
-    let output = Command::new("node")
-        .args(["-e", &script])
-        .output()
-        .expect("Node.js is required to validate the shipped ceremony asset");
+    let output = run_node(&script);
     assert!(
         output.status.success(),
         "{}",
@@ -9729,14 +9695,35 @@ process.stdout.write("trusted-keys-ok");
 "#,
         "0".repeat(64)
     );
-    let output = Command::new("node")
-        .args(["-e", &script])
-        .output()
-        .expect("Node.js is required to validate the shipped ceremony asset");
+    let output = run_node(&script);
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "trusted-keys-ok");
+}
+
+/// Runs a CommonJS script in Node, fed on stdin: the shipped asset alone is
+/// larger than Linux's 128 KiB limit on a single `node -e` argument.
+fn run_node(script: &str) -> std::process::Output {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("node")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    let mut stdin = child.stdin.take().expect("node stdin");
+    let script = script.to_owned();
+    // Write from another thread so a chatty script cannot block on a full
+    // stdout pipe while its input is still being written.
+    let writer = std::thread::spawn(move || stdin.write_all(script.as_bytes()));
+    let output = child.wait_with_output().expect("node output");
+    writer
+        .join()
+        .expect("node stdin writer")
+        .expect("write node script");
+    output
 }
