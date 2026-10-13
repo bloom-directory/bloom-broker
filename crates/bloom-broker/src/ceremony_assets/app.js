@@ -127,6 +127,8 @@ function fmtRemaining(ms) {
 }
 let expiryTimer = null;
 function startExpiry(session, node) {
+  clearInterval(expiryTimer);
+  expiryTimer = null;
   const expiresAt = Number(session.expires_at_ms ||
     session.signer_contribution?.expires_at_ms ||
     session.review_manifest?.expires_at_ms);
@@ -139,11 +141,19 @@ function startExpiry(session, node) {
     if (left <= 0) {
       approve.disabled = true;
       statusNode.textContent = "This ceremony has expired. Nothing was changed.";
+      const page = document.getElementById("ceremony-page");
+      if (page?.classList?.contains("browser-handoff")) {
+        page.classList.add("request-expired");
+        panelTitle.textContent = "This request expired";
+        statusNode.textContent = "Nothing happened. Ask your agent for a fresh link.";
+        approve.textContent = "Request expired";
+        reviewNode.querySelector("details.agent-instructions")?.removeAttribute("open");
+      }
       clearInterval(expiryTimer);
     }
   };
   tick();
-  expiryTimer = setInterval(tick, 1000);
+  if (expiresAt > Date.now()) expiryTimer = setInterval(tick, 1000);
 }
 
 function chainLabel(chain, ctx) {
@@ -327,6 +337,13 @@ function renderCardReview(session) {
   approve.textContent = meta.button;
   const manifest = session.review_manifest;
   const effect = manifest.card_effect;
+  const handoff = effect.kind === "manual_checkout" && !effect.card_id;
+  const page = document.getElementById("ceremony-page");
+  page?.classList?.toggle("browser-handoff", handoff);
+  page?.classList?.remove("request-expired");
+  document.getElementById("ceremony-trust").hidden = handoff;
+  document.getElementById("ceremony-eyebrow").textContent = handoff ? "Browser access" : "Signed wallet review";
+  panelKicker.textContent = "Step 1 of 2 · Check";
   const facts = el("dl", {class: "facts"});
   const fact = (name, value) => facts.append(el("dt", {}, name), el("dd", {}, value));
   if (manifest.card) fact("Card", `${manifest.card.label} · ${manifest.card.brand} ••${manifest.card.last4}`);
@@ -363,17 +380,26 @@ function renderCardReview(session) {
       .catch(() => {});
     reviewNode.replaceChildren(facts, preview, el("h3", {}, "Described by agent — not verified"), el("p", {}, effect.agent_description), el("p", {}, "Bloom reports the merchant's confirmation; it does not verify your bank charge."));
   } else if (effect.kind === "manual_checkout" && !effect.card_id) {
-    document.getElementById("page-title").textContent = "Take over Bloom's browser";
-    approve.textContent = "Open Bloom's browser with passkey";
-    document.getElementById("page-lede").textContent = "The agent needs you in Bloom's browser, for example to log in, enter a code or pass a check. This approval buys nothing and releases no card. Click Done there to hand the browser back.";
-    reviewNode.replaceChildren(facts, el("h3", {}, "Described by agent — not verified"), el("p", {}, effect.agent_description));
+    document.getElementById("page-title").textContent = "Open Bloom's browser";
+    panelKicker.textContent = "Review this request";
+    panelTitle.textContent = "Your task";
+    approve.textContent = "Open browser with passkey";
+    document.getElementById("page-lede").textContent = "Continue where your agent stopped. No payment is approved and no saved card is shared.";
+    statusNode.textContent = "";
+    const steps = effect.agent_description.split(/(?<=[.!?])\s+(?=[A-Z])|\n+/u).filter(Boolean);
+    const instructions = el("details", {class: "agent-instructions", open: ""},
+      el("summary", {}, "Agent instructions · not verified by Bloom"),
+      el("ul", {}, ...steps.map(step => el("li", {}, step))));
+    reviewNode.replaceChildren(facts, instructions,
+      el("p", {class: "handoff-return"}, "When finished, click Done to return control to your agent."));
   } else if (effect.kind === "manual_checkout") {
     approve.textContent = "Open private view with passkey";
     document.getElementById("page-lede").textContent = "Payment facts could not be verified. Open the private view to finish yourself. No saved card will be released and no automated payment is approved.";
     reviewNode.replaceChildren(facts, el("h3", {}, "Described by agent — not verified"), el("p", {}, effect.agent_description));
   } else reviewNode.replaceChildren(facts);
   const expiry = el("p", {class: "expiry"});
-  reviewNode.append(expiry);
+  if (handoff) reviewNode.prepend(expiry);
+  else reviewNode.append(expiry);
   startExpiry(session, expiry);
 }
 
@@ -1369,7 +1395,9 @@ async function load() {
     genericInput.placeholder =
       '{"namespace_id":"...","grant":{...},"authority_signature":"..."}';
   }
-  approve.disabled = false;
+  const expiresAt = Number(session.expires_at_ms ||
+    session.signer_contribution?.expires_at_ms || session.review_manifest?.expires_at_ms);
+  approve.disabled = Number.isFinite(expiresAt) && expiresAt <= Date.now();
   approve.onclick = () => run(session).catch(reportApprovalFailure);
   cancel.onclick = async () => {
     cancel.disabled = true;

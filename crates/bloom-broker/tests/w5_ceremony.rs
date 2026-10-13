@@ -805,6 +805,25 @@ cryptoSelfTest().then(
 }
 
 #[test]
+fn browser_handoff_preserves_instructions_and_disables_expired_requests() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new("node")
+        .arg(root.join("tests/browser_handoff.cjs"))
+        .arg(root.join("src/ceremony_assets/app.js"))
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "browser-handoff-ok"
+    );
+}
+
+#[test]
 fn custody_manifest_is_rendered_on_the_primary_review_surface() {
     let asset = include_str!("../src/ceremony_assets/app.js");
     let executable = asset
