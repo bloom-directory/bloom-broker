@@ -886,6 +886,7 @@ async fn serve_remote_tls_reconciled(
                         (worker_key, hostname.clone(), installation_id)
                     {
                         let material_config = config.clone();
+                        let material_ceremony = ceremony.clone();
                         let worker = tokio::spawn(async move {
                             let mut fast_rounds = FAST_CERTIFICATE_ROUNDS;
                             loop {
@@ -899,15 +900,42 @@ async fn serve_remote_tls_reconciled(
                                     tracing::warn!(event = "broker.acme_account_pending", %error);
                                 }
                                 if desired_remote {
-                                    if let Err(error) =
-                                        remote_material::maintain_scoped_credentials(
-                                            &material_config,
-                                            id,
-                                            broker_uid,
-                                        )
-                                        .await
+                                    match remote_material::maintain_scoped_credentials(
+                                        &material_config,
+                                        id,
+                                        broker_uid,
+                                    )
+                                    .await
                                     {
-                                        tracing::warn!(event = "broker.remote_credential_maintenance_pending", %error);
+                                        Ok(()) => {
+                                            if material_ceremony
+                                                .set_remote_credentials_rejected(false)
+                                            {
+                                                tracing::info!(
+                                                    event = "broker.remote_credentials_restored"
+                                                );
+                                            }
+                                        }
+                                        // Past the relay's renewal grace (or revoked): retrying
+                                        // cannot help, so report it once and keep the tunnel
+                                        // down until the Signer administrator re-provisions.
+                                        Err(error)
+                                            if remote_material::credentials_rejected(&error) =>
+                                        {
+                                            if !material_ceremony
+                                                .set_remote_credentials_rejected(true)
+                                            {
+                                                tracing::error!(
+                                                    event = "broker.remote_credentials_expired",
+                                                    %error,
+                                                    repair = "sudo bloom-signer admin provision --login-uid <uid>",
+                                                    "relay refuses to renew the scoped credentials; remote ceremonies are off until the Signer administrator re-provisions"
+                                                );
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::warn!(event = "broker.remote_credential_maintenance_pending", %error);
+                                        }
                                     }
                                     let certificate = remote_material::maintain_certificate(
                                         &material_config,
@@ -938,7 +966,10 @@ async fn serve_remote_tls_reconciled(
                         .is_ok()
                 });
                 let material_digest = remote_material_digest(&config).ok();
+                // A tunnel with rejected credentials would only be refused
+                // every few seconds; wait for re-provisioning instead.
                 let can_run = desired_remote
+                    && !ceremony.remote_credentials_rejected()
                     && hostname.is_some()
                     && installation_id.is_some()
                     && material_ready

@@ -103,6 +103,11 @@ pub enum CeremonyExposureMode {
 #[serde(rename_all = "snake_case")]
 pub enum CeremonyExposureStage {
     Unprovisioned,
+    /// Broker's scoped relay credentials expired and the relay refuses to
+    /// renew them (past its renewal grace, or revoked). Remote ceremonies stay
+    /// off until the Signer administrator re-provisions (`bloom-signer admin
+    /// provision`), which keeps the same hostname.
+    CredentialsExpired,
     CertificatePending,
     RoutingPending,
     Enabled,

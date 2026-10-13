@@ -49,7 +49,10 @@ use std::{
     future::{Future, IntoFuture},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
     path::Path as FsPath,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -719,6 +722,9 @@ struct BrokerInner {
     journal: Option<Arc<BrokerJournal>>,
     manifest_signer: Option<(Token, SigningKey)>,
     completion_observer: Mutex<Option<Arc<dyn CeremonyCompletionObserver>>>,
+    /// Set while the relay refuses to renew Broker's scoped credentials; see
+    /// [`CeremonyExposureStage::CredentialsExpired`].
+    remote_credentials_rejected: AtomicBool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1183,6 +1189,15 @@ impl CeremonyBroker {
                     // keeping its existing local ceremony entrypoints usable.
                     return Ok(local);
                 }
+                if self.remote_credentials_rejected() {
+                    // A hosted link would never load: the tunnel is down until
+                    // re-provisioning. Like any assigned outage, this does not
+                    // silently fall back to localhost.
+                    return Err(protocol(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "hosted ceremony surface is off: the relay refused to renew Broker's credentials; run `sudo bloom-signer admin provision`, or explicitly select local",
+                    ));
+                }
                 if status.desired_mode != ExposureMode::RemoteEnabled
                     || status.effective_mode != ExposureMode::RemoteEnabled
                     || status.desired_revision != status.effective_revision
@@ -1205,6 +1220,20 @@ impl CeremonyBroker {
                 })
             }
         }
+    }
+
+    /// Records whether the relay refuses to renew Broker's scoped credentials.
+    /// Returns the previous value, so a caller can report only the change.
+    pub fn set_remote_credentials_rejected(&self, rejected: bool) -> bool {
+        self.inner
+            .remote_credentials_rejected
+            .swap(rejected, Ordering::SeqCst)
+    }
+
+    pub fn remote_credentials_rejected(&self) -> bool {
+        self.inner
+            .remote_credentials_rejected
+            .load(Ordering::SeqCst)
     }
 
     pub fn exposure_status(&self) -> Result<CeremonyExposureStatus, ProtocolError> {
@@ -1236,6 +1265,8 @@ impl CeremonyBroker {
             }
         } else if remote.is_none() {
             CeremonyExposureStage::Unprovisioned
+        } else if self.remote_credentials_rejected() {
+            CeremonyExposureStage::CredentialsExpired
         } else if !status.remote_tls_ready {
             CeremonyExposureStage::CertificatePending
         } else if !status.remote_routing_ready {
@@ -1323,6 +1354,7 @@ impl CeremonyBroker {
                 journal,
                 manifest_signer,
                 completion_observer: Mutex::new(None),
+                remote_credentials_rejected: AtomicBool::new(false),
             }),
         }
     }

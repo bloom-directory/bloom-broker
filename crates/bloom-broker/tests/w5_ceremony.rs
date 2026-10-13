@@ -5834,6 +5834,60 @@ async fn remote_fragment_is_single_use_and_cookie_is_ceremony_scoped() {
 }
 
 #[test]
+fn rejected_relay_credentials_report_their_stage_and_never_hand_out_a_dead_link() {
+    use bloom_broker_api::{CeremonyExposureStage, CeremonySurfaceSelection};
+    let broker = CeremonyBroker::new(Arc::new(MockSigner::with_remote_surface()));
+    assert_eq!(
+        broker.exposure_status().unwrap().stage,
+        CeremonyExposureStage::Enabled
+    );
+    assert!(!broker.set_remote_credentials_rejected(true));
+    assert!(
+        broker.set_remote_credentials_rejected(true),
+        "reports the previous value"
+    );
+    assert_eq!(
+        broker.exposure_status().unwrap().stage,
+        CeremonyExposureStage::CredentialsExpired
+    );
+    for selection in [
+        CeremonySurfaceSelection::Default,
+        CeremonySurfaceSelection::Remote,
+    ] {
+        let error = broker.select_surface(selection).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+        assert!(
+            error.message.contains("bloom-signer admin provision"),
+            "{}",
+            error.message
+        );
+    }
+    assert_eq!(
+        broker
+            .select_surface(CeremonySurfaceSelection::Local)
+            .unwrap()
+            .identity
+            .surface_id
+            .as_str(),
+        "local"
+    );
+    // Re-provisioning restores the hosted surface on the next renewal round.
+    assert!(broker.set_remote_credentials_rejected(false));
+    assert_eq!(
+        broker.exposure_status().unwrap().stage,
+        CeremonyExposureStage::Enabled
+    );
+
+    // An owner who chose localhost-only still sees that choice.
+    let local_only = CeremonyBroker::new(Arc::new(MockSigner::with_remote_disabled()));
+    local_only.set_remote_credentials_rejected(true);
+    assert_eq!(
+        local_only.exposure_status().unwrap().stage,
+        CeremonyExposureStage::LocalhostOnly
+    );
+}
+
+#[test]
 fn assigned_remote_outage_never_silently_changes_default_to_local() {
     let pending = CeremonyBroker::new(Arc::new(MockSigner::with_remote_unassigned()));
     assert_eq!(

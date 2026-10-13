@@ -124,6 +124,44 @@ impl std::fmt::Display for RelayNotReady {
 
 impl std::error::Error for RelayNotReady {}
 
+/// The relay refused to renew a scoped credential that has already expired
+/// here: it is past the relay's renewal grace (or was revoked), so no retry can
+/// succeed. Re-provisioning through the Signer administrator replaces it,
+/// because Signer re-issues any credential that is expired or close to it.
+#[derive(Debug)]
+pub(super) struct CredentialsExpired;
+
+impl std::fmt::Display for CredentialsExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "relay refused to renew an expired scoped credential; re-provision with `sudo bloom-signer admin provision`",
+        )
+    }
+}
+
+impl std::error::Error for CredentialsExpired {}
+
+pub(super) fn credentials_rejected(error: &Failure) -> bool {
+    error.downcast_ref::<CredentialsExpired>().is_some()
+}
+
+/// A renewal refusal means the credentials need re-provisioning only once the
+/// local credential has expired: Signer leaves an unexpired one in place, so a
+/// revoked-but-unexpired credential keeps reporting the plain refusal until
+/// then.
+fn renewal_failure(
+    error: bloom_relay_client::ClientError,
+    expires_at_ms: u64,
+    now_ms: u64,
+) -> Failure {
+    match error {
+        bloom_relay_client::ClientError::Refused(401) if expires_at_ms <= now_ms => {
+            Box::new(CredentialsExpired)
+        }
+        other => Box::new(other),
+    }
+}
+
 pub(super) fn relay_not_ready(error: &Failure) -> bool {
     error.downcast_ref::<RelayNotReady>().is_some()
 }
@@ -311,7 +349,8 @@ async fn renew_scope(
             pending.new_token.clone(),
             pending.operation_id,
         )
-        .await?;
+        .await
+        .map_err(|error| renewal_failure(error, metadata.expires_at_ms, now_ms().unwrap_or(0)))?;
         pending.receipt = Some(receipt);
         atomic_private(&pending_path, &serde_json::to_vec(&pending)?)?;
     }
@@ -949,6 +988,36 @@ mod tests {
         assert!(!relay_not_ready(&later_conflict));
         assert!(!relay_not_ready(&unauthorized));
         assert!(!relay_not_ready(&acme));
+    }
+
+    #[test]
+    fn only_refusing_an_expired_credential_means_re_provisioning() {
+        use bloom_relay_client::ClientError;
+        let expired = renewal_failure(ClientError::Refused(401), 1_000, 1_000);
+        assert!(credentials_rejected(&expired));
+        assert!(expired.to_string().contains("bloom-signer admin provision"));
+        // Revoked but not yet expired here: Signer would keep it, so
+        // re-provisioning cannot help yet.
+        assert!(!credentials_rejected(&renewal_failure(
+            ClientError::Refused(401),
+            1_001,
+            1_000
+        )));
+        assert!(!credentials_rejected(&renewal_failure(
+            ClientError::Refused(409),
+            1_000,
+            1_000
+        )));
+        assert!(!credentials_rejected(&renewal_failure(
+            ClientError::Transport,
+            1_000,
+            1_000
+        )));
+        let unauthorized: Failure = Box::new(ClientError::Refused(401));
+        assert!(
+            !credentials_rejected(&unauthorized),
+            "only the renewal path classifies"
+        );
     }
 
     #[test]
