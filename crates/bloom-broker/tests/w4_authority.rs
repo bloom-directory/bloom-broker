@@ -2,9 +2,9 @@ use bloom_broker::{
     assurance_verifiers::SolanaSystemTransferVerifier,
     authority::{
         AssuranceRegistry, AssuranceVerifier, AuthorizationInput, BrokerAuthority,
-        CanonicalWalletPolicy, CeremonyApprovalGrant, EpochReconciliation, PolicyAsset,
-        PolicyDestination, ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject,
-        VerifierCapability, canonical_policy_authority_diff,
+        CanonicalWalletPolicy, CeremonyApprovalGrant, EpochReconciliation, FrozenReview,
+        PolicyAsset, PolicyDestination, ProvenanceOperationClass, ProvenanceRecord,
+        ProvenanceSubject, VerifierCapability, canonical_policy_authority_diff,
     },
     journal::{AuditSigner, BrokerJournal},
 };
@@ -292,6 +292,7 @@ impl Harness {
 
     fn policy_snapshot(&self, version: u64) -> SignedPolicySnapshot {
         let policy = CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: self.wallet.clone(),
             maximum_approval_lifetime_ms: 100_000,
             allowed_petal_packages: vec![digest(9)],
@@ -424,7 +425,12 @@ impl Harness {
             Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(claim).unwrap()).into());
         let approval_id = self
             .authority
-            .prepare_approval_with_claim(terms, &review, Some(&claim_digest))
+            .prepare_approval_with_claim(
+                terms,
+                &review,
+                Some(&claim_digest),
+                &FrozenReview::legacy(),
+            )
             .unwrap();
         let grant = self.signed_grant(terms, approval_id, operation(3));
         self.authority.activate_approval(&grant, 1_500).unwrap();
@@ -893,6 +899,43 @@ fn initial_policy_adoption_requires_outer_receipt_and_does_not_poison_key_pin() 
         .authority
         .adopt_custody_receipt(&receipt, 1_000)
         .unwrap();
+}
+
+#[test]
+fn lineage_only_petal_record_loads_but_cannot_prepare_approval() {
+    let harness = Harness::new();
+    let mut record = harness.provenance();
+    record.subject = ProvenanceSubject::Petal {
+        package_hash: digest(9),
+        route: "__lineage__".into(),
+    };
+    record.operation_classes.clear();
+    record.installer_signature = Base64UrlBytes::from_bytes(&[]);
+    sign_zeroed(
+        &mut record,
+        |value| &mut value.installer_signature,
+        PROVENANCE_DOMAIN,
+        &harness.installer_key,
+    );
+    let catalog = ProvenanceCatalog {
+        schema: PROVENANCE_CATALOG_SCHEMA.into(),
+        records: vec![record.clone()],
+    };
+    catalog.validate_shape().unwrap();
+    harness
+        .authority
+        .synchronize_provenance_catalog(&catalog)
+        .expect("lineage-only catalog record loads");
+    harness
+        .authority
+        .install_provenance(&record)
+        .expect("single-record install also accepts lineage-only metadata");
+    let terms = petal_terms(&harness, &record);
+    let error = harness
+        .authority
+        .prepare_approval(&terms, &digest(7))
+        .expect_err("no operation class may be approved");
+    assert!(error_code(error).contains("PROVENANCE_INVALID"));
 }
 
 #[test]
@@ -2596,6 +2639,7 @@ fn initial_policy_snapshot(
         allowed_petal_packages: Vec::new(),
         allowed_destinations: Vec::new(),
         required_verifiers: Vec::new(),
+        clear_signing: None,
     };
     let canonical = serde_jcs::to_vec(&policy).unwrap();
     let mut snapshot = SignedPolicySnapshot {
