@@ -3,6 +3,7 @@
 mod approval;
 mod ceremony;
 mod claims;
+mod clear_signing;
 mod codec;
 mod crypto;
 mod error;
@@ -20,6 +21,7 @@ mod wallet_account;
 pub use approval::*;
 pub use ceremony::*;
 pub use claims::*;
+pub use clear_signing::*;
 pub use codec::*;
 pub use crypto::*;
 pub use error::*;
