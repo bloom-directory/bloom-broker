@@ -1425,6 +1425,17 @@ async function run(session) {
   }
 }
 
+function browserResultAad(session, contribution) {
+  // Completed pre-surface receipts retain their original encrypted AAD.
+  return {
+    ...(contribution.surface ? {surface: contribution.surface} : {}),
+    ceremony_id: contribution.ceremony_id,
+    ceremony_kind: contribution.ceremony_kind,
+    custody_operation_id: contribution.custody_operation_id,
+    public_binding_digest: session.challenges[0].binding.exact_terms_digest,
+    signer_contribution_digest: session.challenges[0].binding.signer_contribution_digest
+  };
+}
 async function finishBrowserResult(session, result) {
   approvalTerminal = true;
   approve.disabled = true;
@@ -1436,16 +1447,7 @@ async function finishBrowserResult(session, result) {
   approve.hidden = true;
   if (result.encrypted_browser_result) {
     if (!outputRecipient) throw new Error("Browser output key is unavailable");
-    const outputAad = canonicalJson({
-      // Completed pre-surface receipts retain their original encrypted AAD.
-      ...(contribution.surface ? {surface: contribution.surface} : {}),
-      ceremony_id: contribution.ceremony_id,
-      ceremony_kind: contribution.ceremony_kind,
-      custody_operation_id: contribution.custody_operation_id,
-      public_binding_digest: session.challenges[0].binding.exact_terms_digest,
-      signer_contribution_digest:
-        session.challenges[0].binding.signer_contribution_digest
-    });
+    const outputAad = canonicalJson(browserResultAad(session, contribution));
     const plaintext = await hpkeOpen(
       outputRecipient,
       te.encode("bloom-custody-output/v1"),
