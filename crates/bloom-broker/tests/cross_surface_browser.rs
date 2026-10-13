@@ -250,12 +250,7 @@ fn ceremony_asset_has_no_public_recovery_initiation() {
 #[test]
 fn launch_failures_show_one_neutral_page_and_hide_all_stale_controls() {
     let html = include_str!("../src/ceremony_assets/index.html");
-    for id in [
-        "ceremony-page",
-        "ceremony-panel",
-        "ceremony-eyebrow",
-        "ceremony-trust",
-    ] {
+    for id in ["ceremony-page", "ceremony-panel", "panel-title", "status"] {
         assert!(html.contains(&format!("id=\"{id}\"")));
     }
     let output = run_browser(
@@ -264,10 +259,12 @@ const assert = require("node:assert/strict");
 const nodes = new Map();
 const pageClasses = new Set();
 const node = id => {
-  if (!nodes.has(id)) nodes.set(id, {hidden:false, textContent:"", classList:{add: name => pageClasses.add(name)}});
+  if (!nodes.has(id)) nodes.set(id, {hidden:false, textContent:"", attributes:{},
+    setAttribute(name, value) { this.attributes[name] = value; },
+    classList:{add: name => pageClasses.add(name)}});
   return nodes.get(id);
 };
-globalThis.document = {getElementById: node, querySelectorAll: () => inputs};
+globalThis.document = {getElementById: node, querySelector: node, querySelectorAll: () => inputs};
 const inputs = [{value:"wallet-secret"}, {value:"recovery-secret"}];
 const stored = new Map([["bloom.ceremony.remote-session.v1", "saved-session"]]);
 globalThis.sessionStorage = {getItem: key => stored.get(key), removeItem: key => stored.delete(key)};
@@ -287,18 +284,23 @@ for (const message of ["expired wallet alpha", "already used operation beta", "n
   for (const fields of [recoveryFields, exportFields, importFields, genericFields]) fields.hidden = false;
   for (const input of inputs) input.value = "stale-secret";
   statusNode.textContent = "wallet alpha operation beta";
+  node("page-title").textContent = "Wallet alpha";
+  node("panel-title").attributes["data-action"] = "send";
   reportLoadFailure(new Error(message));
   results.push({
-    title: node("page-title").textContent,
-    lede: node("page-lede").textContent,
-    panelHidden: node("ceremony-panel").hidden,
-    eyebrowHidden: node("ceremony-eyebrow").hidden,
-    trustHidden: node("ceremony-trust").hidden,
+    title: node("panel-title").textContent,
+    message: statusNode.textContent,
+    context: node("page-lede").textContent,
+    staleTitleCleared: node("page-title").textContent === "",
+    actionStyleCleared: node("panel-title").attributes["data-action"] === "",
+    panelKept: !node("ceremony-panel").hidden,
+    actionsHidden: node(".ceremony-actions").hidden && node("action-expiry").hidden &&
+      node("review-deadline").hidden && node("preview-banner").hidden,
+    kickerHidden: node("panel-kicker").hidden,
     pageClass: pageClasses.has("link-unavailable"),
     actionsDisabled: approve.disabled && cancel.disabled && approve.onclick === null && cancel.onclick === null,
     fieldsHidden: [recoveryFields, exportFields, importFields, genericFields].every(field => field.hidden),
     inputsCleared: inputs.every(input => input.value === ""),
-    statusCleared: statusNode.textContent === "",
     pairingStopped: crossSurfaceState === null && capability[0] === 0,
     outputRetained: outputRecipient === retainedOutput,
     sessionRetained: stored.get("bloom.ceremony.remote-session.v1") === "saved-session",
@@ -308,7 +310,8 @@ for (const message of ["expired wallet alpha", "already used operation beta", "n
 assert.deepEqual(results[0], results[1]);
 assert.deepEqual(results[1], results[2]);
 assert.equal(results[0].title, "This link couldn’t be opened");
-assert.equal(results[0].lede, "It may have expired or already been used. Generate a new link in Bloom, or ask your agent to generate one.");
+assert.equal(results[0].message, "It may have expired or already been used. Generate a new link in Bloom, or ask your agent to generate one.");
+assert.equal(results[0].context, "Link unavailable");
 for (const [key, value] of Object.entries(results[0])) {
   if (typeof value === "boolean") assert.equal(value, true, key);
 }

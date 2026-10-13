@@ -510,4 +510,20 @@ mod artifact_digest_tests {
             "the published verifier artifact digest no longer matches its sources"
         );
     }
+
+    /// The same rule for the clear-signing verifier. A wallet pins this
+    /// digest in its policy, so parsing, an admitted format or a safety rule
+    /// cannot change while the identity the owner approved stays put.
+    ///
+    /// When this fails after a deliberate change, recompute with
+    /// `cargo test -p bloom-evm-clear-signing artifact_digest_is_reproducible -- --nocapture`
+    /// and update the constant in the same change.
+    #[test]
+    fn published_clear_signing_digest_matches_its_sources() {
+        assert_eq!(
+            bloom_evm_clear_signing::artifact::compute(),
+            bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES,
+            "the published clear-signing verifier digest no longer matches its sources"
+        );
+    }
 }
