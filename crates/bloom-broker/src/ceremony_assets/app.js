@@ -2254,6 +2254,9 @@ async function load() {
       cancel.hidden = true;
       approve.hidden = true;
     } catch (error) {
+      // An expiry that landed while cancelling stays terminal: its message
+      // stands and no control comes back.
+      if (approvalTerminal) return;
       cancel.disabled = false;
       approve.disabled = false;
       reportCeremonyError(error, "Cancellation failed. Please try again.");
