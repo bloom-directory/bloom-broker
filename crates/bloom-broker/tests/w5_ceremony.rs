@@ -3443,6 +3443,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         MachineBrokerService::dispatch(
             &broker,
             MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 requested_review_mode: None,
                 evm_review_payloads: Vec::new(),
                 safe_review_payloads: envelope
