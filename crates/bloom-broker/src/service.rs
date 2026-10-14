@@ -251,11 +251,19 @@ impl BrokerRpcService {
                 }
                 Ok(Response::SealedApprovalList(statuses))
             }
-            Request::SealedApprovalLimitState(request) => Ok(Response::SealedApprovalLimitState(
-                self.journal
+            Request::SealedApprovalLimitState(request) => {
+                let mut state = self
+                    .journal
                     .approval_limit_state(&request.id)
-                    .map_err(journal_error)?,
-            )),
+                    .map_err(journal_error)?;
+                if let Ok(clock) = self.clock.observe(true) {
+                    state.session_budget_state = self
+                        .journal
+                        .session_budget_state(&request.id, clock.effective_now_ms)
+                        .map_err(journal_error)?;
+                }
+                Ok(Response::SealedApprovalLimitState(state))
+            }
             Request::SealedApprovalRevoke(request) => {
                 self.authority
                     .revoke_local_approval(&request.approval_id)
@@ -847,7 +855,13 @@ impl BrokerRpcService {
         let mut context = ReviewManifestContext::default();
         let native_evm =
             crate::evm_review::subject_is_native_evm_transaction(&request.terms.subject);
-        if native_evm && request.evm_review_payloads.is_empty() {
+        if native_evm
+            && request.evm_review_payloads.is_empty()
+            && !matches!(
+                request.terms.selector,
+                bloom_broker_api::ApprovalSelector::SystemSession { .. }
+            )
+        {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::SelectorMismatch,
                 "native EVM approval requires full review payloads; upgrade Bloom Machine",
@@ -904,7 +918,9 @@ impl BrokerRpcService {
                 ordered_payload_digests,
                 ordered_hashes,
             } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
-            ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
+            ApprovalSelector::Petal { .. } | ApprovalSelector::SystemSession { .. } => {
+                (Vec::new(), Vec::new())
+            }
         };
         let ceremony_request = bloom_signer_api::CeremonyPrepareRequest {
             surface: self
@@ -1170,7 +1186,37 @@ impl BrokerRpcService {
             .ok_or_else(|| {
                 ProtocolError::new(ProtocolErrorCode::ApprovalNotFound, "approval not found")
             })?;
-        let trusted_time_required = !terms.limits.operation_rate_limits.is_empty()
+        if terms.session_budget.is_some()
+            || matches!(terms.selector, ApprovalSelector::SystemSession { .. })
+        {
+            if let Some(stored) = self
+                .journal
+                .operation(&request.operation_id)
+                .map_err(journal_error)?
+            {
+                if let Some(result) = stored.result {
+                    let digest = self
+                        .authority
+                        .request_operation_digest(&request)
+                        .map_err(authority_error)?;
+                    if stored.is_batch != is_batch
+                        || stored.operation_digest != digest
+                        || request.operation_digest != digest
+                    {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::OperationIdConflict,
+                            "session replay changed immutable signing identity",
+                        ));
+                    }
+                    return Ok(result);
+                }
+            }
+        }
+        let trusted_time_required = terms
+            .session_budget
+            .as_ref()
+            .is_some_and(bloom_broker_api::SessionBudget::requires_trusted_time)
+            || !terms.limits.operation_rate_limits.is_empty()
             || !terms.limits.signature_rate_limits.is_empty()
             || terms
                 .limits
@@ -1273,6 +1319,9 @@ impl BrokerRpcService {
             signature_count: DecimalU64::new(signature_count as u64),
             petal_use_claim_digest: claim_digest,
             claim_assurance_digest: assurance_digest,
+            session_accounting: decision
+                .session_accounting
+                .map(crate::translation::approval::mirror),
             policy_version: terms.policy_version,
             policy_digest: terms.policy_digest,
             validation_receipt_digest,
@@ -2612,6 +2661,7 @@ mod tests {
             not_before_ms: DecimalU64::new(10),
             expires_at_ms: DecimalU64::new(20),
             renewal_of: None,
+            session_budget: None,
         };
         for class in [
             "transaction.confirm",

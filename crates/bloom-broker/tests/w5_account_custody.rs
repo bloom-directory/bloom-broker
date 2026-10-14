@@ -1899,6 +1899,7 @@ fn sign_terms(
         not_before_ms: DecimalU64::new(now_plus(0) - 1_000),
         expires_at_ms: DecimalU64::new(now_plus(600)),
         renewal_of: None,
+        session_budget: None,
     }
 }
 
@@ -1989,6 +1990,7 @@ async fn approve_and_sign(
     let sign_operation = stack.next_operation();
     let payload_hash = Digest32::from_bytes(Sha256::digest(payload).into());
     let identity = bloom_signer_api::SignOperationIdentity {
+        session_accounting_digest: None,
         operation_id: sign_operation.clone(),
         approval_id: terms.approval_id().unwrap(),
         key_ref: bloom_signer_api::KeyRef {
@@ -2032,6 +2034,7 @@ async fn approve_and_sign(
         policy_digest: terms.policy_digest.clone(),
     };
     let sign_request = MachineSignRequest {
+        session_use: None,
         operation_id: sign_operation,
         operation_digest: identity.digest().unwrap(),
         approval_id: terms.approval_id().unwrap(),

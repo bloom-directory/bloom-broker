@@ -68,6 +68,8 @@ struct MachineSignOperationIdentity {
     ordered_hashes: Vec<Digest32>,
     petal_use_claim_digest: Option<Digest32>,
     claim_assurance_digest: Option<Digest32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_accounting_digest: Option<Digest32>,
     policy_version: bloom_broker_api::DecimalU64,
     policy_digest: Digest32,
 }
@@ -282,6 +284,7 @@ pub struct AuthorizationDecision {
     pub reserved_values: BTreeMap<String, bloom_broker_api::DecimalU256>,
     pub effective_assurance: Option<ClaimAssurance>,
     pub reservation_ids: Vec<Digest32>,
+    pub session_accounting: Option<bloom_broker_api::SessionAccounting>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1534,7 +1537,7 @@ impl BrokerAuthority {
         // otherwise.
         let scope_bound = match terms.selector {
             ApprovalSelector::Exact { .. } => false,
-            ApprovalSelector::Petal { .. } => true,
+            ApprovalSelector::Petal { .. } | ApprovalSelector::SystemSession { .. } => true,
         };
         let outlives_scope = scope_bound && terms.expires_at_ms.get() > expires_at_ms;
         if !identity_matches
@@ -1571,6 +1574,12 @@ impl BrokerAuthority {
             _ => unreachable!("identity_matches requires a Petal subject"),
         };
         match &terms.selector {
+            ApprovalSelector::SystemSession { .. } => {
+                return Err(denied(
+                    "SELECTOR_MISMATCH",
+                    "native sessions cannot use Petal-scoped keys",
+                ));
+            }
             ApprovalSelector::Exact { .. } => {
                 self.validate_scoped_route_lineage(&scope, package_hash, route, &[])?;
             }
@@ -2365,7 +2374,7 @@ impl BrokerAuthority {
                     required_claim_assurance,
                     ..
                 } => Some(required_claim_assurance),
-                ApprovalSelector::Exact { .. } => None,
+                ApprovalSelector::Exact { .. } | ApprovalSelector::SystemSession { .. } => None,
             },
             ceremony_url: None,
             ceremony_expires_at_ms: None,
@@ -2565,7 +2574,7 @@ impl BrokerAuthority {
         // later stays stopped until this check is changed to say otherwise.
         let automation = match terms.selector {
             ApprovalSelector::Exact { .. } => false,
-            ApprovalSelector::Petal { .. } => true,
+            ApprovalSelector::Petal { .. } | ApprovalSelector::SystemSession { .. } => true,
         };
         if !automation {
             return Ok(());
@@ -2752,6 +2761,105 @@ impl BrokerAuthority {
         self.local_epoch(wallet_id)
     }
 
+    /// Recompute identity from actual request bytes before returning a stored
+    /// result. This supplies no authority to produce a new signature.
+    pub fn request_operation_digest(
+        &self,
+        request: &MachineSignRequest,
+    ) -> Result<Digest32, AuthorityError> {
+        request
+            .payloads
+            .validate()
+            .map_err(|e| denied("OPERATION_IDENTITY_INVALID", e.to_string()))?;
+        let terms = self
+            .approval_terms(&request.approval_id)?
+            .ok_or_else(|| denied("APPROVAL_NOT_FOUND", "approval is missing"))?;
+        let provenance_matches = match (
+            &terms.subject,
+            &request.provenance,
+            request.petal_use_claim.as_ref(),
+        ) {
+            (
+                ApprovalSubject::Petal { package_hash, .. },
+                ProvenanceSubject::Petal {
+                    package_hash: actual,
+                    route,
+                },
+                Some(claim),
+            ) => package_hash == actual && actual == &claim.package_hash && route == &claim.route,
+            (_, actual, None) => subject_for(&terms.subject) == *actual,
+            _ => false,
+        };
+        if !provenance_matches {
+            return Err(denied(
+                "PROVENANCE_MISMATCH",
+                "replayed request changed its producing authority",
+            ));
+        }
+        let payloads = payload_bytes(&request.payloads);
+        let claim_digest = request
+            .petal_use_claim
+            .as_ref()
+            .map(jcs_digest)
+            .transpose()?
+            .or(request
+                .system_use_claim
+                .as_ref()
+                .map(jcs_digest)
+                .transpose()?);
+        let assurance_digest = request
+            .petal_use_claim
+            .as_ref()
+            .map(|c| jcs_digest(&c.claim_assurance))
+            .transpose()?
+            .or(request
+                .system_use_claim
+                .as_ref()
+                .map(|c| jcs_digest(&c.claim_assurance))
+                .transpose()?);
+        let accounting = if let Some(use_) = &request.session_use {
+            Some(
+                use_.accounting(terms.session_budget.as_ref())
+                    .map_err(|e| denied("SYSTEM_CLAIM_MISMATCH", e.to_string()))?,
+            )
+        } else if terms.session_budget.is_some() {
+            Some(
+                bloom_broker_api::SessionAccounting::from_petal_claim(
+                    request
+                        .petal_use_claim
+                        .as_ref()
+                        .ok_or_else(|| denied("SELECTOR_MISMATCH", "session claim is missing"))?,
+                    terms.session_budget.as_ref(),
+                )
+                .map_err(|e| denied("SYSTEM_CLAIM_MISMATCH", e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        MachineSignOperationIdentity {
+            operation_id: request.operation_id.clone(),
+            approval_id: request.approval_id.clone(),
+            key_ref: request.key_ref.clone(),
+            crypto_suite: request.crypto_suite,
+            ordered_payload_digests: payloads
+                .iter()
+                .map(|p| Digest32::from_bytes(Sha256::digest(p).into()))
+                .collect(),
+            ordered_hashes: payloads
+                .iter()
+                .map(|p| suite_hash(request.crypto_suite, p))
+                .collect(),
+            petal_use_claim_digest: claim_digest,
+            claim_assurance_digest: assurance_digest,
+            session_accounting_digest: accounting
+                .as_ref()
+                .map(bloom_broker_api::SessionAccounting::digest),
+            policy_version: terms.policy_version,
+            policy_digest: terms.policy_digest,
+        }
+        .digest()
+    }
+
     pub fn authorize(
         &self,
         input: &AuthorizationInput,
@@ -2889,11 +2997,155 @@ impl BrokerAuthority {
                 "current provenance differs from the frozen approval record",
             ));
         }
+        if input.request.session_use.is_some()
+            && !matches!(terms.selector, ApprovalSelector::SystemSession { .. })
+        {
+            return Err(denied(
+                "SELECTOR_MISMATCH",
+                "non-session approval cannot accept typed session claims",
+            ));
+        }
+        if terms.session_budget.is_some()
+            && input.request.petal_use_claim.as_ref().is_some_and(|c| {
+                c.declared_debits.is_empty()
+                    || c.declared_debits.iter().all(|d| d.amount.as_str() == "0")
+            })
+        {
+            return Err(denied(
+                "VALUE_ASSET_NOT_ALLOWED",
+                "monetary Petal session requires a positive declared debit",
+            ));
+        }
         let (values, assurance, fee_asset) = match (
             &terms.selector,
             &input.request.petal_use_claim,
             &input.request.system_use_claim,
         ) {
+            (ApprovalSelector::SystemSession { scope }, None, system_claim) => {
+                let use_ = input.request.session_use.as_ref().ok_or_else(|| {
+                    denied(
+                        "SELECTOR_MISMATCH",
+                        "typed session requires semantic transfer projection",
+                    )
+                })?;
+                scope
+                    .validate_use(use_)
+                    .map_err(|e| denied("SELECTOR_MISMATCH", e.to_string()))?;
+                if payloads.len() != 1 || ordered_hashes.len() != 1 {
+                    return Err(denied(
+                        "SELECTOR_MISMATCH",
+                        "typed session authorizes one transfer per operation",
+                    ));
+                }
+                match &use_.chain {
+                    bloom_broker_api::SystemSessionChain::Evm { .. } => {
+                        if system_claim.is_some() {
+                            return Err(denied(
+                                "SELECTOR_MISMATCH",
+                                "EVM sessions cannot carry a Solana claim",
+                            ));
+                        }
+                        crate::system_session::verify_evm(
+                            &payloads[0],
+                            input.request.crypto_suite,
+                            use_,
+                        )
+                        .map_err(|e| denied("SYSTEM_CLAIM_MISMATCH", e.to_string()))?;
+                    }
+                    bloom_broker_api::SystemSessionChain::Solana {
+                        chain,
+                        genesis_hash,
+                    } => {
+                        let claim = system_claim.as_ref().ok_or_else(|| {
+                            denied(
+                                "ASSURANCE_EVIDENCE_REQUIRED",
+                                "Solana session requires compiled-verifier evidence",
+                            )
+                        })?;
+                        if use_.action != bloom_broker_api::SystemSessionAction::NativeTransfer
+                            || claim.chain_context.genesis_hash != *genesis_hash
+                        {
+                            return Err(denied(
+                                "SYSTEM_CLAIM_MISMATCH",
+                                "Solana session cluster or action mismatch",
+                            ));
+                        }
+                        let classes: Vec<_> = current_provenance
+                            .operation_classes
+                            .iter()
+                            .map(|c| c.operation_class.clone())
+                            .collect();
+                        self.validate_system_claim(
+                            &terms,
+                            &policy,
+                            input,
+                            claim,
+                            &scope.component_id,
+                            &claim.action_class,
+                            &classes,
+                            &payloads,
+                            &ordered_hashes,
+                            &payload_digests,
+                        )?;
+                        let declared = claim
+                            .declared_debits
+                            .iter()
+                            .find(|d| d.asset.chain == *chain && d.asset.asset == "native");
+                        if claim.declared_debits.len() != 1
+                            || declared.is_none_or(|d| d.amount != use_.amount)
+                            || claim.declared_destinations.len() != 1
+                            || claim.declared_destinations[0].destination != use_.recipient
+                            || !matches!(&claim.declared_fee,DeclaredFee::Fee{chain:fee_chain,asset,amount} if fee_chain==chain && asset=="native" && amount==&use_.maximum_fee)
+                        {
+                            return Err(denied(
+                                "SYSTEM_CLAIM_MISMATCH",
+                                "Solana session projection changed reviewed economics",
+                            ));
+                        }
+                    }
+                }
+                if !policy.allowed_destinations.iter().any(|d| {
+                    &d.chain == use_.chain.chain()
+                        && match use_.chain {
+                            bloom_broker_api::SystemSessionChain::Evm { .. } => {
+                                d.destination.eq_ignore_ascii_case(&use_.recipient)
+                            }
+                            bloom_broker_api::SystemSessionChain::Solana { .. } => {
+                                d.destination == use_.recipient
+                            }
+                        }
+                }) {
+                    return Err(denied(
+                        "DESTINATION_NOT_ALLOWED",
+                        "session destination is outside current wallet policy",
+                    ));
+                }
+                let accounting = use_
+                    .accounting(terms.session_budget.as_ref())
+                    .map_err(|e| denied("VALUE_ASSET_NOT_ALLOWED", e.to_string()))?;
+                let allowed: BTreeSet<_> = terms
+                    .limits
+                    .value_limits
+                    .iter()
+                    .map(|l| asset_id(l.asset.chain.as_str(), &l.asset.asset))
+                    .collect();
+                let mut values = BTreeMap::new();
+                for v in accounting.values {
+                    let id = asset_id(v.asset.chain.as_str(), &v.asset.asset);
+                    if !allowed.contains(&id) {
+                        return Err(denied(
+                            "VALUE_ASSET_NOT_ALLOWED",
+                            "native session asset is absent from approval limits",
+                        ));
+                    }
+                    values.insert(id, v.amount);
+                }
+                (
+                    values,
+                    system_claim.as_ref().map(|c| c.claim_assurance.clone()),
+                    Some(asset_id(use_.chain.chain().as_str(), "native")),
+                )
+            }
             (
                 ApprovalSelector::Exact {
                     ordered_payload_digests,
@@ -3083,6 +3335,27 @@ impl BrokerAuthority {
                 "signing claim differs from the claim committed by the reviewed approval manifest",
             ));
         }
+        let session_accounting = if let Some(use_) = &input.request.session_use {
+            Some(
+                use_.accounting(terms.session_budget.as_ref())
+                    .map_err(|e| denied("SYSTEM_CLAIM_MISMATCH", e.to_string()))?,
+            )
+        } else if terms.session_budget.is_some() {
+            Some(
+                bloom_broker_api::SessionAccounting::from_petal_claim(
+                    input.request.petal_use_claim.as_ref().ok_or_else(|| {
+                        denied(
+                            "SELECTOR_MISMATCH",
+                            "shared budget requires an accounted typed/Petal use",
+                        )
+                    })?,
+                    terms.session_budget.as_ref(),
+                )
+                .map_err(|e| denied("VALUE_ASSET_NOT_ALLOWED", e.to_string()))?,
+            )
+        } else {
+            None
+        };
         let operation_digest = MachineSignOperationIdentity {
             operation_id: input.request.operation_id.clone(),
             approval_id: input.request.approval_id.clone(),
@@ -3092,6 +3365,9 @@ impl BrokerAuthority {
             ordered_hashes: ordered_hashes.clone(),
             petal_use_claim_digest: claim_digest,
             claim_assurance_digest: assurance_digest,
+            session_accounting_digest: session_accounting
+                .as_ref()
+                .map(bloom_broker_api::SessionAccounting::digest),
             policy_version: terms.policy_version.clone(),
             policy_digest: terms.policy_digest.clone(),
         }
@@ -3149,6 +3425,7 @@ impl BrokerAuthority {
             reserved_values: values,
             effective_assurance: assurance,
             reservation_ids: vec![reservation_id],
+            session_accounting,
         })
     }
 

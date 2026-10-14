@@ -645,6 +645,7 @@ pub(crate) mod tests {
                 not_before_ms: DecimalU64::new(10),
                 expires_at_ms: DecimalU64::new(20),
                 renewal_of: None,
+                session_budget: None,
             },
         }
     }

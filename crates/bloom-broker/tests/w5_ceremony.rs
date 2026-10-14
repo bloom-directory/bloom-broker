@@ -1259,6 +1259,7 @@ fn petal_sign_request(
         policy_digest: terms.policy_digest.clone(),
     };
     MachineSignRequest {
+        session_use: None,
         operation_id,
         operation_digest: identity.digest(),
         approval_id: terms.approval_id().unwrap(),
@@ -1298,6 +1299,7 @@ fn exact_petal_sign_request(
         policy_digest: terms.policy_digest.clone(),
     };
     MachineSignRequest {
+        session_use: None,
         operation_id,
         operation_digest: identity.digest(),
         approval_id: terms.approval_id().unwrap(),
@@ -1354,6 +1356,7 @@ fn approval_request() -> CeremonyPrepareRequest {
         not_before_ms: DecimalU64::new(1_000),
         expires_at_ms: DecimalU64::new(u64::MAX - 1),
         renewal_of: None,
+        session_budget: None,
     };
     CeremonyPrepareRequest {
         surface: bloom_signer_api::legacy_local_surface(),
@@ -3307,6 +3310,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         not_before_ms: DecimalU64::new(approval_now_ms),
         expires_at_ms: DecimalU64::new(approval_expires_at_ms),
         renewal_of: None,
+        session_budget: None,
     };
     // A native EVM review reads the creation opt-in from the policy the terms
     // are bound to: terms naming another policy are refused before review.
@@ -4526,6 +4530,213 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .await
         .is_err()
     );
+
+    // A new owner-reviewed group on the ordinary account shares one
+    // collateral budget across independent grants. Two distinct actions under
+    // the first grant need no intervening ceremony; another grant cannot get
+    // a second copy of the advertised cap. Everything is disposable/local.
+    {
+        use bloom_broker_api::{
+            SessionAssetScale, SessionBudget, SessionNominalLimits, SessionValueCeiling,
+            ValueWindow,
+        };
+        let now: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap();
+        let n = |v: &str| DecimalU256::parse(v).unwrap();
+        let collateral = AssetId {
+            chain: Token::new("polygon").unwrap(),
+            asset: "pusd".into(),
+        };
+        let group_limits = ApprovalLimits {
+            max_operations: DecimalU64::new(10),
+            max_signatures: DecimalU64::new(10),
+            operation_rate_limits: vec![],
+            signature_rate_limits: vec![],
+            value_limits: vec![bloom_broker_api::ValueLimit {
+                asset: collateral.clone(),
+                lifetime: n("3000000"),
+                rolling_windows: vec![],
+            }],
+        };
+        let budget = SessionBudget {
+            wallet_id: wallet_id.clone(),
+            policy_version: committed.committed.version.clone(),
+            policy_digest: committed.committed.policy_digest.clone(),
+            wallet_revocation_epoch: DecimalU64::new(authority.wallet_epoch(&wallet_id).unwrap()),
+            member_keys: vec![parent_key.clone()],
+            limits: group_limits,
+            nominal_asset_scales: vec![SessionAssetScale {
+                asset: collateral.clone(),
+                units_per_nominal_unit: n("1000000"),
+            }],
+            nominal_limits: SessionNominalLimits {
+                per_action: n("2000000"),
+                lifetime: n("3000000"),
+                rolling_windows: vec![ValueWindow {
+                    maximum: n("3000000"),
+                    duration_ms: DecimalU64::new(86400000),
+                }],
+            },
+            per_action_value_limits: vec![SessionValueCeiling {
+                asset: collateral.clone(),
+                maximum: n("2000000"),
+            }],
+            not_before_ms: DecimalU64::new(now),
+            expires_at_ms: DecimalU64::new(now + 60000),
+        };
+        let mut grant = approval_terms.clone();
+        grant.key_ref = parent_key.clone();
+        grant.subject = ApprovalSubject::Petal {
+            package_hash: petal_package.clone(),
+            route: petal_route.into(),
+            agent_id: None,
+        };
+        grant.not_before_ms = DecimalU64::new(now);
+        grant.issued_at_ms = DecimalU64::new(now);
+        grant.expires_at_ms = DecimalU64::new(now + 60000);
+        grant.request_nonce = RequestNonce::from_bytes([0xaa; 16]);
+        grant.session_budget = Some(budget.clone());
+        grant.limits.max_operations = DecimalU64::new(8);
+        grant.limits.max_signatures = DecimalU64::new(8);
+        grant.limits.value_limits = vec![bloom_broker_api::ValueLimit {
+            asset: collateral.clone(),
+            lifetime: n("10000000"),
+            rolling_windows: vec![],
+        }];
+        let mut other = grant.clone();
+        other.request_nonce = RequestNonce::from_bytes([0xab; 16]);
+        for (terms, id, count) in [(&grant, operation("aa"), 50), (&other, operation("ab"), 51)] {
+            let prepared = prepare_scoped_approval(&restarted_scoped_broker, terms, id.clone())
+                .await
+                .unwrap();
+            let (status, body) = complete_scoped_ceremony(
+                &restarted_scoped_broker,
+                &authenticator,
+                terms,
+                &prepared,
+                &id,
+                &key_to_signer(&parent_key),
+                count,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        }
+        let signed_request =
+            |terms: &SealedApprovalTerms, id: &str, payload: &[u8], quantity: &str| {
+                let mut request = petal_sign_request(
+                    terms,
+                    operation(id),
+                    petal_package.clone(),
+                    petal_route,
+                    payload,
+                );
+                request.petal_use_claim.as_mut().unwrap().declared_debits = vec![DeclaredDebit {
+                    asset: collateral.clone(),
+                    amount: n(quantity),
+                }];
+                request.operation_digest = authority.request_operation_digest(&request).unwrap();
+                request
+            };
+        let first = signed_request(&grant, "ac", b"group action one", "1000000");
+        let first_result = match MachineBrokerService::dispatch(
+            &restarted_scoped_broker,
+            MachineBrokerRequest::SigningSign(first.clone()),
+        )
+        .await
+        .unwrap()
+        {
+            MachineBrokerResponse::SigningSign(result) => result,
+            response => panic!("{response:?}"),
+        };
+        let second = signed_request(&grant, "ad", b"group action two", "1000000");
+        let second_result = match MachineBrokerService::dispatch(
+            &restarted_scoped_broker,
+            MachineBrokerRequest::SigningSign(second),
+        )
+        .await
+        .unwrap()
+        {
+            MachineBrokerResponse::SigningSign(result) => result,
+            response => panic!("{response:?}"),
+        };
+        assert_ne!(first_result.signatures, second_result.signatures);
+        assert_eq!(
+            restarted_scoped_broker.ceremony().status(&operation("aa")),
+            Some(CeremonyState::Completed)
+        );
+        let before = journal
+            .session_budget_state(&grant.approval_id().unwrap(), now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.operations.get(), 2);
+        assert_eq!(before.nominal_used, n("2000000"));
+        let replay = match MachineBrokerService::dispatch(
+            &restarted_scoped_broker,
+            MachineBrokerRequest::SigningSign(first.clone()),
+        )
+        .await
+        .unwrap()
+        {
+            MachineBrokerResponse::SigningSign(result) => result,
+            response => panic!("{response:?}"),
+        };
+        assert_eq!(replay, first_result);
+        let after = journal
+            .session_budget_state(&grant.approval_id().unwrap(), now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before, after, "retry must not reserve or spend twice");
+        let mut mutated = first.clone();
+        mutated.payloads = SigningPayloads::Single {
+            payload: Base64UrlBytes::from_bytes(b"different replay bytes"),
+        };
+        assert!(
+            MachineBrokerService::dispatch(
+                &restarted_scoped_broker,
+                MachineBrokerRequest::SigningSign(mutated)
+            )
+            .await
+            .is_err()
+        );
+        let too_much = signed_request(&other, "ae", b"different child grant action", "2000000");
+        assert!(
+            MachineBrokerService::dispatch(
+                &restarted_scoped_broker,
+                MachineBrokerRequest::SigningSign(too_much)
+            )
+            .await
+            .is_err(),
+            "second grant must share the first grant's spent budget"
+        );
+        MachineBrokerService::dispatch(
+            &restarted_scoped_broker,
+            MachineBrokerRequest::SealedApprovalRevoke(RevokeRequest {
+                operation_id: operation("af"),
+                approval_id: grant.approval_id().unwrap(),
+                wallet_id: wallet_id.clone(),
+                reason: "end disposable session".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            MachineBrokerService::dispatch(
+                &restarted_scoped_broker,
+                MachineBrokerRequest::SigningSign(signed_request(
+                    &grant,
+                    "b0",
+                    b"after group grant revoke",
+                    "1"
+                ))
+            )
+            .await
+            .is_err()
+        );
+    }
 
     let now_after_scope_ms: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9726,4 +9937,34 @@ fn run_node(script: &str) -> std::process::Output {
         .expect("node stdin writer")
         .expect("write node script");
     output
+}
+
+#[test]
+fn key_scope_and_grouped_session_review_helpers_execute_without_scope_errors() {
+    let source = include_str!("../src/ceremony_assets/app.js");
+    let start = source.find("const PETAL_ACTIONS").unwrap();
+    let end = source[start..].find("// Policy updates:").unwrap() + start;
+    let functions = &source[start..end];
+    let script = format!(
+        r#"
+const fmtRemaining = value => String(value);
+const canonicalJson = value => JSON.stringify(value);
+{functions}
+const key=describePetalScope({{allowed_operation_classes:["polymarket.order"],maximum_lifetime_ms:"60000",package_hash:"abc"}});
+if (!key || !key.facts.some(f=>f[0]==="Session lasts")) throw new Error("key-scope review failed");
+const budget={{nominal_limits:{{per_action:"2000000",lifetime:"10000000",rolling_windows:[{{maximum:"5000000",duration_ms:"86400000"}}]}},nominal_asset_scales:[{{asset:{{chain:"polygon",asset:"pusd"}},units_per_nominal_unit:"1000000"}}],limits:{{value_limits:[]}},member_keys:[{{public_key_fingerprint:"def"}}]}};
+const terms={{subject:{{package_hash:"abc"}},selector:{{kind:"petal",package_hash:"abc",allowed_operation_classes:["polymarket.order"]}},limits:{{max_operations:"10"}},session_budget:budget,not_before_ms:"1000",expires_at_ms:"61000",activation_mode:{{kind:"boot_bound"}}}};
+const session=describePetalApproval({{canonical_plan:JSON.stringify({{terms,session_budget_id:"budget-identity",asset_amounts:[]}})}});
+const facts=JSON.stringify(session.facts);
+for (const needle of ["budget-identity","Per action","Rolling cap","Covered assets","pusd","Expires","Activation","nominal"]) {{if (!facts.includes(needle))throw new Error("session review omitted "+needle);}}
+process.stdout.write("session-review-ok");
+"#
+    );
+    let output = run_node(&script);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "session-review-ok");
 }

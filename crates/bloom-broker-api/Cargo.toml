@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+num-bigint = "0.4"
 bloom-rpc-wire.workspace = true
 serde.workspace = true
 serde_jcs.workspace = true

@@ -4992,6 +4992,8 @@ fn canonical_review_plan(
         schema: &'static str,
         asset_amounts: Vec<AssetAmountReview>,
         terms: &'a bloom_signer_api::SealedApprovalTerms,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_budget_id: Option<Digest32>,
         exact_ordered_payload_digests: &'a [Digest32],
         exact_ordered_hashes: &'a [Digest32],
         replacement_approval_id: &'a Option<Digest32>,
@@ -5102,6 +5104,13 @@ fn canonical_review_plan(
         schema: "bloom-review-plan/v1",
         asset_amounts,
         terms: &request.terms,
+        session_budget_id: request
+            .terms
+            .session_budget
+            .as_ref()
+            .map(bloom_signer_api::SessionBudget::budget_id)
+            .transpose()
+            .map_err(malformed)?,
         exact_ordered_payload_digests: &request.exact_ordered_payload_digests,
         exact_ordered_hashes: &request.exact_ordered_hashes,
         replacement_approval_id: &request.replacement_approval_id,
@@ -5119,6 +5128,30 @@ fn review_disclosures(
     evm_review: Option<&crate::evm_review::EvmReview>,
 ) -> Vec<String> {
     let mut disclosures = Vec::new();
+    if let Some(budget) = &request.terms.session_budget {
+        disclosures.push(format!("Shared session budget {}: per action {} nominal micro-units, lifetime {} nominal micro-units. Every approved member shares the same counters. Conversion scales are owner-reviewed collateral conventions, not independently verified USD prices.", budget.budget_id().map(|id|id.to_string()).unwrap_or_else(|_|"invalid".into()),budget.nominal_limits.per_action.as_str(),budget.nominal_limits.lifetime.as_str()));
+        for scale in &budget.nominal_asset_scales {
+            disclosures.push(format!(
+                "Covered collateral: {} on {}, {} raw units per nominal unit.",
+                scale.asset.asset,
+                scale.asset.chain.as_str(),
+                scale.units_per_nominal_unit.as_str()
+            ));
+        }
+        for window in &budget.nominal_limits.rolling_windows {
+            disclosures.push(format!(
+                "Shared rolling ceiling: {} nominal micro-units per {} milliseconds.",
+                window.maximum.as_str(),
+                window.duration_ms.get()
+            ));
+        }
+    }
+    if matches!(
+        request.terms.selector,
+        bloom_signer_api::ApprovalSelector::SystemSession { .. }
+    ) {
+        disclosures.push("Matching distinct typed transfers can sign without another owner ceremony until the session expires, is revoked, changes policy, or exhausts a shared limit. Broker verifies the complete transfer preimage; arbitrary calldata and token allowances are excluded.".into());
+    }
     if evm_review.is_none()
         && (!request.exact_ordered_payload_digests.is_empty()
             || !request.exact_ordered_hashes.is_empty())

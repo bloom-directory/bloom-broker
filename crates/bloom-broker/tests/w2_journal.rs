@@ -219,6 +219,7 @@ fn request(value: u8) -> UnsignedSignRequest {
         }),
     };
     let identity = SignOperationIdentity {
+        session_accounting_digest: None,
         operation_id: operation_id.clone(),
         approval_id: digest("22"),
         key_ref: key_ref.clone(),
@@ -231,6 +232,7 @@ fn request(value: u8) -> UnsignedSignRequest {
         policy_digest: digest("66"),
     };
     let mut request = UnsignedSignRequest {
+        session_accounting: None,
         schema: Token::new("bloom.sign-request/1").unwrap(),
         attempt_id: Digest32::new(format!("{value:02x}").repeat(32)).unwrap(),
         operation_id,

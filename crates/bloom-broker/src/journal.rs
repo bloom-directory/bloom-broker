@@ -480,6 +480,7 @@ impl BrokerJournal {
                 UNIQUE (parent_operation_id, ordinal),
                 UNIQUE (child_operation_id)
             );
+            CREATE TABLE IF NOT EXISTS session_uses (approval_id TEXT NOT NULL, operation_id TEXT NOT NULL, budget_id TEXT NOT NULL, record_jcs TEXT NOT NULL, PRIMARY KEY(approval_id,operation_id));
             CREATE TABLE IF NOT EXISTS reservations (
                 approval_id TEXT NOT NULL,
                 operation_id TEXT NOT NULL,
@@ -1109,7 +1110,44 @@ impl BrokerJournal {
             committed_signatures: DecimalU64::new(committed_signatures),
             reserved_signatures: DecimalU64::new(reserved_signatures),
             quarantined_signatures: DecimalU64::new(quarantined_signatures),
+            session_budget_state: None,
         })
+    }
+
+    pub fn session_budget_state(
+        &self,
+        approval_id: &Digest32,
+        now: u64,
+    ) -> Result<Option<bloom_broker_api::SessionBudgetState>, JournalError> {
+        let connection = self.lock()?;
+        let terms: Option<String> = connection
+            .query_row(
+                "SELECT terms_jcs FROM approval_metadata WHERE approval_id=?1",
+                [approval_id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(terms) = terms else {
+            return Ok(None);
+        };
+        let terms: SealedApprovalTerms = serde_json::from_str(&terms).map_err(storage)?;
+        let Some(budget) = terms.session_budget else {
+            return Ok(None);
+        };
+        let id = budget.budget_id().map_err(JournalError::Protocol)?;
+        let mut statement=connection.prepare("SELECT session_uses.record_jcs FROM session_uses JOIN reservations USING(approval_id,operation_id) WHERE session_uses.budget_id=?1 AND reservations.state!='RELEASED'")?;
+        let rows = statement.query_map([id.as_str()], |r| r.get::<_, String>(0))?;
+        let mut previous = Vec::new();
+        for row in rows {
+            previous.push(
+                serde_json::from_str::<bloom_broker_api::SessionRecordedUse>(&row?)
+                    .map_err(storage)?,
+            );
+        }
+        budget
+            .usage_state(&previous, now)
+            .map(Some)
+            .map_err(JournalError::Protocol)
     }
 
     pub fn begin_sign_attempt(
@@ -1622,6 +1660,7 @@ impl BrokerJournal {
             )
             .into());
         }
+        reserve_session_budget(&transaction, request)?;
         validate_rate_limits(&transaction, request, limits)?;
         validate_value_limits(&transaction, request, limits)?;
         validate_rolling_value_limits(&transaction, request, limits)?;
@@ -3537,4 +3576,65 @@ fn valid_operation_transition(current: OperationState, next: OperationState) -> 
             State::Succeeded | State::Failed | State::Quarantined
         )
     )
+}
+
+fn reserve_session_budget(
+    transaction: &Transaction<'_>,
+    request: &ReservationRequest,
+) -> Result<(), JournalError> {
+    use bloom_broker_api::{SessionAssetAmount, SessionRecordedUse};
+    let terms: Option<String> = transaction
+        .query_row(
+            "SELECT terms_jcs FROM approval_metadata WHERE approval_id=?1",
+            [request.approval_id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(terms) = terms else {
+        return Ok(());
+    };
+    let terms: SealedApprovalTerms = serde_json::from_str(&terms).map_err(storage)?;
+    let Some(budget) = &terms.session_budget else {
+        return Ok(());
+    };
+    let id = budget.budget_id().map_err(JournalError::Protocol)?;
+    let previous = {
+        let mut statement=transaction.prepare("SELECT session_uses.record_jcs FROM session_uses JOIN reservations USING(approval_id,operation_id) WHERE session_uses.budget_id=?1 AND reservations.state!='RELEASED'")?;
+        let rows = statement.query_map([id.as_str()], |r| r.get::<_, String>(0))?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(serde_json::from_str::<SessionRecordedUse>(&row?).map_err(storage)?);
+        }
+        records
+    };
+    let values = request
+        .values
+        .iter()
+        .map(|(name, amount)| {
+            let asset = budget
+                .per_action_value_limits
+                .iter()
+                .find(|v| format!("{}:{}", v.asset.chain.as_str(), v.asset.asset) == *name)
+                .ok_or_else(|| {
+                    JournalError::Protocol(protocol(
+                        ProtocolErrorCode::LimitExceededValue,
+                        "asset is outside the shared session budget",
+                    ))
+                })?;
+            Ok(SessionAssetAmount {
+                asset: asset.asset.clone(),
+                amount: amount.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, JournalError>>()?;
+    let current = SessionRecordedUse {
+        accepted_at_ms: request.reserved_at_ms,
+        signature_count: request.signature_count,
+        values,
+    };
+    budget
+        .check_reservation(&previous, &current)
+        .map_err(JournalError::Protocol)?;
+    transaction.execute("INSERT INTO session_uses(approval_id,operation_id,budget_id,record_jcs) VALUES(?1,?2,?3,?4)",params![request.approval_id.as_str(),request.operation_id.as_str(),id.as_str(),serde_jcs::to_string(&current).map_err(storage)?])?;
+    Ok(())
 }

@@ -275,6 +275,7 @@ impl Harness {
             expires_at_ms: DecimalU64::new(NOW_MS + 50_000),
             not_before_ms: DecimalU64::new(NOW_MS - 10),
             renewal_of: None,
+            session_budget: None,
         }
     }
 
@@ -331,6 +332,7 @@ impl Harness {
         let mut input = AuthorizationInput {
             expected_signer_public_key: None,
             request: MachineSignRequest {
+                session_use: None,
                 operation_id: operation_id.clone(),
                 operation_digest: Digest32::from_bytes([0; 32]),
                 approval_id: terms.approval_id().unwrap(),
@@ -350,6 +352,7 @@ impl Harness {
             clock_boot_epoch: BootEpoch::from_bytes([1; 16]),
         };
         input.request.operation_digest = SignOperationIdentity {
+            session_accounting_digest: None,
             operation_id,
             approval_id,
             key_ref: terms.key_ref.clone(),
