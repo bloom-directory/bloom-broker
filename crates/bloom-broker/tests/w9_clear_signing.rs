@@ -352,7 +352,6 @@ impl Harness {
             clock_boot_epoch: BootEpoch::from_bytes([1; 16]),
         };
         input.request.operation_digest = SignOperationIdentity {
-            session_accounting_digest: None,
             operation_id,
             approval_id,
             key_ref: terms.key_ref.clone(),

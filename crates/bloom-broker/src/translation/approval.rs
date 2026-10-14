@@ -165,6 +165,11 @@ pub(crate) fn validated_terms_to_signer(
     }
 }
 
+pub(crate) fn mirror<T: serde::Serialize, U: serde::de::DeserializeOwned>(value: T) -> U {
+    serde_json::from_value(serde_json::to_value(value).expect("closed API type serializes"))
+        .expect("session API mirrors have identical wire fields")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,9 +347,4 @@ mod tests {
         terms.limits.max_signatures = north::DecimalU64::new(1);
         assert!(terms.validate().is_ok());
     }
-}
-
-pub(crate) fn mirror<T: serde::Serialize, U: serde::de::DeserializeOwned>(value: T) -> U {
-    serde_json::from_value(serde_json::to_value(value).expect("closed API type serializes"))
-        .expect("session API mirrors have identical wire fields")
 }
