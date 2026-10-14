@@ -2852,7 +2852,7 @@ mod tests {
     }
 
     #[test]
-    fn matched_previous_and_current_service_packages_are_compatible_on_the_frozen_wire() {
+    fn matched_build_generations_use_the_current_authority_wire() {
         let mut previous_broker = readiness("bloom-broker", 0x81, ReadinessState::Ready);
         previous_broker.service_version = "0.1.0".into();
         let mut previous_signer = readiness("bloom-signer", 0x81, ReadinessState::Ready);
@@ -2876,7 +2876,7 @@ mod tests {
         assert_ne!(previous_broker.build_digest, current_broker.build_digest);
         assert_eq!(
             bloom_signer_api::SIGNER_API_CURRENT,
-            bloom_broker_api::ProtocolVersion::new(1, 6)
+            bloom_broker_api::ProtocolVersion::new(1, 7)
         );
         validate_signer_readiness(&previous_broker, &previous_signer).unwrap();
         validate_signer_readiness(&current_broker, &current_signer).unwrap();
