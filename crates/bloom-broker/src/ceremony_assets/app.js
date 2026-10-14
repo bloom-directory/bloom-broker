@@ -734,7 +734,9 @@ function describePetalApproval(manifest) {
     ? `Up to ${naturalList(ceilings)} in total across the whole session, counting fees and any funds sent back to your wallet`
     : "None — Bloom will refuse any action that spends funds or pays a fee";
   return {
-    sentence: `Authorize repeated <strong>${app}</strong> actions within the scope and shared budgets below until this approval expires. No funds move in this step, and your main wallet key stays inside Bloom.`,
+    sentence: budget
+      ? `Authorize repeated <strong>${app}</strong> actions within the scope and shared budgets below until this approval expires. No funds move in this step, and your main wallet key stays inside Bloom.`
+      : `Finish setting up a temporary <strong>${app}</strong> session. It can sign only the actions listed below until the timer expires. No funds move in this step, and your main wallet key stays inside Bloom.`,
     facts: [
       ["App", app],
       ["Package", packageHash, true],
