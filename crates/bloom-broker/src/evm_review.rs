@@ -333,82 +333,22 @@ fn apply_review_mode(
         return Ok(());
     };
     settings.validate()?;
-    if requested == Some(ReviewMode::OpaqueExact) {
-        if !settings.opaque_exact_allowed {
-            return Err(denied(
-                ReviewReason::PolicyDenied,
-                "wallet policy does not allow approving payloads Bloom cannot explain",
-            ));
-        }
-        // Opaque is for calls Bloom cannot read. A call it can read keeps its
-        // reading and its refusals: the requester cannot opt out of them.
-        let catalog = context
-            .catalog
-            .as_ref()
-            .filter(|catalog| catalog.check_validity(context.now_ms).is_ok());
-        for (payload, call) in review.payloads.iter().zip(calls) {
-            let (Some(catalog), Some(call)) = (catalog, call) else {
-                continue;
-            };
-            match review_call(
-                catalog,
-                &CallContext {
-                    chain_id: call.chain_id,
-                    to: call.to,
-                    value: call.value,
-                    calldata: &call.calldata,
-                    native: native_units(&payload.chain),
-                    unlimited_allowance_allowed: settings.unlimited_allowance_allowed,
-                },
-            ) {
-                Err(error) if error.reason == ReviewReason::UnsupportedCall => {}
-                Err(error) => return Err(review_error(error)),
-                Ok(_) => {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::ClaimInvalid,
-                        "POLICY_DENIED: Bloom can read this call, so it cannot be approved unread; \
-                         request a clear-signed review",
-                    ));
-                }
-            }
-        }
-        return Ok(());
+    if requested == Some(ReviewMode::OpaqueExact) && !settings.opaque_exact_allowed {
+        return Err(denied(
+            ReviewReason::PolicyDenied,
+            "wallet policy does not allow approving payloads Bloom cannot explain",
+        ));
     }
     let mut entries: Vec<SelectedEntry> = Vec::new();
     for (payload, call) in review.payloads.iter_mut().zip(calls) {
         let Some(call) = call else { continue };
-        let catalog = context.catalog.as_ref().ok_or_else(|| {
-            denied(
-                ReviewReason::CatalogUnavailable,
-                "no accepted clear-signing catalog is loaded",
-            )
-        })?;
-        catalog
-            .check_validity(context.now_ms)
-            .map_err(review_error)?;
-        let (clear, selected) = review_call(
-            catalog,
-            &CallContext {
-                chain_id: call.chain_id,
-                to: call.to,
-                value: call.value,
-                calldata: &call.calldata,
-                native: native_units(&payload.chain),
-                unlimited_allowance_allowed: settings.unlimited_allowance_allowed,
-            },
-        )
-        .map_err(review_error)?;
-        // Every entry the reading depended on, including a token an argument
-        // named, is held to the same observation age.
+        let (clear, selected) = review_contract_call(call, policy, requested, context)?;
         for entry in selected {
-            entry
-                .check_observation_age(context.now_ms, settings.maximum_observation_age_ms)
-                .map_err(review_error)?;
             if !entries.contains(&entry) {
                 entries.push(entry);
             }
         }
-        payload.contract_call = Some(clear);
+        payload.contract_call = clear;
     }
     if let Some(catalog) = context.catalog.as_ref()
         && !entries.is_empty()
@@ -420,6 +360,73 @@ fn apply_review_mode(
         ));
     }
     Ok(())
+}
+
+/// Native and Safe calls spend the same catalog trust and wallet policy.
+/// An opaque request cannot bypass a readable call's policy refusals.
+pub(crate) fn review_contract_call(
+    call: &DecodedCall,
+    policy: &CanonicalWalletPolicy,
+    requested: Option<ReviewMode>,
+    context: &ClearSigningContext,
+) -> Result<(Option<ClearSignedCall>, Vec<SelectedEntry>), ProtocolError> {
+    let settings = policy.clear_signing.as_ref().ok_or_else(|| {
+        denied(
+            ReviewReason::PolicyDenied,
+            "clear signing is not enabled for this wallet",
+        )
+    })?;
+    let opaque = requested == Some(ReviewMode::OpaqueExact);
+    if opaque && !settings.opaque_exact_allowed {
+        return Err(denied(
+            ReviewReason::PolicyDenied,
+            "wallet policy does not allow approving payloads Bloom cannot explain",
+        ));
+    }
+    let catalog = context
+        .catalog
+        .as_ref()
+        .filter(|catalog| !opaque || catalog.check_validity(context.now_ms).is_ok());
+    let Some(catalog) = catalog else {
+        if opaque {
+            return Ok((None, Vec::new()));
+        }
+        return Err(denied(
+            ReviewReason::CatalogUnavailable,
+            "no accepted clear-signing catalog is loaded",
+        ));
+    };
+    catalog
+        .check_validity(context.now_ms)
+        .map_err(review_error)?;
+    let reviewed = review_call(
+        catalog,
+        &CallContext {
+            chain_id: call.chain_id,
+            to: call.to,
+            value: call.value,
+            calldata: &call.calldata,
+            native: native_units(&chain_name(call.chain_id)),
+            unlimited_allowance_allowed: settings.unlimited_allowance_allowed,
+        },
+    );
+    if opaque {
+        return match reviewed {
+            Err(error) if error.reason == ReviewReason::UnsupportedCall => Ok((None, Vec::new())),
+            Err(error) => Err(review_error(error)),
+            Ok(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "POLICY_DENIED: Bloom can read this call, so it cannot be approved unread; request a clear-signed review",
+            )),
+        };
+    }
+    let (clear, selected) = reviewed.map_err(review_error)?;
+    for entry in &selected {
+        entry
+            .check_observation_age(context.now_ms, settings.maximum_observation_age_ms)
+            .map_err(review_error)?;
+    }
+    Ok((Some(clear), selected))
 }
 
 fn native_units(chain: &str) -> Option<NativeUnits> {
@@ -1302,7 +1309,7 @@ pub(crate) mod tests {
 /// One mode for the whole batch, and what a clear-signed member looks like
 /// once the catalog is in play.
 #[cfg(test)]
-mod mode_tests {
+pub(super) mod mode_tests {
     use super::tests::*;
     use super::*;
     use alloy::primitives::U256;
@@ -1319,9 +1326,13 @@ mod mode_tests {
     const TRANSFER: &str = "transfer(address _to, uint256 _value)";
     const APPROVE: &str = "approve(address _spender, uint256 _value)";
 
-    fn accepted_catalog_at(observed_at_ms: u64) -> AcceptedCatalog {
+    pub(crate) fn accepted_catalog_at(observed_at_ms: u64) -> AcceptedCatalog {
+        accepted_catalog_on_chain(31337, observed_at_ms)
+    }
+
+    pub(crate) fn accepted_catalog_on_chain(chain_id: u64, observed_at_ms: u64) -> AcceptedCatalog {
         let descriptor = serde_json::json!({
-            "context": {"contract": {"deployments": [{"chainId": 31337, "address": TOKEN_ADDRESS}]}},
+            "context": {"contract": {"deployments": [{"chainId": chain_id, "address": TOKEN_ADDRESS}]}},
             "display": {"formats": {TRANSFER: {
                 "intent": "Send",
                 "fields": [
@@ -1345,7 +1356,7 @@ mod mode_tests {
             issued_at_ms: DecimalU64::new(NOW_MS - 1000),
             expires_at_ms: DecimalU64::new(NOW_MS + 86_400_000),
             entries: vec![CatalogEntry {
-                chain_id: DecimalU64::new(31337),
+                chain_id: DecimalU64::new(chain_id),
                 contract_address: TOKEN_ADDRESS.into(),
                 admitted_functions: vec![
                     AdmittedFunction {
@@ -1395,7 +1406,7 @@ mod mode_tests {
         accepted_catalog_at(NOW_MS - 500)
     }
 
-    fn enabled_context() -> ClearSigningContext {
+    pub(crate) fn enabled_context() -> ClearSigningContext {
         ClearSigningContext {
             catalog: Some(accepted_catalog()),
             verifier_digest: Digest32::from_bytes(

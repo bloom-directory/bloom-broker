@@ -2897,6 +2897,25 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .allowed_petal_packages
         .push(petal_package.clone());
     proposed_policy.allowed_petal_packages.push(digest("d5"));
+    proposed_policy.clear_signing = Some(bloom_broker_api::ClearSigningPolicy {
+        catalog_id: Token::new("safe-test-tokens").unwrap(),
+        trusted_keys: vec![bloom_broker_api::CatalogTrustedKey {
+            key_id: Token::new("safe-test-publisher").unwrap(),
+            verifying_key: Base64UrlBytes::from_bytes(
+                &SigningKey::from_bytes(&[5; 32]).verifying_key().to_bytes(),
+            ),
+        }],
+        signature_threshold: 1,
+        maximum_observation_age_ms: 86_400_000,
+        opaque_exact_allowed: false,
+        unlimited_allowance_allowed: false,
+        verifier: bloom_broker_api::RequiredVerifier {
+            verifier_id: Token::new(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_ID).unwrap(),
+            verifier_digest: Digest32::from_bytes(
+                bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES,
+            ),
+        },
+    });
     proposed_policy
         .allowed_destinations
         .push(PolicyDestination {
@@ -3568,6 +3587,15 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let mut valid: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
     valid["owner"] = serde_json::json!(owner.to_string());
     valid["owners"] = serde_json::json!([owner.to_string()]);
+    let token_contract = "0x1111111111111111111111111111111111111111";
+    let recipient = "0x2222222222222222222222222222222222222222";
+    let mut calldata = vec![0xa9, 0x05, 0x9c, 0xbb];
+    calldata.extend_from_slice(&[0; 12]);
+    calldata.extend_from_slice(&[0x22; 20]);
+    calldata.extend_from_slice(&alloy::primitives::U256::from(1_000_000).to_be_bytes::<32>());
+    valid["safe_tx"]["to"] = serde_json::json!(token_contract);
+    valid["safe_tx"]["value"] = serde_json::json!("0");
+    valid["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(&calldata)));
     let word = |n: u64| alloy::primitives::U256::from(n).to_be_bytes::<32>();
     let address_word = |address: &str| {
         let mut result = [0u8; 32];
@@ -3586,8 +3614,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     domain.extend_from_slice(&address_word(valid["safe_address"].as_str().unwrap()));
     let mut transaction = alloy::primitives::keccak256("SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)").to_vec();
     transaction.extend_from_slice(&address_word(valid["safe_tx"]["to"].as_str().unwrap()));
-    transaction.extend_from_slice(&word(7));
-    transaction.extend_from_slice(alloy::primitives::keccak256([]).as_slice());
+    transaction.extend_from_slice(&word(0));
+    transaction.extend_from_slice(alloy::primitives::keccak256(&calldata).as_slice());
     for _ in 0..6 {
         transaction.extend_from_slice(&word(0));
     }
@@ -3595,22 +3623,89 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let mut preimage = vec![0x19, 0x01];
     preimage.extend_from_slice(alloy::primitives::keccak256(domain).as_slice());
     preimage.extend_from_slice(alloy::primitives::keccak256(transaction).as_slice());
-    let response = safe_prepare(
-        SealedApprovalTerms {
-            selector: ApprovalSelector::Exact {
-                ordered_payload_digests: vec![Digest32::from_bytes(
-                    sha2::Sha256::digest(&preimage).into(),
-                )],
-                ordered_hashes: vec![Digest32::from_bytes(
-                    alloy::primitives::keccak256(&preimage).0,
-                )],
-            },
-            ..safe_terms
+    let catalog_terms = SealedApprovalTerms {
+        selector: ApprovalSelector::Exact {
+            ordered_payload_digests: vec![Digest32::from_bytes(
+                sha2::Sha256::digest(&preimage).into(),
+            )],
+            ordered_hashes: vec![Digest32::from_bytes(
+                alloy::primitives::keccak256(&preimage).0,
+            )],
         },
+        ..safe_terms
+    };
+    let missing_catalog = safe_prepare(
+        catalog_terms.clone(),
         Some(serde_jcs::to_vec(&valid).unwrap()),
     )
     .await
-    .unwrap();
+    .unwrap_err();
+    assert!(
+        missing_catalog.message.contains("CATALOG_UNAVAILABLE"),
+        "{missing_catalog:?}"
+    );
+    use bloom_evm_clear_signing::{
+        ActionClass, AdmittedFunction, CATALOG_SCHEMA, CATALOG_SIGNATURE_DOMAIN, CatalogEntry,
+        CatalogSignature, ClearSigningCatalog, TokenMetadata, descriptor_digest,
+    };
+    let signature = "transfer(address _to, uint256 _value)";
+    let descriptor = serde_json::json!({
+        "context": {"contract": {"deployments": [{"chainId": 31337, "address": token_contract}]}},
+        "display": {"formats": {signature: {
+            "intent": "Send", "fields": [
+                {"path": "_to", "label": "To", "format": "addressName", "visible": "always"},
+                {"path": "_value", "label": "Amount", "format": "tokenAmount", "params": {"tokenPath": "@.to"}, "visible": "always"}
+            ]
+        }}}
+    });
+    let catalog_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut catalog = ClearSigningCatalog {
+        schema: CATALOG_SCHEMA.into(),
+        catalog_id: Token::new("safe-test-tokens").unwrap(),
+        sequence: DecimalU64::new(1),
+        issued_at_ms: DecimalU64::new(catalog_now_ms - 1000),
+        expires_at_ms: DecimalU64::new(catalog_now_ms + 86_400_000),
+        entries: vec![CatalogEntry {
+            chain_id: DecimalU64::new(31337),
+            contract_address: token_contract.into(),
+            admitted_functions: vec![AdmittedFunction {
+                signature: signature.into(),
+                action_class: ActionClass::Transfer,
+            }],
+            descriptor_digest: Some(descriptor_digest(&descriptor).unwrap()),
+            flattened_descriptor: Some(descriptor),
+            runtime_code_hash: None,
+            token_metadata: Some(TokenMetadata {
+                decimals: 6,
+                symbol: "EXA".into(),
+                name: "Example Token".into(),
+            }),
+            upgradeable: false,
+            implementation_hash: None,
+            observed_at_ms: DecimalU64::new(catalog_now_ms - 500),
+        }],
+        signatures: Vec::new(),
+    };
+    let mut message = CATALOG_SIGNATURE_DOMAIN.to_vec();
+    message.extend(catalog.unsigned_canonical_bytes().unwrap());
+    catalog.signatures.push(CatalogSignature {
+        key_id: Token::new("safe-test-publisher").unwrap(),
+        signature: Base64UrlBytes::from_bytes(
+            &SigningKey::from_bytes(&[5; 32]).sign(&message).to_bytes(),
+        ),
+    });
+    authority
+        .install_clear_signing_catalog_for_enrolled_wallets(
+            &catalog,
+            serde_jcs::to_vec(&catalog).unwrap().len(),
+        )
+        .unwrap();
+    let response = safe_prepare(catalog_terms, Some(serde_jcs::to_vec(&valid).unwrap()))
+        .await
+        .unwrap();
     let response = match response {
         MachineBrokerResponse::SealedApprovalPrepare(response) => response,
         other => panic!("unexpected approval response: {other:?}"),
@@ -3635,6 +3730,11 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         serde_json::from_str(manifest["canonical_plan"].as_str().unwrap()).unwrap();
     assert_eq!(plan["safe_review"]["owner"], owner.to_string());
     assert_eq!(manifest["safe_review"], plan["safe_review"]);
+    let action = plan["safe_review"]["action"].to_string();
+    assert!(
+        action.contains("EXA") && action.contains(recipient),
+        "{action}"
+    );
     assert!(
         plan["security_disclosures"]
             .as_array()
