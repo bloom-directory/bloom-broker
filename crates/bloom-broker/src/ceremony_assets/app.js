@@ -11,6 +11,7 @@ const importFields = document.getElementById("import-fields");
 const mnemonicInput = document.getElementById("mnemonic-input");
 const rawKeyInput = document.getElementById("raw-key-input");
 const cardFields = document.getElementById("card-fields");
+const travelerFields = document.getElementById("traveler-fields");
 const cardCvcFields = document.getElementById("card-cvc-fields");
 const formError = document.getElementById("form-error");
 const panelTitle = document.getElementById("panel-title");
@@ -337,6 +338,25 @@ function renderCardReview(session) {
   approve.textContent = meta.button;
   const manifest = session.review_manifest;
   const effect = manifest.card_effect;
+  if (["save_traveler", "delete_traveler", "fill_traveler"].includes(effect.kind)) {
+    const saving = effect.kind === "save_traveler", filling = effect.kind === "fill_traveler";
+    document.getElementById("page-title").textContent = saving ? "Save a traveler" : filling ? "Autofill traveler details" : "Delete a traveler";
+    document.getElementById("page-lede").textContent = saving
+      ? "Enter details once, privately. Agents can see the label and which fields are saved, but not their values."
+      : filling ? "Share only these saved fields with this booking site. This does not authorize payment."
+      : "Remove this person's saved details from Bloom. Existing airline bookings are unaffected.";
+    approve.textContent = saving ? "Save with passkey" : filling ? "Autofill with passkey" : "Delete with passkey";
+    const facts = el("dl", {class:"facts"});
+    facts.append(el("dt",{},"Traveler"),el("dd",{},saving ? effect.label : (manifest.traveler?.label || effect.traveler_id)));
+    if (filling) {
+      facts.append(el("dt",{},"Website"),el("dd",{},effect.scope.origin),
+        el("dt",{},"Receiving frames"),el("dd",{},effect.scope.frame_origins.join(", ")),
+        el("dt",{},"Fields"),el("dd",{},effect.scope.fields.map(field=>field.replaceAll("_"," ")).join(", ")));
+    }
+    reviewNode.replaceChildren(facts);
+    const expiry=el("p",{class:"expiry"});reviewNode.append(expiry);startExpiry(session,expiry);
+    return;
+  }
   const handoff = effect.kind === "manual_checkout" && !effect.card_id;
   const page = document.getElementById("ceremony-page");
   page?.classList?.toggle("browser-handoff", handoff);
@@ -691,7 +711,19 @@ function setupCardFields() {
 }
 
 function cardFieldsInput(session) {
-  const ids = session.ceremony_kind === "card_add" ? ["card-number", "card-expiry", "card-name"]
+  if (session.review_manifest.card_effect.kind === "save_traveler") {
+    const traveler = {};
+    for (const field of travelerFields.querySelectorAll("input,select")) {
+      if (!field.checkValidity()) { field.reportValidity(); throw new CardFieldError("Check the traveler details."); }
+      let value = field.value.trim();
+      if (field.required && !value) {field.focus();throw new CardFieldError("Enter the name as on the travel document.");}
+      const key = field.id.slice("traveler-".length);
+      if (key === "nationality" || key === "document_country") value = value.toUpperCase();
+      if (value) traveler[key] = value;
+    }
+    return {traveler};
+  }
+  const ids = session.review_manifest.card_effect.kind === "add" ? ["card-number", "card-expiry", "card-name"]
     : session.review_manifest.card_effect.kind === "checkout" ? ["card-cvc"] : [];
   const results = Object.fromEntries(ids.map(id => [id, checkCardField(id)]));
   const invalid = ids.find(id => results[id].error);
@@ -699,7 +731,7 @@ function cardFieldsInput(session) {
     document.getElementById(invalid).focus();
     throw new CardFieldError("Fix the highlighted field to continue.");
   }
-  if (session.ceremony_kind === "card_add") {
+  if (session.review_manifest.card_effect.kind === "add") {
     const {month, year} = results["card-expiry"].value;
     return {card: {number: results["card-number"].value, expiry_month: month, expiry_year: year, name: results["card-name"].value}};
   }
@@ -709,7 +741,11 @@ function cardFieldsInput(session) {
 // After the passkey approves a card request, Signer has consumed the link.
 function reportCardFailure(session, error) {
   console.error("Bloom card ceremony failed", error);
-  const action = session.ceremony_kind === "card_add" ? "Card not saved"
+  const effect = session.review_manifest?.card_effect?.kind;
+  const action = effect === "save_traveler" ? "Traveler not saved"
+    : effect === "delete_traveler" ? "Traveler not deleted"
+    : effect === "fill_traveler" ? "Autofill not approved"
+    : session.ceremony_kind === "card_add" ? "Card not saved"
     : session.ceremony_kind === "card_delete" ? "Card not deleted" : "Not approved";
   const reason = error?.message === "invalid card details"
     ? "Signer rejected the card details." : (error?.message || "Signer refused the request.");
@@ -717,7 +753,7 @@ function reportCardFailure(session, error) {
   formError.textContent = `${action}. ${reason} This link is used up; ask your agent for a new one.`;
   formError.hidden = false;
   clearInterval(expiryTimer);
-  for (const node of [approve, cancel, cardFields, cardCvcFields]) node.hidden = true;
+  for (const node of [approve, cancel, cardFields, cardCvcFields, travelerFields]) node.hidden = true;
 }
 
 function reportApprovalFailure(error) {
@@ -1379,7 +1415,8 @@ async function load() {
   }
   statusNode.textContent = "Check the details, then continue with your passkey.";
   setupCardFields();
-  cardFields.hidden = session.ceremony_kind !== "card_add";
+  cardFields.hidden = session.review_manifest?.card_effect?.kind !== "add";
+  travelerFields.hidden = session.review_manifest?.card_effect?.kind !== "save_traveler";
   cardCvcFields.hidden = session.review_manifest?.card_effect?.kind !== "checkout";
   renderReview(session);
   recoveryFields.hidden = session.ceremony_kind !== "wallet_recovery";
@@ -1488,7 +1525,7 @@ async function run(session) {
     const input = {credential_prf: encodeUrl(prf), ...cardInput};
     secret = te.encode(canonicalJson(input));
     prf.fill(0);
-    for (const field of [...cardFields.querySelectorAll("input"), ...cardCvcFields.querySelectorAll("input")]) field.value = "";
+    for (const field of [...cardFields.querySelectorAll("input"), ...cardCvcFields.querySelectorAll("input"), ...travelerFields.querySelectorAll("input,select")]) field.value = "";
   } else if (kind === "wallet_registration" || (kind === "wallet_import" && !legacyPasskeyImport)) {
     const created = await createCredential(session, 0);
     const prf = await ensureNewCredentialPrf(session, created, 1);
@@ -1633,7 +1670,11 @@ async function finishBrowserResult(session, result) {
     const effect = session.review_manifest.card_effect;
     statusNode.textContent = effect.kind === "manual_checkout" ? (effect.card_id ? "Private view authorized. No saved card was released." : "Bloom's browser is yours. Click Done there to hand it back.") : effect.kind === "site_checkout" ? "Approved. Bloom is placing the order with your saved payment method; the outcome is reported by the shop." : session.ceremony_kind === "card_checkout" ? "Approved. Checkout is continuing; the outcome is reported by the merchant." : session.ceremony_kind === "card_add" ? "Card saved. You can close this page." : "Card deleted. You can close this page.";
     clearInterval(expiryTimer);
+    if (effect.kind === "save_traveler") statusNode.textContent = "Traveler saved privately. You can close this page.";
+    if (effect.kind === "delete_traveler") statusNode.textContent = "Traveler deleted. You can close this page.";
+    if (effect.kind === "fill_traveler") statusNode.textContent = "Approved. Bloom is filling these traveler fields privately. No payment was approved.";
     cardFields.hidden = true;
+    travelerFields.hidden = true;
     cardCvcFields.hidden = true;
     approve.hidden = true;
     cancel.hidden = true;

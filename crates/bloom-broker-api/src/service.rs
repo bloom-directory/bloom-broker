@@ -335,6 +335,12 @@ pub struct CeremonyPublicStatus {
 #[allow(clippy::large_enum_variant)]
 #[serde(tag = "method", content = "body", deny_unknown_fields)]
 pub enum MachineBrokerRequest {
+    #[serde(rename = "traveler.list")]
+    TravelerList(Empty),
+    #[serde(rename = "traveler.save")]
+    TravelerSave(crate::TravelerSaveRequest),
+    #[serde(rename = "traveler.delete")]
+    TravelerDelete(crate::TravelerDeleteRequest),
     #[serde(rename = "card.list")]
     CardList(Empty),
     #[serde(rename = "card.add")]
@@ -440,6 +446,12 @@ pub enum MachineBrokerRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "method", content = "body", deny_unknown_fields)]
 pub enum MachineBrokerResponse {
+    #[serde(rename = "traveler.list")]
+    TravelerList(Vec<crate::TravelerPublic>),
+    #[serde(rename = "traveler.save")]
+    TravelerSave(CustodyPrepareResponse),
+    #[serde(rename = "traveler.delete")]
+    TravelerDelete(CustodyPrepareResponse),
     #[serde(rename = "card.list")]
     CardList(Vec<crate::CardPublic>),
     #[serde(rename = "card.add")]
@@ -566,6 +578,7 @@ pub fn is_read_only_method(method: &Token) -> bool {
         || method == "credential.list_public"
         || method == "custody.result"
         || method == "card.list"
+        || method == "traveler.list"
         || method == "card.status"
 }
 
@@ -573,6 +586,8 @@ impl crate::TypedRequestMethod for MachineBrokerRequest {
     fn operation_id(&self) -> Result<Option<OperationId>, crate::WireError> {
         use MachineBrokerRequest as Request;
         Ok(match self {
+            Request::TravelerSave(request) => Some(request.operation_id.clone()),
+            Request::TravelerDelete(request) => Some(request.operation_id.clone()),
             Request::CardAdd(request) => Some(request.operation_id.clone()),
             Request::CardDelete(request) => Some(request.operation_id.clone()),
             Request::CardStatus(request) | Request::CardCancel(request) => {

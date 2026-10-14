@@ -46,6 +46,24 @@
           <p>BIP-39 passphrases are not supported. Import the recovery phrase only.</p>
           <p>Encrypted directly to the Signer before it leaves this page.</p>
         </fieldset>
+        <fieldset id="traveler-fields" hidden>
+          <legend>Traveler details</legend>
+          <p>Saved encrypted in Signer. Agents see the label, not these details. Saving does not book or pay.</p>
+          <label>First and middle names as on ID<input id="traveler-given_name" autocomplete="off" maxlength="128" required></label>
+          <label>Last name as on ID<input id="traveler-family_name" autocomplete="off" maxlength="128" required></label>
+          <label>Birth date<input id="traveler-born_on" type="date" autocomplete="off" min="1900-01-01"></label>
+          <label>Gender<select id="traveler-gender"><option value="">Do not save</option><option value="female">Female</option><option value="male">Male</option><option value="unspecified">Unspecified</option></select></label>
+          <label>Nationality (country code)<input id="traveler-nationality" autocomplete="off" maxlength="2" pattern="[A-Za-z]{2}" placeholder="CA"></label>
+          <label>Email for booking confirmations<input id="traveler-email" type="email" autocomplete="off" maxlength="320"></label>
+          <label>Phone including country code<input id="traveler-phone" type="tel" autocomplete="off" maxlength="48" placeholder="+1 …"></label>
+          <details><summary>Remember a travel document (optional)</summary>
+            <label>Document type<select id="traveler-document_kind"><option value="">Do not save</option><option value="passport">Passport</option><option value="national_id">National ID</option></select></label>
+            <label>Document number<input id="traveler-document_number" autocomplete="off" maxlength="64"></label>
+            <label>Issuing country (country code)<input id="traveler-document_country" autocomplete="off" maxlength="2" pattern="[A-Za-z]{2}" placeholder="CA"></label>
+            <label>Expiry<input id="traveler-document_expiry" type="date" autocomplete="off"></label>
+          </details>
+          <p>Saving this traveler again replaces their details. Blank optional fields are forgotten.</p>
+        </fieldset>
         <fieldset id="card-fields" hidden>
           <legend>Card to save</legend>
           <label>Card number<input id="card-number" inputmode="numeric" autocomplete="off" maxlength="23" placeholder="1234 5678 9012 3456"><span class="field-error" id="card-number-error"></span></label>

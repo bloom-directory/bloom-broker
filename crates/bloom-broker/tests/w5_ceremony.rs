@@ -149,6 +149,146 @@ async fn card_approve(
 }
 
 #[tokio::test]
+async fn private_traveler_save_and_release_use_real_signer_and_hide_values() {
+    use bloom_broker::ceremony::{
+        CheckoutIntakeRequest, CheckoutIntakeResponse, bind_checkout_intake,
+        serve_checkout_listener,
+    };
+    use bloom_signer_api::{CardEffect, TravelerField, TravelerFillScope};
+    use std::os::unix::fs::PermissionsExt;
+    let broker = CeremonyBroker::new(real_ceremony_signer());
+    let first = broker
+        .prepare_card(
+            operation("b1"),
+            CardEffect::SaveTraveler {
+                traveler_id: Token::new("wife").unwrap(),
+                label: "Wife".into(),
+            },
+            card_test_now(),
+        )
+        .unwrap();
+    let session = card_session_json(&broker, &first).await;
+    let auth = VirtualAuthenticator::generate_for_registration(
+        serde_json::from_value(session["webauthn_options"]["registration_user_handle"].clone())
+            .unwrap(),
+        "http://localhost:18734",
+    );
+    let prf = Base64UrlBytes::from_bytes(&auth.deterministic_prf());
+    for (prepared, given, count) in [(&first, "SyntheticWife", 1)] {
+        let input = serde_json::json!({"credential_prf":prf,"traveler":{"given_name":given,"family_name":"SyntheticFamily","born_on":"1992-02-29","nationality":"CA"}});
+        assert_eq!(
+            card_approve(&broker, prepared, &auth, input, count).await.0,
+            StatusCode::OK
+        );
+    }
+    let second = broker
+        .prepare_card(
+            operation("b2"),
+            CardEffect::SaveTraveler {
+                traveler_id: Token::new("self").unwrap(),
+                label: "Me".into(),
+            },
+            card_test_now(),
+        )
+        .unwrap();
+    assert_eq!(
+        card_approve(
+            &broker,
+            &second,
+            &auth,
+            serde_json::json!({"credential_prf":prf,
+        "traveler":{"given_name":"SyntheticSelf","family_name":"SyntheticFamily"}}),
+            2
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let public = serde_json::to_string(&broker.traveler_list().unwrap()).unwrap();
+    for secret in [
+        "SyntheticWife",
+        "SyntheticSelf",
+        "SyntheticFamily",
+        "1992-02-29",
+    ] {
+        assert!(!public.contains(secret));
+    }
+    assert!(broker.card_list().unwrap().is_empty());
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o710)).unwrap();
+    let socket = dir.path().join("traveler.sock");
+    let listener = bind_checkout_intake(&socket).unwrap();
+    let service = tokio::spawn(serve_checkout_listener(
+        broker.clone(),
+        listener,
+        fs::metadata(dir.path()).unwrap().uid(),
+    ));
+    let recipient = HpkeRecipient::generate();
+    let prepared = match card_intake(
+        &socket,
+        CheckoutIntakeRequest::Traveler {
+            operation_id: operation("b3"),
+            traveler_id: Token::new("wife").unwrap(),
+            scope: TravelerFillScope {
+                origin: "https://airline.example".into(),
+                frame_origins: vec!["https://airline.example".into()],
+                document_binding: Digest32::from_bytes([3; 32]),
+                fields: vec![TravelerField::GivenName, TravelerField::FamilyName],
+            },
+            recipient_key: recipient.public_key().clone(),
+            challenge_url: "http://localhost:28740/private?token=synthetic".into(),
+        },
+    )
+    .await
+    {
+        CheckoutIntakeResponse::Prepared(prepared) => prepared,
+        _ => panic!("private traveler prepare failed"),
+    };
+    let session = card_session_json(&broker, &prepared).await;
+    assert_eq!(session["review_manifest"]["traveler"]["label"], "Wife");
+    assert!(!session.to_string().contains("SyntheticWife"));
+    assert_eq!(
+        card_approve(
+            &broker,
+            &prepared,
+            &auth,
+            serde_json::json!({"credential_prf":prf}),
+            3
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (receipt, aad) = match card_intake(
+        &socket,
+        CheckoutIntakeRequest::Result {
+            operation_id: operation("b3"),
+        },
+    )
+    .await
+    {
+        CheckoutIntakeResponse::Result {
+            receipt: Some(receipt),
+            output_aad: Some(aad),
+            ..
+        } => (receipt, aad),
+        _ => panic!("missing private traveler output"),
+    };
+    let plaintext = recipient
+        .open(
+            receipt.encrypted_browser_result.as_ref().unwrap(),
+            CUSTODY_OUTPUT_INFO,
+            &aad.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(plaintext.expose_to_backend()).unwrap(),
+        serde_json::json!({"given_name":"SyntheticWife","family_name":"SyntheticFamily"})
+    );
+    service.abort();
+}
+
+#[tokio::test]
 async fn card_checkout_private_delivery_is_single_use_and_manual_has_no_release() {
     use bloom_broker::ceremony::{
         CheckoutIntakeRequest, CheckoutIntakeResponse, bind_checkout_intake,
@@ -1951,6 +2091,11 @@ impl CeremonyCompletionObserver for FailOnceAdoptionObserver {
 }
 
 impl CeremonySigner for RealSigner {
+    fn traveler_list(
+        &self,
+    ) -> Result<Vec<bloom_signer_api::TravelerPublic>, bloom_signer_api::ProtocolError> {
+        self.service.traveler_list()
+    }
     fn card_list(
         &self,
     ) -> Result<Vec<bloom_signer_api::CardPublic>, bloom_signer_api::ProtocolError> {

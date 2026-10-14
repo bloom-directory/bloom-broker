@@ -183,6 +183,31 @@ impl BrokerRpcService {
             self.require_network_containment()?;
         }
         match request {
+            Request::TravelerList(_) => Ok(Response::TravelerList(
+                serde_json::from_value(
+                    serde_json::to_value(self.ceremony.traveler_list()?).map_err(malformed)?,
+                )
+                .map_err(malformed)?,
+            )),
+            Request::TravelerSave(request) => {
+                Ok(Response::TravelerSave(self.ceremony.prepare_card(
+                    request.operation_id,
+                    bloom_signer_api::CardEffect::SaveTraveler {
+                        traveler_id: request.traveler_id,
+                        label: request.label,
+                    },
+                    self.clock.now_ms(false)?,
+                )?))
+            }
+            Request::TravelerDelete(request) => {
+                Ok(Response::TravelerDelete(self.ceremony.prepare_card(
+                    request.operation_id,
+                    bloom_signer_api::CardEffect::DeleteTraveler {
+                        traveler_id: request.traveler_id,
+                    },
+                    self.clock.now_ms(false)?,
+                )?))
+            }
             Request::CardList(_) => Ok(Response::CardList(
                 serde_json::from_value(
                     serde_json::to_value(self.ceremony.card_list()?).map_err(malformed)?,
@@ -2107,6 +2132,8 @@ fn machine_request_requires_containment(request: &MachineBrokerRequest) -> bool 
     matches!(
         request,
         Request::SealedApprovalPrepare(_)
+            | Request::TravelerSave(_)
+            | Request::TravelerDelete(_)
             | Request::SealedApprovalRenew(_)
             | Request::SigningSign(_)
             | Request::SigningSignBatch(_)

@@ -41,6 +41,16 @@ const MAX_INTAKE_LINE_BYTES: usize = 1_500_000;
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CheckoutIntakeRequest {
+    TravelerInfo {
+        traveler_id: Token,
+    },
+    Traveler {
+        operation_id: OperationId,
+        traveler_id: Token,
+        scope: bloom_signer_api::TravelerFillScope,
+        recipient_key: Base64UrlBytes,
+        challenge_url: String,
+    },
     Prepare {
         operation_id: OperationId,
         card_id: Token,
@@ -78,6 +88,9 @@ pub enum CheckoutIntakeRequest {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CheckoutIntakeResponse {
+    Traveler {
+        traveler: bloom_signer_api::TravelerPublic,
+    },
     Prepared(CustodyPrepareResponse),
     Result {
         status: CardOperationStatus,
@@ -97,6 +110,12 @@ pub(super) fn is_card(kind: CeremonyKind) -> bool {
 }
 
 impl CeremonyBroker {
+    pub fn traveler_list(&self) -> Result<Vec<bloom_signer_api::TravelerPublic>, ProtocolError> {
+        self.inner
+            .signer
+            .traveler_list()
+            .map_err(signer_error_to_machine)
+    }
     pub fn card_list(&self) -> Result<Vec<CardPublic>, ProtocolError> {
         self.inner
             .signer
@@ -170,7 +189,20 @@ impl CeremonyBroker {
             }
             _ => None,
         };
-        let review = serde_json::json!({"card_effect":request.effect, "card":card, "registrable_domain":domain,
+        let traveler_id = match &request.effect {
+            CardEffect::SaveTraveler { traveler_id, .. }
+            | CardEffect::DeleteTraveler { traveler_id }
+            | CardEffect::FillTraveler { traveler_id, .. } => Some(traveler_id),
+            _ => None,
+        };
+        let traveler = if let Some(id) = traveler_id {
+            self.traveler_list()?
+                .into_iter()
+                .find(|t| &t.traveler_id == id)
+        } else {
+            None
+        };
+        let review = serde_json::json!({"card_effect":request.effect, "card":card, "traveler":traveler, "registrable_domain":domain,
             "heading":custody_review_text(kind).0, "body":custody_review_text(kind).1});
         let origin = self.origin_for_surface(&prepared.contribution.surface)?;
         let contribution_digest = prepared
@@ -183,7 +215,13 @@ impl CeremonyBroker {
             .contribution
             .expires_at_ms
             .get()
-            .min(now_ms.saturating_add(120_000));
+            .min(now_ms.saturating_add(
+                if matches!(request.effect, CardEffect::SaveTraveler { .. }) {
+                    900_000
+                } else {
+                    120_000
+                },
+            ));
         let ceremony_id = prepared.contribution.ceremony_id.clone();
         let session = self.new_session(NewBrowserSession {
             operation_id: operation_id.clone(),
@@ -220,6 +258,36 @@ impl CeremonyBroker {
     ) -> Result<CheckoutIntakeResponse, ProtocolError> {
         let now_ms = unix_time_ms();
         match request {
+            CheckoutIntakeRequest::TravelerInfo { traveler_id } => {
+                let traveler = self
+                    .traveler_list()?
+                    .into_iter()
+                    .find(|t| t.traveler_id == traveler_id)
+                    .ok_or_else(|| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::ServiceUnavailable,
+                            "traveler unavailable",
+                        )
+                    })?;
+                Ok(CheckoutIntakeResponse::Traveler { traveler })
+            }
+            CheckoutIntakeRequest::Traveler {
+                operation_id,
+                traveler_id,
+                scope,
+                recipient_key,
+                challenge_url,
+            } => self.prepare_checkout_channel(
+                operation_id,
+                CardEffect::FillTraveler {
+                    traveler_id,
+                    scope,
+                    recipient_key,
+                },
+                challenge_url,
+                None,
+                now_ms,
+            ),
             CheckoutIntakeRequest::Prepare {
                 operation_id,
                 card_id,

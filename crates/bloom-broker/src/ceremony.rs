@@ -498,6 +498,12 @@ impl PolicyUpdateReviewManifest {
 /// Typed Broker-to-Signer seam. Broker only forwards raw proof and opaque HPKE
 /// envelopes; no method accepts plaintext PRF or custody input.
 pub trait CeremonySigner: Send + Sync {
+    fn traveler_list(&self) -> Result<Vec<bloom_signer_api::TravelerPublic>, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "traveler listing unavailable",
+        ))
+    }
     fn card_list(&self) -> Result<Vec<bloom_signer_api::CardPublic>, SignerProtocolError> {
         Err(SignerProtocolError::new(
             SignerProtocolErrorCode::ServiceUnavailable,

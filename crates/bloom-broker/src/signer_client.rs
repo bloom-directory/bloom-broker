@@ -390,6 +390,12 @@ fn journal_error(error: crate::journal::JournalError) -> ProtocolError {
 }
 
 impl CeremonySigner for BrokerSignerClient {
+    fn traveler_list(&self) -> Result<Vec<bloom_signer_api::TravelerPublic>, ProtocolError> {
+        match self.request(BrokerSignerRequest::TravelerList(Empty {}))? {
+            BrokerSignerResponse::TravelerList(value) => Ok(value),
+            _ => Err(response_mismatch("traveler.list")),
+        }
+    }
     fn card_list(&self) -> Result<Vec<bloom_signer_api::CardPublic>, ProtocolError> {
         match self.request(BrokerSignerRequest::CardList(Empty {}))? {
             BrokerSignerResponse::CardList(value) => Ok(value),
