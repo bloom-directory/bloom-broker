@@ -1314,12 +1314,17 @@ impl CeremonyBroker {
                 "Signer surface inactive",
             ));
         }
-        // The local surface is served on this Broker's configured ceremony
-        // port; its persisted Signer identity stays at the shipping origin.
+        Ok(self.served_origin_for(&descriptor))
+    }
+
+    /// The origin a surface's ceremonies are served on. The local surface is
+    /// served on this Broker's configured ceremony port; its persisted Signer
+    /// identity stays at the shipping origin.
+    fn served_origin_for(&self, descriptor: &SurfaceDescriptor) -> String {
         if descriptor.identity.surface_id.as_str() == "local" {
-            return Ok(self.inner.endpoint.origin());
+            return self.inner.endpoint.origin();
         }
-        Ok(descriptor.identity.origin)
+        descriptor.identity.origin.clone()
     }
 
     /// The instance ceremony endpoint (port, addrs, Host, origin, URLs).
@@ -1505,6 +1510,8 @@ impl CeremonyBroker {
         SysRng.try_fill_bytes(&mut id_bytes).map_err(malformed)?;
         let ceremony_id = Digest32::from_bytes(id_bytes);
         let expires_at_ms = now_ms.saturating_add(CROSS_SURFACE_DEADLINE_MS);
+        let source_origin = self.served_origin_for(&source);
+        let destination_origin = self.served_origin_for(&destination);
         let mut session = self.new_session(NewBrowserSession {
             operation_id: request.operation_id.clone(),
             request_digest,
@@ -1516,8 +1523,8 @@ impl CeremonyBroker {
                 "schema": "bloom.cross_surface_add_review.v1",
                 "title": "Add a wallet passkey",
                 "wallet_name": request.wallet_id,
-                "source_origin": source.identity.origin.clone(),
-                "destination_origin": destination.identity.origin.clone(),
+                "source_origin": source_origin.clone(),
+                "destination_origin": destination_origin.clone(),
                 "exact_terms_digest": terms_digest,
             })),
             challenges: Vec::new(),
@@ -1531,13 +1538,13 @@ impl CeremonyBroker {
             policy_update: None,
             expires_at_ms,
             created_at_ms: now_ms,
-            origin: destination.identity.origin.clone(),
+            origin: destination_origin.clone(),
         })?;
         session.projection.cross_surface = Some(CrossSurfaceBrowserProjection {
             role: CrossSurfaceRole::Destination,
             wallet_id: request.wallet_id,
-            source_origin: source.identity.origin,
-            destination_origin: destination.identity.origin,
+            source_origin,
+            destination_origin,
             pairing: None,
             source_prepared: None,
         });
