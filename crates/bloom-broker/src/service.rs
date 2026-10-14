@@ -138,6 +138,17 @@ fn renewal_of_native_transaction_is_refused(
 }
 
 impl BrokerRpcService {
+    fn prepare_to_signer(
+        &self,
+        request: bloom_broker_api::CustodyPrepareRequest,
+    ) -> Result<bloom_signer_api::CustodyPrepareRequest, ProtocolError> {
+        let surface = self
+            .ceremony
+            .select_surface(request.surface_selection)?
+            .reference();
+        Ok(translate_custody::prepare_to_signer(request, surface))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         authority: Arc<BrokerAuthority>,
@@ -210,6 +221,15 @@ impl BrokerRpcService {
             }
             Request::BrokerCapabilities(_) => {
                 Ok(Response::BrokerCapabilities(self.capabilities()?))
+            }
+            Request::CeremonySurfaceStatus(_) => Ok(Response::CeremonySurfaceStatus(
+                self.ceremony.exposure_status()?,
+            )),
+            Request::CredentialCrossSurfacePrepare(request) => {
+                Ok(Response::CredentialCrossSurfacePrepare(
+                    self.ceremony
+                        .prepare_cross_surface(request, self.clock.now_ms(false)?)?,
+                ))
             }
             Request::ActionValidate(digest) => Ok(Response::ActionValidate(digest)),
             Request::SealedApprovalPrepare(request) => Ok(Response::SealedApprovalPrepare(
@@ -485,7 +505,7 @@ impl BrokerRpcService {
                 request.validate_wallet_creation_binding()?;
                 Ok(Response::WalletRegistrationPrepare(
                     self.ceremony.prepare_custody(
-                        translate_custody::prepare_to_signer(request),
+                        self.prepare_to_signer(request)?,
                         self.clock.now_ms(true)?,
                     )?,
                 ))
@@ -503,7 +523,7 @@ impl BrokerRpcService {
                 request.validate_wallet_creation_binding()?;
                 Ok(Response::WalletImportPrepare(
                     self.ceremony.prepare_custody(
-                        translate_custody::prepare_to_signer(request),
+                        self.prepare_to_signer(request)?,
                         self.clock.now_ms(true)?,
                     )?,
                 ))
@@ -515,7 +535,7 @@ impl BrokerRpcService {
                 )?;
                 Ok(Response::WalletExportPrepare(
                     self.ceremony.prepare_custody(
-                        translate_custody::prepare_to_signer(request),
+                        self.prepare_to_signer(request)?,
                         self.clock.now_ms(true)?,
                     )?,
                 ))
@@ -527,7 +547,7 @@ impl BrokerRpcService {
                 )?;
                 Ok(Response::WalletDeletePrepare(
                     self.ceremony.prepare_custody(
-                        translate_custody::prepare_to_signer(request),
+                        self.prepare_to_signer(request)?,
                         self.clock.now_ms(true)?,
                     )?,
                 ))
@@ -544,7 +564,7 @@ impl BrokerRpcService {
                         .map_err(authority_error)?;
                 }
                 Ok(Response::KeyDerivePrepare(self.ceremony.prepare_custody(
-                    translate_custody::prepare_to_signer(request),
+                    self.prepare_to_signer(request)?,
                     self.clock.now_ms(true)?,
                 )?))
             }
@@ -554,7 +574,7 @@ impl BrokerRpcService {
                     bloom_broker_api::CeremonyKind::BackendEnrollment,
                 )?;
                 Ok(Response::KeyEnrollPrepare(self.ceremony.prepare_custody(
-                    translate_custody::prepare_to_signer(request),
+                    self.prepare_to_signer(request)?,
                     self.clock.now_ms(true)?,
                 )?))
             }
@@ -577,7 +597,7 @@ impl BrokerRpcService {
                     .map_err(authority_error)?;
                 Ok(Response::AccountAllocatePrepare(
                     self.ceremony.prepare_custody_reviewed(
-                        translate_custody::prepare_to_signer(request),
+                        self.prepare_to_signer(request)?,
                         review,
                         self.clock.now_ms(false)?,
                     )?,
@@ -602,7 +622,7 @@ impl BrokerRpcService {
                     .map_err(authority_error)?;
                 Ok(Response::AccountRetirePrepare(
                     self.ceremony.prepare_custody_reviewed(
-                        translate_custody::prepare_to_signer(request),
+                        self.prepare_to_signer(request)?,
                         review,
                         self.clock.now_ms(false)?,
                     )?,
@@ -615,7 +635,7 @@ impl BrokerRpcService {
                 )?;
                 Ok(Response::CredentialAddPrepare(
                     self.ceremony.prepare_custody(
-                        translate_custody::prepare_to_signer(request),
+                        self.prepare_to_signer(request)?,
                         self.clock.now_ms(true)?,
                     )?,
                 ))
@@ -627,7 +647,7 @@ impl BrokerRpcService {
                 )?;
                 Ok(Response::CredentialReplacePrepare(
                     self.ceremony.prepare_custody(
-                        translate_custody::prepare_to_signer(request),
+                        self.prepare_to_signer(request)?,
                         self.clock.now_ms(true)?,
                     )?,
                 ))
@@ -639,7 +659,7 @@ impl BrokerRpcService {
                 )?;
                 Ok(Response::CredentialRemovePrepare(
                     self.ceremony.prepare_custody(
-                        translate_custody::prepare_to_signer(request),
+                        self.prepare_to_signer(request)?,
                         self.clock.now_ms(true)?,
                     )?,
                 ))
@@ -650,7 +670,7 @@ impl BrokerRpcService {
                     bloom_broker_api::CeremonyKind::WalletRecovery,
                 )?;
                 Ok(Response::RecoveryPrepare(self.ceremony.prepare_custody(
-                    translate_custody::prepare_to_signer(request),
+                    self.prepare_to_signer(request)?,
                     self.clock.now_ms(true)?,
                 )?))
             }
@@ -738,7 +758,7 @@ impl BrokerRpcService {
                 // The durable clock refuses while the audit journal is latched;
                 // status must stay readable then, just without the sweep.
                 let status = match self.clock.now_ms(false) {
-                    Ok(now_ms) => self.ceremony.public_status_as_of(&operation_id, now_ms)?,
+                    Ok(now_ms) => self.ceremony.current_public_status(&operation_id, now_ms)?,
                     Err(_) => self.ceremony.public_status(&operation_id)?,
                 };
                 Ok(Response::CeremonyStatus(status))
@@ -896,6 +916,10 @@ impl BrokerRpcService {
             ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
         };
         let ceremony_request = bloom_signer_api::CeremonyPrepareRequest {
+            surface: self
+                .ceremony
+                .select_surface(request.surface_selection)?
+                .reference(),
             activation_operation_id: request.operation_id.clone(),
             terms: translate_approval::validated_terms_to_signer(request.terms.clone()),
             review_manifest_digest: request.canonical_plan_facts_digest,
@@ -1065,6 +1089,10 @@ impl BrokerRpcService {
         self.ceremony.prepare_policy_update(
             PolicyUpdateCeremonyPrepareRequest {
                 custody: bloom_signer_api::CustodyPrepareRequest {
+                    surface: self
+                        .ceremony
+                        .select_surface(bloom_broker_api::CeremonySurfaceSelection::Default)?
+                        .reference(),
                     ceremony_kind: bloom_signer_api::CeremonyKind::PolicyUpdate,
                     custody_operation_id: request.operation_id.clone(),
                     wallet_id: Some(request.wallet_id.clone()),
@@ -1109,6 +1137,7 @@ impl BrokerRpcService {
             requested_review_mode: None,
             evm_review_payloads: Vec::new(),
             operation_id: request.operation_id,
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             canonical_plan_facts_digest: request.replacement_terms.approval_digest()?,
             terms: request.replacement_terms,
             petal_use_claim: None,
@@ -2223,6 +2252,7 @@ fn machine_request_requires_containment(request: &MachineBrokerRequest) -> bool 
             | Request::AccountAllocatePrepare(_)
             | Request::AccountRetirePrepare(_)
             | Request::CredentialAddPrepare(_)
+            | Request::CredentialCrossSurfacePrepare(_)
             | Request::CredentialReplacePrepare(_)
             | Request::CredentialRemovePrepare(_)
             | Request::RecoveryPrepare(_)
@@ -2809,7 +2839,7 @@ mod tests {
         assert_ne!(previous_broker.build_digest, current_broker.build_digest);
         assert_eq!(
             bloom_signer_api::SIGNER_API_CURRENT,
-            bloom_broker_api::ProtocolVersion::new(1, 5)
+            bloom_broker_api::ProtocolVersion::new(1, 6)
         );
         validate_signer_readiness(&previous_broker, &previous_signer).unwrap();
         validate_signer_readiness(&current_broker, &current_signer).unwrap();

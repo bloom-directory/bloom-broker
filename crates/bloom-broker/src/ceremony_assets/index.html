@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#f4efe6">
   <meta name="referrer" content="no-referrer">
   <title>/bloom — Security ceremony</title>
@@ -14,13 +14,13 @@
   <link rel="stylesheet" href="/assets/theme.css">
 </head>
 <body>
-  <main class="page">
+  <main id="ceremony-page" class="page">
     <header class="brand">
       <img src="/assets/bloom-primary.svg" width="24" height="24" alt="">
       <span><strong>Bloom</strong></span>
       <p id="page-lede" class="brand-context">Preparing this request…</p>
     </header>
-    <section class="panel" aria-labelledby="panel-title">
+    <section id="ceremony-panel" class="panel" aria-labelledby="panel-title">
       <p id="preview-banner" class="preview-banner" role="note" hidden></p>
       <header class="panel-header">
         <p id="page-title" class="panel-context"></p>
@@ -39,7 +39,7 @@
           <legend>What to export</legend>
           <label class="choice"><input type="radio" name="export-format" value="bip39_mnemonic" checked><span><strong>Recovery phrase</strong> — the original words that restore this wallet anywhere</span></label>
           <label class="choice"><input type="radio" name="export-format" value="legacy_backup"><span><strong>Bloom backup file</strong> — encrypted backup for restoring into Bloom</span></label>
-          <p>The result is decrypted only in this tab. Nobody else, including Bloom, sees it.</p>
+          <p>The result is encrypted to this tab and decrypted here before display.</p>
         </fieldset>
         <fieldset id="import-fields" hidden>
           <legend>Wallet to import</legend>
