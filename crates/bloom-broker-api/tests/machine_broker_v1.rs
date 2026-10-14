@@ -270,6 +270,16 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
     vec![
         MachineBrokerRequest::SystemHello(hello()),
         MachineBrokerRequest::CardList(Empty {}),
+        MachineBrokerRequest::TravelerList(Empty {}),
+        MachineBrokerRequest::TravelerSave(TravelerSaveRequest {
+            operation_id: operation(90),
+            traveler_id: token("wife"),
+            label: "Wife".into(),
+        }),
+        MachineBrokerRequest::TravelerDelete(TravelerDeleteRequest {
+            operation_id: operation(91),
+            traveler_id: token("wife"),
+        }),
         MachineBrokerRequest::CardAdd(CardAddRequest {
             operation_id: operation(1),
             card_id: token("card-one"),
@@ -575,6 +585,13 @@ fn machine_responses() -> Vec<MachineBrokerResponse> {
         }),
         MachineBrokerResponse::CredentialReplacePrepare(custody_prepared.clone()),
         MachineBrokerResponse::CredentialRemovePrepare(custody_prepared.clone()),
+        MachineBrokerResponse::TravelerList(vec![TravelerPublic {
+            traveler_id: token("wife"),
+            label: "Wife".into(),
+            fields: vec![TravelerField::GivenName, TravelerField::FamilyName],
+        }]),
+        MachineBrokerResponse::TravelerSave(custody_prepared.clone()),
+        MachineBrokerResponse::TravelerDelete(custody_prepared.clone()),
         MachineBrokerResponse::CardList(vec![CardPublic {
             card_id: token("card-one"),
             label: "Synthetic card".into(),
@@ -630,16 +647,16 @@ fn every_machine_broker_variant_matches_frozen_v1_frames() {
     // payload field to the request frames (empty review payloads remain
     // omitted from the pre-existing approval request vectors); 1.7 adds the
     // remote-ceremony methods and surface selection.
-    assert_eq!(MachineBrokerMethod::ALL.len(), 50);
+    assert_eq!(MachineBrokerMethod::ALL.len(), 53);
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "134138dc77f19b49da6024ecc83aeed8b1539691d55eb86ab5ef0ea4fc0644eb",
+        "03686147da419bc5168a08158e3919e44a7f468be506a19ec2d7e03c8e668a8e",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "4c484a60f3e6159cd293aeb2ed40aa9e9fc72760e081dcde38b09bdc15e27992",
+        "1cd62a82b7ba40b3212d02d58578a78b787eb8a2dd5f7ce0c0155bc368cb5261",
     );
 }
 

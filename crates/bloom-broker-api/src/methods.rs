@@ -27,6 +27,7 @@ method_enum!(MachineBrokerMethod {
     CredentialListPublic => "credential.list_public", CredentialAddPrepare => "credential.add_prepare", CredentialCrossSurfacePrepare => "credential.cross_surface_prepare", CredentialReplacePrepare => "credential.replace_prepare", CredentialRemovePrepare => "credential.remove_prepare",
     RecoveryPrepare => "recovery.prepare", CeremonyStatus => "ceremony.status", CeremonyCancel => "ceremony.cancel", CustodyResult => "custody.result",
     CardList => "card.list", CardAdd => "card.add", CardDelete => "card.delete", CardStatus => "card.status", CardCancel => "card.cancel",
+    TravelerList => "traveler.list", TravelerSave => "traveler.save", TravelerDelete => "traveler.delete",
 });
 
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ProtocolError>> + Send + 'a>>;
