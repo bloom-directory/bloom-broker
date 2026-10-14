@@ -55,7 +55,9 @@
 [hidden]{display:none!important}
 html{background:var(--ceremony-bg);color:var(--ceremony-text);-webkit-text-size-adjust:100%}
 body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-font-smoothing:antialiased}
-.page{width:min(var(--ceremony-width),100%);margin:0 auto;padding:var(--ceremony-space-3) var(--ceremony-gutter) var(--ceremony-space-4)}
+/* viewport-fit=cover lets a hosted page reach under a phone's notch and home
+   indicator; the safe-area insets keep its content clear of both. */
+.page{width:min(var(--ceremony-width),100%);margin:0 auto;padding:calc(var(--ceremony-space-3) + env(safe-area-inset-top,0px)) calc(var(--ceremony-gutter) + env(safe-area-inset-right,0px)) calc(var(--ceremony-space-4) + env(safe-area-inset-bottom,0px)) calc(var(--ceremony-gutter) + env(safe-area-inset-left,0px))}
 
 .brand{display:flex;align-items:center;gap:var(--ceremony-space-1);margin-bottom:var(--ceremony-space-3);color:var(--ceremony-muted);font-size:14px}
 .brand img{display:block}

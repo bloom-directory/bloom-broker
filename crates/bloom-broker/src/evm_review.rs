@@ -602,6 +602,7 @@ pub(crate) mod tests {
         ApprovalPrepareRequest {
             attributed_advisory: None,
             requested_review_mode: None,
+            surface_selection: CeremonySurfaceSelection::Default,
             operation_id: OperationId::from_bytes([2; 32]),
             canonical_plan_facts_digest: digest.clone(),
             evm_review_payloads: vec![Base64UrlBytes::from_bytes(bytes)],

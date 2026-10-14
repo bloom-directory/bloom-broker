@@ -110,6 +110,7 @@ fn capabilities() -> ServiceCapabilities {
 fn custody_prepare() -> CustodyPrepareRequest {
     CustodyPrepareRequest {
         ceremony_kind: CeremonyKind::WalletRegistration,
+        surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
         custody_operation_id: operation(14),
         wallet_id: Some(token("wallet")),
         key_ref: Some(key_ref()),
@@ -138,6 +139,11 @@ fn policy_snapshot() -> SignedPolicySnapshot {
 
 fn custody_result() -> CustodyResult {
     CustodyResult {
+        surface: Some(CeremonySurfaceRef {
+            surface_id: token("local"),
+            identity_digest: digest(75),
+        }),
+        credential_authority_generation: Some(DecimalU64::new(0)),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation(14),
         public_status: CeremonyState::Completed,
@@ -145,7 +151,11 @@ fn custody_result() -> CustodyResult {
         public_key_refs: vec![key_ref()],
         credential_summaries: vec![CredentialSummary {
             credential_id: Base64UrlBytes::from_bytes(&[19]),
-            rp_id: token("localhost"),
+            surface: Some(CeremonySurfaceRef {
+                surface_id: token("local"),
+                identity_digest: digest(75),
+            }),
+            rp_id: RpId::new("localhost").unwrap(),
             active: true,
         }],
         initial_policy: Some(policy_snapshot()),
@@ -261,11 +271,13 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
         MachineBrokerRequest::SystemHello(hello()),
         MachineBrokerRequest::BrokerReadiness(Empty {}),
         MachineBrokerRequest::BrokerCapabilities(Empty {}),
+        MachineBrokerRequest::CeremonySurfaceStatus(Empty {}),
         MachineBrokerRequest::ActionValidate(digest(58)),
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
             requested_review_mode: None,
             evm_review_payloads: Vec::new(),
             operation_id: operation(54),
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             terms: approval_terms(),
             canonical_plan_facts_digest: digest(59),
             petal_use_claim: None,
@@ -327,6 +339,11 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
         MachineBrokerRequest::AccountRetirePrepare(account_retire_prepare()),
         MachineBrokerRequest::CredentialListPublic(wallet),
         MachineBrokerRequest::CredentialAddPrepare(custody_prepare()),
+        MachineBrokerRequest::CredentialCrossSurfacePrepare(CeremonyCrossSurfacePrepareRequest {
+            operation_id: operation(64),
+            wallet_id: token("wallet"),
+            destination: bloom_broker_api::CeremonySurfaceSelection::Remote,
+        }),
         MachineBrokerRequest::CredentialReplacePrepare(custody_prepare()),
         MachineBrokerRequest::CredentialRemovePrepare(custody_prepare()),
         MachineBrokerRequest::RecoveryPrepare(custody_prepare()),
@@ -362,6 +379,10 @@ fn credential_public() -> CredentialPublic {
     CredentialPublic {
         credential_id: Base64UrlBytes::from_bytes(&[64]),
         wallet_id: token("wallet"),
+        surface: Some(CeremonySurfaceRef {
+            surface_id: token("local"),
+            identity_digest: digest(75),
+        }),
         created_at_ms: DecimalU64::new(10),
         state: CredentialState::Active,
     }
@@ -397,6 +418,7 @@ fn account_allocate_prepare() -> CustodyPrepareRequest {
     let terms = account_allocate_terms();
     CustodyPrepareRequest {
         ceremony_kind: CeremonyKind::AccountAllocate,
+        surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
         custody_operation_id: operation(70),
         wallet_id: Some(token("wallet")),
         key_ref: None,
@@ -417,6 +439,7 @@ fn account_retire_prepare() -> CustodyPrepareRequest {
     terms.retire_key_fingerprint = Some(digest(74));
     CustodyPrepareRequest {
         ceremony_kind: CeremonyKind::AccountRetire,
+        surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
         custody_operation_id: operation(72),
         wallet_id: Some(token("wallet")),
         key_ref: Some(key_ref()),
@@ -459,6 +482,17 @@ fn machine_responses() -> Vec<MachineBrokerResponse> {
         MachineBrokerResponse::SystemHello(hello()),
         MachineBrokerResponse::BrokerReadiness(readiness()),
         MachineBrokerResponse::BrokerCapabilities(capabilities()),
+        MachineBrokerResponse::CeremonySurfaceStatus(CeremonyExposureStatus {
+            desired_mode: CeremonyExposureMode::LocalhostOnly,
+            desired_revision: DecimalU64::new(1),
+            effective_mode: CeremonyExposureMode::LocalhostOnly,
+            effective_revision: DecimalU64::new(1),
+            local_origin: "http://localhost:18734".into(),
+            remote_origin: None,
+            remote_tls_ready: false,
+            remote_routing_ready: false,
+            stage: CeremonyExposureStage::LocalhostOnly,
+        }),
         MachineBrokerResponse::ActionValidate(digest(58)),
         MachineBrokerResponse::SealedApprovalPrepare(SealedApprovalPrepareResponse {
             approval_id: digest(35),
@@ -519,6 +553,14 @@ fn machine_responses() -> Vec<MachineBrokerResponse> {
         MachineBrokerResponse::AccountRetirePrepare(custody_prepared.clone()),
         MachineBrokerResponse::CredentialListPublic(vec![credential_public()]),
         MachineBrokerResponse::CredentialAddPrepare(custody_prepared.clone()),
+        MachineBrokerResponse::CredentialCrossSurfacePrepare(CeremonyCrossSurfacePrepareResponse {
+            operation_id: operation(64),
+            ceremony_id: digest(65),
+            state: CeremonyState::AwaitingUser,
+            destination_url: "https://abcdefghijklmnopqrstuv2345.relay.bloom.directory/#cap=token"
+                .into(),
+            expires_at_ms: DecimalU64::new(20),
+        }),
         MachineBrokerResponse::CredentialReplacePrepare(custody_prepared.clone()),
         MachineBrokerResponse::CredentialRemovePrepare(custody_prepared.clone()),
         MachineBrokerResponse::RecoveryPrepare(custody_prepared),
@@ -543,19 +585,43 @@ where
 
 #[test]
 fn every_machine_broker_variant_matches_frozen_v1_frames() {
-    // Protocol 1.6 adds the native assurance claims and the EVM review
-    // payload field to the request frames; empty review payloads remain
-    // omitted from the pre-existing approval request vectors.
-    assert_eq!(MachineBrokerMethod::ALL.len(), 43);
+    // Protocol 1.6 added the native assurance claims and the EVM review
+    // payload field to the request frames (empty review payloads remain
+    // omitted from the pre-existing approval request vectors); 1.7 adds the
+    // remote-ceremony methods and surface selection.
+    assert_eq!(MachineBrokerMethod::ALL.len(), 45);
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "1f89b6d43f6b4343b316ded0119f041d3dc9f217e32043aa0616ede900177941",
+        "fad0c8cf62391a1000b1c771b4e482e353efebc9056f263a68670f8abba946a8",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "78b67e7d3c1ad1604e0b6662fe2320df503dbd007918d93540727d220130cc39",
+        "7889a9d1f237553511ddcf311543652f4c199aec2a8069950217e5a5feda9128",
+    );
+}
+
+#[test]
+fn legacy_signed_custody_result_keeps_its_original_canonical_bytes() {
+    let mut legacy = custody_result();
+    legacy.surface = None;
+    legacy.credential_authority_generation = None;
+    for credential in &mut legacy.credential_summaries {
+        credential.surface = None;
+    }
+    let stored = serde_json::to_value(&legacy).unwrap();
+    assert!(stored.get("surface").is_none());
+    assert!(stored.get("credential_authority_generation").is_none());
+    assert!(stored["credential_summaries"][0].get("surface").is_none());
+    let reloaded: CustodyResult = serde_json::from_value(stored.clone()).unwrap();
+    assert_eq!(reloaded, legacy);
+    let mut unsigned = stored.as_object().unwrap().clone();
+    unsigned.remove("signer_signature");
+    assert_eq!(
+        reloaded.unsigned_canonical_bytes().unwrap(),
+        serde_jcs::to_vec(&unsigned).unwrap(),
+        "reloading a historic receipt must not change its signed bytes"
     );
 }
 
