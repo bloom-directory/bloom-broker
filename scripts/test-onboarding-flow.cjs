@@ -7,16 +7,18 @@ const vm = require('node:vm');
 const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../crates/bloom-broker/src/ceremony_assets/onboarding/app.js'), 'utf8');
 const baseState = {selected_wallet:'alice',wallet_choices:[{id:'alice'}],machine:{available:true},config:{exists:true,setup_complete:true,persona:{preset:'trader'},persona_limits:{per_action_usd:'100',daily_usd:'1000',session_duration_secs:'86400'},petals:['polymarket']},catalog:[]};
-function harness(actions) {
+function harness(actions, options = {}) {
   const elements = new Map(), listeners = {}, calls = [];
   function element() { return {hidden:false,value:'',options:[],style:{},dataset:{},classList:{toggle(){}},contentWindow:{},querySelectorAll:()=>[],addEventListener(){},append(){},replaceChildren(){},removeAttribute(name){delete this[name];},add(option){this.options.push(option);}}; }
   const get = id => {if (!elements.has(id)) elements.set(id,element()); return elements.get(id);};
   get('setup-form').elements = {persona:{value:'trader'}};
   const location = new URL('http://localhost:18734/onboarding/');
-  location.hash = '#bridge=' + encodeURIComponent('http://127.0.0.1:54321/onboarding/'+'a'.repeat(64)+'/');
+  location.hash = options.hash ?? ('#bridge=' + encodeURIComponent('http://127.0.0.1:54321/onboarding/'+'a'.repeat(64)+'/'));
+  const storage = options.storage ?? new Map();
+  const sessionStorage = options.storageUnavailable ? {getItem(){throw Error('storage unavailable');},setItem(){throw Error('storage unavailable');},removeItem(){throw Error('storage unavailable');}} : {getItem:key=>storage.get(key) ?? null,setItem:(key,value)=>storage.set(key,value),removeItem:key=>storage.delete(key)};
   const response = (data,ok=true) => ({ok,status:ok?200:409,json:async()=>data,text:async()=>JSON.stringify(data)});
   let sessionCount = 0;
-  const sandbox = {URL,URLSearchParams,Date,Number,JSON,Option:function(text,value){this.value=value;},location,history:{replaceState(){}},document:{getElementById:get,querySelectorAll:()=>[],createElement:element},window:{addEventListener:(name,fn)=>{listeners[name]=fn;}},setTimeout:()=>1,clearTimeout(){},ResizeObserver:function(){},fetch:async(raw,options={})=>{
+  const sandbox = {URL,URLSearchParams,Date,Number,JSON,Option:function(text,value){this.value=value;},location,history:{replaceState(){location.hash='';}},document:{getElementById:get,querySelectorAll:()=>[],createElement:element},window:{sessionStorage,addEventListener:(name,fn)=>{listeners[name]=fn;}},setTimeout:()=>1,clearTimeout(){},ResizeObserver:function(){},fetch:async(raw,options={})=>{
     const url = new URL(raw,location); calls.push({url:url.href,body:options.body});
     if (url.pathname.endsWith('/api/state')) return response(JSON.parse(JSON.stringify(baseState)));
     if (url.pathname.endsWith('/api/action')) {assert.equal(JSON.parse(options.body).action,'policy'); assert.ok(actions.length,'unexpected reconciliation'); return response(actions.shift());}
@@ -27,10 +29,26 @@ function harness(actions) {
   vm.runInContext(source.replace(/\}\)\(\);\s*$/, 'globalThis.hooks={runAction,showStep,refresh,get step(){return step},get pending(){return activeReview}};})();'),sandbox);
   const settle = async()=>{for(let i=0;i<8;i++) await new Promise(resolve=>setImmediate(resolve));};
   const message = overrides => listeners.message({origin:location.origin,source:get('ceremony-frame').contentWindow,data:{type:'bloom.onboarding.ceremony',ceremony_id:sandbox.hooks.pending?.id,state:'completed'},...overrides});
-  return {hooks:sandbox.hooks,calls,message,settle,get};
+  return {hooks:sandbox.hooks,calls,message,settle,get,storage,location};
 }
 const pending = token => ({ceremony_url:'http://localhost:18734/ceremony/'+token.repeat(43),data:{state:'awaiting_owner'}});
 (async()=>{
+  const connected=harness([]);await connected.settle();
+  const reloaded=harness([],{hash:'',storage:connected.storage});await reloaded.settle();
+  assert.ok(reloaded.calls.some(call=>new URL(call.url).pathname.endsWith('/api/state')), 'reload must rediscover existing wallets');
+  assert.equal(reloaded.get('next').disabled,false);
+  const unavailable=harness([],{storageUnavailable:true});await unavailable.settle();assert.ok(unavailable.location.hash.startsWith('#bridge='));assert.ok(unavailable.calls.some(call=>new URL(call.url).pathname.endsWith('/api/state')));
+  const key='bloom.onboarding.bridge.v1';
+  const expires=JSON.parse(connected.storage.get(key)).expires_at;
+  assert.equal(JSON.parse(reloaded.storage.get(key)).expires_at,expires,'reload cannot extend the stored connection lifetime');
+  for (const cached of [
+    {url:'http://127.0.0.1:54321/onboarding/'+'a'.repeat(64)+'/',expires_at:Date.now()-1},
+    {url:'https://attacker.example/onboarding/'+'a'.repeat(64)+'/',expires_at:Date.now()+60000}
+  ]) {
+    const invalid=harness([],{hash:'',storage:new Map([[key,JSON.stringify(cached)]])});await invalid.settle();assert.equal(invalid.calls.length,0);assert.equal(invalid.get('next').disabled,true);
+  }
+  const malformed=harness([],{hash:'#bridge=https://attacker.example/',storage:connected.storage});await malformed.settle();assert.equal(malformed.calls.length,0,'an invalid new fragment cannot fall back to a cached connection');
+
   // DefaultPolicyStatus uses #[serde(tag = "state")]; use the real wire shape.
   const resumed = harness([{data:{state:'applied',petals:['polymarket']}}]); await resumed.settle(); resumed.hooks.showStep(2); await resumed.hooks.runAction('policy'); assert.equal(resumed.hooks.step,3); assert.equal(resumed.get('activate').disabled,false); assert.equal(resumed.hooks.pending,null);
   const h = harness([pending('b'),{data:{state:'applied',petals:['polymarket']}}]); await h.settle(); h.hooks.showStep(2); await h.hooks.runAction('policy');

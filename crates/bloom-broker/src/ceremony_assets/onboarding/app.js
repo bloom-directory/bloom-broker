@@ -3,7 +3,6 @@
   const $ = (id) => document.getElementById(id);
   let bridge = null, activeReview = null, reviewTimer = null;
   const bridgeFragment = location.hash;
-  history.replaceState(null, '', '/onboarding/');
   const form = $('setup-form');
   const titles = ['How would you like to use Bloom?', 'Choose your limits and Petals', 'Review your wallet policy', 'Review session permissions'];
   const presets = {trader: ['100', '1000', '86400'], degen: ['1000', '10000', '604800']};
@@ -218,11 +217,40 @@
   $('finish').addEventListener('click', () => notice(selected() === 'custodian' ? 'Setup is complete. Each action remains under your review.' : 'Setup is complete. Your persona permissions are active.'));
   showStep(0);
   try {
-    const params = new URLSearchParams(bridgeFragment.slice(1));
-    const raw = params.get('bridge');
-    if ([...params.keys()].length !== 1 || !raw) throw new Error('Reopen the setup link printed by Bloom to reconnect this page.');
-    const url = new URL(raw);
-    if (url.href !== raw || url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password || url.search || url.hash || !/^\/onboarding\/[0-9a-f]{64}\/$/.test(url.pathname)) throw new Error('Invalid local setup connection. Reopen the link printed by Bloom.');
+    const storageKey = 'bloom.onboarding.bridge.v1';
+    const lifetime = 30 * 60 * 1000;
+    let storage;
+    try { storage = window.sessionStorage; } catch (_) { /* Retain the fragment if tab storage is unavailable. */ }
+    let connection;
+    if (bridgeFragment) {
+      // An explicit new connection replaces the old one, including on failure.
+      try { storage?.removeItem(storageKey); } catch (_) {}
+      const params = new URLSearchParams(bridgeFragment.slice(1));
+      const raw = params.get('bridge');
+      if ([...params.keys()].length !== 1 || !raw) throw new Error('Invalid setup link. Reopen the link printed by Bloom.');
+      connection = {url:raw, expires_at:Date.now() + lifetime};
+    } else {
+      try { connection = JSON.parse(storage?.getItem(storageKey) ?? 'null'); } catch (_) {}
+      if (!connection) throw new Error('Reopen the setup link printed by Bloom to reconnect this page.');
+    }
+    if (!Number.isFinite(connection.expires_at) || connection.expires_at <= Date.now() || connection.expires_at > Date.now() + lifetime) {
+      try { storage?.removeItem(storageKey); } catch (_) {}
+      throw new Error('This setup connection expired. Run bloom onboard to reconnect.');
+    }
+    const url = new URL(connection.url);
+    if (url.href !== connection.url || url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password || url.search || url.hash || !/^\/onboarding\/[0-9a-f]{64}\/$/.test(url.pathname)) {
+      try { storage?.removeItem(storageKey); } catch (_) {}
+      throw new Error('Invalid local setup connection. Reopen the link printed by Bloom.');
+    }
+    // Tab-scoped recovery only; never localStorage, cookies, or passkey data.
+    // Reload preserves the original deadline. Machine independently enforces
+    // its shorter idle timeout and absolute process lifetime on every request.
+    try {
+      if (storage) {
+        storage.setItem(storageKey, JSON.stringify(connection));
+        history.replaceState(null, '', '/onboarding/');
+      }
+    } catch (_) { /* A valid launch fragment remains usable on reload. */ }
     bridge = url;
     perform(refresh);
   } catch (error) { notice(error.message, true); }
