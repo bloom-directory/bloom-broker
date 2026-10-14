@@ -78,7 +78,7 @@
     const data = result.data;
     if (Array.isArray(data)) return data.length ? data.map(item => `${item.persona ?? item.name ?? 'Session'} · ${item.locally_disabled ? 'Stopped' : item.preparation_pending ? 'Awaiting preparation' : item.authority?.state ?? item.status ?? item.state ?? 'Pending'}`).join('\n') : fallback;
     if (data?.policy) return 'Your wallet policy is available. Review or resume it to check the selected Petals.';
-    if (data?.status) return ({applied:'Policy applied.', awaiting_owner:'Waiting for your approval.', waiting_for_wallet:'Select an existing wallet first.', busy:'Another review is in progress.'})[data.status] ?? String(data.status).replaceAll('_', ' ');
+    if (data?.state) return ({applied:'Policy applied.', awaiting_owner:'Waiting for your approval.', waiting_for_wallet:'Select an existing wallet first.', busy:'Another review is in progress.'})[data.state] ?? String(data.state).replaceAll('_', ' ');
     if (result.stdout?.trim() && !result.stdout.trim().startsWith('{') && !result.stdout.trim().startsWith('[')) return result.stdout.trim().split('\n').map(line => line.split('\t').slice(0, 2).join(' · ')).join('\n');
     return fallback;
   }
@@ -203,7 +203,7 @@
     notice('Working with your local Bloom…');
     const result = await api('action', {action});
     activity(result.stdout || display(result.data ?? result));
-    if (action === 'policy') policyApplied = result.data?.status === 'applied' || (result.data?.status === 'nothing_to_allow' && !(state?.config?.petals?.length));
+    if (action === 'policy') policyApplied = result.data?.state === 'applied' || (result.data?.state === 'nothing_to_allow' && !(state?.config?.petals?.length));
     await refresh();
     if (result.ceremony_url) { await review(result, action); return; }
     if (action === 'policy' && policyApplied) { showStep(3); notice('Wallet policy applied. Continue with your session permissions.'); }

@@ -29,15 +29,17 @@ function harness(actions) {
   const message = overrides => listeners.message({origin:location.origin,source:get('ceremony-frame').contentWindow,data:{type:'bloom.onboarding.ceremony',ceremony_id:sandbox.hooks.pending?.id,state:'completed'},...overrides});
   return {hooks:sandbox.hooks,calls,message,settle,get};
 }
-const pending = token => ({ceremony_url:'http://localhost:18734/ceremony/'+token.repeat(43),data:{status:'awaiting_owner'}});
+const pending = token => ({ceremony_url:'http://localhost:18734/ceremony/'+token.repeat(43),data:{state:'awaiting_owner'}});
 (async()=>{
-  const h = harness([pending('b'),{data:{status:'applied'}}]); await h.settle(); h.hooks.showStep(2); await h.hooks.runAction('policy');
+  // DefaultPolicyStatus uses #[serde(tag = "state")]; use the real wire shape.
+  const resumed = harness([{data:{state:'applied',petals:['polymarket']}}]); await resumed.settle(); resumed.hooks.showStep(2); await resumed.hooks.runAction('policy'); assert.equal(resumed.hooks.step,3); assert.equal(resumed.get('activate').disabled,false); assert.equal(resumed.hooks.pending,null);
+  const h = harness([pending('b'),{data:{state:'applied',petals:['polymarket']}}]); await h.settle(); h.hooks.showStep(2); await h.hooks.runAction('policy');
   const before=h.calls.length;
   h.message({origin:'https://attacker.example'}); h.message({source:{}}); h.message({data:{type:'bloom.onboarding.ceremony',ceremony_id:'f'.repeat(64),state:'completed'}}); await h.settle();
   assert.equal(h.calls.length,before); assert.equal(h.hooks.step,2);
   h.message(); await h.settle(); assert.equal(h.hooks.step,3);
   assert.equal(h.calls.filter(c=>c.body).length,2);
-  for (const result of [{data:{status:'awaiting_owner'}},{data:{status:'busy'}},{error:'Reconciliation rejected'}]) {
+  for (const result of [{data:{state:'awaiting_owner'}},{data:{state:'busy'}},{error:'Reconciliation rejected'}]) {
     const unconfirmed=harness([pending('g'),result]);await unconfirmed.settle();unconfirmed.hooks.showStep(2);await unconfirmed.hooks.runAction('policy');unconfirmed.message();await unconfirmed.settle();assert.equal(unconfirmed.hooks.step,2);assert.equal(unconfirmed.calls.filter(c=>c.body).length,2);
     if (result.error) { assert.equal(unconfirmed.get('ceremony-page').hidden,false);assert.equal(unconfirmed.get('review-host').hidden,true);assert.match(unconfirmed.get('status').textContent,/rejected/i); }
   }
