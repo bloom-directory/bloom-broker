@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Version, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri, Version, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -365,6 +365,15 @@ fn bounded(field: &str, value: u64, ceiling: u64) -> Result<(), ProtocolError> {
 
 const SHELL_HTML: &str = include_str!("ceremony_assets/index.html");
 const APP_JS: &str = include_str!("ceremony_assets/app.js");
+const ONBOARDING_HTML: &str = include_str!("ceremony_assets/onboarding/index.html");
+const ONBOARDING_JS: &str = include_str!("ceremony_assets/onboarding/app.js");
+const ONBOARDING_CSS: &str = include_str!("ceremony_assets/onboarding/style.css");
+
+#[derive(Clone, Copy)]
+enum PageSecurity {
+    Onboarding,
+    EmbeddedLocalCeremony,
+}
 const STYLE_CSS: &str = include_str!("ceremony_assets/style.css");
 const BLOOM_PRIMARY_SVG: &str = include_str!("ceremony_assets/bloom-primary.svg");
 
@@ -2523,6 +2532,9 @@ impl CeremonyBroker {
     pub fn router(&self) -> Router {
         let router = Router::new()
             .route("/", get(shell))
+            .route("/onboarding/", get(onboarding_shell))
+            .route("/onboarding/app.js", get(onboarding_js))
+            .route("/onboarding/style.css", get(onboarding_css))
             .route("/.well-known/bloom/relay-health", get(remote_health))
             .route("/ceremony/{token}", get(ceremony_shell))
             .route("/api/session/exchange", post(exchange_remote_fragment))
@@ -3725,6 +3737,40 @@ async fn shell(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Resp
     Redirect::to("https://bloom.directory/#").into_response()
 }
 
+async fn onboarding_shell(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    if !broker.serves_local() || broker.validate_served_host(&headers).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let mut response = Html(ONBOARDING_HTML).into_response();
+    response.extensions_mut().insert(PageSecurity::Onboarding);
+    response
+}
+
+async fn onboarding_js(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    if !broker.serves_local() || broker.validate_served_host(&headers).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        ONBOARDING_JS,
+    )
+        .into_response()
+}
+
+async fn onboarding_css(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    if !broker.serves_local() || broker.validate_served_host(&headers).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        ONBOARDING_CSS,
+    )
+        .into_response()
+}
+
 async fn ceremony_resume_shell(
     State(broker): State<CeremonyBroker>,
     headers: HeaderMap,
@@ -3823,6 +3869,7 @@ async fn exchange_remote_fragment(
 async fn ceremony_shell(
     State(broker): State<CeremonyBroker>,
     Path(token): Path<String>,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Response {
     if broker.validate_served_host(&headers).is_err() || !broker.serves_local() {
@@ -3835,7 +3882,15 @@ async fn ceremony_shell(
         broker.record_invalid_browser_token();
         return StatusCode::NOT_FOUND.into_response();
     }
-    Html(SHELL_HTML).into_response()
+    let mut response = Html(SHELL_HTML).into_response();
+    // This opt-in changes framing only after the local browser capability has
+    // authenticated. Remote hosted ceremonies and ordinary launches stay DENY.
+    if uri.query() == Some("onboarding=1") {
+        response
+            .extensions_mut()
+            .insert(PageSecurity::EmbeddedLocalCeremony);
+    }
+    response
 }
 
 async fn app_js(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
@@ -4672,6 +4727,7 @@ fn normalize_http2_authority(request: &mut Request<Body>) -> Result<(), ()> {
 }
 
 fn apply_security_headers(response: &mut Response) {
+    let page_security = response.extensions().get::<PageSecurity>().copied();
     let headers = response.headers_mut();
     // This marker is diagnostic only. It lets a Machine whose authenticated
     // Unix edge is unavailable report that a Bloom-shaped listener appears to
@@ -4693,6 +4749,23 @@ fn apply_security_headers(response: &mut Response) {
         HeaderName::from_static("x-frame-options"),
         HeaderValue::from_static("DENY"),
     );
+    match page_security {
+        Some(PageSecurity::Onboarding) => {
+            headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(
+                "default-src 'none'; script-src 'self'; connect-src 'self' http://127.0.0.1:*; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-src 'self'; frame-ancestors 'none'",
+            ));
+        }
+        Some(PageSecurity::EmbeddedLocalCeremony) => {
+            headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(
+                "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'",
+            ));
+            headers.insert(
+                HeaderName::from_static("x-frame-options"),
+                HeaderValue::from_static("SAMEORIGIN"),
+            );
+        }
+        None => {}
+    }
     headers.insert(
         HeaderName::from_static("referrer-policy"),
         HeaderValue::from_static("no-referrer"),

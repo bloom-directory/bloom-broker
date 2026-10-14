@@ -9968,3 +9968,182 @@ process.stdout.write("session-review-ok");
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "session-review-ok");
 }
+
+#[tokio::test]
+async fn onboarding_page_is_local_and_host_bound_with_a_narrow_bridge_csp() {
+    let broker = CeremonyBroker::new(Arc::new(MockSigner::new()));
+    let app = broker.router();
+    let get = |path: &str, host: &str| {
+        Request::builder()
+            .uri(path)
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let page = app
+        .clone()
+        .oneshot(get("/onboarding/", "localhost:18734"))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let csp = page.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap();
+    assert!(csp.contains("connect-src 'self' http://127.0.0.1:*"));
+    assert!(csp.contains("frame-src 'self'"));
+    assert!(csp.contains("frame-ancestors 'none'"));
+    assert_eq!(page.headers()["x-frame-options"], "DENY");
+    assert_eq!(page.headers()[header::CACHE_CONTROL], "no-store");
+    assert!(
+        !page
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+    );
+    let html = String::from_utf8(
+        page.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("/assets/style.css"));
+    assert!(html.contains("/assets/theme.css"));
+    for path in [
+        "/onboarding/",
+        "/onboarding/app.js",
+        "/onboarding/style.css",
+    ] {
+        let wrong_host = app
+            .clone()
+            .oneshot(get(path, "attacker.example"))
+            .await
+            .unwrap();
+        assert_eq!(wrong_host.status(), StatusCode::NOT_FOUND);
+        assert!(
+            wrong_host.headers()[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .contains("frame-ancestors 'none'")
+        );
+    }
+    let remote = broker
+        .for_remote_origin("https://abcdefghijklmnopqrstuv2345.relay.bloom.directory")
+        .unwrap()
+        .router();
+    for path in [
+        "/onboarding/",
+        "/onboarding/app.js",
+        "/onboarding/style.css",
+    ] {
+        let denied = remote
+            .clone()
+            .oneshot(get(
+                path,
+                "abcdefghijklmnopqrstuv2345.relay.bloom.directory",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn onboarding_framing_requires_a_valid_local_ceremony_capability_and_explicit_opt_in() {
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        Arc::new(MockSigner::new()),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[31; 32]),
+    );
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let prepared = broker
+        .prepare_approval(approval_request(), ReviewManifestContext::default(), now_ms)
+        .unwrap();
+    let token = url_token(&prepared.ceremony_url);
+    let app = broker.router();
+    for query in ["", "?onboarding=0", "?onboarding=1"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/ceremony/{token}{query}"))
+                    .header(header::HOST, "localhost:18734")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let embed = query == "?onboarding=1";
+        assert_eq!(
+            response.headers()["x-frame-options"],
+            if embed { "SAMEORIGIN" } else { "DENY" }
+        );
+        assert!(
+            response.headers()[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .contains(if embed {
+                    "frame-ancestors 'self'"
+                } else {
+                    "frame-ancestors 'none'"
+                })
+        );
+    }
+    let invalid = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ceremony/invalid?onboarding=1")
+                .header(header::HOST, "localhost:18734")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::NOT_FOUND);
+    assert_eq!(invalid.headers()["x-frame-options"], "DENY");
+    let remote = broker
+        .for_remote_origin("https://abcdefghijklmnopqrstuv2345.relay.bloom.directory")
+        .unwrap()
+        .router();
+    let denied = remote
+        .oneshot(
+            Request::builder()
+                .uri(format!("/ceremony/{token}?onboarding=1"))
+                .header(
+                    header::HOST,
+                    "abcdefghijklmnopqrstuv2345.relay.bloom.directory",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(denied.headers()["x-frame-options"], "DENY");
+    let hosted_shell = broker
+        .for_remote_origin("https://abcdefghijklmnopqrstuv2345.relay.bloom.directory")
+        .unwrap()
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/ceremony/?onboarding=1")
+                .header(
+                    header::HOST,
+                    "abcdefghijklmnopqrstuv2345.relay.bloom.directory",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hosted_shell.status(), StatusCode::OK);
+    assert_eq!(hosted_shell.headers()["x-frame-options"], "DENY");
+}

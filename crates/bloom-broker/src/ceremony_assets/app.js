@@ -1,4 +1,8 @@
 "use strict";
+const onboardingFrame = window.parent !== window && location.search === '?onboarding=1';
+function notifyOnboarding(state) {
+  if (onboardingFrame) window.parent.postMessage({type:'bloom.onboarding.ceremony', ceremony_id:ceremonyId, state}, location.origin);
+}
 const statusNode = document.getElementById("status");
 const reviewNode = document.getElementById("review");
 const approve = document.getElementById("approve");
@@ -2288,6 +2292,7 @@ async function load() {
         "You cancelled this ceremony. No signature was created and nothing was broadcast."));
       cancel.hidden = true;
       approve.hidden = true;
+      notifyOnboarding('canceled');
     } catch (error) {
       // An expiry that landed while cancelling stays terminal: its message
       // stands and no control comes back.
@@ -2535,6 +2540,7 @@ async function finishBrowserResult(session, result) {
     renderDone(session, result);
   }
   await clearBrowserState(ceremonyId);
+  notifyOnboarding('completed');
 }
 
 function canonicalJson(value) {
