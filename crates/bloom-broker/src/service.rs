@@ -938,12 +938,13 @@ impl BrokerRpcService {
                         "invalid canonical policy",
                     )
                 })?;
+            let clear_signing = self.clear_signing_context(&policy)?;
             if !request.evm_review_payloads.is_empty() {
-                let clear_signing = self.clear_signing_context(&policy)?;
                 context.evm_review =
                     crate::evm_review::review(&request, &policy, from, &clear_signing)?;
             }
-            context.safe_review = crate::safe_review::review(&request, &policy, from)?;
+            context.safe_review =
+                crate::safe_review::review(&request, &policy, from, &clear_signing)?;
             review_policy = Some(policy.clone());
         }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
