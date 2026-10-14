@@ -3136,8 +3136,11 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
 
     let parent_key = machine_registration_result.public_key_refs[0].clone();
     let derive_operation = operation("d2");
-    let scope_lifetime_ms = 60_000;
-    let approval_lifetime_ms = 30_000;
+    // This covers policy/signing behavior through real debug services, not
+    // wall-clock latency. Leave time for the intervening owner ceremonies;
+    // expiry has separate boundary tests.
+    let scope_lifetime_ms = 120_000;
+    let approval_lifetime_ms = 60_000;
     let scope = PetalKeyScope {
         wallet_id: wallet_id.clone(),
         parent_key_ref: parent_key.clone(),
