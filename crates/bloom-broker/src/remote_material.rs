@@ -124,6 +124,44 @@ impl std::fmt::Display for RelayNotReady {
 
 impl std::error::Error for RelayNotReady {}
 
+/// The relay refused to renew a scoped credential that has already expired
+/// here: it is past the relay's renewal grace (or was revoked), so no retry can
+/// succeed. Re-provisioning through the Signer administrator replaces it,
+/// because Signer re-issues any credential that is expired or close to it.
+#[derive(Debug)]
+pub(super) struct CredentialsExpired;
+
+impl std::fmt::Display for CredentialsExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "relay refused to renew an expired scoped credential; re-provision with `sudo bloom-signer admin provision`",
+        )
+    }
+}
+
+impl std::error::Error for CredentialsExpired {}
+
+pub(super) fn credentials_rejected(error: &Failure) -> bool {
+    error.downcast_ref::<CredentialsExpired>().is_some()
+}
+
+/// A renewal refusal means the credentials need re-provisioning only once the
+/// local credential has expired: Signer leaves an unexpired one in place, so a
+/// revoked-but-unexpired credential keeps reporting the plain refusal until
+/// then.
+fn renewal_failure(
+    error: bloom_relay_client::ClientError,
+    expires_at_ms: u64,
+    now_ms: u64,
+) -> Failure {
+    match error {
+        bloom_relay_client::ClientError::Refused(401) if expires_at_ms <= now_ms => {
+            Box::new(CredentialsExpired)
+        }
+        other => Box::new(other),
+    }
+}
+
 pub(super) fn relay_not_ready(error: &Failure) -> bool {
     error.downcast_ref::<RelayNotReady>().is_some()
 }
@@ -250,6 +288,33 @@ fn metadata_path(credential: &Path) -> Result<PathBuf, Failure> {
     sibling(credential, "metadata.json")
 }
 
+/// The durable record for the renewal in flight, created on first use.
+///
+/// One scope has at most one renewal operation at a time: the new token and
+/// its operation ID are durable before the relay is asked to issue against
+/// them, so a crash before the receipt arrives resumes the same operation
+/// rather than minting a second one the relay would have to arbitrate.
+fn load_or_create_pending(pending_path: &Path, uid: u32) -> Result<PendingRenewal, Failure> {
+    let pending: PendingRenewal = if pending_path.exists() {
+        serde_json::from_slice(&read_protected(pending_path, uid)?)?
+    } else {
+        let mut secret = [0u8; 32];
+        rand::fill(&mut secret);
+        let pending = PendingRenewal {
+            version: 1,
+            new_token: hex::encode(secret),
+            operation_id: Uuid::new_v4(),
+            receipt: None,
+        };
+        atomic_private(pending_path, &serde_json::to_vec(&pending)?)?;
+        pending
+    };
+    if pending.version != 1 || pending.operation_id.is_nil() {
+        return Err("invalid persisted scoped renewal".into());
+    }
+    Ok(pending)
+}
+
 async fn renew_scope(
     credential: &Path,
     ca: &[u8],
@@ -273,23 +338,7 @@ async fn renew_scope(
     {
         return Ok(metadata);
     }
-    let mut pending: PendingRenewal = if pending_path.exists() {
-        serde_json::from_slice(&read_protected(&pending_path, uid)?)?
-    } else {
-        let mut secret = [0u8; 32];
-        rand::fill(&mut secret);
-        let pending = PendingRenewal {
-            version: 1,
-            new_token: hex::encode(secret),
-            operation_id: Uuid::new_v4(),
-            receipt: None,
-        };
-        atomic_private(&pending_path, &serde_json::to_vec(&pending)?)?;
-        pending
-    };
-    if pending.version != 1 || pending.operation_id.is_nil() {
-        return Err("invalid persisted scoped renewal".into());
-    }
+    let mut pending = load_or_create_pending(&pending_path, uid)?;
     if pending.receipt.is_none() {
         let receipt = renew_scoped_credential(
             ca.to_vec(),
@@ -300,16 +349,36 @@ async fn renew_scope(
             pending.new_token.clone(),
             pending.operation_id,
         )
-        .await?;
+        .await
+        .map_err(|error| renewal_failure(error, metadata.expires_at_ms, now_ms().unwrap_or(0)))?;
         pending.receipt = Some(receipt);
         atomic_private(&pending_path, &serde_json::to_vec(&pending)?)?;
     }
     let receipt = pending.receipt.as_ref().ok_or("missing renewal receipt")?;
-    if receipt.scope != scope
+    if receipt.version != 1
+        || receipt.scope != scope
         || receipt.operation_id != pending.operation_id
-        || receipt.generation <= metadata.generation
-        || receipt.expires_at_ms <= now_ms()?
     {
+        return Err("scoped renewal receipt mismatches pending operation".into());
+    }
+    // The replacement below writes the credential, then the metadata, then
+    // deletes this record. A crash after both writes leaves a record whose
+    // receipt is already installed, and whose generation is therefore no
+    // longer ahead of the live metadata. Recognise exactly that state and
+    // finish the interrupted deletion instead of refusing forever: the live
+    // metadata is field-for-field what this receipt installed, and the
+    // credential is written before it, so the new token is already in place.
+    // Expiry is deliberately not consulted here. An applied receipt stays
+    // applied, and one that lapsed during a long outage must still be able to
+    // clear its record so the next round can start a fresh renewal.
+    if metadata.generation == receipt.generation
+        && metadata.operation_id == receipt.operation_id
+        && metadata.expires_at_ms == receipt.expires_at_ms
+    {
+        fs::remove_file(&pending_path)?;
+        return Ok(metadata);
+    }
+    if receipt.generation <= metadata.generation || receipt.expires_at_ms <= now_ms()? {
         return Err("scoped renewal receipt mismatches pending operation".into());
     }
     let next = ScopedMetadata {
@@ -922,6 +991,36 @@ mod tests {
     }
 
     #[test]
+    fn only_refusing_an_expired_credential_means_re_provisioning() {
+        use bloom_relay_client::ClientError;
+        let expired = renewal_failure(ClientError::Refused(401), 1_000, 1_000);
+        assert!(credentials_rejected(&expired));
+        assert!(expired.to_string().contains("bloom-signer admin provision"));
+        // Revoked but not yet expired here: Signer would keep it, so
+        // re-provisioning cannot help yet.
+        assert!(!credentials_rejected(&renewal_failure(
+            ClientError::Refused(401),
+            1_001,
+            1_000
+        )));
+        assert!(!credentials_rejected(&renewal_failure(
+            ClientError::Refused(409),
+            1_000,
+            1_000
+        )));
+        assert!(!credentials_rejected(&renewal_failure(
+            ClientError::Transport,
+            1_000,
+            1_000
+        )));
+        let unauthorized: Failure = Box::new(ClientError::Refused(401));
+        assert!(
+            !credentials_rejected(&unauthorized),
+            "only the renewal path classifies"
+        );
+    }
+
+    #[test]
     fn control_roots_load_every_certificate_or_fail() {
         let bundle = include_bytes!("../tests/fixtures/relay/isrg-roots.pem");
         assert_eq!(control_roots(bundle).unwrap().len(), 2);
@@ -1112,6 +1211,278 @@ mod tests {
             now,
             RENEW_BEFORE_MS
         ));
+    }
+
+    const ORIGINAL_TOKEN: &str = "original-tunnel-token";
+    const RENEWED_TOKEN: &str = "renewed-tunnel-token";
+
+    /// A provisioned Tunnel credential and the siblings its split-file
+    /// renewal writes.
+    struct ScopedCredential {
+        _directory: tempfile::TempDir,
+        credential: PathBuf,
+        metadata: PathBuf,
+        pending: PathBuf,
+        installation_id: Uuid,
+        uid: u32,
+    }
+
+    impl ScopedCredential {
+        fn provision() -> Result<Self, Failure> {
+            let directory = tempfile::tempdir()?;
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+            let credential = directory.path().join("relay-tunnel-credential");
+            atomic_private(&credential, ORIGINAL_TOKEN.as_bytes())?;
+            Ok(Self {
+                metadata: metadata_path(&credential)?,
+                pending: sibling(&credential, "renewal.json")?,
+                installation_id: Uuid::new_v4(),
+                uid: fs::symlink_metadata(&credential)?.uid(),
+                credential,
+                _directory: directory,
+            })
+        }
+
+        fn write_metadata(
+            &self,
+            generation: u64,
+            expires_at_ms: u64,
+            operation_id: Uuid,
+        ) -> Result<(), Failure> {
+            atomic_private(
+                &self.metadata,
+                &serde_json::to_vec(&ScopedMetadata {
+                    version: 1,
+                    installation_id: self.installation_id,
+                    scope: Scope::Tunnel,
+                    generation,
+                    expires_at_ms,
+                    operation_id,
+                })?,
+            )
+        }
+
+        fn write_pending(
+            &self,
+            operation_id: Uuid,
+            receipt: Option<CredentialIssueReceipt>,
+        ) -> Result<(), Failure> {
+            atomic_private(
+                &self.pending,
+                &serde_json::to_vec(&PendingRenewal {
+                    version: 1,
+                    new_token: RENEWED_TOKEN.to_owned(),
+                    operation_id,
+                    receipt,
+                })?,
+            )
+        }
+
+        /// Run one maintenance round. The receipt in the pending record is
+        /// already durable in every case below, so no relay call is reached
+        /// and the control CA is never read.
+        async fn round(&self) -> Result<ScopedMetadata, Failure> {
+            renew_scope(
+                &self.credential,
+                &[],
+                self.installation_id,
+                Scope::Tunnel,
+                self.uid,
+            )
+            .await
+        }
+
+        fn token(&self) -> Result<Vec<u8>, Failure> {
+            read_protected(&self.credential, self.uid)
+        }
+    }
+
+    fn tunnel_receipt(
+        generation: u64,
+        operation_id: Uuid,
+        expires_at_ms: u64,
+    ) -> CredentialIssueReceipt {
+        CredentialIssueReceipt {
+            version: 1,
+            scope: Scope::Tunnel,
+            generation,
+            operation_id,
+            expires_at_ms,
+        }
+    }
+
+    #[test]
+    fn scoped_renewal_resumes_one_operation_until_its_receipt_is_durable() {
+        let scoped = ScopedCredential::provision().unwrap();
+        let first = load_or_create_pending(&scoped.pending, scoped.uid).unwrap();
+        assert_eq!(first.new_token.len(), 64);
+        assert!(!first.operation_id.is_nil());
+        assert!(first.receipt.is_none());
+        // A crash between writing this record and hearing back from the relay
+        // must resume the same operation. A second token and operation ID
+        // would leave the relay arbitrating two renewals of one generation.
+        let resumed = load_or_create_pending(&scoped.pending, scoped.uid).unwrap();
+        assert_eq!(resumed.new_token, first.new_token);
+        assert_eq!(resumed.operation_id, first.operation_id);
+        // The record holds the next bearer token, so it is owner-only private
+        // material like the credential beside it.
+        assert_eq!(
+            fs::symlink_metadata(&scoped.pending).unwrap().mode() & 0o777,
+            0o600
+        );
+        scoped.write_pending(Uuid::nil(), None).unwrap();
+        assert!(load_or_create_pending(&scoped.pending, scoped.uid).is_err());
+    }
+
+    #[tokio::test]
+    async fn interrupted_scoped_renewal_converges_and_clears_its_pending_record() {
+        let scoped = ScopedCredential::provision().unwrap();
+        let now = now_ms().unwrap();
+        let renewed_until = now + 48 * 60 * 60 * 1000;
+        let operation_id = Uuid::new_v4();
+        let receipt = tunnel_receipt(8, operation_id, renewed_until);
+
+        // Boundary one: the authenticated receipt is durable and neither split
+        // file has been replaced yet.
+        scoped
+            .write_metadata(7, now + 60_000, Uuid::new_v4())
+            .unwrap();
+        scoped
+            .write_pending(operation_id, Some(receipt.clone()))
+            .unwrap();
+        let applied = scoped.round().await.unwrap();
+        assert_eq!(applied.generation, 8);
+        assert_eq!(applied.operation_id, operation_id);
+        assert_eq!(applied.expires_at_ms, renewed_until);
+        assert_eq!(scoped.token().unwrap(), RENEWED_TOKEN.as_bytes());
+        assert!(!scoped.pending.exists());
+
+        // Boundary two: the credential was replaced and the metadata write was
+        // lost. The same receipt reapplies both writes.
+        scoped
+            .write_metadata(7, now + 60_000, Uuid::new_v4())
+            .unwrap();
+        scoped
+            .write_pending(operation_id, Some(receipt.clone()))
+            .unwrap();
+        let reapplied = scoped.round().await.unwrap();
+        assert_eq!(reapplied.generation, 8);
+        assert_eq!(scoped.token().unwrap(), RENEWED_TOKEN.as_bytes());
+        assert!(!scoped.pending.exists());
+
+        // Boundary three, the reported crash: the credential and the metadata
+        // were both replaced and only the record deletion was lost. The
+        // receipt is no longer ahead of the metadata it installed, which used
+        // to fail this scope's maintenance on every round forever.
+        scoped
+            .write_metadata(8, renewed_until, operation_id)
+            .unwrap();
+        scoped.write_pending(operation_id, Some(receipt)).unwrap();
+        let converged = scoped.round().await.unwrap();
+        assert_eq!(converged.generation, 8);
+        assert_eq!(converged.operation_id, operation_id);
+        assert_eq!(converged.expires_at_ms, renewed_until);
+        assert_eq!(scoped.token().unwrap(), RENEWED_TOKEN.as_bytes());
+        assert!(!scoped.pending.exists());
+        // With the record gone and the credential fresh, the next round is a
+        // no-op rather than a second renewal.
+        assert_eq!(scoped.round().await.unwrap().generation, 8);
+        assert_eq!(scoped.token().unwrap(), RENEWED_TOKEN.as_bytes());
+
+        // An applied receipt that lapsed during a long outage still clears its
+        // record. Holding it would deadlock the scope on a receipt no later
+        // round could ever satisfy.
+        let lapsed = Uuid::new_v4();
+        scoped.write_metadata(9, now - 1, lapsed).unwrap();
+        scoped
+            .write_pending(lapsed, Some(tunnel_receipt(9, lapsed, now - 1)))
+            .unwrap();
+        let cleared = scoped.round().await.unwrap();
+        assert_eq!(cleared.generation, 9);
+        assert!(!scoped.pending.exists());
+    }
+
+    #[tokio::test]
+    async fn scoped_renewal_still_rejects_stale_and_mismatched_receipts() {
+        let now = now_ms().unwrap();
+        let live_until = now + 48 * 60 * 60 * 1000;
+        let operation_id = Uuid::new_v4();
+        let other_operation = Uuid::new_v4();
+        let rejected: [(&str, u64, Uuid, CredentialIssueReceipt); 7] = [
+            (
+                "a receipt issued for the other scope",
+                7,
+                operation_id,
+                CredentialIssueReceipt {
+                    scope: Scope::DnsChallenge,
+                    ..tunnel_receipt(8, operation_id, live_until)
+                },
+            ),
+            (
+                "a receipt with an unsupported protocol version",
+                7,
+                operation_id,
+                CredentialIssueReceipt {
+                    version: 2,
+                    ..tunnel_receipt(8, operation_id, live_until)
+                },
+            ),
+            (
+                "a receipt naming a different renewal operation",
+                7,
+                operation_id,
+                tunnel_receipt(8, other_operation, live_until),
+            ),
+            (
+                "a replayed receipt behind the live generation",
+                9,
+                operation_id,
+                tunnel_receipt(8, operation_id, live_until),
+            ),
+            (
+                // The near miss of convergence: the generation matches but the
+                // metadata was installed by a different operation, so this
+                // receipt was never the one applied.
+                "a receipt at the live generation from another operation",
+                8,
+                operation_id,
+                tunnel_receipt(8, operation_id, live_until),
+            ),
+            (
+                // Same generation and operation, but a different deadline:
+                // not the receipt that produced the live metadata either.
+                "a receipt disagreeing with the live expiry",
+                8,
+                operation_id,
+                tunnel_receipt(8, operation_id, live_until + 1),
+            ),
+            (
+                "an unapplied receipt that already expired",
+                7,
+                operation_id,
+                tunnel_receipt(8, operation_id, now - 1),
+            ),
+        ];
+        for (reason, generation, pending_operation, receipt) in rejected {
+            let scoped = ScopedCredential::provision().unwrap();
+            // Case four installs metadata from an unrelated operation; the
+            // others keep a live operation ID that cannot match the receipt.
+            scoped
+                .write_metadata(generation, live_until, other_operation)
+                .unwrap();
+            scoped
+                .write_pending(pending_operation, Some(receipt))
+                .unwrap();
+            assert!(scoped.round().await.is_err(), "accepted {reason}");
+            // Fail closed: the credential in service is untouched and the
+            // record is retained for an operator to inspect.
+            assert_eq!(
+                scoped.token().unwrap(),
+                ORIGINAL_TOKEN.as_bytes(),
+                "{reason}"
+            );
+            assert!(scoped.pending.exists(), "{reason}");
+        }
     }
 
     #[tokio::test]

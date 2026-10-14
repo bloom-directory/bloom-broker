@@ -240,7 +240,7 @@ impl CeremonyBroker {
             created_at_ms: now_ms,
             origin,
         })?;
-        let url = session_url(&session);
+        let url = new_session_url(&session)?;
         self.insert_session(ceremony_id, session)?;
         Ok(CustodyPrepareResponse {
             ceremony_kind: kind_to_machine(kind),

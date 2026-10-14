@@ -102,6 +102,7 @@ fn capabilities() -> ServiceCapabilities {
             verifier_id: token("webauthn"),
             verifier_digest: digest(13),
         }],
+        clear_signing: Vec::new(),
         frame_max_bytes: DecimalU64::new(FRAME_MAX_BYTES as u64),
     }
 }
@@ -299,6 +300,8 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
         MachineBrokerRequest::CeremonySurfaceStatus(Empty {}),
         MachineBrokerRequest::ActionValidate(digest(58)),
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            requested_review_mode: None,
+            evm_review_payloads: Vec::new(),
             operation_id: operation(54),
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             terms: approval_terms(),
@@ -640,6 +643,11 @@ where
 
 #[test]
 fn every_machine_broker_variant_matches_frozen_v1_frames() {
+    // Protocol 1.6 added the native assurance claims and the EVM review
+    // payload field to the request frames (empty review payloads remain
+    // omitted from the pre-existing approval request vectors); 1.7 adds the
+    // remote-ceremony methods and surface selection. Private travelers add
+    // traveler list, save and delete.
     assert_eq!(MachineBrokerMethod::ALL.len(), 53);
     assert_wire_digest(
         "machine requests",

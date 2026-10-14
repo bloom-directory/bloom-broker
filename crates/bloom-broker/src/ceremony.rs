@@ -55,7 +55,10 @@ use std::{
     future::{Future, IntoFuture},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
     path::Path as FsPath,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -371,11 +374,30 @@ const APP_JS: &str = include_str!("ceremony_assets/app.js");
 const STYLE_CSS: &str = include_str!("ceremony_assets/style.css");
 const BLOOM_PRIMARY_SVG: &str = include_str!("ceremony_assets/bloom-primary.svg");
 
+/// Optional owner-installed ceremony CSS, read once at startup from the path
+/// named in the Broker configuration and held in memory.
+///
+/// Only that one configured file is ever served: the route takes no path,
+/// name or query, so it cannot be used to read anything else. The stylesheet
+/// loads after the default one, so the documented custom properties override
+/// cleanly. It is trusted UI code and nothing pretends otherwise — arbitrary
+/// CSS can hide a warning or a button, which is why it comes from the
+/// owner's own configuration and never from a descriptor, a publisher, a
+/// dapp, a request parameter or a URL.
+static OWNER_THEME_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Install the owner's theme. Called once during startup, before the listener
+/// accepts anything; a wallet with no configured theme keeps the default.
+pub fn install_owner_theme_css(css: String) {
+    let _ = OWNER_THEME_CSS.set(css);
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ReviewManifestContext {
     pub petal_use_claim: Option<PetalUseClaim>,
     pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance: Option<ClaimAssurance>,
+    pub evm_review: Option<crate::evm_review::EvmReview>,
     pub attributed_advisory_items: Vec<String>,
 }
 
@@ -392,6 +414,8 @@ pub(crate) struct ReviewManifest {
     pub petal_use_claim: Option<PetalUseClaim>,
     pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance: Option<ClaimAssurance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm_review: Option<crate::evm_review::EvmReview>,
     pub attributed_advisory_items: Vec<String>,
     pub issued_at_ms: DecimalU64,
     pub expires_at_ms: DecimalU64,
@@ -413,6 +437,8 @@ impl ReviewManifest {
             petal_use_claim: &'a Option<PetalUseClaim>,
             system_use_claim: &'a Option<SystemUseClaim>,
             claim_assurance: &'a Option<ClaimAssurance>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            evm_review: &'a Option<crate::evm_review::EvmReview>,
             attributed_advisory_items: &'a [String],
             issued_at_ms: &'a DecimalU64,
             expires_at_ms: &'a DecimalU64,
@@ -429,6 +455,7 @@ impl ReviewManifest {
             petal_use_claim: &self.petal_use_claim,
             system_use_claim: &self.system_use_claim,
             claim_assurance: &self.claim_assurance,
+            evm_review: &self.evm_review,
             attributed_advisory_items: &self.attributed_advisory_items,
             issued_at_ms: &self.issued_at_ms,
             expires_at_ms: &self.expires_at_ms,
@@ -752,6 +779,9 @@ struct BrokerInner {
     journal: Option<Arc<BrokerJournal>>,
     manifest_signer: Option<(Token, SigningKey)>,
     completion_observer: Mutex<Option<Arc<dyn CeremonyCompletionObserver>>>,
+    /// Set while the relay refuses to renew Broker's scoped credentials; see
+    /// [`CeremonyExposureStage::CredentialsExpired`].
+    remote_credentials_rejected: AtomicBool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1216,6 +1246,15 @@ impl CeremonyBroker {
                     // keeping its existing local ceremony entrypoints usable.
                     return Ok(local);
                 }
+                if self.remote_credentials_rejected() {
+                    // A hosted link would never load: the tunnel is down until
+                    // re-provisioning. Like any assigned outage, this does not
+                    // silently fall back to localhost.
+                    return Err(protocol(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "hosted ceremony surface is off: the relay refused to renew Broker's credentials; run `sudo bloom-signer admin provision`, or explicitly select local",
+                    ));
+                }
                 if status.desired_mode != ExposureMode::RemoteEnabled
                     || status.effective_mode != ExposureMode::RemoteEnabled
                     || status.desired_revision != status.effective_revision
@@ -1238,6 +1277,20 @@ impl CeremonyBroker {
                 })
             }
         }
+    }
+
+    /// Records whether the relay refuses to renew Broker's scoped credentials.
+    /// Returns the previous value, so a caller can report only the change.
+    pub fn set_remote_credentials_rejected(&self, rejected: bool) -> bool {
+        self.inner
+            .remote_credentials_rejected
+            .swap(rejected, Ordering::SeqCst)
+    }
+
+    pub fn remote_credentials_rejected(&self) -> bool {
+        self.inner
+            .remote_credentials_rejected
+            .load(Ordering::SeqCst)
     }
 
     pub fn exposure_status(&self) -> Result<CeremonyExposureStatus, ProtocolError> {
@@ -1269,6 +1322,8 @@ impl CeremonyBroker {
             }
         } else if remote.is_none() {
             CeremonyExposureStage::Unprovisioned
+        } else if self.remote_credentials_rejected() {
+            CeremonyExposureStage::CredentialsExpired
         } else if !status.remote_tls_ready {
             CeremonyExposureStage::CertificatePending
         } else if !status.remote_routing_ready {
@@ -1357,6 +1412,7 @@ impl CeremonyBroker {
                 journal,
                 manifest_signer,
                 completion_observer: Mutex::new(None),
+                remote_credentials_rejected: AtomicBool::new(false),
             }),
         }
     }
@@ -1436,7 +1492,7 @@ impl CeremonyBroker {
             created_at_ms: now_ms,
             origin,
         })?;
-        let url = session_url(&session);
+        let url = new_session_url(&session)?;
         self.insert_session(ceremony_id.clone(), session)?;
         Ok(SealedApprovalPrepareResponse {
             approval_id: request
@@ -1481,14 +1537,14 @@ impl CeremonyBroker {
             if session.request_digest != request_digest || session.cross_surface.is_none() {
                 return Err(operation_conflict());
             }
-            if session.state != CeremonyState::AwaitingUser || session.token.is_none() {
+            if session.state != CeremonyState::AwaitingUser {
                 return Err(replay());
             }
             return Ok(CeremonyCrossSurfacePrepareResponse {
                 operation_id: request.operation_id,
                 ceremony_id: session.projection.ceremony_id.clone(),
                 state: BrokerCeremonyState::AwaitingUser,
-                destination_url: session_url(session),
+                destination_url: session_url(session).ok_or_else(launch_capability_consumed)?,
                 expires_at_ms: DecimalU64::new(session.expires_at_ms),
             });
         }
@@ -1554,7 +1610,7 @@ impl CeremonyBroker {
             source_prepared: None,
             handoff: None,
         });
-        let url = session_url(&session);
+        let url = new_session_url(&session)?;
         self.insert_session(ceremony_id.clone(), session)?;
         Ok(CeremonyCrossSurfacePrepareResponse {
             operation_id: request.operation_id,
@@ -1633,13 +1689,14 @@ impl CeremonyBroker {
                 .get(source_id.as_str())
                 .cloned()
                 .ok_or_else(not_found)?;
-            if pairing.destination_hpke_public_key != body.destination_hpke_public_key
-                || source.token.is_none()
-            {
+            if pairing.destination_hpke_public_key != body.destination_hpke_public_key {
                 return Err(operation_conflict());
             }
+            // The source tab's own launch capability is single-use too: a
+            // repeated pair cannot republish it once that tab exchanged it.
+            let source_url = session_url(&source).ok_or_else(operation_conflict)?;
             return Ok(serde_json::json!({
-                "source_url": session_url(&source),
+                "source_url": source_url,
                 "confirmation_code": pairing.confirmation_code,
                 "pairing_id": pairing.pairing_id,
                 "expires_at_ms": pairing.expires_at_ms,
@@ -2075,7 +2132,7 @@ impl CeremonyBroker {
             created_at_ms: now_ms,
             origin,
         })?;
-        let url = session_url(&session);
+        let url = new_session_url(&session)?;
         self.insert_session(ceremony_id, session)?;
         Ok(CustodyPrepareResponse {
             ceremony_kind: kind_to_machine(request.ceremony_kind),
@@ -2150,7 +2207,7 @@ impl CeremonyBroker {
         let response = PolicyUpdatePrepareResponse {
             operation_id: request.update.operation_id,
             ceremony_kind: BrokerCeremonyKind::PolicyUpdate,
-            ceremony_url: session_url(&session),
+            ceremony_url: new_session_url(&session)?,
             ceremony_expires_at_ms: DecimalU64::new(expires_at_ms),
             review_manifest_digest: request.broker_validation_receipt.review_manifest_digest,
         };
@@ -2186,10 +2243,13 @@ impl CeremonyBroker {
         }
         let manifest: PolicyUpdateReviewManifest =
             serde_json::from_value(session.projection.review_manifest.clone()?).ok()?;
+        let Some(ceremony_url) = session_url(session) else {
+            return Some(Err(launch_capability_consumed()));
+        };
         Some(Ok(PolicyUpdatePrepareResponse {
             operation_id: update.operation_id.clone(),
             ceremony_kind: BrokerCeremonyKind::PolicyUpdate,
-            ceremony_url: session_url(session),
+            ceremony_url,
             ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             review_manifest_digest: manifest.digest().ok()?,
         }))
@@ -2229,7 +2289,7 @@ impl CeremonyBroker {
             None => None,
         };
         let ceremony_url = if session.state == CeremonyState::AwaitingUser {
-            session.token.as_ref().map(|_| session_url(session))
+            session.token.as_ref().and_then(|_| session_url(session))
         } else {
             None
         };
@@ -2284,10 +2344,9 @@ impl CeremonyBroker {
             if manifest_approval_id != approval_id.as_str() {
                 return None;
             }
-            session
-                .token
-                .as_ref()
-                .map(|_| (session_url(session), DecimalU64::new(session.expires_at_ms)))
+            session.token.as_ref().and_then(|_| {
+                session_url(session).map(|url| (url, DecimalU64::new(session.expires_at_ms)))
+            })
         }))
     }
 
@@ -2372,6 +2431,26 @@ impl CeremonyBroker {
         self.cancel_with_backoff(operation_id, now_ms, BackoffClock::Monotonic)
     }
 
+    fn cancel_signer_or_already_released(
+        &self,
+        operation_id: &OperationId,
+        card: bool,
+    ) -> Result<(), ProtocolError> {
+        let result = if card {
+            self.inner.signer.card_cancel(operation_id).map(|_| ())
+        } else {
+            self.inner.signer.cancel(operation_id)
+        };
+        match result.map_err(signer_error_to_machine) {
+            Ok(())
+            | Err(ProtocolError {
+                code: ProtocolErrorCode::ApprovalNotFound,
+                ..
+            }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     fn cancel_with_backoff(
         &self,
         operation_id: &OperationId,
@@ -2416,17 +2495,10 @@ impl CeremonyBroker {
             latch_terminal(&mut snapshot, now_ms);
             (session.wallet_id.clone(), snapshot)
         };
-        if cards::is_card(snapshot.ceremony_kind) {
-            self.inner
-                .signer
-                .card_cancel(operation_id)
-                .map_err(signer_error_to_machine)?;
-        } else {
-            self.inner
-                .signer
-                .cancel(operation_id)
-                .map_err(signer_error_to_machine)?;
-        }
+        self.cancel_signer_or_already_released(
+            operation_id,
+            cards::is_card(snapshot.ceremony_kind),
+        )?;
         // Both tabs belong to one operation. Leaving its auxiliary source live
         // would strand the wallet's admission slot after a successful cancel.
         let auxiliary = self
@@ -2480,17 +2552,7 @@ impl CeremonyBroker {
                     .lock()
                     .get(&ceremony_id)
                     .is_some_and(|s| cards::is_card(s.ceremony_kind));
-                if card {
-                    self.inner
-                        .signer
-                        .card_cancel(&operation_id)
-                        .map_err(signer_error_to_machine)?;
-                } else {
-                    self.inner
-                        .signer
-                        .cancel(&operation_id)
-                        .map_err(signer_error_to_machine)?;
-                }
+                self.cancel_signer_or_already_released(&operation_id, card)?;
             }
             let snapshot = {
                 let sessions = self.inner.sessions.lock();
@@ -2519,7 +2581,7 @@ impl CeremonyBroker {
     }
 
     pub fn router(&self) -> Router {
-        Router::new()
+        let router = Router::new()
             .route("/", get(shell))
             .route("/.well-known/bloom/relay-health", get(remote_health))
             .route("/ceremony/{token}", get(ceremony_shell))
@@ -2527,7 +2589,9 @@ impl CeremonyBroker {
             .route("/ceremony/", get(ceremony_resume_shell))
             .route("/assets/app.js", get(app_js))
             .route("/assets/style.css", get(style_css))
+            .route("/assets/theme.css", get(theme_css))
             .route("/assets/bloom-primary.svg", get(bloom_primary_svg))
+            .route("/assets/tokens/{name}", get(token_svg))
             .route("/api/session", get(read_session_by_token))
             .route("/api/session/{ceremony_id}", get(read_session))
             .route("/api/session/{ceremony_id}/result", get(read_result))
@@ -2561,7 +2625,18 @@ impl CeremonyBroker {
             .route(
                 "/api/cross/{ceremony_id}/already-registered",
                 post(cross_surface_already_registered),
-            )
+            );
+        // Design previews. They serve the same shell and the same renderer;
+        // the page recognises the path and draws a fixture. A preview name is
+        // not a ceremony token and no session is created for it, so the
+        // approval API behind these paths has nothing to act on. They exist
+        // only in a developer-harness build, so a released Broker serves no
+        // preview surface at all.
+        #[cfg(feature = "triad-dev-harness")]
+        let router = router
+            .route("/preview", get(ceremony_resume_shell))
+            .route("/preview/{name}", get(ceremony_resume_shell));
+        router
             .layer(DefaultBodyLimit::max(MAX_CEREMONY_BODY_BYTES))
             .layer(middleware::from_fn(security_headers))
             .with_state(self.clone())
@@ -2764,10 +2839,7 @@ impl CeremonyBroker {
                     Some(serde_json::to_value(result).map_err(malformed)?),
                 ),
                 SignerCeremonyStatus::Pending => {
-                    self.inner
-                        .signer
-                        .cancel(&operation_id)
-                        .map_err(signer_error_to_machine)?;
+                    self.cancel_signer_or_already_released(&operation_id, false)?;
                     (CeremonyState::Expired, None)
                 }
                 SignerCeremonyStatus::Terminal(state) => (state, None),
@@ -3208,10 +3280,13 @@ impl CeremonyBroker {
         }
         let manifest: ReviewManifest =
             serde_json::from_value(session.projection.review_manifest.clone()?).ok()?;
+        let Some(ceremony_url) = session_url(session) else {
+            return Some(Err(launch_capability_consumed()));
+        };
         Some(Ok(SealedApprovalPrepareResponse {
             approval_id: manifest.approval_id.clone(),
             state: ApprovalPrepareState::AwaitingCeremony,
-            ceremony_url: session_url(session),
+            ceremony_url,
             ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             review_manifest_digest: digest(&manifest).ok()?,
         }))
@@ -3233,11 +3308,14 @@ impl CeremonyBroker {
         }
         let contribution: CustodySignerContribution =
             serde_json::from_value(session.projection.signer_contribution.clone()).ok()?;
+        let Some(ceremony_url) = session_url(session) else {
+            return Some(Err(launch_capability_consumed()));
+        };
         Some(Ok(CustodyPrepareResponse {
             ceremony_kind: kind_to_machine(session.ceremony_kind),
             custody_operation_id: operation_id.clone(),
             state: CustodyPrepareState::AwaitingUser,
-            ceremony_url: session_url(session),
+            ceremony_url,
             ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             signer_contribution_digest: contribution.digest().ok()?,
         }))
@@ -3258,10 +3336,13 @@ impl CeremonyBroker {
         if is_terminal(session.state) {
             return Some(Err(replay()));
         }
+        let Some(ceremony_url) = session_url(session) else {
+            return Some(Err(launch_capability_consumed()));
+        };
         Some(Ok(PolicyUpdatePrepareResponse {
             operation_id: operation_id.clone(),
             ceremony_kind: BrokerCeremonyKind::PolicyUpdate,
-            ceremony_url: session_url(session),
+            ceremony_url,
             ceremony_expires_at_ms: DecimalU64::new(session.expires_at_ms),
             review_manifest_digest: review_manifest_digest.clone(),
         }))
@@ -3402,10 +3483,7 @@ impl CeremonyBroker {
                             Some(serde_json::to_value(result).map_err(malformed)?);
                     }
                     SignerCeremonyStatus::Pending => {
-                        self.inner
-                            .signer
-                            .cancel(&session.operation_id)
-                            .map_err(signer_error_to_machine)?;
+                        self.cancel_signer_or_already_released(&session.operation_id, false)?;
                         session.state = CeremonyState::Expired;
                     }
                     SignerCeremonyStatus::Terminal(state) => {
@@ -3455,12 +3533,14 @@ impl CeremonyBroker {
             manifest.claim_assurance.as_ref(),
             manifest.petal_use_claim.as_ref(),
             manifest.system_use_claim.as_ref(),
+            manifest.evm_review.as_ref(),
         );
         let canonical_plan = canonical_review_plan(
             request,
             &disclosures,
             manifest.petal_use_claim.as_ref(),
             manifest.system_use_claim.as_ref(),
+            manifest.evm_review.as_ref(),
         )?;
         if manifest.approval_id != approval_id
             || manifest.approval_digest != approval_digest
@@ -3499,12 +3579,14 @@ impl CeremonyBroker {
             context.claim_assurance.as_ref(),
             context.petal_use_claim.as_ref(),
             context.system_use_claim.as_ref(),
+            context.evm_review.as_ref(),
         );
         let canonical_plan = canonical_review_plan(
             request,
             &disclosures,
             context.petal_use_claim.as_ref(),
             context.system_use_claim.as_ref(),
+            context.evm_review.as_ref(),
         )?;
         let mut manifest = ReviewManifest {
             schema: Token::new("bloom.review-manifest.v1")?,
@@ -3525,6 +3607,7 @@ impl CeremonyBroker {
             petal_use_claim: context.petal_use_claim,
             system_use_claim: context.system_use_claim,
             claim_assurance: context.claim_assurance,
+            evm_review: context.evm_review,
             attributed_advisory_items: context.attributed_advisory_items,
             issued_at_ms: DecimalU64::new(now_ms),
             expires_at_ms: request.terms.expires_at_ms.clone(),
@@ -3806,6 +3889,9 @@ async fn exchange_remote_fragment(
     let mut response = Json(serde_json::json!({
         "ceremony_id": ceremony_id,
         "csrf": csrf_value,
+        // Reuse the exact public projection served by read_session. Never
+        // serialize the internal BrowserSession snapshot into this response.
+        "session": snapshot.projection,
     }))
     .into_response();
     let set_cookie = format!(
@@ -3863,6 +3949,19 @@ async fn style_css(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> 
         .into_response()
 }
 
+/// The owner's theme, or nothing. An absent theme is an empty stylesheet
+/// rather than a 404, so the default page never reports a missing asset.
+async fn theme_css(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    if broker.validate_served_host(&headers).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        OWNER_THEME_CSS.get().cloned().unwrap_or_default(),
+    )
+        .into_response()
+}
+
 async fn bloom_primary_svg(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
     if broker.validate_served_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
@@ -3870,6 +3969,26 @@ async fn bloom_primary_svg(State(broker): State<CeremonyBroker>, headers: Header
     (
         [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
         BLOOM_PRIMARY_SVG,
+    )
+        .into_response()
+}
+
+async fn token_svg(
+    State(broker): State<CeremonyBroker>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if broker.validate_served_host(&headers).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let asset = match name.as_str() {
+        "usdc.svg" => include_str!("ceremony_assets/tokens/usdc.svg"),
+        "dai.svg" => include_str!("ceremony_assets/tokens/dai.svg"),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+        asset,
     )
         .into_response()
 }
@@ -4750,20 +4869,32 @@ fn require_exact_header_name(
 /// Launch URL for a session on its own origin. Local surfaces are plain
 /// HTTP on this Broker's ceremony port and carry the token in the path; the
 /// hosted relay is HTTPS and carries a one-use capability in the fragment.
-fn session_url(session: &BrowserSession) -> String {
-    let token = token_for(session);
-    if session.origin.starts_with("http://") {
+///
+/// `None` once the launch capability is gone — the hosted page exchanged it
+/// for a ceremony cookie, or a terminal latch destroyed it. A session without
+/// its capability has no launch URL at all, and returning one built from an
+/// empty token would hand the caller a dead `#cap=` fragment that every
+/// exchange attempt rejects.
+fn session_url(session: &BrowserSession) -> Option<String> {
+    let token = session.token.as_ref()?;
+    Some(if session.origin.starts_with("http://") {
         format!("{}/ceremony/{}", session.origin, token.encoded())
     } else {
         format!("{}/ceremony/#cap={}", session.origin, token.encoded())
-    }
+    })
 }
 
-fn token_for(session: &BrowserSession) -> Base64UrlBytes {
-    session
-        .token
-        .clone()
-        .unwrap_or_else(|| Base64UrlBytes::from_bytes(&[]))
+/// Launch URL for a session Broker just minted, which always holds the
+/// capability [`CeremonyBroker::new_session`] generated for it. An absent
+/// token here is an internal inconsistency rather than a consumed link, so it
+/// fails closed instead of reporting a launch URL that cannot be opened.
+fn new_session_url(session: &BrowserSession) -> Result<String, ProtocolError> {
+    session_url(session).ok_or_else(|| {
+        protocol(
+            ProtocolErrorCode::ServiceUnavailable,
+            "new ceremony session carries no launch capability",
+        )
+    })
 }
 
 /// Stamp when a session reached its terminal state and destroy the launch
@@ -4927,11 +5058,47 @@ pub(crate) fn account_terms_review(
     })
 }
 
+/// Native asset metadata shared by every display path: (chain, asset) gives
+/// (decimals, symbol). This is the single source for which chains have known
+/// units — the EVM review display and the claim amount display both read it,
+/// so adding a chain in one place cannot silently leave the other raw.
+pub(crate) fn native_asset_metadata(chain: &str, asset: &str) -> Option<(u8, &'static str)> {
+    match (chain, asset) {
+        ("hyperliquid", "usdc") => Some((6, "USDC")),
+        ("solana", "native") | ("solana-mainnet", "native") => Some((9, "SOL")),
+        ("ethereum", "native")
+        | ("optimism", "native")
+        | ("base", "native")
+        | ("arbitrum", "native")
+        | ("anvil", "native") => Some((18, "ETH")),
+        ("polygon", "native") => Some((18, "POL")),
+        ("evm-56", "native") => Some((18, "BNB")),
+        ("evm-43114", "native") => Some((18, "AVAX")),
+        ("evm-999", "native") => Some((18, "HYPE")),
+        _ => None,
+    }
+}
+
+/// Format base units with an explicit decimal count (`300000` at 18 decimals
+/// renders `0.0000000000003`). Shared by the EVM review and claim amount
+/// displays so the same value can never render two ways.
+pub(crate) fn format_base_units(base_units: &str, decimals: usize) -> String {
+    let padded = format!("{:0>width$}", base_units, width = decimals + 1);
+    let split = padded.len() - decimals;
+    let fractional = padded[split..].trim_end_matches('0');
+    if fractional.is_empty() {
+        padded[..split].to_owned()
+    } else {
+        format!("{}.{}", &padded[..split], fractional)
+    }
+}
+
 fn canonical_review_plan(
     request: &CeremonyPrepareRequest,
     security_disclosures: &[String],
     claim: Option<&PetalUseClaim>,
     system_claim: Option<&SystemUseClaim>,
+    evm_review: Option<&crate::evm_review::EvmReview>,
 ) -> Result<String, ProtocolError> {
     #[derive(Serialize)]
     struct AssetAmountReview {
@@ -4952,6 +5119,8 @@ fn canonical_review_plan(
         exact_ordered_hashes: &'a [Digest32],
         replacement_approval_id: &'a Option<Digest32>,
         security_disclosures: &'a [String],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        evm_review: Option<&'a crate::evm_review::EvmReview>,
     }
     let mut asset_amounts = Vec::new();
     // A system claim declares the same amounts a Petal claim does. Reading
@@ -5023,16 +5192,7 @@ fn canonical_review_plan(
         asset: &str,
         base_units: &str,
     ) -> AssetAmountReview {
-        let metadata = match (chain, asset) {
-            ("hyperliquid", "usdc") => Some((6, "USDC")),
-            ("solana", "native") | ("solana-mainnet", "native") => Some((9, "SOL")),
-            ("ethereum", "native") | ("base", "native") | ("arbitrum", "native") => {
-                Some((18, "ETH"))
-            }
-            ("polygon", "native") => Some((18, "POL")),
-            _ => None,
-        };
-        let (display, decimals) = metadata.map_or_else(
+        let (display, decimals) = native_asset_metadata(chain, asset).map_or_else(
             || {
                 (
                     format!(
@@ -5043,7 +5203,10 @@ fn canonical_review_plan(
             },
             |(decimals, symbol)| {
                 (
-                    format!("{} {symbol}", format_base_units(base_units, decimals)),
+                    format!(
+                        "{} {symbol}",
+                        format_base_units(base_units, usize::from(decimals))
+                    ),
                     Some(decimals),
                 )
             },
@@ -5058,21 +5221,6 @@ fn canonical_review_plan(
         }
     }
 
-    fn format_base_units(base_units: &str, decimals: u8) -> String {
-        if decimals == 0 {
-            return base_units.to_owned();
-        }
-        let decimals = usize::from(decimals);
-        let padded = format!("{:0>width$}", base_units, width = decimals + 1);
-        let split = padded.len() - decimals;
-        let fractional = padded[split..].trim_end_matches('0');
-        if fractional.is_empty() {
-            padded[..split].to_owned()
-        } else {
-            format!("{}.{}", &padded[..split], fractional)
-        }
-    }
-
     serde_jcs::to_string(&Plan {
         schema: "bloom-review-plan/v1",
         asset_amounts,
@@ -5081,6 +5229,7 @@ fn canonical_review_plan(
         exact_ordered_hashes: &request.exact_ordered_hashes,
         replacement_approval_id: &request.replacement_approval_id,
         security_disclosures,
+        evm_review,
     })
     .map_err(malformed)
 }
@@ -5090,14 +5239,45 @@ fn review_disclosures(
     assurance: Option<&ClaimAssurance>,
     claim: Option<&PetalUseClaim>,
     system_claim: Option<&SystemUseClaim>,
+    evm_review: Option<&crate::evm_review::EvmReview>,
 ) -> Vec<String> {
     let mut disclosures = Vec::new();
-    if !request.exact_ordered_payload_digests.is_empty() || !request.exact_ordered_hashes.is_empty()
+    if evm_review.is_none()
+        && (!request.exact_ordered_payload_digests.is_empty()
+            || !request.exact_ordered_hashes.is_empty())
     {
         disclosures.push(
             "Bloom has not established the execution effects of these opaque payload digests and hashes."
                 .to_owned(),
         );
+    }
+    if let Some(review) = evm_review {
+        // The decoded destination and value come from the exact transaction
+        // bytes, but anything the input data would execute is still
+        // unverified. This lives in the signed disclosures (not just the
+        // page) so the honesty statement carries the manifest signature.
+        match &review.clear_signing {
+            Some(evidence) => disclosures.push(format!(
+                "Bloom decoded these transactions from their exact bytes and read their contract calls against catalog {}, whose publisher this wallet trusts to describe these contracts. Bloom has not executed the calls or established what the contracts do.",
+                evidence.catalog_id
+            )),
+            None => disclosures.push(
+                "Bloom decoded the destination and value from the exact transaction bytes. Bloom has not established the execution effects of any contract input data."
+                    .to_owned(),
+            ),
+        }
+        // The mandatory inability-to-explain warning, bound to the exact
+        // bytes through this manifest rather than shown only by the page.
+        if review.payloads.iter().any(|payload| {
+            payload.destination.is_some()
+                && payload.calldata_keccak.is_some()
+                && payload.contract_call.is_none()
+        }) {
+            disclosures.push(
+                "Bloom cannot explain what the contract input data in this request does. Approving it authorizes exactly these bytes and nothing less."
+                    .to_owned(),
+            );
+        }
     }
     let machine_asserted = matches!(assurance, Some(ClaimAssurance::MachineAsserted))
         || claim
@@ -5152,6 +5332,19 @@ fn replay() -> ProtocolError {
     protocol(
         ProtocolErrorCode::CeremonyReplay,
         "ceremony is terminal and its launch URL cannot be revived",
+    )
+}
+
+/// A hosted launch capability is single-use: the first-party page exchanges it
+/// for the ceremony cookie and Broker destroys it. A later prepare retry has
+/// no launch URL left to return, and minting a replacement would hand a second
+/// tab the ceremony the first one is already holding. The retry says so
+/// explicitly instead; the ceremony itself is still live and the caller
+/// follows it by status.
+fn launch_capability_consumed() -> ProtocolError {
+    protocol(
+        ProtocolErrorCode::CeremonyReplay,
+        "ceremony launch capability was already exchanged for a browser session; follow the live ceremony by status",
     )
 }
 
@@ -5695,6 +5888,46 @@ mod remote_storage_tests {
 }
 
 #[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn absent_evm_review_preserves_legacy_manifest_bytes() {
+        let manifest = ReviewManifest {
+            schema: Token::new("bloom.review-manifest.v1").unwrap(),
+            approval_id: Digest32::from_bytes([1; 32]),
+            approval_digest: Digest32::from_bytes([2; 32]),
+            canonical_plan: "legacy canonical plan".into(),
+            canonical_plan_digest: Digest32::from_bytes([3; 32]),
+            exact_payload_digests: vec![Digest32::from_bytes([4; 32])],
+            exact_hashes: vec![Digest32::from_bytes([5; 32])],
+            petal_use_claim: None,
+            system_use_claim: None,
+            claim_assurance: None,
+            evm_review: None,
+            attributed_advisory_items: vec!["Petal route advisory".into()],
+            issued_at_ms: DecimalU64::new(6),
+            expires_at_ms: DecimalU64::new(7),
+            broker_key_id: Token::new("broker").unwrap(),
+            broker_signature: Base64UrlBytes::from_bytes(&[8; 64]),
+        };
+        // Bytes a Broker without `evm_review` produces and verifies. Rolling
+        // back must still read and verify manifests signed after this change.
+        let digest = |byte: u8| format!("{byte:02x}").repeat(32);
+        let (d1, d2, d3, d4, d5) = (digest(1), digest(2), digest(3), digest(4), digest(5));
+        let signature = format!(r#""broker_signature":"{}","#, "CAgI".repeat(21) + "CA");
+        let legacy = format!(
+            r#"{{"approval_digest":"{d2}","approval_id":"{d1}","attributed_advisory_items":["Petal route advisory"],"broker_key_id":"broker",{signature}"canonical_plan":"legacy canonical plan","canonical_plan_digest":"{d3}","claim_assurance":null,"exact_hashes":["{d5}"],"exact_payload_digests":["{d4}"],"expires_at_ms":"7","issued_at_ms":"6","petal_use_claim":null,"schema":"bloom.review-manifest.v1","system_use_claim":null}}"#
+        );
+        assert_eq!(serde_jcs::to_string(&manifest).unwrap(), legacy);
+        assert_eq!(
+            manifest.unsigned_canonical_bytes().unwrap(),
+            legacy.replace(&signature, "").into_bytes()
+        );
+    }
+}
+
+#[cfg(test)]
 mod approving_surface_tests {
     use super::*;
 
@@ -5759,7 +5992,7 @@ mod approving_surface_tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod origin_tests {
     use super::*;
 
     #[test]

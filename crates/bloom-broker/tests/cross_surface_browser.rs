@@ -2,7 +2,6 @@
 use bloom_signer::hpke::HpkeRecipient;
 use bloom_signer_api::{CrossSurfaceHpkeAad, HpkeEnvelope};
 use serde_json::json;
-use std::process::Command;
 
 fn browser_script(body: &str) -> String {
     let asset = include_str!("../src/ceremony_assets/app.js")
@@ -22,10 +21,7 @@ globalThis.history = {{replaceState: () => {{}}}};
 }
 
 fn run_browser(body: &str) -> serde_json::Value {
-    let output = Command::new("node")
-        .args(["-e", &browser_script(body)])
-        .output()
-        .expect("Node.js is required for shipped browser asset tests");
+    let output = run_node(&browser_script(body));
     assert!(
         output.status.success(),
         "{}",
@@ -49,6 +45,21 @@ fn prepared() -> serde_json::Value {
         "source_prf_inputs": [{"credential_id": "ZA", "prf_salt": "ZQ"}],
         "destination_user_handle": "Zg", "destination_prf_salt": "Zw"
     })
+}
+
+#[test]
+fn late_card_validation_failure_cannot_reopen_terminal_approval() {
+    let output = run_browser(
+        r#"
+approve.disabled = true;
+approvalTerminal = true;
+statusNode.textContent = "Expired";
+reportApprovalFailure(new CardFieldError("Invalid CVC"));
+process.stdout.write(JSON.stringify({disabled: approve.disabled, status: statusNode.textContent}));
+"#,
+    );
+    assert_eq!(output["disabled"], true);
+    assert_eq!(output["status"], "Expired");
 }
 
 #[test]
@@ -80,6 +91,41 @@ process.stdout.write(JSON.stringify({{aad, envelope, canonical: canonicalJson(aa
             .unwrap();
         assert_eq!(secret.expose_to_backend(), &[19; 32]);
     }
+}
+
+#[test]
+fn completed_pre_surface_browser_result_keeps_its_legacy_aad() {
+    let recipient = HpkeRecipient::generate();
+    let output = run_browser(&format!(
+        r#"
+const session = {session};
+const contribution = {contribution};
+const aad = browserResultAad(session, contribution);
+const envelope = await hpkeSeal(decodeUrl({key}), te.encode("bloom-custody-output/v1"),
+  te.encode(canonicalJson(aad)), new Uint8Array([7, 8, 9]));
+process.stdout.write(JSON.stringify({{aad, canonical: canonicalJson(aad), envelope}}));
+"#,
+        key = serde_json::to_string(recipient.public_key()).unwrap(),
+        session = json!({"challenges": [{"binding": {
+            "exact_terms_digest": "11".repeat(32),
+            "signer_contribution_digest": "22".repeat(32)
+        }}]}),
+        contribution = json!({
+            "ceremony_id": "33".repeat(32),
+            "ceremony_kind": "wallet_export",
+            "custody_operation_id": "44".repeat(32)
+        }),
+    ));
+    assert!(output["aad"].get("surface").is_none());
+    let envelope: HpkeEnvelope = serde_json::from_value(output["envelope"].clone()).unwrap();
+    let plaintext = recipient
+        .open(
+            &envelope,
+            b"bloom-custody-output/v1",
+            output["canonical"].as_str().unwrap().as_bytes(),
+        )
+        .unwrap();
+    assert_eq!(plaintext.expose_to_backend(), &[7, 8, 9]);
 }
 
 #[test]
@@ -215,12 +261,7 @@ fn ceremony_asset_has_no_public_recovery_initiation() {
 #[test]
 fn launch_failures_show_one_neutral_page_and_hide_all_stale_controls() {
     let html = include_str!("../src/ceremony_assets/index.html");
-    for id in [
-        "ceremony-page",
-        "ceremony-panel",
-        "ceremony-eyebrow",
-        "ceremony-trust",
-    ] {
+    for id in ["ceremony-page", "ceremony-panel", "panel-title", "status"] {
         assert!(html.contains(&format!("id=\"{id}\"")));
     }
     let output = run_browser(
@@ -229,10 +270,12 @@ const assert = require("node:assert/strict");
 const nodes = new Map();
 const pageClasses = new Set();
 const node = id => {
-  if (!nodes.has(id)) nodes.set(id, {hidden:false, textContent:"", classList:{add: name => pageClasses.add(name)}});
+  if (!nodes.has(id)) nodes.set(id, {hidden:false, textContent:"", attributes:{},
+    setAttribute(name, value) { this.attributes[name] = value; },
+    classList:{add: name => pageClasses.add(name)}});
   return nodes.get(id);
 };
-globalThis.document = {getElementById: node, querySelectorAll: () => inputs};
+globalThis.document = {getElementById: node, querySelector: node, querySelectorAll: () => inputs};
 const inputs = [{value:"wallet-secret"}, {value:"recovery-secret"}];
 const stored = new Map([["bloom.ceremony.remote-session.v1", "saved-session"]]);
 globalThis.sessionStorage = {getItem: key => stored.get(key), removeItem: key => stored.delete(key)};
@@ -252,18 +295,23 @@ for (const message of ["expired wallet alpha", "already used operation beta", "n
   for (const fields of [recoveryFields, exportFields, importFields, genericFields]) fields.hidden = false;
   for (const input of inputs) input.value = "stale-secret";
   statusNode.textContent = "wallet alpha operation beta";
+  node("page-title").textContent = "Wallet alpha";
+  node("panel-title").attributes["data-action"] = "send";
   reportLoadFailure(new Error(message));
   results.push({
-    title: node("page-title").textContent,
-    lede: node("page-lede").textContent,
-    panelHidden: node("ceremony-panel").hidden,
-    eyebrowHidden: node("ceremony-eyebrow").hidden,
-    trustHidden: node("ceremony-trust").hidden,
+    title: node("panel-title").textContent,
+    message: statusNode.textContent,
+    context: node("page-lede").textContent,
+    staleTitleCleared: node("page-title").textContent === "",
+    actionStyleCleared: node("panel-title").attributes["data-action"] === "",
+    panelKept: !node("ceremony-panel").hidden,
+    actionsHidden: node(".ceremony-actions").hidden && node("action-expiry").hidden &&
+      node("review-deadline").hidden && node("preview-banner").hidden,
+    kickerHidden: node("panel-kicker").hidden,
     pageClass: pageClasses.has("link-unavailable"),
     actionsDisabled: approve.disabled && cancel.disabled && approve.onclick === null && cancel.onclick === null,
     fieldsHidden: [recoveryFields, exportFields, importFields, genericFields].every(field => field.hidden),
     inputsCleared: inputs.every(input => input.value === ""),
-    statusCleared: statusNode.textContent === "",
     pairingStopped: crossSurfaceState === null && capability[0] === 0,
     outputRetained: outputRecipient === retainedOutput,
     sessionRetained: stored.get("bloom.ceremony.remote-session.v1") === "saved-session",
@@ -273,7 +321,8 @@ for (const message of ["expired wallet alpha", "already used operation beta", "n
 assert.deepEqual(results[0], results[1]);
 assert.deepEqual(results[1], results[2]);
 assert.equal(results[0].title, "This link couldn’t be opened");
-assert.equal(results[0].lede, "It may have expired or already been used. Generate a new link in Bloom, or ask your agent to generate one.");
+assert.equal(results[0].message, "It may have expired or already been used. Generate a new link in Bloom, or ask your agent to generate one.");
+assert.equal(results[0].context, "Link unavailable");
 for (const [key, value] of Object.entries(results[0])) {
   if (typeof value === "boolean") assert.equal(value, true, key);
 }
@@ -345,4 +394,28 @@ process.stdout.write(JSON.stringify({ok:true}));
 "#,
     );
     assert_eq!(output, json!({"ok": true}));
+}
+
+/// Runs a CommonJS script in Node, fed on stdin: the shipped asset alone is
+/// larger than Linux's 128 KiB limit on a single `node -e` argument.
+fn run_node(script: &str) -> std::process::Output {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("node")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    let mut stdin = child.stdin.take().expect("node stdin");
+    let script = script.to_owned();
+    // Write from another thread so a chatty script cannot block on a full
+    // stdout pipe while its input is still being written.
+    let writer = std::thread::spawn(move || stdin.write_all(script.as_bytes()));
+    let output = child.wait_with_output().expect("node output");
+    writer
+        .join()
+        .expect("node stdin writer")
+        .expect("write node script");
+    output
 }
