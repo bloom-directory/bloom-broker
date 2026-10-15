@@ -802,10 +802,6 @@ struct SafeCall<'a> {
     current: Option<&'a SafeSigners>,
 }
 
-fn classify_call(call: &SafeCall<'_>) -> Result<String, ProtocolError> {
-    classify_call_with_reader(call, |_, _, _| Ok(None))
-}
-
 fn classify_call_with_reader(
     call: &SafeCall<'_>,
     mut read_call: impl FnMut(Address, U256, &[u8]) -> Result<Option<String>, ProtocolError>,
@@ -1066,42 +1062,7 @@ pub(crate) fn review(
                 keccak256(calldata),
             )));
         };
-        let mut lines = vec![
-            format!("Action: {}", reading.action),
-            format!("Contract: {}", reading.contract),
-        ];
-        if let Some(summary) = reading.intent_summary {
-            lines.push(format!(
-                "Token: {} — {} ({})",
-                summary.token.symbol, summary.token.name, summary.token.address
-            ));
-            let role = if summary.counterparty_role == "recipient" {
-                "Recipient"
-            } else {
-                "Spender"
-            };
-            lines.push(format!("{role}: {}", summary.counterparty));
-            lines.push(format!(
-                "Token amount: {} (base units: {})",
-                summary.amount_display, summary.amount
-            ));
-        } else {
-            for field in reading.fields {
-                lines.push(format!(
-                    "{}: {} (signed: {})",
-                    field.label, field.value, field.raw
-                ));
-            }
-        }
-        lines.push(format!("Native value (wei): {value}"));
-        lines.push(reading.assurance);
-        lines.extend(
-            reading
-                .warnings
-                .into_iter()
-                .map(|warning| format!("Warning: {warning}")),
-        );
-        Ok(Some(lines.join("\n")))
+        Ok(Some(catalog_lines(reading, value)))
     })?;
     // The wallet's clear-signing settings are authority over what the owner
     // can be asked to approve, and they are not about how the bytes reach the
@@ -1199,6 +1160,20 @@ pub(crate) fn outer_call(
     value: U256,
     input: &[u8],
 ) -> Option<Vec<String>> {
+    read_outer_call(chain, from, to, value, input, |_, _, _| Ok(None)).map(|(lines, _)| lines)
+}
+
+/// `outer_call`, reading the Safe's inner calls with `read_call`. The flag is
+/// true when Broker read everything the call does: a creation it recognised,
+/// or an execution whose inner call (every entry, for a batch) it could read.
+pub(crate) fn read_outer_call(
+    chain: u64,
+    from: Address,
+    to: Address,
+    value: U256,
+    input: &[u8],
+    read_call: impl FnMut(Address, U256, &[u8]) -> Result<Option<String>, ProtocolError>,
+) -> Option<(Vec<String>, bool)> {
     let (selector, data) = input.split_at_checked(4)?;
     let is = |signature: &str| selector == &keccak256(signature).as_slice()[..4];
     let chain_name = crate::evm_review::chain_name(chain);
@@ -1222,21 +1197,26 @@ pub(crate) fn outer_call(
         }
         lines.push("Action: Execute a Safe transaction".to_owned());
         lines.push(format!("Safe: {to}"));
-        match classify_call(&SafeCall {
-            chain: U256::from(chain),
-            safe: to,
-            signer: from,
-            to: inner_to,
-            value: inner_value,
-            data: inner_data,
-            operation,
-            // Executing someone else's signed Safe transaction: Broker reads
-            // no chain state, so there is no current owner set to compare a
-            // threshold change against, and the line says so rather than
-            // printing a naked number.
-            current: None,
-        }) {
+        let mut read = false;
+        match classify_call_with_reader(
+            &SafeCall {
+                chain: U256::from(chain),
+                safe: to,
+                signer: from,
+                to: inner_to,
+                value: inner_value,
+                data: inner_data,
+                operation,
+                // Executing someone else's signed Safe transaction: Broker reads
+                // no chain state, so there is no current owner set to compare a
+                // threshold change against, and the line says so rather than
+                // printing a naked number.
+                current: None,
+            },
+            read_call,
+        ) {
             Ok(action) => {
+                read = !action.lines().any(is_opaque_line);
                 for (index, line) in action.lines().enumerate() {
                     match (index, line.strip_prefix("Action: ")) {
                         (0, Some(action)) => lines.push(format!("The Safe will: {action}")),
@@ -1271,7 +1251,7 @@ pub(crate) fn outer_call(
                 native(value, &chain_name)
             ));
         }
-        return Some(lines);
+        return Some((lines, read));
     }
     if is("createProxyWithNonce(address,bytes,uint256)")
         && deployment(U256::from(chain), Role::Factory, &format!("{to:#x}")).is_some()
@@ -1400,9 +1380,52 @@ pub(crate) fn outer_call(
                 native(value, &chain_name)
             ));
         }
-        return Some(lines);
+        return Some((lines, true));
     }
     None
+}
+
+/// A catalog reading of one call a Safe makes, one fact per line.
+pub(crate) fn catalog_lines(
+    reading: bloom_evm_clear_signing::ClearSignedCall,
+    value: U256,
+) -> String {
+    let mut lines = vec![
+        format!("Action: {}", reading.action),
+        format!("Contract: {}", reading.contract),
+    ];
+    if let Some(summary) = reading.intent_summary {
+        lines.push(format!(
+            "Token: {} — {} ({})",
+            summary.token.symbol, summary.token.name, summary.token.address
+        ));
+        let role = if summary.counterparty_role == "recipient" {
+            "Recipient"
+        } else {
+            "Spender"
+        };
+        lines.push(format!("{role}: {}", summary.counterparty));
+        lines.push(format!(
+            "Token amount: {} (base units: {})",
+            summary.amount_display, summary.amount
+        ));
+    } else {
+        for field in reading.fields {
+            lines.push(format!(
+                "{}: {} (signed: {})",
+                field.label, field.value, field.raw
+            ));
+        }
+    }
+    lines.push(format!("Native value (wei): {value}"));
+    lines.push(reading.assurance);
+    lines.extend(
+        reading
+            .warnings
+            .into_iter()
+            .map(|warning| format!("Warning: {warning}")),
+    );
+    lines.join("\n")
 }
 
 /// The Safe equivalent of `evm_review::apply_review_mode`.
@@ -1463,7 +1486,7 @@ pub(crate) fn is_opaque(review: &SafeReview) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bloom_broker_api::*;
 
@@ -2566,8 +2589,10 @@ mod tests {
     // Inputs of transactions that ran on Base: a Safe creation, and three
     // executions of that Safe.
     const SAFE: &str = "0xaefda71ded59b48920131d03454893ec2ad93e88";
-    const WALLET: &str = "0x8d4fafba75a9dc50b4b296211509e856d2c6d081";
-    const FACTORY: &str = "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67";
+    pub(crate) const WALLET: &str = "0x8d4fafba75a9dc50b4b296211509e856d2c6d081";
+    pub(crate) const FACTORY: &str = "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67";
+    /// A 1-of-1 Safe creation on Base owned by `WALLET`.
+    pub(crate) const SAFE_CREATION: &str = "0x1688f0b900000000000000000000000029fcb43b46531bca003ddc8fcb67ffe91900c762000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000013528400000000000000000000000000000000000000000000000000000000000000164b63e800d0000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000fd0732dc9e303f09fcef3a7388ad10a83459ec9900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d081000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
     fn outer(to: &str, input: &str) -> Option<String> {
         outer_on(8453, to, input)
@@ -2621,7 +2646,7 @@ mod tests {
 
     #[test]
     fn a_call_that_creates_a_safe_names_its_owners_and_threshold() {
-        let input = "0x1688f0b900000000000000000000000029fcb43b46531bca003ddc8fcb67ffe91900c762000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000013528400000000000000000000000000000000000000000000000000000000000000164b63e800d0000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000fd0732dc9e303f09fcef3a7388ad10a83459ec9900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d081000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+        let input = SAFE_CREATION;
         let create = outer(FACTORY, input).unwrap();
         assert!(create.starts_with("Action: Create a Safe"), "{create}");
         assert!(create.contains("Signatures required: 1 of 1"), "{create}");

@@ -183,13 +183,16 @@ approval whose inner calls were read from the catalog freezes those entries as
 clear-signing evidence, so the expiry cap and the activation and signing
 rechecks above apply to it exactly as they do to a native call.
 
-Known limit: a wallet with clear signing enabled cannot deploy a Safe or send
-its `execTransaction` through the Safe Petal. Those outer calls go to the Safe
-proxy factory or the Safe itself, which no catalog describes, and Petal signing
-and outbox staging never request `opaque_exact`, so Broker refuses them with
-`UNSUPPORTED_CALL` even when `opaque_exact_allowed` is set. Such a wallet can
-still sign the Safe transaction as an owner; an account without clear signing
-has to deploy the Safe and execute its transactions.
+A transaction that deploys or executes a Safe goes to the Safe proxy factory or
+to the Safe itself, which no catalog can describe: every Safe is its own proxy.
+Broker reads those calls itself. A clear-signing wallet may send one when
+Broker reads all of it: a creation through an official factory with an
+official singleton and fallback handler and no setup code, or an
+`execTransaction` with no gas refund whose inner call Broker reads, with each
+inner contract call read through the catalog and wallet policy as above. The
+page still says Bloom did not check that the destination is a Safe, so such a
+call must send no value of its own. Anything else Broker cannot read is refused
+with `UNSUPPORTED_CALL` unless `opaque_exact` is requested and allowed.
 
 ## Unlimited allowances
 

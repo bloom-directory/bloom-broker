@@ -72,6 +72,9 @@ pub struct EvmReviewPayload {
     /// bytes ask for; whether the destination is a Safe is not verified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub safe_call: Option<Vec<String>>,
+    /// Whether clear signing admitted this call on `safe_call` alone.
+    #[serde(skip)]
+    pub safe_call_read: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -122,6 +125,7 @@ pub(crate) fn review_kind(
         payload.destination.is_some()
             && payload.calldata_keccak.is_some()
             && payload.contract_call.is_none()
+            && !payload.safe_call_read
     });
     if opaque {
         ReviewKind::OpaqueExact
@@ -289,6 +293,7 @@ pub(crate) fn review(
     apply_review_mode(
         &mut review,
         &decoded_calls,
+        from,
         policy,
         request.requested_review_mode,
         clear_signing,
@@ -333,6 +338,7 @@ pub(crate) fn cap_approval_expiry(
 fn apply_review_mode(
     review: &mut EvmReview,
     calls: &[Option<DecodedCall>],
+    from: Address,
     policy: &CanonicalWalletPolicy,
     requested: Option<ReviewMode>,
     context: &ClearSigningContext,
@@ -357,7 +363,14 @@ fn apply_review_mode(
     let mut entries: Vec<SelectedEntry> = Vec::new();
     for (payload, call) in review.payloads.iter_mut().zip(calls) {
         let Some(call) = call else { continue };
-        let (clear, selected) = review_contract_call(call, policy, requested, context)?;
+        let (clear, selected) = match read_safe_call(call, from, policy, requested, context)? {
+            Some((lines, selected)) => {
+                payload.safe_call = Some(lines);
+                payload.safe_call_read = true;
+                (None, selected)
+            }
+            None => review_contract_call(call, policy, requested, context)?,
+        };
         for entry in selected {
             if !entries.contains(&entry) {
                 entries.push(entry);
@@ -375,6 +388,64 @@ fn apply_review_mode(
         ));
     }
     Ok(())
+}
+
+/// A call that creates or executes a Safe goes to an address no catalog can
+/// name: each Safe is its own proxy. Broker reads those calls itself, and a
+/// complete reading is the clear review. The Safe's inner calls still go
+/// through the catalog and wallet policy, exactly as when the owner signs the
+/// Safe transaction, so wrapping a call in `execTransaction` reads no less.
+/// Value sent alongside would go to an address Bloom has not verified is a
+/// Safe, so such a call keeps the ordinary review.
+type SafeReading = (Vec<String>, Vec<SelectedEntry>);
+
+fn read_safe_call(
+    call: &DecodedCall,
+    from: Address,
+    policy: &CanonicalWalletPolicy,
+    requested: Option<ReviewMode>,
+    context: &ClearSigningContext,
+) -> Result<Option<SafeReading>, ProtocolError> {
+    if requested == Some(ReviewMode::OpaqueExact) || !call.value.is_zero() {
+        return Ok(None);
+    }
+    let mut selected = Vec::new();
+    let mut refusal = None;
+    let reading = crate::safe_review::read_outer_call(
+        call.chain_id,
+        from,
+        call.to,
+        call.value,
+        &call.calldata,
+        |to, value, calldata| {
+            let inner = DecodedCall {
+                chain_id: call.chain_id,
+                to,
+                value,
+                calldata: calldata.to_vec(),
+            };
+            match review_contract_call(&inner, policy, requested, context) {
+                Ok((reading, entries)) => {
+                    for entry in entries {
+                        if !selected.contains(&entry) {
+                            selected.push(entry);
+                        }
+                    }
+                    Ok(reading.map(|reading| crate::safe_review::catalog_lines(reading, value)))
+                }
+                Err(error) => {
+                    refusal = Some(error.clone());
+                    Err(error)
+                }
+            }
+        },
+    );
+    if let Some(error) = refusal {
+        return Err(error);
+    }
+    Ok(reading
+        .filter(|(_, read)| *read)
+        .map(|(lines, _)| (lines, selected)))
 }
 
 /// Native and Safe calls spend the same catalog trust and wallet policy.
@@ -567,6 +638,7 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
                 }
                 TxKind::Create => None,
             },
+            safe_call_read: false,
         },
         call,
     ))
@@ -1763,5 +1835,139 @@ pub(super) mod mode_tests {
         assert!(review.payloads[0].contract_call.is_none());
         assert!(review.clear_signing.is_none());
         assert_eq!(review.payloads[0].calldata_bytes, "0");
+    }
+
+    alloy::sol! {
+        function execTransaction(address to, uint256 value, bytes data, uint8 operation,
+            uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken,
+            address refundReceiver, bytes signatures);
+    }
+
+    const SAFE: &str = "0x3333333333333333333333333333333333333333";
+
+    fn exec(to: &str, value: u64, data: Vec<u8>) -> Vec<u8> {
+        use alloy::sol_types::SolCall as _;
+        execTransactionCall {
+            to: to.parse().unwrap(),
+            value: U256::from(value),
+            data: data.into(),
+            operation: 0,
+            safeTxGas: U256::ZERO,
+            baseGas: U256::ZERO,
+            gasPrice: U256::ZERO,
+            gasToken: Address::ZERO,
+            refundReceiver: Address::ZERO,
+            signatures: vec![1; 65].into(),
+        }
+        .abi_encode()
+    }
+
+    fn admit(request: &ApprovalPrepareRequest) -> Result<EvmReview, ProtocolError> {
+        review(
+            request,
+            &enabled_policy(),
+            Address::ZERO,
+            &enabled_context(),
+        )
+        .map(Option::unwrap)
+    }
+
+    #[test]
+    fn a_safe_execution_is_read_through_the_catalog_for_its_inner_call() {
+        let request = batch(&[call(
+            SAFE,
+            exec(TOKEN_ADDRESS, 0, transfer_calldata(RECIPIENT, 2_500_000)),
+        )]);
+        let review = admit(&request).unwrap();
+        let lines = review.payloads[0].safe_call.as_ref().unwrap().join("\n");
+        assert!(lines.contains("The Safe will: transfer"), "{lines}");
+        assert!(lines.contains("2.5 EXA"), "{lines}");
+        assert!(review.payloads[0].contract_call.is_none());
+        assert_eq!(review.clear_signing.as_ref().unwrap().entries.len(), 1);
+        assert_eq!(
+            review_kind(Some(&review), &enabled_policy()),
+            ReviewKind::Clear
+        );
+    }
+
+    #[test]
+    fn a_safe_execution_with_no_inner_calldata_needs_no_catalog() {
+        let request = batch(&[call(SAFE, exec(RECIPIENT, 7, Vec::new()))]);
+        let mut context = enabled_context();
+        context.catalog = None;
+        let review = review(&request, &enabled_policy(), Address::ZERO, &context)
+            .unwrap()
+            .unwrap();
+        assert!(review.payloads[0].safe_call_read);
+        assert!(review.clear_signing.is_none());
+        assert_eq!(
+            review_kind(Some(&review), &enabled_policy()),
+            ReviewKind::Native
+        );
+    }
+
+    #[test]
+    fn wrapping_a_call_in_a_safe_execution_keeps_its_refusals() {
+        let unknown = batch(&[call(SAFE, exec(RECIPIENT, 0, vec![0xde, 0xad, 0xbe, 0xef]))]);
+        let error = admit(&unknown).unwrap_err();
+        assert!(
+            error.message.contains("UNSUPPORTED_CALL"),
+            "{}",
+            error.message
+        );
+
+        let unlimited = batch(&[call(
+            SAFE,
+            exec(
+                TOKEN_ADDRESS,
+                0,
+                address_amount_calldata(APPROVE, RECIPIENT, U256::MAX),
+            ),
+        )]);
+        let error = admit(&unlimited).unwrap_err();
+        assert!(error.message.contains("POLICY_DENIED"), "{}", error.message);
+    }
+
+    #[test]
+    fn value_sent_with_a_safe_execution_keeps_the_ordinary_review() {
+        let mut tx =
+            TxEip1559::decode(&mut &call(SAFE, exec(RECIPIENT, 7, Vec::new()))[1..]).unwrap();
+        tx.value = U256::from(1);
+        let request = batch(&[tx.encoded_for_signing()]);
+        let error = admit(&request).unwrap_err();
+        assert!(
+            error.message.contains("UNSUPPORTED_CALL"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn a_recognised_safe_creation_is_admitted_on_broker_s_reading() {
+        use crate::safe_review::tests::{FACTORY, SAFE_CREATION, WALLET};
+        let tx = TxEip1559 {
+            chain_id: 8453,
+            nonce: 0,
+            gas_limit: 300_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(FACTORY.parse().unwrap()),
+            value: U256::ZERO,
+            input: hex::decode(&SAFE_CREATION[2..]).unwrap().into(),
+            access_list: Default::default(),
+        };
+        let policy = enabled_policy();
+        let request = batch(&[tx.encoded_for_signing()]);
+        let review = review(
+            &request,
+            &policy,
+            WALLET.parse().unwrap(),
+            &enabled_context(),
+        )
+        .unwrap()
+        .unwrap();
+        let lines = review.payloads[0].safe_call.as_ref().unwrap();
+        assert_eq!(lines[0], "Action: Create a Safe");
+        assert_eq!(review_kind(Some(&review), &policy), ReviewKind::Native);
     }
 }
