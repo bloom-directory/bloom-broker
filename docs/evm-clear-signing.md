@@ -27,6 +27,11 @@ assertion. It is **not** proof of execution, contract safety, or the absence
 of an upgrade after the publisher's observation. Broker never fetches
 anything, reads no chain state, and resolves no proxy.
 
+A review that read any address through an [instance entry](#instance-entries)
+has the class `structural_description` instead. The description is trusted in
+the same way, but nothing establishes that the address runs the contract it
+describes.
+
 ## The admitted ERC-7730 subset
 
 Taken from released v2, `ethereum/ERCs@2528d6a0cd463d7309464a33889774368ab52df3`
@@ -41,10 +46,17 @@ published subset, not full ERC-7730 conformance.
 - `metadata.owner`, `metadata.contractName`, `metadata.enums`.
 - `display.formats`, keyed by a function signature with named parameters.
 - Named static scalar arguments: `address`, `bool`, `uintN` (canonical widths)
-  and `bytesN`.
-- Direct named field paths, optionally spelled `#.name`.
-- Always-visible fields in six formats: `raw`, `addressName`, `tokenAmount`,
-  `amount`, `date`, `enum`.
+  and `bytesN`; dynamic `bytes`; and dynamic arrays of one static scalar
+  (`address[]`, `uint256[]`, ...).
+- Direct named field paths, optionally spelled `#.name`. An array argument is
+  addressed as `name.[]` and shown one element per line; nothing else may use
+  `.[]`.
+- Always-visible fields in seven formats: `raw`, `addressName`, `tokenAmount`,
+  `amount`, `date`, `enum`, and `calldata` (see [Embedded calls](#embedded-calls)).
+  `bytes` takes `raw` or `calldata`. `tokenAmount` does not apply per element.
+- `visible: {"mustMatch": [...]}` on a scalar or `bytes` argument. The field is
+  not shown, because the signed description fixes it: any other value makes the
+  call unsupported. A `mustMatch` field carries only `path`, `label` and the rule.
 - `intent` as a plain string. It is supplemental text beside the facts; Bloom
   writes the heading and the warnings.
 
@@ -54,7 +66,8 @@ published subset, not full ERC-7730 conformance.
   inline `abi`, and `factory` bindings.
 - `interpolatedIntent`, `display.definitions`, `$ref` field references, field
   groups, `value` constants, `separator`, `encryption`.
-- Hidden or conditional fields (`visible` other than `"always"`).
+- Hidden or conditional fields (`visible` other than `"always"` or a lone
+  `mustMatch`), and `mustMatch` on an array.
 - `tokenAmount` parameters other than `tokenPath` — in particular `threshold`
   and `message`, which is how the registry's ERC-20 template labels a large
   *finite* allowance "unlimited". An admitted derivative must drop them;
@@ -75,7 +88,9 @@ published subset, not full ERC-7730 conformance.
   signed catalog, not from the document.
 - Any argument left off the screen. Every decoded leaf must be covered by a
   visible field naming its actual path.
-- Dynamic types (`string`, `bytes`, arrays) and signed integers.
+- `string`, fixed-size and nested arrays, and signed integers.
+- `calldata` parameters other than `calleePath` and `amountPath`. `selector`,
+  `spender` and `chainId` would each change how the inner call is read.
 - **Tuples**, deferred from this milestone rather than ruled out. The
   limitation was measured against the pinned parser, not assumed:
   `alloy_json_abi::Function::parse` rejects
@@ -90,6 +105,72 @@ published subset, not full ERC-7730 conformance.
 
 `addressName` name sources are inert: no ENS request, no account-type
 assertion, no sentinel substitution. The raw address is what is shown.
+
+## Embedded calls
+
+A `calldata` field reads a call carried inside this one. `calleePath` names the
+contract it calls, as `"@.to"` or an address argument. The optional
+`amountPath` names a uint argument holding the native value it sends. The inner
+call is reviewed exactly as a top-level call:
+
+- An inner call Bloom cannot read makes the whole call unsupported.
+- Its policy refusals refuse, so an unlimited allowance inside a Safe is
+  denied as it is outside one.
+- Its catalog entries become frozen evidence.
+
+The page shows one heading line, `<function> on <contract>`, then the inner
+call's fields labelled under it (`Safe transaction · Amount`). The inner
+call's warnings are prefixed the same way.
+
+Empty inner calldata is a plain value transfer, shown as `Send <amount> to
+<callee>`, or `No call` when the amount is zero. Calls nest at most two deep.
+
+## Instance entries
+
+Some contracts exist once per user: every Safe is its own proxy, so no catalog
+can list them. ERC-7730 binds such a descriptor to the implementation and
+expects the wallet to resolve the proxy. Broker reads no chain state, so it
+cannot resolve one. An entry may instead set `applies_to_instances`:
+
+- An address with no entry of its own is read by that entry's functions,
+  matched by selector.
+- An address that has an entry is only ever read by that entry, so a listed
+  token is never read as a Safe.
+- On one chain, two instance entries may not admit the same selector.
+- An instance entry carries no token metadata and admits only `other`
+  functions, so it cannot lend a token's identity to unlisted addresses.
+
+Such a call gets the structural assurance and a warning that Bloom has not
+verified the address is that contract. Its evidence records the address it was
+read for, so removing the flag withdraws the reading.
+
+The address not being verified is bounded by an existing rule: an admitted
+call carries no native value. A call to an address that is not what it claims
+can spend only gas and whatever allowances this wallet already gave that
+address.
+
+## Safe
+
+`crates/bloom-evm-clear-signing/catalogs/safe` holds Bloom's Safe descriptors.
+They are derived from `registry/safe` in LedgerHQ/clear-signing-erc7730-registry.
+`entries.json` lists every entry, in the publisher source format except for
+`observed_at_ms`, which the publisher stamps when it checks the code hashes.
+
+The entries cover the official Safe singletons and proxy factories (1.3.0,
+1.4.1, 1.5.0) on chains 1, 10, 100, 137, 8453 and 42161, with their runtime
+code hashes. Safe 1.4.1, the version the Safe Petal deploys, is the instance
+entry on each chain. Its `execTransaction` and owner-management functions are
+identical in 1.3.0 and 1.5.0.
+
+`mustMatch` holds the Safe safety rules:
+
+- `operation` must be a call, so delegatecalls, and with them `MultiSend`
+  batches, are refused.
+- No gas refund: `gasPrice`, `gasToken` and `refundReceiver` must be zero.
+- A new Safe uses an official singleton, has no setup call, no setup payment,
+  and either an official fallback handler or none.
+
+Owner signatures are shown raw and are not checked by Bloom.
 
 ## Safety rules over the generic result
 
@@ -113,8 +194,10 @@ JCS encoding of everything except the signatures. Entry key is
 
 Bounds: 1 MiB per catalog, 1,024 entries, 8 signatures, 64 KiB per descriptor,
 16 admitted functions per entry, 32 arguments per function, 256 scalar values
-per label or intent, 64 labels per enum map, 16 ASCII token symbol, 64 scalar
-values and 256 bytes of token name.
+per label or intent, 64 labels per enum map, 64 values per `mustMatch`, 64
+elements per array argument, two nested calls, 16 ASCII token symbol, 64 scalar
+values and 256 bytes of token name. `bytes` longer than 128 bytes are shown by
+length and keccak-256.
 
 Sequence must increase. The same sequence with the same content is an
 idempotent retry; the same sequence with different content is refused. A newer

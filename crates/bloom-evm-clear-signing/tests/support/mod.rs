@@ -95,6 +95,7 @@ pub fn entry_at(
         upgradeable: false,
         implementation_hash: None,
         observed_at_ms: DecimalU64::new(NOW_MS - 1000),
+        applies_to_instances: false,
     }
 }
 

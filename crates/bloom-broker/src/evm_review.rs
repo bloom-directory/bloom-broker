@@ -1559,37 +1559,46 @@ mod mode_tests {
                 ]
             }}}
         });
+        accept_entries(vec![CatalogEntry {
+            chain_id: DecimalU64::new(31337),
+            contract_address: TOKEN_ADDRESS.into(),
+            admitted_functions: vec![
+                AdmittedFunction {
+                    signature: TRANSFER.into(),
+                    action_class: ActionClass::Transfer,
+                },
+                AdmittedFunction {
+                    signature: APPROVE.into(),
+                    action_class: ActionClass::Allowance,
+                },
+            ],
+            descriptor_digest: Some(descriptor_digest(&descriptor).unwrap()),
+            flattened_descriptor: Some(descriptor),
+            runtime_code_hash: None,
+            token_metadata: Some(TokenMetadata {
+                decimals: 6,
+                symbol: "EXA".into(),
+                name: "Example Token".into(),
+            }),
+            upgradeable: false,
+            implementation_hash: None,
+            observed_at_ms: DecimalU64::new(observed_at_ms),
+            applies_to_instances: false,
+        }])
+    }
+
+    fn accept_entries(mut entries: Vec<CatalogEntry>) -> AcceptedCatalog {
+        entries.sort_by(|left, right| {
+            (left.chain_id.get(), &left.contract_address)
+                .cmp(&(right.chain_id.get(), &right.contract_address))
+        });
         let mut catalog = ClearSigningCatalog {
             schema: CATALOG_SCHEMA.into(),
             catalog_id: Token::new("bloom-tokens").unwrap(),
             sequence: DecimalU64::new(1),
             issued_at_ms: DecimalU64::new(NOW_MS - 1000),
             expires_at_ms: DecimalU64::new(NOW_MS + 86_400_000),
-            entries: vec![CatalogEntry {
-                chain_id: DecimalU64::new(31337),
-                contract_address: TOKEN_ADDRESS.into(),
-                admitted_functions: vec![
-                    AdmittedFunction {
-                        signature: TRANSFER.into(),
-                        action_class: ActionClass::Transfer,
-                    },
-                    AdmittedFunction {
-                        signature: APPROVE.into(),
-                        action_class: ActionClass::Allowance,
-                    },
-                ],
-                descriptor_digest: Some(descriptor_digest(&descriptor).unwrap()),
-                flattened_descriptor: Some(descriptor),
-                runtime_code_hash: None,
-                token_metadata: Some(TokenMetadata {
-                    decimals: 6,
-                    symbol: "EXA".into(),
-                    name: "Example Token".into(),
-                }),
-                upgradeable: false,
-                implementation_hash: None,
-                observed_at_ms: DecimalU64::new(observed_at_ms),
-            }],
+            entries,
             signatures: Vec::new(),
         };
         let key = SigningKey::from_bytes(&[5; 32]);
@@ -2110,5 +2119,81 @@ mod mode_tests {
         assert!(review.payloads[0].contract_call.is_none());
         assert!(review.clear_signing.is_none());
         assert_eq!(review.payloads[0].calldata_bytes, "0");
+    }
+
+    /// The Safe entries this repository ships, as `bloom-clear-signing-catalog`
+    /// would sign them.
+    fn safe_context() -> ClearSigningContext {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../bloom-evm-clear-signing/catalogs/safe");
+        let read = |name: &str| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(directory.join(name)).unwrap()).unwrap()
+        };
+        let entries = read("entries.json")
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                let descriptor = read(entry["descriptor"].as_str().unwrap());
+                CatalogEntry {
+                    chain_id: DecimalU64::new(entry["chain_id"].as_u64().unwrap()),
+                    contract_address: entry["contract_address"].as_str().unwrap().into(),
+                    admitted_functions: serde_json::from_value(entry["admitted_functions"].clone())
+                        .unwrap(),
+                    descriptor_digest: Some(descriptor_digest(&descriptor).unwrap()),
+                    flattened_descriptor: Some(descriptor),
+                    runtime_code_hash: None,
+                    token_metadata: None,
+                    upgradeable: false,
+                    implementation_hash: None,
+                    observed_at_ms: DecimalU64::new(NOW_MS - 500),
+                    applies_to_instances: entry["applies_to_instances"].as_bool().unwrap_or(false),
+                }
+            })
+            .collect();
+        ClearSigningContext {
+            catalog: Some(accept_entries(entries)),
+            ..enabled_context()
+        }
+    }
+
+    #[test]
+    fn a_clear_signing_wallet_executes_a_safe_it_has_no_entry_for() {
+        // A real Base execution: the Safe sends 0.00001 ETH to its owner.
+        let input = hex::decode("6a7612020000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d081000000000000000000000000000000000000000000000000000009184e72a00000000000000000000000000000000000000000000000000000000000000001400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000160000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000411fca12a0c7a67fc6ca9ca271335af2680fae0ce704f5c75fe373ddce47674df33a341f86acbc619d6db40b37ef330f3f2dd47897f0551799f28f20ef7288d69b1b00000000000000000000000000000000000000000000000000000000000000").unwrap();
+        let owner = "0x8d4fafba75a9dc50b4b296211509e856d2c6d081";
+        let safe: Address = "0xaefda71ded59b48920131d03454893ec2ad93e88"
+            .parse()
+            .unwrap();
+        let payload = TxEip1559 {
+            chain_id: 8453,
+            nonce: 0,
+            gas_limit: 100_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(safe),
+            value: U256::ZERO,
+            input: input.into(),
+            access_list: Default::default(),
+        }
+        .encoded_for_signing();
+        let policy = enabled_policy();
+        let review = review(&batch(&[payload]), &policy, Address::ZERO, &safe_context())
+            .unwrap()
+            .unwrap();
+        let call = review.payloads[0].contract_call.as_ref().unwrap();
+        assert_eq!(call.contract_name.as_deref(), Some("Safe"));
+        assert!(
+            call.fields.iter().any(|field| field.value
+                == format!(
+                    "Send 0.00001 ETH to {}",
+                    bloom_evm_clear_signing::checksum(owner)
+                )),
+            "{:?}",
+            call.fields
+        );
+        let evidence = review.clear_signing.as_ref().unwrap();
+        assert_eq!(evidence.assurance, "structural_description");
+        assert_eq!(review_kind(Some(&review), &policy), ReviewKind::Clear);
     }
 }

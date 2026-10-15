@@ -289,29 +289,136 @@ fn unsupported_instructions_make_a_descriptor_unusable() {
     }
 }
 
+fn admit_one(signature: &str, fields: Value) -> Result<AcceptedCatalog, ReviewError> {
+    let descriptor = json!({
+        "context": {"contract": {"deployments": [{"chainId": CHAIN_ID, "address": TOKEN}]}},
+        "display": {"formats": {signature: {"fields": fields}}}
+    });
+    let functions = vec![AdmittedFunction {
+        signature: signature.into(),
+        action_class: ActionClass::Other,
+    }];
+    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
+    sign(&mut catalog, &[(1, "publisher-1")]);
+    accept(&catalog)
+}
+
 #[test]
-fn dynamic_and_signed_argument_types_are_outside_the_subset() {
-    for signature in [
-        "note(string text)",
-        "blob(bytes data)",
-        "many(uint256[] amounts)",
-        "pair(uint256[2] amounts)",
-        "signed(int256 delta)",
-        "alias(uint value)",
+fn strings_signed_integers_and_fixed_or_nested_arrays_are_outside_the_subset() {
+    for (signature, path) in [
+        ("note(string text)", "text"),
+        ("pair(uint256[2] amounts)", "amounts"),
+        ("grid(uint256[][] cells)", "cells.[]"),
+        ("signed(int256 delta)", "delta"),
     ] {
-        let descriptor = json!({
-            "context": {"contract": {"deployments": [{"chainId": CHAIN_ID, "address": TOKEN}]}},
-            "display": {"formats": {signature: {
-                "fields": [{"path": "x", "label": "X", "format": "raw"}]
-            }}}
-        });
-        let functions = vec![AdmittedFunction {
-            signature: signature.into(),
-            action_class: ActionClass::Other,
-        }];
-        let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-        sign(&mut catalog, &[(1, "publisher-1")]);
-        assert!(accept(&catalog).is_err(), "{signature} must be refused");
+        let error = admit_one(
+            signature,
+            json!([{"path": path, "label": "X", "format": "raw"}]),
+        )
+        .expect_err(signature);
+        assert!(
+            error.detail.contains("outside the supported"),
+            "{signature}: {error}"
+        );
+    }
+}
+
+#[test]
+fn bytes_arrays_and_must_match_rules_are_admitted_in_their_one_shape() {
+    const SIGNATURE: &str = "f(address[] owners, bytes blob, uint8 mode)";
+    let fields = |owners: Value, blob: Value, mode: Value| json!([owners, blob, mode]);
+    let owners = json!({"path": "owners.[]", "label": "Owner", "format": "addressName"});
+    let blob = json!({"path": "blob", "label": "Blob", "format": "raw"});
+    let mode = json!({"path": "mode", "label": "Mode", "visible": {"mustMatch": [0]}});
+    admit_one(
+        SIGNATURE,
+        fields(owners.clone(), blob.clone(), mode.clone()),
+    )
+    .unwrap();
+
+    let refused = [
+        (
+            "an array without .[]",
+            json!({"path": "owners", "label": "Owner", "format": "addressName"}),
+            blob.clone(),
+            mode.clone(),
+        ),
+        (
+            "a token amount per element",
+            json!({"path": "owners.[]", "label": "Owner", "format": "tokenAmount", "params": {"tokenPath": "@.to"}}),
+            blob.clone(),
+            mode.clone(),
+        ),
+        (
+            "a mustMatch on an array",
+            json!({"path": "owners.[]", "label": "Owner", "visible": {"mustMatch": []}}),
+            blob.clone(),
+            mode.clone(),
+        ),
+        (
+            "calldata on a non-bytes argument",
+            owners.clone(),
+            blob.clone(),
+            json!({"path": "mode", "label": "Mode", "format": "calldata", "params": {"calleePath": "@.to"}}),
+        ),
+        (
+            "calldata without a callee",
+            owners.clone(),
+            json!({"path": "blob", "label": "Blob", "format": "calldata"}),
+            mode.clone(),
+        ),
+        (
+            "calldata with a redirected selector",
+            owners.clone(),
+            json!({"path": "blob", "label": "Blob", "format": "calldata", "params": {"calleePath": "@.to", "selector": "0x12345678"}}),
+            mode.clone(),
+        ),
+        (
+            "calldata naming a non-address callee",
+            owners.clone(),
+            json!({"path": "blob", "label": "Blob", "format": "calldata", "params": {"calleePath": "mode"}}),
+            mode.clone(),
+        ),
+        (
+            "a scalar addressed with .[]",
+            owners.clone(),
+            blob.clone(),
+            json!({"path": "mode.[]", "label": "Mode", "format": "raw"}),
+        ),
+        (
+            "a mustMatch that also formats",
+            owners.clone(),
+            blob.clone(),
+            json!({"path": "mode", "label": "Mode", "format": "raw", "visible": {"mustMatch": [0]}}),
+        ),
+        (
+            "a mustMatch value of the wrong type",
+            owners.clone(),
+            blob.clone(),
+            json!({"path": "mode", "label": "Mode", "visible": {"mustMatch": ["zero"]}}),
+        ),
+        (
+            "an empty mustMatch",
+            owners.clone(),
+            blob.clone(),
+            json!({"path": "mode", "label": "Mode", "visible": {"mustMatch": []}}),
+        ),
+        (
+            "a conditional rule beside mustMatch",
+            owners,
+            blob,
+            json!({"path": "mode", "label": "Mode", "visible": {"mustMatch": [0], "ifNotIn": [1]}}),
+        ),
+    ];
+    for (name, owners, blob, mode) in refused {
+        let error = admit_one(SIGNATURE, fields(owners, blob, mode))
+            .err()
+            .unwrap_or_else(|| panic!("{name} must be refused"));
+        assert_eq!(
+            error.reason,
+            ReviewReason::CatalogRejected,
+            "{name}: {error}"
+        );
     }
 }
 

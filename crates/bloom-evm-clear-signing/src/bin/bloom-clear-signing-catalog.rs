@@ -59,6 +59,8 @@ struct SourceEntry {
     #[serde(default)]
     implementation_hash: Option<String>,
     observed_at_ms: u64,
+    #[serde(default)]
+    applies_to_instances: bool,
 }
 
 #[derive(Deserialize)]
@@ -214,6 +216,7 @@ fn build(source_path: &Path, options: &BTreeMap<String, String>) -> Result<Strin
             upgradeable: entry.upgradeable,
             implementation_hash: digest(&entry.implementation_hash, "implementation_hash")?,
             observed_at_ms: DecimalU64::new(entry.observed_at_ms),
+            applies_to_instances: entry.applies_to_instances,
         });
     }
     // The signed snapshot has one deterministic order, so the publisher never
