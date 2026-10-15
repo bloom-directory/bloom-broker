@@ -3703,9 +3703,12 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             serde_jcs::to_vec(&catalog).unwrap().len(),
         )
         .unwrap();
-    let response = safe_prepare(catalog_terms, Some(serde_jcs::to_vec(&valid).unwrap()))
-        .await
-        .unwrap();
+    let response = safe_prepare(
+        catalog_terms.clone(),
+        Some(serde_jcs::to_vec(&valid).unwrap()),
+    )
+    .await
+    .unwrap();
     let response = match response {
         MachineBrokerResponse::SealedApprovalPrepare(response) => response,
         other => panic!("unexpected approval response: {other:?}"),
@@ -3747,6 +3750,55 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                     .contains("rebuilt the Safe transaction")
             })
     );
+    // A Safe call read from the catalog is frozen with that evidence, so
+    // withdrawing the entry before signing blocks it as it would a native call.
+    let catalog_approval = catalog_terms.approval_id().unwrap();
+    let (kind, evidence) = authority.frozen_review(&catalog_approval).unwrap().unwrap();
+    assert_eq!(kind, bloom_broker::journal::ReviewKind::Clear);
+    assert!(evidence.is_some());
+    let current_policy: CanonicalWalletPolicy = serde_json::from_slice(
+        &authority
+            .policy_snapshot(&wallet_id)
+            .unwrap()
+            .canonical_policy
+            .decode(),
+    )
+    .unwrap();
+    let verifier = Digest32::from_bytes(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES);
+    authority
+        .recheck_clear_signing(
+            &catalog_approval,
+            &current_policy,
+            &verifier,
+            catalog_now_ms,
+        )
+        .unwrap();
+    catalog.sequence = DecimalU64::new(2);
+    catalog.entries.clear();
+    catalog.signatures.clear();
+    let mut message = CATALOG_SIGNATURE_DOMAIN.to_vec();
+    message.extend(catalog.unsigned_canonical_bytes().unwrap());
+    catalog.signatures.push(CatalogSignature {
+        key_id: Token::new("safe-test-publisher").unwrap(),
+        signature: Base64UrlBytes::from_bytes(
+            &SigningKey::from_bytes(&[5; 32]).sign(&message).to_bytes(),
+        ),
+    });
+    authority
+        .install_clear_signing_catalog_for_enrolled_wallets(
+            &catalog,
+            serde_jcs::to_vec(&catalog).unwrap().len(),
+        )
+        .unwrap();
+    let withdrawn = authority
+        .recheck_clear_signing(
+            &catalog_approval,
+            &current_policy,
+            &verifier,
+            catalog_now_ms,
+        )
+        .unwrap_err();
+    assert!(withdrawn.to_string().contains("withdrawn"), "{withdrawn}");
     broker
         .ceremony()
         .cancel(&operation("da"), approval_now_ms)

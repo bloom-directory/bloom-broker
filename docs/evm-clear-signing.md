@@ -178,7 +178,10 @@ pending approvals when changing those permissions.
 
 Safe inner contract calls use the same accepted catalog, observation-age limits,
 and clear-signing policy as native calls. A familiar selector alone does not
-establish readability. Readable calls cannot request an opaque review.
+establish readability. Readable calls cannot request an opaque review. A Safe
+approval whose inner calls were read from the catalog freezes those entries as
+clear-signing evidence, so the expiry cap and the activation and signing
+rechecks above apply to it exactly as they do to a native call.
 
 ## Unlimited allowances
 
