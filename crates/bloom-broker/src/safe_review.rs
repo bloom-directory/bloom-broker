@@ -1336,6 +1336,12 @@ pub(crate) fn outer_call(
         let payment_token = address_at(setup, 5)?;
         let payment = U256::from_be_slice(word(setup, 6)?);
         let payment_receiver = address_at(setup, 7)?;
+        // `setup` delegatecalls `to` with `data` from the new Safe. That code
+        // can add owners or modules or change the threshold, so the owners
+        // decoded here would not be the Safe's: the call is not read at all.
+        if setup_target != Address::ZERO || !setup_data.is_empty() {
+            return None;
+        }
         lines.push("Action: Create a Safe".to_owned());
         lines.push(format!("Signatures required: {threshold} of {count}"));
         for (index, owner) in owners.iter().enumerate() {
@@ -1365,11 +1371,6 @@ pub(crate) fn outer_call(
         lines.push(format!("Salt nonce: {salt}"));
         if !owners.contains(&from) {
             lines.push("Warning: this wallet is not an owner of the new Safe".to_owned());
-        }
-        if setup_target != Address::ZERO || !setup_data.is_empty() {
-            lines.push(format!(
-                "Warning: setup runs extra code at {setup_target} that Bloom cannot read"
-            ));
         }
         // `setup` pays `payment` out of the new Safe's own balance -- funds
         // already sent to the predicted address -- so the amount, the asset
@@ -2790,6 +2791,24 @@ mod tests {
         // No payment, no payment lines.
         let none = outer(FACTORY, CREATE_SAFE).unwrap();
         assert!(!none.contains("Setup payment"), "{none}");
+    }
+
+    /// `setup` delegatecalls its `to` from the new Safe, and that code can add
+    /// owners or modules, so the owners in the arguments are not a fact.
+    #[test]
+    fn a_creation_whose_setup_runs_code_is_not_read_as_a_safe() {
+        let data_offset = format!("{:0>64}", "140");
+        let no_setup = format!("{}{data_offset}", "0".repeat(64));
+        assert_eq!(CREATE_SAFE.matches(&no_setup).count(), 1);
+        let with_setup = CREATE_SAFE.replacen(
+            &no_setup,
+            &format!(
+                "{:0>64}{data_offset}",
+                "4000000000000000000000000000000000000000"
+            ),
+            1,
+        );
+        assert_eq!(outer(FACTORY, &with_setup), None);
     }
 
     /// Two facts the execution review left off the page.
