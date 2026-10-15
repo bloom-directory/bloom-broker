@@ -6024,3 +6024,21 @@ mod origin_tests {
             .expect("exact origin match must pass");
     }
 }
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    #[test]
+    fn every_element_the_ceremony_script_looks_up_exists_in_the_page() {
+        // A lookup of a removed element throws and shows every review as an
+        // unavailable link.
+        let missing: Vec<&str> = APP_JS
+            .split("getElementById(\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .filter(|id| !SHELL_HTML.contains(&format!("id=\"{id}\"")))
+            .collect();
+        assert!(missing.is_empty(), "missing page elements: {missing:?}");
+    }
+}

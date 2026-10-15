@@ -893,8 +893,6 @@ function renderCardReview(session) {
   const page = document.getElementById("ceremony-page");
   page?.classList?.toggle("browser-handoff", handoff);
   page?.classList?.remove("request-expired");
-  document.getElementById("ceremony-trust").hidden = handoff;
-  document.getElementById("ceremony-eyebrow").textContent = handoff ? "Browser access" : "Signed wallet review";
   panelKicker.textContent = "Step 1 of 2 · Check";
   const facts = el("dl", {class: "facts"});
   const fact = (name, value) => facts.append(el("dt", {}, name), el("dd", {}, value));

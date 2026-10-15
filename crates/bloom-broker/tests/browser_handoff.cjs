@@ -45,7 +45,6 @@ const session = {
 };
 renderCardReview(session);
 assert(nodes["ceremony-page"].classList.contains("browser-handoff"));
-assert.equal(nodes["ceremony-trust"].hidden, true);
 assert.match(nodes["page-lede"].textContent, /No payment is approved/);
 assert.match(nodes["page-lede"].textContent, /no saved card is shared/);
 const instructions = nodes.review.querySelector();
@@ -70,6 +69,4 @@ renderCardReview({...session, expires_at_ms: now + 120000,
   review_manifest: {card_effect: {kind: "manual_checkout", card_id: "saved",
     agent_description: "Finish this purchase yourself."}}});
 assert(!nodes["ceremony-page"].classList.contains("browser-handoff"));
-assert.equal(nodes["ceremony-trust"].hidden, false);
-assert.equal(nodes["ceremony-eyebrow"].textContent, "Signed wallet review");
 console.log("browser-handoff-ok");
