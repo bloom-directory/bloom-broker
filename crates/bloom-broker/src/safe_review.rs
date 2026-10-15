@@ -38,6 +38,10 @@ pub struct SafeReview {
     pub action: Vec<String>,
     pub safe_tx_hash: String,
     pub reported: SafeReported,
+    /// The catalog entries that read the inner calls, frozen with the
+    /// approval so signing re-checks them exactly as it does a native call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_signing: Option<bloom_evm_clear_signing::ClearSigningEvidence>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -761,7 +765,7 @@ fn is_opaque_line(line: &str) -> bool {
 
 fn classify_calls(
     envelope: &Envelope,
-    read_call: impl Fn(Address, U256, &[u8]) -> Result<Option<String>, ProtocolError>,
+    read_call: impl FnMut(Address, U256, &[u8]) -> Result<Option<String>, ProtocolError>,
 ) -> Result<String, ProtocolError> {
     let current = SafeSigners {
         threshold: uint(&envelope.threshold, "threshold")?,
@@ -804,7 +808,7 @@ fn classify_call(call: &SafeCall<'_>) -> Result<String, ProtocolError> {
 
 fn classify_call_with_reader(
     call: &SafeCall<'_>,
-    read_call: impl Fn(Address, U256, &[u8]) -> Result<Option<String>, ProtocolError>,
+    mut read_call: impl FnMut(Address, U256, &[u8]) -> Result<Option<String>, ProtocolError>,
 ) -> Result<String, ProtocolError> {
     let SafeCall {
         chain,
@@ -1032,13 +1036,14 @@ pub(crate) fn review(
             "wallet policy must allow destination exact on {chain_policy} for Safe signing"
         )));
     }
+    let mut entries = Vec::new();
     let rendered = classify_calls(&envelope, |to, value, calldata| {
         if policy.clear_signing.is_none() {
             return Ok(None);
         }
         let chain_id = u64::try_from(chain)
             .map_err(|_| invalid("Safe chain ID is too large for catalog review"))?;
-        let (reading, _) = crate::evm_review::review_contract_call(
+        let (reading, selected) = crate::evm_review::review_contract_call(
             &crate::evm_review::DecodedCall {
                 chain_id,
                 to,
@@ -1049,6 +1054,11 @@ pub(crate) fn review(
             request.requested_review_mode,
             clear_signing,
         )?;
+        for entry in selected {
+            if !entries.contains(&entry) {
+                entries.push(entry);
+            }
+        }
         let Some(reading) = reading else {
             return Ok(Some(format!(
                 "{OPAQUE_ACTION}\nContract: {to}\nNative value (wei): {value}\nCalldata selector: 0x{}\nCalldata keccak256: {:#x}",
@@ -1098,6 +1108,18 @@ pub(crate) fn review(
     // chain. A payload Bloom cannot explain is refused when it is sent
     // directly, so wrapping it in a SafeTx must not be a way around that.
     apply_clear_signing_policy(policy, request.requested_review_mode, &rendered)?;
+    let evidence = match &clear_signing.catalog {
+        Some(catalog) if !entries.is_empty() => {
+            let evidence = bloom_evm_clear_signing::ClearSigningEvidence::new(
+                catalog,
+                &clear_signing.verifier_digest,
+                entries,
+            );
+            crate::evm_review::cap_approval_expiry(&evidence, policy, request)?;
+            Some(evidence)
+        }
+        _ => None,
+    };
     let action = rendered.lines().map(str::to_owned).collect();
     let chain_name = u64::try_from(chain)
         .map(crate::evm_review::chain_name)
@@ -1140,6 +1162,7 @@ pub(crate) fn review(
             fallback_handler: address(&envelope.fallback_handler, "fallback_handler")?.to_string(),
             library_code_hash: envelope.library_code_hash,
         },
+        clear_signing: evidence,
     }))
 }
 
@@ -1763,6 +1786,20 @@ mod tests {
                 plan.action.iter().any(|line| line.contains("EXA")),
                 "{:?}",
                 plan.action
+            );
+            // The approval cannot outlive the catalog entries that read it.
+            let settings = clear_signing_policy(false).clear_signing.unwrap();
+            let permitted = plan
+                .clear_signing
+                .expect("a catalog reading carries its evidence")
+                .permitted_expiry_ms(settings.maximum_observation_age_ms);
+            let mut late = asked.clone();
+            late.terms.expires_at_ms = DecimalU64::new(permitted + 1);
+            let error =
+                super::review(&late, &clear_signing_policy(false), from, &context).unwrap_err();
+            assert!(
+                error.message.contains(&format!("only until {permitted}")),
+                "{error}"
             );
         }
         asked.requested_review_mode = Some(ReviewMode::OpaqueExact);

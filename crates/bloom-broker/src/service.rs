@@ -997,12 +997,16 @@ impl BrokerRpcService {
                 .as_ref()
                 .map_or(crate::journal::ReviewKind::Legacy, |policy| {
                     match (&context.safe_review, &policy.clear_signing) {
-                        // A Safe review is read from the exact bytes rather than from
-                        // a catalog, so it is never `Clear`. It still has to record
-                        // whether the inner call was read, or nothing downstream can
-                        // tell an opaque Safe approval from a fully read one.
+                        // A Safe review whose inner calls were read from the
+                        // catalog is `Clear`, with the same evidence and signing
+                        // recheck as a native call. Otherwise it still has to
+                        // record whether the inner call was read, or nothing
+                        // downstream can tell an opaque Safe approval from a
+                        // fully read one.
                         (Some(review), Some(_)) => {
-                            if crate::safe_review::is_opaque(review) {
+                            if review.clear_signing.is_some() {
+                                crate::journal::ReviewKind::Clear
+                            } else if crate::safe_review::is_opaque(review) {
                                 crate::journal::ReviewKind::OpaqueExact
                             } else {
                                 crate::journal::ReviewKind::Native
@@ -1015,7 +1019,12 @@ impl BrokerRpcService {
             .evm_review
             .as_ref()
             .and_then(|review| review.clear_signing.as_ref())
-        {
+            .or_else(|| {
+                context
+                    .safe_review
+                    .as_ref()
+                    .and_then(|review| review.clear_signing.as_ref())
+            }) {
             Some(evidence) => crate::authority::FrozenReview::with_evidence(review_kind, evidence),
             None => crate::authority::FrozenReview::without_evidence(review_kind),
         }

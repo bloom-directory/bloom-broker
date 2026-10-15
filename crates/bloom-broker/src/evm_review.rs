@@ -293,25 +293,35 @@ pub(crate) fn review(
         request.requested_review_mode,
         clear_signing,
     )?;
-    if let Some(evidence) = &review.clear_signing
-        && let Some(settings) = &policy.clear_signing
-    {
-        // Cap the approval before a ceremony exists. Returning the permitted
-        // instant lets Machine regenerate terms under the existing
-        // operation-conflict rules instead of guessing.
-        let permitted = evidence.permitted_expiry_ms(settings.maximum_observation_age_ms);
-        if request.terms.expires_at_ms.get() > permitted {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::ClaimInvalid,
-                format!(
-                    "POLICY_DENIED: clear-signing evidence permits approval only until \
-                     {permitted}; regenerate the terms with an expiry at or before that. {}",
-                    ReviewReason::PolicyDenied.owner_action()
-                ),
-            ));
-        }
+    if let Some(evidence) = &review.clear_signing {
+        cap_approval_expiry(evidence, policy, request)?;
     }
     Ok(Some(review))
+}
+
+/// Cap the approval before a ceremony exists. Returning the permitted
+/// instant lets Machine regenerate terms under the existing
+/// operation-conflict rules instead of guessing.
+pub(crate) fn cap_approval_expiry(
+    evidence: &ClearSigningEvidence,
+    policy: &CanonicalWalletPolicy,
+    request: &ApprovalPrepareRequest,
+) -> Result<(), ProtocolError> {
+    let Some(settings) = &policy.clear_signing else {
+        return Ok(());
+    };
+    let permitted = evidence.permitted_expiry_ms(settings.maximum_observation_age_ms);
+    if request.terms.expires_at_ms.get() > permitted {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::ClaimInvalid,
+            format!(
+                "POLICY_DENIED: clear-signing evidence permits approval only until \
+                 {permitted}; regenerate the terms with an expiry at or before that. {}",
+                ReviewReason::PolicyDenied.owner_action()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// One mode for the whole batch.
