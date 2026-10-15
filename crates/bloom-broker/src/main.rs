@@ -470,6 +470,7 @@ async fn run_with_paths(
                         reason = "session_unavailable",
                         "Broker startup ended before the login sentinel became available"
                     );
+                    abandon_startup(startup_status_path.as_deref(), broker_effective_uid)?;
                     return Ok(());
                 }
             }
@@ -1384,6 +1385,15 @@ fn write_startup_failure(
     fs::rename(&temporary, path)?;
     fs::File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+/// A startup that ends before the listeners has not failed, so a diagnostic
+/// an earlier run left must not be reported as the current cause.
+fn abandon_startup(path: Option<&Path>, broker_uid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    match path {
+        Some(path) => clear_startup_failure(path, broker_uid),
+        None => Ok(()),
+    }
 }
 
 fn clear_startup_failure(path: &Path, broker_uid: u32) -> Result<(), Box<dyn std::error::Error>> {
@@ -3194,6 +3204,12 @@ mod startup_failure_tests {
 
         clear_startup_failure(&path, metadata.uid()).expect("clear startup failure");
         assert!(!path.exists());
+
+        // An abandoned startup does not leave the earlier failure as its cause.
+        write_startup_failure(&path, metadata.uid(), &failure).expect("write startup failure");
+        abandon_startup(Some(&path), metadata.uid()).expect("abandon startup");
+        assert!(!path.exists());
+        abandon_startup(None, metadata.uid()).expect("abandon without a status path");
 
         std::os::unix::fs::symlink("/dev/null", &path).expect("substitute status path");
         assert!(write_startup_failure(&path, metadata.uid(), &failure).is_err());
