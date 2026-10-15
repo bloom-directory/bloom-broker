@@ -600,6 +600,7 @@ pub(crate) mod tests {
         let token = |s: &str| Token::new(s).unwrap();
         let digest = Digest32::from_bytes([1; 32]);
         ApprovalPrepareRequest {
+            attributed_advisory: None,
             requested_review_mode: None,
             surface_selection: CeremonySurfaceSelection::Default,
             operation_id: OperationId::from_bytes([2; 32]),

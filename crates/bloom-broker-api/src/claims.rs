@@ -61,6 +61,65 @@ impl ClaimAssurance {
     }
 }
 
+/// Plain-text lines a Petal supplies to describe the operation it is asking
+/// the owner to approve. They are presentation only: nothing here is verified,
+/// nothing here changes what the approval permits, and Broker renders them
+/// attributed to the Petal rather than as its own findings.
+///
+/// This is deliberately not part of [`PetalUseClaim`]. The claim is the
+/// economic assertion Broker enforces value limits against; adding display
+/// text to it would make a presentation change alter an enforcement input.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttributedAdvisory {
+    pub schema: Token,
+    pub items: Vec<String>,
+}
+
+impl AttributedAdvisory {
+    pub const SCHEMA: &'static str = "bloom.petal.review.v1";
+    /// Enough lines for a trade's account, assets, floor and costs, and no
+    /// more. A Petal that needs an essay is describing the wrong thing.
+    pub const MAX_ITEMS: usize = 16;
+    pub const MAX_ITEM_CHARS: usize = 200;
+
+    /// The lines, or why they cannot be shown. A rejected advisory fails the
+    /// preparation rather than being silently dropped: an owner must not be
+    /// asked to approve an operation whose description Broker discarded.
+    pub fn validated(&self) -> Result<Vec<String>, String> {
+        if self.schema.as_str() != Self::SCHEMA {
+            return Err(format!(
+                "unsupported advisory schema {:?}; expected {:?}",
+                self.schema.as_str(),
+                Self::SCHEMA
+            ));
+        }
+        if self.items.is_empty() || self.items.len() > Self::MAX_ITEMS {
+            return Err(format!(
+                "an advisory carries 1..={} items, but this one carries {}",
+                Self::MAX_ITEMS,
+                self.items.len()
+            ));
+        }
+        for item in &self.items {
+            let characters = item.chars().count();
+            if characters == 0 || characters > Self::MAX_ITEM_CHARS {
+                return Err(format!(
+                    "each advisory item is 1..={} characters, but one is {characters}",
+                    Self::MAX_ITEM_CHARS
+                ));
+            }
+            // Control characters would let a Petal forge line structure in a
+            // rendered review. The page escapes markup already; this closes
+            // the other half.
+            if item.chars().any(char::is_control) {
+                return Err("an advisory item contains a control character".to_owned());
+            }
+        }
+        Ok(self.items.clone())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PetalUseClaim {
@@ -108,4 +167,67 @@ pub struct SystemUseClaim {
     pub nonce: RequestNonce,
     pub chain_context: SystemChainContext,
     pub claim_assurance: ClaimAssurance,
+}
+
+#[cfg(test)]
+mod attributed_advisory_tests {
+    use super::*;
+
+    fn advisory(items: Vec<String>) -> AttributedAdvisory {
+        AttributedAdvisory {
+            schema: Token::new(AttributedAdvisory::SCHEMA).unwrap(),
+            items,
+        }
+    }
+
+    #[test]
+    fn a_well_formed_advisory_passes_its_lines_through_unchanged() {
+        let items = vec![
+            "Buy on Pump.fun".to_owned(),
+            "Guaranteed minimum received: 1000 raw units of C8CM…pump".to_owned(),
+        ];
+        assert_eq!(advisory(items.clone()).validated().unwrap(), items);
+    }
+
+    /// Every rejection here is a rejection, not a silent drop: the owner must
+    /// never be asked to approve an operation whose description was discarded.
+    #[test]
+    fn an_advisory_that_cannot_be_rendered_honestly_is_refused() {
+        let long = "x".repeat(AttributedAdvisory::MAX_ITEM_CHARS + 1);
+        let cases = [
+            (advisory(Vec::new()), "no items"),
+            (
+                advisory(vec!["x".to_owned(); AttributedAdvisory::MAX_ITEMS + 1]),
+                "too many items",
+            ),
+            (advisory(vec![String::new()]), "an empty item"),
+            (advisory(vec![long]), "an over-long item"),
+            // A newline would let a Petal forge line structure inside one
+            // rendered item.
+            (advisory(vec!["first\nsecond".to_owned()]), "a newline"),
+            (
+                advisory(vec!["ring\u{7}".to_owned()]),
+                "a control character",
+            ),
+            (
+                AttributedAdvisory {
+                    schema: Token::new("bloom.petal.review.v99").unwrap(),
+                    items: vec!["Buy".to_owned()],
+                },
+                "an unknown schema",
+            ),
+        ];
+        for (candidate, reason) in cases {
+            assert!(candidate.validated().is_err(), "{reason} must be refused");
+        }
+    }
+
+    /// A character counts once, however many bytes it takes. A byte-length
+    /// bound would reject a legitimate non-ASCII review.
+    #[test]
+    fn the_item_bound_counts_characters_not_bytes() {
+        let item = "é".repeat(AttributedAdvisory::MAX_ITEM_CHARS);
+        assert!(item.len() > AttributedAdvisory::MAX_ITEM_CHARS);
+        assert!(advisory(vec![item]).validated().is_ok());
+    }
 }

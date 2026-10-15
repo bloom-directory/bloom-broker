@@ -282,6 +282,10 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
             canonical_plan_facts_digest: digest(59),
             petal_use_claim: None,
             system_use_claim: None,
+            attributed_advisory: Some(AttributedAdvisory {
+                schema: token(AttributedAdvisory::SCHEMA),
+                items: vec!["Buy on Pump.fun".into()],
+            }),
         }),
         MachineBrokerRequest::SealedApprovalStatus(id.clone()),
         MachineBrokerRequest::SealedApprovalList(wallet.clone()),
@@ -589,7 +593,7 @@ fn every_machine_broker_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "950b2fc2235205a19fa41058e6c14fb00eba4730415e0545830322cf8d6780cb",
+        "fad0c8cf62391a1000b1c771b4e482e353efebc9056f263a68670f8abba946a8",
     );
     assert_wire_digest(
         "machine responses",

@@ -121,6 +121,11 @@ pub struct ApprovalPrepareRequest {
     pub petal_use_claim: Option<PetalUseClaim>,
     #[serde(default)]
     pub system_use_claim: Option<SystemUseClaim>,
+    /// The Petal's bounded description of the operation for the owner review.
+    /// This is attributed app text, not independently verified economics or
+    /// an additional constraint on a reusable selector's future payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attributed_advisory: Option<crate::AttributedAdvisory>,
 }
 
 /// One mode for the whole batch. There is no mixed badge, no automatic
