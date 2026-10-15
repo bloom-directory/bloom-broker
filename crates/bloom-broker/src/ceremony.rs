@@ -1,7 +1,7 @@
 mod cards;
 pub use cards::{
-    CheckoutIntakeRequest, CheckoutIntakeResponse, bind_checkout_intake, serve_checkout_intake,
-    serve_checkout_listener,
+    CheckoutIntakeRequest, CheckoutIntakeResponse, OrderField, bind_checkout_intake,
+    serve_checkout_intake, serve_checkout_listener,
 };
 
 use crate::{
@@ -2600,6 +2600,10 @@ impl CeremonyBroker {
                 get(read_order_preview),
             )
             .route(
+                "/api/session/{ceremony_id}/order-fields",
+                get(read_order_fields),
+            )
+            .route(
                 "/api/session/{ceremony_id}/complete",
                 post(complete_session),
             )
@@ -4047,6 +4051,30 @@ async fn read_order_preview(
     };
     match broker.inner.cards.order_preview(&operation_id) {
         Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn read_order_fields(
+    State(broker): State<CeremonyBroker>,
+    Path(ceremony_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if broker.validate_served_host(&headers).is_err()
+        || broker
+            .authorize_browser(&ceremony_id, &headers, false)
+            .is_err()
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let operation_id = match broker.inner.sessions.lock().get(&ceremony_id) {
+        Some(session) if session.ceremony_kind == CeremonyKind::CardCheckout => {
+            session.operation_id.clone()
+        }
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    match broker.inner.cards.order_fields(&operation_id) {
+        Some(fields) => Json(fields).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }

@@ -354,6 +354,7 @@ async fn card_checkout_private_delivery_is_single_use_and_manual_has_no_release(
             agent_description: "Unverified description".into(),
             challenge_url: challenge.into(),
             order_preview: Some(Base64UrlBytes::from_bytes(b"<svg/>")),
+            order_fields: vec![],
         },
     )
     .await;
@@ -378,6 +379,10 @@ async fn card_checkout_private_delivery_is_single_use_and_manual_has_no_release(
             agent_description: "Unverified description".into(),
             challenge_url: challenge.into(),
             order_preview: Some(Base64UrlBytes::from_bytes(&jpeg)),
+            order_fields: vec![bloom_broker::ceremony::OrderField {
+                label: "Nombres *".into(),
+                value: "Synthetic Traveler".into(),
+            }],
         },
     )
     .await
@@ -411,6 +416,31 @@ async fn card_checkout_private_delivery_is_single_use_and_manual_has_no_release(
         .unwrap();
     assert_eq!(shown.as_ref(), jpeg.as_slice());
     assert_eq!(preview(None).await.unwrap().status(), StatusCode::FORBIDDEN);
+    // Entered details reach the review page only, never the session projection.
+    let fields = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri(preview_uri.replace("order-preview", "order-fields"))
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&prepared.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fields.status(), StatusCode::OK);
+    let fields: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(fields.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        fields,
+        serde_json::json!([{"label":"Nombres *","value":"Synthetic Traveler"}])
+    );
+    assert!(!session.to_string().contains("Synthetic Traveler"));
     assert!(
         !session
             .to_string()
@@ -605,6 +635,7 @@ async fn card_takeover_and_site_checkout_release_no_card() {
             agent_description: "Shop's saved card".into(),
             challenge_url: challenge.into(),
             order_preview: None,
+            order_fields: vec![],
         },
     ];
     for (count, (id, request)) in (2..).zip(["b4", "b5"].into_iter().zip(requests)) {

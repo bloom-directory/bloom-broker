@@ -896,7 +896,7 @@ function renderCardReview(session) {
   panelKicker.textContent = "Step 1 of 2 · Check";
   const facts = el("dl", {class: "facts"});
   const fact = (name, value) => facts.append(el("dt", {}, name), el("dd", {}, value));
-  if (manifest.card) fact("Card", `${manifest.card.label} · ${manifest.card.brand} ••${manifest.card.last4}`);
+  if (manifest.card) fact("Card", `${manifest.card.brand} ending ${manifest.card.last4} (“${manifest.card.label}”)`);
   if (effect.kind === "add") fact("Label", effect.label);
   if (effect.kind === "checkout" || effect.kind === "site_checkout") {
     const payment = effect.facts;
@@ -928,7 +928,21 @@ function renderCardReview(session) {
       .then(response => response.ok ? response.blob() : null)
       .then(blob => { if (blob?.type === "image/jpeg") { image.src = URL.createObjectURL(blob); preview.hidden = false; } })
       .catch(() => {});
-    reviewNode.replaceChildren(facts, preview, el("h3", {}, "Described by agent — not verified"), el("p", {}, effect.agent_description), el("p", {}, "Bloom reports the merchant's confirmation; it does not verify your bank charge."));
+    // Every field filled on the merchant's page, read just before this
+    // review, so passenger, contact and card-holder details can be checked.
+    const entered = el("section", {class: "order-fields", hidden: ""},
+      el("h3", {}, "Details entered on the merchant's page"));
+    fetch(`/api/session/${session.ceremony_id}/order-fields`, {headers: authHeaders, credentials: "same-origin"})
+      .then(response => response.ok ? response.json() : [])
+      .then(fields => {
+        if (!Array.isArray(fields) || !fields.length) return;
+        const table = el("table", {});
+        for (const field of fields) table.append(el("tr", {}, el("th", {scope: "row"}, field.label || "(no label)"), el("td", {}, field.value)));
+        entered.append(table, el("p", {class: "order-fields-note"}, "Read from the page as it will be submitted. Card number and security code are not shown."));
+        entered.hidden = false;
+      })
+      .catch(() => {});
+    reviewNode.replaceChildren(facts, entered, preview, el("h3", {}, "Described by agent — not verified"), el("p", {}, effect.agent_description), el("p", {}, "Bloom reports the merchant's confirmation; it does not verify your bank charge."));
   } else if (effect.kind === "manual_checkout" && !effect.card_id) {
     document.getElementById("page-title").textContent = "Open Bloom's browser";
     panelKicker.textContent = "Review this request";

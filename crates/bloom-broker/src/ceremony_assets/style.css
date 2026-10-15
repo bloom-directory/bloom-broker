@@ -242,3 +242,10 @@ textarea{resize:vertical}
 .browser-handoff.request-expired .expired{display:none}
 .browser-handoff.request-expired .handoff-return{display:none}
 .browser-handoff.request-expired button:disabled{cursor:not-allowed;opacity:1;background:#ded6ca;color:#554c40}
+
+.order-fields { margin: 1.25rem 0; }
+.order-fields table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+.order-fields th, .order-fields td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--ceremony-border); vertical-align: top; }
+.order-fields th { font-weight: 500; color: var(--ceremony-muted); width: 45%; }
+.order-fields td { font-weight: 600; word-break: break-word; }
+.order-fields-note { font-size: 0.85rem; color: var(--ceremony-muted); }

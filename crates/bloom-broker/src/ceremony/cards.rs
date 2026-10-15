@@ -19,8 +19,35 @@ struct Channel {
     /// Merchant page as checkout saw it, shown on the review page only. Kept
     /// in memory: it can show the buyer's address and is not a bound fact.
     order_preview: Option<Vec<u8>>,
+    /// Labels and values entered on the merchant page, shown on the review
+    /// page only and kept in memory for the same reason.
+    order_fields: Vec<OrderField>,
 }
+
+/// One filled field on the merchant's page, as checkout read it.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderField {
+    pub label: String,
+    pub value: String,
+}
+const MAX_ORDER_FIELDS: usize = 60;
+
+fn checked_order_fields(fields: Vec<OrderField>) -> Result<Vec<OrderField>, ProtocolError> {
+    if fields.len() > MAX_ORDER_FIELDS
+        || fields
+            .iter()
+            .any(|f| f.label.chars().count() > 120 || f.value.chars().count() > 200)
+    {
+        return Err(kind_mismatch());
+    }
+    Ok(fields)
+}
+
 impl CardChannels {
+    pub(super) fn order_fields(&self, operation_id: &OperationId) -> Option<Vec<OrderField>> {
+        Some(self.channels.lock().get(operation_id)?.order_fields.clone())
+    }
     pub(super) fn forget(&self, operation_id: &OperationId) {
         self.channels.lock().remove(operation_id);
     }
@@ -60,6 +87,8 @@ pub enum CheckoutIntakeRequest {
         challenge_url: String,
         #[serde(default)]
         order_preview: Option<Base64UrlBytes>,
+        #[serde(default)]
+        order_fields: Vec<OrderField>,
     },
     /// Without a card, the human takes over the browser for a login or code.
     Manual {
@@ -77,6 +106,8 @@ pub enum CheckoutIntakeRequest {
         challenge_url: String,
         #[serde(default)]
         order_preview: Option<Base64UrlBytes>,
+        #[serde(default)]
+        order_fields: Vec<OrderField>,
     },
     Result {
         operation_id: OperationId,
@@ -286,6 +317,7 @@ impl CeremonyBroker {
                 },
                 challenge_url,
                 None,
+                Vec::new(),
                 now_ms,
             ),
             CheckoutIntakeRequest::Prepare {
@@ -296,8 +328,10 @@ impl CeremonyBroker {
                 agent_description,
                 challenge_url,
                 order_preview,
+                order_fields,
             } => {
                 let order_preview = order_preview_bytes(order_preview)?;
+                let order_fields = checked_order_fields(order_fields)?;
                 // The principal owns this private capability. Never put it in a public projection.
                 let effect = CardEffect::Checkout {
                     card_id,
@@ -310,6 +344,7 @@ impl CeremonyBroker {
                     effect,
                     challenge_url,
                     order_preview,
+                    order_fields,
                     now_ms,
                 )
             }
@@ -326,6 +361,7 @@ impl CeremonyBroker {
                 },
                 challenge_url,
                 None,
+                Vec::new(),
                 now_ms,
             ),
             CheckoutIntakeRequest::Site {
@@ -334,8 +370,10 @@ impl CeremonyBroker {
                 agent_description,
                 challenge_url,
                 order_preview,
+                order_fields,
             } => {
                 let order_preview = order_preview_bytes(order_preview)?;
+                let order_fields = checked_order_fields(order_fields)?;
                 self.prepare_checkout_channel(
                     operation_id,
                     CardEffect::SiteCheckout {
@@ -344,6 +382,7 @@ impl CeremonyBroker {
                     },
                     challenge_url,
                     order_preview,
+                    order_fields,
                     now_ms,
                 )
             }
@@ -377,6 +416,7 @@ impl CeremonyBroker {
         effect: CardEffect,
         challenge_url: String,
         order_preview: Option<Vec<u8>>,
+        order_fields: Vec<OrderField>,
         now_ms: u64,
     ) -> Result<CheckoutIntakeResponse, ProtocolError> {
         let url = url::Url::parse(&challenge_url).map_err(|_| kind_mismatch())?;
@@ -426,6 +466,7 @@ impl CeremonyBroker {
             expires_at_ms: prepared.ceremony_expires_at_ms.get(),
             output_aad,
             order_preview,
+            order_fields,
         });
         Ok(CheckoutIntakeResponse::Prepared(prepared))
     }
