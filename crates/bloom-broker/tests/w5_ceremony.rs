@@ -6678,6 +6678,70 @@ fn explicit_cross_surface_prepare_binds_existing_origins_and_operation() {
     assert!(broker.public_status(&operation("de")).is_err());
 }
 
+/// The local surface's persisted Signer identity keeps the shipping origin, so
+/// a paired enrollment to `local` on a Broker with another ceremony port must
+/// still mint, and serve, its link on that Broker's own origin.
+#[tokio::test]
+async fn local_cross_surface_enrollment_uses_the_configured_ceremony_port() {
+    let (_v4, _v6, endpoint) = ephemeral_endpoint_pair();
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let broker =
+        CeremonyBroker::new_with_endpoint(Arc::new(MockSigner::with_remote_surface()), endpoint);
+    let prepared = broker
+        .prepare_cross_surface(
+            bloom_broker_api::CeremonyCrossSurfacePrepareRequest {
+                operation_id: operation("df"),
+                wallet_id: Token::new("cross-wallet").unwrap(),
+                destination: bloom_broker_api::CeremonySurfaceSelection::Local,
+            },
+            now_ms,
+        )
+        .unwrap();
+    assert!(
+        prepared
+            .destination_url
+            .starts_with(&format!("{}/ceremony/", endpoint.origin())),
+        "{}",
+        prepared.destination_url
+    );
+    assert_eq!(
+        broker
+            .public_status(&operation("df"))
+            .unwrap()
+            .ceremony_url
+            .as_deref(),
+        Some(prepared.destination_url.as_str())
+    );
+    let response = broker
+        .clone()
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, endpoint.host())
+                .header(
+                    "x-bloom-ceremony-token",
+                    url_token(&prepared.destination_url),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let projection: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        projection["cross_surface"]["destination_origin"],
+        endpoint.origin()
+    );
+}
+
 #[tokio::test]
 async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
     let signer = Arc::new(MockSigner::new());
