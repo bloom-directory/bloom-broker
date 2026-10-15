@@ -94,6 +94,12 @@ pub struct CatalogEntry {
     /// When the publisher observed this deployment. Freshness is measured
     /// from here, so republishing an old observation does not renew it.
     pub observed_at_ms: DecimalU64,
+    /// This entry is an implementation that per-user proxies run, such as a
+    /// Safe singleton. Broker also reads calls to an address with no entry of
+    /// its own by this entry's functions, and says that it did not verify the
+    /// address runs this implementation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub applies_to_instances: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -193,9 +199,25 @@ impl ClearSigningCatalog {
             }
         }
         let mut keys: Vec<(u64, &str)> = Vec::with_capacity(self.entries.len());
+        let mut instance_selectors = BTreeSet::new();
         for entry in &self.entries {
             entry.validate_shape()?;
             keys.push((entry.chain_id.get(), entry.contract_address.as_str()));
+            if entry.applies_to_instances {
+                for admitted in &entry.admitted_functions {
+                    let selector = crate::parse_function(&admitted.signature)?.selector().0;
+                    if !instance_selectors.insert((entry.chain_id.get(), selector)) {
+                        return Err(ReviewError::new(
+                            ReviewReason::CatalogRejected,
+                            format!(
+                                "two instance entries on chain {} admit the selector of `{}`, so an unlisted address would be ambiguous",
+                                entry.chain_id.get(),
+                                admitted.signature
+                            ),
+                        ));
+                    }
+                }
+            }
         }
         // Sorted and unique: the signed snapshot has one deterministic order,
         // so a duplicate entry cannot shadow an earlier one during lookup.
@@ -351,6 +373,21 @@ impl CatalogEntry {
         if let Some(metadata) = &self.token_metadata {
             metadata.validate_shape()?;
         }
+        // An instance entry describes addresses nobody listed. Token units or
+        // an ERC-20 class there would lend one token's identity to them all.
+        if self.applies_to_instances
+            && (self.flattened_descriptor.is_none()
+                || self.token_metadata.is_some()
+                || self
+                    .admitted_functions
+                    .iter()
+                    .any(|admitted| admitted.action_class != ActionClass::Other))
+        {
+            return Err(ReviewError::new(
+                ReviewReason::CatalogRejected,
+                "an instance entry needs a descriptor, carries no token metadata, and admits only `other` functions",
+            ));
+        }
         Ok(())
     }
 
@@ -400,6 +437,32 @@ impl AcceptedCatalog {
             .entries
             .iter()
             .find(|entry| entry.chain_id.get() == chain_id && entry.contract_address == address)
+    }
+
+    /// The entry that describes a call to `address` with `selector`, and
+    /// whether it was matched as an unverified instance.
+    ///
+    /// An address with its own entry is read by that entry alone: a listed
+    /// token is never read as a Safe because it lacks the selector. Only an
+    /// unlisted address falls through to the instance entries.
+    pub fn resolve(
+        &self,
+        chain_id: u64,
+        address: &str,
+        selector: &[u8],
+    ) -> Option<(&CatalogEntry, &AdmittedDescriptor, bool)> {
+        if let Some(entry) = self.entry(chain_id, address) {
+            let descriptor = self.descriptor(chain_id, address)?;
+            return Some((entry, descriptor, false));
+        }
+        self.catalog
+            .entries
+            .iter()
+            .filter(|entry| entry.applies_to_instances && entry.chain_id.get() == chain_id)
+            .find_map(|entry| {
+                let descriptor = self.descriptor(chain_id, &entry.contract_address)?;
+                descriptor.call(selector).map(|_| (entry, descriptor, true))
+            })
     }
 
     pub fn descriptor(&self, chain_id: u64, address: &str) -> Option<&AdmittedDescriptor> {

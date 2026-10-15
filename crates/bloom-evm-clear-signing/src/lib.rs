@@ -10,7 +10,9 @@
 //! resolve a name, simulate execution, or claim that a described call is
 //! safe. The assurance class is [`TRUSTED_DESCRIPTION`] — the publisher is
 //! trusted to describe the listed deployment, and a signature authenticates
-//! that assertion and nothing more.
+//! that assertion and nothing more. A call read through an instance entry is
+//! [`STRUCTURAL_DESCRIPTION`]: the description is trusted, but nothing
+//! establishes that the address runs that contract.
 
 pub mod artifact;
 mod catalog;
@@ -29,6 +31,9 @@ use sha2::{Digest as _, Sha256};
 /// "a trusted publisher described this" from being read as "Bloom checked
 /// what this call does".
 pub const TRUSTED_DESCRIPTION: &str = "trusted_description";
+/// A review that read at least one address by an instance entry: the
+/// description is trusted, the address's contract is not established.
+pub const STRUCTURAL_DESCRIPTION: &str = "structural_description";
 
 /// The nine review outcomes. Each one is actionable on its own, and existing
 /// transport and authority errors are reused wherever they already say the
@@ -163,8 +168,14 @@ impl ClearSigningEvidence {
         verifier_digest: &Digest32,
         entries: Vec<SelectedEntry>,
     ) -> Self {
+        let structural = entries.iter().any(|entry| entry.instance.is_some());
         Self {
-            assurance: TRUSTED_DESCRIPTION.to_owned(),
+            assurance: if structural {
+                STRUCTURAL_DESCRIPTION
+            } else {
+                TRUSTED_DESCRIPTION
+            }
+            .to_owned(),
             verifier_id: EVM_CLEAR_SIGNING_VERIFIER_ID.to_owned(),
             verifier_digest: verifier_digest.as_str().to_owned(),
             catalog_id: catalog.catalog.catalog_id.as_str().to_owned(),
@@ -221,7 +232,10 @@ impl ClearSigningEvidence {
             let chain_id = frozen.chain_id.parse::<u64>().unwrap_or(0);
             let current = catalog
                 .entry(chain_id, &frozen.contract_address)
-                .map(SelectedEntry::of)
+                .map(|entry| SelectedEntry {
+                    instance: frozen.instance.clone(),
+                    ..SelectedEntry::of(entry)
+                })
                 .ok_or_else(|| {
                     ReviewError::new(
                         ReviewReason::ReviewChanged,

@@ -42,6 +42,8 @@ pub const MAX_ADMITTED_FORMATS: usize = 16;
 pub const MAX_LEAVES_PER_FORMAT: usize = 32;
 pub const MAX_TEXT_SCALARS: usize = 256;
 pub const MAX_ENUM_ENTRIES: usize = 64;
+/// Values one `mustMatch` rule may list.
+pub const MAX_MATCH_VALUES: usize = 64;
 
 /// The six admitted field formats. Each carries only what Bloom can honour
 /// from authenticated data; name hints, thresholds and messages do not
@@ -62,6 +64,24 @@ pub enum AdmittedFormat {
     Date,
     /// A bounded local value-to-label map from `$.metadata.enums`.
     Enum(BTreeMap<String, String>),
+    /// A call carried inside this one, read against the same catalog as a
+    /// call of its own: an undescribed inner call makes the whole call
+    /// unsupported, and its policy refusals still refuse.
+    Calldata {
+        callee: CalleeSource,
+        /// A named uint argument carrying the native value the inner call
+        /// sends, when there is one.
+        amount: Option<String>,
+    },
+}
+
+/// Which contract an embedded call is made to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CalleeSource {
+    /// `@.to`: the contract being called calls itself.
+    TargetContract,
+    /// A named address argument of the same call.
+    Argument(String),
 }
 
 /// Where a `tokenAmount` field's token comes from.
@@ -89,10 +109,13 @@ impl AdmittedFormat {
             Self::Amount => "amount",
             Self::Date => "date",
             Self::Enum(_) => "enum",
+            Self::Calldata { .. } => "calldata",
         }
     }
 }
 
+/// A displayed argument. For an array argument the format applies to each
+/// element, and each element is shown on its own line.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdmittedField {
     pub path: String,
@@ -106,6 +129,10 @@ pub enum LeafType {
     Uint(usize),
     Bool,
     FixedBytes(usize),
+    /// Dynamic `bytes`: shown raw, or read as an embedded call.
+    Bytes,
+    /// A dynamic array of one static scalar type.
+    Array(Box<LeafType>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -117,6 +144,10 @@ pub struct AdmittedCall {
     pub intent: Option<String>,
     pub fields: Vec<AdmittedField>,
     pub leaves: Vec<(String, LeafType)>,
+    /// `mustMatch` rules: the argument at the path must equal one of the
+    /// values, in the form `match_key` gives a decoded value. A constrained
+    /// argument is not shown, because the signed description fixes it.
+    pub constraints: Vec<(String, Vec<String>)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -370,7 +401,7 @@ fn admit_call(
     if leaves.is_empty() || leaves.len() > MAX_LEAVES_PER_FORMAT {
         return Err(ReviewError::new(
             ReviewReason::LimitExceeded,
-            format!("`{signature}` must decode 1-{MAX_LEAVES_PER_FORMAT} static arguments"),
+            format!("`{signature}` must decode 1-{MAX_LEAVES_PER_FORMAT} arguments"),
         ));
     }
     let leaf_types: BTreeMap<&str, &LeafType> = leaves
@@ -389,6 +420,7 @@ fn admit_call(
         ));
     }
     let mut fields = Vec::with_capacity(declared.len());
+    let mut constraints = Vec::new();
     let mut covered = BTreeSet::new();
     for field in declared {
         let field = object(field, "field")?;
@@ -399,41 +431,72 @@ fn admit_call(
             &["$id", "path", "label", "format", "params", "visible"],
             "field",
         )?;
-        if let Some(visible) = field.get("visible")
-            && visible.as_str() != Some("always")
-        {
-            return Err(rejected(
-                "only always-visible fields are supported; hidden and conditional rules are not",
-            ));
-        }
-        let path = normalize_path(&text(
+        // `mustMatch` is the one hidden rule admitted: it does not hide a
+        // value, it fixes it, and any other value refuses the call.
+        let allowed = match field.get("visible") {
+            None => None,
+            Some(visible) if visible.as_str() == Some("always") => None,
+            Some(Value::Object(rule)) if rule.len() == 1 && rule.contains_key("mustMatch") => {
+                Some(&rule["mustMatch"])
+            }
+            Some(_) => {
+                return Err(rejected(
+                    "a field is always visible or carries a mustMatch rule; hidden and conditional rules are not supported",
+                ));
+            }
+        };
+        let (path, each) = field_path(&text(
             field
                 .get("path")
                 .ok_or_else(|| rejected("field has no path"))?,
             "field.path",
         )?)?;
+        let kind = leaf_types.get(path.as_str()).ok_or_else(|| {
+            rejected(format!(
+                "field path `{path}` is not a decoded argument of `{signature}`"
+            ))
+        })?;
+        if each != matches!(kind, LeafType::Array(_)) {
+            return Err(rejected(format!(
+                "an array argument is addressed as `{path}.[]`, and nothing else may be"
+            )));
+        }
+        if !covered.insert(path.clone()) {
+            return Err(rejected(format!("argument `{path}` is displayed twice")));
+        }
+        if let Some(allowed) = allowed {
+            only_keys(
+                field,
+                &["$id", "path", "label", "visible"],
+                "mustMatch field",
+            )?;
+            constraints.push((path.clone(), match_values(allowed, kind, &path)?));
+            continue;
+        }
         let label = text(
             field
                 .get("label")
                 .ok_or_else(|| rejected("field has no label"))?,
             "field.label",
         )?;
-        let kind = leaf_types.get(path.as_str()).ok_or_else(|| {
-            rejected(format!(
-                "field path `{path}` is not a decoded argument of `{signature}`"
-            ))
-        })?;
-        if !covered.insert(path.clone()) {
-            return Err(rejected(format!("argument `{path}` is displayed twice")));
-        }
         let format_name = field
             .get("format")
             .ok_or_else(|| rejected(format!("field `{path}` has no format")))?
             .as_str()
             .ok_or_else(|| rejected("field format must be a string"))?;
         let params = field.get("params");
+        let element: &LeafType = match kind {
+            LeafType::Array(element) => element,
+            other => other,
+        };
+        let format = admit_format(format_name, params, element, &path, enums, &leaf_types)?;
+        if each && matches!(format, AdmittedFormat::TokenAmount(_)) {
+            return Err(rejected(format!(
+                "`{path}.[]` cannot be a token amount: each element would need its own token"
+            )));
+        }
         fields.push(AdmittedField {
-            format: admit_format(format_name, params, kind, &path, enums, &leaf_types)?,
+            format,
             path,
             label,
         });
@@ -457,7 +520,60 @@ fn admit_call(
         intent,
         fields,
         leaves,
+        constraints,
     })
+}
+
+/// The values a `mustMatch` rule admits, in `match_key` form.
+fn match_values(values: &Value, kind: &LeafType, path: &str) -> Result<Vec<String>, ReviewError> {
+    let values = values
+        .as_array()
+        .filter(|values| !values.is_empty() && values.len() <= MAX_MATCH_VALUES)
+        .ok_or_else(|| {
+            rejected(format!(
+                "mustMatch on `{path}` must list 1-{MAX_MATCH_VALUES} values"
+            ))
+        })?;
+    let bad = || {
+        rejected(format!(
+            "a mustMatch value on `{path}` does not fit its type"
+        ))
+    };
+    values
+        .iter()
+        .map(|value| match kind {
+            LeafType::Address => value
+                .as_str()
+                .map(str::to_ascii_lowercase)
+                .filter(|address| crate::is_canonical_address(address))
+                .ok_or_else(bad),
+            LeafType::Uint(_) => match value {
+                Value::Number(number) => number.as_u64().map(|number| number.to_string()),
+                Value::String(text) => alloy_primitives::U256::from_str_radix(text, 10)
+                    .ok()
+                    .map(|number| number.to_string()),
+                _ => None,
+            }
+            .ok_or_else(bad),
+            LeafType::Bool => value.as_bool().map(|flag| flag.to_string()).ok_or_else(bad),
+            LeafType::FixedBytes(_) | LeafType::Bytes => value
+                .as_str()
+                .map(str::to_ascii_lowercase)
+                .filter(|hex| {
+                    let digits = hex.strip_prefix("0x").unwrap_or("-");
+                    digits.len() % 2 == 0
+                        && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        && match kind {
+                            LeafType::FixedBytes(size) => digits.len() == size * 2,
+                            _ => true,
+                        }
+                })
+                .ok_or_else(bad),
+            LeafType::Array(_) => Err(rejected(format!(
+                "mustMatch on `{path}` would fix a whole array; it is not supported"
+            ))),
+        })
+        .collect()
 }
 
 fn admit_format(
@@ -562,9 +678,60 @@ fn admit_format(
             .then(|| AdmittedFormat::Enum(map.clone()))
             .ok_or_else(|| mismatched("integer, boolean or fixed-bytes"))
         }
+        "calldata" => {
+            // `selector`, `spender` and `chainId` parameters each redirect how
+            // the inner call is read; the inner call is read as it is signed.
+            only_keys(
+                &params_map,
+                &["calleePath", "amountPath"],
+                "calldata params",
+            )?;
+            if !matches!(kind, LeafType::Bytes) {
+                return Err(mismatched("bytes"));
+            }
+            let callee = match params_map.get("calleePath").and_then(Value::as_str) {
+                Some("@.to") => CalleeSource::TargetContract,
+                Some(callee) => {
+                    let callee = normalize_path(callee)?;
+                    if leaf_types.get(callee.as_str()) != Some(&&LeafType::Address) {
+                        return Err(rejected(format!(
+                            "calleePath `{callee}` is not `@.to` or an address argument of this call"
+                        )));
+                    }
+                    CalleeSource::Argument(callee)
+                }
+                None => return Err(rejected("calldata requires a calleePath")),
+            };
+            let amount = params_map
+                .get("amountPath")
+                .map(|amount| {
+                    let amount = normalize_path(
+                        amount
+                            .as_str()
+                            .ok_or_else(|| rejected("amountPath must be a string"))?,
+                    )?;
+                    match leaf_types.get(amount.as_str()) {
+                        Some(LeafType::Uint(_)) => Ok(amount),
+                        _ => Err(rejected(format!(
+                            "amountPath `{amount}` is not an unsigned integer argument of this call"
+                        ))),
+                    }
+                })
+                .transpose()?;
+            Ok(AdmittedFormat::Calldata { callee, amount })
+        }
         other => Err(rejected(format!(
             "field format `{other}` is outside the supported subset"
         ))),
+    }
+}
+
+/// A field path, and whether it addresses each element of an array.
+fn field_path(path: &str) -> Result<(String, bool), ReviewError> {
+    let path = path.strip_prefix("#.").unwrap_or(path);
+    match path.strip_suffix(".[]") {
+        Some(array) => Ok((normalize_path(array)?, true)),
+        None => Ok((normalize_path(path)?, false)),
     }
 }
 
@@ -599,7 +766,7 @@ fn collect_leaves(params: &[Param], out: &mut Vec<(String, LeafType)>) -> Result
                 param.name
             )));
         }
-        out.push((param.name.clone(), static_leaf_type(&param.ty)?));
+        out.push((param.name.clone(), leaf_type(&param.ty)?));
         if out.len() > MAX_LEAVES_PER_FORMAT {
             return Err(ReviewError::new(
                 ReviewReason::LimitExceeded,
@@ -610,9 +777,21 @@ fn collect_leaves(params: &[Param], out: &mut Vec<(String, LeafType)>) -> Result
     Ok(())
 }
 
-/// Canonical static scalars only. `uint`/`int` aliases, signed integers,
-/// dynamic `bytes`/`string` and every array form are refused, so a decoded
-/// value always has one fixed width and one unambiguous spelling.
+/// A static scalar, dynamic `bytes`, or a dynamic array of one static scalar.
+fn leaf_type(ty: &str) -> Result<LeafType, ReviewError> {
+    if ty == "bytes" {
+        return Ok(LeafType::Bytes);
+    }
+    if let Some(element) = ty.strip_suffix("[]") {
+        return Ok(LeafType::Array(Box::new(static_leaf_type(element)?)));
+    }
+    static_leaf_type(ty)
+}
+
+/// Canonical static scalars only. Signed integers, `string`, fixed-size and
+/// nested arrays are refused, so a decoded value always has one fixed width
+/// and one unambiguous spelling. The parser has already turned a `uint` alias
+/// into `uint256`, which is the same type and the same selector.
 fn static_leaf_type(ty: &str) -> Result<LeafType, ReviewError> {
     if ty == "address" {
         return Ok(LeafType::Address);
