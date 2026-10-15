@@ -2121,18 +2121,20 @@ mod mode_tests {
         assert_eq!(review.payloads[0].calldata_bytes, "0");
     }
 
-    /// The Safe entries this repository ships, as `bloom-clear-signing-catalog`
-    /// would sign them.
+    /// The Base Safe entries this repository ships, as
+    /// `bloom-clear-signing-catalog` would sign them.
     fn safe_context() -> ClearSigningContext {
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../bloom-evm-clear-signing/catalogs/safe");
         let read = |name: &str| -> serde_json::Value {
             serde_json::from_str(&std::fs::read_to_string(directory.join(name)).unwrap()).unwrap()
         };
+        // Base only: admitting all six chains' entries costs a second of CPU.
         let entries = read("entries.json")
             .as_array()
             .unwrap()
             .iter()
+            .filter(|entry| entry["chain_id"] == 8453)
             .map(|entry| {
                 let descriptor = read(entry["descriptor"].as_str().unwrap());
                 CatalogEntry {
