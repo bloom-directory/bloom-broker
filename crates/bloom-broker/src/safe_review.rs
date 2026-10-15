@@ -3,17 +3,6 @@
 use std::str::FromStr;
 
 use alloy::primitives::{Address, B256, U256, keccak256};
-use alloy::sol_types::{SolCall as _, sol};
-
-sol! {
-    #![sol(alloy_sol_types = alloy::sol_types)]
-    function execTransaction(address to, uint256 value, bytes data, uint8 operation,
-        uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken,
-        address refundReceiver, bytes signatures);
-    function createProxyWithNonce(address singleton, bytes initializer, uint256 saltNonce);
-    function setup(address[] owners, uint256 threshold, address to, bytes data,
-        address fallbackHandler, address paymentToken, uint256 payment, address paymentReceiver);
-}
 use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalSelector, CanonicalWalletPolicy, CryptoSuite, DeclaredFee,
     Digest32, ProtocolError, ProtocolErrorCode, ReviewMode,
@@ -341,21 +330,8 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
 /// ahead of the evidence.
 const VERIFIED_CHAINS: &[u64] = &[1, 10, 100, 137, 8453, 42161];
 
-/// What a Safe deployment is, and what Broker will accept it as.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Role {
-    /// A `delegatecall` may enter it. `safe_tx.to` is bound by the selector,
-    /// so this is a real constraint on the executing code.
-    Library,
-    /// `createProxyWithNonce` on it is read as Safe creation.
-    Factory,
-    /// A proxy may name it as the implementation it delegates to forever.
-    Singleton,
-    /// A new Safe may name it as its fallback handler.
-    FallbackHandler,
-}
-
-/// One canonical Safe deployment.
+/// One canonical Safe library a `delegatecall` may enter. `safe_tx.to` is
+/// bound by the selector, so this is a real constraint on the executing code.
 ///
 /// `code_hash` is keccak-256 of the deployed runtime code, which is what makes
 /// the address list checkable rather than asserted: the addresses alone say
@@ -365,8 +341,9 @@ enum Role {
 /// deployment fails a test instead of silently widening what a delegatecall
 /// may enter.
 struct Deployment {
-    role: Role,
     kind: &'static str,
+    /// Read only by `safe_deployments_hold_the_pinned_code`'s messages.
+    #[cfg_attr(not(test), allow(dead_code))]
     version: &'static str,
     address: &'static str,
     /// Read only by `safe_deployments_hold_the_pinned_code`. Approval-time
@@ -383,188 +360,65 @@ struct Deployment {
 /// versions have a single address.
 const DEPLOYMENTS: &[Deployment] = &[
     Deployment {
-        role: Role::Library,
         kind: "MultiSendCallOnly",
         version: "1.3.0",
         address: "0x40a2accbd92bca938b02010e17a5b8929b49130d",
         code_hash: "0xa9865ac2d9c7a1591619b188c4d88167b50df6cc0c5327fcbd1c8c75f7c066ad",
     },
     Deployment {
-        role: Role::Library,
         kind: "MultiSendCallOnly",
         version: "1.3.0-eip155",
         address: "0xa1dabef33b3b82c7814b6d82a79e50f4ac44102b",
         code_hash: "0xa9865ac2d9c7a1591619b188c4d88167b50df6cc0c5327fcbd1c8c75f7c066ad",
     },
     Deployment {
-        role: Role::Library,
         kind: "MultiSendCallOnly",
         version: "1.4.1",
         address: "0x9641d764fc13c8b624c04430c7356c1c7c8102e2",
         code_hash: "0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939",
     },
     Deployment {
-        role: Role::Library,
         kind: "MultiSendCallOnly",
         version: "1.5.0",
         address: "0xa83c336b20401af773b6219ba5027174338d1836",
         code_hash: "0xcdbdcec38d2f1c7d961b0029ff8416b7e86e9974d6f0e9c9580c7d17fcfb6663",
     },
     Deployment {
-        role: Role::Library,
         kind: "CreateCall",
         version: "1.3.0",
         address: "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4",
         code_hash: "0x8155d988823a4f6f1bcbc76a64af8e510c4ce68819290d43cf24956bd24dee82",
     },
     Deployment {
-        role: Role::Library,
         kind: "CreateCall",
         version: "1.3.0-eip155",
         address: "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d",
         code_hash: "0x8155d988823a4f6f1bcbc76a64af8e510c4ce68819290d43cf24956bd24dee82",
     },
     Deployment {
-        role: Role::Library,
         kind: "CreateCall",
         version: "1.4.1",
         address: "0x9b35af71d77eaf8d7e40252370304687390a1a52",
         code_hash: "0x2b3060c55fcb8275653e99ad511a71f67ba76934ed66a7d74d6e68b52afff889",
     },
     Deployment {
-        role: Role::Library,
         kind: "CreateCall",
         version: "1.5.0",
         address: "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4",
         code_hash: "0x6b7d8d29bdf7004c4617d95041923774f3f7e74b056bff55c1861c9ec92ce54f",
     },
-    Deployment {
-        role: Role::Factory,
-        kind: "SafeProxyFactory",
-        version: "1.3.0",
-        address: "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2",
-        code_hash: "0x337d7f54be11b6ed55fef7b667ea5488db53db8320a05d1146aa4bd169a39a9b",
-    },
-    Deployment {
-        role: Role::Factory,
-        kind: "SafeProxyFactory",
-        version: "1.3.0-eip155",
-        address: "0xc22834581ebc8527d974f8a1c97e1bea4ef910bc",
-        code_hash: "0x337d7f54be11b6ed55fef7b667ea5488db53db8320a05d1146aa4bd169a39a9b",
-    },
-    Deployment {
-        role: Role::Factory,
-        kind: "SafeProxyFactory",
-        version: "1.4.1",
-        address: "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67",
-        code_hash: "0x50c3cdc4074750a7a974204a716c999edd37482f907608d960b2b025ee0b3317",
-    },
-    Deployment {
-        role: Role::Factory,
-        kind: "SafeProxyFactory",
-        version: "1.5.0",
-        address: "0x14f2982d601c9458f93bd70b218933a6f8165e7b",
-        code_hash: "0x967dae4cda22b0c9ef7f31b010bdc1ceb0af9904b0c3dc060b5302e4c18a4529",
-    },
-    Deployment {
-        role: Role::Singleton,
-        kind: "Safe",
-        version: "1.3.0",
-        address: "0xd9db270c1b5e3bd161e8c8503c55ceabee709552",
-        code_hash: "0xbba688fbdb21ad2bb58bc320638b43d94e7d100f6f3ebaab0a4e4de6304b1c2e",
-    },
-    Deployment {
-        role: Role::Singleton,
-        kind: "Safe",
-        version: "1.3.0-eip155",
-        address: "0x69f4d1788e39c87893c980c06edf4b7f686e2938",
-        code_hash: "0xbba688fbdb21ad2bb58bc320638b43d94e7d100f6f3ebaab0a4e4de6304b1c2e",
-    },
-    Deployment {
-        role: Role::Singleton,
-        kind: "SafeL2",
-        version: "1.3.0",
-        address: "0x3e5c63644e683549055b9be8653de26e0b4cd36e",
-        code_hash: "0x21842597390c4c6e3c1239e434a682b054bd9548eee5e9b1d6a4482731023c0f",
-    },
-    Deployment {
-        role: Role::Singleton,
-        kind: "SafeL2",
-        version: "1.3.0-eip155",
-        address: "0xfb1bffc9d739b8d520daf37df666da4c687191ea",
-        code_hash: "0x21842597390c4c6e3c1239e434a682b054bd9548eee5e9b1d6a4482731023c0f",
-    },
-    Deployment {
-        role: Role::Singleton,
-        kind: "Safe",
-        version: "1.4.1",
-        address: "0x41675c099f32341bf84bfc5382af534df5c7461a",
-        code_hash: "0x1fe2df852ba3299d6534ef416eefa406e56ced995bca886ab7a553e6d0c5e1c4",
-    },
-    Deployment {
-        role: Role::Singleton,
-        kind: "SafeL2",
-        version: "1.4.1",
-        address: "0x29fcb43b46531bca003ddc8fcb67ffe91900c762",
-        code_hash: "0xb1f926978a0f44a2c0ec8fe822418ae969bd8c3f18d61e5103100339894f81ff",
-    },
-    Deployment {
-        role: Role::Singleton,
-        kind: "Safe",
-        version: "1.5.0",
-        address: "0xff51a5898e281db6dfc7855790607438df2ca44b",
-        code_hash: "0xdda019cbd7c867a533a2a86e5c53434fdc50b13122b5a5ddb4a8df61b31c20f2",
-    },
-    Deployment {
-        role: Role::Singleton,
-        kind: "SafeL2",
-        version: "1.5.0",
-        address: "0xedd160febbd92e350d4d398fb636302fccd67c7e",
-        code_hash: "0x180193227186ccb85316c94db1f0d156ed932b14712cfaac78901899178572dc",
-    },
-    Deployment {
-        role: Role::FallbackHandler,
-        kind: "CompatibilityFallbackHandler",
-        version: "1.3.0",
-        address: "0xf48f2b2d2a534e402487b3ee7c18c33aec0fe5e4",
-        code_hash: "0x03e69f7ce809e81687c69b19a7d7cca45b6d551ffdec73d9bb87178476de1abf",
-    },
-    Deployment {
-        role: Role::FallbackHandler,
-        kind: "CompatibilityFallbackHandler",
-        version: "1.3.0-eip155",
-        address: "0x017062a1de2fe6b99be3d9d37841fed19f573804",
-        code_hash: "0x03e69f7ce809e81687c69b19a7d7cca45b6d551ffdec73d9bb87178476de1abf",
-    },
-    Deployment {
-        role: Role::FallbackHandler,
-        kind: "CompatibilityFallbackHandler",
-        version: "1.4.1",
-        address: "0xfd0732dc9e303f09fcef3a7388ad10a83459ec99",
-        code_hash: "0x7c6007a5d711cea8dfd5d91f5940ec29c7f200fe511eb1fc1397b367af3c42f9",
-    },
-    Deployment {
-        role: Role::FallbackHandler,
-        kind: "CompatibilityFallbackHandler",
-        version: "1.5.0",
-        address: "0x3efcbb83a4a7afcb4f68d501e2c2203a38be77f4",
-        code_hash: "0x3c6a85bcf7b563daa624b884b4e9a1b9fa5371edde7be945d998071a48f28bbc",
-    },
 ];
 
-/// The canonical deployment at `address`, if Broker accepts it as `role` on
-/// `chain`.
+/// The canonical library at `address`, if Broker accepts it on `chain`.
 ///
 /// An address is evidence only on a chain where its code was read, so the
 /// chain is part of the lookup: on any other chain the same address can hold
 /// code someone else chose, and nothing may be recognised by identity there.
-fn deployment(chain: U256, role: Role, address: &str) -> Option<&'static Deployment> {
+fn library(chain: U256, address: &str) -> Option<&'static Deployment> {
     if !VERIFIED_CHAINS.iter().any(|id| U256::from(*id) == chain) {
         return None;
     }
-    DEPLOYMENTS
-        .iter()
-        .find(|entry| entry.role == role && entry.address == address)
+    DEPLOYMENTS.iter().find(|entry| entry.address == address)
 }
 
 fn dynamic_bytes(
@@ -655,7 +509,7 @@ fn owner_change(
     signer: Address,
     value: U256,
     data: &[u8],
-    current: Option<&SafeSigners>,
+    current: &SafeSigners,
 ) -> Result<String, ProtocolError> {
     let refused =
         || invalid("Safe self-calls other than owner and threshold changes are not supported");
@@ -688,11 +542,6 @@ fn owner_change(
             "\nWarning: any single owner will then be able to move the Safe's funds alone"
         } else {
             ""
-        };
-        let Some(current) = current else {
-            return format!(
-                "New threshold: {new} (Bloom has no current threshold to compare){single_owner_warning}"
-            );
         };
         let count = (current.owners as i64 + owners).max(0);
         let mut line = format!(
@@ -780,7 +629,7 @@ fn classify_calls(
             value: uint(&envelope.safe_tx.value, "safe_tx.value")?,
             data: &bytes(&envelope.safe_tx.data, "safe_tx.data")?,
             operation: envelope.safe_tx.operation,
-            current: Some(&current),
+            current: &current,
         },
         read_call,
     )
@@ -797,13 +646,8 @@ struct SafeCall<'a> {
     value: U256,
     data: &'a [u8],
     operation: u8,
-    /// The Safe's reported current signing configuration, when there is one.
-    /// Absent on the execution path, where Broker reads no chain state.
-    current: Option<&'a SafeSigners>,
-}
-
-fn classify_call(call: &SafeCall<'_>) -> Result<String, ProtocolError> {
-    classify_call_with_reader(call, |_, _, _| Ok(None))
+    /// The Safe's current signing configuration, as the Petal reports it.
+    current: &'a SafeSigners,
 }
 
 fn classify_call_with_reader(
@@ -863,7 +707,7 @@ fn classify_call_with_reader(
                 )));
             }
             let target = format!("{to:#x}");
-            let library = deployment(chain, Role::Library, &target)
+            let library = library(chain, &target)
                 .ok_or_else(|| invalid("delegatecall target is not an official Safe library"))?;
             if data.len() < 4 {
                 return Err(invalid("Safe library calldata is truncated"));
@@ -1164,245 +1008,6 @@ pub(crate) fn review(
         },
         clear_signing: evidence,
     }))
-}
-
-fn word(data: &[u8], index: usize) -> Option<&[u8]> {
-    data.get(index.checked_mul(32)?..index.checked_mul(32)?.checked_add(32)?)
-}
-
-fn word_usize(data: &[u8], index: usize) -> Option<usize> {
-    U256::from_be_slice(word(data, index)?).try_into().ok()
-}
-
-fn address_at(data: &[u8], index: usize) -> Option<Address> {
-    word_as_address(word(data, index)?).ok()
-}
-
-/// ABI `bytes` whose offset sits in head word `index`.
-fn tail_bytes(data: &[u8], index: usize) -> Option<&[u8]> {
-    let offset = word_usize(data, index)?;
-    if offset % 32 != 0 {
-        return None;
-    }
-    let length = word_usize(data, offset / 32)?;
-    data.get(offset.checked_add(32)?..offset.checked_add(32)?.checked_add(length)?)
-}
-
-/// What a native transaction that calls a Safe or a Safe factory does, read
-/// from the exact bytes being signed. `None` leaves the call to the ordinary
-/// envelope review. Broker reads no chain state, so it cannot tell whether the
-/// destination really is a Safe; the page says so.
-pub(crate) fn outer_call(
-    chain: u64,
-    from: Address,
-    to: Address,
-    value: U256,
-    input: &[u8],
-) -> Option<Vec<String>> {
-    let (selector, data) = input.split_at_checked(4)?;
-    let is = |signature: &str| selector == &keccak256(signature).as_slice()[..4];
-    let chain_name = crate::evm_review::chain_name(chain);
-    let mut lines = Vec::new();
-    if is(
-        "execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)",
-    ) {
-        let decoded = execTransactionCall::abi_decode(input).ok()?;
-        if decoded.abi_encode() != input || !decoded.gasPrice.is_zero() {
-            // The refund depends on execution gas, including baseGas. Without
-            // a verified maximum it must remain an unreadable call.
-            return None;
-        }
-        let inner_to = address_at(data, 0)?;
-        let inner_value = U256::from_be_slice(word(data, 1)?);
-        let inner_data = tail_bytes(data, 2)?;
-        let operation = u8::try_from(U256::from_be_slice(word(data, 3)?)).ok()?;
-        let signatures = tail_bytes(data, 9)?;
-        if signatures.len() % 65 != 0 {
-            return None;
-        }
-        lines.push("Action: Execute a Safe transaction".to_owned());
-        lines.push(format!("Safe: {to}"));
-        match classify_call(&SafeCall {
-            chain: U256::from(chain),
-            safe: to,
-            signer: from,
-            to: inner_to,
-            value: inner_value,
-            data: inner_data,
-            operation,
-            // Executing someone else's signed Safe transaction: Broker reads
-            // no chain state, so there is no current owner set to compare a
-            // threshold change against, and the line says so rather than
-            // printing a naked number.
-            current: None,
-        }) {
-            Ok(action) => {
-                for (index, line) in action.lines().enumerate() {
-                    match (index, line.strip_prefix("Action: ")) {
-                        (0, Some(action)) => lines.push(format!("The Safe will: {action}")),
-                        _ => lines.push(line.to_owned()),
-                    }
-                }
-                // Any non-zero inner value leaves the Safe, whether or not
-                // the call also carries calldata. Showing it only for a bare
-                // transfer meant a payable call moved funds with no amount
-                // anywhere on the page.
-                // A bare transfer shows its amount even when zero, because
-                // "Amount: 0" is the whole content of that transaction.
-                let bare_transfer = inner_data.is_empty() && operation == 0 && inner_to != to;
-                if !inner_value.is_zero() || bare_transfer {
-                    lines.push(format!("Amount: {}", native(inner_value, &chain_name)));
-                }
-            }
-            Err(error) => {
-                lines.push("The Safe will: make a call Bloom cannot read".to_owned());
-                lines.push(format!("Reason: {}", error.message));
-                lines.push(format!("Call target: {inner_to}"));
-                lines.push(format!("Call value: {}", native(inner_value, &chain_name)));
-            }
-        }
-        lines.push(format!(
-            "Signature data slots (not verified owner signatures): {}",
-            signatures.len() / 65
-        ));
-        if !value.is_zero() {
-            lines.push(format!(
-                "Warning: this also sends {} to the Safe",
-                native(value, &chain_name)
-            ));
-        }
-        return Some(lines);
-    }
-    if is("createProxyWithNonce(address,bytes,uint256)")
-        && deployment(U256::from(chain), Role::Factory, &format!("{to:#x}")).is_some()
-    {
-        let decoded = createProxyWithNonceCall::abi_decode(input).ok()?;
-        if decoded.abi_encode() != input {
-            return None;
-        }
-        let singleton = address_at(data, 0)?;
-        // The singleton is the code the proxy delegates to for the rest of its
-        // life, and `SafeProxyFactory` accepts any non-zero address for it. An
-        // attacker-chosen implementation that exposes this `setup` selector
-        // decodes exactly like a real one, so without this check the page
-        // would assert "Create a Safe / Owner 1: (this wallet)" for a contract
-        // whose whole behaviour is chosen by someone else -- and funds sent to
-        // the predicted address, which is normal Safe practice, would be
-        // theirs. Returning `None` puts the call back on the honest "Bloom
-        // cannot read this" path it took before this reading existed.
-        let implementation = deployment(
-            U256::from(chain),
-            Role::Singleton,
-            &format!("{singleton:#x}"),
-        )?;
-        let initializer = tail_bytes(data, 1)?;
-        let decoded_setup = setupCall::abi_decode(initializer).ok()?;
-        if decoded_setup.abi_encode() != initializer {
-            return None;
-        }
-        let salt = U256::from_be_slice(word(data, 2)?);
-        let (selector, setup) = initializer.split_at_checked(4)?;
-        if selector
-            != &keccak256("setup(address[],uint256,address,bytes,address,address,uint256,address)")
-                .as_slice()[..4]
-        {
-            return None;
-        }
-        let owners_at = word_usize(setup, 0)?;
-        if owners_at % 32 != 0 {
-            return None;
-        }
-        let count = word_usize(setup, owners_at / 32)?;
-        if count == 0 || count > 64 {
-            return None;
-        }
-        let owners = (0..count)
-            .map(|index| address_at(setup, owners_at / 32 + 1 + index))
-            .collect::<Option<Vec<_>>>()?;
-        let threshold = U256::from_be_slice(word(setup, 1)?);
-        if threshold.is_zero()
-            || threshold > U256::from(owners.len())
-            || owners
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                != owners.len()
-        {
-            return None;
-        }
-        let setup_target = address_at(setup, 2)?;
-        let setup_data = tail_bytes(setup, 3)?;
-        let fallback = address_at(setup, 4)?;
-        let payment_token = address_at(setup, 5)?;
-        let payment = U256::from_be_slice(word(setup, 6)?);
-        let payment_receiver = address_at(setup, 7)?;
-        // `setup` delegatecalls `to` with `data` from the new Safe. That code
-        // can add owners or modules or change the threshold, so the owners
-        // decoded here would not be the Safe's: the call is not read at all.
-        if setup_target != Address::ZERO || !setup_data.is_empty() {
-            return None;
-        }
-        lines.push("Action: Create a Safe".to_owned());
-        lines.push(format!("Signatures required: {threshold} of {count}"));
-        for (index, owner) in owners.iter().enumerate() {
-            let mine = if *owner == from { " (this wallet)" } else { "" };
-            lines.push(format!("Owner {}: {owner}{mine}", index + 1));
-        }
-        lines.push(format!(
-            "Safe implementation: {singleton} ({} {})",
-            implementation.kind, implementation.version
-        ));
-        // A fallback handler answers for the Safe on every call it does not
-        // implement, so an unknown one is the same handover `owner_change`
-        // refuses `setFallbackHandler` for. Zero means no handler.
-        if fallback == Address::ZERO {
-            lines.push("Fallback handler: none".to_owned());
-        } else {
-            let handler = deployment(
-                U256::from(chain),
-                Role::FallbackHandler,
-                &format!("{fallback:#x}"),
-            )?;
-            lines.push(format!(
-                "Fallback handler: {fallback} ({} {})",
-                handler.kind, handler.version
-            ));
-        }
-        lines.push(format!("Salt nonce: {salt}"));
-        if !owners.contains(&from) {
-            lines.push("Warning: this wallet is not an owner of the new Safe".to_owned());
-        }
-        // `setup` pays `payment` out of the new Safe's own balance -- funds
-        // already sent to the predicted address -- so the amount, the asset
-        // and the receiver are the three facts that decide what leaves it.
-        // A zero receiver is Safe's `tx.origin`, which is this wallet.
-        if !payment.is_zero() {
-            lines.push("Warning: the new Safe makes a payment during setup".to_owned());
-            lines.push(if payment_token == Address::ZERO {
-                format!("Setup payment: {}", native(payment, &chain_name))
-            } else {
-                format!("Setup payment: {payment} base units of token {payment_token}")
-            });
-            lines.push(if payment_receiver == Address::ZERO {
-                format!("Setup payment paid to: {from} (this wallet, as transaction origin)")
-            } else {
-                let mine = if payment_receiver == from {
-                    " (this wallet)"
-                } else {
-                    ""
-                };
-                format!("Setup payment paid to: {payment_receiver}{mine}")
-            });
-        }
-        if !value.is_zero() {
-            lines.push(format!(
-                "Warning: this also sends {} to the factory",
-                native(value, &chain_name)
-            ));
-        }
-        return Some(lines);
-    }
-    None
 }
 
 /// The Safe equivalent of `evm_review::apply_review_mode`.
@@ -2238,10 +1843,8 @@ mod tests {
             threshold: U256::from(1),
             owners: 1,
         };
-        for current in [Some(&reported), None] {
-            let action = owner_change(Address::ZERO, U256::ZERO, &data, current).unwrap();
-            assert!(action.contains("any single owner will then be able to move"));
-        }
+        let action = owner_change(Address::ZERO, U256::ZERO, &data, &reported).unwrap();
+        assert!(action.contains("any single owner will then be able to move"));
     }
 
     fn multisend_entry(to: &str, value: u64, data: &[u8]) -> Vec<u8> {
@@ -2560,321 +2163,6 @@ mod tests {
             !serde_json::to_string(&plan)
                 .unwrap()
                 .contains("Broker-verified")
-        );
-    }
-
-    // Inputs of transactions that ran on Base: a Safe creation, and three
-    // executions of that Safe.
-    const SAFE: &str = "0xaefda71ded59b48920131d03454893ec2ad93e88";
-    const WALLET: &str = "0x8d4fafba75a9dc50b4b296211509e856d2c6d081";
-    const FACTORY: &str = "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67";
-
-    fn outer(to: &str, input: &str) -> Option<String> {
-        outer_on(8453, to, input)
-    }
-
-    fn outer_on(chain: u64, to: &str, input: &str) -> Option<String> {
-        outer_call(
-            chain,
-            address(WALLET, "wallet").unwrap(),
-            address(to, "to").unwrap(),
-            U256::ZERO,
-            &hex::decode(input.trim_start_matches("0x")).unwrap(),
-        )
-        .map(|lines| lines.join("\n"))
-    }
-
-    #[test]
-    fn a_call_that_executes_a_safe_transaction_says_what_the_safe_will_do() {
-        let send = outer(SAFE, "0x6a7612020000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d081000000000000000000000000000000000000000000000000000009184e72a00000000000000000000000000000000000000000000000000000000000000001400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000160000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000411fca12a0c7a67fc6ca9ca271335af2680fae0ce704f5c75fe373ddce47674df33a341f86acbc619d6db40b37ef330f3f2dd47897f0551799f28f20ef7288d69b1b00000000000000000000000000000000000000000000000000000000000000").unwrap();
-        assert!(
-            send.starts_with("Action: Execute a Safe transaction"),
-            "{send}"
-        );
-        assert!(send.contains("The Safe will: Native transfer"), "{send}");
-        assert!(send.contains("Amount: 0.00001 ETH"), "{send}");
-        assert!(
-            send.contains("Signature data slots (not verified owner signatures): 1"),
-            "{send}"
-        );
-        assert!(!send.contains("Warning"), "{send}");
-
-        let batch = outer(SAFE, "0x6a7612020000000000000000000000009641d764fc13c8b624c04430c7356c1c7c8102e20000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002c000000000000000000000000000000000000000000000000000000000000001448d80ff0a000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000ee008d4fafba75a9dc50b4b296211509e856d2c6d0810000000000000000000000000000000000000000000000000000048c27395000000000000000000000000000000000000000000000000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda0291300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000044a9059cbb0000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d0810000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000041387df176124ae8ab24202005fda4428eff86fcd8d9636ec9239aa8646e414ec75fc7a978870c915eb4e85c7f237e6b5fb6167bde0a1b4dad73a3820b055283f91c00000000000000000000000000000000000000000000000000000000000000").unwrap();
-        assert!(batch.contains("The Safe will: Call-only batch"), "{batch}");
-        assert!(batch.contains("1. Send 0.000005 ETH to"), "{batch}");
-        assert!(
-            batch.contains("2. ERC-20 transfer of 0 base units"),
-            "{batch}"
-        );
-
-        let remove = outer(SAFE, "0x6a761202000000000000000000000000aefda71ded59b48920131d03454893ec2ad93e880000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001e00000000000000000000000000000000000000000000000000000000000000064f8dc5dd9000000000000000000000000000000000000000000000000000000000000000100000000000000000000000043d2fdfed480f95b8848840031546e30a60c0a5f000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008200bcff01bcd29252f7a7d20e0fd09d28da5cf5d0f8d4a0165a15e4e62a9e83862f1c20464a3b2cee24762885ff9b86a060d999eb18e74dacdb3256ca919e17121bf5e7e63c173815be4ee254ae96388767b18a7df6c69191bb9bfd9734106efc7b737b98399b57d8847a2f5de37e3ac14b5a3f33bd6d3347f92fa6ac2eec6e80d01c000000000000000000000000000000000000000000000000000000000000").unwrap();
-        assert!(
-            remove.contains("The Safe will: Remove Safe owner"),
-            "{remove}"
-        );
-        assert!(remove.contains("New threshold: 1"), "{remove}");
-        assert!(
-            remove.contains("Signature data slots (not verified owner signatures): 2"),
-            "{remove}"
-        );
-    }
-
-    #[test]
-    fn a_call_that_creates_a_safe_names_its_owners_and_threshold() {
-        let input = "0x1688f0b900000000000000000000000029fcb43b46531bca003ddc8fcb67ffe91900c762000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000013528400000000000000000000000000000000000000000000000000000000000000164b63e800d0000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000fd0732dc9e303f09fcef3a7388ad10a83459ec9900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d081000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
-        let create = outer(FACTORY, input).unwrap();
-        assert!(create.starts_with("Action: Create a Safe"), "{create}");
-        assert!(create.contains("Signatures required: 1 of 1"), "{create}");
-        assert!(create.contains("(this wallet)"), "{create}");
-        assert!(!create.contains("Warning"), "{create}");
-
-        // The same bytes sent anywhere but a Safe factory are not read as one.
-        assert!(outer(SAFE, input).is_none());
-        // Truncated input falls back to the ordinary review.
-        assert!(outer(FACTORY, &input[..input.len() - 64]).is_none());
-        assert!(outer(SAFE, "0x6a761202").is_none());
-    }
-
-    /// The proxy delegates to its singleton forever, and `SafeProxyFactory`
-    /// accepts any non-zero address for it. Without a check the page asserted
-    /// "Action: Create a Safe / Signatures required: 1 of 1 / Owner 1: (this
-    /// wallet)" -- with no warning -- for a proxy whose entire behaviour was
-    /// chosen by whoever supplied the singleton. Funds sent to the predicted
-    /// address, which is ordinary Safe practice, would be theirs.
-    #[test]
-    fn creating_a_safe_needs_a_known_implementation_and_fallback_handler() {
-        let input = "0x1688f0b900000000000000000000000029fcb43b46531bca003ddc8fcb67ffe91900c762000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000013528400000000000000000000000000000000000000000000000000000000000000164b63e800d0000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000fd0732dc9e303f09fcef3a7388ad10a83459ec9900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d081000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
-
-        // The canonical case names the version it recognised.
-        let create = outer(FACTORY, input).unwrap();
-        assert!(
-            create.contains(
-                "Safe implementation: 0x29fcB43b46531BcA003ddC8FCB67FFE91900C762 (SafeL2 1.4.1)"
-            ),
-            "{create}"
-        );
-        assert!(
-            create.contains("Fallback handler: 0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99 (CompatibilityFallbackHandler 1.4.1)"),
-            "{create}"
-        );
-
-        // An implementation Bloom does not know is not a Safe it can describe.
-        // Falling back to `None` puts the call on the honest "cannot read"
-        // path it took before this reading existed.
-        let swapped = input.replacen(
-            "29fcb43b46531bca003ddc8fcb67ffe91900c762",
-            "4000000000000000000000000000000000000000",
-            1,
-        );
-        assert!(
-            outer(FACTORY, &swapped).is_none(),
-            "an unknown singleton must not render as a Safe: {:?}",
-            outer(FACTORY, &swapped)
-        );
-
-        // A fallback handler answers for the Safe on every call it does not
-        // implement, so an unknown one is the handover `setFallbackHandler`
-        // is refused for.
-        let handler = input.replacen(
-            "fd0732dc9e303f09fcef3a7388ad10a83459ec99",
-            "4000000000000000000000000000000000000000",
-            1,
-        );
-        assert!(
-            outer(FACTORY, &handler).is_none(),
-            "unknown fallback handler"
-        );
-
-        // Every other canonical singleton is accepted, so the check is a
-        // table lookup and not a single hardcoded address.
-        for (address, label) in [
-            ("d9db270c1b5e3bd161e8c8503c55ceabee709552", "Safe 1.3.0"),
-            ("41675c099f32341bf84bfc5382af534df5c7461a", "Safe 1.4.1"),
-            ("ff51a5898e281db6dfc7855790607438df2ca44b", "Safe 1.5.0"),
-        ] {
-            let swapped = input.replacen("29fcb43b46531bca003ddc8fcb67ffe91900c762", address, 1);
-            let create = outer(FACTORY, &swapped)
-                .unwrap_or_else(|| panic!("{label} is a canonical singleton"));
-            assert!(create.contains(&format!("({label})")), "{create}");
-        }
-    }
-
-    const CREATE_SAFE: &str = "0x1688f0b900000000000000000000000029fcb43b46531bca003ddc8fcb67ffe91900c762000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000013528400000000000000000000000000000000000000000000000000000000000000164b63e800d0000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000fd0732dc9e303f09fcef3a7388ad10a83459ec9900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d081000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
-
-    /// The deployment table is evidence only where its code was read. On any
-    /// other chain the factory, singleton and fallback addresses can hold code
-    /// someone else chose, so a byte-for-byte canonical creation must not be
-    /// described as a Safe there.
-    #[test]
-    fn a_canonical_safe_creation_on_an_unverified_chain_is_not_read_as_one() {
-        assert!(outer_on(8453, FACTORY, CREATE_SAFE).is_some());
-        for chain in [31337, 11155111, 56] {
-            assert!(
-                !VERIFIED_CHAINS.contains(&chain),
-                "{chain} is meant to be unverified"
-            );
-            assert_eq!(
-                outer_on(chain, FACTORY, CREATE_SAFE),
-                None,
-                "chain {chain} must fall back to the ordinary review"
-            );
-        }
-    }
-
-    /// `setup` pays out of the new Safe's balance, so the page names the
-    /// amount, the asset and who receives it, not just that a payment exists.
-    #[test]
-    fn a_setup_payment_names_its_amount_asset_and_receiver() {
-        let fallback = "fd0732dc9e303f09fcef3a7388ad10a83459ec99";
-        let zero = "0".repeat(64);
-        let tail = format!("{fallback}{zero}{zero}{zero}");
-        assert!(CREATE_SAFE.contains(&tail));
-        let address_word = |value: &str| format!("{:0>64}", value);
-        let with_payment = |token: &str, amount: &str, receiver: &str| {
-            CREATE_SAFE.replacen(
-                &tail,
-                &format!(
-                    "{fallback}{}{}{}",
-                    address_word(token),
-                    address_word(amount),
-                    address_word(receiver)
-                ),
-                1,
-            )
-        };
-
-        // Native payment to a zero receiver: Safe pays `tx.origin`.
-        let native_payment = outer(FACTORY, &with_payment("0", "5", "0")).unwrap();
-        assert!(
-            native_payment.contains("Warning: the new Safe makes a payment during setup"),
-            "{native_payment}"
-        );
-        assert!(
-            native_payment.contains("Setup payment: 0.000000000000000005 ETH"),
-            "{native_payment}"
-        );
-        assert!(
-            native_payment.contains(
-                "Setup payment paid to: 0x8d4faFBA75a9dC50B4b296211509E856d2c6D081 (this wallet, as transaction origin)"
-            ),
-            "{native_payment}"
-        );
-
-        // Token payment to someone else.
-        let token_payment = outer(
-            FACTORY,
-            &with_payment(
-                "833589fcd6edb6e08f4c7c32d4f71b54bda02913",
-                "f4240",
-                "4000000000000000000000000000000000000000",
-            ),
-        )
-        .unwrap();
-        assert!(
-            token_payment.contains(
-                "Setup payment: 1000000 base units of token 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-            ),
-            "{token_payment}"
-        );
-        assert!(
-            token_payment
-                .lines()
-                .any(|line| line
-                    == "Setup payment paid to: 0x4000000000000000000000000000000000000000"),
-            "{token_payment}"
-        );
-        assert!(
-            !token_payment.contains("(this wallet, as"),
-            "{token_payment}"
-        );
-
-        // No payment, no payment lines.
-        let none = outer(FACTORY, CREATE_SAFE).unwrap();
-        assert!(!none.contains("Setup payment"), "{none}");
-    }
-
-    /// `setup` delegatecalls its `to` from the new Safe, and that code can add
-    /// owners or modules, so the owners in the arguments are not a fact.
-    #[test]
-    fn a_creation_whose_setup_runs_code_is_not_read_as_a_safe() {
-        let data_offset = format!("{:0>64}", "140");
-        let no_setup = format!("{}{data_offset}", "0".repeat(64));
-        assert_eq!(CREATE_SAFE.matches(&no_setup).count(), 1);
-        let with_setup = CREATE_SAFE.replacen(
-            &no_setup,
-            &format!(
-                "{:0>64}{data_offset}",
-                "4000000000000000000000000000000000000000"
-            ),
-            1,
-        );
-        assert_eq!(outer(FACTORY, &with_setup), None);
-    }
-
-    /// Two facts the execution review left off the page.
-    #[test]
-    fn executing_a_safe_transaction_shows_its_value_and_any_real_refund() {
-        // A call that carries both calldata and native value: the amount was
-        // printed only when the calldata was empty, so a payable call moved
-        // funds with no amount anywhere on the page.
-        //
-        // execTransaction has ten head words, so the two dynamic arguments
-        // start at 320 and 384.
-        let address_word = |value: &str| {
-            let mut word = [0_u8; 32];
-            word[12..].copy_from_slice(address(value, "test").unwrap().as_slice());
-            word.to_vec()
-        };
-        let number = |value: u64| U256::from(value).to_be_bytes::<32>().to_vec();
-        let build = |safe_tx_gas: u64, gas_price: u64| {
-            let mut input = keccak256(
-                "execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)",
-            )
-            .as_slice()[..4]
-            .to_vec();
-            input.extend(address_word(WALLET)); // to
-            input.extend(number(1_000_000_000_000_000)); // value
-            input.extend(number(320)); // data offset
-            input.extend(number(0)); // operation: call
-            input.extend(number(safe_tx_gas));
-            input.extend(number(0)); // baseGas
-            input.extend(number(gas_price));
-            input.extend(number(0)); // gasToken: native
-            input.extend(number(0)); // refundReceiver: the executor
-            input.extend(number(384)); // signatures offset
-            input.extend(number(4)); // data length
-            let mut payload = [0_u8; 32];
-            payload[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
-            input.extend(payload);
-            input.extend(number(65)); // signatures length
-            input.extend([7_u8; 65]);
-            input.extend([0_u8; 31]);
-            format!("0x{}", hex::encode(input))
-        };
-
-        let paying = outer(SAFE, &build(0, 0)).unwrap();
-        assert!(paying.contains("The Safe will: Contract call"), "{paying}");
-        assert!(paying.contains("Amount: 0.001 ETH"), "{paying}");
-
-        // safeTxGas alone is an execution bound, not a refund. Warning on it
-        // fired on ordinary transactions and said nothing about what was paid.
-        let bounded = outer(SAFE, &build(100_000, 0)).unwrap();
-        assert!(!bounded.contains("gas refund"), "{bounded}");
-
-        // No verified refund maximum: preserve the ordinary opaque review.
-        assert!(outer(SAFE, &build(0, 7)).is_none());
-        assert!(outer(SAFE, &build(100_000, 7)).is_none());
-        let mut noncanonical = hex::decode(build(0, 0).trim_start_matches("0x")).unwrap();
-        noncanonical.extend([0u8; 32]);
-        assert!(
-            outer_call(
-                8453,
-                Address::ZERO,
-                address(SAFE, "safe").unwrap(),
-                U256::ZERO,
-                &noncanonical
-            )
-            .is_none()
         );
     }
 

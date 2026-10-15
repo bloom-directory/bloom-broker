@@ -477,17 +477,6 @@ const banners = node => !node || typeof node === "string" ? [] : [
 if (!banners(nodes.review).some(node => allText(node).includes("removes this Bloom wallet"))) {{
   throw new Error("Safe owner removal warning missing from the warning banner");
 }}
-const setupWarning = session({{
-  chain_id: "8453", chain: "base", sender: "0x1111111111111111111111111111111111111111",
-  destination: "0x2222222222222222222222222222222222222222", value: "0", value_display: "0 ETH",
-  calldata_keccak: "0x1234", payload_keccak: "0x5678", nonce: "1", gas_limit: "100000",
-  fee: {{kind: "legacy", gas_price: "1", gas_price_display: "1 wei"}},
-  safe_call: ["Action: Create a Safe", "Warning: the new Safe makes a payment during setup"]
-}});
-renderReview(setupWarning);
-if (!banners(nodes.review).some(node => allText(node).includes("payment during setup"))) {{
-  throw new Error("Safe setup payment warning missing from the warning banner");
-}}
 
 // A batch member Bloom could not read is never shown as a plain send, and a
 // batch spanning two networks is not headed with the first one alone.
