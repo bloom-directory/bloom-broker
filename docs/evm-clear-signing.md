@@ -1,17 +1,27 @@
 # EVM clear signing: the supported subset
 
-Broker shows the actual recipient and amount of an ERC-20 `transfer`, and the
-spender and requested total of an `approve`, before the owner signs. It does
-that by reading a **flattened ERC-7730 descriptor** out of a **signed local
-catalog**, decoding the exact calldata with one generic ABI path, and applying
-wallet safety rules the descriptor cannot switch off.
+Broker always decodes the exact address and raw integer in canonical ERC-20
+`transfer(address,uint256)` and `approve(address,uint256)` calldata. This
+**structural review** needs no catalog. It does not claim that the destination
+is a token: any contract can implement the same four-byte selector.
+
+When a **signed local catalog** covers the deployment, Broker upgrades that
+reading with a trusted token identity, decimals and human units. Other
+catalogued calls use a flattened ERC-7730 descriptor and the same strict ABI
+rules.
 
 Adding a contract inside this subset is catalog data. Changing what Bloom
 promises about a call is code.
 
-## What the assurance means
+## Assurance levels
 
-The class is `trusted_description`. The catalog publisher is trusted to
+`structural_calldata` means Broker verified the canonical selector, length,
+address padding and exact raw arguments from the signing preimage. The page
+names the contract, recipient or spender and raw integer, and warns that token
+behavior is unverified. Structural review never supplies a trusted symbol,
+human units or reusable authority.
+
+`trusted_description` means the catalog publisher is trusted to
 describe the listed deployment accurately, and a signature authenticates that
 assertion. It is **not** proof of execution, contract safety, or the absence
 of an upgrade after the publisher's observation. Broker never fetches
@@ -132,8 +142,9 @@ unlimited_allowance_allowed (default false),
 verifier (id + source digest)
 ```
 
-Omitting it preserves the previous serialization exactly and leaves the wallet
-on the existing envelope review, which is not advertised as clear signing.
+Omitting it preserves the previous policy serialization. The wallet still gets
+structural review for canonical transfers and approvals, but trusts no catalog,
+permits no catalog-based authority and cannot request a clear or opaque mode.
 
 The threshold counts distinct trusted keys, so a publisher repeating one key
 cannot reach two. Stored catalog bytes are not trusted on their own: every
@@ -143,16 +154,18 @@ it.
 
 ## Modes and expiry
 
-One mode per batch. In an enabled wallet, omission means `clear` for contract
-calls; native sends and deployments keep their existing exact envelope review.
-One member Bloom cannot describe blocks the whole batch — there is no split,
-no mixed badge and no downgrade. `opaque_exact` must be requested explicitly,
-needs `opaque_exact_allowed`, and carries the inability-to-explain warning in
-the signed manifest. It covers only calls Bloom cannot read: a batch member
-a currently valid catalog describes is refused under `opaque_exact`, and one the
-catalog would refuse (such as an unlimited allowance) is refused for that
-reason, so requesting `opaque_exact` cannot skip a refusal. A wallet without
-the extension refuses a requested mode rather than ignoring it.
+One mode applies to a batch. In an enabled wallet, omission means `clear` for
+contract calls; native sends and deployments keep their existing exact
+envelope review. A canonical transfer or approval may fall back to structural
+review when its deployment is absent, withdrawn or stale. A mixed batch labels
+the weaker members and freezes catalog evidence only for the trusted members.
+Any other unreadable member still blocks the batch.
+
+`opaque_exact` must be requested explicitly, needs `opaque_exact_allowed`, and
+carries the inability-to-explain warning in the signed manifest. It covers
+only calls Bloom cannot read: neither a catalog-backed nor a structurally
+decoded call can be approved unread. A wallet without the extension refuses a
+requested mode rather than ignoring it.
 
 Approval expiry is capped at
 
@@ -171,8 +184,9 @@ extends an approval, and a signature already produced cannot be recalled.
 
 ## Unlimited allowances
 
-Denied by default. A maximum-U256 request explains the denial and names one
-action: change the wallet policy. That is **one existing wallet-policy
+For a wallet with clear signing enabled, maximum U256 is denied by default. A
+request explains the denial and names one action: change the wallet policy.
+That is **one existing wallet-policy
 ceremony** — setting `unlimited_allowance_allowed` in the canonical policy
 document and running the ordinary update. Enabling it is a visible authority
 change: the policy authority diff both services compute carries the
@@ -182,6 +196,10 @@ the update actually grants rather than an empty diff.
 After the policy commits, the staged allowance is reprepared and gets its own
 ordinary exact approval ceremony. These are two different authorizations, and
 the second is never automatic.
+
+A wallet without the clear-signing extension has no unlimited-allowance policy
+to enforce. Broker still decodes the maximum value, displays the strong warning
+and permits only that exact owner approval; it creates no reusable authority.
 
 The rule is narrow. It matches only canonical `approve(address,uint256)` with
 the exact U256 maximum. A requester can ask for one less, and that is shown as

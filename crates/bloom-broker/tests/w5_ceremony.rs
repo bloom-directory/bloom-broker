@@ -8836,6 +8836,37 @@ if (!view.all.includes("11579208923731619542357098500868790785326998466564056403
   throw new Error("the exact maximum lost precision");
 }}
 
+// A structural transfer is useful without borrowing a token identity or
+// decimals from the selector. Raw units and the unverified-contract warning
+// stay beside the decision.
+view = show("structural-transfer");
+if (view.heading !== "Review transfer-shaped call for 250000000 raw units") throw new Error(`structural heading: ${{view.heading}}`);
+if (view.primary.includes("−250000000 raw units") || view.primary.includes("+250000000 raw units")) {{
+  throw new Error(`a structural reading claimed token balance changes: ${{view.primary}}`);
+}}
+if (!view.primary.includes("has not verified that this contract is a token")) {{
+  throw new Error("the structural assurance warning is not visible");
+}}
+if (view.primary.includes("Bloom Demo Token") || view.primary.includes(" BDT")) {{
+  throw new Error("a structural reading borrowed catalog token identity");
+}}
+if (!view.technical.includes("Decoded from the standard ERC-20 calldata shape")) {{
+  throw new Error("the structural assurance explanation disappeared");
+}}
+if (view.action !== "call" || view.button !== "Approve call" || !view.roles.includes("recipient")) {{
+  throw new Error("a structural transfer was not presented as a decoded call");
+}}
+
+view = show("structural-allowance-unlimited");
+if (view.heading !== "Review approval-shaped call for maximum uint256") throw new Error(`structural unlimited heading: ${{view.heading}}`);
+if (!view.primary.includes("maximum uint256") || !view.primary.includes("current and future tokens")) {{
+  throw new Error("the structural unlimited warning is not visible");
+}}
+if (view.primary.includes("115792089")) throw new Error("raw maximum led the structural decision");
+if (!view.technical.includes("115792089237316195423570985008687907853269984665640564039457584007913129639")) {{
+  throw new Error("the exact structural allowance left the signed details");
+}}
+
 // An uninterpretable call says so instead of drawing a transfer.
 view = show("deposit-native-opaque");
 if (!view.primary.includes("Native value sent") || !view.primary.includes("1 ETH")) {{
@@ -8870,6 +8901,15 @@ if (view.primary.indexOf("Transaction 1") > view.primary.indexOf("Transaction 2"
 if (view.button !== "Approve all transactions") throw new Error(`batch button: ${{view.button}}`);
 if (!view.roles.includes("spender") || !view.roles.includes("recipient")) {{
   throw new Error("batch members lost their distinct spender and recipient roles");
+}}
+
+// One catalogued member cannot lend its assurance to a structural member.
+view = show("mixed-assurance");
+if (!view.technical.includes("mixes trusted catalog descriptions with structural calldata readings")) {{
+  throw new Error("a mixed batch borrowed the first member's stronger assurance");
+}}
+if (!view.primary.includes("has not verified that this contract is a token")) {{
+  throw new Error("the mixed batch hid its structural member's warning");
 }}
 
 // Markup in a publisher's name is text, not markup, and does not reach innerHTML.

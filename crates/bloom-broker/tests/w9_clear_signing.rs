@@ -751,7 +751,7 @@ fn evidence_cannot_be_swapped_for_another_readings() {
 }
 
 #[test]
-fn legacy_and_opaque_approvals_still_activate_and_sign_without_evidence() {
+fn reviews_without_catalog_evidence_still_activate_and_sign() {
     let harness = Harness::open(None);
     harness.install_policy(1, Some(clear_signing_policy(5)));
     install(&harness, &catalog(1, vec![entry()], 5)).unwrap();
@@ -760,6 +760,7 @@ fn legacy_and_opaque_approvals_still_activate_and_sign_without_evidence() {
         ReviewKind::Legacy,
         ReviewKind::Native,
         ReviewKind::OpaqueExact,
+        ReviewKind::Structural,
     ] {
         let payload = format!("payload-{}", kind.as_str());
         let terms = harness.exact_terms(1, payload.as_bytes());
@@ -778,9 +779,12 @@ fn legacy_and_opaque_approvals_still_activate_and_sign_without_evidence() {
 #[test]
 fn a_review_whose_kind_and_evidence_disagree_cannot_be_constructed() {
     // The frozen review is the only way evidence reaches an approval record,
-    // and it refuses both halves of the confusion: a clear review with no
-    // evidence, and evidence attached to a review that does not need it.
+    // and it refuses both halves of the confusion: a catalog-backed review
+    // with no evidence, and evidence attached to a review that does not need
+    // it.
     let error = FrozenReview::without_evidence(ReviewKind::Clear).unwrap_err();
+    assert!(error.contains("disagree"), "{error}");
+    let error = FrozenReview::without_evidence(ReviewKind::Mixed).unwrap_err();
     assert!(error.contains("disagree"), "{error}");
     let error =
         FrozenReview::with_evidence(ReviewKind::OpaqueExact, &serde_json::json!({})).unwrap_err();

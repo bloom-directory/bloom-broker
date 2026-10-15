@@ -165,6 +165,12 @@ pub enum ReviewKind {
     /// The owner deliberately approved a payload Bloom did not explain,
     /// under a policy that permits it.
     OpaqueExact,
+    /// Every contract call was decoded from a standard byte shape without a
+    /// catalog-backed deployment identity. No mutable evidence is needed.
+    Structural,
+    /// One batch contains both catalog-backed and structural readings. Only
+    /// the catalog-backed members contribute evidence that must be rechecked.
+    Mixed,
     /// Every contract call in the batch was read from a signed description.
     /// Evidence is required and rechecked before every signature.
     Clear,
@@ -176,6 +182,8 @@ impl ReviewKind {
             Self::Legacy => "LEGACY",
             Self::Native => "NATIVE",
             Self::OpaqueExact => "OPAQUE_EXACT",
+            Self::Structural => "STRUCTURAL",
+            Self::Mixed => "MIXED",
             Self::Clear => "CLEAR",
         }
     }
@@ -188,12 +196,14 @@ impl ReviewKind {
             "LEGACY" => Self::Legacy,
             "NATIVE" => Self::Native,
             "OPAQUE_EXACT" => Self::OpaqueExact,
+            "STRUCTURAL" => Self::Structural,
+            "MIXED" => Self::Mixed,
             _ => Self::Clear,
         }
     }
 
     pub const fn requires_clear_signing_evidence(self) -> bool {
-        matches!(self, Self::Clear)
+        matches!(self, Self::Mixed | Self::Clear)
     }
 }
 

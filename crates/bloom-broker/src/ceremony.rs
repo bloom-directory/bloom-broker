@@ -5140,12 +5140,24 @@ fn review_disclosures(
         // bytes, but anything the input data would execute is still
         // unverified. This lives in the signed disclosures (not just the
         // page) so the honesty statement carries the manifest signature.
-        match &review.clear_signing {
-            Some(evidence) => disclosures.push(format!(
+        let has_structural = review
+            .payloads
+            .iter()
+            .any(|payload| payload.structural_call.is_some());
+        match (&review.clear_signing, has_structural) {
+            (Some(evidence), true) => disclosures.push(format!(
+                "Bloom decoded these transactions from their exact bytes. Catalog {} describes only the catalog-backed calls; the other readings prove standard calldata shapes and exact arguments, not token behavior. Bloom has not executed the calls or established what the contracts do.",
+                evidence.catalog_id
+            )),
+            (Some(evidence), false) => disclosures.push(format!(
                 "Bloom decoded these transactions from their exact bytes and read their contract calls against catalog {}, whose publisher this wallet trusts to describe these contracts. Bloom has not executed the calls or established what the contracts do.",
                 evidence.catalog_id
             )),
-            None => disclosures.push(
+            (None, true) => disclosures.push(
+                "Bloom decoded these transactions from their exact bytes. The contract inputs match standard ERC-20 calldata shapes, but Bloom has not verified token behavior or established execution effects."
+                    .to_owned(),
+            ),
+            (None, false) => disclosures.push(
                 "Bloom decoded the destination and value from the exact transaction bytes. Bloom has not established the execution effects of any contract input data."
                     .to_owned(),
             ),
@@ -5156,6 +5168,7 @@ fn review_disclosures(
             payload.destination.is_some()
                 && payload.calldata_keccak.is_some()
                 && payload.contract_call.is_none()
+                && payload.structural_call.is_none()
         }) {
             disclosures.push(
                 "Bloom cannot explain what the contract input data in this request does. Approving it authorizes exactly these bytes and nothing less."

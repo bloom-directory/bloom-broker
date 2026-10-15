@@ -292,6 +292,9 @@ function shortAddress(value) {
   const text = String(value || "");
   return /^0x[0-9a-fA-F]{40}$/.test(text) ? `${text.slice(0, 6)}…${text.slice(-4)}` : text;
 }
+function reviewedContractCall(payload) {
+  return payload?.contract_call || payload?.structural_call || null;
+}
 // Headings describe the requested call. None of them promise an outcome:
 // Bloom has not executed anything, and a passkey response is an approval,
 // not a settlement.
@@ -308,6 +311,27 @@ function callIntent(call) {
   }
   const who = shortAddress(summary.counterparty);
   const symbol = summary.token?.symbol || "tokens";
+  const structural = call.assurance_class === "structural_calldata";
+  if (structural && summary.action === "transfer") {
+    return {
+      action: "call", magnitude: summary.magnitude,
+      eyebrow: "ERC-20-shaped call",
+      heading: `Review transfer-shaped call for ${summary.amount_display}`,
+      detail: "The calldata names a recipient and raw amount. It does not prove that the contract will transfer tokens.",
+      relation: "calls"
+    };
+  }
+  if (structural) {
+    const amount = summary.magnitude === "unlimited" ? "maximum uint256"
+      : summary.magnitude === "zero" ? "zero" : summary.amount_display;
+    return {
+      action: "call", magnitude: summary.magnitude,
+      eyebrow: "ERC-20-shaped call",
+      heading: `Review approval-shaped call for ${amount}`,
+      detail: "The calldata names a spender and raw total. It does not prove that the contract will change a token allowance.",
+      relation: "calls"
+    };
+  }
   if (summary.action === "transfer") {
     return {
       action: "transfer", magnitude: summary.magnitude,
@@ -375,7 +399,7 @@ function describeTransfer(manifest) {
     // second time. They stay in technical details, where the exact bytes are.
     // The one exception is native value riding along with a contract call:
     // that is a second thing being moved and nothing else says so.
-    const decoded = Boolean(payload.contract_call);
+    const decoded = Boolean(reviewedContractCall(payload));
     const movesNative = !/^0(\.0+)?(\s|$)/.test(String(payload.value_display || "0"));
     technical.push([label(payload.destination ? "Transaction to" : "Action"),
       payload.destination || "Deploy contract (CREATE)", Boolean(payload.destination)]);
@@ -417,7 +441,7 @@ function describeTransfer(manifest) {
   // to whom, in which token. The envelope facts stay underneath — they are
   // what was actually signed, and the description never replaces them.
   const appendCallFacts = (facts, technical, payload, prefix) => {
-    const call = payload.contract_call;
+    const call = reviewedContractCall(payload);
     const label = name => prefix ? `${prefix} ${name.toLowerCase()}` : name;
     // Complete argument coverage is a property of the review, so every
     // decoded argument is still listed even when the heading already named
@@ -430,7 +454,7 @@ function describeTransfer(manifest) {
     // the review, and only the two the typed intent already named are
     // dropped — never a field whose meaning is unsupported.
     for (const field of call.fields || []) {
-      if (summary && field.format === "tokenAmount" && field.raw === summary.amount) continue;
+      if (summary && field.raw === summary.amount) continue;
       if (summary && field.raw === summary.counterparty) continue;
       if (summary) facts.push([label(field.label), field.value, field.format === "addressName"]);
     }
@@ -443,12 +467,12 @@ function describeTransfer(manifest) {
     const facts = [];
     const technical = [];
     const clear = plan.evm_review?.clear_signing;
-    const calls = evmPayloads.filter(payload => payload.contract_call);
+    const calls = evmPayloads.filter(payload => reviewedContractCall(payload));
     for (const [index, payload] of evmPayloads.entries()) {
       const factStart = facts.length;
       const technicalStart = technical.length;
       const prefix = evmPayloads.length > 1 ? `Transaction ${index + 1}` : "";
-      if (payload.contract_call) appendCallFacts(facts, technical, payload, prefix);
+      if (reviewedContractCall(payload)) appendCallFacts(facts, technical, payload, prefix);
       appendEnvelopeFacts(facts, technical, payload, prefix);
       for (const row of facts.slice(factStart)) row[3] = payload.chain_id;
       for (const row of technical.slice(technicalStart)) row[3] = payload.chain_id;
@@ -457,7 +481,7 @@ function describeTransfer(manifest) {
     // visible rather than folded into the fact list or the details section.
     const warnings = [];
     for (const payload of calls) {
-      for (const warning of payload.contract_call.warnings || []) warnings.push(warning);
+      for (const warning of reviewedContractCall(payload).warnings || []) warnings.push(warning);
     }
     const interpretation = [];
     // Upgradeability belongs to a contract, so it is stated once per affected
@@ -493,8 +517,8 @@ function describeTransfer(manifest) {
           cards: evmPayloads.map((payload, index) => ({
             position: index + 1,
             chainId: payload.chain_id,
-            intent: payload.contract_call
-              ? callIntent(payload.contract_call)
+            intent: reviewedContractCall(payload)
+              ? callIntent(reviewedContractCall(payload))
               : payload.destination && payload.calldata_keccak
               ? {action: "opaque", eyebrow: "Contract call", heading: "Approve a call Bloom cannot read",
                  detail: "No signed description is available. Bloom cannot say what this call does.",
@@ -507,17 +531,17 @@ function describeTransfer(manifest) {
                    ? "Bloom checked the envelope: destination and value come from the transaction bytes."
                    : "This creates a new contract. Bloom does not verify what its code does.",
                  relation: payload.destination ? `sends ${payload.value_display} to` : "creates"},
-            counterparty: payload.contract_call?.intent_summary?.counterparty || payload.destination,
-            counterpartyRole: payload.contract_call?.intent_summary?.counterparty_role ||
-              (payload.contract_call || payload.calldata_keccak ? "contract" : "recipient"),
-            contract: payload.contract_call?.contract,
-            contractName: payload.contract_call?.intent_summary?.token
-              ? `${payload.contract_call.intent_summary.token.symbol} — ${payload.contract_call.intent_summary.token.name}`
-              : payload.contract_call?.contract_name
+            counterparty: reviewedContractCall(payload)?.intent_summary?.counterparty || payload.destination,
+            counterpartyRole: reviewedContractCall(payload)?.intent_summary?.counterparty_role ||
+              (reviewedContractCall(payload) || payload.calldata_keccak ? "contract" : "recipient"),
+            contract: reviewedContractCall(payload)?.contract,
+            contractName: reviewedContractCall(payload)?.intent_summary?.token
+              ? `${reviewedContractCall(payload).intent_summary.token.symbol} — ${reviewedContractCall(payload).intent_summary.token.name}`
+              : reviewedContractCall(payload)?.contract_name
           }))
         }
-      : first.contract_call
-        ? callIntent(first.contract_call)
+      : reviewedContractCall(first)
+        ? callIntent(reviewedContractCall(first))
         : first.destination
           ? (first.calldata_keccak
             ? {action: "opaque", eyebrow: "Contract call", heading: "Approve a call Bloom cannot read",
@@ -530,17 +554,19 @@ function describeTransfer(manifest) {
           : {action: "deploy", eyebrow: "Contract creation", heading: "Deploy a contract",
              detail: "This creates a new contract from the initcode below. Bloom does not verify " +
                "what that code does.", relation: "creates"};
-    const summary = first.contract_call?.intent_summary;
+    const firstCall = reviewedContractCall(first);
+    const summary = firstCall?.intent_summary;
     const counterparty = summary?.counterparty ||
-      (first.contract_call ? null : first.destination);
+      (firstCall ? null : first.destination);
     const parties = [{role: "source", label: "From this wallet", value: first.sender}];
     if (counterparty) {
       parties.push({
-        role: intent.action === "allowance" ? "spender"
-          : intent.action === "transfer" || intent.action === "send" ? "recipient" : "contract",
-        label: intent.action === "allowance" ? "Spender"
-          : intent.action === "transfer" || intent.action === "send" ? "Recipient"
-          : "Contract being called",
+        role: summary?.counterparty_role || (intent.action === "allowance" ? "spender"
+          : intent.action === "transfer" || intent.action === "send" ? "recipient" : "contract"),
+        label: summary?.counterparty_role === "spender" ? "Spender"
+          : summary?.counterparty_role === "recipient" ? "Recipient"
+          : intent.action === "allowance" ? "Spender"
+          : intent.action === "transfer" || intent.action === "send" ? "Recipient" : "Contract being called",
         value: counterparty
       });
     }
@@ -550,7 +576,7 @@ function describeTransfer(manifest) {
     // addresses keep both roles, whatever their names say.
     if (summary?.token) {
       const sameAddress = summary.token.address.toLowerCase() ===
-        String(first.contract_call.contract).toLowerCase();
+        String(firstCall.contract).toLowerCase();
       parties.push({
         role: "token",
         label: sameAddress ? "Token contract — the contract being called"
@@ -560,18 +586,25 @@ function describeTransfer(manifest) {
       });
       if (!sameAddress) {
         parties.push({role: "contract", label: "Contract being called",
-          name: first.contract_call.contract_name || null,
-          value: first.contract_call.contract});
+          name: firstCall.contract_name || null,
+          value: firstCall.contract});
       }
-    } else if (first.contract_call) {
+    } else if (firstCall) {
       parties.push({role: "contract", label: "Contract being called",
-        name: first.contract_call.contract_name || null,
-        value: first.contract_call.contract});
+        name: firstCall.contract_name || null,
+        value: firstCall.contract});
     }
     // One sentence, from the review rather than from matching warning text.
-    const assurance = first.contract_call?.assurance ||
-      (clear ? "Interpreted using a trusted signed description. Contract behavior has not been verified."
-             : "Transaction destination, value and bytes checked. Contract behavior not verified.");
+    // A mixed batch never borrows the stronger assurance of its first member.
+    const structuralCalls = evmPayloads.filter(payload => payload.structural_call);
+    const assurance = structuralCalls.length && clear
+      ? "This batch mixes trusted catalog descriptions with structural calldata readings. Structural readings verify exact arguments, not contract or token behavior."
+      : structuralCalls.length
+        ? (structuralCalls.length === 1 ? structuralCalls[0].structural_call.assurance
+          : "These calls match standard ERC-20 calldata shapes. Bloom verified their exact arguments, but not that the contracts are tokens or follow ERC-20 behavior.")
+        : firstCall?.assurance ||
+          (clear ? "Interpreted using a trusted signed description. Contract behavior has not been verified."
+                 : "Transaction destination, value and bytes checked. Contract behavior not verified.");
     if (clear) {
       interpretation.push(["Catalog", `${clear.catalog_id}, sequence ${clear.catalog_sequence}`]);
       interpretation.push(["Assurance class", clear.assurance]);
@@ -580,7 +613,7 @@ function describeTransfer(manifest) {
     }
     const networkIdentity = oneNetwork
       ? `EVM · ${network} · Chain ID ${first.chain_id}` : "EVM · Multiple networks";
-    return {intent, payloads: evmPayloads, parties: parties.map(party => ({...party, chainId: first.chain_id})), assurance, interpretation, facts, technical, warnings, networkIdentity,
+    return {intent, payloads: evmPayloads, parties: parties.map(party => ({...party, chainId: first.chain_id})), assurance, interpretation, mixedAssurance: Boolean(clear && structuralCalls.length), facts, technical, warnings, networkIdentity,
             chainId: evmPayloads.length === 1 ? first.chain_id : null,
             assetSummary: evmPayloads.length === 1 ? summary : null,
             networkIcon: oneNetwork ? ({"1": "ethereum", "8453": "base", "31337": "test"}[first.chain_id] || "unknown") : "unknown",
@@ -1010,7 +1043,7 @@ function renderReview(session) {
     }
     if (transfer.intent.detail) parts.push(intentBlock(transfer.intent));
     for (const [index, payload] of (transfer.payloads || []).entries()) {
-      const call = payload.contract_call;
+      const call = reviewedContractCall(payload);
       if (!call || call.intent_summary) continue;
       const argumentsList = el("dl", {class: "facts"});
       for (const field of call.fields || []) {
@@ -1057,7 +1090,8 @@ function renderReview(session) {
         transfer.intent.action === "batch" ? party.role === "source" : party !== token).sort((a, b) =>
           Number(b.role === "spender") - Number(a.role === "spender"));
       const flow = el("div", {class: `ceremony-identity ${isTransfer ? "ceremony-transfer-path" : "ceremony-permission"}`});
-      const movement = transfer.assetSummary?.action === "transfer" ? transfer.assetSummary.amount_display : null;
+      const movement = isTransfer && transfer.assetSummary?.action === "transfer"
+        ? transfer.assetSummary.amount_display : null;
       for (const party of parties) {
         if (isTransfer && party.role === "recipient") {
           flow.append(el("div", {class: "ceremony-flow-arrow", "aria-hidden": "true"}, "↓"));
@@ -1078,8 +1112,8 @@ function renderReview(session) {
         el("summary", {}, `${prefix}${name} · ${payload.calldata_bytes} bytes`),
         payload.calldata_hex ? el("pre", {}, payload.calldata_hex)
           : el("p", {class: "ceremony-assurance"}, "This older review records only the data length and hash. Prepare a new review to see the bytes."));
-      if (!payload.contract_call) raw.setAttribute("open", "");
-      parts.push(payload.contract_call ? raw : el("section", {class: "ceremony-raw"}, raw));
+      if (!reviewedContractCall(payload)) raw.setAttribute("open", "");
+      parts.push(reviewedContractCall(payload) ? raw : el("section", {class: "ceremony-raw"}, raw));
     }
   } else {
     parts.push(el("p", {class: "summary", html: summaryHtml}));
@@ -1105,9 +1139,11 @@ function renderReview(session) {
     }
     parts.push(el("details", {class: "ceremony-details"},
       el("summary", {}, "How this was interpreted"),
-      el("p", {}, "The catalog publisher is trusted to describe this deployment accurately, and a " +
-        "signature authenticates that claim. It is not proof of what the contract does, and Bloom " +
-        "did not execute anything."),
+      el("p", {}, transfer.mixedAssurance
+        ? "The catalog publisher is trusted only for the catalog-backed calls. Structural calls are decoded from their exact calldata without trusting a deployment identity. Neither reading proves execution behavior."
+        : "The catalog publisher is trusted to describe this deployment accurately, and a " +
+          "signature authenticates that claim. It is not proof of what the contract does, and Bloom " +
+          "did not execute anything."),
       rows));
   }
   if (transfer?.technical?.length) {
@@ -1846,7 +1882,7 @@ function previewPayload(extra) {
     calldata_bytes: "68",
     calldata_keccak: "11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"
   }, extra);
-  const summary = payload.contract_call?.intent_summary;
+  const summary = reviewedContractCall(payload)?.intent_summary;
   if (summary) payload.calldata_hex = (summary.action === "transfer" ? "0xa9059cbb" : "0x095ea7b3") +
     summary.counterparty.slice(2).toLowerCase().padStart(64, "0") + BigInt(summary.amount).toString(16).padStart(64, "0");
   return payload;
@@ -1879,6 +1915,30 @@ function previewCall(action, amount, amountDisplay, magnitude, warnings) {
       action, counterparty_role: role, counterparty: PREVIEW_SPENDER,
       amount, amount_display: amountDisplay, magnitude, token: PREVIEW_TOKEN_IDENTITY
     },
+    warnings
+  };
+}
+function previewStructuralCall(action, amount, magnitude, warnings, contract = PREVIEW_TOKEN) {
+  const role = action === "transfer" ? "recipient" : "spender";
+  const amountDisplay = `${amount} raw units`;
+  return {
+    contract,
+    function_signature: action === "transfer"
+      ? "transfer(address,uint256)" : "approve(address,uint256)",
+    selector: action === "transfer" ? "0xa9059cbb" : "0x095ea7b3",
+    action,
+    fields: [
+      {label: action === "transfer" ? "Recipient" : "Spender", format: "addressName",
+       value: PREVIEW_SPENDER, raw: PREVIEW_SPENDER},
+      {label: action === "transfer" ? "Raw token amount" : "Raw total allowance",
+       format: "raw", value: amount, raw: amount}
+    ],
+    intent_summary: {
+      action, counterparty_role: role, counterparty: PREVIEW_SPENDER,
+      amount, amount_display: amountDisplay, magnitude
+    },
+    assurance_class: "structural_calldata",
+    assurance: "Decoded from the standard ERC-20 calldata shape. Bloom verified the exact arguments, but not that this contract is a token or follows ERC-20 behavior.",
     warnings
   };
 }
@@ -1987,6 +2047,17 @@ const PREVIEWS = {
   transfer: () => previewApproval([previewPayload({
     contract_call: previewCall("transfer", "250000000", "250 BDT", "finite", [])
   })], previewClearSigning()),
+  "structural-transfer": () => previewApproval([previewPayload({
+    structural_call: previewStructuralCall("transfer", "250000000", "finite", [
+      `Bloom decoded an ERC-20-shaped call to ${PREVIEW_TOKEN}, but has not verified that this contract is a token or follows ERC-20 behavior.`])
+  })], null),
+  "structural-allowance-unlimited": () => previewApproval([previewPayload({
+    structural_call: previewStructuralCall("allowance",
+      "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+      "unlimited", [
+        `Bloom decoded an ERC-20-shaped call to ${PREVIEW_TOKEN}, but has not verified that this contract is a token or follows ERC-20 behavior.`,
+        "The decoded allowance is the maximum uint256. If this contract behaves as ERC-20, the spender can use all current and future tokens without asking again, and the permission has no expiry."])
+  })], null),
   "transfer-ethereum": () => {
     const session = previewApproval([previewPayload({chain_id: "1", chain: "ethereum",
       contract_call: previewCall("transfer", "250000000", "250 BDT", "finite", [])
@@ -2023,6 +2094,12 @@ const PREVIEWS = {
       "This sets the spender's total allowance to the amount shown. It is not added to any existing allowance."])}),
     previewPayload({nonce: "8",
       contract_call: previewCall("transfer", "250000000", "250 BDT", "finite", [])})
+  ], previewClearSigning()),
+  "mixed-assurance": () => previewApproval([
+    previewPayload({contract_call: previewCall("transfer", "250000000", "250 BDT", "finite", [])}),
+    previewPayload({nonce: "8", destination: PREVIEW_SPENDER,
+      structural_call: previewStructuralCall("transfer", "42", "finite", [
+        `Bloom decoded an ERC-20-shaped call to ${PREVIEW_SPENDER}, but has not verified that this contract is a token or follows ERC-20 behavior.`], PREVIEW_SPENDER)})
   ], previewClearSigning()),
   "long-identity": () => previewApproval([previewPayload({
     contract_call: Object.assign(
