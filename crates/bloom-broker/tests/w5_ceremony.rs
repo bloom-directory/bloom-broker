@@ -2381,6 +2381,7 @@ async fn prepare_scoped_approval(
     match MachineBrokerService::dispatch(
         broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id,
             terms: terms.clone(),
@@ -3335,6 +3336,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let stale_policy_error = MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: vec![Base64UrlBytes::from_bytes(&creation)],
             safe_review_payloads: Vec::new(),
@@ -3412,6 +3414,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         MachineBrokerService::dispatch(
             &broker,
             MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                evm_reported_token: None,
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 evm_review_payloads: Vec::new(),
                 safe_review_payloads: envelope
@@ -3643,6 +3646,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let approval_prepared = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
@@ -3778,6 +3782,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let exact_prepared = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             safe_review_payloads: Vec::new(),
             operation_id: exact_approval_operation.clone(),
@@ -4011,6 +4016,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             MachineBrokerService::dispatch(
                 &broker,
                 MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                    evm_reported_token: None,
                     surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                     evm_review_payloads: Vec::new(),
                     safe_review_payloads: Vec::new(),
@@ -4825,6 +4831,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         MachineBrokerService::dispatch(
             &restarted_scoped_broker,
             MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                evm_reported_token: None,
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 evm_review_payloads: Vec::new(),
                 safe_review_payloads: Vec::new(),

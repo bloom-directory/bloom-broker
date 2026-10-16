@@ -110,10 +110,24 @@ pub struct ApprovalPrepareRequest {
     /// preimage from each envelope and binds it to the exact selector.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub safe_review_payloads: Vec<Base64UrlBytes>,
+    /// The symbol and decimals an unlisted token contract reports, read by
+    /// Machine. Broker uses them only to display an amount it decoded itself,
+    /// and labels that display as unverified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm_reported_token: Option<EvmReportedToken>,
     #[serde(default)]
     pub petal_use_claim: Option<PetalUseClaim>,
     #[serde(default)]
     pub system_use_claim: Option<SystemUseClaim>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvmReportedToken {
+    /// Lowercase `0x`-prefixed address of the called contract.
+    pub address: String,
+    pub symbol: String,
+    pub decimals: u8,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

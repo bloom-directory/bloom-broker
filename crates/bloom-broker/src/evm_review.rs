@@ -221,7 +221,51 @@ pub(crate) fn review(
         clear_signing: None,
     };
     read_calls(&mut review, &decoded_calls, catalog);
+    if let Some(reported) = &request.evm_reported_token {
+        show_reported_token(&mut review, reported);
+    }
     Ok(Some(review))
+}
+
+/// Show an unlisted token's amount with the symbol and decimals the token
+/// reports, read by Machine. Only the display changes, and it says so: the
+/// exact raw amount stays in the fields. A report for any other contract, or
+/// one whose symbol is not a plain label, is ignored.
+fn show_reported_token(review: &mut EvmReview, reported: &bloom_broker_api::EvmReportedToken) {
+    let symbol = &reported.symbol;
+    if symbol.is_empty()
+        || symbol.len() > 16
+        || !symbol
+            .chars()
+            .all(|c| c.is_ascii_graphic() && !matches!(c, '<' | '>' | '&'))
+        || reported.decimals > 36
+    {
+        return;
+    }
+    for payload in &mut review.payloads {
+        let Some(call) = &mut payload.contract_call else {
+            continue;
+        };
+        if !call.contract.eq_ignore_ascii_case(&reported.address) {
+            continue;
+        }
+        let Some(intent) = call
+            .intent_summary
+            .as_mut()
+            .filter(|intent| intent.token.is_none())
+        else {
+            continue;
+        };
+        intent.amount_display = format!(
+            "{} {symbol}",
+            bloom_evm_clear_signing::format_base_units(&intent.amount, reported.decimals)
+        );
+        call.warnings.push(format!(
+            "{symbol} and its {} decimals are what the token contract reports about itself; \
+             Bloom has not verified them. The exact amount is {} raw units.",
+            reported.decimals, intent.amount
+        ));
+    }
 }
 
 /// Read every contract call Broker can. A call it cannot read is shown as
@@ -446,6 +490,7 @@ pub(crate) mod tests {
         let token = |s: &str| Token::new(s).unwrap();
         let digest = Digest32::from_bytes([1; 32]);
         ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: CeremonySurfaceSelection::Default,
             operation_id: OperationId::from_bytes([2; 32]),
             canonical_plan_facts_digest: digest.clone(),
@@ -1298,6 +1343,46 @@ pub(crate) mod mode_tests {
         assert!(structural.structural && summary.token.is_none());
         assert!(structural.warnings[0].contains("has not verified"));
         assert!(decoded.clear_signing.is_none());
+    }
+
+    /// The token's own symbol and decimals shape the display, marked as
+    /// unverified; a report naming another contract or carrying markup does not.
+    #[test]
+    fn an_unlisted_token_shows_the_amount_it_reports_about_itself() {
+        let read = |address: &str, symbol: &str| {
+            let mut request =
+                batch(&[call(RECIPIENT, transfer_calldata(TOKEN_ADDRESS, 2_500_000))]);
+            request.evm_reported_token = Some(bloom_broker_api::EvmReportedToken {
+                address: address.to_owned(),
+                symbol: symbol.to_owned(),
+                decimals: 6,
+            });
+            let review = review(&request, &policy(), Address::ZERO, &accepted_catalog())
+                .unwrap()
+                .unwrap();
+            review.payloads[0].contract_call.clone().unwrap()
+        };
+        let shown = read(&RECIPIENT.to_lowercase(), "BRETT");
+        let summary = shown.intent_summary.as_ref().unwrap();
+        assert_eq!(summary.amount_display, "2.5 BRETT");
+        assert_eq!(summary.amount, "2500000");
+        assert!(summary.token.is_none() && shown.structural);
+        assert!(
+            shown
+                .warnings
+                .iter()
+                .any(|w| w.contains("has not verified them"))
+        );
+        for (address, symbol) in [(TOKEN_ADDRESS, "BRETT"), (RECIPIENT, "<b>X</b>")] {
+            let ignored = read(address, symbol);
+            assert!(
+                ignored
+                    .intent_summary
+                    .unwrap()
+                    .amount_display
+                    .contains("raw units")
+            );
+        }
     }
 
     #[test]
