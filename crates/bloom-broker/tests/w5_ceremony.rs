@@ -454,15 +454,19 @@ renderReview({{
         "Recipient: 0x6000000000000000000000000000000000000000", "Token amount (base units): 123",
         "Warning: this removes this Bloom wallet from the Safe's owners"],
       safe_tx_hash: "0x9565"
-    }}}}),
+    }}, security_disclosures: ["Safe transaction rebuilt from the exact signing bytes."]}}),
     attributed_advisory_items: []
   }}
 }});
-rendered = allText(nodes.review);
-for (const expected of ["Approve one Safe transaction", "ERC-20 transfer",
+rendered = [nodes["panel-title"], nodes.review].map(allText).join(" ");
+for (const expected of ["ERC-20 transfer", "Approve this Safe transaction",
   "0x6000000000000000000000000000000000000000", "Token amount (base units): 123",
-  "Safe nonce", "0x9565", "rebuilt from the exact signing bytes", "not verified"]) {{
+  "Nonce", "0x9565", "rebuilt from the exact signing bytes"]) {{
   if (!rendered.includes(expected)) throw new Error(`Safe review not disclosed ${{expected}}: ${{rendered}}`);
+}}
+const openTags = nodes.review.children.map(node => node.tagName);
+if (openTags.join(",") !== "P,ASIDE,DETAILS") {{
+  throw new Error(`Safe open view is not summary, warning, details: ${{openTags}}`);
 }}
 const banners = node => !node || typeof node === "string" ? [] : [
   ...(node.className === "ceremony-warning" ? [node] : []),
@@ -470,6 +474,37 @@ const banners = node => !node || typeof node === "string" ? [] : [
 ];
 if (!banners(nodes.review).some(node => allText(node).includes("removes this Bloom wallet"))) {{
   throw new Error("Safe owner removal warning missing from the warning banner");
+}}
+
+// Safe self-calls use the change itself as the heading, not a Solidity
+// function name or the generic "Requested action" placeholder.
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "wallet-primary"}},
+  review_manifest: {{
+    schema: "bloom.review-manifest.v1",
+    canonical_plan: JSON.stringify({{safe_review: {{
+      chain_id: "8453", chain: "base",
+      safe: "0x1000000000000000000000000000000000000000",
+      owner: "0x3000000000000000000000000000000000000000",
+      nonce: "2", operation: "call",
+      destination: "0x1000000000000000000000000000000000000000",
+      value: "0", value_display: "0 ETH",
+      action: ["Action: addOwnerWithThreshold on Safe 0x1000000000000000000000000000000000000000",
+        "New owner: 0x7000000000000000000000000000000000000007",
+        "Signatures required: 1"],
+      safe_tx_hash: "0x9566"
+    }}}}),
+    attributed_advisory_items: []
+  }}
+}});
+if (nodes["panel-title"].textContent !==
+    "Add owner 0x7000000000000000000000000000000000000007; 1 signature still required") {{
+  throw new Error(`Safe owner heading stayed technical: ${{nodes["panel-title"].textContent}}`);
+}}
+if (allText(nodes.review).includes("Calls   0x1000000000000000000000000000000000000000")) {{
+  throw new Error("Safe self-call repeated the Safe as a Calls row");
 }}
 
 // A batch member Bloom could not read is never shown as a plain send, and a
@@ -671,12 +706,15 @@ renderReview({{
 const primary = allText({{textContent: "", innerHTML: "", children:
   nodes.review.children.filter(child => child?.name !== "details")}});
 const technical = allText(nodes.review.children.find(child => child?.name === "details"));
-for (const phrase of ["this Petal", scope.package_hash, "No funds move", "buy tokens", "sell tokens",
-                      "return unused SOL", "main wallet key stays inside Bloom", "Up to 1h 0m"]) {{
+for (const phrase of ["this Petal", "no funds move", "main wallet key stays inside Bloom", "1h 0m"]) {{
   if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
 }}
 for (const internal of ["allowed_routes", "custody_operation_id", "package_hash", "r000010"]) {{
   if (primary.includes(internal)) throw new Error(`primary review exposed ${{internal}}: ${{primary}}`);
+}}
+for (const phrase of [scope.package_hash, "allowed_routes", "buy tokens", "sell tokens",
+                      "return unused SOL", "Up to 1h 0m"]) {{
+  if (!technical.includes(phrase)) throw new Error(`technical details omitted ${{phrase}}: ${{technical}}`);
 }}
 if (!technical.includes(scope.package_hash) || !technical.includes("allowed_routes")) {{
   throw new Error(`technical details omitted the exact signed scope: ${{technical}}`);
@@ -759,18 +797,17 @@ renderReview({{
 const primary = allText({{textContent: "", innerHTML: "", children:
   nodes.review.children.filter(child => child?.name !== "details")}});
 const technical = allText(nodes.review.children.find(child => child?.name === "details"));
-for (const phrase of ["Finish setting up", "this Petal", packageHash, "buy tokens", "sell tokens",
-                      "return unused SOL", "Up to 256 signed actions",
-                      "Up to 0.5 SOL in total across the whole session",
-                      "main wallet key stays inside Bloom"]) {{
+for (const phrase of ["Finish setting up", "this Petal", "main wallet key stays inside Bloom"]) {{
   if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
 }}
 for (const internal of ["route_grants", "machine_asserted", "r000010",
                         "limits are asserted by the named Petal"]) {{
   if (primary.includes(internal)) throw new Error(`primary review exposed ${{internal}}: ${{primary}}`);
 }}
-if (!technical.includes(packageHash) || !technical.includes("route_grants")) {{
-  throw new Error(`technical details omitted the exact signed plan: ${{technical}}`);
+for (const phrase of [packageHash, "route_grants", "buy tokens", "sell tokens",
+                      "return unused SOL", "Up to 256 signed actions",
+                      "Up to 0.5 SOL in total across the whole session"]) {{
+  if (!technical.includes(phrase)) throw new Error(`technical details omitted ${{phrase}}: ${{technical}}`);
 }}
 if (nodes["page-title"].textContent !== "Finish temporary session setup" ||
     nodes.approve.textContent !== "Finish session setup") {{
@@ -790,10 +827,9 @@ renderReview({{
     approval_id: "internal-approval-id"
   }}
 }});
-const unbudgeted = allText({{textContent: "", innerHTML: "", children:
-  nodes.review.children.filter(child => child?.name !== "details")}});
+const unbudgeted = allText(nodes.review.children.find(child => child?.name === "details"));
 if (!unbudgeted.includes("refuse any action that spends funds") || unbudgeted.includes("0.5 SOL")) {{
-  throw new Error(`an empty spending ceiling was not stated: ${{unbudgeted}}`);
+  throw new Error(`an empty spending ceiling was not stated in details: ${{unbudgeted}}`);
 }}
 "#
     );
@@ -9111,9 +9147,9 @@ function show(name) {{
 // A transfer names the amount and the recipient, and the recipient is a
 // recipient — never the contract, never a generic "To".
 let view = show("transfer");
-if (view.heading !== "Requested transfer") throw new Error(`transfer heading: ${{view.heading}}`);
+if (view.heading !== "Send 250 BDT") throw new Error(`transfer heading: ${{view.heading}}`);
 if (view.primary.includes(view.heading)) throw new Error("action title was printed twice");
-if (!view.primary.includes("−250 BDT") || !view.primary.includes("+250 BDT")) {{
+if (!view.technical.includes("−250 BDT") || !view.technical.includes("+250 BDT")) {{
   throw new Error("requested sender/recipient movements are missing");
 }}
 if (!view.technical.includes("Contract behavior has not been verified")) {{
@@ -9122,26 +9158,26 @@ if (!view.technical.includes("Contract behavior has not been verified")) {{
 if (!allText(nodes["page-title"]).includes("Chain ID 31337")) {{
   throw new Error("the exact EVM chain is missing from the primary context");
 }}
-if (!view.primary.includes("BDT — Bloom Demo Token")) {{
-  throw new Error("the token's full name is missing from the primary review");
+if (!view.technical.includes("BDT — Bloom Demo Token")) {{
+  throw new Error("the token's full name is missing from details");
 }}
 if (view.action !== "transfer") throw new Error(`transfer action: ${{view.action}}`);
 if (!view.roles.includes("recipient")) throw new Error(`transfer roles: ${{view.roles}}`);
 if (view.roles.includes("spender")) throw new Error("a transfer must not name a spender");
 if (view.button !== "Approve transfer") throw new Error(`transfer button: ${{view.button}}`);
 // Identity is the address. A name may accompany it and must never stand in.
-if (!view.primary.includes("0x9fE46736679d2d9a65F0992F2272dE9f3c7fa6e0")) {{
+if (!view.technical.includes("0x9fE46736679d2d9a65F0992F2272dE9f3c7fa6e0")) {{
   throw new Error("the recipient address is not on the page");
 }}
-if (!view.primary.includes("0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512")) {{
+if (!view.technical.includes("0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512")) {{
   throw new Error("the token contract address is not on the page");
 }}
 // The envelope's zero native value must not read as the thing being sent.
 if (view.primary.includes("  0 ETH")) throw new Error(`primary showed the native zero: ${{view.primary}}`);
 // The potential cost stays with the decision, labelled as a ceiling.
-if (!view.primary.includes("Gas fee") ||
-    !view.primary.includes("Up to 0.000199 ETH")) {{
-  throw new Error(`the execution gas ceiling is not visible: ${{view.primary}}`);
+if (!view.technical.includes("Gas fee") ||
+    !view.technical.includes("Up to 0.000199 ETH")) {{
+  throw new Error(`the execution gas ceiling is not in details: ${{view.technical}}`);
 }}
 if (!view.technical.includes("0.000198510751634520 ETH")) {{
   throw new Error("the exact execution cap disappeared");
@@ -9246,7 +9282,7 @@ if (!view.technical.includes("11579208923731619542357098500868790785326998466564
 
 // An uninterpretable call says so instead of drawing a transfer.
 view = show("deposit-native-opaque");
-if (!view.primary.includes("Native value sent") || !view.primary.includes("1 ETH")) {{
+if (!view.technical.includes("Native value sent") || !view.technical.includes("1 ETH")) {{
   throw new Error("an opaque payable call hid the native value it sends");
 }}
 for (const name of ["deposit-static", "stake-static", "operator-approval"]) {{
@@ -9255,13 +9291,13 @@ for (const name of ["deposit-static", "stake-static", "operator-approval"]) {{
   if (view.primary.includes("Requested movements")) throw new Error(`invented balance changes: ${{name}}`);
 }}
 view = show("opaque-call");
-if (!view.primary.includes("0xa9059cbb")) throw new Error("opaque calldata is not visible");
+if (!view.technical.includes("0xa9059cbb")) throw new Error("opaque calldata is not in details");
 if (view.action !== "opaque") throw new Error(`opaque action: ${{view.action}}`);
-if (!view.primary.includes("cannot say what")) throw new Error(`opaque detail: ${{view.primary}}`);
+if (!view.heading.includes("Bloom cannot read")) throw new Error(`opaque heading: ${{view.heading}}`);
 view = show("operator-approval");
-if (!view.primary.includes("Function arguments") ||
-    !view.primary.includes("setApprovalForAll(address operator, bool approved)") ||
-    !view.primary.includes("true")) throw new Error("generic call arguments lost their function context");
+if (!view.technical.includes("Function arguments") ||
+    !view.technical.includes("setApprovalForAll(address operator, bool approved)") ||
+    !view.technical.includes("true")) throw new Error("generic call arguments lost their function context");
 
 // A batch keeps every member, in order, under one approval.
 view = show("batch");
@@ -9269,10 +9305,10 @@ if (view.action !== "batch") throw new Error(`batch action: ${{view.action}}`);
 if (allText(nodes["page-title"]).includes("Wallet settings")) {{
   throw new Error("a transaction batch was labelled as wallet settings");
 }}
-if (!view.primary.includes("Transaction 1") || !view.primary.includes("Transaction 2")) {{
+if (!view.technical.includes("Transaction 1") || !view.technical.includes("Transaction 2")) {{
   throw new Error("batch members are not listed in order");
 }}
-if (view.primary.indexOf("Transaction 1") > view.primary.indexOf("Transaction 2")) {{
+if (view.technical.indexOf("Transaction 1") > view.technical.indexOf("Transaction 2")) {{
   throw new Error("batch members are out of order");
 }}
 if (view.button !== "Approve all transactions") throw new Error(`batch button: ${{view.button}}`);
@@ -9312,7 +9348,7 @@ call.intent = "Totally different publisher story";
 renamed.review_manifest.canonical_plan = JSON.stringify(plan);
 renderReview(renamed);
 const relabelled = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
-if (nodes["panel-title"].textContent !== "Requested transfer") {{
+if (nodes["panel-title"].textContent !== "Send 250 BDT") {{
   throw new Error(`relabelling changed the heading: ${{relabelled}}`);
 }}
 if (!relabelled.includes("Beneficiary")) {{
