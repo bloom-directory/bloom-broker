@@ -431,6 +431,92 @@ function compactFeeCap(value) {
   const decimals = (units % 1000000n).toString().padStart(6, "0").replace(/0+$/, "");
   return `${units / 1000000n}${decimals ? `.${decimals}` : ""} ${match[3]}`;
 }
+// Safe reviews arrive as flat "Label: value" lines. The page turns those into
+// a heading, one sentence, and separate rows. Function names, adapters, raw
+// units, and hashes stay in a second disclosure.
+function parseSafeAction(lines) {
+  const warnings = [];
+  const rows = [];
+  let rawAction = "";
+  for (const line of lines) {
+    if (line.startsWith("Warning: ")) {
+      warnings.push(line.slice(9));
+      continue;
+    }
+    if (line.startsWith("Action: ") && !rawAction) {
+      rawAction = line.slice(8);
+      continue;
+    }
+    const separator = line.indexOf(": ");
+    if (separator < 0) {
+      rows.push({label: line.replace(/^Safe transaction · /, ""), value: ""});
+      continue;
+    }
+    rows.push({
+      label: line.slice(0, separator).replace(/^Safe transaction · /, ""),
+      value: line.slice(separator + 2)
+    });
+  }
+  return {rawAction, rows, warnings};
+}
+function safeRowValue(rows, label) {
+  return rows.find(row => row.label === label)?.value || "";
+}
+function safeTechnical(row) {
+  if (!row.value) return true;
+  if (/^Action( \d+)?$/.test(row.label)) return true;
+  if (/^Action contract \d+$/.test(row.label)) return true;
+  if (/^Action sends \d+$/.test(row.label)) return true;
+  if (/^Transaction \d+$/.test(row.label) && !row.value.startsWith("Send ")) return true;
+  if (row.label === "Safe calls" || row.label === "Safe gas limit" || row.label === "Base gas") return true;
+  if (/raw units|Contract code|Highest share price|Callback|Skip on failure/i.test(row.label)) return true;
+  if (row.label === "Sent to" || row.label.endsWith(" · Sent to")) return true;
+  if ((row.label === "Safe sends" || row.label === "Value" || row.label === "Sends to the new contract")
+      && /^0(?:\.0+)? ETH$/.test(row.value)) return true;
+  return false;
+}
+function safeDecisionLabel(label) {
+  const nested = label.match(/^(Transaction \d+|Action \d+) · (.+)$/);
+  const name = nested ? nested[2] : label;
+  const prefix = nested && nested[1].startsWith("Transaction") ? `${nested[1]} ` : "";
+  if (name === "Shares go to") return `${prefix}Shares recipient`.trim();
+  if (name === "To" || name === "Recipient") return `${prefix}Recipient`.trim();
+  if (name === "Amount") return prefix ? `${nested[1]} amount` : "Amount";
+  if (name === "Value") return "Native value";
+  if (name === "Sends to the new contract") return "Value sent to the new contract";
+  return prefix ? `${nested[1]} ${name}` : name;
+}
+// Morpho records a maximum assets-per-share price, scaled by 1e27. Turning
+// that into a share count needs the vault's share decimals, which this review
+// does not carry.
+function safeShareBound(raw) {
+  if (!/^\d+$/.test(raw)) return "Bloom cannot read this share-price bound.";
+  return `The deposit reverts if one vault share would cost more than ${raw} asset units on a 1e27 scale. Bloom cannot show that as a minimum number of shares, because this review does not include the vault's share decimals.`;
+}
+function safeIdentityRisk(warning) {
+  const match = String(warning).match(/^(?:Bloom cannot check that |Bloom has not verified that )(0x[0-9a-fA-F]{40}) is a Safe\b/);
+  if (!match) return null;
+  return `Bloom has not checked that ${shortAddress(match[1])} is a Safe. This signature authorizes the transaction hash for that address, and a different contract there could accept it for another effect.`;
+}
+function safeAmount(rows) {
+  const named = rows.find(row => /(?:^|· )Amount$/.test(row.label) && /[A-Za-z]/.test(row.value));
+  if (named) return named.value;
+  const raw = rows.find(row => row.label === "Token amount (base units)" || row.label === "Raw token amount");
+  return raw ? `${raw.value} base units` : "";
+}
+function safeMovements(rows) {
+  const bits = [];
+  for (const row of rows) {
+    if (/(?:^|· )Amount$/.test(row.label) && /[A-Za-z]/.test(row.value)) {
+      const prefix = row.label.replace(/Amount$/, "");
+      const to = rows.find(other => other.label === `${prefix}To` || other.label === `${prefix}Recipient`);
+      bits.push(to ? `${row.value} to ${shortAddress(to.value)}` : row.value);
+    } else if (/^Transaction \d+$/.test(row.label) && /^Send .+ to 0x[0-9a-fA-F]{40}$/.test(row.value)) {
+      bits.push(row.value.replace(/^Send /, "").replace(/0x[0-9a-fA-F]{40}/g, match => shortAddress(match)));
+    }
+  }
+  return bits;
+}
 function describeTransfer(manifest) {
   const claim = manifest?.system_use_claim || manifest?.petal_use_claim;
   let plan = {};
@@ -666,57 +752,91 @@ function describeTransfer(manifest) {
   const safe = plan.safe_review;
   if (safe) {
     const network = chainLabel(safe.chain);
-    // Broker's mandatory warnings are lines inside `action`. Left there they
-    // render as part of a fact value, in the same weight as the Safe nonce,
-    // while the EVM branch puts the identical strings through the warning
-    // banner. Split them out so both ceremonies style them the one way.
-    const safeWarnings = safe.action
-      .filter(line => line.startsWith("Warning: "))
-      .map(line => line.slice(9));
-    const safeAction = safe.action.filter(line => !line.startsWith("Warning: "));
-    // The action line already names the recipient and amount; the rows
-    // below add only what it does not say.
-    const changes = Object.fromEntries(safeAction.slice(1).map(line => {
-      const separator = line.indexOf(": ");
-      return separator < 0 ? [line, ""] : [line.slice(0, separator), line.slice(separator + 2)];
-    }));
-    const rawAction = safeAction[0].replace(/^Action: /, "");
-    const threshold = changes["Signatures required"];
+    // Warnings are lines inside `action`. The banner shows them; the other
+    // lines become one row each. Joining those lines into one cell hides the
+    // amount, the vault, and the recipient in a single unreadable string.
+    const parsed = parseSafeAction(safe.action);
+    const {rawAction, rows} = parsed;
+    const threshold = safeRowValue(rows, "Signatures required");
     const thresholdText = threshold
       ? `${threshold} signature${threshold === "1" ? "" : "s"}` : "";
-    let heading = rawAction;
+    const amount = safeAmount(rows);
+    const vault = rows.find(row => /(?:^|· )Vault$/.test(row.label))?.value || "";
+    const shares = rows.find(row => /Shares go to$/.test(row.label))?.value || "";
+    const recipient = safeRowValue(rows, "Recipient") || safeRowValue(rows, "To");
+    const sendTo = rawAction.match(/^Send (.+) to (0x[0-9a-fA-F]{40})$/);
+    const movements = safeMovements(rows);
+    const safeShort = shortAddress(safe.safe);
+    let heading = rawAction.replace(/0x[0-9a-fA-F]{40}/g, match => shortAddress(match));
+    let sentence = `On <strong>${escapeHtml(network)}</strong>, Safe <strong>${escapeHtml(safeShort)}</strong> requests this action. Amounts, parties, and the nonce are listed below.`;
     if (rawAction.startsWith("addOwnerWithThreshold")) {
-      heading = `Add owner ${shortAddress(changes["New owner"])}; ${thresholdText} still required`;
+      heading = `Add owner ${shortAddress(safeRowValue(rows, "New owner"))}; ${thresholdText} still required`;
+      sentence = `Add <strong>${escapeHtml(shortAddress(safeRowValue(rows, "New owner")))}</strong> as an owner of Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>. ${escapeHtml(thresholdText)} will still be required.`;
     } else if (rawAction.startsWith("removeOwner")) {
-      heading = `Remove owner ${shortAddress(changes["Removed owner"])}; ${thresholdText} still required`;
+      heading = `Remove owner ${shortAddress(safeRowValue(rows, "Removed owner"))}; ${thresholdText} still required`;
+      sentence = `Remove owner <strong>${escapeHtml(shortAddress(safeRowValue(rows, "Removed owner")))}</strong> from Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>. ${escapeHtml(thresholdText)} will still be required.`;
     } else if (rawAction.startsWith("swapOwner")) {
-      heading = `Replace owner ${shortAddress(changes["Removed owner"])} with ${shortAddress(changes["New owner"])}`;
+      heading = `Replace owner ${shortAddress(safeRowValue(rows, "Removed owner"))} with ${shortAddress(safeRowValue(rows, "New owner"))}`;
+      sentence = `Replace owner <strong>${escapeHtml(shortAddress(safeRowValue(rows, "Removed owner")))}</strong> with <strong>${escapeHtml(shortAddress(safeRowValue(rows, "New owner")))}</strong> on Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>.`;
     } else if (rawAction.startsWith("changeThreshold")) {
       heading = `Require ${thresholdText}`;
-    } else if (rawAction.startsWith("transfer on ") && changes.Amount && changes.Recipient) {
-      heading = `Send ${changes.Amount} to ${shortAddress(changes.Recipient)}`;
+      sentence = `Require <strong>${escapeHtml(thresholdText)}</strong> on Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>.`;
+    } else if (rawAction.startsWith("transfer on ") && amount && recipient) {
+      heading = `Send ${amount} to ${shortAddress(recipient)}`;
+      sentence = `Send <strong>${escapeHtml(amount)}</strong> from Safe <strong>${escapeHtml(safeShort)}</strong> to <strong>${escapeHtml(shortAddress(recipient))}</strong> on <strong>${escapeHtml(network)}</strong>.`;
+    } else if (sendTo) {
+      heading = `Send ${sendTo[1]} to ${shortAddress(sendTo[2])}`;
+      sentence = `Send <strong>${escapeHtml(sendTo[1])}</strong> from Safe <strong>${escapeHtml(safeShort)}</strong> to <strong>${escapeHtml(shortAddress(sendTo[2]))}</strong> on <strong>${escapeHtml(network)}</strong>.`;
     } else if (rawAction.startsWith("performCreate2")) {
       heading = "Create a contract at a fixed address";
+      sentence = `Create a contract at a fixed address from Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>.`;
     } else if (rawAction.startsWith("performCreate")) {
       heading = "Create a contract";
-    } else if (rawAction.startsWith("multicall on Morpho Bundler3")) {
-      heading = "Deposit into a Morpho vault";
-    } else if (rawAction.startsWith("erc4626Deposit")) {
-      heading = "Deposit into a vault";
+      sentence = `Create a contract from Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>.`;
+    } else if (rawAction.startsWith("multicall on Morpho Bundler3") || rawAction.startsWith("erc4626Deposit")) {
+      const morpho = rawAction.startsWith("multicall on Morpho Bundler3");
+      const vaultName = morpho ? "a Morpho vault" : "a vault";
+      heading = amount ? `Deposit ${amount} into ${vaultName}` : `Deposit into ${vaultName}`;
+      const who = !shares ? "the recipient in details"
+        : shares.toLowerCase() === String(safe.owner).toLowerCase() ? `your account ${shortAddress(shares)}`
+        : shares.toLowerCase() === String(safe.safe).toLowerCase() ? `this Safe ${shortAddress(shares)}`
+        : shortAddress(shares);
+      const deposited = amount ? `<strong>${escapeHtml(amount)}</strong>` : "tokens";
+      const into = vault ? `vault <strong>${escapeHtml(shortAddress(vault))}</strong>` : vaultName;
+      sentence = `Deposit ${deposited} into ${into} on <strong>${escapeHtml(network)}</strong>. Vault shares go to <strong>${escapeHtml(who)}</strong>.`;
+    } else if (rawAction.startsWith("multiSend") || movements.length > 1) {
+      heading = movements.length ? `Send ${naturalList(movements.map(bit => bit.split(" to ")[0]))}` : "Send a batch from the Safe";
+      sentence = movements.length
+        ? `From Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>: ${escapeHtml(naturalList(movements))}.`
+        : sentence;
+    } else if (amount && recipient) {
+      heading = `Send ${amount} to ${shortAddress(recipient)}`;
+      sentence = `Send <strong>${escapeHtml(amount)}</strong> from Safe <strong>${escapeHtml(safeShort)}</strong> to <strong>${escapeHtml(shortAddress(recipient))}</strong> on <strong>${escapeHtml(network)}</strong>.`;
+    } else if (rawAction === "Contract call Bloom cannot read") {
+      const reason = safeRowValue(rows, "Reason");
+      heading = "Contract call Bloom cannot read";
+      sentence = `Bloom cannot read this Safe transaction on <strong>${escapeHtml(network)}</strong> for Safe <strong>${escapeHtml(safeShort)}</strong>.${reason ? ` ${escapeHtml(reason)}.` : ""}`;
     }
-    const whatChanges = safeAction.slice(1).join("; ");
-    const facts = [
-      ["Safe", safe.safe, true],
-      ["What changes", whatChanges || null],
-      ["Network", network],
-      ["Nonce", safe.nonce],
-      ["Signing owner", safe.owner, true],
-      safe.destination.toLowerCase() !== safe.safe.toLowerCase() ? ["Calls", safe.destination, true] : null,
-      safe.operation === "delegatecall" ? ["Operation", "delegatecall (a batch or deployment, read above)"] : null,
-      ["Safe transaction hash", safe.safe_tx_hash, true],
-    ].filter(Boolean);
-    const sentence = `Approve this Safe transaction on <strong>${escapeHtml(network)}</strong>; the Safe, owner, nonce, and exact signing bytes are in details.`;
-    return {sentence, facts, warnings: safeWarnings, willVerify: true, heading, button: "Approve Safe signature"};
+    const share = rows.find(row => /Highest share price/i.test(row.label));
+    const facts = rows
+      .filter(row => !safeTechnical(row))
+      .map(row => [safeDecisionLabel(row.label), row.value, /^0x[0-9a-fA-F]{40}$/.test(row.value)]);
+    facts.push(["Safe", safe.safe, true], ["Network", network], ["Nonce", safe.nonce]);
+    if (share) facts.push(["Share bound", safeShareBound(share.value)]);
+    const technical = [["Described as", rawAction, false]];
+    for (const row of rows.filter(safeTechnical)) {
+      technical.push([row.label, row.value, /^0x[0-9a-fA-F]{40}$/.test(row.value) || row.label === "Contract code"]);
+    }
+    technical.push(["Signing owner", safe.owner, true]);
+    if (safe.destination.toLowerCase() !== safe.safe.toLowerCase()) technical.push(["Calls", safe.destination, true]);
+    if (safe.operation === "delegatecall") technical.push(["Operation", "delegatecall"]);
+    technical.push(["Safe transaction hash", safe.safe_tx_hash, true]);
+    for (const warning of parsed.warnings) {
+      if (safeIdentityRisk(warning)) technical.push(["Safe identity check", warning, false]);
+    }
+    const warnings = parsed.warnings.map(warning => safeIdentityRisk(warning) || warning);
+    return {sentence, facts, technical, warnings, willVerify: true, heading,
+      button: "Approve Safe signature", chainId: safe.chain_id};
   }
   if (!claim) return null;
   const debits = claim.declared_debits || [];

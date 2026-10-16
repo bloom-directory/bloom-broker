@@ -459,10 +459,16 @@ renderReview({{
   }}
 }});
 rendered = [nodes["panel-title"], nodes.review].map(allText).join(" ");
-for (const expected of ["ERC-20 transfer", "Approve this Safe transaction",
-  "0x6000000000000000000000000000000000000000", "Token amount (base units): 123",
+for (const expected of ["Send 123 base units", "ERC-20 transfer",
+  "0x6000000000000000000000000000000000000000", "Token amount (base units)", "123",
   "Nonce", "0x9565", "rebuilt from the exact signing bytes"]) {{
   if (!rendered.includes(expected)) throw new Error(`Safe review not disclosed ${{expected}}: ${{rendered}}`);
+}}
+const safeFactText = (nodes.review.children.find(node => node.tagName === "DETAILS")?.children || [])
+  .filter(node => node && node.tagName === "DL" && node.className === "facts")
+  .map(allText).join(" ");
+if (safeFactText.includes("Token amount (base units): 123") || safeFactText.includes("What changes") || safeFactText.includes("; ")) {{
+  throw new Error(`Safe review still dumps action lines: ${{safeFactText}}`);
 }}
 const openTags = nodes.review.children.map(node => node.tagName);
 if (openTags.join(",") !== "P,ASIDE,DETAILS") {{
@@ -530,6 +536,138 @@ renderReview({{
 }});
 if (nodes["panel-title"].textContent !== "Create a contract") {{
   throw new Error(`Safe deployment heading stayed technical: ${{nodes["panel-title"].textContent}}`);
+}}
+
+// A Morpho deposit has to show the amount, vault, and shares recipient
+// before details are opened, and details are rows rather than one dump.
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "wallet-primary"}},
+  review_manifest: {{
+    schema: "bloom.review-manifest.v1",
+    canonical_plan: JSON.stringify({{safe_review: {{
+      chain_id: "8453", chain: "base",
+      safe: "0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61",
+      owner: "0x86dB2acbF74856fd3286Cb5B755A5a05Ba445864",
+      nonce: "2", operation: "call",
+      destination: "0x6BFd8137e702540E7A42B74178A4a49Ba43920C4",
+      value: "0", value_display: "0 ETH",
+      action: [
+        "Action: multicall on Morpho Bundler3 0x6BFd8137e702540E7A42B74178A4a49Ba43920C4",
+        "Action 1: erc20TransferFrom on Morpho GeneralAdapter1 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+        "Action 1 · Amount: 2.5 USDC",
+        "Action 1 · Token: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "Action 1 · Sent to: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+        "Action contract 1: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+        "Action sends 1: 0 ETH",
+        "Action 2: erc4626Deposit on Morpho GeneralAdapter1 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+        "Action 2 · Vault: 0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca",
+        "Action 2 · Assets (raw units): 2500000",
+        "Action 2 · Highest share price (1e27 scale): 1000000000",
+        "Action 2 · Shares go to: 0x86dB2acbF74856fd3286Cb5B755A5a05Ba445864",
+        "Action contract 2: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+        "Action sends 2: 0 ETH",
+        "Warning: Bloom cannot check that 0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61 is a Safe; it reads it as one."
+      ],
+      safe_tx_hash: "0x5160acd8c69384337afae5de65027a3fef41f5ba421060d78f9d0c87fa1b3d17"
+    }}, security_disclosures: ["Bloom rebuilt the Safe transaction from the exact signing bytes."]}}),
+    attributed_advisory_items: []
+  }}
+}});
+if (nodes["panel-title"].textContent !== "Deposit 2.5 USDC into a Morpho vault") {{
+  throw new Error(`Morpho heading hid the amount: ${{nodes["panel-title"].textContent}}`);
+}}
+const morphoSummary = allText(nodes.review.children[0]);
+for (const expected of ["2.5 USDC", "0xc125…A2Ca", "0x86dB…5864", "Base"]) {{
+  if (!morphoSummary.includes(expected)) throw new Error(`Morpho summary hid ${{expected}}: ${{morphoSummary}}`);
+}}
+if (morphoSummary.includes("0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca") ||
+    morphoSummary.includes("erc4626Deposit") || morphoSummary.includes("; ")) {{
+  throw new Error(`Morpho summary dumped technical detail: ${{morphoSummary}}`);
+}}
+function walk(node, out = []) {{
+  if (!node || typeof node === "string") return out;
+  out.push(node);
+  for (const child of node.children || []) walk(child, out);
+  return out;
+}}
+function pairs(list) {{
+  const out = [];
+  const children = (list?.children || []).filter(child => child && typeof child !== "string");
+  for (let i = 0; i + 1 < children.length; i += 2) out.push([allText(children[i]).trim(), allText(children[i + 1]).trim()]);
+  return out;
+}}
+const morphoLists = walk(nodes.review).filter(node => node.tagName === "DL");
+const morphoFacts = pairs(morphoLists.find(node => node.className === "facts"));
+const morphoTechnical = pairs(morphoLists.find(node => String(node.className).includes("technical")));
+const factValue = label => morphoFacts.find(([name]) => name === label)?.[1] || "";
+for (const [label, expected] of [
+  ["Amount", "2.5 USDC"],
+  ["Token", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"],
+  ["Vault", "0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca"],
+  ["Shares recipient", "0x86dB2acbF74856fd3286Cb5B755A5a05Ba445864"],
+  ["Safe", "0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61"],
+  ["Network", "Base"],
+  ["Nonce", "2"]
+]) {{
+  if (!factValue(label).includes(expected)) {{
+    throw new Error(`Morpho detail ${{label}} was ${{JSON.stringify(factValue(label))}}`);
+  }}
+}}
+if (!factValue("Share bound").includes("share decimals") || factValue("Share bound") === "1000000000") {{
+  throw new Error(`Morpho share bound stayed raw: ${{factValue("Share bound")}}`);
+}}
+const factText = morphoFacts.map(pair => pair.join(" ")).join(" | ");
+if (factText.includes("erc4626Deposit") || factText.includes("erc20TransferFrom") ||
+    factText.includes("2500000") || factText.includes("; ")) {{
+  throw new Error(`Morpho decision rows include technical dump: ${{factText}}`);
+}}
+const technicalText = morphoTechnical.map(pair => pair.join(" ")).join(" | ");
+for (const expected of ["erc4626Deposit", "erc20TransferFrom", "2500000",
+  "0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+  "0x5160acd8c69384337afae5de65027a3fef41f5ba421060d78f9d0c87fa1b3d17",
+  "cannot check that"]) {{
+  if (!technicalText.includes(expected)) throw new Error(`Morpho technical detail hid ${{expected}}: ${{technicalText}}`);
+}}
+const morphoBanner = banners(nodes.review).map(allText).join(" ");
+if (!morphoBanner.includes("different contract") || morphoBanner.includes("cannot check that")) {{
+  throw new Error(`Morpho warning did not state the Safe-identity risk: ${{morphoBanner}}`);
+}}
+
+// A Safe batch states each movement in the heading and keeps one row per fact.
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "wallet-primary"}},
+  review_manifest: {{
+    schema: "bloom.review-manifest.v1",
+    canonical_plan: JSON.stringify({{safe_review: {{
+      chain_id: "8453", chain: "base",
+      safe: "0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61",
+      owner: "0x86dB2acbF74856fd3286Cb5B755A5a05Ba445864",
+      nonce: "3", operation: "delegatecall",
+      destination: "0x9641d764fc13c8B624c04430C7356C1C7C8102e2",
+      value: "0", value_display: "0 ETH",
+      action: [
+        "Action: multiSend on Safe batch 0x9641d764fc13c8B624c04430C7356C1C7C8102e2",
+        "Safe transaction · Transaction 1: transfer on USD Coin 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "Safe transaction · Transaction 1 · To: 0x4000000000000000000000000000000000000000",
+        "Safe transaction · Transaction 1 · Amount: 5 USDC",
+        "Safe transaction · Transaction 2: Send 0.0001 ETH to 0x6000000000000000000000000000000000000000",
+        "Warning: Bloom cannot check that 0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61 is a Safe; it reads it as one."
+      ],
+      safe_tx_hash: "0xaaaa"
+    }}}}),
+    attributed_advisory_items: []
+  }}
+}});
+if (nodes["panel-title"].textContent !== "Send 5 USDC and 0.0001 ETH") {{
+  throw new Error(`Safe batch heading hid the amounts: ${{nodes["panel-title"].textContent}}`);
+}}
+const batchSummary = allText(nodes.review.children[0]);
+if (!batchSummary.includes("5 USDC to 0x4000…0000") || !batchSummary.includes("0.0001 ETH to 0x6000…0000")) {{
+  throw new Error(`Safe batch summary hid a movement: ${{batchSummary}}`);
 }}
 
 // A batch member Bloom could not read is never shown as a plain send, and a
