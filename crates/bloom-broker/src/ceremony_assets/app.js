@@ -292,6 +292,11 @@ function shortAddress(value) {
   const text = String(value || "");
   return /^0x[0-9a-fA-F]{40}$/.test(text) ? `${text.slice(0, 6)}…${text.slice(-4)}` : text;
 }
+// Why Bloom could not read a call, so the owner can judge it.
+function unreadDetail(payload) {
+  const reason = payload?.unread_reason ? ` Reason: ${payload.unread_reason}.` : "";
+  return `Bloom cannot say what this call does.${reason}`;
+}
 function reviewedContractCall(payload) {
   return payload?.contract_call || null;
 }
@@ -519,7 +524,7 @@ function describeTransfer(manifest) {
               ? callIntent(reviewedContractCall(payload))
               : payload.destination && payload.calldata_keccak
               ? {action: "opaque", eyebrow: "Contract call", heading: "Approve a call Bloom cannot read",
-                 detail: "Bloom has no description of this call. It cannot say what this call does.",
+                 detail: unreadDetail(payload),
                  relation: "calls"}
               : {action: payload.destination ? "send" : "deploy",
                  eyebrow: payload.destination ? "Native transfer" : "Contract creation",
@@ -543,7 +548,7 @@ function describeTransfer(manifest) {
         : first.destination
           ? (first.calldata_keccak
             ? {action: "opaque", eyebrow: "Contract call", heading: "Approve a call Bloom cannot read",
-               detail: "Bloom has no description of this call. It cannot say what this call does.",
+               detail: unreadDetail(first),
                relation: "calls"}
             : {action: "send", eyebrow: "Native transfer",
                heading: `Send ${first.value_display}`,
@@ -773,58 +778,14 @@ function describePolicy(manifest) {
   if (Number.isFinite(before) && Number.isFinite(after) && before !== after) {
     lines.push(["Max approval lifetime", `${fmtRemaining(before)} → ${fmtRemaining(after)}`]);
   }
-  // Clear-signing settings are authority, so a change to them is shown as
-  // current → proposed rather than left to an empty diff. Each one says what
-  // it permits: none of them grants anyone an allowance by itself.
-  const CLEAR_SIGNING_SETTINGS = [
-    ["unlimited_allowance_allowed", "Unlimited-allowance requests",
-     "A request to approve the maximum possible amount is refused. A large finite amount is still shown with its exact value.",
-     "This wallet setting applies to all supported tokens. Each request will still need your approval " +
-     "and will name its token and spender. This setting does not move tokens or grant a spender an allowance."],
-    ["opaque_exact_allowed", "Requests Bloom cannot describe",
-     "A call Bloom has no description of is refused.",
-     "A call Bloom has no description of can be approved as exact bytes, carrying the " +
-     "inability-to-explain warning."]
-  ];
-  const clearBefore = diff.clear_signing?.before || null;
-  const clearAfter = diff.clear_signing?.after || null;
-  const intentLines = [];
-  // A wallet without clear signing reads no calldata and refuses nothing for
-  // it, so for the two refusals "off" means allowed, not blocked.
-  if (clearBefore && !clearAfter) {
-    lines.push(["Clear signing", "on → off"]);
-    intentLines.push(["Clear signing",
-      "Bloom stops reading contract calls for this wallet. Unlimited allowances and calls Bloom has no " +
-      "description of are no longer refused: each is shown only as exact bytes for you to approve."]);
-  } else if (clearAfter) {
-    if (!clearBefore) lines.push(["Clear signing", "off → on"]);
-    for (const [key, title, whenOff, whenOn] of CLEAR_SIGNING_SETTINGS) {
-      const was = clearBefore ? Boolean(clearBefore[key]) : true;
-      const now = Boolean(clearAfter[key]);
-      if (was === now) continue;
-      lines.push([title, `${was ? "allowed" : "blocked"} → ${now ? "allowed" : "blocked"}`]);
-      intentLines.push([title, now ? whenOn : whenOff]);
-    }
-  }
-  // A clear-signing change that produced no line is a change this page cannot
-  // describe. Saying nothing changed would be a lie, so say that instead.
-  const clearSigningUndescribed = Boolean(diff.clear_signing) && lines.length === 0;
   const n = lines.length;
-  const sentence = clearSigningUndescribed
-    ? "This updates the clear-signing settings in a way this page cannot describe. " +
-      "Do not approve it; check \"What your passkey signs\" below and report it."
-    : n === 0
+  const sentence = n === 0
     ? "No rule changes are proposed."
     : `Change <strong>${n} rule${n === 1 ? "" : "s"}</strong> for this wallet. Nothing moves; after approval Bloom applies the new rules to future transactions.`;
   const intent = n === 0 ? null : {
     action: "policy", eyebrow: "Wallet policy change",
-    heading: n === 1 && intentLines.length === 1 && intentLines[0][0] === "Unlimited-allowance requests"
-      ? (clearAfter?.unlimited_allowance_allowed
-          ? "Allow requests for unlimited token spending"
-          : "Block requests for unlimited token spending")
-      : `Change ${n} wallet rule${n === 1 ? "" : "s"}`,
-    detail: (intentLines.map(([, text]) => text).join(" ") ||
-      "These rules apply to future requests. Approving them moves no funds.")
+    heading: `Change ${n} wallet rule${n === 1 ? "" : "s"}`,
+    detail: "These rules apply to future requests. Approving them moves no funds."
   };
   return {sentence, intent, facts: lines};
 }
@@ -2058,20 +2019,6 @@ const PREVIEWS = {
        token: Object.assign({}, PREVIEW_TOKEN_IDENTITY,
          {name: "<b>Bloom</b> Demo Token With An Unusually Long Descriptive Name"})})
   })], previewClearSigning()),
-  "policy-unlimited": () => ({
-    ceremony_kind: "policy_update", expires_at_ms: Date.now() + 9 * 60 * 1000,
-    signer_contribution: {wallet_id: "clearsign-owner"},
-    review_manifest: {
-      schema: "bloom.custody_ceremony_review.v1", title: "Approve a policy change",
-      summary: "Review the policy change below.",
-      authority_diff: {
-        clear_signing: {
-          before: {unlimited_allowance_allowed: false},
-          after: {unlimited_allowance_allowed: true}
-        }
-      }
-    }
-  }),
   expiring: () => {
     const session = PREVIEWS.transfer();
     session.expires_at_ms = Date.now() + 25 * 1000;

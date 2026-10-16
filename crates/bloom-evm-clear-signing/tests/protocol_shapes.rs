@@ -34,7 +34,7 @@ fn scalar_vault_deposit_identifies_the_asset_but_does_not_invent_shares() {
             address_word(RECIPIENT),
         ],
     );
-    let mut ctx = context(&bytes, false);
+    let mut ctx = context(&bytes);
     ctx.to = VAULT.parse().unwrap();
     let (call, _) = review_call(&accepted, &ctx).unwrap();
     assert_eq!(field(&call, "Amount").value, "250 EXA");
@@ -55,7 +55,7 @@ fn stake_scalar_is_readable_but_does_not_guess_which_token_it_uses() {
     )
     .unwrap();
     let bytes = calldata(signature, &[U256::from(250_000_000)]);
-    let (call, _) = review_call(&accepted, &context(&bytes, false)).unwrap();
+    let (call, _) = review_call(&accepted, &context(&bytes)).unwrap();
     assert_eq!(field(&call, "Amount (raw units)").raw, "250000000");
     assert!(call.intent_summary.is_none());
     assert!(call.token.is_none());
@@ -74,7 +74,7 @@ fn operator_approval_is_not_misclassified_as_an_erc20_allowance() {
     )
     .unwrap();
     let bytes = calldata(signature, &[address_word(RECIPIENT), U256::from(1)]);
-    let (call, _) = review_call(&accepted, &context(&bytes, false)).unwrap();
+    let (call, _) = review_call(&accepted, &context(&bytes)).unwrap();
     assert_eq!(call.action, "other");
     assert!(call.intent_summary.is_none());
     assert_eq!(field(&call, "Approved").value, "true");

@@ -49,7 +49,7 @@ fn six_calldata(mode: u64, deadline: u64) -> Vec<u8> {
 fn all_six_formats_render_from_authenticated_data() {
     let catalog = six_catalog(six_format_descriptor()).unwrap();
     let bytes = six_calldata(1, 1_760_000_000);
-    let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
 
     assert_eq!(field(&call, "Operator").value, checksum(RECIPIENT));
     assert_eq!(field(&call, "Fee").value, "1.5 EXA");
@@ -74,7 +74,7 @@ fn each_format_has_an_invalid_input_that_fails_review() {
     // enum: a value the signed map does not label.
     let unknown_mode = six_calldata(2, 1_760_000_000);
     assert_eq!(
-        review_call(&accepted, &context(&unknown_mode, false))
+        review_call(&accepted, &context(&unknown_mode))
             .unwrap_err()
             .reason,
         ReviewReason::UnsupportedCall
@@ -83,7 +83,7 @@ fn each_format_has_an_invalid_input_that_fails_review() {
     // date: beyond the representable range.
     let far_future = six_calldata(1, 253_402_300_800);
     assert_eq!(
-        review_call(&accepted, &context(&far_future, false))
+        review_call(&accepted, &context(&far_future))
             .unwrap_err()
             .reason,
         ReviewReason::UnsupportedCall
@@ -91,7 +91,7 @@ fn each_format_has_an_invalid_input_that_fails_review() {
 
     // amount: no authenticated native units for this chain.
     let bytes = six_calldata(1, 1_760_000_000);
-    let mut without_native = context(&bytes, false);
+    let mut without_native = context(&bytes);
     without_native.native = None;
     assert_eq!(
         review_call(&accepted, &without_native).unwrap_err().reason,
@@ -101,9 +101,7 @@ fn each_format_has_an_invalid_input_that_fails_review() {
     // tokenAmount: no listed decimals for the token.
     let catalog = build(vec![six_format_descriptor()], Vec::new()).unwrap();
     assert_eq!(
-        review_call(&catalog, &context(&bytes, false))
-            .unwrap_err()
-            .reason,
+        review_call(&catalog, &context(&bytes)).unwrap_err().reason,
         ReviewReason::UnsupportedCall
     );
 }
@@ -401,14 +399,15 @@ fn a_renamed_or_reclassified_erc20_call_cannot_bypass_allowance_policy() {
         }}}
     });
     // The class comes from the signature, not the descriptor, so the
-    // allowance rules still run and still refuse an unlimited allowance.
+    // allowance rules still run: Bloom's heading and unlimited warning.
     let catalog = build(vec![descriptor], vec![token(TOKEN, 6)]).unwrap();
     let bytes = calldata(
         "approve(address _spender, uint256 _value)",
         &[address_word(RECIPIENT), U256::MAX],
     );
-    let error = review_call(&catalog, &context(&bytes, false)).unwrap_err();
-    assert_eq!(error.reason, ReviewReason::PolicyDenied, "{error}");
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
+    assert_eq!(call.action, "allowance");
+    assert_eq!(call.intent_summary.unwrap().magnitude, "unlimited");
 }
 
 #[test]
@@ -428,7 +427,7 @@ fn an_unrelated_call_cannot_borrow_the_transfer_screen() {
         "donate(address _to, uint256 _value, uint256 _tip)",
         &[address_word(RECIPIENT), U256::from(1u8), U256::from(2u8)],
     );
-    let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
     assert_eq!(call.action, "other");
     assert!(call.intent_summary.is_none());
 }
@@ -487,9 +486,7 @@ fn a_noncanonical_boolean_word_does_not_survive_the_round_trip() {
     let catalog = build(vec![descriptor], vec![token(TOKEN, 6)]).unwrap();
     let bytes = calldata(signature, &[U256::from(2u8)]);
     assert_eq!(
-        review_call(&catalog, &context(&bytes, false))
-            .unwrap_err()
-            .reason,
+        review_call(&catalog, &context(&bytes)).unwrap_err().reason,
         ReviewReason::InvalidPayload
     );
 }
@@ -562,7 +559,7 @@ fn a_list_of_calls_is_read_call_by_call() {
         (TOKEN, transfer.clone(), 0, false, 0),
         (unlisted, transfer, 0, false, 0),
     ]);
-    let mut ctx = context(&input, false);
+    let mut ctx = context(&input);
     ctx.to = bundler.parse().unwrap();
     let (call, used) = review_call(&catalog, &ctx).unwrap();
     assert_eq!(
@@ -577,7 +574,7 @@ fn a_list_of_calls_is_read_call_by_call() {
 
     // The fixed components are enforced on every element.
     let callback = multicall_input(&[(TOKEN, Vec::new(), 0, false, 1)]);
-    let mut ctx = context(&callback, false);
+    let mut ctx = context(&callback);
     ctx.to = bundler.parse().unwrap();
     let error = review_call(&catalog, &ctx).unwrap_err();
     assert_eq!(error.reason, ReviewReason::UnsupportedCall, "{error}");

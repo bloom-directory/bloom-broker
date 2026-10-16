@@ -24,7 +24,7 @@ fn approve_bytes(spender: &str, amount: U256) -> Vec<u8> {
 fn a_transfer_shows_the_actual_recipient_and_exact_amount() {
     let catalog = accepted_erc20();
     let bytes = transfer_bytes(RECIPIENT, U256::from(100_000_000u64));
-    let (call, used) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, used) = review_call(&catalog, &context(&bytes)).unwrap();
 
     assert_eq!(call.action, "transfer");
     assert_eq!(
@@ -47,7 +47,7 @@ fn a_transfer_shows_the_actual_recipient_and_exact_amount() {
 fn an_allowance_shows_the_spender_and_the_total_it_sets() {
     let catalog = accepted_erc20();
     let bytes = approve_bytes(RECIPIENT, U256::from(250u64));
-    let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
 
     assert_eq!(call.action, "allowance");
     assert_eq!(field(&call, "Spender").value, checksum(RECIPIENT));
@@ -80,7 +80,7 @@ fn an_upgradeable_contract_is_typed_evidence_and_not_a_call_warning() {
     let catalog = build(vec![erc20_descriptor()], vec![upgradeable]).unwrap();
 
     let bytes = transfer_bytes(RECIPIENT, U256::from(100_000_000u64));
-    let (call, used) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, used) = review_call(&catalog, &context(&bytes)).unwrap();
 
     // The property survives, on the entry, where a page can state it once per
     // contract however many calls referenced that contract.
@@ -101,7 +101,7 @@ fn an_upgradeable_contract_is_typed_evidence_and_not_a_call_warning() {
     }
 
     // A direct deployment differs only in the flag, never in the warnings.
-    let (direct, _) = review_call(&accepted_erc20(), &context(&bytes, false)).unwrap();
+    let (direct, _) = review_call(&accepted_erc20(), &context(&bytes)).unwrap();
     assert_eq!(call.warnings, direct.warnings);
 }
 
@@ -109,7 +109,7 @@ fn an_upgradeable_contract_is_typed_evidence_and_not_a_call_warning() {
 fn a_zero_allowance_is_shown_as_clearing_it() {
     let catalog = accepted_erc20();
     let bytes = approve_bytes(RECIPIENT, U256::ZERO);
-    let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
     assert_eq!(field(&call, "Amount").value, "0 EXA");
     assert!(
         call.warnings
@@ -119,16 +119,10 @@ fn a_zero_allowance_is_shown_as_clearing_it() {
 }
 
 #[test]
-fn a_maximum_allowance_is_denied_until_policy_enables_it() {
+fn a_maximum_allowance_carries_one_complete_warning() {
     let catalog = accepted_erc20();
     let bytes = approve_bytes(RECIPIENT, U256::MAX);
-
-    let denied = review_call(&catalog, &context(&bytes, false)).unwrap_err();
-    assert_eq!(denied.reason, ReviewReason::PolicyDenied);
-
-    // Enabling the policy does not approve the transaction: it only makes the
-    // request reviewable, and the exact amount stays visible.
-    let (call, _) = review_call(&catalog, &context(&bytes, true)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
     assert!(
         call.warnings
             .iter()
@@ -153,7 +147,7 @@ fn a_large_finite_allowance_is_never_relabelled_unlimited() {
     let catalog = accepted_erc20();
     let large = U256::from(2u8).pow(U256::from(255u8));
     let bytes = approve_bytes(RECIPIENT, large);
-    let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
     assert_eq!(field(&call, "Amount").raw, large.to_string());
     assert!(
         !call
@@ -167,7 +161,7 @@ fn a_large_finite_allowance_is_never_relabelled_unlimited() {
 fn trailing_dirty_and_truncated_calldata_are_all_refused() {
     let catalog = accepted_erc20();
     let valid = transfer_bytes(RECIPIENT, U256::from(1u8));
-    review_call(&catalog, &context(&valid, false)).unwrap();
+    review_call(&catalog, &context(&valid)).unwrap();
 
     let mut trailing = valid.clone();
     trailing.extend_from_slice(&[0; 32]);
@@ -183,12 +177,12 @@ fn trailing_dirty_and_truncated_calldata_are_all_refused() {
         ("dirty padding", dirty.as_slice()),
         ("truncated", truncated),
     ] {
-        let error = review_call(&catalog, &context(bytes, false)).unwrap_err();
+        let error = review_call(&catalog, &context(bytes)).unwrap_err();
         assert_eq!(error.reason, ReviewReason::InvalidPayload, "{name}");
     }
     // An unknown selector is not malformed, it is undescribed.
     assert_eq!(
-        review_call(&catalog, &context(&wrong_selector, false))
+        review_call(&catalog, &context(&wrong_selector))
             .unwrap_err()
             .reason,
         ReviewReason::UnsupportedCall
@@ -208,14 +202,14 @@ fn a_narrow_integer_with_high_bits_set_is_refused() {
     let catalog = build(vec![descriptor], vec![token(TOKEN, 6)]).unwrap();
 
     let ok = calldata("cap(uint64 limit)", &[U256::from(u64::MAX)]);
-    review_call(&catalog, &context(&ok, false)).unwrap();
+    review_call(&catalog, &context(&ok)).unwrap();
 
     let overflowing = calldata(
         "cap(uint64 limit)",
         &[U256::from(u64::MAX) + U256::from(1u8)],
     );
     assert_eq!(
-        review_call(&catalog, &context(&overflowing, false))
+        review_call(&catalog, &context(&overflowing))
             .unwrap_err()
             .reason,
         ReviewReason::InvalidPayload
@@ -226,7 +220,7 @@ fn a_narrow_integer_with_high_bits_set_is_refused() {
 fn a_contract_call_carrying_native_value_is_refused() {
     let catalog = accepted_erc20();
     let bytes = transfer_bytes(RECIPIENT, U256::from(1u8));
-    let mut context = context(&bytes, false);
+    let mut context = context(&bytes);
     context.value = U256::from(1u8);
     assert_eq!(
         review_call(&catalog, &context).unwrap_err().reason,
@@ -249,9 +243,7 @@ fn the_token_contract_is_not_a_valid_recipient_and_zero_never_is() {
         ),
     ] {
         assert_eq!(
-            review_call(&catalog, &context(&bytes, false))
-                .unwrap_err()
-                .reason,
+            review_call(&catalog, &context(&bytes)).unwrap_err().reason,
             ReviewReason::InvalidPayload
         );
     }
@@ -261,7 +253,7 @@ fn the_token_contract_is_not_a_valid_recipient_and_zero_never_is() {
 fn a_zero_amount_transfer_is_shown_honestly_rather_than_hidden() {
     let catalog = accepted_erc20();
     let bytes = transfer_bytes(RECIPIENT, U256::ZERO);
-    let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
     assert_eq!(field(&call, "Amount").value, "0 EXA");
 }
 
@@ -276,7 +268,7 @@ fn decimals_zero_six_eighteen_and_255_all_format_exactly() {
     ] {
         let catalog = build(vec![erc20_descriptor()], vec![token(TOKEN, decimals)]).unwrap();
         let bytes = transfer_bytes(RECIPIENT, amount.parse::<U256>().unwrap());
-        let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+        let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
         assert_eq!(
             field(&call, "Amount").value,
             expected,
@@ -286,7 +278,7 @@ fn decimals_zero_six_eighteen_and_255_all_format_exactly() {
     // 255 decimals is representable and is not rounded to zero.
     let catalog = build(vec![erc20_descriptor()], vec![token(TOKEN, 255)]).unwrap();
     let bytes = transfer_bytes(RECIPIENT, U256::from(1u8));
-    let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
     let value = &field(&call, "Amount").value;
     assert!(
         value.starts_with("0.") && value.ends_with("1 EXA"),
@@ -304,8 +296,8 @@ fn two_tokens_sharing_a_symbol_stay_distinct_by_contract() {
     .unwrap();
 
     let bytes = transfer_bytes(RECIPIENT, U256::from(1u8));
-    let (first, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
-    let mut other = context(&bytes, false);
+    let (first, _) = review_call(&catalog, &context(&bytes)).unwrap();
+    let mut other = context(&bytes);
     other.to = "0x3333333333333333333333333333333333333333"
         .parse()
         .unwrap();
@@ -324,7 +316,7 @@ fn two_tokens_sharing_a_symbol_stay_distinct_by_contract() {
 fn a_call_to_an_undescribed_contract_is_read_by_shape_or_not_at_all() {
     let catalog = accepted_erc20();
     let bytes = transfer_bytes(RECIPIENT, U256::from(1u8));
-    let mut elsewhere = context(&bytes, false);
+    let mut elsewhere = context(&bytes);
     elsewhere.to = "0x9999999999999999999999999999999999999999"
         .parse()
         .unwrap();
@@ -337,7 +329,7 @@ fn a_call_to_an_undescribed_contract_is_read_by_shape_or_not_at_all() {
         "mint(address,uint256)",
         &[address_word(RECIPIENT), U256::from(1u8)],
     );
-    let mut wrong_chain = context(&other, false);
+    let mut wrong_chain = context(&other);
     wrong_chain.chain_id = 8453;
     assert_eq!(
         review_call(&catalog, &wrong_chain).unwrap_err().reason,
@@ -350,9 +342,7 @@ fn a_token_without_listed_decimals_cannot_display_an_amount() {
     let catalog = build(vec![erc20_descriptor()], Vec::new()).unwrap();
     let bytes = transfer_bytes(RECIPIENT, U256::from(1u8));
     assert_eq!(
-        review_call(&catalog, &context(&bytes, false))
-            .unwrap_err()
-            .reason,
+        review_call(&catalog, &context(&bytes)).unwrap_err().reason,
         ReviewReason::UnsupportedCall
     );
 }
@@ -425,7 +415,7 @@ fn a_fixed_bytes_word_with_nonzero_trailing_bytes_is_refused() {
     let mut clean = [0u8; 32];
     clean[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
     let ok = calldata("settle(bytes4 tag)", &[U256::from_be_bytes(clean)]);
-    let (call, _) = review_call(&catalog, &context(&ok, false)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&ok)).unwrap();
     assert_eq!(field(&call, "Tag").value, "0xdeadbeef");
 
     let mut dirty = [0xaau8; 32];
@@ -433,9 +423,7 @@ fn a_fixed_bytes_word_with_nonzero_trailing_bytes_is_refused() {
     let hidden = calldata("settle(bytes4 tag)", &[U256::from_be_bytes(dirty)]);
     // The bytes still round-trip, so only the explicit tail check refuses them.
     assert_eq!(
-        review_call(&catalog, &context(&hidden, false))
-            .unwrap_err()
-            .reason,
+        review_call(&catalog, &context(&hidden)).unwrap_err().reason,
         ReviewReason::InvalidPayload
     );
 }

@@ -62,7 +62,6 @@ fn review(to: &str, input: &[u8]) -> Result<(ClearSignedCall, Vec<SelectedEntry>
                 decimals: 18,
                 symbol: "ETH".into(),
             }),
-            unlimited_allowance_allowed: false,
         },
     )
 }
@@ -268,8 +267,12 @@ fn only_the_batch_library_may_be_delegatecalled_and_only_for_plain_calls() {
 
     // Every call is read under the same rules as outside a batch.
     let unlimited = token_call("approve(address,uint256)", WALLET, U256::MAX);
-    let error = review(SAFE, &batch(batch_entry(0, USDC, 0, &unlimited))).unwrap_err();
-    assert_eq!(error.reason, ReviewReason::PolicyDenied, "{error}");
+    let (call, _) = review(SAFE, &batch(batch_entry(0, USDC, 0, &unlimited))).unwrap();
+    assert!(
+        call.warnings
+            .iter()
+            .any(|warning| warning.contains("future USDC"))
+    );
 }
 
 #[test]
@@ -298,8 +301,12 @@ fn a_safe_token_call_is_read_and_policed_by_the_token_entry() {
         0,
         0,
     );
-    let error = review(SAFE, &unlimited).unwrap_err();
-    assert_eq!(error.reason, ReviewReason::PolicyDenied, "{error}");
+    let (call, _) = review(SAFE, &unlimited).unwrap();
+    assert!(
+        call.warnings
+            .iter()
+            .any(|warning| warning.contains("future USDC"))
+    );
 
     let unknown = exec(RECIPIENT, 0, vec![0xde, 0xad, 0xbe, 0xef], 0, 0);
     let error = review(SAFE, &unknown).unwrap_err();
@@ -343,8 +350,12 @@ fn a_safe_call_to_an_unlisted_token_is_read_by_its_shape() {
         0,
         0,
     );
-    let error = review(SAFE, &unlimited).unwrap_err();
-    assert_eq!(error.reason, ReviewReason::PolicyDenied, "{error}");
+    let (call, _) = review(SAFE, &unlimited).unwrap();
+    assert!(
+        call.warnings
+            .iter()
+            .any(|warning| warning.contains("maximum uint256"))
+    );
 
     // Native value riding on a token call is not a token transfer.
     let with_value = exec(
@@ -417,7 +428,6 @@ fn the_built_in_catalog_reads_a_real_safe_execution() {
                 decimals: 18,
                 symbol: "ETH".into(),
             }),
-            unlimited_allowance_allowed: false,
         },
     )
     .unwrap();

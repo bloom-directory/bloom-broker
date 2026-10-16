@@ -1916,7 +1916,6 @@ async fn approve_and_sign(
         stack.broker.as_ref(),
         MachineBrokerRequest::SealedApprovalPrepare(bloom_broker_api::ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            requested_review_mode: None,
             operation_id: approval_operation.clone(),
             terms: terms.clone(),
             canonical_plan_facts_digest: terms.approval_digest().unwrap(),

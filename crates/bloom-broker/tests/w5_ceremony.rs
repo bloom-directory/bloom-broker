@@ -531,30 +531,6 @@ for (const expected of [
 for (const stale of ["Allow deploying contracts on", "Stop allowing contract deployment on"]) {{
   if (rendered.includes(stale)) throw new Error(`stale policy wording ${{stale}}: ${{rendered}}`);
 }}
-
-// Without clear signing nothing is refused for being unreadable or
-// unlimited, so switching it off loosens the wallet and switching it on
-// tightens it. Each direction must say so.
-const strict = {{unlimited_allowance_allowed: false, opaque_exact_allowed: false}};
-function renderClearSigning(before, after) {{
-  renderReview({{
-    ceremony_kind: "policy_update",
-    expires_at_ms: Date.now() + 60000,
-    signer_contribution: {{wallet_id: "wallet-primary"}},
-    review_manifest: {{schema: "bloom.review-manifest.v1",
-      authority_diff: {{clear_signing: {{before, after}}}}}}
-  }});
-  return [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
-}}
-const off = renderClearSigning(strict, null);
-if (!off.includes("on → off") || !off.includes("no longer refused") ||
-    off.includes("→ blocked") || off.includes("refused rather than approved unread")) {{
-  throw new Error(`disabling clear signing misdescribed: ${{off}}`);
-}}
-const on = renderClearSigning(null, strict);
-for (const expected of ["off → on", "Unlimited-allowance requests", "allowed → blocked"]) {{
-  if (!on.includes(expected)) throw new Error(`enabling clear signing missing ${{expected}}: ${{on}}`);
-}}
 "#
     );
     let output = run_node(&script);
@@ -2370,7 +2346,6 @@ async fn prepare_scoped_approval(
         broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            requested_review_mode: None,
             operation_id,
             terms: terms.clone(),
             canonical_plan_facts_digest: digest("e7"),
@@ -3317,7 +3292,6 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            requested_review_mode: None,
             evm_review_payloads: vec![Base64UrlBytes::from_bytes(&creation)],
             operation_id: operation("d9"),
             terms: SealedApprovalTerms {
@@ -3356,7 +3330,6 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            requested_review_mode: None,
             evm_review_payloads: Vec::new(),
             operation_id: approval_operation.clone(),
             terms: approval_terms.clone(),
@@ -3491,7 +3464,6 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            requested_review_mode: None,
             operation_id: exact_approval_operation.clone(),
             terms: exact_terms.clone(),
             canonical_plan_facts_digest: digest("e7"),
@@ -3724,7 +3696,6 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                 &broker,
                 MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
                     surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-                    requested_review_mode: None,
                     evm_review_payloads: Vec::new(),
                     operation_id: operation(&format!("{:02x}", 0xc0 + index)),
                     terms: denied_terms,
@@ -4538,7 +4509,6 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             &restarted_scoped_broker,
             MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-                requested_review_mode: None,
                 evm_review_payloads: Vec::new(),
                 operation_id: operation("dc"),
                 terms: expired_terms,
@@ -9024,68 +8994,6 @@ async fn a_preview_name_reaches_no_session_and_cannot_be_completed() {
     }
 }
 
-/// Enabling unlimited allowances is an authority change, so the page has to
-/// show it as current → proposed and say what it does and does not grant.
-/// An empty diff for a real widening is the defect this guards.
-#[test]
-fn the_policy_page_shows_the_clear_signing_authority_change() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
-    let script = format!(
-        r#"
-class Node {{
-  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = "";
-                       this.attrs = {{}}; this.hidden = false; }}
-  setAttribute(key, value) {{ this.attrs[key] = value; }}
-  append(...children) {{ this.children.push(...children); }}
-  replaceChildren(...children) {{ this.children = children; }}
-}}
-const nodes = {{}};
-globalThis.document = {{
-  getElementById: id => nodes[id] ||= new Node(id),
-  createElement: name => new Node(name),
-  createElementNS: (_, name) => new Node(name),
-  createTextNode: text => String(text)
-}};
-globalThis.location = {{hash: "", search: "", pathname: "/"}};
-globalThis.history = {{replaceState: () => {{}}}};
-globalThis.setInterval = () => 1;
-globalThis.clearInterval = () => {{}};
-{executable}
-function allText(node) {{
-  if (typeof node === "string") return node;
-  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
-}}
-renderReview(previewSession("policy-unlimited"));
-const rendered = allText({{textContent: "", innerHTML: "", children: [nodes["panel-title"], ...nodes.review.children]}});
-for (const phrase of ["Allow requests for unlimited token spending", "blocked → allowed",
-                      "does not move tokens or grant a spender an allowance", "Each request will still need your approval",
-                      "applies to all supported tokens", "will name its token and spender"]) {{
-  if (!rendered.includes(phrase)) throw new Error(`policy page omitted ${{phrase}}: ${{rendered}}`);
-}}
-if (nodes.approve.textContent !== "Approve policy change") {{
-  throw new Error(`policy button: ${{nodes.approve.textContent}}`);
-}}
-const blocked = previewSession("policy-unlimited");
-const change = blocked.review_manifest.authority_diff.clear_signing;
-[change.before, change.after] = [change.after, change.before];
-renderReview(blocked);
-if (nodes["panel-title"].textContent !== "Block requests for unlimited token spending") {{
-  throw new Error("disabling unlimited requests was labelled as enabling them");
-}}
-"#
-    );
-    let output = run_node(&script);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 /// Two differently configured Brokers in one process isolate Host, Origin,
 /// generated URLs, and completion: each mints URLs under its own origin,
 /// refuses the other's Host/Origin, and the default broker still completes a
@@ -9708,43 +9616,6 @@ async fn destination_reports_an_already_registered_device_over_http() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-}
-
-/// A clear-signing change this page cannot describe must never reach the
-/// owner as "No rule changes are proposed." under an "Approve policy change"
-/// button.
-#[test]
-fn an_undescribable_clear_signing_change_never_reads_as_no_change() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
-    let script = format!(
-        r#"
-globalThis.document = {{getElementById: () => ({{}})}};
-globalThis.location = {{hash: "", search: "", pathname: "/"}};
-globalThis.history = {{replaceState: () => {{}}}};
-{executable}
-const settings = {{opaque_exact_allowed: false, unlimited_allowance_allowed: false}};
-const opaque = describePolicy({{authority_diff: {{clear_signing: {{before: settings, after: settings}}}}}});
-if (!/cannot describe/.test(opaque.sentence)) {{
-  throw new Error("expected the undescribable-change wording, got: " + opaque.sentence);
-}}
-const none = describePolicy({{authority_diff: {{}}}});
-if (!/No rule changes are proposed/.test(none.sentence)) {{
-  throw new Error("an empty diff must still read as no change: " + none.sentence);
-}}
-process.stdout.write("undescribable-ok");
-"#
-    );
-    let output = run_node(&script);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "undescribable-ok");
 }
 
 /// Runs a CommonJS script in Node, fed on stdin: the shipped asset alone is

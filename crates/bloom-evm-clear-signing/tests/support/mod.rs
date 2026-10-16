@@ -113,7 +113,7 @@ pub fn accepted_vault() -> Catalog {
 pub fn vault_context(calldata: &[u8]) -> CallContext<'_> {
     CallContext {
         to: VAULT.parse().unwrap(),
-        ..context(calldata, false)
+        ..context(calldata)
     }
 }
 
@@ -134,7 +134,7 @@ pub fn address_word(address: &str) -> U256 {
     U256::from_be_slice(address.parse::<Address>().unwrap().as_slice())
 }
 
-pub fn context(calldata: &[u8], unlimited: bool) -> CallContext<'_> {
+pub fn context(calldata: &[u8]) -> CallContext<'_> {
     CallContext {
         chain_id: CHAIN_ID,
         to: TOKEN.parse().unwrap(),
@@ -144,7 +144,6 @@ pub fn context(calldata: &[u8], unlimited: bool) -> CallContext<'_> {
             decimals: 18,
             symbol: "ETH".into(),
         }),
-        unlimited_allowance_allowed: unlimited,
     }
 }
 

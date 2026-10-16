@@ -7,11 +7,11 @@ use alloy::{
 };
 use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalSelector, ApprovalSubject, CanonicalWalletPolicy, CryptoSuite,
-    Digest32, ProtocolError, ProtocolErrorCode, ReviewMode, SigningPayloads,
+    Digest32, ProtocolError, ProtocolErrorCode, SigningPayloads,
 };
 use bloom_evm_clear_signing::{
-    CallContext, Catalog, ClearSignedCall, ClearSigningEvidence, NativeUnits, ReviewError,
-    ReviewReason, SelectedEntry, review_call,
+    CallContext, Catalog, ClearSignedCall, ClearSigningEvidence, NativeUnits, SelectedEntry,
+    review_call,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -65,6 +65,10 @@ pub struct EvmReviewPayload {
     /// read, and every member of an explicitly opaque batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract_call: Option<ClearSignedCall>,
+    /// Why a contract call has no reading: no description of the contract,
+    /// or bytes the description does not admit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -80,25 +84,6 @@ pub enum EvmFeeReview {
         max_priority_fee_per_gas: String,
         max_priority_fee_per_gas_display: String,
     },
-}
-
-/// Carry the /// Carry the nine review reasons out on the existing transport codes rather
-/// than inventing a tenth: the reason and its owner sentence travel in the
-/// message, which is what the ceremony and the CLI both show.
-fn review_error(error: ReviewError) -> ProtocolError {
-    let code = match error.reason {
-        ReviewReason::InvalidPayload => ProtocolErrorCode::SelectorMismatch,
-        ReviewReason::LimitExceeded => ProtocolErrorCode::LimitExceededFrame,
-        ReviewReason::CatalogRejected | ReviewReason::UnsupportedCall => {
-            ProtocolErrorCode::AssuranceUnavailable
-        }
-        ReviewReason::PolicyDenied => ProtocolErrorCode::ClaimInvalid,
-    };
-    ProtocolError::new(code, error.to_string())
-}
-
-fn denied(reason: ReviewReason, message: impl Into<String>) -> ProtocolError {
-    review_error(ReviewError::new(reason, message))
 }
 
 fn invalid(message: impl Into<String>) -> ProtocolError {
@@ -235,58 +220,26 @@ pub(crate) fn review(
         payloads,
         clear_signing: None,
     };
-    apply_review_mode(
-        &mut review,
-        &decoded_calls,
-        policy,
-        request.requested_review_mode,
-        catalog,
-    )?;
+    read_calls(&mut review, &decoded_calls, catalog);
     Ok(Some(review))
 }
 
-/// Read every call and apply the requested review mode to the whole batch.
-///
-/// Every wallet gets every reading Broker can produce. Clear signing adds
-/// refusals: a call Bloom cannot read fails the batch unless the wallet
-/// permits, and the caller explicitly requests, an opaque approval, and an
-/// explicit opaque request cannot hide a call Bloom can read. Native sends
-/// and deployments keep their exact envelope review.
-fn apply_review_mode(
-    review: &mut EvmReview,
-    calls: &[Option<DecodedCall>],
-    policy: &CanonicalWalletPolicy,
-    requested: Option<ReviewMode>,
-    catalog: &Catalog,
-) -> Result<(), ProtocolError> {
-    let settings = policy.clear_signing.as_ref();
-    // An incapable wallet refuses a required mode rather than ignoring it.
-    if settings.is_none() && requested.is_some() {
-        return Err(denied(
-            ReviewReason::PolicyDenied,
-            "clear signing is not enabled for this wallet",
-        ));
-    }
-    let opaque = requested == Some(ReviewMode::OpaqueExact);
-    if opaque && !settings.is_some_and(|settings| settings.opaque_exact_allowed) {
-        return Err(denied(
-            ReviewReason::PolicyDenied,
-            "wallet policy does not allow approving payloads Bloom cannot explain",
-        ));
-    }
-    let unlimited = settings.is_none_or(|settings| settings.unlimited_allowance_allowed);
+/// Read every contract call Broker can. A call it cannot read is shown as
+/// exact bytes with the reason, and the owner decides. Native sends and
+/// deployments keep their exact envelope review.
+fn read_calls(review: &mut EvmReview, calls: &[Option<DecodedCall>], catalog: &Catalog) {
     let mut entries: Vec<SelectedEntry> = Vec::new();
     let mut structural = false;
     for (payload, call) in review.payloads.iter_mut().zip(calls) {
         let Some(call) = call else { continue };
-        match review_call(catalog, &call_context(payload, call, unlimited)) {
-            Ok(_) if opaque => {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::ClaimInvalid,
-                    "POLICY_DENIED: Bloom can read this call, so it cannot be approved unread; \
-                     request a clear-signed review",
-                ));
-            }
+        let context = CallContext {
+            chain_id: call.chain_id,
+            to: call.to,
+            value: call.value,
+            calldata: &call.calldata,
+            native: native_units(&payload.chain),
+        };
+        match review_call(catalog, &context) {
             Ok((clear, selected)) => {
                 structural |= clear.structural;
                 for entry in selected {
@@ -296,31 +249,11 @@ fn apply_review_mode(
                 }
                 payload.contract_call = Some(clear);
             }
-            // Without clear signing nothing is refused for being unreadable:
-            // the call is approved as exact bytes, as it always was.
-            Err(_) if settings.is_none() => {}
-            Err(error) if opaque && error.reason == ReviewReason::UnsupportedCall => {}
-            Err(error) => return Err(review_error(error)),
+            Err(error) => payload.unread_reason = Some(error.detail),
         }
     }
     if !entries.is_empty() {
         review.clear_signing = Some(ClearSigningEvidence::new(entries, structural));
-    }
-    Ok(())
-}
-
-fn call_context<'a>(
-    payload: &EvmReviewPayload,
-    call: &'a DecodedCall,
-    unlimited_allowance_allowed: bool,
-) -> CallContext<'a> {
-    CallContext {
-        chain_id: call.chain_id,
-        to: call.to,
-        value: call.value,
-        calldata: &call.calldata,
-        native: native_units(&payload.chain),
-        unlimited_allowance_allowed,
     }
 }
 
@@ -441,6 +374,7 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
                 &chain_name,
             ),
             contract_call: None,
+            unread_reason: None,
         },
         call,
     ))
@@ -502,7 +436,6 @@ pub(crate) mod tests {
         let token = |s: &str| Token::new(s).unwrap();
         let digest = Digest32::from_bytes([1; 32]);
         ApprovalPrepareRequest {
-            requested_review_mode: None,
             surface_selection: CeremonySurfaceSelection::Default,
             operation_id: OperationId::from_bytes([2; 32]),
             canonical_plan_facts_digest: digest.clone(),
@@ -560,7 +493,6 @@ pub(crate) mod tests {
                 destination: "exact".into(),
             }],
             required_verifiers: vec![],
-            clear_signing: None,
         }
     }
     fn no_clear_signing() -> &'static Catalog {
@@ -1242,12 +1174,6 @@ mod mode_tests {
         Catalog::build(&[(descriptor, Binding::Listed)], vec![token]).unwrap()
     }
 
-    fn enabled_policy() -> CanonicalWalletPolicy {
-        let mut policy = policy();
-        policy.clear_signing = Some(bloom_broker_api::ClearSigningPolicy::default());
-        policy
-    }
-
     fn transfer_calldata(to: &str, amount: u64) -> Vec<u8> {
         address_amount_calldata(TRANSFER, to, U256::from(amount))
     }
@@ -1301,200 +1227,86 @@ mod mode_tests {
     }
 
     #[test]
-    fn an_enabled_wallet_reads_a_contract_call_without_being_asked_to() {
+    fn a_catalogued_token_reads_with_its_name_and_units() {
         let request = batch(&[call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 2_500_000))]);
-        let review = review(
-            &request,
-            &enabled_policy(),
-            Address::ZERO,
-            &accepted_catalog(),
-        )
-        .unwrap()
-        .unwrap();
-        let call = review.payloads[0]
-            .contract_call
-            .as_ref()
-            .expect("clear call");
-        assert_eq!(call.action, "transfer");
-        assert!(call.fields.iter().any(|field| field.value == "2.5 EXA"));
-        let evidence = review.clear_signing.as_ref().expect("evidence");
-        assert_eq!(evidence.assurance, "trusted_description");
-        assert_eq!(evidence.entries.len(), 1);
-    }
-
-    #[test]
-    fn one_undescribed_member_blocks_the_whole_clear_batch() {
-        let request = batch(&[
-            call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 1)),
-            call(RECIPIENT, vec![0xde, 0xad, 0xbe, 0xef]),
-        ]);
-        let error = review(
-            &request,
-            &enabled_policy(),
-            Address::ZERO,
-            &accepted_catalog(),
-        )
-        .unwrap_err();
-        assert!(
-            error.message.contains("UNSUPPORTED_CALL"),
-            "{}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn an_explicitly_opaque_batch_needs_policy_permission_and_stays_opaque() {
-        let mut request = batch(&[call(RECIPIENT, vec![0xde, 0xad, 0xbe, 0xef])]);
-        request.requested_review_mode = Some(ReviewMode::OpaqueExact);
-
-        let denied = review(
-            &request,
-            &enabled_policy(),
-            Address::ZERO,
-            &accepted_catalog(),
-        )
-        .unwrap_err();
-        assert!(
-            denied.message.contains("POLICY_DENIED"),
-            "{}",
-            denied.message
-        );
-
-        let mut policy = enabled_policy();
-        policy.clear_signing.as_mut().unwrap().opaque_exact_allowed = true;
-        let review = review(&request, &policy, Address::ZERO, &accepted_catalog())
-            .unwrap()
-            .unwrap();
-        // No downgrade badge, no partial reading: the member stays opaque and
-        // the evidence block is absent.
-        assert!(review.payloads[0].contract_call.is_none());
-        assert!(review.clear_signing.is_none());
-    }
-
-    #[test]
-    fn a_readable_call_cannot_be_downgraded_to_opaque() {
-        let mut policy = enabled_policy();
-        policy.clear_signing.as_mut().unwrap().opaque_exact_allowed = true;
-        let mut request = batch(&[call(
-            TOKEN_ADDRESS,
-            address_amount_calldata(APPROVE, RECIPIENT, U256::MAX),
-        )]);
-        request.requested_review_mode = Some(ReviewMode::OpaqueExact);
-        // Unlimited and refused: asking for an opaque review does not skip it.
-        let error = review(&request, &policy, Address::ZERO, &accepted_catalog()).unwrap_err();
-        assert!(error.message.contains("POLICY_DENIED"), "{}", error.message);
-
-        // Readable and allowed: still not approvable unread.
-        let mut request = batch(&[call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 1))]);
-        request.requested_review_mode = Some(ReviewMode::OpaqueExact);
-        let error = review(&request, &policy, Address::ZERO, &accepted_catalog()).unwrap_err();
-        assert!(
-            error.message.contains("cannot be approved unread")
-                && !error.message.contains("Change policy"),
-            "{}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn an_unlimited_allowance_is_refused_unless_policy_allows_it() {
-        let request = batch(&[call(
-            TOKEN_ADDRESS,
-            address_amount_calldata(APPROVE, RECIPIENT, U256::MAX),
-        )]);
-        let error = review(
-            &request,
-            &enabled_policy(),
-            Address::ZERO,
-            &accepted_catalog(),
-        )
-        .unwrap_err();
-        assert!(error.message.contains("POLICY_DENIED"), "{}", error.message);
-
-        let mut policy = enabled_policy();
-        policy
-            .clear_signing
-            .as_mut()
-            .unwrap()
-            .unlimited_allowance_allowed = true;
-        let review = review(&request, &policy, Address::ZERO, &accepted_catalog())
-            .unwrap()
-            .unwrap();
-        assert!(review.payloads[0].contract_call.is_some());
-    }
-
-    #[test]
-    fn a_wallet_without_clear_signing_refuses_a_required_mode_rather_than_ignoring_it() {
-        let mut request = batch(&[call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 1))]);
-        request.requested_review_mode = Some(ReviewMode::Clear);
-        let error = review(&request, &policy(), Address::ZERO, &accepted_catalog()).unwrap_err();
-        assert!(error.message.contains("POLICY_DENIED"), "{}", error.message);
-    }
-
-    #[test]
-    fn an_enabled_wallet_reads_an_unlisted_token_by_its_erc20_shape() {
-        let request = batch(&[call(RECIPIENT, transfer_calldata(RECIPIENT, 1))]);
-        let review = review(
-            &request,
-            &enabled_policy(),
-            Address::ZERO,
-            &accepted_catalog(),
-        )
-        .unwrap()
-        .unwrap();
-        let structural = review.payloads[0]
-            .contract_call
-            .as_ref()
-            .expect("structural transfer");
-        let summary = structural.intent_summary.as_ref().unwrap();
-        assert_eq!(summary.counterparty, checksum(RECIPIENT));
-        assert_eq!(summary.amount_display, "1 raw units");
-        assert!(structural.structural && summary.token.is_none());
-        assert!(review.clear_signing.is_none());
-    }
-
-    /// The catalog ships with Broker, so a wallet that never enabled clear
-    /// signing still sees a catalogued token's name and units. Nothing is
-    /// refused for it: an unreadable call stays exact bytes.
-    #[test]
-    fn every_wallet_reads_catalogued_tokens_without_enabling_clear_signing() {
-        let request = batch(&[
-            call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 2_500_000)),
-            call(RECIPIENT, vec![0xde, 0xad, 0xbe, 0xef]),
-        ]);
         let review = review(&request, &policy(), Address::ZERO, &accepted_catalog())
             .unwrap()
             .unwrap();
         let call = review.payloads[0].contract_call.as_ref().unwrap();
+        assert_eq!(call.action, "transfer");
         assert!(call.fields.iter().any(|field| field.value == "2.5 EXA"));
-        assert!(review.payloads[1].contract_call.is_none());
+        let evidence = review.clear_signing.as_ref().unwrap();
+        assert_eq!(evidence.assurance, "trusted_description");
+        assert_eq!(evidence.entries.len(), 1);
+    }
+
+    /// Bloom never refuses a call for being unreadable: it shows the exact
+    /// bytes and why it could not read them, and the owner decides.
+    #[test]
+    fn an_unreadable_call_is_shown_as_exact_bytes_with_its_reason() {
+        let mut trailing = transfer_calldata(RECIPIENT, 1);
+        trailing.push(0);
+        let request = batch(&[
+            call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 1)),
+            call(RECIPIENT, vec![0xde, 0xad, 0xbe, 0xef]),
+            call(TOKEN_ADDRESS, trailing),
+        ]);
+        let review = review(&request, &policy(), Address::ZERO, &accepted_catalog())
+            .unwrap()
+            .unwrap();
+        assert!(review.payloads[0].contract_call.is_some());
+        for unread in &review.payloads[1..] {
+            assert!(unread.contract_call.is_none());
+            assert!(unread.unread_reason.is_some());
+        }
+        assert!(
+            review.payloads[1]
+                .unread_reason
+                .as_ref()
+                .unwrap()
+                .contains("no description")
+        );
     }
 
     #[test]
-    fn every_wallet_gets_structural_review_without_enabling_catalog_trust() {
+    fn an_unlisted_token_is_read_by_its_erc20_shape() {
         let request = batch(&[call(RECIPIENT, transfer_calldata(TOKEN_ADDRESS, 2_500_000))]);
         let decoded = review(&request, &policy(), Address::ZERO, &accepted_catalog())
             .unwrap()
             .unwrap();
-        let structural = decoded.payloads[0]
-            .contract_call
-            .as_ref()
-            .expect("selector-shaped call");
+        let structural = decoded.payloads[0].contract_call.as_ref().unwrap();
         assert_eq!(structural.contract, checksum(RECIPIENT));
         let summary = structural.intent_summary.as_ref().unwrap();
         assert_eq!(summary.amount, "2500000");
         assert!(summary.amount_display.contains("raw units"));
+        assert!(structural.structural && summary.token.is_none());
         assert!(structural.warnings[0].contains("has not verified"));
+        assert!(decoded.clear_signing.is_none());
     }
 
     #[test]
-    fn a_mixed_batch_keeps_catalog_evidence_only_for_its_trusted_member() {
+    fn an_unlimited_allowance_is_shown_with_its_warning() {
+        for to in [TOKEN_ADDRESS, RECIPIENT] {
+            let request = batch(&[call(
+                to,
+                address_amount_calldata(APPROVE, TOKEN_ADDRESS, U256::MAX),
+            )]);
+            let decoded = review(&request, &policy(), Address::ZERO, &accepted_catalog())
+                .unwrap()
+                .unwrap();
+            let call = decoded.payloads[0].contract_call.as_ref().unwrap();
+            assert_eq!(call.intent_summary.as_ref().unwrap().magnitude, "unlimited");
+            assert!(!call.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_mixed_batch_lists_only_the_catalogued_entries() {
         let request = batch(&[
             call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 1_000_000)),
             call(RECIPIENT, transfer_calldata(TOKEN_ADDRESS, 2)),
         ]);
-        let policy = enabled_policy();
-        let review = review(&request, &policy, Address::ZERO, &accepted_catalog())
+        let review = review(&request, &policy(), Address::ZERO, &accepted_catalog())
             .unwrap()
             .unwrap();
         assert!(
@@ -1515,89 +1327,19 @@ mod mode_tests {
     }
 
     #[test]
-    fn noncanonical_selector_matches_are_unreadable_not_structural() {
-        let mut trailing = transfer_calldata(RECIPIENT, 1);
-        trailing.push(0);
-        let mut request = batch(&[call(RECIPIENT, trailing)]);
-        let error = review(
-            &request,
-            &enabled_policy(),
-            Address::ZERO,
-            &accepted_catalog(),
-        )
-        .unwrap_err();
-        assert!(
-            error.message.contains("UNSUPPORTED_CALL"),
-            "{}",
-            error.message
-        );
-
-        let mut opaque_policy = enabled_policy();
-        opaque_policy
-            .clear_signing
-            .as_mut()
-            .unwrap()
-            .opaque_exact_allowed = true;
-        request.requested_review_mode = Some(ReviewMode::OpaqueExact);
-        let opaque = review(&request, &opaque_policy, Address::ZERO, &accepted_catalog())
-            .unwrap()
-            .unwrap();
-        assert!(opaque.payloads[0].contract_call.is_none());
-
-        let mut dirty = transfer_calldata(RECIPIENT, 1);
-        dirty[4] = 1;
-        let request = batch(&[call(RECIPIENT, dirty)]);
-        let envelope_only = review(&request, &policy(), Address::ZERO, &accepted_catalog())
-            .unwrap()
-            .unwrap();
-        assert!(envelope_only.payloads[0].contract_call.is_none());
-    }
-
-    #[test]
-    fn structural_unlimited_allowances_warn_or_obey_an_enabled_policy() {
-        let request = batch(&[call(
-            RECIPIENT,
-            address_amount_calldata(APPROVE, TOKEN_ADDRESS, U256::MAX),
-        )]);
-        let decoded = review(&request, &policy(), Address::ZERO, &accepted_catalog())
-            .unwrap()
-            .unwrap();
-        let call = decoded.payloads[0].contract_call.as_ref().unwrap();
-        assert_eq!(call.intent_summary.as_ref().unwrap().magnitude, "unlimited");
-        assert!(
-            call.warnings
-                .iter()
-                .any(|warning| warning.contains("maximum uint256"))
-        );
-
-        let error = review(
-            &request,
-            &enabled_policy(),
-            Address::ZERO,
-            &accepted_catalog(),
-        )
-        .unwrap_err();
-        assert!(error.message.contains("denies unlimited allowances"));
-    }
-
-    #[test]
-    fn a_plain_native_send_keeps_its_envelope_review_inside_an_enabled_wallet() {
+    fn a_plain_native_send_keeps_its_envelope_review() {
         let request = batch(&[call(RECIPIENT, Vec::new())]);
-        let review = review(
-            &request,
-            &enabled_policy(),
-            Address::ZERO,
-            &accepted_catalog(),
-        )
-        .unwrap()
-        .unwrap();
+        let review = review(&request, &policy(), Address::ZERO, &accepted_catalog())
+            .unwrap()
+            .unwrap();
         assert!(review.payloads[0].contract_call.is_none());
+        assert!(review.payloads[0].unread_reason.is_none());
         assert!(review.clear_signing.is_none());
         assert_eq!(review.payloads[0].calldata_bytes, "0");
     }
 
     #[test]
-    fn a_clear_signing_wallet_executes_a_safe_it_has_no_entry_for() {
+    fn a_safe_it_has_no_entry_for_is_read_as_a_safe() {
         // A real Base execution: the Safe sends 0.00001 ETH to its owner.
         let input = hex::decode("6a7612020000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d081000000000000000000000000000000000000000000000000000009184e72a00000000000000000000000000000000000000000000000000000000000000001400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000160000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000411fca12a0c7a67fc6ca9ca271335af2680fae0ce704f5c75fe373ddce47674df33a341f86acbc619d6db40b37ef330f3f2dd47897f0551799f28f20ef7288d69b1b00000000000000000000000000000000000000000000000000000000000000").unwrap();
         let owner = "0x8d4fafba75a9dc50b4b296211509e856d2c6d081";
@@ -1616,7 +1358,7 @@ mod mode_tests {
             access_list: Default::default(),
         }
         .encoded_for_signing();
-        let policy = enabled_policy();
+        let policy = policy();
         let review = review(
             &batch(&[payload]),
             &policy,

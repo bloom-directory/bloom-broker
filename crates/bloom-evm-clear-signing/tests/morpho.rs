@@ -39,7 +39,6 @@ fn review(to: &str, input: &[u8]) -> Result<ClearSignedCall, ReviewError> {
                 decimals: 18,
                 symbol: "ETH".into(),
             }),
-            unlimited_allowance_allowed: false,
         },
     )
     .map(|(call, _)| call)
