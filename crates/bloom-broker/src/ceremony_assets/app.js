@@ -642,20 +642,23 @@ function describeTransfer(manifest) {
       .filter(line => line.startsWith("Warning: "))
       .map(line => line.slice(9));
     const safeAction = safe.action.filter(line => !line.startsWith("Warning: "));
+    // The action line already names the recipient and amount; the rows
+    // below add only what it does not say.
+    const details = safeAction.slice(1).join("\n");
     const facts = [
       ["Safe", safe.safe, true],
-      ["Action", safeAction.map((line, index) => index ? line : line.replace(/^Action: /, "")).join("\n")],
-      ["Destination", safe.destination, true],
-      [safe.operation === "delegatecall" ? "Outer call value (batch or deployment values are shown above)" : "Value", safe.value_display],
+      ["Details", details || null],
+      ["Calls", safe.destination, true],
       ["Network", network],
       ["Signing owner", safe.owner, true],
       ["Safe nonce", safe.nonce],
-      ["Operation", safe.operation],
+      safe.operation === "delegatecall" ? ["Operation", "delegatecall (a batch or deployment, read above)"] : null,
       ["Safe transaction hash", safe.safe_tx_hash, true],
-      ["Bloom verification", "Safe transaction rebuilt from the exact signing bytes. Safe configuration and call execution effects are not verified."],
-    ];
+      ["Bloom verification", "Safe transaction rebuilt from the exact signing bytes. What the Safe and its calls do is not verified."],
+    ].filter(Boolean);
     const sentence = `Approve one Safe transaction on <strong>${escapeHtml(network)}</strong>: ${escapeHtml(safeAction[0].replace(/^Action: /, ""))}.`;
-    return {sentence, facts, warnings: safeWarnings, willVerify: true};
+    const heading = `Sign Safe transaction: ${safeAction[0].replace(/^Action: /, "")}`;
+    return {sentence, facts, warnings: safeWarnings, willVerify: true, heading, button: "Approve Safe signature"};
   }
   if (!claim) return null;
   const debits = claim.declared_debits || [];
@@ -899,6 +902,7 @@ function renderReview(session) {
         transfer = petalApproval;
         summaryHtml = petalApproval.sentence;
         approve.textContent = petalApproval.button;
+        if (petalApproval.heading) panelTitle.textContent = petalApproval.heading;
         if (pageTitle) pageTitle.textContent = petalApproval.title;
       }
     }

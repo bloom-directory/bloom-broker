@@ -122,7 +122,7 @@ fn a_vault_withdrawal_is_read_by_the_standard() {
     assert_eq!(field(&call, "Assets go to"), checksum(OWNER));
     assert!(call.structural);
     assert!(
-        call.warnings[0].contains("has not verified") && call.warnings[0].contains("standard"),
+        call.warnings[0].contains("cannot check") && call.warnings[0].contains("an ERC-4626 vault"),
         "{:?}",
         call.warnings
     );

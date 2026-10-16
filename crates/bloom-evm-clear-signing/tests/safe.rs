@@ -167,7 +167,7 @@ fn an_unlisted_safe_is_read_structurally_and_says_so() {
     assert_eq!(call.contract, checksum(SAFE));
     assert_eq!(call.assurance, structural_assurance());
     assert!(
-        call.warnings[0].contains("has not verified") && call.warnings[0].contains("a Safe"),
+        call.warnings[0].contains("cannot check") && call.warnings[0].contains("a Safe"),
         "{:?}",
         call.warnings
     );

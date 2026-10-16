@@ -300,8 +300,10 @@ pub(crate) fn review(
     );
     let (action, evidence) = match reading {
         Ok((call, entries)) => {
-            // The inner call's heading first; then every other field, except
-            // the signatures, which are not part of what the owner signs.
+            // The inner call's heading first, then what it adds. The page
+            // shows the destination, value and operation separately, the
+            // signatures are not part of what the owner signs, and zero gas
+            // settings say nothing.
             let heading = call
                 .fields
                 .iter()
@@ -312,12 +314,15 @@ pub(crate) fn review(
                 call.fields
                     .iter()
                     .filter(|field| {
-                        field.label != "Safe transaction"
-                            && !field.label.starts_with("Owner signatures")
+                        !matches!(
+                            field.label.as_str(),
+                            "Safe transaction" | "Safe calls" | "Safe sends" | "Operation"
+                        ) && !field.label.starts_with("Owner signatures")
+                            && !(field.raw == "0"
+                                && matches!(field.label.as_str(), "Safe gas limit" | "Base gas"))
                     })
                     .map(|field| format!("{}: {}", field.label, field.value)),
             );
-            lines.push(call.assurance.clone());
             lines.extend(
                 call.warnings
                     .iter()

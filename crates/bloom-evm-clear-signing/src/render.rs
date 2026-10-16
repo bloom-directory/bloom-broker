@@ -371,24 +371,21 @@ fn review_at(
     // publisher's observation, so it is not repeated here as a warning.
     let mut warnings: Vec<String> = Vec::new();
     if instance {
-        let kind = admitted
-            .contract_name
-            .as_deref()
-            .map_or("the contract it appears to be".to_owned(), |name| {
-                format!("a {name}")
-            });
-        warnings.push(if entry.chain_id == 0 {
-            format!(
-                "Bloom has not verified that {} is {kind}. It is read by that standard's functions.",
-                checksum(&address)
-            )
-        } else {
-            format!(
-                "Bloom has not verified that {} is {kind}. It is read with Bloom's description of {}, the contract such addresses are expected to run.",
-                checksum(&address),
-                checksum(&entry.contract_address)
-            )
-        });
+        let kind = admitted.contract_name.as_deref().map_or(
+            "the contract it appears to be".to_owned(),
+            |name| {
+                let article = if name.starts_with(['A', 'E', 'I', 'O', 'U']) {
+                    "an"
+                } else {
+                    "a"
+                };
+                format!("{article} {name}")
+            },
+        );
+        warnings.push(format!(
+            "Bloom cannot check that {} is {kind}; it reads it as one.",
+            checksum(&address)
+        ));
     }
     // Fields in order; an array's fields are shown element by element, each
     // labelled with its position, so a list of calls reads call by call.
