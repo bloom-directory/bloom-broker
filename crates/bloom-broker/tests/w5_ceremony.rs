@@ -719,7 +719,7 @@ async fn card_add_delete_and_expiry_use_real_signer_proofs() {
     let session = card_session_json(&broker, &prepared).await;
     assert_eq!(
         session["expires_at_ms"].as_u64().unwrap(),
-        prepared_at + 120_000
+        prepared.ceremony_expires_at_ms.get()
     );
     let handle: Base64UrlBytes =
         serde_json::from_value(session["webauthn_options"]["registration_user_handle"].clone())
