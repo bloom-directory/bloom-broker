@@ -204,7 +204,8 @@ three-argument call never gets the transfer screen.
 ## Catalog
 
 `catalog.rs` lists the compiled-in descriptor files in `DESCRIPTORS`, each with
-its optional instance address. `catalogs/tokens.json` lists tokens:
+its optional instance address. Tokens are listed once, in
+`bloom-broker-api/tokens/tokens.json`, which Machine compiles in too:
 
 ```json
 {"chain_id": 1, "address": "0x…", "symbol": "USDC", "name": "USD Coin",
@@ -251,8 +252,8 @@ read is shown as exact bytes with the reason, as anywhere else.
 
 ## Adding to the catalog
 
-- **Tokens:** before each release, run `python3 -I catalogs/tokens.py >
-  catalogs/tokens.json`. It rebuilds the list from the Uniswap default list,
+- **Tokens:** before each release, run `python3 -I tokens/tokens.py >
+  tokens/tokens.json` in `crates/bloom-broker-api`. It rebuilds the list from the Uniswap default list,
   CoinGecko's Gnosis list and Robinhood's Stock Token registry, keeps a token
   only if its address has code and its `decimals()` matches, and marks
   proxies `upgradeable`. A new family of tokens is a new source in

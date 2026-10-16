@@ -57,8 +57,8 @@ pub fn erc20_functions() -> Vec<AdmittedFunction> {
     ]
 }
 
-pub fn token(address: &str, decimals: u8) -> TokenRecord {
-    TokenRecord {
+pub fn token(address: &str, decimals: u8) -> KnownToken {
+    KnownToken {
         chain_id: CHAIN_ID,
         address: address.into(),
         symbol: "EXA".into(),
@@ -68,7 +68,7 @@ pub fn token(address: &str, decimals: u8) -> TokenRecord {
     }
 }
 
-pub fn build(descriptors: Vec<Value>, tokens: Vec<TokenRecord>) -> Result<Catalog, ReviewError> {
+pub fn build(descriptors: Vec<Value>, tokens: Vec<KnownToken>) -> Result<Catalog, ReviewError> {
     let descriptors: Vec<_> = descriptors
         .into_iter()
         .map(|descriptor| (descriptor, Binding::Listed))

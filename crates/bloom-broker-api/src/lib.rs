@@ -14,6 +14,7 @@ mod revocation;
 mod service;
 mod signing;
 pub mod solana_vectors;
+mod tokens;
 mod validation;
 mod wallet_account;
 
@@ -30,6 +31,7 @@ pub use provenance::*;
 pub use revocation::*;
 pub use service::*;
 pub use signing::*;
+pub use tokens::*;
 pub use wallet_account::*;
 
 pub use bloom_rpc_wire::{

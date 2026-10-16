@@ -1147,7 +1147,8 @@ pub(crate) mod mode_tests {
     use super::*;
     use alloy::primitives::U256;
     use bloom_broker_api::Base64UrlBytes;
-    use bloom_evm_clear_signing::{Binding, TokenRecord, checksum};
+    use bloom_broker_api::KnownToken;
+    use bloom_evm_clear_signing::{Binding, checksum};
 
     const TOKEN_ADDRESS: &str = "0x1111111111111111111111111111111111111111";
     const RECIPIENT: &str = "0x2222222222222222222222222222222222222222";
@@ -1178,7 +1179,7 @@ pub(crate) mod mode_tests {
                 ]
             }}}
         });
-        let token = TokenRecord {
+        let token = KnownToken {
             chain_id,
             address: TOKEN_ADDRESS.into(),
             symbol: "EXA".into(),

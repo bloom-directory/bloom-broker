@@ -3,11 +3,13 @@
 //! It is compiled into Broker from `catalogs/`, so it is trusted exactly as
 //! far as the Broker release is, and it is covered by the verifier digest. A
 //! new contract is a descriptor file and one line in [`DESCRIPTORS`]; a new
-//! token is a row in `catalogs/tokens.json`. Broker never fetches anything.
+//! token is a row in `bloom-broker-api/tokens/tokens.json`, the list Machine
+//! also compiles in. Broker never fetches anything.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
+pub use bloom_broker_api::KnownToken;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -67,7 +69,6 @@ pub const DESCRIPTORS: [(&str, &str, Binding); 6] = [
         Binding::Standard,
     ),
 ];
-pub const TOKENS: &str = include_str!("../catalogs/tokens.json");
 
 /// Safe's MultiSendCallOnly (1.3.0 twice, 1.4.1, 1.5.0): the only contract a
 /// Safe may delegatecall, and only to run a batch of plain calls. Its packed
@@ -134,20 +135,6 @@ pub struct TokenMetadata {
     pub name: String,
 }
 
-/// One row of `catalogs/tokens.json`.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TokenRecord {
-    pub chain_id: u64,
-    pub address: String,
-    pub symbol: String,
-    pub name: String,
-    pub decimals: u8,
-    /// A proxy whose implementation its admin can replace.
-    #[serde(default)]
-    pub upgradeable: bool,
-}
-
 /// One describable deployment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogEntry {
@@ -183,13 +170,7 @@ static BUILT_IN: LazyLock<Result<Catalog, ReviewError>> = LazyLock::new(|| {
             Ok((value, *binding))
         })
         .collect::<Result<Vec<_>, ReviewError>>()?;
-    let tokens = serde_json::from_str(TOKENS).map_err(|error| {
-        ReviewError::new(
-            ReviewReason::CatalogRejected,
-            format!("tokens.json: {error}"),
-        )
-    })?;
-    Catalog::build(&descriptors, tokens)
+    Catalog::build(&descriptors, bloom_broker_api::known_tokens().to_vec())
 });
 
 impl Catalog {
@@ -204,7 +185,7 @@ impl Catalog {
     /// built-in ERC-20 profile.
     pub fn build(
         descriptors: &[(Value, Binding)],
-        tokens: Vec<TokenRecord>,
+        tokens: Vec<KnownToken>,
     ) -> Result<Self, ReviewError> {
         let (profile, functions) = erc20_profile();
         let mut catalog = Catalog {

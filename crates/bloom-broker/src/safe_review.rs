@@ -382,11 +382,12 @@ mod tests {
 
     /// The Safe description on `chain_id`, and an example token there.
     fn catalog_on(chain_id: u64) -> bloom_evm_clear_signing::Catalog {
-        use bloom_evm_clear_signing::{Binding, DESCRIPTORS, TokenRecord};
+        use bloom_broker_api::KnownToken;
+        use bloom_evm_clear_signing::{Binding, DESCRIPTORS};
         let mut safe: serde_json::Value = serde_json::from_str(DESCRIPTORS[0].1).unwrap();
         safe["context"]["contract"]["deployments"] =
             serde_json::json!([{"chainId": chain_id, "address": SINGLETON}]);
-        let token = TokenRecord {
+        let token = KnownToken {
             chain_id,
             address: "0x1111111111111111111111111111111111111111".into(),
             symbol: "EXA".into(),

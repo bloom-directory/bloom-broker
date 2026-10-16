@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Regenerate tokens.json from curated token lists, checked on chain.
+"""Regenerate tokens.json, the token list Broker and Machine both compile in,
+from curated token lists, checked on chain.
 
 A curated list proposes a token and its labels; the chain checks it. A token
 is kept only if its address has code and its own decimals() agrees with the

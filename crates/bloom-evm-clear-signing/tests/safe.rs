@@ -36,8 +36,8 @@ fn safe_descriptors() -> Vec<(Value, Binding)> {
 }
 
 /// USDC on Base, so a Safe's inner token call has something to be read by.
-fn usdc() -> TokenRecord {
-    TokenRecord {
+fn usdc() -> KnownToken {
+    KnownToken {
         chain_id: BASE,
         address: USDC.into(),
         symbol: "USDC".into(),
