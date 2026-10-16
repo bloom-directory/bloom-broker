@@ -27,14 +27,8 @@ fn six_format_descriptor() -> Value {
     })
 }
 
-fn six_catalog(descriptor: Value) -> Result<AcceptedCatalog, ReviewError> {
-    let functions = vec![AdmittedFunction {
-        signature: SIX.into(),
-        action_class: ActionClass::Other,
-    }];
-    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    accept(&catalog)
+fn six_catalog(descriptor: Value) -> Result<Catalog, ReviewError> {
+    build(vec![descriptor], vec![token(TOKEN, 6)])
 }
 
 fn six_calldata(mode: u64, deadline: u64) -> Vec<u8> {
@@ -104,19 +98,8 @@ fn each_format_has_an_invalid_input_that_fails_review() {
         ReviewReason::UnsupportedCall
     );
 
-    // tokenAmount: no signed decimals for the token.
-    let mut entry = entry(
-        six_format_descriptor(),
-        vec![AdmittedFunction {
-            signature: SIX.into(),
-            action_class: ActionClass::Other,
-        }],
-        6,
-    );
-    entry.token_metadata = None;
-    let mut catalog = catalog(vec![entry]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+    // tokenAmount: no listed decimals for the token.
+    let catalog = build(vec![six_format_descriptor()], Vec::new()).unwrap();
     assert_eq!(
         review_call(&catalog, &context(&bytes, false))
             .unwrap_err()
@@ -135,18 +118,6 @@ fn unsupported_instructions_make_a_descriptor_unusable() {
             "unresolved include",
             Box::new(|value: &mut Value| {
                 value["includes"] = json!("https://example.invalid/base.json");
-            }),
-        ),
-        (
-            "wrong chain binding",
-            Box::new(|value: &mut Value| {
-                value["context"]["contract"]["deployments"][0]["chainId"] = json!(8453);
-            }),
-        ),
-        (
-            "wrong address binding",
-            Box::new(|value: &mut Value| {
-                value["context"]["contract"]["deployments"][0]["address"] = json!(RECIPIENT);
             }),
         ),
         (
@@ -289,18 +260,12 @@ fn unsupported_instructions_make_a_descriptor_unusable() {
     }
 }
 
-fn admit_one(signature: &str, fields: Value) -> Result<AcceptedCatalog, ReviewError> {
+fn admit_one(signature: &str, fields: Value) -> Result<Catalog, ReviewError> {
     let descriptor = json!({
         "context": {"contract": {"deployments": [{"chainId": CHAIN_ID, "address": TOKEN}]}},
         "display": {"formats": {signature: {"fields": fields}}}
     });
-    let functions = vec![AdmittedFunction {
-        signature: signature.into(),
-        action_class: ActionClass::Other,
-    }];
-    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    accept(&catalog)
+    build(vec![descriptor], vec![token(TOKEN, 6)])
 }
 
 #[test]
@@ -435,21 +400,15 @@ fn a_renamed_or_reclassified_erc20_call_cannot_bypass_allowance_policy() {
             ]
         }}}
     });
-    for class in [ActionClass::Other, ActionClass::Transfer] {
-        let functions = vec![AdmittedFunction {
-            signature: "approve(address _spender, uint256 _value)".into(),
-            action_class: class,
-        }];
-        let mut catalog = catalog(vec![entry(descriptor.clone(), functions, 6)]);
-        sign(&mut catalog, &[(1, "publisher-1")]);
-        let catalog = accept(&catalog).unwrap();
-        let bytes = calldata(
-            "approve(address _spender, uint256 _value)",
-            &[address_word(RECIPIENT), U256::MAX],
-        );
-        let error = review_call(&catalog, &context(&bytes, false)).unwrap_err();
-        assert_eq!(error.reason, ReviewReason::CatalogRejected, "{error}");
-    }
+    // The class comes from the signature, not the descriptor, so the
+    // allowance rules still run and still refuse an unlimited allowance.
+    let catalog = build(vec![descriptor], vec![token(TOKEN, 6)]).unwrap();
+    let bytes = calldata(
+        "approve(address _spender, uint256 _value)",
+        &[address_word(RECIPIENT), U256::MAX],
+    );
+    let error = review_call(&catalog, &context(&bytes, false)).unwrap_err();
+    assert_eq!(error.reason, ReviewReason::PolicyDenied, "{error}");
 }
 
 #[test]
@@ -464,23 +423,14 @@ fn an_unrelated_call_cannot_borrow_the_transfer_screen() {
             ]
         }}}
     });
-    let functions = vec![AdmittedFunction {
-        signature: "donate(address _to, uint256 _value, uint256 _tip)".into(),
-        action_class: ActionClass::Transfer,
-    }];
-    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+    let catalog = build(vec![descriptor], vec![token(TOKEN, 6)]).unwrap();
     let bytes = calldata(
         "donate(address _to, uint256 _value, uint256 _tip)",
         &[address_word(RECIPIENT), U256::from(1u8), U256::from(2u8)],
     );
-    assert_eq!(
-        review_call(&catalog, &context(&bytes, false))
-            .unwrap_err()
-            .reason,
-        ReviewReason::CatalogRejected
-    );
+    let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    assert_eq!(call.action, "other");
+    assert!(call.intent_summary.is_none());
 }
 
 #[test]
@@ -502,26 +452,7 @@ fn two_format_keys_selecting_the_same_function_are_ambiguous() {
             }
         }}
     });
-    let functions = vec![AdmittedFunction {
-        signature: "transfer(address _to, uint256 _value)".into(),
-        action_class: ActionClass::Transfer,
-    }];
-    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    assert!(accept(&catalog).is_err());
-}
-
-#[test]
-fn a_descriptor_whose_content_changed_after_signing_is_refused() {
-    let mut entry = erc20_entry();
-    // The digest still names the reviewed document; the content does not.
-    entry.flattened_descriptor.as_mut().unwrap()["metadata"]["contractName"] = json!("Other Token");
-    let mut catalog = catalog(vec![entry]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    assert_eq!(
-        accept(&catalog).unwrap_err().reason,
-        ReviewReason::CatalogRejected
-    );
+    assert!(build(vec![descriptor], Vec::new()).is_err());
 }
 
 #[test]
@@ -539,13 +470,7 @@ fn a_tuple_argument_is_refused_because_no_path_can_reach_it() {
             ]
         }}}
     });
-    let functions = vec![AdmittedFunction {
-        signature: signature.into(),
-        action_class: ActionClass::Other,
-    }];
-    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let error = accept(&catalog).unwrap_err();
+    let error = build(vec![descriptor], Vec::new()).unwrap_err();
     assert_eq!(error.reason, ReviewReason::CatalogRejected);
     assert!(error.detail.contains("tuple"), "{error}");
 }
@@ -559,13 +484,7 @@ fn a_noncanonical_boolean_word_does_not_survive_the_round_trip() {
             "fields": [{"path": "on", "label": "On", "format": "raw"}]
         }}}
     });
-    let functions = vec![AdmittedFunction {
-        signature: signature.into(),
-        action_class: ActionClass::Other,
-    }];
-    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+    let catalog = build(vec![descriptor], vec![token(TOKEN, 6)]).unwrap();
     let bytes = calldata(signature, &[U256::from(2u8)]);
     assert_eq!(
         review_call(&catalog, &context(&bytes, false))

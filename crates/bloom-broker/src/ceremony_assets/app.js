@@ -368,10 +368,6 @@ function callIntent(call) {
     relation: `may spend up to ${summary.amount_display} of`
   };
 }
-function formatObserved(milliseconds) {
-  const value = Number(milliseconds);
-  return Number.isFinite(value) ? new Date(value).toISOString().replace("T", " ").slice(0, 19) + " UTC" : "an unknown time";
-}
 // Round a displayed upper bound upwards using decimal integers. Floating
 // point rounding must never turn a maximum into an understated charge.
 function compactFeeCap(value) {
@@ -490,16 +486,13 @@ function describeTransfer(manifest) {
     // exactly once. The consequence is the whole warning; when the review
     // touches a single upgradeable contract the identity is already on the
     // page, and when it touches more than one the address distinguishes them.
-    // Which deployment was observed, and when, is a detail and lives in the
-    // details section rather than beside the decision.
     const upgradeable = clear ? (clear.entries || []).filter(entry => entry.upgradeable) : [];
     for (const entry of upgradeable) {
       warnings.push(upgradeable.length > 1
         ? `Upgradeable contract ${shortAddress(entry.contract_address)} — its behavior can change.`
         : "Upgradeable contract — its behavior can change.");
       interpretation.push(["Upgradeable contract",
-        `${entry.contract_address} — the publisher observed this deployment at ` +
-        `${formatObserved(entry.observed_at_ms)}; its code may have changed since.`]);
+        `${entry.contract_address} — its code may have changed since this Bloom release described it.`]);
     }
     const first = evmPayloads[0];
     const oneNetwork = evmPayloads.every(payload => String(payload.chain_id) === String(first.chain_id));
@@ -521,7 +514,7 @@ function describeTransfer(manifest) {
               ? callIntent(reviewedContractCall(payload))
               : payload.destination && payload.calldata_keccak
               ? {action: "opaque", eyebrow: "Contract call", heading: "Approve a call Bloom cannot read",
-                 detail: "No signed description is available. Bloom cannot say what this call does.",
+                 detail: "Bloom has no description of this call. It cannot say what this call does.",
                  relation: "calls"}
               : {action: payload.destination ? "send" : "deploy",
                  eyebrow: payload.destination ? "Native transfer" : "Contract creation",
@@ -545,7 +538,7 @@ function describeTransfer(manifest) {
         : first.destination
           ? (first.calldata_keccak
             ? {action: "opaque", eyebrow: "Contract call", heading: "Approve a call Bloom cannot read",
-               detail: "No signed description is available. Bloom cannot say what this call does.",
+               detail: "Bloom has no description of this call. It cannot say what this call does.",
                relation: "calls"}
             : {action: "send", eyebrow: "Native transfer",
                heading: `Send ${first.value_display}`,
@@ -603,13 +596,11 @@ function describeTransfer(manifest) {
         ? (structuralCalls.length === 1 ? structuralCalls[0].structural_call.assurance
           : "These calls match standard ERC-20 calldata shapes. Bloom verified their exact arguments, but not that the contracts are tokens or follow ERC-20 behavior.")
         : firstCall?.assurance ||
-          (clear ? "Interpreted using a trusted signed description. Contract behavior has not been verified."
+          (clear ? "Interpreted using Bloom's description of this contract. Contract behavior has not been verified."
                  : "Transaction destination, value and bytes checked. Contract behavior not verified.");
     if (clear) {
-      interpretation.push(["Catalog", `${clear.catalog_id}, sequence ${clear.catalog_sequence}`]);
       interpretation.push(["Assurance class", clear.assurance]);
       interpretation.push(["Verifier", `${clear.verifier_id} (${shortDigest(clear.verifier_digest)})`]);
-      // The catalog commitment is already in the complete signed manifest.
     }
     const networkIdentity = oneNetwork
       ? `EVM · ${network} · Chain ID ${first.chain_id}` : "EVM · Multiple networks";
@@ -787,8 +778,8 @@ function describePolicy(manifest) {
      "This wallet setting applies to all supported tokens. Each request will still need your approval " +
      "and will name its token and spender. This setting does not move tokens or grant a spender an allowance."],
     ["opaque_exact_allowed", "Requests Bloom cannot describe",
-     "A call with no signed description is refused.",
-     "A call with no signed description can be approved as exact bytes, carrying the " +
+     "A call Bloom has no description of is refused.",
+     "A call Bloom has no description of can be approved as exact bytes, carrying the " +
      "inability-to-explain warning."]
   ];
   const clearBefore = diff.clear_signing?.before || null;
@@ -799,8 +790,8 @@ function describePolicy(manifest) {
   if (clearBefore && !clearAfter) {
     lines.push(["Clear signing", "on → off"]);
     intentLines.push(["Clear signing",
-      "Bloom stops reading contract calls for this wallet. Unlimited allowances and calls with no " +
-      "signed description are no longer refused: each is shown only as exact bytes for you to approve."]);
+      "Bloom stops reading contract calls for this wallet. Unlimited allowances and calls Bloom has no " +
+      "description of are no longer refused: each is shown only as exact bytes for you to approve."]);
   } else if (clearAfter) {
     if (!clearBefore) lines.push(["Clear signing", "off → on"]);
     for (const [key, title, whenOff, whenOn] of CLEAR_SIGNING_SETTINGS) {
@@ -809,45 +800,6 @@ function describePolicy(manifest) {
       if (was === now) continue;
       lines.push([title, `${was ? "allowed" : "blocked"} → ${now ? "allowed" : "blocked"}`]);
       intentLines.push([title, now ? whenOn : whenOff]);
-    }
-    for (const [key, title] of [["catalog_id", "Descriptions come from catalog"],
-                                ["signature_threshold", "Publisher signatures required"],
-                                ["maximum_observation_age_ms", "Oldest usable observation"]]) {
-      const was = clearBefore?.[key];
-      const now = clearAfter?.[key];
-      if (was === now || (was == null && now == null)) continue;
-      lines.push([title, `${was == null ? "none" : was} → ${now == null ? "none" : now}`]);
-    }
-    const wasVerifier = clearBefore?.verifier?.verifier_digest;
-    const nowVerifier = clearAfter?.verifier?.verifier_digest;
-    if (wasVerifier !== nowVerifier) {
-      lines.push(["Pinned verifier", `${shortDigest(wasVerifier) || "none"} → ${shortDigest(nowVerifier) || "none"}`, true]);
-      intentLines.push(["Pinned verifier",
-        "Reviews are accepted only from the build whose verifier sources hash to the new value. " +
-        "A different build stops being able to describe calls for this wallet."]);
-    }
-    // The trusted publisher keys are the root of trust for every description
-    // Bloom will later read calldata against, so a rotation is the largest
-    // authority change this diff can carry and has to be named key by key.
-    const keyLabel = k => `${k?.key_id || "unnamed"} (${shortDigest(k?.verifying_key) || "no key"})`;
-    const keyIdentity = k => `${k?.key_id || ""}\u0000${k?.verifying_key || ""}`;
-    const keysBefore = Array.isArray(clearBefore?.trusted_keys) ? clearBefore.trusted_keys : [];
-    const keysAfter = Array.isArray(clearAfter?.trusted_keys) ? clearAfter.trusted_keys : [];
-    const idsBefore = new Set(keysBefore.map(keyIdentity));
-    const idsAfter = new Set(keysAfter.map(keyIdentity));
-    const addedKeys = keysAfter.filter(k => !idsBefore.has(keyIdentity(k)));
-    const removedKeys = keysBefore.filter(k => !idsAfter.has(keyIdentity(k)));
-    for (const k of addedKeys) lines.push(["Trust descriptions signed by", keyLabel(k), true]);
-    for (const k of removedKeys) lines.push(["Stop trusting descriptions signed by", keyLabel(k), true]);
-    if (addedKeys.length) {
-      intentLines.push(["Trusted publisher",
-        "A new publisher becomes able to describe any contract call for this wallet. " +
-        "Every future approval screen for a contract call is written from descriptions it signs."]);
-    }
-    if (removedKeys.length && !addedKeys.length) {
-      intentLines.push(["Trusted publisher",
-        "Descriptions signed by the named publisher stop being accepted. Contract calls that only " +
-        "it described can no longer be read, and will be refused rather than approved unread."]);
     }
   }
   // A clear-signing change that produced no line is a change this page cannot
@@ -1140,10 +1092,9 @@ function renderReview(session) {
     parts.push(el("details", {class: "ceremony-details"},
       el("summary", {}, "How this was interpreted"),
       el("p", {}, transfer.mixedAssurance
-        ? "The catalog publisher is trusted only for the catalog-backed calls. Structural calls are decoded from their exact calldata without trusting a deployment identity. Neither reading proves execution behavior."
-        : "The catalog publisher is trusted to describe this deployment accurately, and a " +
-          "signature authenticates that claim. It is not proof of what the contract does, and Bloom " +
-          "did not execute anything."),
+        ? "Catalogued calls are read with descriptions built into this Bloom release. Structural calls are decoded from their exact calldata without trusting a deployment identity. Neither reading proves execution behavior."
+        : "This call is read with a description of this deployment built into this Bloom release. " +
+          "It is not proof of what the contract does, and Bloom did not execute anything."),
       rows));
   }
   if (transfer?.technical?.length) {
@@ -1868,7 +1819,7 @@ const PREVIEW_TOKEN = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
 const PREVIEW_TOKEN_IDENTITY =
   {address: PREVIEW_TOKEN, symbol: "BDT", name: "Bloom Demo Token", decimals: 6};
 const PREVIEW_ASSURANCE =
-  "Interpreted using a trusted signed description. Contract behavior has not been verified.";
+  "Interpreted using Bloom's description of this contract. Contract behavior has not been verified.";
 const PREVIEW_ALLOWANCE_ADVISORY =
   "This spender can move your tokens later without another approval. The permission does not expire with this review.";
 function previewPayload(extra) {
@@ -1891,11 +1842,7 @@ function previewClearSigning() {
   return {
     assurance: "trusted_description", verifier_id: "evm-clear-signing-v1",
     verifier_digest: "2c75ec2390991c0bbab6e17694525cd46ef65614fa31e62cadac6aab58751a15",
-    catalog_id: "bloom-demo-tokens", catalog_sequence: "5",
-    catalog_digest: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
-    catalog_expires_at_ms: String(Date.now() + 86400000),
-    entries: [{chain_id: "31337", contract_address: PREVIEW_TOKEN,
-               observed_at_ms: String(Date.now() - 3600000), upgradeable: false}]
+    entries: [{chain_id: "31337", contract_address: PREVIEW_TOKEN, upgradeable: false}]
   };
 }
 function previewCall(action, amount, amountDisplay, magnitude, warnings) {
@@ -1982,7 +1929,7 @@ const PREVIEW_PROTOCOL_CALLS = {
         "raw": "0x2222222222222222222222222222222222222222"
       }
     ],
-    "assurance": "Interpreted using a trusted signed description. Contract behavior has not been verified.",
+    "assurance": "Interpreted using Bloom's description of this contract. Contract behavior has not been verified.",
     "warnings": []
   },
   "operator-approval": {
@@ -2005,7 +1952,7 @@ const PREVIEW_PROTOCOL_CALLS = {
         "raw": "true"
       }
     ],
-    "assurance": "Interpreted using a trusted signed description. Contract behavior has not been verified.",
+    "assurance": "Interpreted using Bloom's description of this contract. Contract behavior has not been verified.",
     "warnings": []
   },
   "stake-static": {
@@ -2022,13 +1969,13 @@ const PREVIEW_PROTOCOL_CALLS = {
         "raw": "250000000"
       }
     ],
-    "assurance": "Interpreted using a trusted signed description. Contract behavior has not been verified.",
+    "assurance": "Interpreted using Bloom's description of this contract. Contract behavior has not been verified.",
     "warnings": []
   }
 };
 function previewProtocolCall(name) {
   const call = PREVIEW_PROTOCOL_CALLS[name];
-  const clear = {...previewClearSigning(), catalog_id: "synthetic-protocol-fixtures", entries: []};
+  const clear = {...previewClearSigning(), entries: []};
   const session = previewApproval([previewPayload({chain_id: "1", chain: "ethereum",
     destination: call.contract, contract_call: call})], clear);
   session.preview_status = "Synthetic descriptor test — not a deployed protocol integration";

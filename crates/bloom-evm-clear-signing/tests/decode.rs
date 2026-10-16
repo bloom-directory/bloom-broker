@@ -3,7 +3,6 @@
 mod support;
 
 use alloy_primitives::U256;
-use bloom_broker_api::Digest32;
 use bloom_evm_clear_signing::*;
 use support::*;
 
@@ -76,12 +75,9 @@ fn an_allowance_shows_the_spender_and_the_total_it_sets() {
 /// every single-entry review.
 #[test]
 fn an_upgradeable_contract_is_typed_evidence_and_not_a_call_warning() {
-    let mut upgradeable = erc20_entry();
+    let mut upgradeable = token(TOKEN, 6);
     upgradeable.upgradeable = true;
-    upgradeable.implementation_hash = Some(Digest32::from_bytes([7; 32]));
-    let mut catalog = catalog(vec![upgradeable]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+    let catalog = build(vec![erc20_descriptor()], vec![upgradeable]).unwrap();
 
     let bytes = transfer_bytes(RECIPIENT, U256::from(100_000_000u64));
     let (call, used) = review_call(&catalog, &context(&bytes, false)).unwrap();
@@ -209,13 +205,7 @@ fn a_narrow_integer_with_high_bits_set_is_refused() {
             "fields": [{"path": "limit", "label": "Limit", "format": "raw", "visible": "always"}]
         }}}
     });
-    let functions = vec![AdmittedFunction {
-        signature: "cap(uint64 limit)".into(),
-        action_class: ActionClass::Other,
-    }];
-    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+    let catalog = build(vec![descriptor], vec![token(TOKEN, 6)]).unwrap();
 
     let ok = calldata("cap(uint64 limit)", &[U256::from(u64::MAX)]);
     review_call(&catalog, &context(&ok, false)).unwrap();
@@ -284,9 +274,7 @@ fn decimals_zero_six_eighteen_and_255_all_format_exactly() {
         (18, "1000000000000000000", "1 EXA"),
         (18, "1", "0.000000000000000001 EXA"),
     ] {
-        let mut catalog = catalog(vec![entry(erc20_descriptor(), erc20_functions(), decimals)]);
-        sign(&mut catalog, &[(1, "publisher-1")]);
-        let catalog = accept(&catalog).unwrap();
+        let catalog = build(vec![erc20_descriptor()], vec![token(TOKEN, decimals)]).unwrap();
         let bytes = transfer_bytes(RECIPIENT, amount.parse::<U256>().unwrap());
         let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
         assert_eq!(
@@ -296,9 +284,7 @@ fn decimals_zero_six_eighteen_and_255_all_format_exactly() {
         );
     }
     // 255 decimals is representable and is not rounded to zero.
-    let mut catalog = catalog(vec![entry(erc20_descriptor(), erc20_functions(), 255)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+    let catalog = build(vec![erc20_descriptor()], vec![token(TOKEN, 255)]).unwrap();
     let bytes = transfer_bytes(RECIPIENT, U256::from(1u8));
     let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
     let value = &field(&call, "Amount").value;
@@ -310,29 +296,12 @@ fn decimals_zero_six_eighteen_and_255_all_format_exactly() {
 
 #[test]
 fn two_tokens_sharing_a_symbol_stay_distinct_by_contract() {
-    let mut second = erc20_entry();
-    second.contract_address = "0x3333333333333333333333333333333333333333".into();
-    let descriptor = serde_json::json!({
-        "context": {"contract": {"deployments": [
-            {"chainId": CHAIN_ID, "address": "0x3333333333333333333333333333333333333333"}]}},
-        "display": {"formats": {"transfer(address _to, uint256 _value)": {
-            "fields": [
-                {"path": "_to", "label": "To", "format": "addressName", "visible": "always"},
-                {"path": "_value", "label": "Amount", "format": "tokenAmount",
-                 "params": {"tokenPath": "@.to"}, "visible": "always"}
-            ]
-        }}}
-    });
-    second.descriptor_digest = Some(descriptor_digest(&descriptor).unwrap());
-    second.flattened_descriptor = Some(descriptor);
-    second.admitted_functions = vec![AdmittedFunction {
-        signature: "transfer(address _to, uint256 _value)".into(),
-        action_class: ActionClass::Transfer,
-    }];
-
-    let mut catalog = catalog(vec![erc20_entry(), second]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+    let second = "0x3333333333333333333333333333333333333333";
+    let catalog = build(
+        vec![erc20_descriptor()],
+        vec![token(TOKEN, 6), token(second, 6)],
+    )
+    .unwrap();
 
     let bytes = transfer_bytes(RECIPIENT, U256::from(1u8));
     let (first, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
@@ -371,12 +340,8 @@ fn a_call_to_an_undescribed_contract_is_unsupported_not_guessed() {
 }
 
 #[test]
-fn a_token_without_signed_decimals_cannot_display_an_amount() {
-    let mut entry = erc20_entry();
-    entry.token_metadata = None;
-    let mut catalog = catalog(vec![entry]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+fn a_token_without_listed_decimals_cannot_display_an_amount() {
+    let catalog = build(vec![erc20_descriptor()], Vec::new()).unwrap();
     let bytes = transfer_bytes(RECIPIENT, U256::from(1u8));
     assert_eq!(
         review_call(&catalog, &context(&bytes, false))
@@ -390,7 +355,7 @@ fn a_token_without_signed_decimals_cannot_display_an_amount() {
 /// contract being called. The same generic decoder handles it, and the
 /// decimals come from the catalog entry the decoded address names.
 #[test]
-fn a_token_named_by_an_argument_is_resolved_from_the_signed_catalog() {
+fn a_token_named_by_an_argument_is_resolved_from_the_catalog() {
     let catalog = accepted_vault();
     let bytes = calldata(
         VAULT_DEPOSIT,
@@ -428,52 +393,9 @@ fn a_token_the_catalog_does_not_describe_cannot_be_shown() {
     let error = review_call(&catalog, &vault_context(&bytes)).unwrap_err();
     assert_eq!(error.reason, ReviewReason::UnsupportedCall);
     assert!(
-        error.detail.contains("no signed description of the token"),
+        error.detail.contains("no description of the token"),
         "{error}"
     );
-}
-
-#[test]
-fn withdrawing_or_changing_the_named_token_invalidates_the_frozen_review() {
-    let accepted = accepted_vault();
-    let bytes = calldata(
-        VAULT_DEPOSIT,
-        &[
-            address_word(TOKEN),
-            U256::from(2_500_000u64),
-            address_word(RECIPIENT),
-        ],
-    );
-    let (_, used) = review_call(&accepted, &vault_context(&bytes)).unwrap();
-    let verifier = bloom_broker_api::Digest32::from_bytes([7; 32]);
-    let evidence = ClearSigningEvidence::new(&accepted, &verifier, used);
-    evidence
-        .recheck(Some(&accepted), &verifier, NOW_MS, 86_400_000)
-        .expect("nothing has changed yet");
-
-    // Withdrawing the token entry leaves the vault entry intact, and the
-    // review is still invalid: the amount was denominated in that token.
-    let mut without_token = catalog(vec![vault_entry()]);
-    sign(&mut without_token, &[(1, "publisher-1")]);
-    let without_token = accept(&without_token).unwrap();
-    let error = evidence
-        .recheck(Some(&without_token), &verifier, NOW_MS, 86_400_000)
-        .unwrap_err();
-    assert_eq!(error.reason, ReviewReason::ReviewChanged);
-    assert!(error.detail.contains(TOKEN), "{error}");
-
-    // So does changing its decimals, which would change what "2.5 EXA" means.
-    let mut redenominated = catalog(vec![
-        entry(erc20_descriptor(), erc20_functions(), 8),
-        vault_entry(),
-    ]);
-    sign(&mut redenominated, &[(1, "publisher-1")]);
-    let redenominated = accept(&redenominated).unwrap();
-    let error = evidence
-        .recheck(Some(&redenominated), &verifier, NOW_MS, 86_400_000)
-        .unwrap_err();
-    assert_eq!(error.reason, ReviewReason::ReviewChanged);
-    assert!(error.detail.contains(TOKEN), "{error}");
 }
 
 #[test]
@@ -489,13 +411,7 @@ fn a_fixed_bytes_word_with_nonzero_trailing_bytes_is_refused() {
             "fields": [{"path": "tag", "label": "Tag", "format": "raw", "visible": "always"}]
         }}}
     });
-    let functions = vec![AdmittedFunction {
-        signature: "settle(bytes4 tag)".into(),
-        action_class: ActionClass::Other,
-    }];
-    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+    let catalog = build(vec![descriptor], vec![token(TOKEN, 6)]).unwrap();
 
     let mut clean = [0u8; 32];
     clean[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);

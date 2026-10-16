@@ -5,12 +5,9 @@
 
 mod support;
 
-use std::path::Path;
-
 use alloy_dyn_abi::{DynSolValue, JsonAbiExt as _};
 use alloy_json_abi::Function;
 use alloy_primitives::{Address, U256};
-use bloom_broker_api::{DecimalU64, Digest32};
 use bloom_evm_clear_signing::*;
 use serde_json::{Value, json};
 use support::*;
@@ -29,64 +26,28 @@ const BATCH: &str = "0x6a7612020000000000000000000000009641d764fc13c8b624c04430c
 const REMOVE_OWNER: &str = "0x6a761202000000000000000000000000aefda71ded59b48920131d03454893ec2ad93e880000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001e00000000000000000000000000000000000000000000000000000000000000064f8dc5dd9000000000000000000000000000000000000000000000000000000000000000100000000000000000000000043d2fdfed480f95b8848840031546e30a60c0a5f000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008200bcff01bcd29252f7a7d20e0fd09d28da5cf5d0f8d4a0165a15e4e62a9e83862f1c20464a3b2cee24762885ff9b86a060d999eb18e74dacdb3256ca919e17121bf5e7e63c173815be4ee254ae96388767b18a7df6c69191bb9bfd9734106efc7b737b98399b57d8847a2f5de37e3ac14b5a3f33bd6d3347f92fa6ac2eec6e80d01c000000000000000000000000000000000000000000000000000000000000";
 const CREATION: &str = "0x1688f0b900000000000000000000000029fcb43b46531bca003ddc8fcb67ffe91900c762000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000013528400000000000000000000000000000000000000000000000000000000000000164b63e800d0000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000fd0732dc9e303f09fcef3a7388ad10a83459ec9900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d081000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
-fn safe_entries() -> Vec<CatalogEntry> {
-    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("catalogs/safe");
-    let read = |name: &str| -> Value {
-        serde_json::from_str(&std::fs::read_to_string(directory.join(name)).unwrap()).unwrap()
-    };
-    let Value::Array(entries) = read("entries.json") else {
-        panic!("entries.json is a list")
-    };
-    entries
-        .into_iter()
-        .map(|entry| {
-            let descriptor = read(entry["descriptor"].as_str().unwrap());
-            CatalogEntry {
-                chain_id: DecimalU64::new(entry["chain_id"].as_u64().unwrap()),
-                contract_address: entry["contract_address"].as_str().unwrap().into(),
-                admitted_functions: serde_json::from_value(entry["admitted_functions"].clone())
-                    .unwrap(),
-                descriptor_digest: Some(descriptor_digest(&descriptor).unwrap()),
-                flattened_descriptor: Some(descriptor),
-                runtime_code_hash: Some(
-                    Digest32::new(entry["runtime_code_hash"].as_str().unwrap().to_owned()).unwrap(),
-                ),
-                token_metadata: None,
-                upgradeable: false,
-                implementation_hash: None,
-                observed_at_ms: DecimalU64::new(NOW_MS - 1000),
-                applies_to_instances: entry["applies_to_instances"].as_bool().unwrap_or(false),
-            }
-        })
+/// The compiled-in Safe descriptors, as `Catalog::built_in` admits them.
+fn safe_descriptors() -> Vec<(Value, Option<&'static str>, bool)> {
+    DESCRIPTORS
+        .iter()
+        .map(|(_, text, instance)| (serde_json::from_str(text).unwrap(), *instance, false))
         .collect()
 }
 
-/// USDC on Base, listed the way a token is: by its metadata alone.
-fn usdc() -> CatalogEntry {
-    let mut entry = entry_at(USDC, json!({}), Vec::new(), Some(6));
-    entry.chain_id = DecimalU64::new(BASE);
-    entry.flattened_descriptor = None;
-    entry.descriptor_digest = None;
-    let token = entry.token_metadata.as_mut().unwrap();
-    token.symbol = "USDC".into();
-    token.name = "USD Coin".into();
-    entry
+/// USDC on Base, so a Safe's inner token call has something to be read by.
+fn usdc() -> TokenRecord {
+    TokenRecord {
+        chain_id: BASE,
+        address: USDC.into(),
+        symbol: "USDC".into(),
+        name: "USD Coin".into(),
+        decimals: 6,
+        upgradeable: true,
+    }
 }
 
-fn accepted(mut entries: Vec<CatalogEntry>) -> Result<AcceptedCatalog, ReviewError> {
-    entries.sort_by(|left, right| {
-        (left.chain_id.get(), &left.contract_address)
-            .cmp(&(right.chain_id.get(), &right.contract_address))
-    });
-    let mut catalog = catalog(entries);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    accept(&catalog)
-}
-
-fn safe_catalog() -> AcceptedCatalog {
-    let mut entries = safe_entries();
-    entries.push(usdc());
-    accepted(entries).unwrap()
+fn safe_catalog() -> Catalog {
+    Catalog::build(&safe_descriptors(), vec![usdc()]).unwrap()
 }
 
 fn review(to: &str, input: &[u8]) -> Result<(ClearSignedCall, Vec<SelectedEntry>), ReviewError> {
@@ -219,32 +180,8 @@ fn an_unlisted_safe_is_read_structurally_and_says_so() {
     assert_eq!(entries[0].contract_address, SAFE_141);
     assert_eq!(entries[0].instance.as_deref(), Some(SAFE));
 
-    let catalog = safe_catalog();
-    let evidence = ClearSigningEvidence::new(&catalog, &Digest32::from_bytes([9; 32]), entries);
+    let evidence = ClearSigningEvidence::new(artifact::digest(), entries, false);
     assert_eq!(evidence.assurance, STRUCTURAL_DESCRIPTION);
-    evidence
-        .recheck(
-            Some(&catalog),
-            &Digest32::from_bytes([9; 32]),
-            NOW_MS,
-            86_400_000,
-        )
-        .unwrap();
-    // Withdrawing the instance flag withdraws every reading that relied on it.
-    let mut entries = safe_entries();
-    for entry in &mut entries {
-        entry.applies_to_instances = false;
-    }
-    let withdrawn = accepted(entries).unwrap();
-    let error = evidence
-        .recheck(
-            Some(&withdrawn),
-            &Digest32::from_bytes([9; 32]),
-            NOW_MS,
-            86_400_000,
-        )
-        .unwrap_err();
-    assert_eq!(error.reason, ReviewReason::ReviewChanged, "{error}");
 }
 
 #[test]
@@ -385,21 +322,39 @@ fn safes_nested_past_the_limit_are_refused() {
 
 #[test]
 fn instance_entries_cannot_overlap_or_borrow_token_identity() {
-    let mut entries = safe_entries();
-    let second = entries
-        .iter_mut()
-        .find(|entry| {
-            entry.chain_id.get() == BASE
-                && entry.contract_address == "0x29fcb43b46531bca003ddc8fcb67ffe91900c762"
-        })
-        .unwrap();
-    second.applies_to_instances = true;
-    let error = accepted(entries).unwrap_err();
+    // A second contract type whose instances would answer the same selectors.
+    let other = "0x5555555555555555555555555555555555555555";
+    let mut copy = safe_descriptors()[0].0.clone();
+    copy["context"]["contract"]["deployments"] = json!([{"chainId": BASE, "address": other}]);
+    let mut descriptors = safe_descriptors();
+    descriptors.push((copy, Some(other), false));
+    let error = Catalog::build(&descriptors, Vec::new()).unwrap_err();
     assert_eq!(error.reason, ReviewReason::CatalogRejected, "{error}");
     assert!(error.detail.contains("ambiguous"), "{error}");
 
-    let mut token = usdc();
-    token.applies_to_instances = true;
-    let error = accepted(vec![token]).unwrap_err();
+    let mut borrowed = usdc();
+    borrowed.address = SAFE_141.into();
+    let error = Catalog::build(&safe_descriptors(), vec![borrowed]).unwrap_err();
     assert_eq!(error.reason, ReviewReason::CatalogRejected, "{error}");
+}
+
+/// The shipped catalog reads these transactions exactly as the fixture does.
+#[test]
+fn the_built_in_catalog_reads_a_real_safe_execution() {
+    let (call, _) = review_call(
+        Catalog::built_in().unwrap(),
+        &CallContext {
+            chain_id: BASE,
+            to: SAFE.parse().unwrap(),
+            value: U256::ZERO,
+            calldata: &hex_input(SEND),
+            native: Some(NativeUnits {
+                decimals: 18,
+                symbol: "ETH".into(),
+            }),
+            unlimited_allowance_allowed: false,
+        },
+    )
+    .unwrap();
+    assert!(call.structural);
 }

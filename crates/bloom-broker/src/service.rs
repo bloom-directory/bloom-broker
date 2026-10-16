@@ -781,58 +781,6 @@ impl BrokerRpcService {
         }
     }
 
-    /// Resolve what this wallet's authenticated policy says about clear
-    /// signing, and load the catalog under exactly that trust. A stored
-    /// snapshot the policy no longer trusts reads as no catalog at all.
-    fn clear_signing_context(
-        &self,
-        policy: &bloom_broker_api::CanonicalWalletPolicy,
-    ) -> Result<crate::evm_review::ClearSigningContext, ProtocolError> {
-        let verifier_digest =
-            Digest32::from_bytes(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES);
-        // The same authority clock the rest of preparation uses. This read is
-        // not a mutation, so it does not consume the caller's mutation
-        // allowance a second time; `prepare_approval` already takes one.
-        let now_ms = self.clock.now_ms(false)?;
-        // The wallet pins the verifier by digest, and this is where that pin
-        // is spent. A build whose verifier sources hash to something else
-        // cannot describe calls for this wallet: refusing here is what stops
-        // an upgraded Broker quietly substituting its own reading for the one
-        // the owner approved.
-        if let Some(settings) = &policy.clear_signing
-            && (settings.verifier.verifier_id.as_str()
-                != bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_ID
-                || settings.verifier.verifier_digest != verifier_digest)
-        {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::ClaimInvalid,
-                "wallet policy pins a clear-signing verifier absent from this build; \
-                 approve a policy update naming this build's verifier",
-            ));
-        }
-        let Some(settings) = &policy.clear_signing else {
-            return Ok(crate::evm_review::ClearSigningContext {
-                catalog: None,
-                verifier_digest,
-                now_ms,
-            });
-        };
-        let trusted = crate::authority::trusted_catalog_keys(settings).map_err(authority_error)?;
-        let catalog = self
-            .authority
-            .clear_signing_catalog(
-                &settings.catalog_id,
-                &trusted,
-                usize::from(settings.signature_threshold),
-            )
-            .map_err(authority_error)?;
-        Ok(crate::evm_review::ClearSigningContext {
-            catalog,
-            verifier_digest,
-            now_ms,
-        })
-    }
-
     async fn prepare_approval(
         &self,
         request: ApprovalPrepareRequest,
@@ -894,9 +842,10 @@ impl BrokerRpcService {
                         "invalid canonical policy",
                     )
                 })?;
-            let clear_signing = self.clear_signing_context(&policy)?;
-            context.evm_review =
-                crate::evm_review::review(&request, &policy, from, &clear_signing)?;
+            let catalog = bloom_evm_clear_signing::Catalog::built_in().map_err(|error| {
+                ProtocolError::new(ProtocolErrorCode::AssuranceUnavailable, error.to_string())
+            })?;
+            context.evm_review = crate::evm_review::review(&request, &policy, from, catalog)?;
             review_policy = Some(policy.clone());
         }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
@@ -2197,10 +2146,6 @@ impl BrokerRpcService {
                     verifier_digest: capability.artifact_digest,
                 })
                 .collect(),
-            clear_signing: self
-                .authority
-                .clear_signing_status()
-                .map_err(authority_error)?,
             frame_max_bytes: DecimalU64::new(bloom_broker_api::FRAME_MAX_BYTES as u64),
         })
     }

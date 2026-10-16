@@ -12,8 +12,8 @@ use alloy_primitives::{Address, U256, keccak256};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AcceptedCatalog, ActionClass, AdmittedFormat, AdmittedFunction, CalleeSource, CatalogEntry,
-    LeafType, ReviewError, ReviewReason,
+    ActionClass, AdmittedFormat, CalleeSource, Catalog, CatalogEntry, LeafType, ReviewError,
+    ReviewReason,
 };
 
 pub const TRANSFER_SIGNATURE: &str = "transfer(address,uint256)";
@@ -70,12 +70,12 @@ pub struct TokenIdentity {
 /// What clear signing establishes, and what it does not. One sentence, the
 /// same for every call, stated once per review.
 pub fn standing_assurance() -> String {
-    "Interpreted using a trusted signed description. Contract behavior has not been verified."
+    "Interpreted using Bloom's description of this contract. Contract behavior has not been verified."
         .to_owned()
 }
 
 /// The sentence for a call Bloom read by the standard ERC-20 calldata shape
-/// alone, with no signed description of the contract.
+/// alone, with no catalog description of the contract.
 pub const STRUCTURAL_ERC20_ASSURANCE: &str = "Decoded from the standard ERC-20 calldata shape. Bloom verified the exact arguments, but not that this contract is a token or follows ERC-20 behavior.";
 
 /// Exact canonical `transfer(address,uint256)` or `approve(address,uint256)`
@@ -102,7 +102,7 @@ pub fn canonical_erc20(calldata: &[u8]) -> Option<(ActionClass, Address, U256)> 
 /// instance read by its contract type, or an embedded ERC-20 call read by its
 /// shape. The reading is exact; what that contract is, is not established.
 pub fn structural_assurance() -> String {
-    "Interpreted using trusted signed descriptions, but this call reaches a contract Bloom has not identified. Bloom has not verified what that contract is or what it does."
+    "Interpreted using Bloom's contract descriptions, but this call reaches a contract Bloom has not identified. Bloom has not verified what that contract is or what it does."
         .to_owned()
 }
 
@@ -153,7 +153,7 @@ pub struct ClearSignedCall {
     /// Present only for the canonical ERC-20 actions; see [`CallIntent`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent_summary: Option<CallIntent>,
-    /// What reading this call against a signed description does and does not
+    /// What reading this call against a catalog description does and does not
     /// establish. Identical for every clear-signed call, so a review states
     /// it once; it is not a property of this call and never a warning.
     #[serde(default = "standing_assurance")]
@@ -167,32 +167,15 @@ pub struct ClearSignedCall {
     pub warnings: Vec<String>,
 }
 
-/// The complete signed entry a review selected, kept so activation and
-/// signing can tell whether the catalog still says the same thing.
+/// A catalog entry a review used, as the page shows it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelectedEntry {
     pub chain_id: String,
     pub contract_address: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub descriptor_digest: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_code_hash: Option<String>,
-    pub observed_at_ms: String,
     pub upgradeable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub implementation_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<TokenIdentity>,
-    /// The functions the entry admitted when the review was frozen.
-    ///
-    /// The descriptor digest covers how a call is displayed; this covers
-    /// whether the call was describable at all. Withdrawing a function, or
-    /// moving it to another action class, changes what the same descriptor
-    /// authorizes, and `recheck`'s `current != frozen` comparison can only see
-    /// that if the projection carries it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub admitted_functions: Vec<AdmittedFunction>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub applies_to_instances: bool,
     /// The unlisted address this entry was read for, when it was matched as
@@ -204,62 +187,18 @@ pub struct SelectedEntry {
 impl SelectedEntry {
     pub fn of(entry: &CatalogEntry) -> Self {
         Self {
-            chain_id: entry.chain_id.as_str().to_owned(),
+            chain_id: entry.chain_id.to_string(),
             contract_address: entry.contract_address.clone(),
-            descriptor_digest: entry
-                .descriptor_digest
-                .as_ref()
-                .map(|digest| digest.as_str().to_owned()),
-            runtime_code_hash: entry
-                .runtime_code_hash
-                .as_ref()
-                .map(|digest| digest.as_str().to_owned()),
-            observed_at_ms: entry.observed_at_ms.as_str().to_owned(),
             upgradeable: entry.upgradeable,
-            implementation_hash: entry
-                .implementation_hash
-                .as_ref()
-                .map(|digest| digest.as_str().to_owned()),
             token: entry.token_metadata.as_ref().map(|metadata| TokenIdentity {
                 address: checksum(&entry.contract_address),
                 symbol: metadata.symbol.clone(),
                 name: metadata.name.clone(),
                 decimals: metadata.decimals,
             }),
-            admitted_functions: entry.admitted_functions.clone(),
             applies_to_instances: entry.applies_to_instances,
             instance: None,
         }
-    }
-
-    /// Enforce the wallet's observation-age bound in both directions. A future
-    /// timestamp is not fresh evidence: it describes an observation that has
-    /// not happened under Broker's trusted clock.
-    pub fn check_observation_age(
-        &self,
-        now_ms: u64,
-        maximum_age_ms: u64,
-    ) -> Result<(), ReviewError> {
-        let observed = self.observed_at_ms.parse::<u64>().unwrap_or(0);
-        if observed > now_ms {
-            return Err(ReviewError::new(
-                ReviewReason::CatalogRejected,
-                format!(
-                    "the publisher's observation of {} is later than trusted time",
-                    self.contract_address
-                ),
-            ));
-        }
-        if now_ms > observed.saturating_add(maximum_age_ms) {
-            return Err(ReviewError::new(
-                ReviewReason::EvidenceExpired,
-                format!(
-                    "the publisher's observation of {} is older than wallet policy allows",
-                    self.contract_address
-                ),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -278,14 +217,14 @@ fn invalid(message: impl Into<String>) -> ReviewError {
 /// become frozen evidence, so withdrawing or changing a token entry
 /// invalidates the review exactly as changing the contract's own entry does.
 pub fn review_call(
-    catalog: &AcceptedCatalog,
+    catalog: &Catalog,
     context: &CallContext<'_>,
 ) -> Result<(ClearSignedCall, Vec<SelectedEntry>), ReviewError> {
     review_at(catalog, context, 0)
 }
 
 fn review_at(
-    catalog: &AcceptedCatalog,
+    catalog: &Catalog,
     context: &CallContext<'_>,
     depth: usize,
 ) -> Result<(ClearSignedCall, Vec<SelectedEntry>), ReviewError> {
@@ -304,7 +243,7 @@ fn review_at(
     else {
         return Err(match (listed, selector) {
             (None, _) => unsupported(format!(
-                "no signed description for {address} on chain {}",
+                "no description of {address} on chain {}",
                 context.chain_id
             )),
             (Some(_), None) => invalid("contract call has no complete selector"),
@@ -365,7 +304,7 @@ fn review_at(
         let value = match_key(leaf(path));
         if !allowed.contains(&value) {
             return Err(unsupported(format!(
-                "`{path}` is {value}, and the signed description admits only {}",
+                "`{path}` is {value}, and the description admits only {}",
                 allowed.join(", ")
             )));
         }
@@ -382,7 +321,7 @@ fn review_at(
     let mut warnings: Vec<String> = Vec::new();
     if instance {
         warnings.push(format!(
-            "Bloom has not verified that {} is {}. It is read with the signed description of {}, the contract such addresses are expected to run.",
+            "Bloom has not verified that {} is {}. It is read with Bloom's description of {}, the contract such addresses are expected to run.",
             checksum(&address),
             admitted
                 .contract_name
@@ -460,7 +399,12 @@ fn review_at(
     Ok((
         ClearSignedCall {
             contract: checksum(&address),
-            contract_name: admitted.contract_name.clone(),
+            contract_name: admitted.contract_name.clone().or_else(|| {
+                entry
+                    .token_metadata
+                    .as_ref()
+                    .map(|token| token.name.clone())
+            }),
             function_signature: call.signature.clone(),
             selector: format!("0x{}", hex_lower(&call.selector)),
             action: action.as_str().to_owned(),
@@ -485,7 +429,7 @@ fn review_at(
 /// would be, so its entries become evidence and its refusals refuse. Returns
 /// whether the reading is structural.
 fn render_embedded(
-    catalog: &AcceptedCatalog,
+    catalog: &Catalog,
     inner: &CallContext<'_>,
     label: &str,
     depth: usize,
@@ -643,7 +587,7 @@ fn resolve_token(
     call: &crate::AdmittedCall,
     leaves: &[DynSolValue],
     entry: &CatalogEntry,
-    catalog: &AcceptedCatalog,
+    catalog: &Catalog,
     context: &CallContext<'_>,
 ) -> Result<ResolvedToken, ReviewError> {
     let token_entry = match source {
@@ -660,7 +604,7 @@ fn resolve_token(
             let address = format!("0x{address:x}");
             catalog.entry(context.chain_id, &address).ok_or_else(|| {
                 unsupported(format!(
-                    "no signed description of the token {address} this call names"
+                    "no description of the token {address} this call names"
                 ))
             })?
         }

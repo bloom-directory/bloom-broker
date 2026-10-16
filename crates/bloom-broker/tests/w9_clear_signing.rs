@@ -1,25 +1,21 @@
-//! Clear signing at the authority boundary: catalog trust, sequence rules,
-//! withdrawal, the downgrade floor, and what a frozen review still needs to
-//! be true when a signature is actually authorized.
+//! Clear signing at the authority boundary: the downgrade floor, and what a
+//! frozen review still needs to be true when a signature is actually
+//! authorized.
 
 use bloom_broker::{
     authority::{
         AssuranceRegistry, AuthorizationInput, BrokerAuthority, CanonicalWalletPolicy,
-        CatalogInstall, CeremonyApprovalGrant, ProvenanceOperationClass, ProvenanceRecord,
-        ProvenanceSubject,
+        CeremonyApprovalGrant, ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject,
     },
     journal::{AuditSigner, BrokerJournal, FrozenReview, ReviewKind},
 };
 use bloom_broker_api::{
     ActivationMode, ApprovalLimits, ApprovalSelector, ApprovalSubject, Base64UrlBytes, BootEpoch,
-    CatalogTrustedKey, ClearSigningPolicy, CryptoSuite, DecimalU64, Digest32,
-    EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES, EVM_CLEAR_SIGNING_VERIFIER_ID, KeyRef, KeySpec,
-    MachineSignRequest, OperationId, RequestNonce, RequiredVerifier, SealedApprovalTerms,
-    SignedPolicySnapshot, SigningPayloads, Token,
+    ClearSigningPolicy, CryptoSuite, DecimalU64, Digest32, KeyRef, KeySpec, MachineSignRequest,
+    OperationId, RequestNonce, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads, Token,
 };
 use bloom_evm_clear_signing::*;
 use ed25519_dalek::{Signer as _, SigningKey};
-use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
 use std::{collections::BTreeMap, sync::Arc};
@@ -158,24 +154,6 @@ impl Harness {
             .unwrap();
     }
 
-    fn try_install_policy(
-        &self,
-        version: u64,
-        clear_signing: Option<ClearSigningPolicy>,
-    ) -> Result<(), String> {
-        let policy = CanonicalWalletPolicy {
-            wallet_id: self.wallet.clone(),
-            maximum_approval_lifetime_ms: 100_000,
-            allowed_petal_packages: Vec::new(),
-            allowed_destinations: Vec::new(),
-            required_verifiers: Vec::new(),
-            clear_signing,
-        };
-        self.authority
-            .install_policy(&self.sign_policy(version, &policy))
-            .map_err(|error| error.to_string())
-    }
-
     fn sign_policy(&self, version: u64, policy: &CanonicalWalletPolicy) -> SignedPolicySnapshot {
         let canonical = serde_jcs::to_vec(policy).unwrap();
         let mut snapshot = SignedPolicySnapshot {
@@ -196,11 +174,6 @@ impl Harness {
         snapshot.signer_signature =
             Base64UrlBytes::from_bytes(&self.policy_key.sign(&message).to_bytes());
         snapshot
-    }
-
-    fn current_policy(&self) -> CanonicalWalletPolicy {
-        let snapshot = self.authority.policy_snapshot(&self.wallet).unwrap();
-        serde_json::from_slice(&snapshot.canonical_policy.decode()).unwrap()
     }
 
     fn system_provenance(&self) -> ProvenanceRecord {
@@ -371,14 +344,9 @@ impl Harness {
     /// The frozen review Broker would have produced for a clear reading of
     /// the catalog entry this suite installs.
     fn clear_review(&self) -> FrozenReview {
-        let accepted = stored(self).unwrap();
         FrozenReview::with_evidence(
             ReviewKind::Clear,
-            &ClearSigningEvidence::new(
-                &accepted,
-                &Digest32::from_bytes(EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES),
-                vec![SelectedEntry::of(accepted.entry(1, TOKEN_ADDRESS).unwrap())],
-            ),
+            &ClearSigningEvidence::new(artifact::digest(), vec![token_entry()], false),
         )
         .unwrap()
     }
@@ -403,6 +371,17 @@ impl Harness {
     }
 }
 
+fn token_entry() -> SelectedEntry {
+    SelectedEntry {
+        chain_id: "1".into(),
+        contract_address: TOKEN_ADDRESS.into(),
+        upgradeable: false,
+        token: None,
+        applies_to_instances: false,
+        instance: None,
+    }
+}
+
 #[allow(non_snake_case)]
 fn REVIEW_MANIFEST_DIGEST() -> Digest32 {
     Digest32::from_bytes([0x33; 32])
@@ -422,195 +401,8 @@ fn sign_zeroed<T: Clone + serde::Serialize>(
 
 use std::path::Path;
 
-fn publisher(seed: u8) -> SigningKey {
-    SigningKey::from_bytes(&[seed; 32])
-}
-
-fn clear_signing_policy(seed: u8) -> ClearSigningPolicy {
-    ClearSigningPolicy {
-        catalog_id: token("bloom-tokens"),
-        trusted_keys: vec![CatalogTrustedKey {
-            key_id: token("publisher-1"),
-            verifying_key: Base64UrlBytes::from_bytes(&publisher(seed).verifying_key().to_bytes()),
-        }],
-        signature_threshold: 1,
-        maximum_observation_age_ms: 86_400_000,
-        opaque_exact_allowed: false,
-        unlimited_allowance_allowed: false,
-        verifier: RequiredVerifier {
-            verifier_id: token(EVM_CLEAR_SIGNING_VERIFIER_ID),
-            verifier_digest: Digest32::from_bytes(EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES),
-        },
-    }
-}
-
-fn entry() -> CatalogEntry {
-    let descriptor = json!({
-        "context": {"contract": {"deployments": [{"chainId": 1, "address": TOKEN_ADDRESS}]}},
-        "display": {"formats": {"transfer(address _to, uint256 _value)": {
-            "fields": [
-                {"path": "_to", "label": "To", "format": "addressName", "visible": "always"},
-                {"path": "_value", "label": "Amount", "format": "tokenAmount",
-                 "params": {"tokenPath": "@.to"}, "visible": "always"}
-            ]
-        }}}
-    });
-    CatalogEntry {
-        chain_id: DecimalU64::new(1),
-        contract_address: TOKEN_ADDRESS.into(),
-        admitted_functions: vec![AdmittedFunction {
-            signature: "transfer(address _to, uint256 _value)".into(),
-            action_class: ActionClass::Transfer,
-        }],
-        descriptor_digest: Some(descriptor_digest(&descriptor).unwrap()),
-        flattened_descriptor: Some(descriptor),
-        runtime_code_hash: None,
-        token_metadata: Some(TokenMetadata {
-            decimals: 6,
-            symbol: "EXA".into(),
-            name: "Example Token".into(),
-        }),
-        upgradeable: false,
-        implementation_hash: None,
-        observed_at_ms: DecimalU64::new(NOW_MS - 1000),
-        applies_to_instances: false,
-    }
-}
-
-fn catalog(sequence: u64, entries: Vec<CatalogEntry>, seed: u8) -> ClearSigningCatalog {
-    let mut catalog = ClearSigningCatalog {
-        schema: CATALOG_SCHEMA.into(),
-        catalog_id: token("bloom-tokens"),
-        sequence: DecimalU64::new(sequence),
-        issued_at_ms: DecimalU64::new(NOW_MS - 10_000),
-        expires_at_ms: DecimalU64::new(NOW_MS + 86_400_000),
-        entries,
-        signatures: Vec::new(),
-    };
-    let mut message = CATALOG_SIGNATURE_DOMAIN.to_vec();
-    message.extend_from_slice(&catalog.unsigned_canonical_bytes().unwrap());
-    catalog.signatures = vec![CatalogSignature {
-        key_id: token("publisher-1"),
-        signature: Base64UrlBytes::from_bytes(&publisher(seed).sign(&message).to_bytes()),
-    }];
-    catalog
-}
-
-fn install(harness: &Harness, catalog: &ClearSigningCatalog) -> Result<bool, String> {
-    let bytes = serde_jcs::to_vec(catalog).unwrap().len();
-    match harness
-        .authority
-        .install_clear_signing_catalog_for_enrolled_wallets(catalog, bytes)
-        .unwrap()
-    {
-        CatalogInstall::Installed => Ok(true),
-        CatalogInstall::NotPinned => Ok(false),
-        CatalogInstall::Rejected(reason) => Err(reason),
-    }
-}
-
-fn stored(harness: &Harness) -> Option<AcceptedCatalog> {
-    let policy = harness.current_policy();
-    let settings = policy.clear_signing.as_ref().unwrap();
-    let trusted = bloom_broker::authority::trusted_catalog_keys(settings).unwrap();
-    harness
-        .authority
-        .clear_signing_catalog(
-            &settings.catalog_id,
-            &trusted,
-            usize::from(settings.signature_threshold),
-        )
-        .unwrap()
-}
-
-#[test]
-fn a_catalog_installs_only_for_a_wallet_that_already_trusts_its_publisher() {
-    let harness = Harness::open(None);
-    harness.install_policy(1, None);
-    // No wallet has enabled clear signing: nothing to install against.
-    assert!(!install(&harness, &catalog(1, vec![entry()], 5)).unwrap());
-    assert!(harness.authority.clear_signing_status().unwrap().is_empty());
-
-    harness.install_policy(2, Some(clear_signing_policy(5)));
-    assert!(install(&harness, &catalog(1, vec![entry()], 5)).unwrap());
-    assert!(stored(&harness).unwrap().entry(1, TOKEN_ADDRESS).is_some());
-
-    // A snapshot signed by someone the wallet does not trust is refused, and
-    // does not replace what is stored.
-    assert!(install(&harness, &catalog(2, vec![], 9)).is_err());
-    assert!(stored(&harness).unwrap().entry(1, TOKEN_ADDRESS).is_some());
-}
-
-#[test]
-fn sequence_moves_forward_only_and_equal_sequences_must_be_identical() {
-    let harness = Harness::open(None);
-    harness.install_policy(1, Some(clear_signing_policy(5)));
-    install(&harness, &catalog(7, vec![entry()], 5)).unwrap();
-
-    // The same sequence with the same content is an idempotent retry.
-    install(&harness, &catalog(7, vec![entry()], 5)).unwrap();
-
-    // The same sequence with different content is a conflict, not a newer
-    // truth to prefer.
-    let mut conflicting = entry();
-    conflicting.observed_at_ms = DecimalU64::new(NOW_MS - 2000);
-    let error = install(&harness, &catalog(7, vec![conflicting], 5)).unwrap_err();
-    assert!(error.contains("sequence"), "{error}");
-
-    // A rollback is refused.
-    assert!(install(&harness, &catalog(6, vec![entry()], 5)).is_err());
-
-    // A newer complete snapshot that omits the entry withdraws it.
-    install(&harness, &catalog(8, vec![], 5)).unwrap();
-    assert!(stored(&harness).unwrap().entry(1, TOKEN_ADDRESS).is_none());
-    assert_eq!(
-        harness.authority.clear_signing_status().unwrap()[0].sequence,
-        "8"
-    );
-}
-
-#[test]
-fn stored_bytes_stop_authorizing_when_the_wallet_rotates_its_trust() {
-    let harness = Harness::open(None);
-    harness.install_policy(1, Some(clear_signing_policy(5)));
-    install(&harness, &catalog(1, vec![entry()], 5)).unwrap();
-    assert!(stored(&harness).is_some());
-
-    // The owner rotates the publisher key in a policy ceremony. Nothing was
-    // deleted, and the same bytes now authorize nothing.
-    harness.install_policy(2, Some(clear_signing_policy(6)));
-    assert!(stored(&harness).is_none());
-    // The operator can still see what is stored, which is how they notice.
-    assert!(!harness.authority.clear_signing_status().unwrap().is_empty());
-
-    // Restarting with the old file is a rejection Broker reports and starts
-    // through, not a startup failure.
-    let error = install(&harness, &catalog(1, vec![entry()], 5)).unwrap_err();
-    assert!(error.contains("CATALOG_REJECTED"), "{error}");
-
-    // The publisher re-signs the same snapshot with the new key. The new
-    // signatures replace the old ones, so the stored bytes authorize again.
-    assert!(install(&harness, &catalog(1, vec![entry()], 6)).unwrap());
-    assert!(stored(&harness).unwrap().entry(1, TOKEN_ADDRESS).is_some());
-}
-
-#[test]
-fn a_policy_pinning_a_verifier_this_build_does_not_contain_is_refused() {
-    let harness = Harness::open(None);
-    let mut wrong_digest = clear_signing_policy(5);
-    wrong_digest.verifier.verifier_digest = Digest32::from_bytes([0xaa; 32]);
-    let error = harness
-        .try_install_policy(1, Some(wrong_digest))
-        .unwrap_err();
-    assert!(error.contains("POLICY_VERIFIER_UNAVAILABLE"), "{error}");
-
-    let mut impossible_threshold = clear_signing_policy(5);
-    impossible_threshold.signature_threshold = 2;
-    assert!(
-        harness
-            .try_install_policy(1, Some(impossible_threshold))
-            .is_err()
-    );
+fn clear_signing_policy() -> ClearSigningPolicy {
+    ClearSigningPolicy::default()
 }
 
 #[test]
@@ -620,7 +412,7 @@ fn enabling_clear_signing_raises_the_downgrade_floor_before_the_policy_is_visibl
         let harness = Harness::open(Some(directory.path()));
         harness.install_policy(1, None);
         assert_eq!(state_floor(directory.path()), None);
-        harness.install_policy(2, Some(clear_signing_policy(5)));
+        harness.install_policy(2, Some(clear_signing_policy()));
         assert_eq!(state_floor(directory.path()), Some(2));
     }
     // Reopening with a build that understands the floor succeeds.
@@ -690,8 +482,7 @@ fn a_clear_approval_cannot_activate_or_sign_once_its_frozen_evidence_is_gone() {
     let directory = tempfile::tempdir().unwrap();
     let payload = b"clear-payload";
     let harness = Harness::open(Some(directory.path()));
-    harness.install_policy(1, Some(clear_signing_policy(5)));
-    install(&harness, &catalog(1, vec![entry()], 5)).unwrap();
+    harness.install_policy(1, Some(clear_signing_policy()));
     let (terms, approval) = prepared_clear_approval(&harness, payload);
 
     // Losing the evidence row must not read as "this approval never had any".
@@ -717,8 +508,7 @@ fn a_clear_approval_cannot_activate_or_sign_once_its_frozen_evidence_is_gone() {
 fn corrupt_evidence_is_refused_rather_than_read_as_absent() {
     let directory = tempfile::tempdir().unwrap();
     let harness = Harness::open(Some(directory.path()));
-    harness.install_policy(1, Some(clear_signing_policy(5)));
-    install(&harness, &catalog(1, vec![entry()], 5)).unwrap();
+    harness.install_policy(1, Some(clear_signing_policy()));
     let (terms, approval) = prepared_clear_approval(&harness, b"clear-payload");
 
     harness.corrupt_stored_evidence(directory.path(), &approval, Some("{\"not\":\"evidence\"}"));
@@ -730,17 +520,15 @@ fn corrupt_evidence_is_refused_rather_than_read_as_absent() {
 fn evidence_cannot_be_swapped_for_another_readings() {
     let directory = tempfile::tempdir().unwrap();
     let harness = Harness::open(Some(directory.path()));
-    harness.install_policy(1, Some(clear_signing_policy(5)));
-    install(&harness, &catalog(1, vec![entry()], 5)).unwrap();
+    harness.install_policy(1, Some(clear_signing_policy()));
     let (terms, approval) = prepared_clear_approval(&harness, b"clear-payload");
 
     // Evidence naming a verifier this build is not is refused, so replacing
     // one approval's reading with another's cannot pass the recheck.
-    let accepted = stored(&harness).unwrap();
     let foreign = ClearSigningEvidence::new(
-        &accepted,
         &Digest32::from_bytes([0x11; 32]),
-        vec![SelectedEntry::of(accepted.entry(1, TOKEN_ADDRESS).unwrap())],
+        vec![token_entry()],
+        false,
     );
     harness.corrupt_stored_evidence(
         directory.path(),
@@ -748,14 +536,13 @@ fn evidence_cannot_be_swapped_for_another_readings() {
         Some(&serde_jcs::to_string(&foreign).unwrap()),
     );
     let error = harness.activate(&terms, &approval).unwrap_err();
-    assert!(error.contains("verifier changed"), "{error}");
+    assert!(error.contains("verifier or catalog changed"), "{error}");
 }
 
 #[test]
 fn reviews_without_catalog_evidence_still_activate_and_sign() {
     let harness = Harness::open(None);
-    harness.install_policy(1, Some(clear_signing_policy(5)));
-    install(&harness, &catalog(1, vec![entry()], 5)).unwrap();
+    harness.install_policy(1, Some(clear_signing_policy()));
 
     for kind in [
         ReviewKind::Legacy,
@@ -795,8 +582,7 @@ fn a_review_whose_kind_and_evidence_disagree_cannot_be_constructed() {
 #[test]
 fn an_identical_retry_is_idempotent_and_a_changed_review_is_a_conflict() {
     let harness = Harness::open(None);
-    harness.install_policy(1, Some(clear_signing_policy(5)));
-    install(&harness, &catalog(1, vec![entry()], 5)).unwrap();
+    harness.install_policy(1, Some(clear_signing_policy()));
     let terms = harness.exact_terms(1, b"clear-payload");
     let approval = harness.prepare(&terms, &harness.clear_review()).unwrap();
 
@@ -819,13 +605,8 @@ fn an_identical_retry_is_idempotent_and_a_changed_review_is_a_conflict() {
         "{error}"
     );
 
-    let accepted = stored(&harness).unwrap();
-    let mut different = ClearSigningEvidence::new(
-        &accepted,
-        &Digest32::from_bytes(EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES),
-        vec![SelectedEntry::of(accepted.entry(1, TOKEN_ADDRESS).unwrap())],
-    );
-    different.catalog_sequence = "99".into();
+    let mut different = ClearSigningEvidence::new(artifact::digest(), vec![token_entry()], false);
+    different.entries[0].upgradeable = true;
     let error = harness
         .prepare(
             &terms,
@@ -840,14 +621,13 @@ fn an_identical_retry_is_idempotent_and_a_changed_review_is_a_conflict() {
     // The original review is untouched by either refusal.
     let (kind, evidence) = harness.authority.frozen_review(&approval).unwrap().unwrap();
     assert_eq!(kind, ReviewKind::Clear);
-    assert_eq!(evidence.unwrap().catalog_sequence, "1");
+    assert!(!evidence.unwrap().entries[0].upgradeable);
 }
 
 #[test]
 fn an_interrupted_preparation_leaves_nothing_that_can_activate() {
     let harness = Harness::open(None);
-    harness.install_policy(1, Some(clear_signing_policy(5)));
-    install(&harness, &catalog(1, vec![entry()], 5)).unwrap();
+    harness.install_policy(1, Some(clear_signing_policy()));
 
     // Preparation that never reached the approval record — a crash between
     // the ceremony and the record — leaves no record at all, so the identity
@@ -866,70 +646,14 @@ fn an_interrupted_preparation_leaves_nothing_that_can_activate() {
 }
 
 #[test]
-fn a_withdrawal_committed_before_the_decision_blocks_the_frozen_review() {
-    let harness = Harness::open(None);
-    harness.install_policy(1, Some(clear_signing_policy(5)));
-    install(&harness, &catalog(1, vec![entry()], 5)).unwrap();
-
-    let payload = b"clear-payload";
-    let (terms, approval) = prepared_clear_approval(&harness, payload);
-    harness
-        .activate(&terms, &approval)
-        .expect("nothing has changed yet");
-
-    // A newer complete snapshot that omits the entry withdraws it, and the
-    // signature that would still have been authorized a moment ago is not.
-    install(&harness, &catalog(2, vec![], 5)).unwrap();
-    let error = harness.authorize(&terms, payload).unwrap_err();
-    assert!(error.contains("withdrawn"), "{error}");
-
-    // An approval prepared without a clear reading is unaffected.
-    let opaque_terms = harness.exact_terms(1, b"opaque-payload");
-    let opaque = harness
-        .prepare(
-            &opaque_terms,
-            &FrozenReview::without_evidence(ReviewKind::OpaqueExact).unwrap(),
-        )
-        .unwrap();
-    harness.activate(&opaque_terms, &opaque).unwrap();
-    harness.authorize(&opaque_terms, b"opaque-payload").unwrap();
-}
-
-#[test]
-fn evidence_that_goes_stale_after_activation_cannot_sign() {
-    let harness = Harness::open(None);
-    let mut policy = clear_signing_policy(5);
-    // The entry was observed 1 s before NOW and may be used for 10 s.
-    policy.maximum_observation_age_ms = 10_000;
-    harness.install_policy(1, Some(policy));
-    install(&harness, &catalog(1, vec![entry()], 5)).unwrap();
-    let payload = b"clear-payload";
-    let (terms, approval) = prepared_clear_approval(&harness, payload);
-    harness.activate(&terms, &approval).unwrap();
-
-    // Signing is judged at the moment it is reserved, not when the terms were
-    // issued: 40 s later the approval is still valid but its evidence is not.
-    assert!(
-        harness
-            .authorize_at(&terms, payload, NOW_MS + 40_000)
-            .is_err()
-    );
-    harness
-        .authorize_at(&terms, payload, NOW_MS + 5_000)
-        .unwrap();
-}
-
-#[test]
 fn a_verifier_upgrade_invalidates_a_review_frozen_under_the_old_one() {
     let harness = Harness::open(None);
-    harness.install_policy(1, Some(clear_signing_policy(5)));
-    install(&harness, &catalog(1, vec![entry()], 5)).unwrap();
+    harness.install_policy(1, Some(clear_signing_policy()));
 
-    let accepted = stored(&harness).unwrap();
     let superseded = ClearSigningEvidence::new(
-        &accepted,
         &Digest32::from_bytes([0x11; 32]),
-        vec![SelectedEntry::of(accepted.entry(1, TOKEN_ADDRESS).unwrap())],
+        vec![token_entry()],
+        false,
     );
     let terms = harness.exact_terms(1, b"clear-payload");
     let approval = harness
@@ -939,64 +663,20 @@ fn a_verifier_upgrade_invalidates_a_review_frozen_under_the_old_one() {
         )
         .unwrap();
     let error = harness.activate(&terms, &approval).unwrap_err();
-    assert!(error.contains("verifier changed"), "{error}");
+    assert!(error.contains("verifier or catalog changed"), "{error}");
 }
 
-#[test]
-fn a_restart_keeps_the_sequence_watermark_and_the_frozen_review() {
-    let directory = tempfile::tempdir().unwrap();
-    let payload = b"clear-payload";
-    let terms;
-    let approval;
-    {
-        let harness = Harness::open(Some(directory.path()));
-        harness.install_policy(1, Some(clear_signing_policy(5)));
-        install(&harness, &catalog(4, vec![entry()], 5)).unwrap();
-        (terms, approval) = prepared_clear_approval(&harness, payload);
-        harness.activate(&terms, &approval).unwrap();
-    }
-    let harness = Harness::open(Some(directory.path()));
-    assert_eq!(
-        harness.authority.clear_signing_status().unwrap()[0].sequence,
-        "4"
-    );
-    // The frozen review survived the restart, so the approval still signs.
-    let (kind, evidence) = harness.authority.frozen_review(&approval).unwrap().unwrap();
-    assert_eq!(kind, ReviewKind::Clear);
-    assert_eq!(evidence.unwrap().catalog_sequence, "4");
-    harness.authorize(&terms, payload).unwrap();
-
-    // The watermark survived, so a rollback is still refused after a restart.
-    assert!(install(&harness, &catalog(3, vec![entry()], 5)).is_err());
-
-    // And a withdrawal after the restart still blocks it.
-    install(&harness, &catalog(5, vec![], 5)).unwrap();
-    assert!(harness.authorize(&terms, payload).is_err());
-}
-
-/// The exact canonical bytes of the authority diff for enabling unlimited
-/// allowances. Bloom's machine client computes a claimed diff that Broker
-/// refuses if it differs, so the two shapes must agree byte for byte.
-/// `bloom-machine-client` asserts this same literal.
 const UNLIMITED_ALLOWANCE_DIFF_JCS: &str = concat!(
     r#"{"added_destinations":[],"added_petal_packages":[],"added_required_verifiers":[],"#,
-    r#""clear_signing":{"after":{"catalog_id":"bloom-tokens","maximum_observation_age_ms":86400000,"#,
-    r#""opaque_exact_allowed":false,"signature_threshold":1,"#,
-    r#""trusted_keys":[{"key_id":"publisher-1","verifying_key":"bnoc3Smwt4_ROvTFWY_v9O8qlxZuPKby5Pv8zYBQW_E"}],"#,
-    r#""unlimited_allowance_allowed":true,"#,
-    r#""verifier":{"verifier_digest":"VERIFIER","verifier_id":"evm-clear-signing-v1"}},"#,
-    r#""before":{"catalog_id":"bloom-tokens","maximum_observation_age_ms":86400000,"#,
-    r#""opaque_exact_allowed":false,"signature_threshold":1,"#,
-    r#""trusted_keys":[{"key_id":"publisher-1","verifying_key":"bnoc3Smwt4_ROvTFWY_v9O8qlxZuPKby5Pv8zYBQW_E"}],"#,
-    r#""unlimited_allowance_allowed":false,"#,
-    r#""verifier":{"verifier_digest":"VERIFIER","verifier_id":"evm-clear-signing-v1"}}},"#,
+    r#""clear_signing":{"after":{"opaque_exact_allowed":false,"unlimited_allowance_allowed":true},"#,
+    r#""before":{"opaque_exact_allowed":false,"unlimited_allowance_allowed":false}},"#,
     r#""maximum_approval_lifetime_ms_after":"100000","maximum_approval_lifetime_ms_before":"100000","#,
     r#""removed_destinations":[],"removed_petal_packages":[],"removed_required_verifiers":[]}"#,
 );
 
 #[test]
 fn enabling_unlimited_allowances_is_a_visible_authority_change() {
-    let mut before = clear_signing_policy(5);
+    let mut before = clear_signing_policy();
     before.unlimited_allowance_allowed = false;
     let mut after = before.clone();
     after.unlimited_allowance_allowed = true;
@@ -1023,10 +703,7 @@ fn enabling_unlimited_allowances_is_a_visible_authority_change() {
 
     assert_eq!(
         serde_jcs::to_string(&changed).unwrap(),
-        UNLIMITED_ALLOWANCE_DIFF_JCS.replace(
-            "VERIFIER",
-            Digest32::from_bytes(EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES).as_str()
-        ),
+        UNLIMITED_ALLOWANCE_DIFF_JCS,
         "Bloom's machine client asserts these same bytes; a change here must be made on both sides"
     );
 }
@@ -1059,91 +736,4 @@ fn wallet_policy(clear_signing: Option<ClearSigningPolicy>) -> CanonicalWalletPo
         required_verifiers: Vec::new(),
         clear_signing,
     }
-}
-
-/// A verifier that moves must not strand the wallet that pinned the old one.
-/// Installing an unknown pin stays refused, and re-presenting the snapshot
-/// already stored stays readable — otherwise the owner could not approve the
-/// policy update that re-pins it, and there would be no way out at all. The
-/// pin is still spent: `clear_signing_context` refuses to produce a review
-/// from a verifier the policy does not name.
-#[test]
-fn an_outdated_verifier_pin_does_not_strand_the_wallet() {
-    let harness = Harness::open(None);
-    let mut stale = clear_signing_policy(7);
-    stale.verifier.verifier_digest = Digest32::from_bytes([0x5a; 32]);
-
-    // Installing a policy pinning a verifier this build lacks is refused.
-    let refused = harness.try_install_policy(2, Some(stale));
-    assert!(
-        refused
-            .as_ref()
-            .err()
-            .is_some_and(|message| message.contains("absent from this build")),
-        "installing an unknown verifier pin must be refused, got {refused:?}"
-    );
-
-    // A policy installed while its verifier was current stays installable
-    // from the identical stored snapshot — the read path a client takes on
-    // every call.
-    harness.install_policy(3, Some(clear_signing_policy(7)));
-    let snapshot = harness.sign_policy(3, &harness.current_policy());
-    harness
-        .authority
-        .install_policy(&snapshot)
-        .expect("re-presenting the stored snapshot must stay readable");
-}
-
-/// `catalog_id` is documented as "the one catalog identity this wallet accepts
-/// descriptions from", and the owner approves it through a policy ceremony.
-/// It was compared only where a catalog is installed, so a wallet read
-/// contract calls against whichever catalog was stored last as long as a
-/// publisher it trusted had signed it.
-#[test]
-fn a_catalog_the_wallet_did_not_pin_describes_nothing_for_it() {
-    let harness = Harness::open(None);
-    harness.install_policy(2, Some(clear_signing_policy(5)));
-    assert!(install(&harness, &catalog(8, vec![entry()], 5)).unwrap());
-    assert!(
-        stored(&harness).is_some(),
-        "the pinned catalog is readable for this wallet"
-    );
-
-    // Same publisher, same threshold, different catalog identity. Installing
-    // it directly is what a second enrolled wallet's startup would do.
-    let mut other = catalog(9, vec![entry()], 5);
-    other.catalog_id = token("staging-catalog");
-    let mut message = CATALOG_SIGNATURE_DOMAIN.to_vec();
-    message.extend_from_slice(&other.unsigned_canonical_bytes().unwrap());
-    other.signatures = vec![CatalogSignature {
-        key_id: token("publisher-1"),
-        signature: Base64UrlBytes::from_bytes(&publisher(5).sign(&message).to_bytes()),
-    }];
-    let settings = clear_signing_policy(5);
-    let trusted = bloom_broker::authority::trusted_catalog_keys(&settings).unwrap();
-    harness
-        .authority
-        .install_clear_signing_catalog(
-            &other,
-            serde_jcs::to_vec(&other).unwrap().len(),
-            &trusted,
-            1,
-        )
-        .expect("a trusted publisher's other catalog installs for the wallets that pin it");
-
-    // The wallet pins `bloom-tokens`, so the substituted catalog describes
-    // nothing for it -- and, crucially, its own catalog is still there.
-    let mine = stored(&harness).expect("the pinned catalog must survive another one's install");
-    assert_eq!(mine.catalog.catalog_id.as_str(), "bloom-tokens");
-    assert_eq!(mine.catalog.sequence.as_str(), "8");
-
-    // Both are visible to the operator, one row each.
-    let status = harness.authority.clear_signing_status().unwrap();
-    let ids: Vec<&str> = status.iter().map(|row| row.catalog_id.as_str()).collect();
-    assert_eq!(ids, vec!["bloom-tokens", "staging-catalog"]);
-
-    // The sequence watermark is per identity, so a catalog stored at a high
-    // sequence under one identity cannot wedge another at a low one.
-    assert!(install(&harness, &catalog(9, vec![entry()], 5)).unwrap());
-    assert_eq!(stored(&harness).unwrap().catalog.sequence.as_str(), "9");
 }

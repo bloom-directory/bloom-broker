@@ -1,5 +1,5 @@
 //! Representative ABI shapes, not endorsements of deployed protocols.
-//! Synthetic signed catalogs isolate what this verifier can actually explain.
+//! Synthetic catalogs isolate what this verifier can actually explain.
 mod support;
 
 use alloy_primitives::U256;
@@ -7,23 +7,13 @@ use bloom_evm_clear_signing::*;
 use serde_json::{Value, json};
 use support::*;
 
-fn other(signature: &str, fields: Value) -> Result<AcceptedCatalog, ReviewError> {
+fn other(signature: &str, fields: Value) -> Result<Catalog, ReviewError> {
     let descriptor = json!({
         "context": {"contract": {"deployments": [{"chainId": CHAIN_ID, "address": TOKEN}]}},
         "metadata": {"contractName": "Example contract"},
         "display": {"formats": {signature: {"fields": fields}}}
     });
-    let mut signed = catalog(vec![entry_at(
-        TOKEN,
-        descriptor,
-        vec![AdmittedFunction {
-            signature: signature.into(),
-            action_class: ActionClass::Other,
-        }],
-        None,
-    )]);
-    sign(&mut signed, &[(1, "publisher-1")]);
-    accept(&signed)
+    build(vec![descriptor], Vec::new())
 }
 
 fn export(name: &str, call: &ClearSignedCall) {
@@ -35,9 +25,7 @@ fn export(name: &str, call: &ClearSignedCall) {
 
 #[test]
 fn scalar_vault_deposit_identifies_the_asset_but_does_not_invent_shares() {
-    let mut signed = catalog(vec![erc20_entry(), vault_entry()]);
-    sign(&mut signed, &[(1, "publisher-1")]);
-    let accepted = accept(&signed).unwrap();
+    let accepted = accepted_vault();
     let bytes = calldata(
         VAULT_DEPOSIT,
         &[

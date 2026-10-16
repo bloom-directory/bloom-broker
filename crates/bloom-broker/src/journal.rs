@@ -171,7 +171,7 @@ pub enum ReviewKind {
     /// One batch contains both catalog-backed and structural readings. Only
     /// the catalog-backed members contribute evidence that must be rechecked.
     Mixed,
-    /// Every contract call in the batch was read from a signed description.
+    /// Every contract call in the batch was read from a catalog description.
     /// Evidence is required and rechecked before every signature.
     Clear,
 }

@@ -5145,14 +5145,14 @@ fn review_disclosures(
             .iter()
             .any(|payload| payload.structural_call.is_some());
         match (&review.clear_signing, has_structural) {
-            (Some(evidence), true) => disclosures.push(format!(
-                "Bloom decoded these transactions from their exact bytes. Catalog {} describes only the catalog-backed calls; the other readings prove standard calldata shapes and exact arguments, not token behavior. Bloom has not executed the calls or established what the contracts do.",
-                evidence.catalog_id
-            )),
-            (Some(evidence), false) => disclosures.push(format!(
-                "Bloom decoded these transactions from their exact bytes and read their contract calls against catalog {}, whose publisher this wallet trusts to describe these contracts. Bloom has not executed the calls or established what the contracts do.",
-                evidence.catalog_id
-            )),
+            (Some(_), true) => disclosures.push(
+                "Bloom decoded these transactions from their exact bytes. Bloom's catalog describes only the catalogued calls; the other readings prove standard calldata shapes and exact arguments, not token behavior. Bloom has not executed the calls or established what the contracts do."
+                    .to_owned(),
+            ),
+            (Some(_), false) => disclosures.push(
+                "Bloom decoded these transactions from their exact bytes and read their contract calls against Bloom's catalog of contract descriptions. Bloom has not executed the calls or established what the contracts do."
+                    .to_owned(),
+            ),
             (None, true) => disclosures.push(
                 "Bloom decoded these transactions from their exact bytes. The contract inputs match standard ERC-20 calldata shapes, but Bloom has not verified token behavior or established execution effects."
                     .to_owned(),

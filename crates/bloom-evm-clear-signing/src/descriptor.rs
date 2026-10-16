@@ -146,7 +146,7 @@ pub struct AdmittedCall {
     pub leaves: Vec<(String, LeafType)>,
     /// `mustMatch` rules: the argument at the path must equal one of the
     /// values, in the form `match_key` gives a decoded value. A constrained
-    /// argument is not shown, because the signed description fixes it.
+    /// argument is not shown, because the description fixes it.
     pub constraints: Vec<(String, Vec<String>)>,
 }
 
@@ -218,13 +218,11 @@ fn text(value: &Value, what: &str) -> Result<String, ReviewError> {
     Ok(value.to_owned())
 }
 
-/// The transfer and approval description every token entry without a
-/// descriptor of its own is read by. It is compiled in, so it is covered by
-/// the verifier digest, and a publisher lists a token by its metadata alone.
-pub fn erc20_profile(chain_id: u64, address: &str, name: &str) -> (Value, Vec<AdmittedFunction>) {
+/// The transfer and approval description every listed token is read by. It
+/// is compiled in, so it is covered by the verifier digest, and a token is
+/// listed by its metadata alone.
+pub fn erc20_profile() -> (Value, Vec<AdmittedFunction>) {
     let descriptor = serde_json::json!({
-        "context": {"contract": {"deployments": [{"chainId": chain_id, "address": address}]}},
-        "metadata": {"contractName": name},
         "display": {"formats": {
             "transfer(address to, uint256 amount)": {"fields": [
                 {"path": "to", "label": "To", "format": "addressName"},
@@ -262,6 +260,34 @@ pub fn admit(
     address: &str,
     admitted_functions: &[AdmittedFunction],
 ) -> Result<AdmittedDescriptor, ReviewError> {
+    admit_document(descriptor, Some((chain_id, address)), admitted_functions)
+}
+
+/// Every `(chain, address)` a descriptor binds itself to, lowercased.
+pub fn deployments(descriptor: &Value) -> Result<Vec<(u64, String)>, ReviewError> {
+    descriptor
+        .pointer("/context/contract/deployments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| rejected("context.contract.deployments must be an array"))?
+        .iter()
+        .map(|deployment| {
+            let chain_id = deployment.get("chainId").and_then(Value::as_u64);
+            let address = deployment.get("address").and_then(Value::as_str);
+            match (chain_id, address) {
+                (Some(chain_id), Some(address)) => Ok((chain_id, address.to_ascii_lowercase())),
+                _ => Err(rejected("a deployment needs a chainId and an address")),
+            }
+        })
+        .collect()
+}
+
+/// `binding` is `None` only for the built-in ERC-20 profile, which describes
+/// every listed token rather than one deployment.
+pub(crate) fn admit_document(
+    descriptor: &Value,
+    binding: Option<(u64, &str)>,
+    admitted_functions: &[AdmittedFunction],
+) -> Result<AdmittedDescriptor, ReviewError> {
     let encoded = serde_jcs::to_vec(descriptor)
         .map_err(|error| rejected(format!("descriptor canonicalization failed: {error}")))?;
     if encoded.len() > DESCRIPTOR_MAX_BYTES {
@@ -288,7 +314,9 @@ pub fn admit(
         "descriptor",
     )?;
 
-    check_binding(root, chain_id, address)?;
+    if let Some((chain_id, address)) = binding {
+        check_binding(root, chain_id, address)?;
+    }
     let (contract_name, enums) = read_metadata(root)?;
 
     let display = object(

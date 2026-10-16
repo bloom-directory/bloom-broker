@@ -12,14 +12,12 @@ use bloom_broker_api::{
     SignedPolicySnapshot, SigningPayloads, SystemUseClaim, Token,
 };
 pub use bloom_broker_api::{CanonicalWalletPolicy, PolicyDestination, RequiredVerifier};
-pub use bloom_broker_api::{ClearSigningPolicy, ClearSigningStatus, ReviewMode};
+pub use bloom_broker_api::{ClearSigningPolicy, ReviewMode};
 pub use bloom_broker_api::{
     ProvenanceCatalog, ProvenanceFeeAsset as PolicyAsset, ProvenanceOperationClass,
     ProvenanceRecord, ProvenanceSubject,
 };
-use bloom_evm_clear_signing::{
-    AcceptedCatalog, ClearSigningCatalog, ClearSigningEvidence, TrustedCatalogKey,
-};
+use bloom_evm_clear_signing::ClearSigningEvidence;
 use bloom_signer_api::SignerActivationReceipt;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use num_bigint::BigUint;
@@ -79,16 +77,6 @@ impl MachineSignOperationIdentity {
         hasher.update(serde_jcs::to_vec(self).map_err(storage)?);
         Ok(Digest32::from_bytes(hasher.finalize().into()))
     }
-}
-
-/// What happened to an operator-supplied clear-signing catalog at startup.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CatalogInstall {
-    Installed,
-    /// No enrolled wallet pins this catalog id.
-    NotPinned,
-    /// Every pinning wallet refused it; the stored catalog is unchanged.
-    Rejected(String),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -629,17 +617,6 @@ impl BrokerAuthority {
                 expires_at_ms TEXT NOT NULL,
                 custody_receipt_digest TEXT NOT NULL
             );
-            -- One row per catalog identity, not one row for the Broker. A
-            -- Broker serves several wallets and each pins its own catalog_id,
-            -- so a shared row would let one wallet's install evict another's
-            -- catalog, and a shared sequence watermark would then refuse to
-            -- put the evicted one back.
-            CREATE TABLE IF NOT EXISTS clear_signing_catalog (
-                catalog_id TEXT PRIMARY KEY,
-                sequence TEXT NOT NULL,
-                content_digest TEXT NOT NULL,
-                catalog_jcs TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS store_compatibility (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 minimum_state_version INTEGER NOT NULL
@@ -799,19 +776,9 @@ impl BrokerAuthority {
         if exact.as_ref().is_some_and(|(version, stored)| {
             *version == snapshot.version.get() && stored == &snapshot_jcs
         }) {
-            // Re-presenting the snapshot already stored is a read, not an
-            // install. It must not be refused because the verifier it pins
-            // has since moved: that would make the wallet unreadable and
-            // leave the owner unable to prepare the re-pin ceremony that is
-            // the only way out. Reviews are refused separately, by the
-            // comparison in `clear_signing_context`, so nothing is accepted
-            // from a verifier the policy does not name.
             return Ok(());
         }
         drop(connection);
-        // Installing or changing a policy still requires the verifier it
-        // pins to exist here.
-        check_clear_signing_policy(policy)?;
         let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
         let existing: Option<(u64, String)> = transaction
@@ -1847,185 +1814,6 @@ impl BrokerAuthority {
         self.journal.checkpoint_committed_head()?;
         Ok(digest)
     }
-
-    /// Install a signed clear-signing catalog, replacing the whole entry set.
-    ///
-    /// The snapshot is verified against the trust a wallet policy pins, so
-    /// the operator supplies bytes and Broker decides whether they authorize
-    /// anything. Sequence must increase; the same sequence with the same
-    /// content is an idempotent retry, and the same sequence with different
-    /// content is refused rather than silently preferred.
-    pub fn install_clear_signing_catalog(
-        &self,
-        catalog: &ClearSigningCatalog,
-        encoded_bytes: usize,
-        trusted: &[TrustedCatalogKey],
-        threshold: usize,
-    ) -> Result<AcceptedCatalog, AuthorityError> {
-        let _barrier = self.lock_authorization_barrier()?;
-        let accepted = catalog
-            .accept(encoded_bytes, trusted, threshold)
-            .map_err(|error| denied("CLEAR_SIGNING_CATALOG_REJECTED", error.to_string()))?;
-        let mut connection = self.lock_for_mutation()?;
-        let transaction = connection.transaction()?;
-        let catalog_jcs = serde_jcs::to_string(catalog).map_err(storage)?;
-        let current: Option<(String, String, String)> = transaction
-            .query_row(
-                "SELECT sequence, content_digest, catalog_jcs FROM clear_signing_catalog
-                 WHERE catalog_id = ?1",
-                params![catalog.catalog_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        if let Some((sequence, digest, stored_jcs)) = current {
-            let stored: u64 = sequence.parse().unwrap_or(0);
-            let incoming = catalog.sequence.get();
-            if incoming < stored
-                || (incoming == stored && digest != accepted.content_digest.as_str())
-            {
-                return Err(denied(
-                    "CLEAR_SIGNING_CATALOG_REJECTED",
-                    "catalog sequence rolls back or reuses a sequence with different content",
-                ));
-            }
-            if incoming == stored && stored_jcs == catalog_jcs {
-                // Same sequence, same bytes: an idempotent retry, not a
-                // second installation to journal. Same content with new
-                // signatures (a key rotation or a co-signature) falls through
-                // and replaces the stored signatures.
-                return Ok(accepted);
-            }
-        }
-        transaction.execute(
-            "INSERT INTO clear_signing_catalog(catalog_id, sequence, content_digest, catalog_jcs)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(catalog_id) DO UPDATE SET
-                sequence=excluded.sequence,
-                content_digest=excluded.content_digest,
-                catalog_jcs=excluded.catalog_jcs",
-            params![
-                catalog.catalog_id.as_str(),
-                catalog.sequence.as_str(),
-                accepted.content_digest.as_str(),
-                catalog_jcs
-            ],
-        )?;
-        self.journal.append_external_audit(
-            &transaction,
-            "clear_signing.catalog_installed",
-            &serde_json::json!({
-                "catalog_id": catalog.catalog_id,
-                "sequence": catalog.sequence,
-                "content_digest": accepted.content_digest,
-                "entries": catalog.entries.len(),
-            }),
-        )?;
-        transaction.commit()?;
-        drop(connection);
-        self.journal.checkpoint_committed_head()?;
-        Ok(accepted)
-    }
-
-    /// Install a snapshot supplied by the operator at startup.
-    ///
-    /// Storage is not authorization. The snapshot is stored only if some
-    /// enrolled wallet's authenticated policy already trusts its signers and
-    /// names its catalog, and every review re-verifies it against the trust
-    /// of the wallet actually being reviewed. A wallet that later rotates its
-    /// keys stops accepting the stored bytes without anything being deleted.
-    ///
-    /// A snapshot every pinning wallet refuses (after a key rotation, or a
-    /// rolled-back file) is reported as `Rejected`, not as an error: Broker
-    /// keeps starting for every wallet. Only storage failures are errors.
-    pub fn install_clear_signing_catalog_for_enrolled_wallets(
-        &self,
-        catalog: &ClearSigningCatalog,
-        encoded_bytes: usize,
-    ) -> Result<CatalogInstall, AuthorityError> {
-        let mut last_error = None;
-        for settings in self.enrolled_clear_signing_policies()? {
-            if settings.catalog_id != catalog.catalog_id {
-                continue;
-            }
-            let trusted = trusted_catalog_keys(&settings)?;
-            match self.install_clear_signing_catalog(
-                catalog,
-                encoded_bytes,
-                &trusted,
-                usize::from(settings.signature_threshold),
-            ) {
-                Ok(_) => return Ok(CatalogInstall::Installed),
-                Err(error @ AuthorityError::Denied { .. }) => last_error = Some(error),
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(match last_error {
-            Some(error) => CatalogInstall::Rejected(error.to_string()),
-            None => CatalogInstall::NotPinned,
-        })
-    }
-
-    fn enrolled_clear_signing_policies(&self) -> Result<Vec<ClearSigningPolicy>, AuthorityError> {
-        let connection = self.lock()?;
-        let mut statement =
-            connection.prepare("SELECT policy_jcs FROM policies ORDER BY wallet_id")?;
-        let rows: Vec<String> = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<_, _>>()?;
-        drop(statement);
-        drop(connection);
-        rows.into_iter()
-            .map(|row| {
-                serde_json::from_str::<CanonicalWalletPolicy>(&row)
-                    .map(|policy| policy.clear_signing)
-                    .map_err(storage)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(|policies| policies.into_iter().flatten().collect())
-    }
-
-    /// The stored catalog, re-accepted under the trust the caller's wallet
-    /// policy pins. Stored bytes are not trusted on their own: a policy that
-    /// rotated its keys stops accepting the snapshot it used to accept.
-    /// The stored catalog, as the wallet whose policy pins `catalog_id`,
-    /// `trusted` and `threshold` sees it.
-    ///
-    /// `catalog_id` is a pin the wallet's owner approved, so it is spent here
-    /// rather than only where a catalog is installed. Broker keeps one catalog
-    /// row, and a second enrolled wallet can name a different catalog, so
-    /// without this check a wallet would read contract calls against whichever
-    /// catalog was installed last as long as a publisher it trusts signed it.
-    /// A catalog the wallet did not pin reads the same as having none: the call
-    /// is refused as undescribable rather than described by the wrong source.
-    pub fn clear_signing_catalog(
-        &self,
-        catalog_id: &Token,
-        trusted: &[TrustedCatalogKey],
-        threshold: usize,
-    ) -> Result<Option<AcceptedCatalog>, AuthorityError> {
-        let connection = self.lock()?;
-        let stored: Option<String> = connection
-            .query_row(
-                "SELECT catalog_jcs FROM clear_signing_catalog WHERE catalog_id = ?1",
-                params![catalog_id.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        drop(connection);
-        let Some(stored) = stored else {
-            return Ok(None);
-        };
-        let catalog: ClearSigningCatalog = serde_json::from_str(&stored).map_err(storage)?;
-        if &catalog.catalog_id != catalog_id {
-            return Ok(None);
-        }
-        match catalog.accept(stored.len(), trusted, threshold) {
-            Ok(accepted) => Ok(Some(accepted)),
-            // Not a storage failure: the wallet no longer trusts what is
-            // stored, which reads the same as having no catalog.
-            Err(_) => Ok(None),
-        }
-    }
 }
 
 impl BrokerAuthority {
@@ -2070,8 +1858,6 @@ impl BrokerAuthority {
         &self,
         approval_id: &Digest32,
         policy: &CanonicalWalletPolicy,
-        verifier_digest: &Digest32,
-        now_ms: u64,
     ) -> Result<(), AuthorityError> {
         let Some((kind, evidence)) = self.frozen_review(approval_id)? else {
             return Err(denied(
@@ -2097,25 +1883,14 @@ impl BrokerAuthority {
             }
             (false, None) => return Ok(()),
         };
-        let settings = policy.clear_signing.as_ref().ok_or_else(|| {
-            denied(
+        if policy.clear_signing.is_none() {
+            return Err(denied(
                 "CLEAR_SIGNING_REVIEW_CHANGED",
                 "wallet policy no longer enables clear signing",
-            )
-        })?;
-        let trusted = trusted_catalog_keys(settings)?;
-        let catalog = self.clear_signing_catalog(
-            &settings.catalog_id,
-            &trusted,
-            usize::from(settings.signature_threshold),
-        )?;
+            ));
+        }
         evidence
-            .recheck(
-                catalog.as_ref(),
-                verifier_digest,
-                now_ms,
-                settings.maximum_observation_age_ms,
-            )
+            .recheck(bloom_evm_clear_signing::artifact::digest())
             .map_err(|error| denied("CLEAR_SIGNING_REVIEW_CHANGED", error.to_string()))
     }
 
@@ -2213,12 +1988,7 @@ impl BrokerAuthority {
             ));
         }
         let (_, activation_policy) = self.current_policy(&terms.wallet_id)?;
-        self.recheck_clear_signing(
-            &grant.approval_id,
-            &activation_policy,
-            &Digest32::from_bytes(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES),
-            now_ms,
-        )?;
+        self.recheck_clear_signing(&grant.approval_id, &activation_policy)?;
         if grant.approval_digest != grant.approval_id
             || grant.approval_id
                 != terms
@@ -2658,7 +2428,6 @@ impl BrokerAuthority {
                 ));
             }
         }
-        check_clear_signing_policy(&proposed)?;
         let authority_diff = canonical_policy_authority_diff(&current, &proposed);
         if authority_diff.digest().map_err(storage)? != request.authority_diff_digest {
             return Err(denied(
@@ -2667,68 +2436,6 @@ impl BrokerAuthority {
             ));
         }
         Ok(authority_diff)
-    }
-
-    /// The operator-visible clear-signing status: what is stored, how long it
-    /// is valid, and which profiles this build can read. One entry per stored
-    /// catalog identity, ordered by identity, because a Broker holds one
-    /// catalog per identity its wallets pin. Per-wallet trust is deliberately
-    /// absent — that lives in the wallet's policy, which `policy.read` already
-    /// returns.
-    pub fn clear_signing_status(&self) -> Result<Vec<ClearSigningStatus>, AuthorityError> {
-        let connection = self.lock()?;
-        let mut statement = connection.prepare(
-            "SELECT catalog_id, sequence, content_digest, catalog_jcs
-             FROM clear_signing_catalog ORDER BY catalog_id",
-        )?;
-        let stored: Vec<(String, String, String, String)> = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?
-            .collect::<Result<_, _>>()?;
-        drop(statement);
-        drop(connection);
-        stored
-            .into_iter()
-            .map(|(catalog_id, sequence, content_digest, stored)| {
-                self.clear_signing_status_row(catalog_id, sequence, content_digest, &stored)
-            })
-            .collect()
-    }
-
-    fn clear_signing_status_row(
-        &self,
-        catalog_id: String,
-        sequence: String,
-        content_digest: String,
-        stored: &str,
-    ) -> Result<ClearSigningStatus, AuthorityError> {
-        let catalog: ClearSigningCatalog = serde_json::from_str(stored).map_err(storage)?;
-        let oldest_observation_ms = catalog
-            .entries
-            .iter()
-            .map(|entry| entry.observed_at_ms.get())
-            .min()
-            .unwrap_or_default();
-        Ok(ClearSigningStatus {
-            catalog_id,
-            sequence,
-            content_digest,
-            expires_at_ms: catalog.expires_at_ms.as_str().to_owned(),
-            entries: catalog.entries.len() as u64,
-            oldest_observation_ms: oldest_observation_ms.to_string(),
-            verifier_id: bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_ID.to_owned(),
-            verifier_digest: Digest32::from_bytes(
-                bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES,
-            )
-            .as_str()
-            .to_owned(),
-        })
     }
 
     pub fn wallet_ids(&self) -> Result<Vec<Token>, AuthorityError> {
@@ -2815,12 +2522,7 @@ impl BrokerAuthority {
         // boundary is this barrier, so the race resolves the same way every
         // time; a withdrawal after a short-lived signing request has been
         // dispatched cannot be recalled, and is not claimed to be.
-        self.recheck_clear_signing(
-            &input.request.approval_id,
-            &policy,
-            &Digest32::from_bytes(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES),
-            input.reserved_at_ms,
-        )?;
+        self.recheck_clear_signing(&input.request.approval_id, &policy)?;
         let (local_epoch, reconciled) = self.epoch_state(&terms.wallet_id)?;
         if !reconciled || local_epoch != terms.wallet_revocation_epoch.get() {
             return Err(denied(
@@ -4534,55 +4236,6 @@ fn raise_state_floor(
             minimum_state_version = MAX(minimum_state_version, excluded.minimum_state_version)",
         [version],
     )?;
-    Ok(())
-}
-
-pub fn trusted_catalog_keys(
-    settings: &ClearSigningPolicy,
-) -> Result<Vec<TrustedCatalogKey>, AuthorityError> {
-    settings
-        .trusted_keys
-        .iter()
-        .map(|key| {
-            let bytes: [u8; 32] =
-                key.verifying_key.decode().try_into().map_err(|_| {
-                    denied("POLICY_INVALID", "a trusted catalog key is not 32 bytes")
-                })?;
-            Ok(TrustedCatalogKey {
-                key_id: key.key_id.clone(),
-                verifying_key: VerifyingKey::from_bytes(&bytes).map_err(|_| {
-                    denied(
-                        "POLICY_INVALID",
-                        "a trusted catalog key is not a valid Ed25519 key",
-                    )
-                })?,
-            })
-        })
-        .collect()
-}
-
-/// Validate a clear-signing extension against this build.
-///
-/// The pinned verifier must exist here, exactly as `required_verifiers`
-/// pins a claim verifier: a policy naming a verifier this binary does not
-/// contain is refused rather than quietly ignored.
-fn check_clear_signing_policy(policy: &CanonicalWalletPolicy) -> Result<(), AuthorityError> {
-    let Some(settings) = &policy.clear_signing else {
-        return Ok(());
-    };
-    settings
-        .validate()
-        .map_err(|error| denied("POLICY_INVALID", error.message))?;
-    trusted_catalog_keys(settings)?;
-    if settings.verifier.verifier_id.as_str() != bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_ID
-        || settings.verifier.verifier_digest
-            != Digest32::from_bytes(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES)
-    {
-        return Err(denied(
-            "POLICY_VERIFIER_UNAVAILABLE",
-            "proposed policy pins a clear-signing verifier absent from this build",
-        ));
-    }
     Ok(())
 }
 
