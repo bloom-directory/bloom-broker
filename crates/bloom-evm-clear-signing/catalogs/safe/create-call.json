@@ -1,0 +1,149 @@
+{
+  "$schema": "https://eips.ethereum.org/assets/eip-7730/erc7730-v2.schema.json",
+  "$comment": "Safe's CreateCall library (1.3.0 twice, 1.4.1, 1.5.0), which a Safe delegatecalls to deploy a contract. Runtime code checked on each chain listed.",
+  "context": {
+    "contract": {
+      "deployments": [
+        {
+          "chainId": 1,
+          "address": "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4"
+        },
+        {
+          "chainId": 1,
+          "address": "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d"
+        },
+        {
+          "chainId": 1,
+          "address": "0x9b35af71d77eaf8d7e40252370304687390a1a52"
+        },
+        {
+          "chainId": 1,
+          "address": "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4"
+        },
+        {
+          "chainId": 10,
+          "address": "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4"
+        },
+        {
+          "chainId": 10,
+          "address": "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d"
+        },
+        {
+          "chainId": 10,
+          "address": "0x9b35af71d77eaf8d7e40252370304687390a1a52"
+        },
+        {
+          "chainId": 10,
+          "address": "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4"
+        },
+        {
+          "chainId": 100,
+          "address": "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4"
+        },
+        {
+          "chainId": 100,
+          "address": "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d"
+        },
+        {
+          "chainId": 100,
+          "address": "0x9b35af71d77eaf8d7e40252370304687390a1a52"
+        },
+        {
+          "chainId": 100,
+          "address": "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4"
+        },
+        {
+          "chainId": 137,
+          "address": "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4"
+        },
+        {
+          "chainId": 137,
+          "address": "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d"
+        },
+        {
+          "chainId": 137,
+          "address": "0x9b35af71d77eaf8d7e40252370304687390a1a52"
+        },
+        {
+          "chainId": 137,
+          "address": "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4"
+        },
+        {
+          "chainId": 8453,
+          "address": "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4"
+        },
+        {
+          "chainId": 8453,
+          "address": "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d"
+        },
+        {
+          "chainId": 8453,
+          "address": "0x9b35af71d77eaf8d7e40252370304687390a1a52"
+        },
+        {
+          "chainId": 8453,
+          "address": "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4"
+        },
+        {
+          "chainId": 42161,
+          "address": "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4"
+        },
+        {
+          "chainId": 42161,
+          "address": "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d"
+        },
+        {
+          "chainId": 42161,
+          "address": "0x9b35af71d77eaf8d7e40252370304687390a1a52"
+        },
+        {
+          "chainId": 42161,
+          "address": "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "owner": "Safe{Wallet}",
+    "contractName": "Safe CreateCall"
+  },
+  "display": {
+    "formats": {
+      "performCreate(uint256 value, bytes deploymentData)": {
+        "intent": "Deploy a contract",
+        "fields": [
+          {
+            "path": "value",
+            "label": "Sends to the new contract",
+            "format": "amount"
+          },
+          {
+            "path": "deploymentData",
+            "label": "Contract code",
+            "format": "raw"
+          }
+        ]
+      },
+      "performCreate2(uint256 value, bytes deploymentData, bytes32 salt)": {
+        "intent": "Deploy a contract at a fixed address",
+        "fields": [
+          {
+            "path": "value",
+            "label": "Sends to the new contract",
+            "format": "amount"
+          },
+          {
+            "path": "deploymentData",
+            "label": "Contract code",
+            "format": "raw"
+          },
+          {
+            "path": "salt",
+            "label": "Salt",
+            "format": "raw"
+          }
+        ]
+      }
+    }
+  }
+}
