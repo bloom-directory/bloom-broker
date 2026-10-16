@@ -321,7 +321,10 @@ pub(crate) fn review(
                             && !(field.raw == "0"
                                 && matches!(field.label.as_str(), "Safe gas limit" | "Base gas"))
                     })
-                    .map(|field| format!("{}: {}", field.label, field.value)),
+                    .map(|field| {
+                        let label = field.label.trim_start_matches("Safe transaction · ");
+                        format!("{label}: {}", field.value)
+                    }),
             );
             lines.extend(
                 call.warnings
