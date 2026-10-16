@@ -436,7 +436,7 @@ for (const expected of ["Deploy a contract", "Initcode", "5 bytes", "0xcafe"]) {
   if (!rendered.includes(expected)) throw new Error(`creation not disclosed ${{expected}}: ${{rendered}}`);
 }}
 
-// A Safe review is the headline, with the Petal-reported state marked unverified.
+// A Safe review is the headline.
 renderReview({{
   ceremony_kind: "sealed_approval",
   expires_at_ms: Date.now() + 60000,
@@ -453,11 +453,7 @@ renderReview({{
       action: ["Action: ERC-20 transfer", "Token: 0x5000000000000000000000000000000000000000",
         "Recipient: 0x6000000000000000000000000000000000000000", "Token amount (base units): 123",
         "Warning: this removes this Bloom wallet from the Safe's owners"],
-      safe_tx_hash: "0x9565",
-      reported: {{version: "1.4.1", singleton: "0x41", singleton_code_hash: "0x1f",
-        owners: ["0x3000000000000000000000000000000000000000", "0xaaaa"], threshold: "2",
-        guard: "0x0000000000000000000000000000000000000000", modules: [],
-        fallback_handler: "0x0000000000000000000000000000000000000000"}}
+      safe_tx_hash: "0x9565"
     }}}}),
     attributed_advisory_items: []
   }}
@@ -465,9 +461,7 @@ renderReview({{
 rendered = allText(nodes.review);
 for (const expected of ["Approve one Safe transaction", "ERC-20 transfer",
   "0x6000000000000000000000000000000000000000", "Token amount (base units): 123",
-  "Safe nonce", "0x9565", "rebuilt from the exact signing bytes", "not verified",
-  "Reported by the Petal, not verified",
-  "Threshold 2 of 2 owners"]) {{
+  "Safe nonce", "0x9565", "rebuilt from the exact signing bytes", "not verified"]) {{
   if (!rendered.includes(expected)) throw new Error(`Safe review not disclosed ${{expected}}: ${{rendered}}`);
 }}
 const banners = node => !node || typeof node === "string" ? [] : [
@@ -5517,11 +5511,7 @@ async fn unreadable_safe_call_carries_a_signed_inability_to_explain_disclosure()
         "chain_id":"1", "chain":"ethereum", "safe":"0x1000000000000000000000000000000000000000",
         "owner":"0x3000000000000000000000000000000000000000", "nonce":"4", "operation":"call",
         "destination":"0x4000000000000000000000000000000000000000", "value":"0", "value_display":"0 ETH",
-        "action":["Action: Contract call Bloom cannot read", "Reason: no description of 0x4000000000000000000000000000000000000000 on chain 1"], "safe_tx_hash":"0x1234",
-        "reported":{"version":"1.4.1", "singleton":"0x41", "singleton_code_hash":"0x1f",
-            "owners":["0x3000000000000000000000000000000000000000"], "threshold":"1",
-            "guard":"0x0000000000000000000000000000000000000000", "modules":[],
-            "fallback_handler":"0x0000000000000000000000000000000000000000", "library_code_hash":null}
+        "action":["Action: Contract call Bloom cannot read", "Reason: no description of 0x4000000000000000000000000000000000000000 on chain 1"], "safe_tx_hash":"0x1234"
     })).unwrap();
     let prepared = broker
         .prepare_approval(

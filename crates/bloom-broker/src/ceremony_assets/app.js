@@ -641,14 +641,6 @@ function describeTransfer(manifest) {
       ["Operation", safe.operation],
       ["Safe transaction hash", safe.safe_tx_hash, true],
       ["Bloom verification", "Safe transaction rebuilt from the exact signing bytes. Safe configuration and call execution effects are not verified."],
-      ["Reported by the Petal, not verified", [
-        `Safe version ${safe.reported.version}`,
-        `Threshold ${safe.reported.threshold} of ${safe.reported.owners.length} owners`,
-        `Singleton ${safe.reported.singleton}`,
-        `Guard ${safe.reported.guard}`,
-        `Modules ${safe.reported.modules.join(", ") || "none"}`,
-        `Fallback handler ${safe.reported.fallback_handler}`,
-      ].join("\n")],
     ];
     const sentence = `Approve one Safe transaction on <strong>${escapeHtml(network)}</strong>: ${escapeHtml(safeAction[0].replace(/^Action: /, ""))}.`;
     return {sentence, facts, warnings: safeWarnings, willVerify: true};

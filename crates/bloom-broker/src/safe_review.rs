@@ -10,8 +10,7 @@ use bloom_broker_api::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-/// Facts Broker rebuilt from the exact Safe signing bytes, plus what the
-/// Petal reported about the Safe and Broker could not check.
+/// Facts Broker rebuilt from the exact Safe signing bytes.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SafeReview {
@@ -26,31 +25,13 @@ pub struct SafeReview {
     pub value_display: String,
     pub action: Vec<String>,
     pub safe_tx_hash: String,
-    pub reported: SafeReported,
     /// The catalog entries that read the inner calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clear_signing: Option<bloom_evm_clear_signing::ClearSigningEvidence>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SafeReported {
-    pub version: String,
-    pub singleton: String,
-    pub singleton_code_hash: String,
-    pub owners: Vec<String>,
-    pub threshold: String,
-    pub guard: String,
-    pub modules: Vec<String>,
-    pub fallback_handler: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub library_code_hash: Option<String>,
-}
-
 const MAX_REVIEW_BYTES: usize = 256 * 1024;
 const MAX_CALLDATA_BYTES: usize = 128 * 1024;
-const MAX_OWNERS: usize = 64;
-const MAX_MODULES: usize = 64;
 const SAFE_TX_TYPE: &str = "SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)";
 const DOMAIN_TYPE: &str = "EIP712Domain(uint256 chainId,address verifyingContract)";
 
@@ -107,57 +88,6 @@ fn uint(value: &str, field: &str) -> Result<U256, ProtocolError> {
         )));
     }
     U256::from_str(value).map_err(|_| invalid(format!("{field} is too large")))
-}
-
-/// A 32-byte hash as a Petal reports it.
-///
-/// Broker cannot verify these against a chain, but a hash has a shape, and a
-/// field with a checkable shape is checked: the value is rendered into the
-/// ceremony, so accepting arbitrary text here means accepting whatever a
-/// Petal puts on the approval screen.
-fn code_hash(value: &str, field: &str) -> Result<(), ProtocolError> {
-    let digits = value
-        .strip_prefix("0x")
-        .ok_or_else(|| invalid(format!("{field} must be 0x-prefixed hex")))?;
-    if digits.len() != 64 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(invalid(format!(
-            "{field} must be a 0x-prefixed 32-byte hash"
-        )));
-    }
-    Ok(())
-}
-
-/// A Safe version as a Petal reports it: `major.minor.patch`, optionally with
-/// a short alphanumeric suffix such as `1.3.0+L2`. Short and printable, for
-/// the same reason as `code_hash`.
-fn safe_version(value: &str) -> Result<(), ProtocolError> {
-    let invalid_version = || invalid("safe_version must look like 1.4.1, with an optional +suffix");
-    if value.is_empty() || value.len() > 16 {
-        return Err(invalid_version());
-    }
-    let (core, suffix) = match value.split_once('+') {
-        Some((core, suffix)) => (core, Some(suffix)),
-        None => (value, None),
-    };
-    if let Some(suffix) = suffix
-        && (suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()))
-    {
-        return Err(invalid_version());
-    }
-    let parts: Vec<&str> = core.split('.').collect();
-    if parts.len() != 3 {
-        return Err(invalid_version());
-    }
-    for part in parts {
-        if part.is_empty()
-            || part.len() > 3
-            || (part.len() > 1 && part.starts_with('0'))
-            || !part.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err(invalid_version());
-        }
-    }
-    Ok(())
 }
 
 fn bytes(value: &str, field: &str) -> Result<Vec<u8>, ProtocolError> {
@@ -253,57 +183,19 @@ fn exact_bytes(
     Ok((ordered_payload_digests, ordered_hashes))
 }
 
+/// The Safe's version, singleton, owners, threshold, guard, modules and
+/// fallback handler are the Petal's report and outside the signed bytes, so
+/// Broker neither checks nor shows them. It checks the one thing it can: the
+/// signing owner is this wallet's key.
 fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolError> {
     if envelope.schema != "bloom.safe.review.v1" {
         return Err(invalid("unsupported Safe review schema"));
     }
-    // Petal-reported fields outside the EIP-712 preimage are bounded for
-    // display only: a pinned table could refuse an honest Petal and not a
-    // dishonest one. A pre-1.3.0 domain separator fails the selector check.
-    // Bounded still means checked, though -- every one of these is rendered
-    // into the ceremony, so each is held to the shape its own type has.
-    address(&envelope.singleton, "singleton")?;
-    address(&envelope.guard, "guard")?;
-    address(&envelope.fallback_handler, "fallback_handler")?;
-    safe_version(&envelope.safe_version)?;
-    code_hash(&envelope.singleton_code_hash, "singleton_code_hash")?;
-    if let Some(hash) = &envelope.library_code_hash {
-        code_hash(hash, "library_code_hash")?;
-    }
-    if envelope.owners.len() > MAX_OWNERS || envelope.modules.len() > MAX_MODULES {
-        return Err(invalid(
-            "Safe owner or module count is outside supported bounds",
-        ));
-    }
-    for value in &envelope.owners {
-        address(value, "owners[]")?;
-    }
-    for value in &envelope.modules {
-        address(value, "modules[]")?;
-    }
-    let threshold = uint(&envelope.threshold, "threshold")?;
-    let owners = envelope
-        .owners
-        .iter()
-        .map(|value| address(value, "owners[]"))
-        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
-    if threshold == U256::ZERO
-        || threshold > U256::from(owners.len())
-        || owners.len() != envelope.owners.len()
-    {
-        return Err(invalid(
-            "reported Safe owners must be distinct and threshold must be between one and owner count",
-        ));
-    }
-
-    // `from` comes from the Signer-held key, so this is the one configuration
-    // fact Broker can establish itself.
     if address(&envelope.owner, "owner")? != from {
         return Err(invalid(
             "Safe review owner differs from the Bloom signing key",
         ));
     }
-
     Ok(())
 }
 
@@ -469,25 +361,6 @@ pub(crate) fn review(
         value: envelope.safe_tx.value,
         action,
         safe_tx_hash: format!("{:#x}", keccak256(&preimage)),
-        reported: SafeReported {
-            version: envelope.safe_version,
-            singleton: address(&envelope.singleton, "singleton")?.to_string(),
-            singleton_code_hash: envelope.singleton_code_hash,
-            owners: envelope
-                .owners
-                .iter()
-                .map(|value| address(value, "owners[]").map(|address| address.to_string()))
-                .collect::<Result<_, _>>()?,
-            threshold: envelope.threshold,
-            guard: address(&envelope.guard, "guard")?.to_string(),
-            modules: envelope
-                .modules
-                .iter()
-                .map(|value| address(value, "modules[]").map(|address| address.to_string()))
-                .collect::<Result<_, _>>()?,
-            fallback_handler: address(&envelope.fallback_handler, "fallback_handler")?.to_string(),
-            library_code_hash: envelope.library_code_hash,
-        },
         clear_signing: evidence,
     }))
 }
@@ -829,37 +702,6 @@ mod tests {
         assert!(is_opaque(&plan));
     }
 
-    #[test]
-    fn petal_reported_version_and_code_hashes_must_have_their_own_shape() {
-        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-        for (field, bad) in [
-            ("safe_version", serde_json::json!("1.4.1; see attached")),
-            ("safe_version", serde_json::json!("")),
-            ("safe_version", serde_json::json!("1.4")),
-            ("safe_version", serde_json::json!("01.4.1")),
-            ("singleton_code_hash", serde_json::json!("not a hash")),
-            ("singleton_code_hash", serde_json::json!("0xabcd")),
-            ("library_code_hash", serde_json::json!("0xzz")),
-        ] {
-            let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-            value[field] = bad.clone();
-            let bytes = serde_jcs::to_vec(&value).unwrap();
-            assert!(
-                review(&request(bytes), &policy(), from).is_err(),
-                "{field} = {bad} must be refused"
-            );
-        }
-
-        // The shapes an honest Petal reports are all still accepted.
-        for version in ["1.3.0", "1.4.1", "1.5.0", "1.3.0+L2"] {
-            let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-            value["safe_version"] = serde_json::json!(version);
-            let bytes = serde_jcs::to_vec(&value).unwrap();
-            review(&request(bytes), &policy(), from)
-                .unwrap_or_else(|error| panic!("{version} must be accepted: {error}"));
-        }
-    }
-
     fn multisend_entry(to: &str, value: u64, data: &[u8]) -> Vec<u8> {
         let mut out = vec![0_u8];
         out.extend_from_slice(address(to, "to").unwrap().as_slice());
@@ -950,82 +792,6 @@ mod tests {
                 .message
                 .contains("cannot be mixed")
         );
-    }
-
-    #[test]
-    fn impossible_reported_owner_sets_and_thresholds_are_refused() {
-        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-        for threshold in ["0", "2"] {
-            let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-            value["threshold"] = serde_json::json!(threshold);
-            let request = request(serde_jcs::to_vec(&value).unwrap());
-            assert!(
-                review(&request, &policy(), from)
-                    .unwrap_err()
-                    .message
-                    .contains("threshold must be between")
-            );
-        }
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["owners"] = serde_json::json!([from.to_string(), from.to_string()]);
-        let request = request(serde_jcs::to_vec(&value).unwrap());
-        assert!(
-            review(&request, &policy(), from)
-                .unwrap_err()
-                .message
-                .contains("owners must be distinct")
-        );
-    }
-
-    #[test]
-    fn unverifiable_safe_state_is_reported_separately_from_the_rebuilt_transaction() {
-        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        // `threshold` is not an EIP-712 member, so the digest cannot constrain
-        // it and Broker has no chain client to check it against. It must not be
-        // presented as something Broker established.
-        value["threshold"] = serde_json::json!("3");
-        value["owners"] = serde_json::json!([
-            "0x3000000000000000000000000000000000000000",
-            "0xaaaa000000000000000000000000000000000000",
-            "0xbbbb000000000000000000000000000000000000"
-        ]);
-        let canonical = serde_jcs::to_vec(&value).unwrap();
-        let plan = review(&request(canonical), &policy(), from)
-            .unwrap()
-            .unwrap();
-        assert_eq!(plan.reported.threshold, "3");
-        assert_eq!(plan.reported.owners.len(), 3);
-        assert!(
-            !serde_json::to_string(&plan)
-                .unwrap()
-                .contains("Broker-verified")
-        );
-    }
-
-    #[test]
-    fn an_unrecognized_safe_deployment_is_disclosed_rather_than_refused() {
-        // Deployment fields are outside the preimage: a pinned table could only
-        // refuse an honest Petal, so they are disclosed as unverified instead.
-        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["singleton"] = serde_json::json!("0x4000000000000000000000000000000000000000");
-        value["singleton_code_hash"] = serde_json::json!("0x".to_owned() + &"ab".repeat(32));
-        value["safe_version"] = serde_json::json!("1.4.2");
-        let canonical = serde_jcs::to_vec(&value).unwrap();
-
-        let plan = review(&request(canonical), &policy(), from)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            plan.reported.singleton,
-            "0x4000000000000000000000000000000000000000"
-        );
-        assert_eq!(
-            plan.reported.singleton_code_hash,
-            "0x".to_owned() + &"ab".repeat(32)
-        );
-        assert_eq!(plan.reported.version, "1.4.2");
     }
 
     #[test]
