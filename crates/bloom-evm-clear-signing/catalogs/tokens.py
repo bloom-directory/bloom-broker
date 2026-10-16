@@ -20,6 +20,8 @@ UNISWAP = "https://cdn.jsdelivr.net/npm/@uniswap/default-token-list@{}/build/uni
 UNISWAP_VERSION = "22.27.0"
 # Uniswap's list has no Gnosis tokens.
 GNOSIS = "https://tokens.coingecko.com/xdai/all.json"
+# Robinhood's Stock Tokens, from the issuer's own registry.
+ROBINHOOD = "https://api.robinhood.com/rhj/assets"
 RPC = {
     1: "https://ethereum-rpc.publicnode.com",
     10: "https://optimism-rpc.publicnode.com",
@@ -27,6 +29,7 @@ RPC = {
     137: "https://polygon-bor-rpc.publicnode.com",
     8453: "https://base-rpc.publicnode.com",
     42161: "https://arbitrum-one-rpc.publicnode.com",
+    4663: "https://rpc.mainnet.chain.robinhood.com",
 }
 PROXY_SLOTS = [
     # EIP-1967 implementation
@@ -35,7 +38,8 @@ PROXY_SLOTS = [
     "0x7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3",
 ]
 DECIMALS, SYMBOL, NAME = "0x313ce567", "0x95d89b41", "0x06fdde03"
-BATCH = 20
+# Tokens per RPC request. Robinhood's endpoint rate-limits large batches.
+BATCH = {4663: 2}
 
 
 def get(url):
@@ -51,14 +55,15 @@ def rpc(chain, calls):
     request = urllib.request.Request(
         RPC[chain], body, {"Content-Type": "application/json", "User-Agent": "bloom-tokens"}
     )
-    for attempt in range(8):
+    for attempt in range(10):
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
                 replies = {reply["id"]: reply.get("result") for reply in json.load(response)}
+            time.sleep(0.5)
             return [replies.get(i) for i in range(len(calls))]
         except urllib.error.HTTPError as error:
-            if error.code != 429 or attempt == 7:
-                raise
+            if error.code != 429 or attempt == 9:
+                raise RuntimeError(f"chain {chain}: {error}") from error
             time.sleep(2**attempt)
 
 
@@ -89,7 +94,23 @@ def candidates():
     """Tokens with whether their list's labels are curated (Uniswap's are;
     CoinGecko's call wrapped xDAI "XDAI")."""
     seen = set()
-    lists = [(get(UNISWAP.format(UNISWAP_VERSION))["tokens"], True), (get(GNOSIS)["tokens"], False)]
+    stocks = [
+        {
+            "chainId": deployment["chainId"],
+            "address": deployment["contractAddress"],
+            "symbol": asset["tokenSymbol"],
+            "name": asset["tokenName"],
+            "decimals": asset["tokenDecimals"],
+        }
+        for asset in get(ROBINHOOD)["assets"]
+        if asset["status"] == "ASSET_STATUS_ACTIVE"
+        for deployment in asset["deployments"]
+    ]
+    lists = [
+        (get(UNISWAP.format(UNISWAP_VERSION))["tokens"], True),
+        (get(GNOSIS)["tokens"], False),
+        (stocks, True),
+    ]
     for tokens, curated in lists:
         for token in tokens:
             key = (token["chainId"], token["address"].lower())
@@ -104,8 +125,9 @@ def main():
     for token in candidates():
         by_chain.setdefault(token["chainId"], []).append(token)
     for chain, tokens in sorted(by_chain.items()):
-        for start in range(0, len(tokens), BATCH):
-            batch = tokens[start : start + BATCH]
+        size = BATCH.get(chain, 20)
+        for start in range(0, len(tokens), size):
+            batch = tokens[start : start + size]
             calls = []
             for token in batch:
                 address = token["address"].lower()
