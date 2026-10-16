@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use bloom_broker_api::{
     ApprovalLifecycleState, ApprovalPrepareRequest, ApprovalRenewRequest, ApprovalSelector,
-    Base64UrlBytes, BootEpoch, DecimalU64, Digest32, MachineBrokerMethod, MachineBrokerRequest,
-    MachineBrokerResponse, MachineBrokerService, MachineSignRequest, OperationId,
-    OperationPublicStatus, OperationState, PolicyUpdateRequest, ProtocolError, ProtocolErrorCode,
-    RPC_ENVELOPE_SCHEMA_V1, Readiness, ReadinessState, RevokeRequest,
+    ApprovalSubject, Base64UrlBytes, BootEpoch, DecimalU64, Digest32, MachineBrokerMethod,
+    MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
+    OperationId, OperationPublicStatus, OperationState, PolicyUpdateRequest, ProtocolError,
+    ProtocolErrorCode, RPC_ENVELOPE_SCHEMA_V1, Readiness, ReadinessState, RevokeRequest,
     SealedApprovalPrepareResponse, ServiceCapabilities, ServiceFuture, SigningPayloads, Token,
     VerifierPublicCapability, WalletAccountsPublic, WalletPublic, WalletRequest, WalletSeedProfile,
 };
@@ -801,7 +801,51 @@ impl BrokerRpcService {
                 "native EVM approval requires full review payloads; upgrade Bloom Machine",
             ));
         }
-        if !request.evm_review_payloads.is_empty() {
+        // A package declaring the Safe class signs opaque EIP-712 preimages:
+        // exact approvals need the envelope and reusable ones are refused.
+        let safe_class = bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS;
+        let safe_petal = matches!(request.terms.subject, ApprovalSubject::Petal { .. })
+            && self
+                .authority
+                .subject_declares_operation_class(&request.terms.subject, safe_class)
+                .map_err(authority_error)?;
+        match &request.terms.selector {
+            ApprovalSelector::Exact { .. } => {
+                if safe_petal && request.safe_review_payloads.is_empty() {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "Safe approval requires the review envelope; upgrade Bloom Machine",
+                    ));
+                }
+            }
+            ApprovalSelector::Petal {
+                allowed_operation_classes,
+                route_grants,
+                ..
+            } => {
+                if allowed_operation_classes
+                    .iter()
+                    .chain(
+                        route_grants
+                            .iter()
+                            .flat_map(|grant| &grant.allowed_operation_classes),
+                    )
+                    .any(|class| class.as_str() == safe_class)
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "Safe transactions require exact approval",
+                    ));
+                }
+            }
+        }
+        if !request.safe_review_payloads.is_empty() && !safe_petal {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "Safe review payloads require a Safe Petal subject",
+            ));
+        }
+        if !request.evm_review_payloads.is_empty() || !request.safe_review_payloads.is_empty() {
             let response = self
                 .signer
                 .request_for_machine(BrokerSignerRequest::KeyGetPublic(
@@ -842,7 +886,10 @@ impl BrokerRpcService {
             let catalog = bloom_evm_clear_signing::Catalog::built_in().map_err(|error| {
                 ProtocolError::new(ProtocolErrorCode::AssuranceUnavailable, error.to_string())
             })?;
-            context.evm_review = crate::evm_review::review(&request, &policy, from, catalog)?;
+            if !request.evm_review_payloads.is_empty() {
+                context.evm_review = crate::evm_review::review(&request, &policy, from, catalog)?;
+            }
+            context.safe_review = crate::safe_review::review(&request, &policy, from, catalog)?;
         }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
             ApprovalSelector::Exact {
@@ -1054,6 +1101,7 @@ impl BrokerRpcService {
         self.prepare_approval(ApprovalPrepareRequest {
             requested_review_mode: None,
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
             operation_id: request.operation_id,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             canonical_plan_facts_digest: request.replacement_terms.approval_digest()?,

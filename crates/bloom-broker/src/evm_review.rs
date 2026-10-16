@@ -259,6 +259,37 @@ fn apply_review_mode(
     requested: Option<ReviewMode>,
     catalog: &Catalog,
 ) -> Result<(), ProtocolError> {
+    let mut entries: Vec<SelectedEntry> = Vec::new();
+    let mut structural = false;
+    for (payload, call) in review.payloads.iter_mut().zip(calls) {
+        let Some(call) = call else { continue };
+        let Some((clear, selected)) = review_contract_call(call, policy, requested, catalog)?
+        else {
+            continue;
+        };
+        structural |= clear.structural;
+        for entry in selected {
+            if !entries.contains(&entry) {
+                entries.push(entry);
+            }
+        }
+        payload.contract_call = Some(clear);
+    }
+    if !entries.is_empty() {
+        review.clear_signing = Some(ClearSigningEvidence::new(entries, structural));
+    }
+    Ok(())
+}
+
+/// One contract call, read under the wallet's policy. Native and Safe calls
+/// share it. `None` is a call approved as exact bytes: one Bloom cannot read
+/// in a wallet without clear signing, or under an explicit opaque request.
+pub(crate) fn review_contract_call(
+    call: &DecodedCall,
+    policy: &CanonicalWalletPolicy,
+    requested: Option<ReviewMode>,
+    catalog: &Catalog,
+) -> Result<Option<(ClearSignedCall, Vec<SelectedEntry>)>, ProtocolError> {
     let settings = policy.clear_signing.as_ref();
     // An incapable wallet refuses a required mode rather than ignoring it.
     if settings.is_none() && requested.is_some() {
@@ -274,53 +305,32 @@ fn apply_review_mode(
             "wallet policy does not allow approving payloads Bloom cannot explain",
         ));
     }
-    let unlimited = settings.is_none_or(|settings| settings.unlimited_allowance_allowed);
-    let mut entries: Vec<SelectedEntry> = Vec::new();
-    let mut structural = false;
-    for (payload, call) in review.payloads.iter_mut().zip(calls) {
-        let Some(call) = call else { continue };
-        match review_call(catalog, &call_context(payload, call, unlimited)) {
-            Ok(_) if opaque => {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::ClaimInvalid,
-                    "POLICY_DENIED: Bloom can read this call, so it cannot be approved unread; \
-                     request a clear-signed review",
-                ));
-            }
-            Ok((clear, selected)) => {
-                structural |= clear.structural;
-                for entry in selected {
-                    if !entries.contains(&entry) {
-                        entries.push(entry);
-                    }
-                }
-                payload.contract_call = Some(clear);
-            }
-            // Without clear signing nothing is refused for being unreadable:
-            // the call is approved as exact bytes, as it always was.
-            Err(_) if settings.is_none() => {}
-            Err(error) if opaque && error.reason == ReviewReason::UnsupportedCall => {}
-            Err(error) => return Err(review_error(error)),
-        }
-    }
-    if !entries.is_empty() {
-        review.clear_signing = Some(ClearSigningEvidence::new(entries, structural));
-    }
-    Ok(())
-}
-
-fn call_context<'a>(
-    payload: &EvmReviewPayload,
-    call: &'a DecodedCall,
-    unlimited_allowance_allowed: bool,
-) -> CallContext<'a> {
-    CallContext {
-        chain_id: call.chain_id,
-        to: call.to,
-        value: call.value,
-        calldata: &call.calldata,
-        native: native_units(&payload.chain),
-        unlimited_allowance_allowed,
+    let reading = review_call(
+        catalog,
+        &CallContext {
+            chain_id: call.chain_id,
+            to: call.to,
+            value: call.value,
+            calldata: &call.calldata,
+            native: native_units(&chain_name(call.chain_id)),
+            unlimited_allowance_allowed: settings
+                .is_none_or(|settings| settings.unlimited_allowance_allowed),
+        },
+    );
+    match reading {
+        // Opaque is for calls Bloom cannot read. A call it can read keeps its
+        // reading and its refusals: the requester cannot opt out of them.
+        Ok(_) if opaque => Err(ProtocolError::new(
+            ProtocolErrorCode::ClaimInvalid,
+            "POLICY_DENIED: Bloom can read this call, so it cannot be approved unread; \
+             request a clear-signed review",
+        )),
+        Ok(reading) => Ok(Some(reading)),
+        // Without clear signing nothing is refused for being unreadable: the
+        // call is approved as exact bytes, as it always was.
+        Err(_) if settings.is_none() => Ok(None),
+        Err(error) if opaque && error.reason == ReviewReason::UnsupportedCall => Ok(None),
+        Err(error) => Err(review_error(error)),
     }
 }
 
@@ -446,7 +456,7 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
     ))
 }
 
-fn chain_name(chain_id: u64) -> String {
+pub(crate) fn chain_name(chain_id: u64) -> String {
     match chain_id {
         1 => "ethereum".into(),
         10 => "optimism".into(),
@@ -475,7 +485,7 @@ fn maximum_execution_gas_fee_display(
     ))
 }
 
-fn native_value_display(value: &str, chain: &str) -> String {
+pub(crate) fn native_value_display(value: &str, chain: &str) -> String {
     // Decimals and symbols come from the shared asset table so the EVM
     // review can never disagree with the claim amount display.
     match crate::ceremony::native_asset_metadata(chain, "native") {
@@ -507,6 +517,7 @@ pub(crate) mod tests {
             operation_id: OperationId::from_bytes([2; 32]),
             canonical_plan_facts_digest: digest.clone(),
             evm_review_payloads: vec![Base64UrlBytes::from_bytes(bytes)],
+            safe_review_payloads: Vec::new(),
             petal_use_claim: None,
             system_use_claim: None,
             terms: SealedApprovalTerms {
@@ -1199,7 +1210,7 @@ pub(crate) mod tests {
 /// One mode for the whole batch, and what a clear-signed member looks like
 /// once the catalog is in play.
 #[cfg(test)]
-mod mode_tests {
+pub(crate) mod mode_tests {
     use super::tests::*;
     use super::*;
     use alloy::primitives::U256;
@@ -1212,8 +1223,12 @@ mod mode_tests {
     const APPROVE: &str = "approve(address _spender, uint256 _value)";
 
     fn accepted_catalog() -> Catalog {
+        accepted_catalog_on_chain(31337)
+    }
+
+    pub(crate) fn accepted_catalog_on_chain(chain_id: u64) -> Catalog {
         let descriptor = serde_json::json!({
-            "context": {"contract": {"deployments": [{"chainId": 31337, "address": TOKEN_ADDRESS}]}},
+            "context": {"contract": {"deployments": [{"chainId": chain_id, "address": TOKEN_ADDRESS}]}},
             "metadata": {"contractName": "Example Token"},
             "display": {"formats": {TRANSFER: {
                 "intent": "Send",
@@ -1232,7 +1247,7 @@ mod mode_tests {
             }}}
         });
         let token = TokenRecord {
-            chain_id: 31337,
+            chain_id,
             address: TOKEN_ADDRESS.into(),
             symbol: "EXA".into(),
             name: "Example Token".into(),
