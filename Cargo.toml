@@ -68,3 +68,10 @@ futures-util = "0.3"
 x509-parser = "0.18"
 ureq = { version = "3.4.2", default-features = false, features = ["platform-verifier", "rustls"] }
 url = "2.5"
+
+# Match bloom's workspace: optimise dependencies in dev builds. Unoptimised
+# curve25519-dalek makes ed25519 verification ~90x slower, which turns the
+# startup audit-checkpoint scan into minutes on a long-lived developer root.
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
