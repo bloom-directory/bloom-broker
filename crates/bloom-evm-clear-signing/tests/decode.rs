@@ -318,20 +318,26 @@ fn two_tokens_sharing_a_symbol_stay_distinct_by_contract() {
     assert_ne!(first.token.unwrap().address, second.token.unwrap().address);
 }
 
+/// Off the catalog, only the exact ERC-20 shape is read, structurally and
+/// in raw units; anything else is unsupported rather than guessed at.
 #[test]
-fn a_call_to_an_undescribed_contract_is_unsupported_not_guessed() {
+fn a_call_to_an_undescribed_contract_is_read_by_shape_or_not_at_all() {
     let catalog = accepted_erc20();
     let bytes = transfer_bytes(RECIPIENT, U256::from(1u8));
     let mut elsewhere = context(&bytes, false);
     elsewhere.to = "0x9999999999999999999999999999999999999999"
         .parse()
         .unwrap();
-    assert_eq!(
-        review_call(&catalog, &elsewhere).unwrap_err().reason,
-        ReviewReason::UnsupportedCall
-    );
+    let (call, used) = review_call(&catalog, &elsewhere).unwrap();
+    assert!(call.structural);
+    assert!(call.intent_summary.unwrap().token.is_none());
+    assert!(used.is_empty());
 
-    let mut wrong_chain = context(&bytes, false);
+    let other = calldata(
+        "mint(address,uint256)",
+        &[address_word(RECIPIENT), U256::from(1u8)],
+    );
+    let mut wrong_chain = context(&other, false);
     wrong_chain.chain_id = 8453;
     assert_eq!(
         review_call(&catalog, &wrong_chain).unwrap_err().reason,

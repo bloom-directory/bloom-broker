@@ -11,10 +11,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The verifier named in clear-signing evidence. Its digest is computed from
-/// the verifier's sources and catalog; see `bloom_evm_clear_signing::artifact`.
-pub const EVM_CLEAR_SIGNING_VERIFIER_ID: &str = "evm-clear-signing-v1";
-
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClearSigningPolicy {

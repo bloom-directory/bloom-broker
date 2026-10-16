@@ -14,7 +14,6 @@
 //! [`STRUCTURAL_DESCRIPTION`]: the description is trusted, but nothing
 //! establishes that the address runs that contract.
 
-pub mod artifact;
 mod catalog;
 mod descriptor;
 mod render;
@@ -23,7 +22,6 @@ pub use catalog::*;
 pub use descriptor::*;
 pub use render::*;
 
-use bloom_broker_api::{Digest32, EVM_CLEAR_SIGNING_VERIFIER_ID};
 use serde::{Deserialize, Serialize};
 
 /// Not `ProofVerified`: nothing here proves execution. A distinct class keeps
@@ -34,7 +32,7 @@ pub const TRUSTED_DESCRIPTION: &str = "trusted_description";
 /// description is trusted, the address's contract is not established.
 pub const STRUCTURAL_DESCRIPTION: &str = "structural_description";
 
-/// The six review outcomes. Each one is actionable on its own, and existing
+/// The five review outcomes. Each one is actionable on its own, and existing
 /// transport and authority errors are reused wherever they already say the
 /// same thing.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -48,8 +46,6 @@ pub enum ReviewReason {
     InvalidPayload,
     /// Opaque or unlimited denied.
     PolicyDenied,
-    /// Broker's verifier or catalog changed after the review was frozen.
-    ReviewChanged,
     /// A size or count bound was exceeded.
     LimitExceeded,
 }
@@ -61,7 +57,6 @@ impl ReviewReason {
             Self::UnsupportedCall => "UNSUPPORTED_CALL",
             Self::InvalidPayload => "INVALID_PAYLOAD",
             Self::PolicyDenied => "POLICY_DENIED",
-            Self::ReviewChanged => "REVIEW_CHANGED",
             Self::LimitExceeded => "LIMIT_EXCEEDED",
         }
     }
@@ -81,7 +76,6 @@ impl ReviewReason {
             Self::PolicyDenied => {
                 "Wallet policy refuses this request. Change policy in a ceremony first."
             }
-            Self::ReviewChanged => "Broker was upgraded. Prepare this approval again.",
             Self::LimitExceeded => "The request is larger than Bloom accepts.",
         }
     }
@@ -116,22 +110,18 @@ impl std::fmt::Display for ReviewError {
 
 impl std::error::Error for ReviewError {}
 
-/// The review-wide clear-signing facts, frozen into the manifest beside the
-/// per-payload calls.
+/// The review-wide clear-signing facts, shown beside the per-payload calls
+/// and signed with the review manifest.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClearSigningEvidence {
     pub assurance: String,
-    pub verifier_id: String,
-    /// The verifier and catalog this build compiled in. The catalog changes
-    /// only with Broker, so this is the whole recheck.
-    pub verifier_digest: String,
-    /// Every entry this review used, complete, in selection order.
+    /// Every catalog entry this review used, in selection order.
     pub entries: Vec<SelectedEntry>,
 }
 
 impl ClearSigningEvidence {
-    pub fn new(verifier_digest: &Digest32, entries: Vec<SelectedEntry>, structural: bool) -> Self {
+    pub fn new(entries: Vec<SelectedEntry>, structural: bool) -> Self {
         let structural = structural || entries.iter().any(|entry| entry.instance.is_some());
         Self {
             assurance: if structural {
@@ -140,21 +130,7 @@ impl ClearSigningEvidence {
                 TRUSTED_DESCRIPTION
             }
             .to_owned(),
-            verifier_id: EVM_CLEAR_SIGNING_VERIFIER_ID.to_owned(),
-            verifier_digest: verifier_digest.as_str().to_owned(),
             entries,
         }
-    }
-
-    /// A Broker upgrade between review and signing may read the same bytes
-    /// differently, so it invalidates the review rather than carrying it.
-    pub fn recheck(&self, verifier_digest: &Digest32) -> Result<(), ReviewError> {
-        if self.verifier_digest != verifier_digest.as_str() {
-            return Err(ReviewError::new(
-                ReviewReason::ReviewChanged,
-                "Broker's clear-signing verifier or catalog changed after this review was frozen",
-            ));
-        }
-        Ok(())
     }
 }

@@ -5140,24 +5140,21 @@ fn review_disclosures(
         // bytes, but anything the input data would execute is still
         // unverified. This lives in the signed disclosures (not just the
         // page) so the honesty statement carries the manifest signature.
-        let has_structural = review
+        let calls = review
             .payloads
             .iter()
-            .any(|payload| payload.structural_call.is_some());
-        match (&review.clear_signing, has_structural) {
-            (Some(_), true) => disclosures.push(
-                "Bloom decoded these transactions from their exact bytes. Bloom's catalog describes only the catalogued calls; the other readings prove standard calldata shapes and exact arguments, not token behavior. Bloom has not executed the calls or established what the contracts do."
+            .filter_map(|payload| payload.contract_call.as_ref());
+        let structural = calls.clone().any(|call| call.structural);
+        match (calls.count() > 0, structural) {
+            (true, true) => disclosures.push(
+                "Bloom decoded these transactions from their exact bytes. Some readings rely on standard calldata shapes or reach contracts Bloom has not identified: they prove exact arguments, not contract or token behavior. Bloom has not executed the calls or established what the contracts do."
                     .to_owned(),
             ),
-            (Some(_), false) => disclosures.push(
+            (true, false) => disclosures.push(
                 "Bloom decoded these transactions from their exact bytes and read their contract calls against Bloom's catalog of contract descriptions. Bloom has not executed the calls or established what the contracts do."
                     .to_owned(),
             ),
-            (None, true) => disclosures.push(
-                "Bloom decoded these transactions from their exact bytes. The contract inputs match standard ERC-20 calldata shapes, but Bloom has not verified token behavior or established execution effects."
-                    .to_owned(),
-            ),
-            (None, false) => disclosures.push(
+            (false, _) => disclosures.push(
                 "Bloom decoded the destination and value from the exact transaction bytes. Bloom has not established the execution effects of any contract input data."
                     .to_owned(),
             ),
@@ -5168,7 +5165,6 @@ fn review_disclosures(
             payload.destination.is_some()
                 && payload.calldata_keccak.is_some()
                 && payload.contract_call.is_none()
-                && payload.structural_call.is_none()
         }) {
             disclosures.push(
                 "Bloom cannot explain what the contract input data in this request does. Approving it authorizes exactly these bytes and nothing less."

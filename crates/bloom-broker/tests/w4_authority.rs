@@ -2,9 +2,9 @@ use bloom_broker::{
     assurance_verifiers::SolanaSystemTransferVerifier,
     authority::{
         AssuranceRegistry, AssuranceVerifier, AuthorizationInput, BrokerAuthority,
-        CanonicalWalletPolicy, CeremonyApprovalGrant, EpochReconciliation, FrozenReview,
-        PolicyAsset, PolicyDestination, ProvenanceOperationClass, ProvenanceRecord,
-        ProvenanceSubject, VerifierCapability, canonical_policy_authority_diff,
+        CanonicalWalletPolicy, CeremonyApprovalGrant, EpochReconciliation, PolicyAsset,
+        PolicyDestination, ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject,
+        VerifierCapability, canonical_policy_authority_diff,
     },
     journal::{AuditSigner, BrokerJournal},
 };
@@ -425,12 +425,7 @@ impl Harness {
             Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(claim).unwrap()).into());
         let approval_id = self
             .authority
-            .prepare_approval_with_claim(
-                terms,
-                &review,
-                Some(&claim_digest),
-                &FrozenReview::legacy(),
-            )
+            .prepare_approval_with_claim(terms, &review, Some(&claim_digest))
             .unwrap();
         let grant = self.signed_grant(terms, approval_id, operation(3));
         self.authority.activate_approval(&grant, 1_500).unwrap();

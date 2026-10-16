@@ -72,13 +72,12 @@ fn a_third_function_arrives_as_catalog_data_and_displays_every_argument() {
 }
 
 #[test]
-fn the_six_reasons_each_carry_an_actionable_sentence() {
+fn the_five_reasons_each_carry_an_actionable_sentence() {
     let reasons = [
         ReviewReason::CatalogRejected,
         ReviewReason::UnsupportedCall,
         ReviewReason::InvalidPayload,
         ReviewReason::PolicyDenied,
-        ReviewReason::ReviewChanged,
         ReviewReason::LimitExceeded,
     ];
     let mut codes: Vec<_> = reasons.iter().map(|reason| reason.as_str()).collect();
@@ -148,30 +147,6 @@ fn a_deployment_listed_twice_is_refused() {
     assert!(build(Vec::new(), vec![uppercase]).is_err());
 }
 
-/// A review frozen under one build stops signing under another.
-#[test]
-fn a_changed_verifier_invalidates_a_frozen_review() {
-    let catalog = accepted_erc20();
-    let bytes = calldata(
-        "transfer(address _to, uint256 _value)",
-        &[address_word(RECIPIENT), U256::from(1u8)],
-    );
-    let (_, used) = review_call(&catalog, &context(&bytes, false)).unwrap();
-    let evidence = ClearSigningEvidence::new(artifact::digest(), used, false);
-    evidence.recheck(artifact::digest()).unwrap();
-    assert_eq!(evidence.assurance, TRUSTED_DESCRIPTION);
-    let other = bloom_broker_api::Digest32::from_bytes([9; 32]);
-    assert_eq!(
-        evidence.recheck(&other).unwrap_err().reason,
-        ReviewReason::ReviewChanged
-    );
-}
-
-/// A signed token name is rendered verbatim on the approval screen, so a
-/// character that rewrites the line without changing the text is as good as a
-/// control character. `char::is_control` is category Cc only: it misses the
-/// line and paragraph separators and every format character except the
-/// bidirectional overrides that were listed by hand.
 #[test]
 fn invisible_and_line_breaking_characters_are_refused_in_a_token_name() {
     for (what, injected) in [

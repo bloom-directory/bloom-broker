@@ -1,9 +1,8 @@
 //! Independently decode native EVM preimages for exact owner review. Machine
 //! descriptions are never used to infer transaction destination or authority.
-use crate::journal::ReviewKind;
 use alloy::{
     consensus::{SignableTransaction, Transaction, TxEip1559, TxLegacy},
-    primitives::{Address, Signature, TxKind, U256, keccak256},
+    primitives::{Address, Signature, TxKind, keccak256},
     rlp::Decodable,
 };
 use bloom_broker_api::{
@@ -11,9 +10,8 @@ use bloom_broker_api::{
     Digest32, ProtocolError, ProtocolErrorCode, ReviewMode, SigningPayloads,
 };
 use bloom_evm_clear_signing::{
-    ActionClass, CallContext, Catalog, ClearSignedCall, ClearSigningEvidence, DisplayField,
-    NativeUnits, ReviewError, ReviewReason, STRUCTURAL_ERC20_ASSURANCE, SelectedEntry,
-    canonical_erc20, checksum, review_call,
+    CallContext, Catalog, ClearSignedCall, ClearSigningEvidence, NativeUnits, ReviewError,
+    ReviewReason, SelectedEntry, review_call,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -22,9 +20,8 @@ use sha2::{Digest as _, Sha256};
 #[serde(deny_unknown_fields)]
 pub struct EvmReview {
     pub payloads: Vec<EvmReviewPayload>,
-    /// Review-wide clear-signing facts: the catalog this reading came from,
-    /// the verifier that produced it, and every entry it used. Activation and
-    /// signing re-read these against the current catalog and policy.
+    /// Review-wide clear-signing facts: the assurance and every catalog entry
+    /// the readings used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clear_signing: Option<ClearSigningEvidence>,
 }
@@ -63,49 +60,12 @@ pub struct EvmReviewPayload {
     /// be shown rather than omitting the subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximum_execution_gas_fee_display: Option<String>,
-    /// The clear-signed reading of this call, when a catalog description
-    /// covered it. Absent for native sends, deployments, and every member of
-    /// an explicitly opaque batch.
+    /// Broker's reading of this call: from the catalog, or from the exact
+    /// ERC-20 shape. Absent for native sends, deployments, calls Bloom cannot
+    /// read, and every member of an explicitly opaque batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract_call: Option<ClearSignedCall>,
-    /// A strict reading of canonical ERC-20-shaped calldata that does not
-    /// depend on a catalog. It proves the selector and exact arguments, not
-    /// that the destination is a token or implements ERC-20 semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub structural_call: Option<StructuralErc20Call>,
 }
-
-/// An independently decoded standard call shape with no deployment trust.
-///
-/// This deliberately remains separate from [`ClearSignedCall`]: the latter
-/// carries a publisher-backed token identity and may support catalog policy,
-/// while this type can authorize only the exact transaction the owner sees.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct StructuralErc20Call {
-    pub contract: String,
-    pub function_signature: String,
-    pub selector: String,
-    pub action: String,
-    pub fields: Vec<DisplayField>,
-    pub intent_summary: StructuralErc20Intent,
-    pub assurance_class: String,
-    pub assurance: String,
-    pub warnings: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct StructuralErc20Intent {
-    pub action: String,
-    pub counterparty_role: String,
-    pub counterparty: String,
-    pub amount: String,
-    pub amount_display: String,
-    pub magnitude: String,
-}
-
-const STRUCTURAL_CALLDATA: &str = "structural_calldata";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -122,158 +82,7 @@ pub enum EvmFeeReview {
     },
 }
 
-/// Which review Broker produced, to be frozen with the approval record.
-///
-/// Read from Broker's own rendered review and the policy it reviewed
-/// against — never from the mode the caller requested, which is a request
-/// and not a result.
-pub(crate) fn review_kind(
-    review: Option<&EvmReview>,
-    policy: &CanonicalWalletPolicy,
-) -> ReviewKind {
-    let Some(review) = review else {
-        return ReviewKind::Legacy;
-    };
-    let has_structural = review
-        .payloads
-        .iter()
-        .any(|payload| payload.structural_call.is_some());
-    // A call with a destination and calldata that carries no reading.
-    let has_unread = review.payloads.iter().any(|payload| {
-        payload.destination.is_some()
-            && payload.calldata_keccak.is_some()
-            && payload.contract_call.is_none()
-            && payload.structural_call.is_none()
-    });
-    if review.clear_signing.is_some() {
-        return if has_structural || has_unread {
-            ReviewKind::Mixed
-        } else {
-            ReviewKind::Clear
-        };
-    }
-    if has_structural {
-        return ReviewKind::Structural;
-    }
-    if policy.clear_signing.is_none() {
-        return ReviewKind::Legacy;
-    }
-    // An unread call here is one the owner approved opaquely: a batch that
-    // could not be read under the clear mode fails preparation instead.
-    if has_unread {
-        ReviewKind::OpaqueExact
-    } else {
-        ReviewKind::Native
-    }
-}
-
-/// Decode only the two canonical ERC-20 call shapes that have stable safety
-/// meaning at the byte level. A selector match is not deployment evidence:
-/// any contract can implement these four bytes, so the result stays
-/// structural and carries no token name, decimals, or policy identity.
-fn review_structural_erc20(
-    call: &DecodedCall,
-    unlimited_allowance_allowed: Option<bool>,
-) -> Result<Option<StructuralErc20Call>, ReviewError> {
-    let Some((class, counterparty_address, amount)) = canonical_erc20(&call.calldata) else {
-        return Ok(None);
-    };
-    let (signature, action, role, counterparty_label, amount_label) = match class {
-        ActionClass::Transfer => (
-            "transfer(address,uint256)",
-            "transfer",
-            "recipient",
-            "Recipient",
-            "Raw token amount",
-        ),
-        _ => (
-            "approve(address,uint256)",
-            "allowance",
-            "spender",
-            "Spender",
-            "Raw total allowance",
-        ),
-    };
-    let counterparty = checksum(&format!("0x{counterparty_address:x}"));
-    let magnitude = if amount.is_zero() {
-        "zero"
-    } else if amount == U256::MAX {
-        "unlimited"
-    } else {
-        "finite"
-    };
-    if action == "allowance"
-        && magnitude == "unlimited"
-        && unlimited_allowance_allowed == Some(false)
-    {
-        return Err(ReviewError::new(
-            ReviewReason::PolicyDenied,
-            "wallet policy denies unlimited allowances; enable them in a policy ceremony first",
-        ));
-    }
-
-    let contract = checksum(&format!("0x{:x}", call.to));
-    let mut warnings = vec![format!(
-        "Bloom decoded an ERC-20-shaped call to {contract}, but has not verified that this contract is a token or follows ERC-20 behavior."
-    )];
-    if counterparty_address.is_zero() {
-        warnings.push(format!("The decoded {role} is the zero address."));
-    }
-    if action == "allowance" {
-        match magnitude {
-            "zero" => warnings
-                .push("This requests a total allowance of zero.".to_owned()),
-            "unlimited" => warnings.push(
-                "The decoded allowance is the maximum uint256. If this contract behaves as ERC-20, the spender can use all current and future tokens without asking again, and the permission has no expiry."
-                    .to_owned(),
-            ),
-            _ => {
-                warnings.push(
-                    "If this contract behaves as ERC-20, the spender can move tokens later without another approval. The permission does not expire with this review."
-                        .to_owned(),
-                );
-                warnings.push(
-                    "This requests a total allowance, not an increase to an existing allowance."
-                        .to_owned(),
-                );
-            }
-        }
-    }
-    let amount = amount.to_string();
-    Ok(Some(StructuralErc20Call {
-        contract,
-        function_signature: signature.to_owned(),
-        selector: format!("0x{}", hex::encode(&call.calldata[..4])),
-        action: action.to_owned(),
-        fields: vec![
-            DisplayField {
-                label: counterparty_label.to_owned(),
-                format: "addressName".to_owned(),
-                value: counterparty.clone(),
-                raw: counterparty.clone(),
-            },
-            DisplayField {
-                label: amount_label.to_owned(),
-                format: "raw".to_owned(),
-                value: amount.clone(),
-                raw: amount.clone(),
-            },
-        ],
-        intent_summary: StructuralErc20Intent {
-            action: action.to_owned(),
-            counterparty_role: role.to_owned(),
-            counterparty,
-            amount: amount.clone(),
-            amount_display: format!("{amount} raw units"),
-            magnitude: magnitude.to_owned(),
-        },
-        assurance_class: STRUCTURAL_CALLDATA.to_owned(),
-        assurance: STRUCTURAL_ERC20_ASSURANCE.to_owned(),
-        warnings,
-    }))
-}
-
-/// Carry the nine review reasons out on the existing transport codes rather
+/// Carry the /// Carry the nine review reasons out on the existing transport codes rather
 /// than inventing a tenth: the reason and its owner sentence travel in the
 /// message, which is what the ceremony and the CLI both show.
 fn review_error(error: ReviewError) -> ProtocolError {
@@ -283,7 +92,7 @@ fn review_error(error: ReviewError) -> ProtocolError {
         ReviewReason::CatalogRejected | ReviewReason::UnsupportedCall => {
             ProtocolErrorCode::AssuranceUnavailable
         }
-        ReviewReason::PolicyDenied | ReviewReason::ReviewChanged => ProtocolErrorCode::ClaimInvalid,
+        ReviewReason::PolicyDenied => ProtocolErrorCode::ClaimInvalid,
     };
     ProtocolError::new(code, error.to_string())
 }
@@ -436,12 +245,13 @@ pub(crate) fn review(
     Ok(Some(review))
 }
 
-/// Apply the requested review mode to the whole batch.
+/// Read every call and apply the requested review mode to the whole batch.
 ///
-/// Canonical transfers and approvals the catalog does not list get a weaker
-/// structural reading. Every other unreadable member still fails clear mode,
-/// and an explicit opaque mode cannot hide a readable call. Native sends and
-/// deployments keep their exact envelope review.
+/// Every wallet gets every reading Broker can produce. Clear signing adds
+/// refusals: a call Bloom cannot read fails the batch unless the wallet
+/// permits, and the caller explicitly requests, an opaque approval, and an
+/// explicit opaque request cannot hide a call Bloom can read. Native sends
+/// and deployments keep their exact envelope review.
 fn apply_review_mode(
     review: &mut EvmReview,
     calls: &[Option<DecodedCall>],
@@ -449,60 +259,27 @@ fn apply_review_mode(
     requested: Option<ReviewMode>,
     catalog: &Catalog,
 ) -> Result<(), ProtocolError> {
-    let Some(settings) = policy.clear_signing.as_ref() else {
-        // An incapable wallet refuses a required mode rather than ignoring it.
-        if requested.is_some() {
-            return Err(denied(
-                ReviewReason::PolicyDenied,
-                "clear signing is not enabled for this wallet",
-            ));
-        }
-        // Every wallet gets the catalog's reading and the structural one:
-        // both read Broker's exact signing preimage. Without the extension
-        // nothing is refused for being unreadable, so a call either reading
-        // rejects is approved as exact bytes, as before.
-        let mut entries: Vec<SelectedEntry> = Vec::new();
-        let mut structural = false;
-        for (payload, call) in review.payloads.iter_mut().zip(calls) {
-            let Some(call) = call else { continue };
-            match review_call(catalog, &call_context(payload, call, true)) {
-                Ok((clear, selected)) => {
-                    structural |= clear.structural;
-                    for entry in selected {
-                        if !entries.contains(&entry) {
-                            entries.push(entry);
-                        }
-                    }
-                    payload.contract_call = Some(clear);
-                }
-                Err(_) => {
-                    payload.structural_call =
-                        review_structural_erc20(call, None).map_err(review_error)?;
-                }
-            }
-        }
-        freeze_evidence(review, entries, structural);
-        return Ok(());
-    };
-    let unlimited = Some(settings.unlimited_allowance_allowed);
+    let settings = policy.clear_signing.as_ref();
+    // An incapable wallet refuses a required mode rather than ignoring it.
+    if settings.is_none() && requested.is_some() {
+        return Err(denied(
+            ReviewReason::PolicyDenied,
+            "clear signing is not enabled for this wallet",
+        ));
+    }
     let opaque = requested == Some(ReviewMode::OpaqueExact);
-    if opaque && !settings.opaque_exact_allowed {
+    if opaque && !settings.is_some_and(|settings| settings.opaque_exact_allowed) {
         return Err(denied(
             ReviewReason::PolicyDenied,
             "wallet policy does not allow approving payloads Bloom cannot explain",
         ));
     }
+    let unlimited = settings.is_none_or(|settings| settings.unlimited_allowance_allowed);
     let mut entries: Vec<SelectedEntry> = Vec::new();
     let mut structural = false;
     for (payload, call) in review.payloads.iter_mut().zip(calls) {
         let Some(call) = call else { continue };
-        let reading = review_call(
-            catalog,
-            &call_context(payload, call, settings.unlimited_allowance_allowed),
-        );
-        match reading {
-            // Opaque is for calls Bloom cannot read. A call it can read keeps
-            // its reading and its refusals: the requester cannot opt out.
+        match review_call(catalog, &call_context(payload, call, unlimited)) {
             Ok(_) if opaque => {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::ClaimInvalid,
@@ -519,23 +296,16 @@ fn apply_review_mode(
                 }
                 payload.contract_call = Some(clear);
             }
-            Err(error) if error.reason == ReviewReason::UnsupportedCall => {
-                match review_structural_erc20(call, unlimited).map_err(review_error)? {
-                    Some(_) if opaque => {
-                        return Err(ProtocolError::new(
-                            ProtocolErrorCode::ClaimInvalid,
-                            "POLICY_DENIED: Bloom can read this call structurally, so it cannot be approved unread; request a clear review",
-                        ));
-                    }
-                    Some(reading) => payload.structural_call = Some(reading),
-                    None if opaque => {}
-                    None => return Err(review_error(error)),
-                }
-            }
+            // Without clear signing nothing is refused for being unreadable:
+            // the call is approved as exact bytes, as it always was.
+            Err(_) if settings.is_none() => {}
+            Err(error) if opaque && error.reason == ReviewReason::UnsupportedCall => {}
             Err(error) => return Err(review_error(error)),
         }
     }
-    freeze_evidence(review, entries, structural);
+    if !entries.is_empty() {
+        review.clear_signing = Some(ClearSigningEvidence::new(entries, structural));
+    }
     Ok(())
 }
 
@@ -551,16 +321,6 @@ fn call_context<'a>(
         calldata: &call.calldata,
         native: native_units(&payload.chain),
         unlimited_allowance_allowed,
-    }
-}
-
-fn freeze_evidence(review: &mut EvmReview, entries: Vec<SelectedEntry>, structural: bool) {
-    if !entries.is_empty() {
-        review.clear_signing = Some(ClearSigningEvidence::new(
-            bloom_evm_clear_signing::artifact::digest(),
-            entries,
-            structural,
-        ));
     }
 }
 
@@ -681,7 +441,6 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
                 &chain_name,
             ),
             contract_call: None,
-            structural_call: None,
         },
         call,
     ))
@@ -1445,7 +1204,7 @@ mod mode_tests {
     use super::*;
     use alloy::primitives::U256;
     use bloom_broker_api::Base64UrlBytes;
-    use bloom_evm_clear_signing::{Binding, TokenRecord};
+    use bloom_evm_clear_signing::{Binding, TokenRecord, checksum};
 
     const TOKEN_ADDRESS: &str = "0x1111111111111111111111111111111111111111";
     const RECIPIENT: &str = "0x2222222222222222222222222222222222222222";
@@ -1684,18 +1443,14 @@ mod mode_tests {
         .unwrap()
         .unwrap();
         let structural = review.payloads[0]
-            .structural_call
+            .contract_call
             .as_ref()
             .expect("structural transfer");
-        assert_eq!(structural.intent_summary.counterparty, checksum(RECIPIENT));
-        assert_eq!(structural.intent_summary.amount_display, "1 raw units");
-        assert_eq!(structural.assurance_class, "structural_calldata");
-        assert!(review.payloads[0].contract_call.is_none());
+        let summary = structural.intent_summary.as_ref().unwrap();
+        assert_eq!(summary.counterparty, checksum(RECIPIENT));
+        assert_eq!(summary.amount_display, "1 raw units");
+        assert!(structural.structural && summary.token.is_none());
         assert!(review.clear_signing.is_none());
-        assert_eq!(
-            review_kind(Some(&review), &enabled_policy()),
-            ReviewKind::Structural
-        );
     }
 
     /// The catalog ships with Broker, so a wallet that never enabled clear
@@ -1713,8 +1468,6 @@ mod mode_tests {
         let call = review.payloads[0].contract_call.as_ref().unwrap();
         assert!(call.fields.iter().any(|field| field.value == "2.5 EXA"));
         assert!(review.payloads[1].contract_call.is_none());
-        assert!(review.payloads[1].structural_call.is_none());
-        assert_eq!(review_kind(Some(&review), &policy()), ReviewKind::Mixed);
     }
 
     #[test]
@@ -1724,22 +1477,14 @@ mod mode_tests {
             .unwrap()
             .unwrap();
         let structural = decoded.payloads[0]
-            .structural_call
+            .contract_call
             .as_ref()
             .expect("selector-shaped call");
         assert_eq!(structural.contract, checksum(RECIPIENT));
-        assert_eq!(structural.intent_summary.amount, "2500000");
-        assert!(
-            structural
-                .intent_summary
-                .amount_display
-                .contains("raw units")
-        );
+        let summary = structural.intent_summary.as_ref().unwrap();
+        assert_eq!(summary.amount, "2500000");
+        assert!(summary.amount_display.contains("raw units"));
         assert!(structural.warnings[0].contains("has not verified"));
-        assert_eq!(
-            review_kind(Some(&decoded), &policy()),
-            ReviewKind::Structural
-        );
     }
 
     #[test]
@@ -1752,12 +1497,21 @@ mod mode_tests {
         let review = review(&request, &policy, Address::ZERO, &accepted_catalog())
             .unwrap()
             .unwrap();
-        assert!(review.payloads[0].contract_call.is_some());
-        assert!(review.payloads[0].structural_call.is_none());
-        assert!(review.payloads[1].contract_call.is_none());
-        assert!(review.payloads[1].structural_call.is_some());
+        assert!(
+            !review.payloads[0]
+                .contract_call
+                .as_ref()
+                .unwrap()
+                .structural
+        );
+        assert!(
+            review.payloads[1]
+                .contract_call
+                .as_ref()
+                .unwrap()
+                .structural
+        );
         assert_eq!(review.clear_signing.as_ref().unwrap().entries.len(), 1);
-        assert_eq!(review_kind(Some(&review), &policy), ReviewKind::Mixed);
     }
 
     #[test]
@@ -1788,7 +1542,7 @@ mod mode_tests {
         let opaque = review(&request, &opaque_policy, Address::ZERO, &accepted_catalog())
             .unwrap()
             .unwrap();
-        assert!(opaque.payloads[0].structural_call.is_none());
+        assert!(opaque.payloads[0].contract_call.is_none());
 
         let mut dirty = transfer_calldata(RECIPIENT, 1);
         dirty[4] = 1;
@@ -1796,7 +1550,7 @@ mod mode_tests {
         let envelope_only = review(&request, &policy(), Address::ZERO, &accepted_catalog())
             .unwrap()
             .unwrap();
-        assert!(envelope_only.payloads[0].structural_call.is_none());
+        assert!(envelope_only.payloads[0].contract_call.is_none());
     }
 
     #[test]
@@ -1808,8 +1562,8 @@ mod mode_tests {
         let decoded = review(&request, &policy(), Address::ZERO, &accepted_catalog())
             .unwrap()
             .unwrap();
-        let call = decoded.payloads[0].structural_call.as_ref().unwrap();
-        assert_eq!(call.intent_summary.magnitude, "unlimited");
+        let call = decoded.payloads[0].contract_call.as_ref().unwrap();
+        assert_eq!(call.intent_summary.as_ref().unwrap().magnitude, "unlimited");
         assert!(
             call.warnings
                 .iter()
@@ -1884,6 +1638,5 @@ mod mode_tests {
         );
         let evidence = review.clear_signing.as_ref().unwrap();
         assert_eq!(evidence.assurance, "structural_description");
-        assert_eq!(review_kind(Some(&review), &policy), ReviewKind::Clear);
     }
 }

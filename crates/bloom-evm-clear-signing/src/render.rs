@@ -134,7 +134,10 @@ pub struct CallIntent {
     /// `zero`, `finite` or `unlimited`, decided on the decoded integer rather
     /// than on its rendering.
     pub magnitude: String,
-    pub token: TokenIdentity,
+    /// Absent for a call read by its ERC-20 shape alone: the amount is raw
+    /// units of a contract Bloom has not identified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<TokenIdentity>,
 }
 
 /// The reviewed contract call, as it is frozen into the manifest.
@@ -240,6 +243,11 @@ fn review_at(
     let address = format!("{:x}", context.to);
     let address = format!("0x{address}");
     let listed = catalog.entry(context.chain_id, &address);
+    if listed.is_none()
+        && let Some(reading) = canonical_erc20(context.calldata)
+    {
+        return shaped_erc20(context, reading).map(|call| (call, Vec::new()));
+    }
     let selector = context.calldata.get(..4);
     let Some((entry, admitted, instance)) =
         selector.and_then(|selector| catalog.resolve(context.chain_id, &address, selector))
@@ -598,14 +606,6 @@ fn render_embedded(
         });
         return Ok(false);
     }
-    let address = format!("0x{:x}", inner.to);
-    if catalog.entry(inner.chain_id, &address).is_none()
-        && let Some(reading) = canonical_erc20(inner.calldata)
-    {
-        // No deployment is listed for the callee, so the instance entries
-        // are not consulted: the ERC-20 shape is the only thing to read.
-        return render_shaped_erc20(inner, label, reading, &raw, fields, warnings).map(|()| true);
-    }
     let (call, entries) = review_at(catalog, inner, depth + 1)?;
     // Named by its function, as a top-level call is: publisher intent text
     // is never a heading.
@@ -643,69 +643,112 @@ fn render_embedded(
     Ok(call.structural)
 }
 
-/// An embedded transfer or approval to a contract the catalog does not list:
-/// the exact arguments, in raw units, under the same allowance policy as a
-/// catalogued token.
-fn render_shaped_erc20(
-    inner: &CallContext<'_>,
-    label: &str,
+/// A transfer or approval to a contract the catalog does not list, read by
+/// its exact ERC-20 shape: the counterparty and the raw amount, under the same
+/// allowance policy as a listed token, with no token identity.
+fn shaped_erc20(
+    context: &CallContext<'_>,
     (class, counterparty, amount): (ActionClass, Address, U256),
-    raw: &str,
-    fields: &mut Vec<DisplayField>,
-    warnings: &mut Vec<String>,
-) -> Result<(), ReviewError> {
-    if !inner.value.is_zero() {
+) -> Result<ClearSignedCall, ReviewError> {
+    if !context.value.is_zero() {
         return Err(invalid(
             "admitted contract calls must carry zero native value",
         ));
     }
-    let callee = checksum(&format!("0x{:x}", inner.to));
-    let counterparty = checksum(&format!("0x{counterparty:x}"));
-    let (action, role, amount_label) = match class {
-        ActionClass::Transfer => ("transfer", "Recipient", "Raw token amount"),
-        _ => ("approve", "Spender", "Raw total allowance"),
+    let contract = checksum(&format!("0x{:x}", context.to));
+    let counterparty_shown = checksum(&format!("0x{counterparty:x}"));
+    let (signature, action, role, label, amount_label) = match class {
+        ActionClass::Transfer => (
+            TRANSFER_SIGNATURE,
+            "transfer",
+            "recipient",
+            "Recipient",
+            "Raw token amount",
+        ),
+        _ => (
+            APPROVE_SIGNATURE,
+            "allowance",
+            "spender",
+            "Spender",
+            "Raw total allowance",
+        ),
     };
-    let mut shown = vec![format!(
-        "{label}: Bloom decoded an ERC-20-shaped call to {callee}, but has not verified that this contract is a token or follows ERC-20 behavior."
+    let magnitude = if amount.is_zero() {
+        "zero"
+    } else if amount == U256::MAX {
+        "unlimited"
+    } else {
+        "finite"
+    };
+    let mut warnings = vec![format!(
+        "Bloom decoded an ERC-20-shaped call to {contract}, but has not verified that this contract is a token or follows ERC-20 behavior."
     )];
+    if counterparty.is_zero() {
+        warnings.push(format!("The decoded {role} is the zero address."));
+    }
     if class == ActionClass::Allowance {
-        if amount == U256::MAX {
-            if !inner.unlimited_allowance_allowed {
-                return Err(ReviewError::new(
-                    ReviewReason::PolicyDenied,
-                    "wallet policy denies unlimited allowances; enable them in a policy ceremony first",
-                ));
+        match magnitude {
+            "zero" => warnings.push("This requests a total allowance of zero.".to_owned()),
+            "unlimited" => {
+                if !context.unlimited_allowance_allowed {
+                    return Err(ReviewError::new(
+                        ReviewReason::PolicyDenied,
+                        "wallet policy denies unlimited allowances; enable them in a policy ceremony first",
+                    ));
+                }
+                warnings.push(
+                    "The decoded allowance is the maximum uint256. If this contract behaves as ERC-20, the spender can use all current and future tokens without asking again, and the permission has no expiry."
+                        .to_owned(),
+                );
             }
-            shown.push(format!(
-                "{label}: The allowance is the maximum uint256. If {callee} behaves as ERC-20, the spender can use all current and future tokens without asking again."
-            ));
-        } else if !amount.is_zero() {
-            shown.push(format!(
-                "{label}: If {callee} behaves as ERC-20, the spender can move tokens later without another approval."
-            ));
+            _ => {
+                warnings.push(
+                    "If this contract behaves as ERC-20, the spender can move tokens later without another approval. The permission does not expire with this review."
+                        .to_owned(),
+                );
+                warnings.push(
+                    "This requests a total allowance, not an increase to an existing allowance."
+                        .to_owned(),
+                );
+            }
         }
     }
     let amount = amount.to_string();
-    fields.push(DisplayField {
-        label: label.to_owned(),
-        format: "calldata".to_owned(),
-        value: format!("{action} on {callee}"),
-        raw: raw.to_owned(),
-    });
-    fields.push(DisplayField {
-        label: format!("{label} · {role}"),
-        format: "addressName".to_owned(),
-        value: counterparty.clone(),
-        raw: counterparty,
-    });
-    fields.push(DisplayField {
-        label: format!("{label} · {amount_label}"),
-        format: "raw".to_owned(),
-        value: amount.clone(),
-        raw: amount,
-    });
-    warnings.extend(shown);
-    Ok(())
+    Ok(ClearSignedCall {
+        contract,
+        contract_name: None,
+        function_signature: signature.to_owned(),
+        selector: format!("0x{}", hex_lower(&context.calldata[..4])),
+        action: action.to_owned(),
+        intent: None,
+        fields: vec![
+            DisplayField {
+                label: label.to_owned(),
+                format: "addressName".to_owned(),
+                value: counterparty_shown.clone(),
+                raw: counterparty_shown.clone(),
+            },
+            DisplayField {
+                label: amount_label.to_owned(),
+                format: "raw".to_owned(),
+                value: amount.clone(),
+                raw: amount.clone(),
+            },
+        ],
+        token: None,
+        intent_summary: Some(CallIntent {
+            action: action.to_owned(),
+            counterparty_role: role.to_owned(),
+            counterparty: counterparty_shown,
+            amount: amount.clone(),
+            amount_display: format!("{amount} raw units"),
+            magnitude: magnitude.to_owned(),
+            token: None,
+        }),
+        assurance: STRUCTURAL_ERC20_ASSURANCE.to_owned(),
+        structural: true,
+        warnings,
+    })
 }
 
 /// The token a `tokenAmount` field is denominated in, and the catalog entry
@@ -841,7 +884,7 @@ fn apply_safety_rules(
             identity.symbol
         ),
         magnitude: magnitude.to_owned(),
-        token: identity.clone(),
+        token: Some(identity.clone()),
     };
     if call.action_class == ActionClass::Transfer {
         if format!("0x{:x}", counterparty) == entry.contract_address {

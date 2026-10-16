@@ -14,7 +14,6 @@ bloom-broker-api = { path = "../bloom-broker-api" }
 serde.workspace = true
 serde_jcs.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 
 [dev-dependencies]
 hex.workspace = true

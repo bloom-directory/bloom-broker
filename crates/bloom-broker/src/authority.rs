@@ -1,6 +1,5 @@
-pub use crate::journal::FrozenReview;
 use crate::journal::{
-    BrokerJournal, BudgetLimits, JournalError, NewApprovalRecord, ReservationRequest, ReviewKind,
+    BrokerJournal, BudgetLimits, JournalError, NewApprovalRecord, ReservationRequest,
     SlidingBudgetLimit, SlidingValueLimit,
 };
 use bloom_broker_api::{
@@ -17,7 +16,6 @@ pub use bloom_broker_api::{
     ProvenanceCatalog, ProvenanceFeeAsset as PolicyAsset, ProvenanceOperationClass,
     ProvenanceRecord, ProvenanceSubject,
 };
-use bloom_evm_clear_signing::ClearSigningEvidence;
 use bloom_signer_api::SignerActivationReceipt;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use num_bigint::BigUint;
@@ -1602,12 +1600,7 @@ impl BrokerAuthority {
         terms: &SealedApprovalTerms,
         review_manifest_digest: &Digest32,
     ) -> Result<Digest32, AuthorityError> {
-        self.prepare_approval_with_claim(
-            terms,
-            review_manifest_digest,
-            None,
-            &FrozenReview::legacy(),
-        )
+        self.prepare_approval_with_claim(terms, review_manifest_digest, None)
     }
 
     pub fn prepare_approval_with_claim(
@@ -1615,7 +1608,6 @@ impl BrokerAuthority {
         terms: &SealedApprovalTerms,
         review_manifest_digest: &Digest32,
         approved_claim_digest: Option<&Digest32>,
-        review: &FrozenReview,
     ) -> Result<Digest32, AuthorityError> {
         let _barrier = self.lock_authorization_barrier()?;
         terms
@@ -1633,8 +1625,6 @@ impl BrokerAuthority {
                 && existing.review_manifest_digest == review_manifest_digest.as_str()
                 && existing.approved_claim_digest.as_deref()
                     == approved_claim_digest.map(Digest32::as_str)
-                && existing.review_kind == review.kind.as_str()
-                && existing.clear_signing_evidence_jcs.as_deref() == review.evidence_jcs()
             {
                 return Ok(approval_id);
             }
@@ -1767,7 +1757,6 @@ impl BrokerAuthority {
                 approved_claim_digest,
                 provenance_jcs: Some(&provenance_jcs),
                 renewal_of: terms.renewal_of.as_ref(),
-                review,
             },
         )?;
         Ok(approval_id)
@@ -1817,73 +1806,6 @@ impl BrokerAuthority {
 }
 
 impl BrokerAuthority {
-    /// The review kind and evidence frozen with an approval.
-    ///
-    /// Both come from the one approval record, written in the transaction
-    /// that created it. There is no second copy to lose or to disagree with.
-    pub fn frozen_review(
-        &self,
-        approval_id: &Digest32,
-    ) -> Result<Option<(ReviewKind, Option<ClearSigningEvidence>)>, AuthorityError> {
-        let Some(record) = self.journal.approval_record(approval_id)? else {
-            return Ok(None);
-        };
-        let kind = ReviewKind::from_stored(&record.review_kind);
-        let evidence = record
-            .clear_signing_evidence_jcs
-            .as_deref()
-            .map(serde_json::from_str::<ClearSigningEvidence>)
-            .transpose()
-            // Evidence that no longer parses is corrupt, not absent. Reading
-            // it as absent is exactly the confusion this record prevents.
-            .map_err(|error| {
-                denied(
-                    "CLEAR_SIGNING_EVIDENCE_UNREADABLE",
-                    format!("frozen clear-signing evidence is corrupt: {error}"),
-                )
-            })?;
-        Ok(Some((kind, evidence)))
-    }
-
-    /// Re-resolve a frozen review against the current catalog and policy.
-    ///
-    /// Called at activation and again at each signing authorization, so a
-    /// withdrawal committed before the decision blocks it. A newer catalog
-    /// never extends an approval: only the original expiry does that.
-    ///
-    /// An approval the owner approved as clear signing cannot authorize a
-    /// signature without its evidence. Missing evidence is a denial, not a
-    /// fallback to the envelope review the owner never saw.
-    pub fn recheck_clear_signing(&self, approval_id: &Digest32) -> Result<(), AuthorityError> {
-        let Some((kind, evidence)) = self.frozen_review(approval_id)? else {
-            return Err(denied(
-                "APPROVAL_NOT_FOUND",
-                "approval has no frozen review record",
-            ));
-        };
-        let evidence = match (kind.requires_clear_signing_evidence(), evidence) {
-            (true, Some(evidence)) => evidence,
-            (true, None) => {
-                return Err(denied(
-                    "CLEAR_SIGNING_EVIDENCE_MISSING",
-                    "approval was approved as clear signing but its frozen evidence is gone",
-                ));
-            }
-            // A non-clear approval carrying evidence is a record this build
-            // did not write. Refuse rather than pick a reading.
-            (false, Some(_)) => {
-                return Err(denied(
-                    "CLEAR_SIGNING_REVIEW_CHANGED",
-                    "approval record carries evidence its review kind does not permit",
-                ));
-            }
-            (false, None) => return Ok(()),
-        };
-        evidence
-            .recheck(bloom_evm_clear_signing::artifact::digest())
-            .map_err(|error| denied("CLEAR_SIGNING_REVIEW_CHANGED", error.to_string()))
-    }
-
     /// Atomically replace the complete installer-owned provenance catalog.
     /// Records absent from the root-owned package catalog are withdrawals,
     /// not stale grants retained in Broker's durable cache.
@@ -1977,7 +1899,6 @@ impl BrokerAuthority {
                 "ceremony cannot activate authority from an old or unreconciled epoch",
             ));
         }
-        self.recheck_clear_signing(&grant.approval_id)?;
         if grant.approval_digest != grant.approval_id
             || grant.approval_id
                 != terms
@@ -2507,9 +2428,6 @@ impl BrokerAuthority {
                 "frozen approval policy no longer matches current verified policy",
             ));
         }
-        // A Broker upgrade since the review blocks it. A signature already
-        // dispatched cannot be recalled, and is not claimed to be.
-        self.recheck_clear_signing(&input.request.approval_id)?;
         let (local_epoch, reconciled) = self.epoch_state(&terms.wallet_id)?;
         if !reconciled || local_epoch != terms.wallet_revocation_epoch.get() {
             return Err(denied(

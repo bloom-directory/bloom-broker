@@ -293,7 +293,12 @@ function shortAddress(value) {
   return /^0x[0-9a-fA-F]{40}$/.test(text) ? `${text.slice(0, 6)}…${text.slice(-4)}` : text;
 }
 function reviewedContractCall(payload) {
-  return payload?.contract_call || payload?.structural_call || null;
+  return payload?.contract_call || null;
+}
+// A transfer or approval read by its ERC-20 shape alone: the amount is raw
+// units of a contract Bloom has not identified, so there is no token.
+function shapeOnly(call) {
+  return Boolean(call?.intent_summary && !call.intent_summary.token);
 }
 // Headings describe the requested call. None of them promise an outcome:
 // Bloom has not executed anything, and a passkey response is an approval,
@@ -311,7 +316,7 @@ function callIntent(call) {
   }
   const who = shortAddress(summary.counterparty);
   const symbol = summary.token?.symbol || "tokens";
-  const structural = call.assurance_class === "structural_calldata";
+  const structural = shapeOnly(call);
   if (structural && summary.action === "transfer") {
     return {
       action: "call", magnitude: summary.magnitude,
@@ -589,18 +594,17 @@ function describeTransfer(manifest) {
     }
     // One sentence, from the review rather than from matching warning text.
     // A mixed batch never borrows the stronger assurance of its first member.
-    const structuralCalls = evmPayloads.filter(payload => payload.structural_call);
+    const structuralCalls = evmPayloads.filter(payload => shapeOnly(payload.contract_call));
     const assurance = structuralCalls.length && clear
       ? "This batch mixes trusted catalog descriptions with structural calldata readings. Structural readings verify exact arguments, not contract or token behavior."
       : structuralCalls.length
-        ? (structuralCalls.length === 1 ? structuralCalls[0].structural_call.assurance
+        ? (structuralCalls.length === 1 ? structuralCalls[0].contract_call.assurance
           : "These calls match standard ERC-20 calldata shapes. Bloom verified their exact arguments, but not that the contracts are tokens or follow ERC-20 behavior.")
         : firstCall?.assurance ||
           (clear ? "Interpreted using Bloom's description of this contract. Contract behavior has not been verified."
                  : "Transaction destination, value and bytes checked. Contract behavior not verified.");
     if (clear) {
       interpretation.push(["Assurance class", clear.assurance]);
-      interpretation.push(["Verifier", `${clear.verifier_id} (${shortDigest(clear.verifier_digest)})`]);
     }
     const networkIdentity = oneNetwork
       ? `EVM · ${network} · Chain ID ${first.chain_id}` : "EVM · Multiple networks";
@@ -1840,8 +1844,7 @@ function previewPayload(extra) {
 }
 function previewClearSigning() {
   return {
-    assurance: "trusted_description", verifier_id: "evm-clear-signing-v1",
-    verifier_digest: "2c75ec2390991c0bbab6e17694525cd46ef65614fa31e62cadac6aab58751a15",
+    assurance: "trusted_description",
     entries: [{chain_id: "31337", contract_address: PREVIEW_TOKEN, upgradeable: false}]
   };
 }
@@ -1884,7 +1887,7 @@ function previewStructuralCall(action, amount, magnitude, warnings, contract = P
       action, counterparty_role: role, counterparty: PREVIEW_SPENDER,
       amount, amount_display: amountDisplay, magnitude
     },
-    assurance_class: "structural_calldata",
+    structural: true,
     assurance: "Decoded from the standard ERC-20 calldata shape. Bloom verified the exact arguments, but not that this contract is a token or follows ERC-20 behavior.",
     warnings
   };
@@ -1995,11 +1998,11 @@ const PREVIEWS = {
     contract_call: previewCall("transfer", "250000000", "250 BDT", "finite", [])
   })], previewClearSigning()),
   "structural-transfer": () => previewApproval([previewPayload({
-    structural_call: previewStructuralCall("transfer", "250000000", "finite", [
+    contract_call: previewStructuralCall("transfer", "250000000", "finite", [
       `Bloom decoded an ERC-20-shaped call to ${PREVIEW_TOKEN}, but has not verified that this contract is a token or follows ERC-20 behavior.`])
   })], null),
   "structural-allowance-unlimited": () => previewApproval([previewPayload({
-    structural_call: previewStructuralCall("allowance",
+    contract_call: previewStructuralCall("allowance",
       "115792089237316195423570985008687907853269984665640564039457584007913129639935",
       "unlimited", [
         `Bloom decoded an ERC-20-shaped call to ${PREVIEW_TOKEN}, but has not verified that this contract is a token or follows ERC-20 behavior.`,
@@ -2045,7 +2048,7 @@ const PREVIEWS = {
   "mixed-assurance": () => previewApproval([
     previewPayload({contract_call: previewCall("transfer", "250000000", "250 BDT", "finite", [])}),
     previewPayload({nonce: "8", destination: PREVIEW_SPENDER,
-      structural_call: previewStructuralCall("transfer", "42", "finite", [
+      contract_call: previewStructuralCall("transfer", "42", "finite", [
         `Bloom decoded an ERC-20-shaped call to ${PREVIEW_SPENDER}, but has not verified that this contract is a token or follows ERC-20 behavior.`], PREVIEW_SPENDER)})
   ], previewClearSigning()),
   "long-identity": () => previewApproval([previewPayload({

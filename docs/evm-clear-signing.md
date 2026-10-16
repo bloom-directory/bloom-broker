@@ -17,22 +17,20 @@ Bloom promises about a call is code.
 
 ## Assurance levels
 
-`structural_calldata` means Broker verified the canonical selector, length,
-address padding and exact raw arguments from the signing preimage. The page
-names the contract, recipient or spender and raw integer, and warns that token
-behavior is unverified. Structural review never supplies a symbol, human units
-or reusable authority.
+Every reading is display: it is shown to the owner and signed with the review
+manifest, and no authority is derived from it. A reading has one of two
+assurance classes:
 
-`trusted_description` means the call was read with the catalog's description
-of the listed deployment. It is **not** proof of execution, contract safety, or
-the absence of an upgrade since the release. Broker reads no chain state and
-resolves no proxy.
-
-A review that read any address through an
-[instance or standard description](#instance-and-standard-descriptions), an
-embedded ERC-20 call by its shape alone, or an unlisted token's amount, has the class
-`structural_description` instead: the description is used in the same way, but
-nothing establishes which contract the address is.
+- `trusted_description`: every contract the call reaches is listed in the
+  catalog. It is **not** proof of execution, contract safety, or the absence
+  of an upgrade since the release. Broker reads no chain state and resolves no
+  proxy.
+- `structural_description`: some part of the reading names a contract the
+  catalog does not identify. That is a call read by its ERC-20 shape alone
+  (exact counterparty and raw amount, no token identity), an address read
+  through an [instance or standard
+  description](#instance-and-standard-descriptions), or an amount in an
+  unlisted token.
 
 ## The admitted ERC-7730 subset
 
@@ -80,7 +78,7 @@ published subset, not full ERC-7730 conformance.
   `tokenPath` itself takes either `"@.to"`, meaning the contract being called
   is the token, or the name of a top-level address argument of the same call.
   In the second form the address that was actually decoded is looked up in the
-  catalog, and that token's entry becomes part of the frozen evidence. A token
+  catalog, and that token's entry is listed with the review. A token
   the catalog does not list is shown in raw units with its address, never with
   borrowed decimals, and the review is structural. A token path that names a non-address argument, or no argument
   at all, is refused at admission.
@@ -111,7 +109,7 @@ The inner call is reviewed exactly as a top-level call:
 - An inner call Bloom cannot read makes the whole call unsupported.
 - Its policy refusals refuse, so an unlimited allowance inside a Safe is
   denied as it is outside one.
-- Its catalog entries become frozen evidence.
+- Its catalog entries are listed with the review.
 
 An inner canonical `transfer` or `approve` to a contract the catalog does not
 list is read by its shape, as at the top level: recipient or spender and raw
@@ -148,7 +146,7 @@ entry or instance description covers, on any chain, by selector: a vault's
 the vault's asset is not known offline. The same ERC-20 rule applies.
 
 Such a call gets the structural assurance and a warning that Bloom has not
-verified the address is that contract. Its evidence records the address it was
+verified the address is that contract. The review records the address it was
 read for.
 
 The address not being verified is bounded by an existing rule: an admitted
@@ -250,9 +248,7 @@ approved as exact bytes. It cannot request a clear or opaque mode.
 One mode applies to a batch. In an enabled wallet, omission means `clear` for
 contract calls; native sends and deployments keep their existing exact
 envelope review. A canonical transfer or approval to an unlisted contract
-falls back to structural review. A mixed batch labels the weaker members and
-freezes catalog evidence only for the catalogued members. Any other unreadable
-member still blocks the batch.
+is read by its shape. Any other unreadable member still blocks the batch.
 
 `opaque_exact` must be requested explicitly, needs `opaque_exact_allowed`, and
 carries the inability-to-explain warning in the signed manifest. It covers
@@ -260,11 +256,6 @@ only calls Bloom cannot read: neither a catalogued nor a structurally decoded
 call can be approved unread. A wallet without the extension refuses a
 requested mode rather than ignoring it.
 
-The frozen evidence records the verifier digest: SHA-256 over the verifier
-sources and the compiled-in catalog. At activation and at each signing
-authorization Broker compares it with its own, so a Broker upgrade between
-review and signature invalidates the unsigned review rather than carrying it
-forward. A signature already produced cannot be recalled.
 
 ## Unlimited allowances
 
@@ -299,8 +290,12 @@ demonstrated with an owner approval.
 
 ## Adding to the catalog
 
-- **A token:** add a row to `catalogs/tokens.json`. Check `decimals()`,
-  `symbol()` and `name()` on chain, and mark a proxy `upgradeable`.
+- **Tokens:** before each release, run `python3 -I catalogs/tokens.py >
+  catalogs/tokens.json`. It rebuilds the list from the Uniswap default list,
+  CoinGecko's Gnosis list and Robinhood's Stock Token registry, keeps a token
+  only if its address has code and its `decimals()` matches, and marks
+  proxies `upgradeable`. A new family of tokens is a new source in
+  `tokens.py`, not a hand-edited row.
 - **A contract:** add its ERC-7730 descriptor under `catalogs/` and a line to
   `DESCRIPTORS`, binding it to its listed deployments, to per-user instances
   of one deployment, or as a standard. A descriptor outside the subset fails

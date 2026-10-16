@@ -180,7 +180,7 @@ fn an_unlisted_safe_is_read_structurally_and_says_so() {
     assert_eq!(entries[0].contract_address, SAFE_141);
     assert_eq!(entries[0].instance.as_deref(), Some(SAFE));
 
-    let evidence = ClearSigningEvidence::new(artifact::digest(), entries, false);
+    let evidence = ClearSigningEvidence::new(entries, false);
     assert_eq!(evidence.assurance, STRUCTURAL_DESCRIPTION);
 }
 

@@ -11,7 +11,7 @@ use bloom_broker::{
         ReviewManifestContext,
     },
     clock::BrokerClock,
-    journal::{AuditSigner, BrokerJournal, FrozenReview, NewApprovalRecord},
+    journal::{AuditSigner, BrokerJournal, NewApprovalRecord},
     service::BrokerRpcService,
     signer_client::BrokerSignerClient,
 };
@@ -4100,7 +4100,6 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                 approved_claim_digest: None,
                 provenance_jcs: None,
                 renewal_of: None,
-                review: &FrozenReview::legacy(),
             },
         )
         .unwrap();

@@ -801,9 +801,6 @@ impl BrokerRpcService {
                 "native EVM approval requires full review payloads; upgrade Bloom Machine",
             ));
         }
-        // The policy the review was produced against, kept so the frozen
-        // review kind is read from the same document the reading used.
-        let mut review_policy: Option<bloom_broker_api::CanonicalWalletPolicy> = None;
         if !request.evm_review_payloads.is_empty() {
             let response = self
                 .signer
@@ -835,7 +832,7 @@ impl BrokerRpcService {
                     message: "approval is not bound to Broker's verified current policy".into(),
                 }));
             }
-            let policy =
+            let policy: bloom_broker_api::CanonicalWalletPolicy =
                 serde_json::from_slice(&snapshot.canonical_policy.decode()).map_err(|_| {
                     ProtocolError::new(
                         ProtocolErrorCode::SelectorMismatch,
@@ -846,7 +843,6 @@ impl BrokerRpcService {
                 ProtocolError::new(ProtocolErrorCode::AssuranceUnavailable, error.to_string())
             })?;
             context.evm_review = crate::evm_review::review(&request, &policy, from, catalog)?;
-            review_policy = Some(policy.clone());
         }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
             ApprovalSelector::Exact {
@@ -890,23 +886,6 @@ impl BrokerRpcService {
         context.petal_use_claim = request.petal_use_claim;
         context.system_use_claim = request.system_use_claim;
         context.claim_assurance = claim_assurance;
-        // Freeze what Broker itself concluded, alongside the record that
-        // authorizes signing. There is no second write to lose: an approval
-        // record either exists with its review, or does not exist at all.
-        let review_kind = review_policy
-            .as_ref()
-            .map_or(crate::journal::ReviewKind::Legacy, |policy| {
-                crate::evm_review::review_kind(context.evm_review.as_ref(), policy)
-            });
-        let frozen_review = match context
-            .evm_review
-            .as_ref()
-            .and_then(|review| review.clear_signing.as_ref())
-        {
-            Some(evidence) => crate::authority::FrozenReview::with_evidence(review_kind, evidence),
-            None => crate::authority::FrozenReview::without_evidence(review_kind),
-        }
-        .map_err(|error| ProtocolError::new(ProtocolErrorCode::ClaimInvalid, error))?;
         let response =
             self.ceremony
                 .prepare_approval(ceremony_request, context, self.clock.now_ms(true)?)?;
@@ -916,7 +895,6 @@ impl BrokerRpcService {
                 &request.terms,
                 &response.review_manifest_digest,
                 approved_claim_digest.as_ref(),
-                &frozen_review,
             )
             .map_err(authority_error)
         {
