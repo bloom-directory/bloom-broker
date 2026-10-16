@@ -45,7 +45,6 @@ pub struct CallContext<'a> {
     pub value: U256,
     pub calldata: &'a [u8],
     pub native: Option<NativeUnits>,
-    pub unlimited_allowance_allowed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -690,12 +689,6 @@ fn shaped_erc20(
         match magnitude {
             "zero" => warnings.push("This requests a total allowance of zero.".to_owned()),
             "unlimited" => {
-                if !context.unlimited_allowance_allowed {
-                    return Err(ReviewError::new(
-                        ReviewReason::PolicyDenied,
-                        "wallet policy denies unlimited allowances; enable them in a policy ceremony first",
-                    ));
-                }
                 warnings.push(
                     "The decoded allowance is the maximum uint256. If this contract behaves as ERC-20, the spender can use all current and future tokens without asking again, and the permission has no expiry."
                         .to_owned(),
@@ -901,12 +894,6 @@ fn apply_safety_rules(
         warnings.push("This sets the spender's allowance to zero, clearing it.".to_owned());
         "zero"
     } else if *amount == U256::MAX {
-        if !context.unlimited_allowance_allowed {
-            return Err(ReviewError::new(
-                ReviewReason::PolicyDenied,
-                "wallet policy denies unlimited allowances; enable them in a policy ceremony first",
-            ));
-        }
         warnings.push(format!(
             "If executed, this spender can use all your current and future {} without asking again. This permission has no expiry; changing it requires another transaction.",
             identity.symbol

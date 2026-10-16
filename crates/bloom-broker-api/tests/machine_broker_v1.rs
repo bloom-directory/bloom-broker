@@ -273,7 +273,6 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
         MachineBrokerRequest::CeremonySurfaceStatus(Empty {}),
         MachineBrokerRequest::ActionValidate(digest(58)),
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
-            requested_review_mode: None,
             evm_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
             operation_id: operation(54),

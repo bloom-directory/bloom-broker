@@ -292,7 +292,6 @@ impl Harness {
 
     fn policy_snapshot(&self, version: u64) -> SignedPolicySnapshot {
         let policy = CanonicalWalletPolicy {
-            clear_signing: None,
             wallet_id: self.wallet.clone(),
             maximum_approval_lifetime_ms: 100_000,
             allowed_petal_packages: vec![digest(9)],
@@ -2649,7 +2648,6 @@ fn initial_policy_snapshot(
         allowed_petal_packages: Vec::new(),
         allowed_destinations: Vec::new(),
         required_verifiers: Vec::new(),
-        clear_signing: None,
     };
     let canonical = serde_jcs::to_vec(&policy).unwrap();
     let mut snapshot = SignedPolicySnapshot {

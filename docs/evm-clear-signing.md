@@ -227,76 +227,26 @@ longer than 128 bytes are shown by length and keccak-256.
 cannot certify a proxy's current implementation; the page says its code may
 have changed since this release described it.
 
-## Wallet policy
+## The owner decides
 
-An optional closed extension on the canonical wallet policy, changed through
-the existing policy ceremony:
+There is no setting. Every wallet gets every reading Broker can produce, and
+nothing is refused for being unreadable. A call Bloom cannot read is shown as
+exact bytes with the inability-to-explain warning and the reason: no
+description of the contract, or bytes the description does not admit. The
+owner approves or rejects it like any other.
 
-```text
-opaque_exact_allowed (default false),
-unlimited_allowance_allowed (default false)
-```
-
-Its presence turns clear signing on: contract calls Bloom cannot read are
-refused, and unlimited allowances follow the setting. Omitting it preserves the
-previous policy serialization. Such a wallet still gets every reading, catalog
-and structural, but refuses nothing for being unreadable: an unread call is
-approved as exact bytes. It cannot request a clear or opaque mode.
-
-## Modes
-
-One mode applies to a batch. In an enabled wallet, omission means `clear` for
-contract calls; native sends and deployments keep their existing exact
-envelope review. A canonical transfer or approval to an unlisted contract
-is read by its shape. Any other unreadable member still blocks the batch.
-
-`opaque_exact` must be requested explicitly, needs `opaque_exact_allowed`, and
-carries the inability-to-explain warning in the signed manifest. It covers
-only calls Bloom cannot read: neither a catalogued nor a structurally decoded
-call can be approved unread. A wallet without the extension refuses a
-requested mode rather than ignoring it.
-
-## Safe approval permissions
-
-Safe approval freezes its chain opt-in and opaque review permission when
-prepared. Signing rechecks the approval's policy binding, but does not
-separately re-evaluate those Safe-specific permissions. Retire pending
-approvals when changing those permissions.
-
-When an owner signs a Safe transaction, its inner calls are read through the
-same catalog and clear-signing policy as native calls, including the ERC-20
-shape reading. Readable calls cannot request an opaque review.
-
-## Unlimited allowances
-
-For a wallet with clear signing enabled, maximum U256 is denied by default. A
-request explains the denial and names one action: change the wallet policy.
-That is **one existing wallet-policy
-ceremony** — setting `unlimited_allowance_allowed` in the canonical policy
-document and running the ordinary update. Enabling it is a visible authority
-change: the policy authority diff both services compute carries the
-clear-signing settings before and after, so the ceremony shows the owner what
-the update actually grants rather than an empty diff.
-
-After the policy commits, the staged allowance is reprepared and gets its own
-ordinary exact approval ceremony. These are two different authorizations, and
-the second is never automatic.
-
-A wallet without the clear-signing extension has no unlimited-allowance policy
-to enforce. Broker still decodes the maximum value, displays the strong warning
-and permits only that exact owner approval; it creates no reusable authority.
-
-The rule is narrow. It matches only canonical `approve(address,uint256)` with
-the exact U256 maximum. A requester can ask for one less, and that is shown as
-a finite allowance with its exact amount, not refused. Other calls that grant
+A maximum-U256 `approve(address,uint256)` is shown with the strong unlimited
+warning, never refused. The rule matches only that exact value: one less is
+shown as a finite allowance with its exact amount. Other calls that grant
 spending power, such as `increaseAllowance`, `setApprovalForAll` or Permit2's
 `approve`, are not recognised as allowances: a descriptor that formats one
-reads it as `other`, with no allowance warning and no unlimited gate.
+reads it as `other`, with no allowance warning.
 
-Demonstrated so far: the default denial, against real services on a
-disposable chain, with the message above. The enabling ceremony and the
-reprepared allowance that follows it have been implemented but not yet
-demonstrated with an owner approval.
+## Safe owner signatures
+
+When an owner signs a Safe transaction, its inner calls are read with the same
+catalog as native calls, including the ERC-20 shape reading. A call it cannot
+read is shown as exact bytes with the reason, as anywhere else.
 
 ## Adding to the catalog
 

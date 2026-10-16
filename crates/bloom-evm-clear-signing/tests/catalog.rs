@@ -57,7 +57,7 @@ fn a_third_function_arrives_as_catalog_data_and_displays_every_argument() {
             U256::from(1_800_000_000u64),
         ],
     );
-    let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
 
     // Every decoded argument is on screen, and none of them borrowed a
     // transfer or allowance guarantee.
@@ -72,12 +72,11 @@ fn a_third_function_arrives_as_catalog_data_and_displays_every_argument() {
 }
 
 #[test]
-fn the_five_reasons_each_carry_an_actionable_sentence() {
+fn the_four_reasons_each_carry_an_actionable_sentence() {
     let reasons = [
         ReviewReason::CatalogRejected,
         ReviewReason::UnsupportedCall,
         ReviewReason::InvalidPayload,
-        ReviewReason::PolicyDenied,
         ReviewReason::LimitExceeded,
     ];
     let mut codes: Vec<_> = reasons.iter().map(|reason| reason.as_str()).collect();
@@ -99,7 +98,7 @@ fn a_token_listed_by_metadata_alone_reads_through_the_built_in_profile() {
         "transfer(address,uint256)",
         &[address_word(RECIPIENT), U256::from(2_500_000u64)],
     );
-    let (call, used) = review_call(&accepted, &context(&transfer, false)).unwrap();
+    let (call, used) = review_call(&accepted, &context(&transfer)).unwrap();
     assert_eq!(call.action, "transfer");
     assert_eq!(call.contract_name.as_deref(), Some("Example Token"));
     assert_eq!(field(&call, "Amount").value, "2.5 EXA");
@@ -110,26 +109,20 @@ fn a_token_listed_by_metadata_alone_reads_through_the_built_in_profile() {
     assert!(!call.structural);
     assert_eq!(used.len(), 1);
 
-    // The ERC-20 safety rules still apply: unlimited allowances follow policy.
+    // The ERC-20 safety rules still apply: an unlimited allowance warns.
     let unlimited = calldata(
         "approve(address,uint256)",
         &[address_word(RECIPIENT), U256::MAX],
     );
-    assert_eq!(
-        review_call(&accepted, &context(&unlimited, false))
-            .unwrap_err()
-            .reason,
-        ReviewReason::PolicyDenied
-    );
+    let (call, _) = review_call(&accepted, &context(&unlimited)).unwrap();
+    assert_eq!(call.intent_summary.unwrap().magnitude, "unlimited");
     // And nothing else is admitted.
     let other = calldata(
         "mint(address,uint256)",
         &[address_word(RECIPIENT), U256::from(1u8)],
     );
     assert_eq!(
-        review_call(&accepted, &context(&other, false))
-            .unwrap_err()
-            .reason,
+        review_call(&accepted, &context(&other)).unwrap_err().reason,
         ReviewReason::UnsupportedCall
     );
 }

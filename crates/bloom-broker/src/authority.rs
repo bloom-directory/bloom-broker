@@ -11,7 +11,6 @@ use bloom_broker_api::{
     SignedPolicySnapshot, SigningPayloads, SystemUseClaim, Token,
 };
 pub use bloom_broker_api::{CanonicalWalletPolicy, PolicyDestination, RequiredVerifier};
-pub use bloom_broker_api::{ClearSigningPolicy, ReviewMode};
 pub use bloom_broker_api::{
     ProvenanceCatalog, ProvenanceFeeAsset as PolicyAsset, ProvenanceOperationClass,
     ProvenanceRecord, ProvenanceSubject,
@@ -37,22 +36,6 @@ const APPROVAL_TOMBSTONE_DOMAIN: &[u8] = b"bloom-approval-tombstone/v1";
 const WALLET_TOMBSTONE_DOMAIN: &[u8] = b"bloom-wallet-tombstone/v1";
 const POLICY_AUTHORITY_DIFF_DOMAIN: &[u8] = b"bloom-policy-authority-diff/v1";
 const SIGN_OPERATION_DOMAIN: &[u8] = b"bloom-sign-operation/v1";
-
-/// The durable-state contract this build can interpret.
-///
-/// Version 2 is the first that understands a wallet policy carrying the
-/// clear-signing extension. The floor is raised to 2 in the same transaction
-/// that first stores such a policy, so a later build with a lower version
-/// refuses to open the store before it mutates anything.
-///
-/// This gate protects combinations that have it. A build predating the gate
-/// has no floor to read — it fails a step later instead, when its strict
-/// decoder rejects the unknown `clear_signing` field while loading the
-/// policy. That is fail-closed rather than silent, but it is a different
-/// message, and the supported-downgrade statement in the review packet is
-/// about the whole combination, not about which decoder speaks first.
-pub const BROKER_STATE_VERSION: i64 = 2;
-const STATE_VERSION_WITH_CLEAR_SIGNING: i64 = 2;
 
 #[derive(Serialize)]
 struct MachineSignOperationIdentity {
@@ -88,28 +71,6 @@ pub struct PolicyAuthorityDiff {
     pub removed_destinations: Vec<PolicyAuthorityDestination>,
     pub added_required_verifiers: Vec<PolicyAuthorityVerifier>,
     pub removed_required_verifiers: Vec<PolicyAuthorityVerifier>,
-    /// Present only when clear signing actually changed. Absent when neither
-    /// the current nor the proposed policy carries the extension, so every
-    /// policy update that predates clear signing keeps its exact diff bytes
-    /// and digest.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clear_signing: Option<PolicyAuthorityClearSigning>,
-}
-
-/// What a policy update does to clear signing, before and after.
-///
-/// The whole settings document appears on both sides rather than a summary:
-/// the trusted publisher keys, the signature threshold, the observation age
-/// and the two permissions are each authority the owner is granting or
-/// withdrawing, and a diff that named only some of them would be a diff the
-/// ceremony could not honestly present.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PolicyAuthorityClearSigning {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub before: Option<ClearSigningPolicy>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after: Option<ClearSigningPolicy>,
 }
 
 impl PolicyAuthorityDiff {
@@ -193,14 +154,7 @@ pub fn canonical_policy_authority_diff(
             }),
     );
 
-    let clear_signing =
-        (current.clear_signing != proposed.clear_signing).then(|| PolicyAuthorityClearSigning {
-            before: current.clear_signing.clone(),
-            after: proposed.clear_signing.clone(),
-        });
-
     PolicyAuthorityDiff {
-        clear_signing,
         maximum_approval_lifetime_ms_before: bloom_broker_api::DecimalU64::new(
             current.maximum_approval_lifetime_ms,
         ),
@@ -615,19 +569,8 @@ impl BrokerAuthority {
                 expires_at_ms TEXT NOT NULL,
                 custody_receipt_digest TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS store_compatibility (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                minimum_state_version INTEGER NOT NULL
-            );
             ",
             )?;
-            // Before anything is migrated or mutated: refuse to open a store
-            // that records a floor this build cannot honour. A rollback that
-            // opened it anyway would read an enabled clear-signing policy
-            // with a decoder that does not know the field, and the only ways
-            // out of that are dropping a security field or corrupting the
-            // document. Neither is acceptable, so the build stops here.
-            enforce_state_floor(&connection)?;
             migrate_legacy_authority(&mut connection, &legacy_connection, &journal)?;
         }
         let mut policy_keys = policy_keys;
@@ -803,11 +746,6 @@ impl BrokerAuthority {
                     "policy version must advance monotonically",
                 ));
             }
-        }
-        if policy.clear_signing.is_some() {
-            // Raise the downgrade floor before the document that needs it is
-            // visible, not after.
-            raise_state_floor(&transaction, STATE_VERSION_WITH_CLEAR_SIGNING)?;
         }
         transaction.execute(
             "INSERT INTO policies(wallet_id, version, digest, snapshot_jcs, policy_jcs)
@@ -4123,39 +4061,6 @@ fn storage(error: impl ToString) -> AuthorityError {
 }
 
 /// Refuse to open a store whose recorded floor is above this build.
-fn enforce_state_floor(connection: &Connection) -> Result<(), AuthorityError> {
-    let floor: Option<i64> = connection
-        .query_row(
-            "SELECT minimum_state_version FROM store_compatibility WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    match floor {
-        Some(floor) if floor > BROKER_STATE_VERSION => Err(AuthorityError::Storage(format!(
-            "this Broker interprets durable state version {BROKER_STATE_VERSION}, but the store \
-             requires at least {floor}; run a build that understands the stored wallet policy \
-             instead of downgrading, which would have to drop a security field to proceed"
-        ))),
-        _ => Ok(()),
-    }
-}
-
-/// Raise the floor in the same transaction as the mutation that needs it, so
-/// there is no window in which incompatible state exists without its gate.
-fn raise_state_floor(
-    transaction: &rusqlite::Transaction<'_>,
-    version: i64,
-) -> Result<(), AuthorityError> {
-    transaction.execute(
-        "INSERT INTO store_compatibility(id, minimum_state_version) VALUES (1, ?1)
-         ON CONFLICT(id) DO UPDATE SET
-            minimum_state_version = MAX(minimum_state_version, excluded.minimum_state_version)",
-        [version],
-    )?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod lineage_only_provenance_tests {
     use super::*;

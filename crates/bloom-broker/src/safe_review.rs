@@ -5,7 +5,7 @@ use std::str::FromStr;
 use alloy::primitives::{Address, B256, U256, keccak256};
 use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalSelector, CanonicalWalletPolicy, CryptoSuite, DeclaredFee,
-    Digest32, ProtocolError, ProtocolErrorCode, ReviewMode,
+    Digest32, ProtocolError, ProtocolErrorCode,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -884,28 +884,18 @@ pub(crate) fn review(
     let rendered = classify_calls(&envelope, |to, value, calldata| {
         let chain_id = u64::try_from(chain)
             .map_err(|_| invalid("Safe chain ID is too large for catalog review"))?;
-        let reading = crate::evm_review::review_contract_call(
+        let reading = crate::evm_review::read_contract_call(
             &crate::evm_review::DecodedCall {
                 chain_id,
                 to,
                 value,
                 calldata: calldata.to_vec(),
             },
-            policy,
-            request.requested_review_mode,
             catalog,
-        )?;
-        let Some((reading, selected)) = reading else {
-            // Without clear signing an unread call keeps the Safe's own
-            // summary; with it, only an opaque request reaches here.
-            if policy.clear_signing.is_none() {
-                return Ok(None);
-            }
-            return Ok(Some(format!(
-                "{OPAQUE_ACTION}\nContract: {to}\nNative value (wei): {value}\nCalldata selector: 0x{}\nCalldata keccak256: {:#x}",
-                hex::encode(&calldata[..calldata.len().min(4)]),
-                keccak256(calldata),
-            )));
+        );
+        // A call Bloom cannot read keeps the Safe's own summary of its bytes.
+        let Ok((reading, selected)) = reading else {
+            return Ok(None);
         };
         structural |= reading.structural;
         for entry in selected {
@@ -953,11 +943,6 @@ pub(crate) fn review(
         );
         Ok(Some(lines.join("\n")))
     })?;
-    // The wallet's clear-signing settings are authority over what the owner
-    // can be asked to approve, and they are not about how the bytes reach the
-    // chain. A payload Bloom cannot explain is refused when it is sent
-    // directly, so wrapping it in a SafeTx must not be a way around that.
-    apply_clear_signing_policy(policy, request.requested_review_mode, &rendered)?;
     let evidence = (!entries.is_empty())
         .then(|| bloom_evm_clear_signing::ClearSigningEvidence::new(entries, structural));
     let action = rendered.lines().map(str::to_owned).collect();
@@ -1004,57 +989,6 @@ pub(crate) fn review(
         },
         clear_signing: evidence,
     }))
-}
-
-/// The Safe equivalent of `evm_review::apply_review_mode`.
-///
-/// The native path decides three things from `policy.clear_signing`: that an
-/// unreadable call needs an explicit `OpaqueExact` request, that the request
-/// is only honored when the wallet allows it, and that a mode a wallet cannot
-/// serve is refused rather than dropped. A Safe transaction is the same
-/// decision about the same calldata, so it gets the same three.
-fn apply_clear_signing_policy(
-    policy: &CanonicalWalletPolicy,
-    requested: Option<ReviewMode>,
-    rendered: &str,
-) -> Result<(), ProtocolError> {
-    let opaque = rendered.lines().any(is_opaque_line);
-    let Some(settings) = policy.clear_signing.as_ref() else {
-        // An incapable wallet refuses a required mode rather than ignoring it,
-        // exactly as the native path does.
-        if requested.is_some() {
-            return Err(invalid("clear signing is not enabled for this wallet"));
-        }
-        return Ok(());
-    };
-    match requested {
-        Some(ReviewMode::OpaqueExact) => {
-            if !settings.opaque_exact_allowed {
-                return Err(invalid(
-                    "wallet policy does not allow approving payloads Bloom cannot explain",
-                ));
-            }
-            if !opaque {
-                return Err(invalid(
-                    "Bloom can read this call, so it cannot be approved unread; request a clear-signed review",
-                ));
-            }
-            Ok(())
-        }
-        // A clear review cannot contain an unreadable inner call.
-        Some(ReviewMode::Clear) if opaque => Err(invalid(concat!(
-            "Bloom cannot read this Safe transaction's inner call, so it cannot be ",
-            "clear-signed; approve it as an exact payload if wallet policy allows that",
-        ))),
-        Some(ReviewMode::Clear) | None => {
-            if opaque {
-                return Err(invalid(
-                    "Bloom cannot explain this Safe call; request an explicit opaque_exact review",
-                ));
-            }
-            Ok(())
-        }
-    }
 }
 
 /// Whether a prepared Safe review read its inner call, for the frozen record.
@@ -1125,7 +1059,6 @@ mod tests {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: OperationId::from_bytes([2; 32]),
             canonical_plan_facts_digest: digest.clone(),
-            requested_review_mode: None,
             evm_review_payloads: vec![],
             safe_review_payloads: vec![Base64UrlBytes::from_bytes(&review)],
             petal_use_claim: None,
@@ -1183,7 +1116,6 @@ mod tests {
                 destination: "exact".into(),
             }],
             required_verifiers: vec![],
-            clear_signing: None,
         }
     }
 
@@ -1339,19 +1271,9 @@ mod tests {
         assert!(review(&request, &policy(), from).is_err());
     }
 
-    fn clear_signing_policy(opaque_exact_allowed: bool) -> CanonicalWalletPolicy {
-        CanonicalWalletPolicy {
-            clear_signing: Some(ClearSigningPolicy {
-                opaque_exact_allowed,
-                unlimited_allowance_allowed: false,
-            }),
-            ..policy()
-        }
-    }
-
     #[test]
-    fn safe_transfers_use_catalog_identity_and_reject_readable_as_opaque() {
-        let context = crate::evm_review::mode_tests::accepted_catalog_on_chain(31337);
+    fn safe_inner_calls_are_read_with_the_catalog() {
+        let catalog = crate::evm_review::mode_tests::accepted_catalog_on_chain(31337);
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
         let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
         value["safe_tx"]["to"] = serde_json::json!("0x1111111111111111111111111111111111111111");
@@ -1361,124 +1283,36 @@ mod tests {
             "0".repeat(24) + &"2".repeat(40),
             format!("{:064x}", 1_000_000),
         ));
-        let mut asked = request(serde_jcs::to_vec(&value).unwrap());
-        for mode in [None, Some(ReviewMode::Clear)] {
-            asked.requested_review_mode = mode;
-            let plan = super::review(&asked, &clear_signing_policy(false), from, &context)
-                .unwrap()
-                .unwrap();
-            assert!(!is_opaque(&plan));
-            assert!(
-                plan.action.iter().any(|line| line.contains("EXA")),
-                "{:?}",
-                plan.action
-            );
-            assert!(plan.clear_signing.is_some());
-        }
-        asked.requested_review_mode = Some(ReviewMode::OpaqueExact);
-        let error = super::review(&asked, &clear_signing_policy(true), from, &context).unwrap_err();
+        let plan = super::review(
+            &request(serde_jcs::to_vec(&value).unwrap()),
+            &policy(),
+            from,
+            &catalog,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!is_opaque(&plan));
         assert!(
-            error.to_string().contains("cannot be approved unread"),
-            "{error}"
+            plan.action.iter().any(|line| line.contains("EXA")),
+            "{:?}",
+            plan.action
         );
+        assert!(plan.clear_signing.is_some());
 
-        // A call to a contract outside the catalog that is not ERC-20-shaped
-        // is not readable.
+        // A call Bloom cannot read is shown as its bytes, not refused.
         value["safe_tx"]["to"] = serde_json::json!("0x4000000000000000000000000000000000000000");
         value["safe_tx"]["data"] = serde_json::json!("0xdeadbeef");
-        let mut asked = request(serde_jcs::to_vec(&value).unwrap());
-        for mode in [None, Some(ReviewMode::Clear), Some(ReviewMode::OpaqueExact)] {
-            asked.requested_review_mode = mode;
-            assert!(super::review(&asked, &clear_signing_policy(false), from, &context).is_err());
-        }
-        asked.requested_review_mode = Some(ReviewMode::OpaqueExact);
-        let plan = super::review(&asked, &clear_signing_policy(true), from, &context)
-            .unwrap()
-            .unwrap();
+        let plan = super::review(
+            &request(serde_jcs::to_vec(&value).unwrap()),
+            &policy(),
+            from,
+            &catalog,
+        )
+        .unwrap()
+        .unwrap();
         assert!(is_opaque(&plan));
-        assert!(!plan.action.iter().any(|line| line.contains("ERC-20")));
     }
 
-    /// An owner who set `opaque_exact_allowed: false` said "do not ask me to
-    /// approve payloads Bloom cannot explain". The native path enforced that
-    /// and the Safe path did not, so the same undescribable calldata that is
-    /// refused when sent directly was approvable wrapped in a SafeTx, with
-    /// the owner shown a selector and a keccak.
-    #[test]
-    fn an_unreadable_safe_call_obeys_the_wallets_opaque_payload_setting() {
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["data"] = serde_json::json!("0xdeadbeef00112233");
-        let opaque = serde_jcs::to_vec(&value).unwrap();
-        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-
-        // No clear-signing policy: unchanged, the envelope review stands.
-        let plan = review(&request(opaque.clone()), &policy(), from)
-            .unwrap()
-            .unwrap();
-        assert!(is_opaque(&plan), "{:?}", plan.action);
-
-        // Clear signing on, opaque payloads refused: this must not prepare.
-        let error = review(&request(opaque.clone()), &clear_signing_policy(false), from)
-            .expect_err("an unreadable Safe call must obey the wallet's setting");
-        assert!(
-            error.to_string().contains("UNSUPPORTED_CALL"),
-            "{}",
-            error
-        );
-
-        // Clear signing on, opaque payloads permitted: prepares, and the
-        // frozen record has to be able to say it was not read.
-        let mut opaque_request = request(opaque);
-        assert!(review(&opaque_request, &clear_signing_policy(true), from).is_err());
-        opaque_request.requested_review_mode = Some(ReviewMode::OpaqueExact);
-        let plan = review(&opaque_request, &clear_signing_policy(true), from)
-            .unwrap()
-            .unwrap();
-        assert!(is_opaque(&plan));
-
-        // A call Bloom *can* read is unaffected by the setting.
-        let readable = review(&request(envelope()), &clear_signing_policy(false), from)
-            .unwrap()
-            .unwrap();
-        assert!(!is_opaque(&readable), "{:?}", readable.action);
-    }
-
-    /// A requested mode the Safe path cannot serve was dropped rather than
-    /// refused, so a Machine asking for a clear reading got an unread one
-    /// under that name.
-    #[test]
-    fn a_review_mode_the_safe_path_cannot_serve_is_refused_not_dropped() {
-        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["data"] = serde_json::json!("0xdeadbeef00112233");
-        let opaque = serde_jcs::to_vec(&value).unwrap();
-
-        // A wallet with no clear-signing policy cannot honor any mode.
-        let mut asked = request(envelope());
-        asked.requested_review_mode = Some(ReviewMode::Clear);
-        let error = review(&asked, &policy(), from).expect_err("an incapable wallet refuses");
-        assert!(error.to_string().contains("not enabled"), "{error}");
-
-        // Clear was asked for and the inner call cannot be read.
-        let mut asked = request(opaque.clone());
-        asked.requested_review_mode = Some(ReviewMode::Clear);
-        let error = review(&asked, &clear_signing_policy(true), from)
-            .expect_err("an unreadable call cannot be clear-signed");
-        assert!(error.to_string().contains("UNSUPPORTED_CALL"), "{error}");
-
-        // OpaqueExact is honored only where the wallet allows it.
-        let mut asked = request(opaque);
-        asked.requested_review_mode = Some(ReviewMode::OpaqueExact);
-        assert!(review(&asked, &clear_signing_policy(false), from).is_err());
-        assert!(review(&asked, &clear_signing_policy(true), from).is_ok());
-    }
-
-    /// Three envelope fields are rendered into the ceremony and none of them
-    /// had a shape check, so a Petal could put arbitrary text on the approval
-    /// screen. Broker cannot verify them against a chain; it can still
-    /// require a hash to be a hash.
     #[test]
     fn petal_reported_version_and_code_hashes_must_have_their_own_shape() {
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
@@ -1816,10 +1650,10 @@ mod tests {
     }
 
     #[test]
-    fn safe_batch_transfers_cannot_bypass_catalog_policy() {
-        let context = crate::evm_review::mode_tests::accepted_catalog_on_chain(8453);
+    fn safe_batch_calls_are_read_with_the_catalog() {
+        let catalog = crate::evm_review::mode_tests::accepted_catalog_on_chain(8453);
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-        let mut policy = clear_signing_policy(false);
+        let mut policy = policy();
         policy.allowed_destinations[0].chain = token("evm-8453");
         let mut parsed: Envelope = serde_json::from_slice(&envelope()).unwrap();
         parsed.chain_id = "8453".into();
@@ -1830,45 +1664,26 @@ mod tests {
         transfer.extend_from_slice(&[0; 12]);
         transfer.extend_from_slice(&[0x22; 20]);
         transfer.extend_from_slice(&U256::from(1_000_000).to_be_bytes::<32>());
-        for (target, known) in [
-            ("0x1111111111111111111111111111111111111111", true),
-            ("0x4000000000000000000000000000000000000000", false),
+        for (target, data, known) in [
+            ("0x1111111111111111111111111111111111111111", transfer, true),
+            (
+                "0x4000000000000000000000000000000000000000",
+                vec![0xde, 0xad, 0xbe, 0xef],
+                false,
+            ),
         ] {
-            // Off the catalog, the shape of a transfer would still be read.
-            let data = if known {
-                transfer.clone()
-            } else {
-                vec![0xde, 0xad, 0xbe, 0xef]
-            };
             let packed = multisend_entry(target, 0, &data);
             parsed.safe_tx.data = format!("0x{}", hex::encode(multisend_calldata(&packed)));
-            let mut asked = request(serde_jcs::to_vec(&parsed).unwrap());
-            let result = super::review(&asked, &policy, from, &context);
-            if known {
-                let plan = result.unwrap().unwrap();
-                assert!(!is_opaque(&plan));
-                assert!(plan.action.iter().any(|line| line.contains("EXA")));
-            } else {
-                assert!(result.is_err());
-            }
-            asked.requested_review_mode = Some(ReviewMode::OpaqueExact);
-            let mut allowing = policy.clone();
-            allowing
-                .clear_signing
-                .as_mut()
-                .unwrap()
-                .opaque_exact_allowed = true;
-            let result = super::review(&asked, &allowing, from, &context);
-            if known {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .to_string()
-                        .contains("cannot be approved unread")
-                );
-            } else {
-                assert!(is_opaque(&result.unwrap().unwrap()));
-            }
+            let plan = super::review(
+                &request(serde_jcs::to_vec(&parsed).unwrap()),
+                &policy,
+                from,
+                &catalog,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(is_opaque(&plan), !known, "{:?}", plan.action);
+            assert_eq!(plan.action.iter().any(|line| line.contains("EXA")), known);
         }
     }
 
@@ -2037,59 +1852,6 @@ mod tests {
         assert!(action.contains(
             "2. Send 0.000000000000000003 ETH to 0x6000000000000000000000000000000000000000"
         ));
-    }
-
-    /// Wrapping an unreadable call in a MultiSendCallOnly batch rendered it as
-    /// a numbered entry, which the opacity gates did not recognise: a wallet
-    /// that refuses payloads Bloom cannot explain prepared it anyway, and the
-    /// journal recorded it as read.
-    #[test]
-    fn an_unreadable_batch_entry_obeys_the_wallets_opaque_payload_setting() {
-        let mut packed = multisend_entry(
-            "0x6000000000000000000000000000000000000000",
-            0,
-            &[0xde, 0xad, 0xbe, 0xef, 0x00, 0x11],
-        );
-        packed.extend(multisend_entry(
-            "0x6000000000000000000000000000000000000000",
-            3,
-            &[],
-        ));
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["chain_id"] = serde_json::json!("8453");
-        value["safe_tx"]["to"] = serde_json::json!("0x9641d764fc13c8b624c04430c7356c1c7c8102e2");
-        value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["operation"] = serde_json::json!(1);
-        value["safe_tx"]["data"] =
-            serde_json::json!(format!("0x{}", hex::encode(multisend_calldata(&packed))));
-        value["library_code_hash"] =
-            serde_json::json!("0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939");
-        value["chain_id"] = serde_json::json!("8453");
-        let batch = serde_jcs::to_vec(&value).unwrap();
-        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-        // Safe libraries are only verified on some chains; Base is one of them.
-        let on_base = |opaque_exact_allowed| CanonicalWalletPolicy {
-            allowed_destinations: vec![PolicyDestination {
-                chain: token("evm-8453"),
-                destination: "exact".into(),
-            }],
-            ..clear_signing_policy(opaque_exact_allowed)
-        };
-
-        let error = review(&request(batch.clone()), &on_base(false), from)
-            .expect_err("an unreadable batch entry must obey the wallet's setting");
-        assert!(
-            error.to_string().contains("UNSUPPORTED_CALL"),
-            "{}",
-            error
-        );
-
-        let mut opaque_request = request(batch);
-        opaque_request.requested_review_mode = Some(ReviewMode::OpaqueExact);
-        let plan = review(&opaque_request, &on_base(true), from)
-            .unwrap()
-            .unwrap();
-        assert!(is_opaque(&plan), "{:?}", plan.action);
     }
 
     #[test]

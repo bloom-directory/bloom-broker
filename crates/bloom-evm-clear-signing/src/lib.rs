@@ -32,7 +32,7 @@ pub const TRUSTED_DESCRIPTION: &str = "trusted_description";
 /// description is trusted, the address's contract is not established.
 pub const STRUCTURAL_DESCRIPTION: &str = "structural_description";
 
-/// The five review outcomes. Each one is actionable on its own, and existing
+/// The four review outcomes. Each one is actionable on its own, and existing
 /// transport and authority errors are reused wherever they already say the
 /// same thing.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -44,8 +44,6 @@ pub enum ReviewReason {
     UnsupportedCall,
     /// Envelope or selector mismatch, or malformed ABI.
     InvalidPayload,
-    /// Opaque or unlimited denied.
-    PolicyDenied,
     /// A size or count bound was exceeded.
     LimitExceeded,
 }
@@ -56,7 +54,6 @@ impl ReviewReason {
             Self::CatalogRejected => "CATALOG_REJECTED",
             Self::UnsupportedCall => "UNSUPPORTED_CALL",
             Self::InvalidPayload => "INVALID_PAYLOAD",
-            Self::PolicyDenied => "POLICY_DENIED",
             Self::LimitExceeded => "LIMIT_EXCEEDED",
         }
     }
@@ -72,9 +69,6 @@ impl ReviewReason {
             }
             Self::InvalidPayload => {
                 "The transaction bytes do not match the description. Restage it."
-            }
-            Self::PolicyDenied => {
-                "Wallet policy refuses this request. Change policy in a ceremony first."
             }
             Self::LimitExceeded => "The request is larger than Bloom accepts.",
         }

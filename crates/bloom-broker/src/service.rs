@@ -1099,7 +1099,6 @@ impl BrokerRpcService {
             return Err(error);
         }
         self.prepare_approval(ApprovalPrepareRequest {
-            requested_review_mode: None,
             evm_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
             operation_id: request.operation_id,
