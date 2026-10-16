@@ -337,16 +337,16 @@ fn review_at(
         _ => 1,
     };
     // A Safe's delegatecall runs another contract's code as the Safe, with
-    // its storage and owners. The one contract allowed to is the batch
-    // library, which only makes plain calls.
+    // its storage and owners. The contracts allowed to are Safe's batch and
+    // deployment libraries, which only make plain calls or create contracts.
     if crate::parse_function(&call.signature)?.signature() == SAFE_EXEC_SIGNATURE
         && let (DynSolValue::Uint(operation, _), DynSolValue::Address(to)) =
             (value_at("operation", 0), value_at("to", 0))
         && !operation.is_zero()
-        && !catalog.is_safe_batch(context.chain_id, &format!("0x{to:x}"))
+        && !catalog.is_safe_library(context.chain_id, &format!("0x{to:x}"))
     {
         return Err(unsupported(
-            "a Safe may delegatecall only Safe's MultiSendCallOnly batch library",
+            "a Safe may delegatecall only Safe's own batch and deployment libraries",
         ));
     }
     for (path, allowed) in &call.constraints {

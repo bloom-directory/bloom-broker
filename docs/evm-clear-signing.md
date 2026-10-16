@@ -166,7 +166,8 @@ identical in 1.3.0 and 1.5.0.
 `mustMatch` and one rule in code hold the Safe safety rules:
 
 - A delegatecall runs code as the Safe, so `execTransaction` may delegatecall
-  only Safe's MultiSendCallOnly (1.3.0, 1.4.1, 1.5.0). That batch library's
+  only Safe's own libraries: CreateCall, described in `catalogs/safe`, and
+  MultiSendCallOnly (1.3.0, 1.4.1, 1.5.0). That batch library's
   packed format is not ERC-7730, so Broker reads it in code: each call is
   shown as an embedded call, `Transaction 1`, `Transaction 2`, and reviewed as
   a top-level call would be. A call inside a batch must be a plain call to a

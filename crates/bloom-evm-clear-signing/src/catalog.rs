@@ -35,7 +35,7 @@ pub enum Binding {
 }
 
 /// The compiled-in descriptor files: path, contents and binding.
-pub const DESCRIPTORS: [(&str, &str, Binding); 5] = [
+pub const DESCRIPTORS: [(&str, &str, Binding); 6] = [
     (
         "safe/safe.json",
         include_str!("../catalogs/safe/safe.json"),
@@ -44,6 +44,11 @@ pub const DESCRIPTORS: [(&str, &str, Binding); 5] = [
     (
         "safe/safe-proxy-factory.json",
         include_str!("../catalogs/safe/safe-proxy-factory.json"),
+        Binding::Listed,
+    ),
+    (
+        "safe/create-call.json",
+        include_str!("../catalogs/safe/create-call.json"),
         Binding::Listed,
     ),
     (
@@ -75,6 +80,13 @@ pub const SAFE_BATCH: [&str; 4] = [
     "0xa83c336b20401af773b6219ba5027174338d1836",
 ];
 pub const SAFE_BATCH_CHAINS: [u64; 6] = [1, 10, 100, 137, 8453, 42161];
+/// Safe's CreateCall, described in `catalogs/safe/create-call.json`.
+const SAFE_CREATE_CALL: [&str; 4] = [
+    "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4",
+    "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d",
+    "0x9b35af71d77eaf8d7e40252370304687390a1a52",
+    "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4",
+];
 
 /// What a reviewed function is permitted to mean. It is derived from the
 /// signature: only the canonical ERC-20 `transfer` and `approve` get the
@@ -336,10 +348,13 @@ impl Catalog {
         Ok(())
     }
 
-    /// Whether a Safe may delegatecall this address: a MultiSendCallOnly.
-    pub fn is_safe_batch(&self, chain_id: u64, address: &str) -> bool {
-        self.entry(chain_id, address)
-            .is_some_and(|entry| entry.descriptor == SAFE_BATCH_DESCRIPTOR)
+    /// Whether a Safe may delegatecall this address: one of Safe's own
+    /// libraries, MultiSendCallOnly or CreateCall, which act only as the
+    /// Safe's batch or deployment.
+    pub fn is_safe_library(&self, chain_id: u64, address: &str) -> bool {
+        self.entry(chain_id, address).is_some_and(|entry| {
+            entry.descriptor == SAFE_BATCH_DESCRIPTOR || SAFE_CREATE_CALL.contains(&address)
+        })
     }
 
     pub fn len(&self) -> usize {
