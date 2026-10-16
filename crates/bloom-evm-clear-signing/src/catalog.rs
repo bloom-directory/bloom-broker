@@ -14,7 +14,9 @@ use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::{AdmittedDescriptor, ReviewError, ReviewReason, admit, descriptor_digest};
+use crate::{
+    AdmittedDescriptor, ReviewError, ReviewReason, admit, descriptor_digest, erc20_profile,
+};
 
 pub const CATALOG_SCHEMA: &str = "bloom.clear-signing-catalog.1";
 /// Versioned domain for the one catalog signature. This is a Bloom content
@@ -76,8 +78,8 @@ pub struct CatalogEntry {
     /// address form compared against the transaction destination.
     pub contract_address: String,
     pub admitted_functions: Vec<AdmittedFunction>,
-    /// The flattened ERC-7730 document. Absent for a token-only entry that
-    /// exists to supply decimals for another contract's `tokenAmount`.
+    /// The flattened ERC-7730 document. Absent for a token entry, which is
+    /// read by the built-in [`crate::erc20_profile`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flattened_descriptor: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -296,6 +298,19 @@ impl ClearSigningCatalog {
         let mut admitted = Vec::with_capacity(self.entries.len());
         for entry in &self.entries {
             let Some(descriptor) = &entry.flattened_descriptor else {
+                if let Some(token) = &entry.token_metadata {
+                    let (profile, functions) =
+                        erc20_profile(entry.chain_id.get(), &entry.contract_address, &token.name);
+                    admitted.push((
+                        (entry.chain_id.get(), entry.contract_address.clone()),
+                        admit(
+                            &profile,
+                            entry.chain_id.get(),
+                            &entry.contract_address,
+                            &functions,
+                        )?,
+                    ));
+                }
                 continue;
             };
             let expected = entry

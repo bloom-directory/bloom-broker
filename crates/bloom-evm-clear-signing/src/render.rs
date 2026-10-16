@@ -74,10 +74,35 @@ pub fn standing_assurance() -> String {
         .to_owned()
 }
 
-/// The assurance of a call read by an instance entry: the description is
-/// trusted, but nothing establishes that the address runs that contract.
+/// The sentence for a call Bloom read by the standard ERC-20 calldata shape
+/// alone, with no signed description of the contract.
+pub const STRUCTURAL_ERC20_ASSURANCE: &str = "Decoded from the standard ERC-20 calldata shape. Bloom verified the exact arguments, but not that this contract is a token or follows ERC-20 behavior.";
+
+/// Exact canonical `transfer(address,uint256)` or `approve(address,uint256)`
+/// calldata: its class, counterparty and amount. Anything else, including
+/// dirty address padding or a wrong length, is `None`. A selector match is not
+/// deployment evidence: any contract can implement these four bytes.
+pub fn canonical_erc20(calldata: &[u8]) -> Option<(ActionClass, Address, U256)> {
+    if calldata.len() != 68 || calldata[4..16].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    let class = match calldata[..4] {
+        [0xa9, 0x05, 0x9c, 0xbb] => ActionClass::Transfer,
+        [0x09, 0x5e, 0xa7, 0xb3] => ActionClass::Allowance,
+        _ => return None,
+    };
+    Some((
+        class,
+        Address::from_slice(&calldata[16..36]),
+        U256::from_be_slice(&calldata[36..]),
+    ))
+}
+
+/// The assurance of a call that names a contract no signed entry lists: an
+/// instance read by its contract type, or an embedded ERC-20 call read by its
+/// shape. The reading is exact; what that contract is, is not established.
 pub fn structural_assurance() -> String {
-    "Interpreted using a trusted signed description of a contract type. Bloom has not verified that this address is that contract, or what it does."
+    "Interpreted using trusted signed descriptions, but this call reaches a contract Bloom has not identified. Bloom has not verified what that contract is or what it does."
         .to_owned()
 }
 
@@ -133,6 +158,10 @@ pub struct ClearSignedCall {
     /// it once; it is not a property of this call and never a warning.
     #[serde(default = "standing_assurance")]
     pub assurance: String,
+    /// Some part of this reading rests on no listed deployment: an instance
+    /// entry, or an embedded ERC-20 call read by its shape alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub structural: bool,
     /// Risks specific to this call: upgradeability, and what an allowance
     /// grants. Never the standing assurance.
     pub warnings: Vec<String>,
@@ -269,11 +298,6 @@ fn review_at(
     let address = format!("{:x}", context.to);
     let address = format!("0x{address}");
     let listed = catalog.entry(context.chain_id, &address);
-    if listed.is_some() && catalog.descriptor(context.chain_id, &address).is_none() {
-        return Err(unsupported(
-            "catalog entry carries token metadata but no descriptor",
-        ));
-    }
     let selector = context.calldata.get(..4);
     let Some((entry, admitted, instance)) =
         selector.and_then(|selector| catalog.resolve(context.chain_id, &address, selector))
@@ -367,6 +391,7 @@ fn review_at(
             checksum(&entry.contract_address)
         ));
     }
+    let mut structural = instance;
     let mut fields = Vec::with_capacity(call.fields.len());
     for field in &call.fields {
         let value = leaf(&field.path);
@@ -390,7 +415,7 @@ fn review_at(
                     calldata: data,
                     ..context.clone()
                 };
-                render_embedded(
+                structural |= render_embedded(
                     catalog,
                     &inner,
                     &field.label,
@@ -443,11 +468,12 @@ fn review_at(
             fields,
             token: SelectedEntry::of(entry).token,
             intent_summary,
-            assurance: if instance {
+            assurance: if structural {
                 structural_assurance()
             } else {
                 standing_assurance()
             },
+            structural,
             warnings,
         },
         used,
@@ -456,7 +482,8 @@ fn review_at(
 
 /// An embedded call, shown as one heading line and then its own fields, each
 /// labelled under the heading. It is reviewed exactly as a top-level call
-/// would be, so its entries become evidence and its refusals refuse.
+/// would be, so its entries become evidence and its refusals refuse. Returns
+/// whether the reading is structural.
 fn render_embedded(
     catalog: &AcceptedCatalog,
     inner: &CallContext<'_>,
@@ -465,7 +492,7 @@ fn render_embedded(
     fields: &mut Vec<DisplayField>,
     used: &mut Vec<SelectedEntry>,
     warnings: &mut Vec<String>,
-) -> Result<(), ReviewError> {
+) -> Result<bool, ReviewError> {
     let raw = format!("0x{}", hex_lower(inner.calldata));
     let callee = checksum(&format!("0x{:x}", inner.to));
     if inner.calldata.is_empty() {
@@ -487,7 +514,15 @@ fn render_embedded(
             value,
             raw,
         });
-        return Ok(());
+        return Ok(false);
+    }
+    let address = format!("0x{:x}", inner.to);
+    if catalog.entry(inner.chain_id, &address).is_none()
+        && let Some(reading) = canonical_erc20(inner.calldata)
+    {
+        // No deployment is listed for the callee, so the instance entries
+        // are not consulted: the ERC-20 shape is the only thing to read.
+        return render_shaped_erc20(inner, label, reading, &raw, fields, warnings).map(|()| true);
     }
     let (call, entries) = review_at(catalog, inner, depth + 1)?;
     // Named by its function, as a top-level call is: publisher intent text
@@ -523,6 +558,71 @@ fn render_embedded(
             used.push(entry);
         }
     }
+    Ok(call.structural)
+}
+
+/// An embedded transfer or approval to a contract the catalog does not list:
+/// the exact arguments, in raw units, under the same allowance policy as a
+/// catalogued token.
+fn render_shaped_erc20(
+    inner: &CallContext<'_>,
+    label: &str,
+    (class, counterparty, amount): (ActionClass, Address, U256),
+    raw: &str,
+    fields: &mut Vec<DisplayField>,
+    warnings: &mut Vec<String>,
+) -> Result<(), ReviewError> {
+    if !inner.value.is_zero() {
+        return Err(invalid(
+            "admitted contract calls must carry zero native value",
+        ));
+    }
+    let callee = checksum(&format!("0x{:x}", inner.to));
+    let counterparty = checksum(&format!("0x{counterparty:x}"));
+    let (action, role, amount_label) = match class {
+        ActionClass::Transfer => ("transfer", "Recipient", "Raw token amount"),
+        _ => ("approve", "Spender", "Raw total allowance"),
+    };
+    let mut shown = vec![format!(
+        "{label}: Bloom decoded an ERC-20-shaped call to {callee}, but has not verified that this contract is a token or follows ERC-20 behavior."
+    )];
+    if class == ActionClass::Allowance {
+        if amount == U256::MAX {
+            if !inner.unlimited_allowance_allowed {
+                return Err(ReviewError::new(
+                    ReviewReason::PolicyDenied,
+                    "wallet policy denies unlimited allowances; enable them in a policy ceremony first",
+                ));
+            }
+            shown.push(format!(
+                "{label}: The allowance is the maximum uint256. If {callee} behaves as ERC-20, the spender can use all current and future tokens without asking again."
+            ));
+        } else if !amount.is_zero() {
+            shown.push(format!(
+                "{label}: If {callee} behaves as ERC-20, the spender can move tokens later without another approval."
+            ));
+        }
+    }
+    let amount = amount.to_string();
+    fields.push(DisplayField {
+        label: label.to_owned(),
+        format: "calldata".to_owned(),
+        value: format!("{action} on {callee}"),
+        raw: raw.to_owned(),
+    });
+    fields.push(DisplayField {
+        label: format!("{label} · {role}"),
+        format: "addressName".to_owned(),
+        value: counterparty.clone(),
+        raw: counterparty,
+    });
+    fields.push(DisplayField {
+        label: format!("{label} · {amount_label}"),
+        format: "raw".to_owned(),
+        value: amount.clone(),
+        raw: amount,
+    });
+    warnings.extend(shown);
     Ok(())
 }
 

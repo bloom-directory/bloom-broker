@@ -11,8 +11,9 @@ use bloom_broker_api::{
     Digest32, ProtocolError, ProtocolErrorCode, ReviewMode, SigningPayloads,
 };
 use bloom_evm_clear_signing::{
-    AcceptedCatalog, CallContext, ClearSignedCall, ClearSigningEvidence, DisplayField, NativeUnits,
-    ReviewError, ReviewReason, SelectedEntry, checksum, review_call,
+    AcceptedCatalog, ActionClass, CallContext, ClearSignedCall, ClearSigningEvidence, DisplayField,
+    NativeUnits, ReviewError, ReviewReason, STRUCTURAL_DESCRIPTION, STRUCTURAL_ERC20_ASSURANCE,
+    SelectedEntry, canonical_erc20, checksum, review_call,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -104,10 +105,7 @@ pub struct StructuralErc20Intent {
     pub magnitude: String,
 }
 
-const TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
-const APPROVE_SELECTOR: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
 const STRUCTURAL_CALLDATA: &str = "structural_calldata";
-const STRUCTURAL_ASSURANCE: &str = "Decoded from the standard ERC-20 calldata shape. Bloom verified the exact arguments, but not that this contract is a token or follows ERC-20 behavior.";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -184,39 +182,26 @@ fn review_structural_erc20(
     call: &DecodedCall,
     unlimited_allowance_allowed: Option<bool>,
 ) -> Result<Option<StructuralErc20Call>, ReviewError> {
-    if call.calldata.len() < 4 {
+    let Some((class, counterparty_address, amount)) = canonical_erc20(&call.calldata) else {
         return Ok(None);
-    }
-    let selector: [u8; 4] = call.calldata[..4]
-        .try_into()
-        .expect("the length check proved a complete selector");
-    let (signature, action, role, counterparty_label, amount_label) = match selector {
-        TRANSFER_SELECTOR => (
+    };
+    let (signature, action, role, counterparty_label, amount_label) = match class {
+        ActionClass::Transfer => (
             "transfer(address,uint256)",
             "transfer",
             "recipient",
             "Recipient",
             "Raw token amount",
         ),
-        APPROVE_SELECTOR => (
+        _ => (
             "approve(address,uint256)",
             "allowance",
             "spender",
             "Spender",
             "Raw total allowance",
         ),
-        _ => return Ok(None),
     };
-    if call.calldata.len() != 68 {
-        return Ok(None);
-    }
-    let address_word = &call.calldata[4..36];
-    if address_word[..12].iter().any(|byte| *byte != 0) {
-        return Ok(None);
-    }
-    let counterparty_address = Address::from_slice(&address_word[12..]);
     let counterparty = checksum(&format!("0x{counterparty_address:x}"));
-    let amount = U256::from_be_slice(&call.calldata[36..]);
     let magnitude = if amount.is_zero() {
         "zero"
     } else if amount == U256::MAX {
@@ -265,7 +250,7 @@ fn review_structural_erc20(
     Ok(Some(StructuralErc20Call {
         contract,
         function_signature: signature.to_owned(),
-        selector: format!("0x{}", hex::encode(selector)),
+        selector: format!("0x{}", hex::encode(&call.calldata[..4])),
         action: action.to_owned(),
         fields: vec![
             DisplayField {
@@ -290,7 +275,7 @@ fn review_structural_erc20(
             magnitude: magnitude.to_owned(),
         },
         assurance_class: STRUCTURAL_CALLDATA.to_owned(),
-        assurance: STRUCTURAL_ASSURANCE.to_owned(),
+        assurance: STRUCTURAL_ERC20_ASSURANCE.to_owned(),
         warnings,
     }))
 }
@@ -634,11 +619,16 @@ fn apply_review_mode(
     if let Some(catalog) = context.catalog.as_ref()
         && !entries.is_empty()
     {
-        review.clear_signing = Some(ClearSigningEvidence::new(
-            catalog,
-            &context.verifier_digest,
-            entries,
-        ));
+        let mut evidence = ClearSigningEvidence::new(catalog, &context.verifier_digest, entries);
+        if review.payloads.iter().any(|payload| {
+            payload
+                .contract_call
+                .as_ref()
+                .is_some_and(|call| call.structural)
+        }) {
+            evidence.assurance = STRUCTURAL_DESCRIPTION.to_owned();
+        }
+        review.clear_signing = Some(evidence);
     }
     Ok(())
 }

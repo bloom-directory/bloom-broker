@@ -384,8 +384,10 @@ fn the_nine_reasons_each_carry_an_actionable_sentence() {
     }
 }
 
+/// Catalog v2's token record: metadata alone. The built-in profile reads its
+/// transfers and approvals with the same rules a full descriptor gets.
 #[test]
-fn a_token_only_entry_supplies_units_without_admitting_any_call() {
+fn a_token_listed_by_metadata_alone_reads_through_the_built_in_profile() {
     let mut token_only = erc20_entry();
     token_only.admitted_functions = Vec::new();
     token_only.flattened_descriptor = None;
@@ -394,19 +396,38 @@ fn a_token_only_entry_supplies_units_without_admitting_any_call() {
     sign(&mut catalog, &[(1, "publisher-1")]);
     let accepted = accept(&catalog).unwrap();
 
-    assert!(
-        accepted
-            .entry(CHAIN_ID, TOKEN)
-            .unwrap()
-            .token_metadata
-            .is_some()
+    let transfer = calldata(
+        "transfer(address,uint256)",
+        &[address_word(RECIPIENT), U256::from(2_500_000u64)],
     );
-    let bytes = calldata(
-        "transfer(address _to, uint256 _value)",
+    let (call, used) = review_call(&accepted, &context(&transfer, false)).unwrap();
+    assert_eq!(call.action, "transfer");
+    assert_eq!(field(&call, "Amount").value, "2.5 EXA");
+    assert_eq!(
+        call.intent_summary.unwrap().counterparty,
+        checksum(RECIPIENT)
+    );
+    assert!(!call.structural);
+    assert_eq!(used.len(), 1);
+
+    // The ERC-20 safety rules still apply: unlimited allowances follow policy.
+    let unlimited = calldata(
+        "approve(address,uint256)",
+        &[address_word(RECIPIENT), U256::MAX],
+    );
+    assert_eq!(
+        review_call(&accepted, &context(&unlimited, false))
+            .unwrap_err()
+            .reason,
+        ReviewReason::PolicyDenied
+    );
+    // And nothing else is admitted.
+    let other = calldata(
+        "mint(address,uint256)",
         &[address_word(RECIPIENT), U256::from(1u8)],
     );
     assert_eq!(
-        review_call(&accepted, &context(&bytes, false))
+        review_call(&accepted, &context(&other, false))
             .unwrap_err()
             .reason,
         ReviewReason::UnsupportedCall

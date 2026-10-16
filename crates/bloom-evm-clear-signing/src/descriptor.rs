@@ -218,6 +218,39 @@ fn text(value: &Value, what: &str) -> Result<String, ReviewError> {
     Ok(value.to_owned())
 }
 
+/// The transfer and approval description every token entry without a
+/// descriptor of its own is read by. It is compiled in, so it is covered by
+/// the verifier digest, and a publisher lists a token by its metadata alone.
+pub fn erc20_profile(chain_id: u64, address: &str, name: &str) -> (Value, Vec<AdmittedFunction>) {
+    let descriptor = serde_json::json!({
+        "context": {"contract": {"deployments": [{"chainId": chain_id, "address": address}]}},
+        "metadata": {"contractName": name},
+        "display": {"formats": {
+            "transfer(address to, uint256 amount)": {"fields": [
+                {"path": "to", "label": "To", "format": "addressName"},
+                {"path": "amount", "label": "Amount", "format": "tokenAmount",
+                 "params": {"tokenPath": "@.to"}}
+            ]},
+            "approve(address spender, uint256 amount)": {"fields": [
+                {"path": "spender", "label": "Spender", "format": "addressName"},
+                {"path": "amount", "label": "Amount", "format": "tokenAmount",
+                 "params": {"tokenPath": "@.to"}}
+            ]}
+        }}
+    });
+    let functions = vec![
+        AdmittedFunction {
+            signature: "transfer(address to, uint256 amount)".to_owned(),
+            action_class: ActionClass::Transfer,
+        },
+        AdmittedFunction {
+            signature: "approve(address spender, uint256 amount)".to_owned(),
+            action_class: ActionClass::Allowance,
+        },
+    ];
+    (descriptor, functions)
+}
+
 /// Admit one flattened descriptor for one catalog entry.
 ///
 /// `chain_id`/`address` come from the signed entry, not the document: the

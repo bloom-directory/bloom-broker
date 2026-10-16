@@ -61,27 +61,15 @@ fn safe_entries() -> Vec<CatalogEntry> {
         .collect()
 }
 
-/// USDC on Base, so a Safe's inner token call has something to be read by.
+/// USDC on Base, listed the way a token is: by its metadata alone.
 fn usdc() -> CatalogEntry {
-    let descriptor = json!({
-        "context": {"contract": {"deployments": [{"chainId": BASE, "address": USDC}]}},
-        "metadata": {"contractName": "USD Coin"},
-        "display": {"formats": {
-            "transfer(address _to, uint256 _value)": {"fields": [
-                {"path": "_to", "label": "To", "format": "addressName"},
-                {"path": "_value", "label": "Amount", "format": "tokenAmount",
-                 "params": {"tokenPath": "@.to"}}
-            ]},
-            "approve(address _spender, uint256 _value)": {"fields": [
-                {"path": "_spender", "label": "Spender", "format": "addressName"},
-                {"path": "_value", "label": "Amount", "format": "tokenAmount",
-                 "params": {"tokenPath": "@.to"}}
-            ]}
-        }}
-    });
-    let mut entry = entry_at(USDC, descriptor, erc20_functions(), Some(6));
+    let mut entry = entry_at(USDC, json!({}), Vec::new(), Some(6));
     entry.chain_id = DecimalU64::new(BASE);
-    entry.token_metadata.as_mut().unwrap().symbol = "USDC".into();
+    entry.flattened_descriptor = None;
+    entry.descriptor_digest = None;
+    let token = entry.token_metadata.as_mut().unwrap();
+    token.symbol = "USDC".into();
+    token.name = "USD Coin".into();
     entry
 }
 
@@ -314,6 +302,60 @@ fn a_safe_token_call_is_read_and_policed_by_the_token_entry() {
     let unknown = exec(RECIPIENT, 0, vec![0xde, 0xad, 0xbe, 0xef], 0, 0);
     let error = review(SAFE, &unknown).unwrap_err();
     assert_eq!(error.reason, ReviewReason::UnsupportedCall, "{error}");
+}
+
+/// A token the catalog does not list is still readable inside a Safe: by its
+/// ERC-20 shape, in raw units, and the review says it is structural.
+#[test]
+fn a_safe_call_to_an_unlisted_token_is_read_by_its_shape() {
+    let transfer = exec(
+        RECIPIENT,
+        0,
+        token_call("transfer(address,uint256)", WALLET, U256::from(7)),
+        0,
+        0,
+    );
+    let (call, entries) = review(SAFE, &transfer).unwrap();
+    assert_eq!(
+        field(&call, "Safe transaction"),
+        format!("transfer on {}", checksum(RECIPIENT))
+    );
+    assert_eq!(
+        field(&call, "Safe transaction · Recipient"),
+        checksum(WALLET)
+    );
+    assert_eq!(field(&call, "Safe transaction · Raw token amount"), "7");
+    assert!(call.structural);
+    assert!(
+        call.warnings
+            .iter()
+            .any(|warning| warning.contains("ERC-20-shaped"))
+    );
+    // Only the Safe's entry is evidence: the token contributed none.
+    assert_eq!(entries.len(), 1);
+
+    let unlimited = exec(
+        RECIPIENT,
+        0,
+        token_call("approve(address,uint256)", WALLET, U256::MAX),
+        0,
+        0,
+    );
+    let error = review(SAFE, &unlimited).unwrap_err();
+    assert_eq!(error.reason, ReviewReason::PolicyDenied, "{error}");
+
+    // Native value riding on a token call is not a token transfer.
+    let with_value = exec(
+        RECIPIENT,
+        1,
+        token_call("transfer(address,uint256)", WALLET, U256::from(7)),
+        0,
+        0,
+    );
+    assert_eq!(
+        review(SAFE, &with_value).unwrap_err().reason,
+        ReviewReason::InvalidPayload
+    );
 }
 
 #[test]
