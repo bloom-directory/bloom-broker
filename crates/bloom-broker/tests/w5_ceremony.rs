@@ -3543,7 +3543,6 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     valid["owner"] = serde_json::json!(owner.to_string());
     valid["owners"] = serde_json::json!([owner.to_string()]);
     let token_contract = "0x1111111111111111111111111111111111111111";
-    let recipient = "0x2222222222222222222222222222222222222222";
     let mut calldata = vec![0xa9, 0x05, 0x9c, 0xbb];
     calldata.extend_from_slice(&[0; 12]);
     calldata.extend_from_slice(&[0x22; 20]);
@@ -3619,11 +3618,12 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         serde_json::from_str(manifest["canonical_plan"].as_str().unwrap()).unwrap();
     assert_eq!(plan["safe_review"]["owner"], owner.to_string());
     assert_eq!(manifest["safe_review"], plan["safe_review"]);
-    // The token is not in Broker's catalog, so the inner transfer is read
-    // by its ERC-20 shape: the exact recipient and raw amount.
+    // Broker's catalog describes Safes on the chains Safe deploys to, not
+    // this test chain, so the transaction is shown as bytes Bloom cannot
+    // read, with the reason.
     let action = plan["safe_review"]["action"].to_string();
     assert!(
-        action.contains("unidentified contract") && action.contains(recipient),
+        action.contains("Bloom cannot read") && action.contains("no description"),
         "{action}"
     );
     assert!(
@@ -5517,7 +5517,7 @@ async fn unreadable_safe_call_carries_a_signed_inability_to_explain_disclosure()
         "chain_id":"1", "chain":"ethereum", "safe":"0x1000000000000000000000000000000000000000",
         "owner":"0x3000000000000000000000000000000000000000", "nonce":"4", "operation":"call",
         "destination":"0x4000000000000000000000000000000000000000", "value":"0", "value_display":"0 ETH",
-        "action":["Action: Contract call", "Calldata selector: 0xdeadbeef"], "safe_tx_hash":"0x1234",
+        "action":["Action: Contract call Bloom cannot read", "Reason: no description of 0x4000000000000000000000000000000000000000 on chain 1"], "safe_tx_hash":"0x1234",
         "reported":{"version":"1.4.1", "singleton":"0x41", "singleton_code_hash":"0x1f",
             "owners":["0x3000000000000000000000000000000000000000"], "threshold":"1",
             "guard":"0x0000000000000000000000000000000000000000", "modules":[],

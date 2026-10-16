@@ -2,7 +2,7 @@
 
 use std::str::FromStr;
 
-use alloy::primitives::{Address, B256, U256, keccak256};
+use alloy::primitives::{Address, U256, keccak256};
 use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalSelector, CanonicalWalletPolicy, CryptoSuite, DeclaredFee,
     Digest32, ProtocolError, ProtocolErrorCode,
@@ -51,7 +51,6 @@ const MAX_REVIEW_BYTES: usize = 256 * 1024;
 const MAX_CALLDATA_BYTES: usize = 128 * 1024;
 const MAX_OWNERS: usize = 64;
 const MAX_MODULES: usize = 64;
-const ZERO: &str = "0x0000000000000000000000000000000000000000";
 const SAFE_TX_TYPE: &str = "SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)";
 const DOMAIN_TYPE: &str = "EIP712Domain(uint256 chainId,address verifyingContract)";
 
@@ -305,522 +304,38 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
         ));
     }
 
-    // These five are EIP-712 members, so the selector comparison binds them.
-    if envelope.safe_tx.safe_tx_gas != "0"
-        || envelope.safe_tx.base_gas != "0"
-        || envelope.safe_tx.gas_price != "0"
-        || !envelope.safe_tx.gas_token.eq_ignore_ascii_case(ZERO)
-        || !envelope.safe_tx.refund_receiver.eq_ignore_ascii_case(ZERO)
-    {
-        return Err(invalid(
-            "Safe gas reimbursement fields must all be zero in this release",
-        ));
-    }
     Ok(())
 }
 
-/// Chains on which every deployment in [`DEPLOYMENTS`] was read and found to
-/// hold the code its `code_hash` names.
-///
-/// The chain ID is an EIP-712 domain member, so a signature cannot be replayed
-/// onto a chain outside this list, where the same address could hold other
-/// code. Adding a chain means reading every address on it -- which is what
-/// `safe_deployments_hold_the_pinned_code` does, so the list cannot grow
-/// ahead of the evidence.
-const VERIFIED_CHAINS: &[u64] = &[1, 10, 100, 137, 8453, 42161];
+/// The heading of a Safe transaction Bloom could not read.
+pub(crate) const OPAQUE_ACTION: &str = "Action: Contract call Bloom cannot read";
 
-/// One canonical Safe library a `delegatecall` may enter. `safe_tx.to` is
-/// bound by the selector, so this is a real constraint on the executing code.
-///
-/// `code_hash` is keccak-256 of the deployed runtime code, which is what makes
-/// the address list checkable rather than asserted: the addresses alone say
-/// only that somebody wrote them down. The hash is not read at approval time
-/// -- Broker performs no chain access -- but it is what the ignored RPC test
-/// compares, so a wrong address or a chain that does not actually carry the
-/// deployment fails a test instead of silently widening what a delegatecall
-/// may enter.
-struct Deployment {
-    kind: &'static str,
-    /// Read only by `safe_deployments_hold_the_pinned_code`'s messages.
-    #[cfg_attr(not(test), allow(dead_code))]
-    version: &'static str,
-    address: &'static str,
-    /// Read only by `safe_deployments_hold_the_pinned_code`. Approval-time
-    /// code is offline and compares nothing; this is the recorded evidence
-    /// that the addresses above are what they claim to be.
-    #[cfg_attr(not(test), allow(dead_code))]
-    code_hash: &'static str,
-}
+const EXEC_TRANSACTION: &str =
+    "execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)";
 
-/// Canonical Safe deployments, from `@safe-global/safe-deployments`.
-///
-/// The 1.3.0 entries come in a canonical and an EIP-155 pair: the same
-/// bytecode at two addresses, because it was deployed two ways. Later
-/// versions have a single address.
-const DEPLOYMENTS: &[Deployment] = &[
-    Deployment {
-        kind: "MultiSendCallOnly",
-        version: "1.3.0",
-        address: "0x40a2accbd92bca938b02010e17a5b8929b49130d",
-        code_hash: "0xa9865ac2d9c7a1591619b188c4d88167b50df6cc0c5327fcbd1c8c75f7c066ad",
-    },
-    Deployment {
-        kind: "MultiSendCallOnly",
-        version: "1.3.0-eip155",
-        address: "0xa1dabef33b3b82c7814b6d82a79e50f4ac44102b",
-        code_hash: "0xa9865ac2d9c7a1591619b188c4d88167b50df6cc0c5327fcbd1c8c75f7c066ad",
-    },
-    Deployment {
-        kind: "MultiSendCallOnly",
-        version: "1.4.1",
-        address: "0x9641d764fc13c8b624c04430c7356c1c7c8102e2",
-        code_hash: "0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939",
-    },
-    Deployment {
-        kind: "MultiSendCallOnly",
-        version: "1.5.0",
-        address: "0xa83c336b20401af773b6219ba5027174338d1836",
-        code_hash: "0xcdbdcec38d2f1c7d961b0029ff8416b7e86e9974d6f0e9c9580c7d17fcfb6663",
-    },
-    Deployment {
-        kind: "CreateCall",
-        version: "1.3.0",
-        address: "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4",
-        code_hash: "0x8155d988823a4f6f1bcbc76a64af8e510c4ce68819290d43cf24956bd24dee82",
-    },
-    Deployment {
-        kind: "CreateCall",
-        version: "1.3.0-eip155",
-        address: "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d",
-        code_hash: "0x8155d988823a4f6f1bcbc76a64af8e510c4ce68819290d43cf24956bd24dee82",
-    },
-    Deployment {
-        kind: "CreateCall",
-        version: "1.4.1",
-        address: "0x9b35af71d77eaf8d7e40252370304687390a1a52",
-        code_hash: "0x2b3060c55fcb8275653e99ad511a71f67ba76934ed66a7d74d6e68b52afff889",
-    },
-    Deployment {
-        kind: "CreateCall",
-        version: "1.5.0",
-        address: "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4",
-        code_hash: "0x6b7d8d29bdf7004c4617d95041923774f3f7e74b056bff55c1861c9ec92ce54f",
-    },
-];
-
-/// The canonical library at `address`, if Broker accepts it on `chain`.
-///
-/// An address is evidence only on a chain where its code was read, so the
-/// chain is part of the lookup: on any other chain the same address can hold
-/// code someone else chose, and nothing may be recognised by identity there.
-fn library(chain: U256, address: &str) -> Option<&'static Deployment> {
-    if !VERIFIED_CHAINS.iter().any(|id| U256::from(*id) == chain) {
-        return None;
-    }
-    DEPLOYMENTS.iter().find(|entry| entry.address == address)
-}
-
-fn dynamic_bytes(
-    data: &[u8],
-    head_words: usize,
-    offset_word: usize,
-) -> Result<&[u8], ProtocolError> {
-    if data.len() < head_words * 32 {
-        return Err(invalid("delegatecall ABI data is truncated"));
-    }
-    let offset = U256::from_be_slice(&data[offset_word * 32..offset_word * 32 + 32])
-        .try_into()
-        .map_err(|_| invalid("delegatecall ABI offset is too large"))?;
-    if offset != head_words * 32 || offset + 32 > data.len() {
-        return Err(invalid("delegatecall ABI offset is invalid"));
-    }
-    let length: usize = U256::from_be_slice(&data[offset..offset + 32])
-        .try_into()
-        .map_err(|_| invalid("delegatecall ABI length is too large"))?;
-    let end = offset
-        .checked_add(32)
-        .and_then(|start| start.checked_add(length))
-        .ok_or_else(|| invalid("delegatecall ABI length overflow"))?;
-    let padded_end = end
-        .checked_add(31)
-        .map(|value| value / 32 * 32)
-        .ok_or_else(|| invalid("delegatecall ABI padding overflow"))?;
-    if padded_end != data.len() || data[end..].iter().any(|byte| *byte != 0) {
-        return Err(invalid(
-            "delegatecall ABI bytes are truncated or noncanonical",
-        ));
-    }
-    Ok(&data[offset + 32..end])
-}
-
-/// A native amount in the chain's own unit, from the shared asset table.
-fn native(value: U256, chain: &str) -> String {
-    crate::evm_review::native_value_display(&value.to_string(), chain)
-}
-
-/// One disclosed line per call-only batch entry, decoded the same way a
-/// top-level call is.
-fn entry_summary(chain: &str, index: usize, to: Address, value: U256, data: &[u8]) -> String {
-    if data.len() == 68 && data[..4] == [0xa9, 0x05, 0x9c, 0xbb] {
-        format!(
-            "{index}. ERC-20 transfer of {} base units of token {to} to {} with native value {}",
-            U256::from_be_slice(&data[36..68]),
-            Address::from_slice(&data[16..36]),
-            native(value, chain)
-        )
-    } else if data.is_empty() {
-        format!("{index}. Send {} to {to}", native(value, chain))
-    } else {
-        format!(
-            "{index}. {OPAQUE_ENTRY}{to} with {}, selector 0x{}, calldata keccak256 {:#x}",
-            native(value, chain),
-            hex::encode(&data[..data.len().min(4)]),
-            keccak256(data)
-        )
-    }
-}
-
-/// One ABI word that must hold an address and nothing above it.
-fn word_as_address(word: &[u8]) -> Result<Address, ProtocolError> {
-    if word[..12].iter().any(|byte| *byte != 0) {
-        return Err(invalid("Safe owner change carries a malformed address"));
-    }
-    Ok(Address::from_slice(&word[12..]))
-}
-
-/// The Safe's current signing configuration, as the Petal reports it.
-///
-/// Unverified -- the envelope discloses it separately for that reason -- but a
-/// threshold change is unreadable without a baseline, so the reading uses it
-/// and says that is where it came from.
-struct SafeSigners {
-    threshold: U256,
-    owners: usize,
-}
-
-/// The four Safe self-calls that change who may sign and how many must. Every
-/// other self-call stays refused: enabling a module, or setting a guard or
-/// fallback handler, hands the Safe to code Broker cannot review.
-///
-/// The `prevOwner` argument only locates an entry in the Safe's owner list,
-/// so it is checked for shape and not shown.
-fn owner_change(
-    signer: Address,
-    value: U256,
-    data: &[u8],
-    current: &SafeSigners,
-) -> Result<String, ProtocolError> {
-    let refused =
-        || invalid("Safe self-calls other than owner and threshold changes are not supported");
-    if !value.is_zero() || data.len() < 4 || (data.len() - 4) % 32 != 0 {
-        return Err(refused());
-    }
-    let words: Vec<&[u8]> = data[4..].chunks(32).collect();
-    let selector = |signature: &str| data[..4] == keccak256(signature).as_slice()[..4];
-    let removes_signer = |removed: Address| {
-        if removed == signer {
-            "\nWarning: this removes this Bloom wallet from the Safe's owners"
-        } else {
-            ""
-        }
-    };
-    let threshold = |word: &[u8]| {
-        let threshold = U256::from_be_slice(word);
-        if threshold.is_zero() {
-            return Err(invalid("Safe threshold must be at least 1"));
-        }
-        Ok(threshold)
-    };
-    // A bare "New threshold: 1" reads identically whether it leaves the Safe
-    // as it was or drops it from 3-of-4 to 1-of-4, which is the difference
-    // between a no-op and handing the Safe to any single owner. The current
-    // values come from the Petal and Broker cannot verify them, so the line
-    // says where the comparison came from and stays silent without it.
-    let describe_threshold = |new: U256, owners: i64| -> String {
-        let single_owner_warning = if new == U256::from(1u8) {
-            "\nWarning: any single owner will then be able to move the Safe's funds alone"
-        } else {
-            ""
-        };
-        let count = (current.owners as i64 + owners).max(0);
-        let mut line = format!(
-            "New threshold: {new} of {count} owners (reported now: {} of {})",
-            current.threshold, current.owners
-        );
-        if new < current.threshold {
-            line.push_str(&format!(
-                "\nWarning: this lowers the signatures the Safe requires, from {} to {new}",
-                current.threshold
-            ));
-        }
-        line.push_str(single_owner_warning);
-        line
-    };
-    if selector("addOwnerWithThreshold(address,uint256)") && words.len() == 2 {
-        Ok(format!(
-            "Action: Add Safe owner\nNew owner: {}\n{}",
-            word_as_address(words[0])?,
-            describe_threshold(threshold(words[1])?, 1)
-        ))
-    } else if selector("removeOwner(address,address,uint256)") && words.len() == 3 {
-        word_as_address(words[0])?;
-        let removed = word_as_address(words[1])?;
-        Ok(format!(
-            "Action: Remove Safe owner\nOwner removed: {removed}\n{}{}",
-            describe_threshold(threshold(words[2])?, -1),
-            removes_signer(removed)
-        ))
-    } else if selector("swapOwner(address,address,address)") && words.len() == 3 {
-        word_as_address(words[0])?;
-        let removed = word_as_address(words[1])?;
-        Ok(format!(
-            "Action: Replace Safe owner\nOwner removed: {removed}\nNew owner: {}{}",
-            word_as_address(words[2])?,
-            removes_signer(removed)
-        ))
-    } else if selector("changeThreshold(uint256)") && words.len() == 1 {
-        Ok(format!(
-            "Action: Change Safe threshold\n{}",
-            describe_threshold(threshold(words[0])?, 0)
-        ))
-    } else {
-        Err(refused())
-    }
-}
-
-/// The heading `classify` uses when it could read nothing about the inner
-/// call beyond its selector and hash. Named rather than spelled out at each
-/// use so the wallet-policy gate can ask whether the reading was opaque
-/// instead of re-deriving the question from the rendered text.
-pub(crate) const OPAQUE_ACTION: &str = "Action: Contract call";
-
-/// What follows the index of a batch entry Bloom could not read.
-const OPAQUE_ENTRY: &str = "Contract call to ";
-
-/// Whether a rendered line is a call Bloom read no further than its selector
-/// and hash: the whole transaction, or any one entry of a call-only batch.
-/// Both gates ask this one question, so a batch cannot hide what a direct
-/// call would have to disclose.
-fn is_opaque_line(line: &str) -> bool {
-    let line = line.trim_start();
-    line.starts_with(OPAQUE_ACTION)
-        || line.split_once(". ").is_some_and(|(index, rest)| {
-            !index.is_empty()
-                && index.bytes().all(|byte| byte.is_ascii_digit())
-                && (rest.starts_with(OPAQUE_ENTRY) || rest.starts_with(OPAQUE_ACTION))
-        })
-}
-
-fn classify_calls(
-    envelope: &Envelope,
-    read_call: impl FnMut(Address, U256, &[u8]) -> Result<Option<String>, ProtocolError>,
-) -> Result<String, ProtocolError> {
-    let current = SafeSigners {
-        threshold: uint(&envelope.threshold, "threshold")?,
-        owners: envelope.owners.len(),
-    };
-    classify_call_with_reader(
-        &SafeCall {
-            chain: uint(&envelope.chain_id, "chain_id")?,
-            safe: address(&envelope.safe_address, "safe_address")?,
-            signer: address(&envelope.owner, "owner")?,
-            to: address(&envelope.safe_tx.to, "safe_tx.to")?,
-            value: uint(&envelope.safe_tx.value, "safe_tx.value")?,
-            data: &bytes(&envelope.safe_tx.data, "safe_tx.data")?,
-            operation: envelope.safe_tx.operation,
-            current: &current,
-        },
-        read_call,
-    )
-}
-
-/// Read one Safe transaction. `signer` is the Bloom wallet approving, so a
-/// change that removes it can say so.
-/// One Safe transaction to read, as the bytes being signed describe it.
-struct SafeCall<'a> {
-    chain: U256,
-    safe: Address,
-    signer: Address,
-    to: Address,
-    value: U256,
-    data: &'a [u8],
-    operation: u8,
-    /// The Safe's current signing configuration, as the Petal reports it.
-    current: &'a SafeSigners,
-}
-
-fn classify_call_with_reader(
-    call: &SafeCall<'_>,
-    mut read_call: impl FnMut(Address, U256, &[u8]) -> Result<Option<String>, ProtocolError>,
-) -> Result<String, ProtocolError> {
-    let SafeCall {
-        chain,
-        safe,
-        signer,
-        to,
-        value,
-        data,
-        operation,
-        current,
-    } = *call;
-    match operation {
-        0 => {
-            if to == safe {
-                if value.is_zero() && data.is_empty() {
-                    return Ok("Action: Reject competing Safe transaction\nValue: 0".into());
-                }
-                return owner_change(signer, value, data, current);
-            }
-            if !data.is_empty()
-                && let Some(reading) = read_call(to, value, data)?
-            {
-                return Ok(reading);
-            }
-            if data.len() == 68 && data[..4] == [0xa9, 0x05, 0x9c, 0xbb] {
-                let recipient = Address::from_slice(&data[16..36]);
-                let amount = U256::from_be_slice(&data[36..68]);
-                Ok(format!(
-                    "Action: ERC-20 transfer\nToken: {to}\nRecipient: {recipient}\nToken amount (base units): {amount}"
-                ))
-            } else if data.is_empty() {
-                Ok(format!("Action: Native transfer\nRecipient: {to}"))
-            } else {
-                Ok(format!(
-                    "{OPAQUE_ACTION}\nCalldata selector: 0x{}\nCalldata keccak256: {:#x}",
-                    hex::encode(&data[..data.len().min(4)]),
-                    keccak256(data)
-                ))
-            }
-        }
-        1 => {
-            if value != U256::ZERO {
-                return Err(invalid("Safe delegatecall transaction value must be zero"));
-            }
-            let chain_name = u64::try_from(chain)
-                .map(crate::evm_review::chain_name)
-                .unwrap_or_else(|_| format!("evm-{chain}"));
-            if !VERIFIED_CHAINS.iter().any(|id| U256::from(*id) == chain) {
-                return Err(invalid(concat!(
-                    "Safe delegatecalls are refused on this chain because Broker has no ",
-                    "verified Safe library deployment for it",
-                )));
-            }
-            let target = format!("{to:#x}");
-            let library = library(chain, &target)
-                .ok_or_else(|| invalid("delegatecall target is not an official Safe library"))?;
-            if data.len() < 4 {
-                return Err(invalid("Safe library calldata is truncated"));
-            }
-            if library.kind == "MultiSendCallOnly" {
-                if data[..4] != keccak256("multiSend(bytes)").as_slice()[..4] {
-                    return Err(invalid("unexpected MultiSendCallOnly selector"));
-                }
-                let packed = dynamic_bytes(&data[4..], 1, 0)?;
-                let mut cursor = 0;
-                let mut calls = 0usize;
-                let mut total = U256::ZERO;
-                let mut entries = Vec::new();
-                while cursor < packed.len() {
-                    if calls == 32 || packed.len() - cursor < 85 {
-                        return Err(invalid("MultiSendCallOnly batch is malformed or too large"));
-                    }
-                    if packed[cursor] != 0 {
-                        return Err(invalid("MultiSendCallOnly contains a delegatecall"));
-                    }
-                    let destination = Address::from_slice(&packed[cursor + 1..cursor + 21]);
-                    if destination == safe || destination == Address::ZERO {
-                        return Err(invalid("MultiSendCallOnly contains a Safe self-call"));
-                    }
-                    let call_value = U256::from_be_slice(&packed[cursor + 21..cursor + 53]);
-                    let length: usize = U256::from_be_slice(&packed[cursor + 53..cursor + 85])
-                        .try_into()
-                        .map_err(|_| invalid("MultiSend call data length is too large"))?;
-                    let data_start = cursor
-                        .checked_add(85)
-                        .ok_or_else(|| invalid("MultiSend call data length overflow"))?;
-                    let next = data_start
-                        .checked_add(length)
-                        .ok_or_else(|| invalid("MultiSend call data length overflow"))?;
-                    if next > packed.len() {
-                        return Err(invalid("MultiSend call data is truncated"));
-                    }
-                    total = total.checked_add(call_value).ok_or_else(|| {
-                        invalid(format!(
-                            "MultiSend native value overflow at entry {}",
-                            calls + 1
-                        ))
-                    })?;
-                    calls += 1;
-                    // Every entry is disclosed; a batch must not hide a call.
-                    let call_data = &packed[data_start..next];
-                    if !call_data.is_empty()
-                        && let Some(reading) = read_call(destination, call_value, call_data)?
-                    {
-                        entries.push(format!("  {calls}. {}", reading.replace('\n', "\n     ")));
-                    } else {
-                        entries.push(entry_summary(
-                            &chain_name,
-                            calls,
-                            destination,
-                            call_value,
-                            call_data,
-                        ));
-                    }
-                    cursor = next;
-                }
-                if calls == 0 {
-                    return Err(invalid("MultiSendCallOnly batch is empty"));
-                }
-                Ok(format!(
-                    "Action: Call-only batch\nCalls: {calls}\nTotal native value: {}\n{}\nPacked calls keccak256: {:#x}",
-                    native(total, &chain_name),
-                    entries.join("\n"),
-                    keccak256(packed)
-                ))
-            } else {
-                let create = keccak256("performCreate(uint256,bytes)");
-                let create2 = keccak256("performCreate2(uint256,bytes,bytes32)");
-                let deployment_value = if data.len() >= 36 {
-                    U256::from_be_slice(&data[4..36])
-                } else {
-                    return Err(invalid("CreateCall calldata is truncated"));
-                };
-                let (kind, initcode, salt) = if data[..4] == create.as_slice()[..4] {
-                    if data.len() < 68 {
-                        return Err(invalid("CreateCall calldata is truncated"));
-                    }
-                    ("CREATE", dynamic_bytes(&data[4..], 2, 1)?, None)
-                } else if data[..4] == create2.as_slice()[..4] {
-                    if data.len() < 100 {
-                        return Err(invalid("CreateCall CREATE2 calldata is truncated"));
-                    }
-                    (
-                        "CREATE2",
-                        dynamic_bytes(&data[4..], 3, 1)?,
-                        Some(B256::from_slice(&data[68..100])),
-                    )
-                } else {
-                    return Err(invalid("unexpected CreateCall selector"));
-                };
-                if initcode.is_empty() {
-                    return Err(invalid("contract deployment initcode is empty"));
-                }
-                let mut result = format!(
-                    "Action: Deploy contract ({kind})\nDeployment value: {}\nInitcode keccak256: {:#x}",
-                    native(deployment_value, &chain_name),
-                    keccak256(initcode)
-                );
-                if let Some(salt) = salt {
-                    result.push_str(&format!(
-                        "\nSalt: {salt:#x}\nPredicted address: {}",
-                        safe.create2(salt, keccak256(initcode))
-                    ));
-                }
-                Ok(result)
-            }
-        }
-        _ => Err(invalid("unsupported Safe operation")),
-    }
+/// The Safe transaction as the `execTransaction` call that runs it, so it is
+/// read with the same catalog and rules as a Safe execution: inner calls,
+/// owner changes, batches and deployments. Signatures are not part of it.
+fn exec_calldata(envelope: &Envelope) -> Result<Vec<u8>, ProtocolError> {
+    use alloy_dyn_abi::{DynSolValue, JsonAbiExt as _};
+    let tx = &envelope.safe_tx;
+    let address = |value: &str, field| address(value, field).map(DynSolValue::Address);
+    let uint = |value: &str, field| uint(value, field).map(|value| DynSolValue::Uint(value, 256));
+    bloom_evm_clear_signing::parse_function(EXEC_TRANSACTION)
+        .map_err(|error| invalid(error.to_string()))?
+        .abi_encode_input(&[
+            address(&tx.to, "safe_tx.to")?,
+            uint(&tx.value, "safe_tx.value")?,
+            DynSolValue::Bytes(bytes(&tx.data, "safe_tx.data")?),
+            DynSolValue::Uint(U256::from(tx.operation), 8),
+            uint(&tx.safe_tx_gas, "safe_tx.safe_tx_gas")?,
+            uint(&tx.base_gas, "safe_tx.base_gas")?,
+            uint(&tx.gas_price, "safe_tx.gas_price")?,
+            address(&tx.gas_token, "safe_tx.gas_token")?,
+            address(&tx.refund_receiver, "safe_tx.refund_receiver")?,
+            DynSolValue::Bytes(Vec::new()),
+        ])
+        .map_err(|error| invalid(error.to_string()))
 }
 
 pub(crate) fn review(
@@ -879,73 +394,59 @@ pub(crate) fn review(
             "wallet policy must allow destination exact on {chain_policy} for Safe signing"
         )));
     }
-    let mut entries = Vec::new();
-    let mut structural = false;
-    let rendered = classify_calls(&envelope, |to, value, calldata| {
-        let chain_id = u64::try_from(chain)
-            .map_err(|_| invalid("Safe chain ID is too large for catalog review"))?;
-        let reading = crate::evm_review::read_contract_call(
-            &crate::evm_review::DecodedCall {
-                chain_id,
-                to,
-                value,
-                calldata: calldata.to_vec(),
-            },
-            catalog,
-        );
-        // A call Bloom cannot read keeps the Safe's own summary of its bytes.
-        let Ok((reading, selected)) = reading else {
-            return Ok(None);
-        };
-        structural |= reading.structural;
-        for entry in selected {
-            if !entries.contains(&entry) {
-                entries.push(entry);
-            }
+    let chain_id = u64::try_from(chain)
+        .map_err(|_| invalid("Safe chain ID is too large for catalog review"))?;
+    let reading = bloom_evm_clear_signing::review_call(
+        catalog,
+        &bloom_evm_clear_signing::CallContext {
+            chain_id,
+            to: address(&envelope.safe_address, "safe_address")?,
+            value: U256::ZERO,
+            calldata: &exec_calldata(&envelope)?,
+            native: crate::evm_review::native_units(&crate::evm_review::chain_name(chain_id)),
+        },
+    );
+    let (action, evidence) = match reading {
+        Ok((call, entries)) => {
+            // The inner call's heading first; then every other field, except
+            // the signatures, which are not part of what the owner signs.
+            let heading = call
+                .fields
+                .iter()
+                .find(|field| field.label == "Safe transaction")
+                .map_or(call.function_signature.clone(), |field| field.value.clone());
+            let mut lines = vec![format!("Action: {heading}")];
+            lines.extend(
+                call.fields
+                    .iter()
+                    .filter(|field| {
+                        field.label != "Safe transaction"
+                            && !field.label.starts_with("Owner signatures")
+                    })
+                    .map(|field| format!("{}: {}", field.label, field.value)),
+            );
+            lines.push(call.assurance.clone());
+            lines.extend(
+                call.warnings
+                    .iter()
+                    .map(|warning| format!("Warning: {warning}")),
+            );
+            (
+                lines,
+                Some(bloom_evm_clear_signing::ClearSigningEvidence::new(
+                    entries,
+                    call.structural,
+                )),
+            )
         }
-        let mut lines = vec![
-            format!("Action: {}", reading.action),
-            format!("Contract: {}", reading.contract),
-        ];
-        if let Some(summary) = reading.intent_summary {
-            lines.push(match &summary.token {
-                Some(token) => format!(
-                    "Token: {} — {} ({})",
-                    token.symbol, token.name, token.address
-                ),
-                None => format!("Token: unidentified contract {}", reading.contract),
-            });
-            let role = if summary.counterparty_role == "recipient" {
-                "Recipient"
-            } else {
-                "Spender"
-            };
-            lines.push(format!("{role}: {}", summary.counterparty));
-            lines.push(format!(
-                "Token amount: {} (base units: {})",
-                summary.amount_display, summary.amount
-            ));
-        } else {
-            for field in reading.fields {
-                lines.push(format!(
-                    "{}: {} (signed: {})",
-                    field.label, field.value, field.raw
-                ));
-            }
-        }
-        lines.push(format!("Native value (wei): {value}"));
-        lines.push(reading.assurance);
-        lines.extend(
-            reading
-                .warnings
-                .into_iter()
-                .map(|warning| format!("Warning: {warning}")),
-        );
-        Ok(Some(lines.join("\n")))
-    })?;
-    let evidence = (!entries.is_empty())
-        .then(|| bloom_evm_clear_signing::ClearSigningEvidence::new(entries, structural));
-    let action = rendered.lines().map(str::to_owned).collect();
+        Err(error) => (
+            vec![
+                OPAQUE_ACTION.to_owned(),
+                format!("Reason: {}", error.detail),
+            ],
+            None,
+        ),
+    };
     let chain_name = u64::try_from(chain)
         .map(crate::evm_review::chain_name)
         .unwrap_or(chain_policy);
@@ -991,9 +492,12 @@ pub(crate) fn review(
     }))
 }
 
-/// Whether a prepared Safe review read its inner call, for the frozen record.
+/// Whether Bloom could not read the Safe transaction.
 pub(crate) fn is_opaque(review: &SafeReview) -> bool {
-    review.action.iter().any(|line| is_opaque_line(line))
+    review
+        .action
+        .first()
+        .is_some_and(|line| line == OPAQUE_ACTION)
 }
 
 #[cfg(test)]
@@ -1001,8 +505,27 @@ mod tests {
     use super::*;
     use bloom_broker_api::*;
 
-    fn no_catalog() -> bloom_evm_clear_signing::Catalog {
-        bloom_evm_clear_signing::Catalog::build(&[], Vec::new()).unwrap()
+    const SINGLETON: &str = "0x41675c099f32341bf84bfc5382af534df5c7461a";
+
+    /// The Safe description on `chain_id`, and an example token there.
+    fn catalog_on(chain_id: u64) -> bloom_evm_clear_signing::Catalog {
+        use bloom_evm_clear_signing::{Binding, DESCRIPTORS, TokenRecord};
+        let mut safe: serde_json::Value = serde_json::from_str(DESCRIPTORS[0].1).unwrap();
+        safe["context"]["contract"]["deployments"] =
+            serde_json::json!([{"chainId": chain_id, "address": SINGLETON}]);
+        let token = TokenRecord {
+            chain_id,
+            address: "0x1111111111111111111111111111111111111111".into(),
+            symbol: "EXA".into(),
+            name: "Example Token".into(),
+            decimals: 6,
+            upgradeable: false,
+        };
+        bloom_evm_clear_signing::Catalog::build(
+            &[(safe, Binding::Instances(SINGLETON))],
+            vec![token],
+        )
+        .unwrap()
     }
 
     fn review(
@@ -1010,11 +533,7 @@ mod tests {
         policy: &CanonicalWalletPolicy,
         from: Address,
     ) -> Result<Option<SafeReview>, ProtocolError> {
-        super::review(request, policy, from, &no_catalog())
-    }
-
-    fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
-        classify_calls(envelope, |_, _, _| Ok(None))
+        super::review(request, policy, from, &catalog_on(31337))
     }
 
     fn token(value: &str) -> Token {
@@ -1255,11 +774,8 @@ mod tests {
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
         let plan = review(&request, &policy(), from).unwrap().unwrap();
         assert_eq!(
-            plan.action,
-            [
-                "Action: Native transfer",
-                "Recipient: 0x4000000000000000000000000000000000000000"
-            ]
+            plan.action[0],
+            "Action: Send 0.000000000000000007 ETH to 0x4000000000000000000000000000000000000000"
         );
         assert_eq!(plan.nonce, "4");
         assert_eq!(plan.value_display, "0.000000000000000007 ETH");
@@ -1273,7 +789,7 @@ mod tests {
 
     #[test]
     fn safe_inner_calls_are_read_with_the_catalog() {
-        let catalog = crate::evm_review::mode_tests::accepted_catalog_on_chain(31337);
+        let catalog = catalog_on(31337);
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
         let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
         value["safe_tx"]["to"] = serde_json::json!("0x1111111111111111111111111111111111111111");
@@ -1344,293 +860,6 @@ mod tests {
         }
     }
 
-    /// The evidence behind [`DEPLOYMENTS`] and [`VERIFIED_CHAINS`].
-    ///
-    /// Everything else here runs offline, and Broker itself never reads a
-    /// chain. But the delegatecall allowlist, the factory list and the
-    /// singleton check are all claims about what code lives at an address on
-    /// six chains, and a comment asserting it is not evidence. This reads
-    /// every address on every chain and compares keccak-256 of the deployed
-    /// runtime code against the pinned `code_hash`, so the claim is
-    /// falsifiable and adding a chain or a Safe version cannot outrun it.
-    ///
-    /// Ignored because it needs network. `curl` rather than an HTTP crate:
-    /// Broker has no HTTP dependency and should not gain one for a test.
-    ///
-    /// ```sh
-    /// BLOOM_SAFE_RPC_1=https://ethereum-rpc.publicnode.com \
-    /// BLOOM_SAFE_RPC_10=https://optimism-rpc.publicnode.com \
-    /// BLOOM_SAFE_RPC_100=https://gnosis-rpc.publicnode.com \
-    /// BLOOM_SAFE_RPC_137=https://polygon-bor-rpc.publicnode.com \
-    /// BLOOM_SAFE_RPC_8453=https://mainnet.base.org \
-    /// BLOOM_SAFE_RPC_42161=https://arbitrum-one-rpc.publicnode.com \
-    ///   cargo test -p bloom-broker safe_deployments_hold_the_pinned_code -- --ignored
-    /// ```
-    #[test]
-    #[ignore = "reads six public RPC endpoints; set BLOOM_SAFE_RPC_<chain_id>"]
-    fn safe_deployments_hold_the_pinned_code() {
-        fn rpc(url: &str, address: &str) -> Result<Vec<u8>, String> {
-            let body = format!(
-                r#"{{"jsonrpc":"2.0","id":1,"method":"eth_getCode","params":["{address}","latest"]}}"#
-            );
-            let output = std::process::Command::new("curl")
-                .args([
-                    "-sS",
-                    "--max-time",
-                    "30",
-                    "-X",
-                    "POST",
-                    url,
-                    "-H",
-                    "content-type: application/json",
-                    "--data",
-                    &body,
-                ])
-                .output()
-                .map_err(|error| format!("curl is required for this test: {error}"))?;
-            if !output.status.success() {
-                return Err(String::from_utf8_lossy(&output.stderr).into_owned());
-            }
-            let text = String::from_utf8_lossy(&output.stdout).into_owned();
-            let marker = "\"result\":\"0x";
-            let start = text
-                .find(marker)
-                .ok_or_else(|| format!("no result in response: {text}"))?
-                + marker.len();
-            let hex = text[start..]
-                .split('"')
-                .next()
-                .ok_or_else(|| format!("truncated result: {text}"))?;
-            hex::decode(hex).map_err(|error| format!("result is not hex: {error}"))
-        }
-
-        let mut missing = Vec::new();
-        let mut endpoints = Vec::new();
-        for chain in VERIFIED_CHAINS {
-            match std::env::var(format!("BLOOM_SAFE_RPC_{chain}")) {
-                Ok(url) if !url.trim().is_empty() => endpoints.push((*chain, url)),
-                _ => missing.push(format!("BLOOM_SAFE_RPC_{chain}")),
-            }
-        }
-        assert!(
-            missing.is_empty(),
-            "every verified chain needs an endpoint, or the evidence is partial; missing: {}",
-            missing.join(" ")
-        );
-
-        let mut wrong = Vec::new();
-        for (chain, url) in &endpoints {
-            for entry in DEPLOYMENTS {
-                match rpc(url, entry.address) {
-                    Ok(code) if code.is_empty() => wrong.push(format!(
-                        "chain {chain}: {} {} at {} has no code",
-                        entry.kind, entry.version, entry.address
-                    )),
-                    Ok(code) => {
-                        let actual = format!("{:#x}", keccak256(&code));
-                        if actual != entry.code_hash {
-                            wrong.push(format!(
-                                "chain {chain}: {} {} at {} holds {actual}, pinned {}",
-                                entry.kind, entry.version, entry.address, entry.code_hash
-                            ));
-                        }
-                    }
-                    Err(error) => wrong.push(format!(
-                        "chain {chain}: reading {} failed: {error}",
-                        entry.address
-                    )),
-                }
-            }
-        }
-        assert!(
-            wrong.is_empty(),
-            "a pinned Safe deployment is not what this table says it is. Until every line \
-             here is explained, a delegatecall allowlist and a singleton check built on it \
-             are not verified:\n{}",
-            wrong.join("\n")
-        );
-    }
-
-    #[test]
-    fn permits_only_the_canonical_same_nonce_rejection_self_call() {
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["safe_tx"]["to"] = value["safe_address"].clone();
-        value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["data"] = serde_json::json!("0x");
-        let envelope: Envelope = serde_json::from_value(value.clone()).unwrap();
-        assert!(classify(&envelope).unwrap().contains("Reject competing"));
-
-        value["safe_tx"]["data"] = serde_json::json!("0x01");
-        let envelope: Envelope = serde_json::from_value(value).unwrap();
-        assert!(classify(&envelope).is_err());
-    }
-
-    #[test]
-    fn create_review_discloses_endowment_and_requires_canonical_abi() {
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        let mut calldata = keccak256("performCreate(uint256,bytes)").as_slice()[..4].to_vec();
-        calldata.extend_from_slice(&U256::from(9).to_be_bytes::<32>());
-        calldata.extend_from_slice(&U256::from(64).to_be_bytes::<32>());
-        calldata.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
-        calldata.push(0);
-        calldata.extend_from_slice(&[0; 31]);
-        value["safe_tx"]["to"] = serde_json::json!("0x9b35af71d77eaf8d7e40252370304687390a1a52");
-        value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["operation"] = serde_json::json!(1);
-        value["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(&calldata)));
-        value["library_code_hash"] =
-            serde_json::json!("0x2b3060c55fcb8275653e99ad511a71f67ba76934ed66a7d74d6e68b52afff889");
-        value["chain_id"] = serde_json::json!("8453");
-        let parsed: Envelope = serde_json::from_value(value.clone()).unwrap();
-        assert!(
-            classify(&parsed)
-                .unwrap()
-                .contains("Deployment value: 0.000000000000000009 ETH")
-        );
-
-        calldata.extend_from_slice(&[0; 32]);
-        value["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(calldata)));
-        let parsed: Envelope = serde_json::from_value(value).unwrap();
-        assert!(classify(&parsed).is_err());
-    }
-
-    #[test]
-    fn owner_and_threshold_changes_are_decoded_and_other_self_calls_refused() {
-        let base: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        let signer = "0x3000000000000000000000000000000000000000";
-        let other = "0x7000000000000000000000000000000000000000";
-        let word = |value: &str| {
-            let mut word = [0_u8; 32];
-            word[12..].copy_from_slice(address(value, "test").unwrap().as_slice());
-            word.to_vec()
-        };
-        let number = |value: u64| U256::from(value).to_be_bytes::<32>().to_vec();
-        let self_call = |signature: &str, words: Vec<Vec<u8>>, value: &str| {
-            let mut data = keccak256(signature).as_slice()[..4].to_vec();
-            data.extend(words.into_iter().flatten());
-            let mut envelope = base.clone();
-            envelope["safe_tx"]["to"] = envelope["safe_address"].clone();
-            envelope["safe_tx"]["value"] = serde_json::json!(value);
-            envelope["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(data)));
-            classify(&serde_json::from_value::<Envelope>(envelope).unwrap())
-        };
-        let checksum = |value: &str| address(value, "test").unwrap().to_string();
-
-        let added = self_call(
-            "addOwnerWithThreshold(address,uint256)",
-            vec![word(other), number(2)],
-            "0",
-        )
-        .unwrap();
-        // The envelope reports a 1-of-1 Safe, so the new threshold is shown
-        // against that baseline: "2" alone would read the same whether it
-        // raised the requirement or left it alone.
-        assert_eq!(
-            added,
-            format!(
-                "Action: Add Safe owner\nNew owner: {}\nNew threshold: 2 of 2 owners \
-                 (reported now: 1 of 1)",
-                checksum(other)
-            )
-        );
-        // Raising the requirement carries no warning.
-        assert!(!added.contains("Warning"));
-        let removed = self_call(
-            "removeOwner(address,address,uint256)",
-            vec![word(other), word(signer), number(1)],
-            "0",
-        )
-        .unwrap();
-        assert!(removed.contains(&format!("Owner removed: {}", checksum(signer))));
-        assert!(removed.contains("removes this Bloom wallet"));
-        let swapped = self_call(
-            "swapOwner(address,address,address)",
-            vec![word(signer), word(other), word(signer)],
-            "0",
-        )
-        .unwrap();
-        assert!(swapped.contains(&format!("Owner removed: {}", checksum(other))));
-        assert!(swapped.contains(&format!("New owner: {}", checksum(signer))));
-        assert!(!swapped.contains("Warning"));
-        assert!(
-            self_call("changeThreshold(uint256)", vec![number(3)], "0")
-                .unwrap()
-                .contains("New threshold: 3 of 1 owners (reported now: 1 of 1)")
-        );
-
-        // A reduction has to be unmistakable. This Safe is 1-of-1, so build a
-        // 3-of-4 baseline and drop it to 1: before, the page said only
-        // "New threshold: 1", which reads the same as no change at all.
-        let mut multi = base.clone();
-        multi["threshold"] = serde_json::json!("3");
-        multi["owners"] = serde_json::json!([
-            signer,
-            other,
-            "0x8000000000000000000000000000000000000000",
-            "0x9000000000000000000000000000000000000000"
-        ]);
-        let lowered = {
-            let mut data = keccak256("changeThreshold(uint256)").as_slice()[..4].to_vec();
-            data.extend(number(1));
-            let mut envelope = multi.clone();
-            envelope["safe_tx"]["to"] = envelope["safe_address"].clone();
-            envelope["safe_tx"]["value"] = serde_json::json!("0");
-            envelope["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(data)));
-            classify(&serde_json::from_value::<Envelope>(envelope).unwrap()).unwrap()
-        };
-        assert!(
-            lowered.contains("New threshold: 1 of 4 owners (reported now: 3 of 4)"),
-            "{lowered}"
-        );
-        assert!(
-            lowered.contains("lowers the signatures the Safe requires, from 3 to 1"),
-            "{lowered}"
-        );
-        assert!(
-            lowered.contains("any single owner will then be able to move"),
-            "{lowered}"
-        );
-
-        // Shape: no value, exact argument count, clean address words, threshold >= 1.
-        let add = "addOwnerWithThreshold(address,uint256)";
-        assert!(self_call(add, vec![word(other), number(2)], "1").is_err());
-        assert!(self_call(add, vec![word(other)], "0").is_err());
-        assert!(self_call(add, vec![word(other), number(2), number(0)], "0").is_err());
-        assert!(self_call(add, vec![vec![1; 32], number(2)], "0").is_err());
-        assert!(self_call(add, vec![word(other), number(0)], "0").is_err());
-        assert!(self_call("changeThreshold(uint256)", vec![number(0)], "0").is_err());
-
-        // Anything that hands the Safe to other code stays refused.
-        for signature in [
-            "enableModule(address)",
-            "setGuard(address)",
-            "setFallbackHandler(address)",
-            "setModuleGuard(address)",
-        ] {
-            assert!(self_call(signature, vec![word(other)], "0").is_err());
-        }
-        assert!(
-            self_call(
-                "disableModule(address,address)",
-                vec![word(other), word(other)],
-                "0"
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn threshold_one_warning_does_not_trust_the_reported_owner_count() {
-        let mut data = keccak256("changeThreshold(uint256)").as_slice()[..4].to_vec();
-        data.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
-        let reported = SafeSigners {
-            threshold: U256::from(1),
-            owners: 1,
-        };
-        let action = owner_change(Address::ZERO, U256::ZERO, &data, &reported).unwrap();
-        assert!(action.contains("any single owner will then be able to move"));
-    }
-
     fn multisend_entry(to: &str, value: u64, data: &[u8]) -> Vec<u8> {
         let mut out = vec![0_u8];
         out.extend_from_slice(address(to, "to").unwrap().as_slice());
@@ -1651,7 +880,7 @@ mod tests {
 
     #[test]
     fn safe_batch_calls_are_read_with_the_catalog() {
-        let catalog = crate::evm_review::mode_tests::accepted_catalog_on_chain(8453);
+        let catalog = catalog_on(8453);
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
         let mut policy = policy();
         policy.allowed_destinations[0].chain = token("evm-8453");
@@ -1684,51 +913,6 @@ mod tests {
             .unwrap();
             assert_eq!(is_opaque(&plan), !known, "{:?}", plan.action);
             assert_eq!(plan.action.iter().any(|line| line.contains("EXA")), known);
-        }
-    }
-
-    #[test]
-    fn batch_value_overflow_names_the_offending_entry() {
-        let target = "0x4000000000000000000000000000000000000000";
-        let mut packed = multisend_entry(target, 0, &[]);
-        packed[21..53].copy_from_slice(&U256::MAX.to_be_bytes::<32>());
-        packed.extend(multisend_entry(target, 1, &[]));
-        let mut parsed: Envelope = serde_json::from_slice(&envelope()).unwrap();
-        parsed.chain_id = "8453".into();
-        parsed.safe_tx.to = "0xa83c336b20401af773b6219ba5027174338d1836".into();
-        parsed.safe_tx.operation = 1;
-        parsed.safe_tx.value = "0".into();
-        parsed.safe_tx.data = format!("0x{}", hex::encode(multisend_calldata(&packed)));
-        assert!(
-            classify(&parsed)
-                .unwrap_err()
-                .message
-                .contains("overflow at entry 2")
-        );
-    }
-
-    #[test]
-    fn version_150_batch_rejects_zero_and_explicit_safe_self_calls() {
-        for target in [ZERO, "0x1000000000000000000000000000000000000000"] {
-            let mut parsed: Envelope = serde_json::from_slice(&envelope()).unwrap();
-            parsed.chain_id = "8453".into();
-            parsed.safe_tx.to = "0xa83c336b20401af773b6219ba5027174338d1836".into();
-            parsed.safe_tx.operation = 1;
-            parsed.safe_tx.value = "0".into();
-            parsed.safe_tx.data = format!(
-                "0x{}",
-                hex::encode(multisend_calldata(&multisend_entry(
-                    target,
-                    0,
-                    &[0x61, 0x0b, 0x59, 0x25]
-                )))
-            );
-            assert!(
-                classify(&parsed)
-                    .unwrap_err()
-                    .message
-                    .contains("Safe self-call")
-            );
         }
     }
 
@@ -1766,14 +950,6 @@ mod tests {
                 .message
                 .contains("cannot be mixed")
         );
-        let mut delegate: Envelope = serde_json::from_slice(&envelope()).unwrap();
-        delegate.safe_tx.operation = 1;
-        assert!(
-            classify(&delegate)
-                .unwrap_err()
-                .message
-                .contains("value must be zero")
-        );
     }
 
     #[test]
@@ -1802,59 +978,6 @@ mod tests {
     }
 
     #[test]
-    fn call_only_batches_disclose_every_entry() {
-        let mut erc20 = vec![0xa9, 0x05, 0x9c, 0xbb];
-        erc20.extend_from_slice(&[0; 12]);
-        erc20.extend_from_slice(
-            address("0x4000000000000000000000000000000000000000", "to")
-                .unwrap()
-                .as_slice(),
-        );
-        erc20.extend_from_slice(&U256::from(7).to_be_bytes::<32>());
-
-        let mut packed = multisend_entry("0x5000000000000000000000000000000000000000", 2, &erc20);
-        packed.extend(multisend_entry(
-            "0x6000000000000000000000000000000000000000",
-            3,
-            &[],
-        ));
-
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["safe_tx"]["to"] = serde_json::json!("0x9641d764fc13c8b624c04430c7356c1c7c8102e2");
-        value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["operation"] = serde_json::json!(1);
-        value["safe_tx"]["data"] =
-            serde_json::json!(format!("0x{}", hex::encode(multisend_calldata(&packed))));
-        value["library_code_hash"] =
-            serde_json::json!("0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939");
-
-        // The same address on a chain Broker has not verified may hold other
-        // code, and the Petal's code hash cannot vouch for it.
-        let unverified: Envelope = serde_json::from_value(value.clone()).unwrap();
-        assert!(
-            classify(&unverified)
-                .unwrap_err()
-                .message
-                .contains("no verified Safe library deployment")
-        );
-
-        value["chain_id"] = serde_json::json!("8453");
-        let parsed: Envelope = serde_json::from_value(value).unwrap();
-        let action = classify(&parsed).unwrap();
-
-        // A batch must not be a cheaper way to hide a call than sending it
-        // directly: every destination and amount is disclosed.
-        assert!(action.contains("Calls: 2"));
-        assert!(action.contains("Total native value: 0.000000000000000005 ETH"));
-        assert!(action.contains(
-            "1. ERC-20 transfer of 7 base units of token 0x5000000000000000000000000000000000000000 to 0x4000000000000000000000000000000000000000"
-        ));
-        assert!(action.contains(
-            "2. Send 0.000000000000000003 ETH to 0x6000000000000000000000000000000000000000"
-        ));
-    }
-
-    #[test]
     fn unverifiable_safe_state_is_reported_separately_from_the_rebuilt_transaction() {
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
         let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
@@ -1878,35 +1001,6 @@ mod tests {
                 .unwrap()
                 .contains("Broker-verified")
         );
-    }
-
-    #[test]
-    fn rejects_refunds_and_delegatecalls_outside_the_official_safe_libraries() {
-        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-
-        // Refund fields are EIP-712 members, so the digest binds them and this
-        // is a real constraint on what the owner is signing.
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["safe_tx"]["gas_price"] = serde_json::json!("1");
-        let canonical = serde_jcs::to_vec(&value).unwrap();
-        assert!(review(&request(canonical), &policy(), from).is_err());
-
-        // `safe_tx.to` is an EIP-712 member too, so restricting a delegatecall
-        // to the official libraries constrains the transaction rather than the
-        // Petal's description of it.
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["safe_tx"]["operation"] = serde_json::json!(1);
-        value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["data"] = serde_json::json!("0xdeadbeef");
-        value["safe_tx"]["to"] = serde_json::json!("0x4000000000000000000000000000000000000000");
-        let canonical = serde_jcs::to_vec(&value).unwrap();
-        assert!(review(&request(canonical), &policy(), from).is_err());
-
-        // Reaching an official library is not enough; the call into it must
-        // still decode.
-        value["safe_tx"]["to"] = serde_json::json!("0x9641d764fc13c8b624c04430c7356c1c7c8102e2");
-        let canonical = serde_jcs::to_vec(&value).unwrap();
-        assert!(review(&request(canonical), &policy(), from).is_err());
     }
 
     #[test]

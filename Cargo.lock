@@ -1070,6 +1070,7 @@ name = "bloom-broker"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "alloy-dyn-abi",
  "axum",
  "axum-server",
  "bloom-audit-checkpoint",

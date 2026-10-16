@@ -267,7 +267,7 @@ pub(crate) fn read_contract_call(
     )
 }
 
-fn native_units(chain: &str) -> Option<NativeUnits> {
+pub(crate) fn native_units(chain: &str) -> Option<NativeUnits> {
     crate::ceremony::native_asset_metadata(chain, "native").map(|(decimals, symbol)| NativeUnits {
         decimals,
         symbol: symbol.to_owned(),
