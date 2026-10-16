@@ -500,11 +500,36 @@ renderReview({{
   }}
 }});
 if (nodes["panel-title"].textContent !==
-    "Add owner 0x7000000000000000000000000000000000000007; 1 signature still required") {{
+    "Add owner 0x7000…0007; 1 signature still required") {{
   throw new Error(`Safe owner heading stayed technical: ${{nodes["panel-title"].textContent}}`);
 }}
 if (allText(nodes.review).includes("Calls   0x1000000000000000000000000000000000000000")) {{
   throw new Error("Safe self-call repeated the Safe as a Calls row");
+}}
+
+// Safe deployment helpers are implementation details, not approval language.
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "wallet-primary"}},
+  review_manifest: {{
+    schema: "bloom.review-manifest.v1",
+    canonical_plan: JSON.stringify({{safe_review: {{
+      chain_id: "8453", chain: "base",
+      safe: "0x1000000000000000000000000000000000000000",
+      owner: "0x3000000000000000000000000000000000000000",
+      nonce: "3", operation: "delegatecall",
+      destination: "0x9b35af71d77eaf8d7e40252370304687390a1a52",
+      value: "0", value_display: "0 ETH",
+      action: ["Action: performCreate on Safe CreateCall 0x9b35Af71d77eaf8d7e40252370304687390A1A52",
+        "Value: 0 ETH", "Initcode: 5 bytes"],
+      safe_tx_hash: "0x9567"
+    }}}}),
+    attributed_advisory_items: []
+  }}
+}});
+if (nodes["panel-title"].textContent !== "Create a contract") {{
+  throw new Error(`Safe deployment heading stayed technical: ${{nodes["panel-title"].textContent}}`);
 }}
 
 // A batch member Bloom could not read is never shown as a plain send, and a

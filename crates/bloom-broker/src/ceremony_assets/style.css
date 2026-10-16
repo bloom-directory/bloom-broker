@@ -65,8 +65,8 @@ body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-f
 .brand-context{margin:0 0 0 auto;text-align:right}
 
 .panel{border:1px solid var(--ceremony-border);border-radius:var(--ceremony-radius);background:var(--ceremony-surface)}
-.panel-header{padding:var(--ceremony-padding) var(--ceremony-padding) var(--ceremony-space-3)}
-.panel-context{display:flex;align-items:center;gap:8px;margin:0 0 var(--ceremony-space-2);color:var(--ceremony-accent-deep);font-size:14px}
+.panel-header{padding:var(--ceremony-space-3) var(--ceremony-padding) var(--ceremony-space-2)}
+.panel-context{display:flex;align-items:center;gap:8px;margin:0 0 var(--ceremony-space-1);color:var(--ceremony-accent-deep);font-size:14px}
 .panel-context svg{width:22px;height:22px;flex:none}
 .panel-title{margin:0;font:600 var(--ceremony-heading-size)/1.25 var(--ceremony-font-display);letter-spacing:-.035em;overflow-wrap:anywhere}
 #status{margin:var(--ceremony-space-1) 0 0;color:var(--ceremony-muted);font-size:14px}
@@ -75,7 +75,7 @@ body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-f
 .review-countdown{font-size:15px;font-weight:600;font-variant-numeric:tabular-nums;color:var(--ceremony-text)}
 .review-deadline:empty{display:none}
 #review{padding:0 var(--ceremony-padding) var(--ceremony-padding)}
-#review>*+*{margin-top:var(--ceremony-space-3)}
+#review>*+*{margin-top:var(--ceremony-space-2)}
 
 /* The action. One heading, at the largest size on the page. */
 .ceremony-intent{margin:0}
@@ -184,7 +184,7 @@ textarea{resize:vertical}
 .choice{grid-template-columns:auto 1fr;align-items:start}
 .choice input{width:auto}
 
-.summary{margin:0}
+.summary{max-width:65ch;margin:0}
 .warn{margin:0;padding:var(--ceremony-space-2);border-radius:var(--ceremony-radius);background:var(--ceremony-warning-surface);color:var(--ceremony-warning)}
 .expiry.soon{color:var(--ceremony-accent);font-weight:600}
 .expired{color:var(--ceremony-danger);font-weight:600}

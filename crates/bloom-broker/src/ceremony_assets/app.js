@@ -686,15 +686,23 @@ function describeTransfer(manifest) {
       ? `${threshold} signature${threshold === "1" ? "" : "s"}` : "";
     let heading = rawAction;
     if (rawAction.startsWith("addOwnerWithThreshold")) {
-      heading = `Add owner ${changes["New owner"]}; ${thresholdText} still required`;
+      heading = `Add owner ${shortAddress(changes["New owner"])}; ${thresholdText} still required`;
     } else if (rawAction.startsWith("removeOwner")) {
-      heading = `Remove owner ${changes["Removed owner"]}; ${thresholdText} still required`;
+      heading = `Remove owner ${shortAddress(changes["Removed owner"])}; ${thresholdText} still required`;
     } else if (rawAction.startsWith("swapOwner")) {
-      heading = `Replace owner ${changes["Removed owner"]} with ${changes["New owner"]}`;
+      heading = `Replace owner ${shortAddress(changes["Removed owner"])} with ${shortAddress(changes["New owner"])}`;
     } else if (rawAction.startsWith("changeThreshold")) {
       heading = `Require ${thresholdText}`;
     } else if (rawAction.startsWith("transfer on ") && changes.Amount && changes.Recipient) {
-      heading = `Send ${changes.Amount} to ${changes.Recipient}`;
+      heading = `Send ${changes.Amount} to ${shortAddress(changes.Recipient)}`;
+    } else if (rawAction.startsWith("performCreate2")) {
+      heading = "Create a contract at a fixed address";
+    } else if (rawAction.startsWith("performCreate")) {
+      heading = "Create a contract";
+    } else if (rawAction.startsWith("multicall on Morpho Bundler3")) {
+      heading = "Deposit into a Morpho vault";
+    } else if (rawAction.startsWith("erc4626Deposit")) {
+      heading = "Deposit into a vault";
     }
     const whatChanges = safeAction.slice(1).join("; ");
     const facts = [
