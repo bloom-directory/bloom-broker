@@ -138,8 +138,15 @@ pub(crate) fn review_kind(
         .payloads
         .iter()
         .any(|payload| payload.structural_call.is_some());
+    // A call with a destination and calldata that carries no reading.
+    let has_unread = review.payloads.iter().any(|payload| {
+        payload.destination.is_some()
+            && payload.calldata_keccak.is_some()
+            && payload.contract_call.is_none()
+            && payload.structural_call.is_none()
+    });
     if review.clear_signing.is_some() {
-        return if has_structural {
+        return if has_structural || has_unread {
             ReviewKind::Mixed
         } else {
             ReviewKind::Clear
@@ -151,15 +158,9 @@ pub(crate) fn review_kind(
     if policy.clear_signing.is_none() {
         return ReviewKind::Legacy;
     }
-    // A call with a destination and calldata that carries no reading is one
-    // the owner approved opaquely: a batch that could not be read under the
-    // clear mode fails preparation instead of reaching here.
-    let opaque = review.payloads.iter().any(|payload| {
-        payload.destination.is_some()
-            && payload.calldata_keccak.is_some()
-            && payload.contract_call.is_none()
-    });
-    if opaque {
+    // An unread call here is one the owner approved opaquely: a batch that
+    // could not be read under the clear mode fails preparation instead.
+    if has_unread {
         ReviewKind::OpaqueExact
     } else {
         ReviewKind::Native
@@ -456,13 +457,31 @@ fn apply_review_mode(
                 "clear signing is not enabled for this wallet",
             ));
         }
-        // Structural review is a reading of Broker's exact signing preimage,
-        // not a clear-signing authority. It improves every exact ceremony and
-        // needs no wallet-policy extension.
+        // Every wallet gets the catalog's reading and the structural one:
+        // both read Broker's exact signing preimage. Without the extension
+        // nothing is refused for being unreadable, so a call either reading
+        // rejects is approved as exact bytes, as before.
+        let mut entries: Vec<SelectedEntry> = Vec::new();
+        let mut structural = false;
         for (payload, call) in review.payloads.iter_mut().zip(calls) {
             let Some(call) = call else { continue };
-            payload.structural_call = review_structural_erc20(call, None).map_err(review_error)?;
+            match review_call(catalog, &call_context(payload, call, true)) {
+                Ok((clear, selected)) => {
+                    structural |= clear.structural;
+                    for entry in selected {
+                        if !entries.contains(&entry) {
+                            entries.push(entry);
+                        }
+                    }
+                    payload.contract_call = Some(clear);
+                }
+                Err(_) => {
+                    payload.structural_call =
+                        review_structural_erc20(call, None).map_err(review_error)?;
+                }
+            }
         }
+        freeze_evidence(review, entries, structural);
         return Ok(());
     };
     let unlimited = Some(settings.unlimited_allowance_allowed);
@@ -479,14 +498,7 @@ fn apply_review_mode(
         let Some(call) = call else { continue };
         let reading = review_call(
             catalog,
-            &CallContext {
-                chain_id: call.chain_id,
-                to: call.to,
-                value: call.value,
-                calldata: &call.calldata,
-                native: native_units(&payload.chain),
-                unlimited_allowance_allowed: settings.unlimited_allowance_allowed,
-            },
+            &call_context(payload, call, settings.unlimited_allowance_allowed),
         );
         match reading {
             // Opaque is for calls Bloom cannot read. A call it can read keeps
@@ -523,6 +535,26 @@ fn apply_review_mode(
             Err(error) => return Err(review_error(error)),
         }
     }
+    freeze_evidence(review, entries, structural);
+    Ok(())
+}
+
+fn call_context<'a>(
+    payload: &EvmReviewPayload,
+    call: &'a DecodedCall,
+    unlimited_allowance_allowed: bool,
+) -> CallContext<'a> {
+    CallContext {
+        chain_id: call.chain_id,
+        to: call.to,
+        value: call.value,
+        calldata: &call.calldata,
+        native: native_units(&payload.chain),
+        unlimited_allowance_allowed,
+    }
+}
+
+fn freeze_evidence(review: &mut EvmReview, entries: Vec<SelectedEntry>, structural: bool) {
     if !entries.is_empty() {
         review.clear_signing = Some(ClearSigningEvidence::new(
             bloom_evm_clear_signing::artifact::digest(),
@@ -530,7 +562,6 @@ fn apply_review_mode(
             structural,
         ));
     }
-    Ok(())
 }
 
 fn native_units(chain: &str) -> Option<NativeUnits> {
@@ -1665,6 +1696,25 @@ mod mode_tests {
             review_kind(Some(&review), &enabled_policy()),
             ReviewKind::Structural
         );
+    }
+
+    /// The catalog ships with Broker, so a wallet that never enabled clear
+    /// signing still sees a catalogued token's name and units. Nothing is
+    /// refused for it: an unreadable call stays exact bytes.
+    #[test]
+    fn every_wallet_reads_catalogued_tokens_without_enabling_clear_signing() {
+        let request = batch(&[
+            call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 2_500_000)),
+            call(RECIPIENT, vec![0xde, 0xad, 0xbe, 0xef]),
+        ]);
+        let review = review(&request, &policy(), Address::ZERO, &accepted_catalog())
+            .unwrap()
+            .unwrap();
+        let call = review.payloads[0].contract_call.as_ref().unwrap();
+        assert!(call.fields.iter().any(|field| field.value == "2.5 EXA"));
+        assert!(review.payloads[1].contract_call.is_none());
+        assert!(review.payloads[1].structural_call.is_none());
+        assert_eq!(review_kind(Some(&review), &policy()), ReviewKind::Mixed);
     }
 
     #[test]

@@ -22,6 +22,12 @@ fn the_built_in_catalog_admits_and_lists_the_safe_deployments() {
         .unwrap();
     assert!(singleton.applies_to_instances);
     assert!(singleton.token_metadata.is_none());
+    let usdc = catalog
+        .entry(8453, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")
+        .unwrap();
+    assert_eq!(usdc.token_metadata.as_ref().unwrap().decimals, 6);
+    assert!(usdc.upgradeable);
+    assert!(catalog.len() > 1000);
 }
 
 /// The extension proof. A third static function becomes reviewable by

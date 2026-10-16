@@ -1854,11 +1854,7 @@ impl BrokerAuthority {
     /// An approval the owner approved as clear signing cannot authorize a
     /// signature without its evidence. Missing evidence is a denial, not a
     /// fallback to the envelope review the owner never saw.
-    pub fn recheck_clear_signing(
-        &self,
-        approval_id: &Digest32,
-        policy: &CanonicalWalletPolicy,
-    ) -> Result<(), AuthorityError> {
+    pub fn recheck_clear_signing(&self, approval_id: &Digest32) -> Result<(), AuthorityError> {
         let Some((kind, evidence)) = self.frozen_review(approval_id)? else {
             return Err(denied(
                 "APPROVAL_NOT_FOUND",
@@ -1883,12 +1879,6 @@ impl BrokerAuthority {
             }
             (false, None) => return Ok(()),
         };
-        if policy.clear_signing.is_none() {
-            return Err(denied(
-                "CLEAR_SIGNING_REVIEW_CHANGED",
-                "wallet policy no longer enables clear signing",
-            ));
-        }
         evidence
             .recheck(bloom_evm_clear_signing::artifact::digest())
             .map_err(|error| denied("CLEAR_SIGNING_REVIEW_CHANGED", error.to_string()))
@@ -1987,8 +1977,7 @@ impl BrokerAuthority {
                 "ceremony cannot activate authority from an old or unreconciled epoch",
             ));
         }
-        let (_, activation_policy) = self.current_policy(&terms.wallet_id)?;
-        self.recheck_clear_signing(&grant.approval_id, &activation_policy)?;
+        self.recheck_clear_signing(&grant.approval_id)?;
         if grant.approval_digest != grant.approval_id
             || grant.approval_id
                 != terms
@@ -2518,11 +2507,9 @@ impl BrokerAuthority {
                 "frozen approval policy no longer matches current verified policy",
             ));
         }
-        // A withdrawal committed before this decision blocks it. The decision
-        // boundary is this barrier, so the race resolves the same way every
-        // time; a withdrawal after a short-lived signing request has been
+        // A Broker upgrade since the review blocks it. A signature already
         // dispatched cannot be recalled, and is not claimed to be.
-        self.recheck_clear_signing(&input.request.approval_id, &policy)?;
+        self.recheck_clear_signing(&input.request.approval_id)?;
         let (local_epoch, reconciled) = self.epoch_state(&terms.wallet_id)?;
         if !reconciled || local_epoch != terms.wallet_revocation_epoch.get() {
             return Err(denied(

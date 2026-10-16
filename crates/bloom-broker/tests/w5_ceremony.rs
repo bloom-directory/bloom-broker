@@ -535,12 +535,7 @@ for (const stale of ["Allow deploying contracts on", "Stop allowing contract dep
 // Without clear signing nothing is refused for being unreadable or
 // unlimited, so switching it off loosens the wallet and switching it on
 // tightens it. Each direction must say so.
-const strict = {{
-  catalog_id: "bloom-evm", signature_threshold: 2, maximum_observation_age_ms: 3600000,
-  unlimited_allowance_allowed: false, opaque_exact_allowed: false,
-  verifier: {{verifier_digest: "ab".repeat(32)}},
-  trusted_keys: [{{key_id: "publisher-1", verifying_key: "cd".repeat(32)}}]
-}};
+const strict = {{unlimited_allowance_allowed: false, opaque_exact_allowed: false}};
 function renderClearSigning(before, after) {{
   renderReview({{
     ceremony_kind: "policy_update",
@@ -557,9 +552,7 @@ if (!off.includes("on → off") || !off.includes("no longer refused") ||
   throw new Error(`disabling clear signing misdescribed: ${{off}}`);
 }}
 const on = renderClearSigning(null, strict);
-for (const expected of ["off → on", "Unlimited-allowance requests", "allowed → blocked",
-  "Descriptions come from catalog", "none → bloom-evm", "Publisher signatures required",
-  "none → 2", "Oldest usable observation", "none → 3600000", "publisher-1"]) {{
+for (const expected of ["off → on", "Unlimited-allowance requests", "allowed → blocked"]) {{
   if (!on.includes(expected)) throw new Error(`enabling clear signing missing ${{expected}}: ${{on}}`);
 }}
 "#
@@ -8511,11 +8504,11 @@ if (!usdcIcon.replacedWith || !isGeneric(usdcIcon.replacedWith)) {{
 /// Upgradeability is one fact about one contract. It used to arrive twice —
 /// once from the verifier's per-call `warnings` and once from the page's walk
 /// over the selected catalog entries — so a single-entry review printed the
-/// same sentence and the same timestamp in two consecutive paragraphs. The
-/// catalog entries are now the only source, and the observation moves into
-/// the details section where the rest of the provenance already lives.
+/// same sentence in two consecutive paragraphs. The catalog entries are now
+/// the only source, and the caveat lives in the details section with the rest
+/// of the provenance.
 #[test]
-fn the_upgradeable_warning_is_stated_once_per_contract_and_keeps_its_timestamp_in_details() {
+fn the_upgradeable_warning_is_stated_once_per_contract_and_keeps_its_caveat_in_details() {
     let asset = include_str!("../src/ceremony_assets/app.js");
     let executable = asset
         .split_once("\nload().catch")
@@ -8592,12 +8585,12 @@ for (const stale of ["can be upgraded", "The publisher observed it at"]) {{
     throw new Error(`the superseded wording survived: ${{stale}}`);
   }}
 }}
-// The decision does not carry a timestamp; the details section does, once.
+// The decision carries no timestamp; the details section has the caveat, once.
 if (/\d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}} UTC/.test(view.primary)) {{
   throw new Error(`an observation timestamp is still beside the decision: ${{view.primary}}`);
 }}
-if (count(view.details, "the publisher observed this deployment at") !== 1) {{
-  throw new Error(`the observation is not stated exactly once in details: ${{view.details}}`);
+if (count(view.details, "its code may have changed since this Bloom release described it") !== 1) {{
+  throw new Error(`the upgrade caveat is not stated exactly once in details: ${{view.details}}`);
 }}
 if (!view.details.includes(TOKEN)) {{
   throw new Error("details do not say which contract is upgradeable");
@@ -9083,20 +9076,6 @@ const change = blocked.review_manifest.authority_diff.clear_signing;
 renderReview(blocked);
 if (nodes["panel-title"].textContent !== "Block requests for unlimited token spending") {{
   throw new Error("disabling unlimited requests was labelled as enabling them");
-}}
-// A verifier re-pin is authority too: it decides which build may describe
-// calls for this wallet at all.
-const repin = previewSession("policy-unlimited");
-repin.review_manifest.authority_diff = {{clear_signing: {{
-  before: {{unlimited_allowance_allowed: false,
-           verifier: {{verifier_digest: "77f7d9d939a496a16a9e5d517bb57c8e8eea397751dabdac5f923e0f2e91cc20"}}}},
-  after: {{unlimited_allowance_allowed: false,
-          verifier: {{verifier_digest: "e12e0cbb6873ab1c2ef89cb2e7e41333d0238b574a4629f36ba6b16f21b38beb"}}}}
-}}}};
-renderReview(repin);
-const pinned = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
-for (const phrase of ["Pinned verifier", "77f7d9d9", "e12e0cbb", "stops being able to describe"]) {{
-  if (!pinned.includes(phrase)) throw new Error(`verifier re-pin omitted ${{phrase}}: ${{pinned}}`);
 }}
 "#
     );
@@ -9732,14 +9711,11 @@ async fn destination_reports_an_already_registered_device_over_http() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
-/// The clear-signing trusted publisher keys are the root of trust for every
-/// contract description Broker will later read calldata against, so rotating
-/// them is the largest authority a policy update can move. `describePolicy`
-/// enumerated the clear-signing fields it renders and left `trusted_keys` out,
-/// so a keys-only rotation reached the owner as "No rule changes are proposed."
-/// under an "Approve policy change" button.
+/// A clear-signing change this page cannot describe must never reach the
+/// owner as "No rule changes are proposed." under an "Approve policy change"
+/// button.
 #[test]
-fn a_trusted_publisher_key_rotation_is_named_on_the_policy_page() {
+fn an_undescribable_clear_signing_change_never_reads_as_no_change() {
     let asset = include_str!("../src/ceremony_assets/app.js");
     let executable = asset
         .split_once("\nload().catch")
@@ -9751,53 +9727,17 @@ globalThis.document = {{getElementById: () => ({{}})}};
 globalThis.location = {{hash: "", search: "", pathname: "/"}};
 globalThis.history = {{replaceState: () => {{}}}};
 {executable}
-const settings = keys => ({{
-  catalog_id: "bloom-tokens",
-  trusted_keys: keys,
-  signature_threshold: 1,
-  maximum_observation_age_ms: "86400000",
-  opaque_exact_allowed: false,
-  unlimited_allowance_allowed: false,
-  verifier: {{verifier_id: "bloom-evm-clear-signing", verifier_digest: "{}"}}
-}});
-const oldKey = {{key_id: "publisher-1", verifying_key: "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE"}};
-const newKey = {{key_id: "publisher-1", verifying_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg"}};
-
-// Nothing else differs: only the Ed25519 verifying key behind the same id.
-const diff = clear_signing => describePolicy({{authority_diff: {{clear_signing}}}});
-const rotation = diff({{before: settings([oldKey]), after: settings([newKey])}});
-if (/No rule changes are proposed/.test(rotation.sentence)) {{
-  throw new Error("a trusted-key rotation was rendered as no change: " + rotation.sentence);
-}}
-const rotationFacts = JSON.stringify(rotation.facts);
-for (const needle of ["Stop trusting descriptions signed by", "Trust descriptions signed by"]) {{
-  if (!rotationFacts.includes(needle)) throw new Error("missing " + needle + " in " + rotationFacts);
-}}
-if (!rotation.intent) throw new Error("a key rotation must produce an action card");
-
-// Adding a second publisher is an addition only, and must still be named.
-const added = diff({{before: settings([oldKey]), after: settings([oldKey, {{key_id: "publisher-2", verifying_key: "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M"}}])}});
-if (!JSON.stringify(added.facts).includes("publisher-2")) {{
-  throw new Error("adding a publisher was not named: " + JSON.stringify(added.facts));
-}}
-
-// A clear-signing change this page cannot describe must not read as no change.
-const opaque = diff({{before: settings([oldKey]), after: settings([oldKey])}});
-if (/No rule changes are proposed/.test(opaque.sentence)) {{
-  throw new Error("an undescribable clear-signing change claimed nothing changed");
-}}
+const settings = {{opaque_exact_allowed: false, unlimited_allowance_allowed: false}};
+const opaque = describePolicy({{authority_diff: {{clear_signing: {{before: settings, after: settings}}}}}});
 if (!/cannot describe/.test(opaque.sentence)) {{
   throw new Error("expected the undescribable-change wording, got: " + opaque.sentence);
 }}
-
-// A policy update with no clear-signing section keeps its existing wording.
 const none = describePolicy({{authority_diff: {{}}}});
 if (!/No rule changes are proposed/.test(none.sentence)) {{
   throw new Error("an empty diff must still read as no change: " + none.sentence);
 }}
-process.stdout.write("trusted-keys-ok");
-"#,
-        "0".repeat(64)
+process.stdout.write("undescribable-ok");
+"#
     );
     let output = run_node(&script);
     assert!(
@@ -9805,7 +9745,7 @@ process.stdout.write("trusted-keys-ok");
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "trusted-keys-ok");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "undescribable-ok");
 }
 
 /// Runs a CommonJS script in Node, fed on stdin: the shipped asset alone is

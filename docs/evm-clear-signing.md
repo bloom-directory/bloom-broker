@@ -225,9 +225,11 @@ opaque_exact_allowed (default false),
 unlimited_allowance_allowed (default false)
 ```
 
-Its presence turns clear signing on. Omitting it preserves the previous policy
-serialization: the wallet still gets structural review for canonical transfers
-and approvals, and cannot request a clear or opaque mode.
+Its presence turns clear signing on: contract calls Bloom cannot read are
+refused, and unlimited allowances follow the setting. Omitting it preserves the
+previous policy serialization. Such a wallet still gets every reading, catalog
+and structural, but refuses nothing for being unreadable: an unread call is
+approved as exact bytes. It cannot request a clear or opaque mode.
 
 ## Modes
 
