@@ -6,18 +6,21 @@
 //! different decoder — so adding a contract is catalog data, while changing
 //! what Bloom promises about a call is code.
 
+use std::collections::BTreeSet;
+
 use alloy_dyn_abi::{DynSolValue, JsonAbiExt};
-use alloy_json_abi::Function;
 use alloy_primitives::{Address, U256, keccak256};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     ActionClass, AdmittedFormat, CalleeSource, Catalog, CatalogEntry, LeafType, ReviewError,
-    ReviewReason,
+    ReviewReason, array_of,
 };
 
 pub const TRANSFER_SIGNATURE: &str = "transfer(address,uint256)";
 pub const APPROVE_SIGNATURE: &str = "approve(address,uint256)";
+const SAFE_EXEC_SIGNATURE: &str =
+    "execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)";
 /// Latest timestamp rendered as a date: 23:59:59 UTC, 31 December 9999.
 const MAX_TIMESTAMP_SECONDS: u64 = 253_402_300_799;
 /// Calls carried inside calls: a Safe executing a Safe's call is two.
@@ -263,8 +266,7 @@ fn review_at(
     // is what rejects trailing words, dirty address padding, noncanonical
     // booleans and short calldata in one place. Narrow-integer width is the
     // one thing it cannot see; `check_leaf` below covers that.
-    let function = Function::parse(&call.signature)
-        .map_err(|error| invalid(format!("admitted signature no longer parses: {error}")))?;
+    let function = crate::parse_function(&call.signature)?;
     let decoded = function
         .abi_decode_input(&context.calldata[4..])
         .map_err(|error| {
@@ -292,21 +294,63 @@ fn review_at(
     for ((path, declared), value) in call.leaves.iter().zip(&leaves) {
         check_leaf(path, declared, value)?;
     }
-    let leaf = |path: &str| {
+    // The decoded value at a field path; in element `index` when the path
+    // reaches into an array. Admission and `check_leaf` proved the shapes.
+    let top = |path: &str| {
+        let name = array_of(path).unwrap_or(path);
         let index = call
             .leaves
             .iter()
-            .position(|(name, _)| name == path)
+            .position(|(leaf, _)| leaf == name)
             .expect("admission proved every path is a decoded leaf");
-        &leaves[index]
+        (&call.leaves[index].1, &leaves[index])
     };
+    let value_at = |path: &str, index: usize| -> &DynSolValue {
+        let (kind, value) = top(path);
+        let (Some((_, rest)), DynSolValue::Array(items)) = (path.split_once(".[]"), value) else {
+            return value;
+        };
+        let item = &items[index];
+        match (kind, item, rest.strip_prefix('.')) {
+            (LeafType::Array(element), DynSolValue::Tuple(values), Some(component)) => {
+                let LeafType::Tuple(components) = element.as_ref() else {
+                    unreachable!("a component path is admitted only on a tuple array")
+                };
+                let position = components
+                    .iter()
+                    .position(|(name, _)| name == component)
+                    .expect("admission proved the component exists");
+                &values[position]
+            }
+            _ => item,
+        }
+    };
+    let length = |path: &str| match top(path).1 {
+        DynSolValue::Array(items) if array_of(path).is_some() => items.len(),
+        _ => 1,
+    };
+    // A Safe's delegatecall runs another contract's code as the Safe, with
+    // its storage and owners. The one contract allowed to is the batch
+    // library, which only makes plain calls.
+    if crate::parse_function(&call.signature)?.signature() == SAFE_EXEC_SIGNATURE
+        && let (DynSolValue::Uint(operation, _), DynSolValue::Address(to)) =
+            (value_at("operation", 0), value_at("to", 0))
+        && !operation.is_zero()
+        && !catalog.is_safe_batch(context.chain_id, &format!("0x{to:x}"))
+    {
+        return Err(unsupported(
+            "a Safe may delegatecall only Safe's MultiSendCallOnly batch library",
+        ));
+    }
     for (path, allowed) in &call.constraints {
-        let value = match_key(leaf(path));
-        if !allowed.contains(&value) {
-            return Err(unsupported(format!(
-                "`{path}` is {value}, and the description admits only {}",
-                allowed.join(", ")
-            )));
+        for index in 0..length(path) {
+            let value = match_key(value_at(path, index));
+            if !allowed.contains(&value) {
+                return Err(unsupported(format!(
+                    "`{path}` is {value}, and the description admits only {}",
+                    allowed.join(", ")
+                )));
+            }
         }
     }
 
@@ -320,30 +364,60 @@ fn review_at(
     // publisher's observation, so it is not repeated here as a warning.
     let mut warnings: Vec<String> = Vec::new();
     if instance {
-        warnings.push(format!(
-            "Bloom has not verified that {} is {}. It is read with Bloom's description of {}, the contract such addresses are expected to run.",
-            checksum(&address),
-            admitted
-                .contract_name
-                .as_deref()
-                .map_or("the contract it appears to be".to_owned(), |name| format!("a {name}")),
-            checksum(&entry.contract_address)
-        ));
+        let kind = admitted
+            .contract_name
+            .as_deref()
+            .map_or("the contract it appears to be".to_owned(), |name| {
+                format!("a {name}")
+            });
+        warnings.push(if entry.chain_id == 0 {
+            format!(
+                "Bloom has not verified that {} is {kind}. It is read by that standard's functions.",
+                checksum(&address)
+            )
+        } else {
+            format!(
+                "Bloom has not verified that {} is {kind}. It is read with Bloom's description of {}, the contract such addresses are expected to run.",
+                checksum(&address),
+                checksum(&entry.contract_address)
+            )
+        });
+    }
+    // Fields in order; an array's fields are shown element by element, each
+    // labelled with its position, so a list of calls reads call by call.
+    let mut jobs = Vec::new();
+    let mut shown_arrays = BTreeSet::new();
+    for field in &call.fields {
+        match array_of(&field.path) {
+            None => jobs.push((field, field.label.clone(), 0)),
+            Some(array) if shown_arrays.insert(array) => {
+                for index in 0..length(&field.path) {
+                    for member in call
+                        .fields
+                        .iter()
+                        .filter(|member| array_of(&member.path) == Some(array))
+                    {
+                        jobs.push((member, format!("{} {}", member.label, index + 1), index));
+                    }
+                }
+            }
+            Some(_) => {}
+        }
     }
     let mut structural = instance;
-    let mut fields = Vec::with_capacity(call.fields.len());
-    for field in &call.fields {
-        let value = leaf(&field.path);
+    let mut fields = Vec::with_capacity(jobs.len());
+    for (field, label, index) in jobs {
+        let value = value_at(&field.path, index);
         match (&field.format, value) {
             (AdmittedFormat::Calldata { callee, amount }, DynSolValue::Bytes(data)) => {
                 let callee = match callee {
                     CalleeSource::TargetContract => context.to,
-                    CalleeSource::Argument(path) => match leaf(path) {
+                    CalleeSource::Argument(path) => match value_at(path, index) {
                         DynSolValue::Address(address) => *address,
                         _ => return Err(invalid("callee path did not decode as an address")),
                     },
                 };
-                let value = match amount.as_deref().map(leaf) {
+                let value = match amount.as_deref().map(|path| value_at(path, index)) {
                     Some(DynSolValue::Uint(value, _)) => *value,
                     Some(_) => return Err(invalid("amount path did not decode as an integer")),
                     None => U256::ZERO,
@@ -357,25 +431,50 @@ fn review_at(
                 structural |= render_embedded(
                     catalog,
                     &inner,
-                    &field.label,
+                    &label,
                     depth,
                     &mut fields,
                     &mut used,
                     &mut warnings,
                 )?;
             }
-            (_, DynSolValue::Array(items)) => {
-                for (index, item) in items.iter().enumerate() {
-                    let mut shown = render_field(field, item, None, context)?;
-                    shown.label = format!("{} {}", field.label, index + 1);
-                    fields.push(shown);
+            (AdmittedFormat::SafeBatch, DynSolValue::Bytes(packed)) => {
+                for (number, (to, value, data)) in safe_batch(packed)?.into_iter().enumerate() {
+                    let inner = CallContext {
+                        to,
+                        value,
+                        calldata: data,
+                        ..context.clone()
+                    };
+                    structural |= render_embedded(
+                        catalog,
+                        &inner,
+                        &format!("{label} {}", number + 1),
+                        depth,
+                        &mut fields,
+                        &mut used,
+                        &mut warnings,
+                    )?;
                 }
+            }
+            (AdmittedFormat::TokenAmount(source), DynSolValue::Uint(amount, _))
+                if let Err(token) =
+                    resolve_token(source, call, &leaves, entry, catalog, context)? =>
+            {
+                structural = true;
+                fields.push(DisplayField {
+                    label,
+                    format: "raw".to_owned(),
+                    value: format!("{amount} raw units of {token}"),
+                    raw: amount.to_string(),
+                });
             }
             _ => {
                 let token = match &field.format {
-                    AdmittedFormat::TokenAmount(source) => Some(resolve_token(
-                        source, call, &leaves, entry, catalog, context,
-                    )?),
+                    AdmittedFormat::TokenAmount(source) => Some(
+                        resolve_token(source, call, &leaves, entry, catalog, context)?
+                            .expect("an unlisted token was shown in raw units above"),
+                    ),
                     _ => None,
                 };
                 if let Some(token) = &token
@@ -383,7 +482,9 @@ fn review_at(
                 {
                     used.push(token.entry.clone());
                 }
-                fields.push(render_field(field, value, token.as_ref(), context)?);
+                let mut shown = render_field(field, value, token.as_ref(), context)?;
+                shown.label = label;
+                fields.push(shown);
             }
         }
     }
@@ -422,6 +523,43 @@ fn review_at(
         },
         used,
     ))
+}
+
+/// The calls in Safe's packed MultiSend encoding: operation, address, value,
+/// data length and data, back to back. Only plain calls to a nonzero address
+/// are accepted; MultiSendCallOnly reverts on any other operation, and Safe
+/// 1.5.0 reads a zero address as the Safe itself.
+/// One call of a Safe batch: address, native value and calldata.
+type BatchCall<'a> = (Address, U256, &'a [u8]);
+
+fn safe_batch(packed: &[u8]) -> Result<Vec<BatchCall<'_>>, ReviewError> {
+    let mut calls = Vec::new();
+    let mut rest = packed;
+    while !rest.is_empty() {
+        if rest.len() < 85 || calls.len() == MAX_ARRAY_ITEMS {
+            return Err(invalid("Safe batch is truncated or has too many calls"));
+        }
+        let to = Address::from_slice(&rest[1..21]);
+        if rest[0] != 0 || to.is_zero() {
+            return Err(invalid(
+                "a Safe batch call must be a plain call to a nonzero address",
+            ));
+        }
+        let length = usize::try_from(U256::from_be_slice(&rest[53..85]))
+            .ok()
+            .filter(|length| *length <= rest.len() - 85)
+            .ok_or_else(|| invalid("Safe batch call data is truncated"))?;
+        calls.push((
+            to,
+            U256::from_be_slice(&rest[21..53]),
+            &rest[85..85 + length],
+        ));
+        rest = &rest[85 + length..];
+    }
+    if calls.is_empty() {
+        return Err(invalid("Safe batch is empty"));
+    }
+    Ok(calls)
 }
 
 /// An embedded call, shown as one heading line and then its own fields, each
@@ -580,8 +718,9 @@ struct ResolvedToken {
 /// Resolve a field's token from the signed catalog.
 ///
 /// For an argument token path, the address that was actually decoded is what
-/// is looked up — so a call naming a token the catalog does not describe is
-/// unsupported rather than shown with borrowed decimals.
+/// is looked up. A token the catalog does not list comes back as its
+/// address, and its amount is shown in raw units rather than with borrowed
+/// decimals.
 fn resolve_token(
     source: &crate::TokenSource,
     call: &crate::AdmittedCall,
@@ -589,7 +728,7 @@ fn resolve_token(
     entry: &CatalogEntry,
     catalog: &Catalog,
     context: &CallContext<'_>,
-) -> Result<ResolvedToken, ReviewError> {
+) -> Result<Result<ResolvedToken, String>, ReviewError> {
     let token_entry = match source {
         crate::TokenSource::TargetContract => entry,
         crate::TokenSource::Argument(path) => {
@@ -602,11 +741,10 @@ fn resolve_token(
                 return Err(invalid("token path did not decode as an address"));
             };
             let address = format!("0x{address:x}");
-            catalog.entry(context.chain_id, &address).ok_or_else(|| {
-                unsupported(format!(
-                    "no description of the token {address} this call names"
-                ))
-            })?
+            match catalog.entry(context.chain_id, &address) {
+                Some(entry) if entry.token_metadata.is_some() => entry,
+                _ => return Ok(Err(checksum(&address))),
+            }
         }
     };
     let metadata = token_entry.token_metadata.as_ref().ok_or_else(|| {
@@ -615,7 +753,7 @@ fn resolve_token(
             checksum(&token_entry.contract_address)
         ))
     })?;
-    Ok(ResolvedToken {
+    Ok(Ok(ResolvedToken {
         identity: TokenIdentity {
             address: checksum(&token_entry.contract_address),
             symbol: metadata.symbol.clone(),
@@ -623,7 +761,7 @@ fn resolve_token(
             decimals: metadata.decimals,
         },
         entry: SelectedEntry::of(token_entry),
-    })
+    }))
 }
 
 /// The transfer and allowance rules. They read the generic decoded result and
@@ -637,9 +775,7 @@ fn apply_safety_rules(
     context: &CallContext<'_>,
     warnings: &mut Vec<String>,
 ) -> Result<(ActionClass, Option<CallIntent>), ReviewError> {
-    let canonical = Function::parse(&call.signature)
-        .map_err(|error| invalid(error.to_string()))?
-        .signature();
+    let canonical = crate::parse_function(&call.signature)?.signature();
     let expected = match canonical.as_str() {
         TRANSFER_SIGNATURE => Some(ActionClass::Transfer),
         APPROVE_SIGNATURE => Some(ActionClass::Allowance),
@@ -804,7 +940,7 @@ fn render_field(
             })?;
             format!("{label} ({raw})")
         }
-        AdmittedFormat::Calldata { .. } => {
+        AdmittedFormat::Calldata { .. } | AdmittedFormat::SafeBatch => {
             return Err(invalid(
                 "an embedded call is rendered as a call, not a value",
             ));
@@ -876,6 +1012,16 @@ fn check_leaf(path: &str, declared: &LeafType, value: &DynSolValue) -> Result<()
             Ok(())
         }
         (LeafType::Bytes, DynSolValue::Bytes(_)) => Ok(()),
+        (LeafType::Tuple(components), DynSolValue::Tuple(values))
+            if components.len() == values.len() =>
+        {
+            components
+                .iter()
+                .zip(values)
+                .try_for_each(|((name, kind), value)| {
+                    check_leaf(&format!("{path}.[].{name}"), kind, value)
+                })
+        }
         (LeafType::Array(element), DynSolValue::Array(items)) => {
             if items.len() > MAX_ARRAY_ITEMS {
                 return Err(ReviewError::new(

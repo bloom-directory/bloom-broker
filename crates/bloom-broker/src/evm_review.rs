@@ -1445,7 +1445,7 @@ mod mode_tests {
     use super::*;
     use alloy::primitives::U256;
     use bloom_broker_api::Base64UrlBytes;
-    use bloom_evm_clear_signing::TokenRecord;
+    use bloom_evm_clear_signing::{Binding, TokenRecord};
 
     const TOKEN_ADDRESS: &str = "0x1111111111111111111111111111111111111111";
     const RECIPIENT: &str = "0x2222222222222222222222222222222222222222";
@@ -1480,7 +1480,7 @@ mod mode_tests {
             decimals: 6,
             upgradeable: false,
         };
-        Catalog::build(&[(descriptor, None, false)], vec![token]).unwrap()
+        Catalog::build(&[(descriptor, Binding::Listed)], vec![token]).unwrap()
     }
 
     fn enabled_policy() -> CanonicalWalletPolicy {

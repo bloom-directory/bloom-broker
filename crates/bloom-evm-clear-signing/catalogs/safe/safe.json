@@ -306,7 +306,8 @@
             "label": "Operation",
             "visible": {
               "mustMatch": [
-                "0"
+                "0",
+                "1"
               ]
             }
           },

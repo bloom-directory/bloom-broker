@@ -73,6 +73,9 @@ pub enum AdmittedFormat {
         /// sends, when there is one.
         amount: Option<String>,
     },
+    /// Safe's packed `MultiSend` transactions, each read as an embedded call.
+    /// Only the built-in Safe batch description uses it; no descriptor can.
+    SafeBatch,
 }
 
 /// Which contract an embedded call is made to.
@@ -110,6 +113,7 @@ impl AdmittedFormat {
             Self::Date => "date",
             Self::Enum(_) => "enum",
             Self::Calldata { .. } => "calldata",
+            Self::SafeBatch => "safeBatch",
         }
     }
 }
@@ -131,8 +135,10 @@ pub enum LeafType {
     FixedBytes(usize),
     /// Dynamic `bytes`: shown raw, or read as an embedded call.
     Bytes,
-    /// A dynamic array of one static scalar type.
+    /// A dynamic array of one static scalar type, or of a tuple.
     Array(Box<LeafType>),
+    /// The named components of an array element: static scalars or `bytes`.
+    Tuple(Vec<(String, LeafType)>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -168,11 +174,106 @@ impl AdmittedDescriptor {
 /// spells it. Exposed so a caller can derive the same selector this reader
 /// derives, rather than deriving one of its own.
 pub fn parse_function(signature: &str) -> Result<Function, ReviewError> {
-    Function::parse(signature).map_err(|error| {
+    let parse_error = |error: String| {
         rejected(format!(
             "`{signature}` is not a function signature: {error}"
         ))
-    })
+    };
+    // ERC-7730 names tuple components in the key, which the alloy parser
+    // refuses, so they are lifted out here and put back on the parsed inputs.
+    let open = signature
+        .find('(')
+        .ok_or_else(|| parse_error("no argument list".into()))?;
+    let mut names = Vec::new();
+    let mut rest = &signature[open + 1..];
+    let stripped = strip_component_names(&mut rest, true, &mut names).map_err(parse_error)?;
+    if !rest.is_empty() {
+        return Err(parse_error("text after the argument list".into()));
+    }
+    let mut function = Function::parse(&format!("{}({stripped})", &signature[..open]))
+        .map_err(|error| parse_error(error.to_string()))?;
+    let mut names = names.into_iter();
+    for input in &mut function.inputs {
+        name_components(input, &mut names).map_err(parse_error)?;
+    }
+    Ok(function)
+}
+
+/// Read one argument list up to and including its `)`, returning it without
+/// the names of tuple components (top-level names stay). The component names
+/// are collected per tuple, outer tuples first.
+fn strip_component_names(
+    rest: &mut &str,
+    top: bool,
+    names: &mut Vec<Vec<String>>,
+) -> Result<String, String> {
+    let mut out = Vec::new();
+    let mut own = Vec::new();
+    let slot = names.len();
+    if !top {
+        names.push(Vec::new());
+    }
+    loop {
+        *rest = rest.trim_start();
+        let mut ty = String::new();
+        if let Some(inner) = rest.strip_prefix('(') {
+            *rest = inner;
+            ty = format!("({})", strip_component_names(rest, false, names)?);
+        } else if let Some(after) = rest.strip_prefix(')') {
+            if !out.is_empty() {
+                return Err("empty argument".into());
+            }
+            *rest = after;
+            return Ok(String::new());
+        }
+        let end = rest
+            .find([',', ')', ' '])
+            .ok_or("unterminated argument list")?;
+        ty.push_str(&rest[..end]);
+        *rest = rest[end..].trim_start();
+        let end = rest.find([',', ')']).ok_or("unterminated argument list")?;
+        let name = rest[..end].trim();
+        *rest = &rest[end..];
+        if top {
+            out.push(if name.is_empty() {
+                ty
+            } else {
+                format!("{ty} {name}")
+            });
+        } else {
+            out.push(ty);
+            own.push(name.to_owned());
+        }
+        let close = rest.starts_with(')');
+        *rest = &rest[1..];
+        if close {
+            break;
+        }
+    }
+    if !top {
+        names[slot] = own;
+    }
+    Ok(out.join(","))
+}
+
+fn name_components(
+    param: &mut Param,
+    names: &mut impl Iterator<Item = Vec<String>>,
+) -> Result<(), String> {
+    if param.components.is_empty() {
+        return Ok(());
+    }
+    let own = names
+        .next()
+        .ok_or("tuple names do not match the tuple types")?;
+    if own.len() != param.components.len() {
+        return Err("tuple names do not match the tuple types".into());
+    }
+    for (component, name) in param.components.iter_mut().zip(own) {
+        component.name = name;
+        name_components(component, names)?;
+    }
+    Ok(())
 }
 
 fn rejected(message: impl Into<String>) -> ReviewError {
@@ -465,10 +566,7 @@ fn admit_call(
             format!("`{signature}` must decode 1-{MAX_LEAVES_PER_FORMAT} arguments"),
         ));
     }
-    let leaf_types: BTreeMap<&str, &LeafType> = leaves
-        .iter()
-        .map(|(path, kind)| (path.as_str(), kind))
-        .collect();
+    let paths = addressable(&leaves);
 
     let declared = format
         .get("fields")
@@ -506,22 +604,17 @@ fn admit_call(
                 ));
             }
         };
-        let (path, each) = field_path(&text(
+        let path = normalize_path(&text(
             field
                 .get("path")
                 .ok_or_else(|| rejected("field has no path"))?,
             "field.path",
         )?)?;
-        let kind = leaf_types.get(path.as_str()).ok_or_else(|| {
+        let kind = *paths.get(path.as_str()).ok_or_else(|| {
             rejected(format!(
                 "field path `{path}` is not a decoded argument of `{signature}`"
             ))
         })?;
-        if each != matches!(kind, LeafType::Array(_)) {
-            return Err(rejected(format!(
-                "an array argument is addressed as `{path}.[]`, and nothing else may be"
-            )));
-        }
         if !covered.insert(path.clone()) {
             return Err(rejected(format!("argument `{path}` is displayed twice")));
         }
@@ -546,14 +639,10 @@ fn admit_call(
             .as_str()
             .ok_or_else(|| rejected("field format must be a string"))?;
         let params = field.get("params");
-        let element: &LeafType = match kind {
-            LeafType::Array(element) => element,
-            other => other,
-        };
-        let format = admit_format(format_name, params, element, &path, enums, &leaf_types)?;
-        if each && matches!(format, AdmittedFormat::TokenAmount(_)) {
+        let format = admit_format(format_name, params, kind, &path, enums, &paths)?;
+        if array_of(&path).is_some() && matches!(format, AdmittedFormat::TokenAmount(_)) {
             return Err(rejected(format!(
-                "`{path}.[]` cannot be a token amount: each element would need its own token"
+                "`{path}` cannot be a token amount: each element would need its own token"
             )));
         }
         fields.push(AdmittedField {
@@ -564,12 +653,11 @@ fn admit_call(
     }
     // Every decoded leaf must be on screen. A descriptor that simply omits an
     // argument is the quiet failure this rule exists to prevent.
-    if covered.len() != leaves.len() {
-        let missing = leaves
-            .iter()
-            .map(|(path, _)| path.as_str())
+    if covered.len() != paths.len() {
+        let missing = paths
+            .keys()
             .find(|path| !covered.contains(*path))
-            .unwrap_or("?");
+            .map_or("?", String::as_str);
         return Err(rejected(format!(
             "`{signature}` decodes argument `{missing}` without displaying it"
         )));
@@ -630,7 +718,7 @@ fn match_values(values: &Value, kind: &LeafType, path: &str) -> Result<Vec<Strin
                         }
                 })
                 .ok_or_else(bad),
-            LeafType::Array(_) => Err(rejected(format!(
+            LeafType::Array(_) | LeafType::Tuple(_) => Err(rejected(format!(
                 "mustMatch on `{path}` would fix a whole array; it is not supported"
             ))),
         })
@@ -643,8 +731,13 @@ fn admit_format(
     kind: &LeafType,
     path: &str,
     enums: &EnumMaps,
-    leaf_types: &BTreeMap<&str, &LeafType>,
+    paths: &BTreeMap<String, &LeafType>,
 ) -> Result<AdmittedFormat, ReviewError> {
+    // A callee or amount must come from the same place as the field: a
+    // top-level argument for a top-level field, the same element otherwise.
+    let sibling = |other: &str, want: &LeafType| {
+        paths.get(other).is_some_and(|kind| *kind == want) && array_of(other) == array_of(path)
+    };
     let params_map = match params {
         Some(value) => object(value, "field.params")?.clone(),
         None => serde_json::Map::new(),
@@ -685,7 +778,10 @@ fn admit_format(
                 // call, or a path to a non-address argument has no address to
                 // resolve and is refused rather than guessed at.
                 let named = normalize_path(token_path)?;
-                match leaf_types.get(named.as_str()) {
+                match paths
+                    .get(named.as_str())
+                    .filter(|_| array_of(&named).is_none())
+                {
                     Some(LeafType::Address) => TokenSource::Argument(named),
                     Some(_) => {
                         return Err(rejected(format!(
@@ -754,7 +850,7 @@ fn admit_format(
                 Some("@.to") => CalleeSource::TargetContract,
                 Some(callee) => {
                     let callee = normalize_path(callee)?;
-                    if leaf_types.get(callee.as_str()) != Some(&&LeafType::Address) {
+                    if !sibling(&callee, &LeafType::Address) {
                         return Err(rejected(format!(
                             "calleePath `{callee}` is not `@.to` or an address argument of this call"
                         )));
@@ -771,8 +867,10 @@ fn admit_format(
                             .as_str()
                             .ok_or_else(|| rejected("amountPath must be a string"))?,
                     )?;
-                    match leaf_types.get(amount.as_str()) {
-                        Some(LeafType::Uint(_)) => Ok(amount),
+                    match paths.get(amount.as_str()) {
+                        Some(LeafType::Uint(_)) if array_of(&amount) == array_of(path) => {
+                            Ok(amount)
+                        }
                         _ => Err(rejected(format!(
                             "amountPath `{amount}` is not an unsigned integer argument of this call"
                         ))),
@@ -787,28 +885,26 @@ fn admit_format(
     }
 }
 
-/// A field path, and whether it addresses each element of an array.
-fn field_path(path: &str) -> Result<(String, bool), ReviewError> {
-    let path = path.strip_prefix("#.").unwrap_or(path);
-    match path.strip_suffix(".[]") {
-        Some(array) => Ok((normalize_path(array)?, true)),
-        None => Ok((normalize_path(path)?, false)),
-    }
-}
-
-/// `#.` is the upstream spelling for "relative to this structure". Nothing
-/// else is accepted: no slices, container roots, maps or expressions, and no
-/// dotted descent while tuples are unsupported.
+/// `#.` is the upstream spelling for "relative to this structure". Accepted:
+/// `name`, `name.[]` and `name.[].component`, nothing else: no slices,
+/// container roots, maps or expressions.
 fn normalize_path(path: &str) -> Result<String, ReviewError> {
     let path = path.strip_prefix("#.").unwrap_or(path);
-    let valid = !path.is_empty()
-        && path
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        && !path.as_bytes()[0].is_ascii_digit();
+    let ident = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            && !part.as_bytes()[0].is_ascii_digit()
+    };
+    let valid = match path.split_once(".[]") {
+        None => ident(path),
+        Some((array, "")) => ident(array),
+        Some((array, rest)) => ident(array) && rest.strip_prefix('.').is_some_and(ident),
+    };
     if !valid {
         return Err(rejected(format!(
-            "field path `{path}` is not a direct named argument path"
+            "field path `{path}` is not a named argument path"
         )));
     }
     Ok(path.to_owned())
@@ -821,13 +917,37 @@ fn collect_leaves(params: &[Param], out: &mut Vec<(String, LeafType)>) -> Result
                 "every argument must be named so a field path can reference it",
             ));
         }
-        if !param.components.is_empty() || param.ty.starts_with("tuple") {
+        let kind = if param.ty == "tuple[]" {
+            // A list of calls or orders: each element's named components.
+            let components = param
+                .components
+                .iter()
+                .map(|component| {
+                    if component.name.is_empty() || !component.components.is_empty() {
+                        return Err(rejected(format!(
+                            "a component of `{}` is unnamed or nested",
+                            param.name
+                        )));
+                    }
+                    match leaf_type(&component.ty)? {
+                        LeafType::Array(_) => Err(rejected(format!(
+                            "`{}.[].{}` is an array inside an array",
+                            param.name, component.name
+                        ))),
+                        kind => Ok((component.name.clone(), kind)),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            LeafType::Array(Box::new(LeafType::Tuple(components)))
+        } else if !param.components.is_empty() || param.ty.starts_with("tuple") {
             return Err(rejected(format!(
-                "argument `{}` is a tuple; component names do not survive a signature key, so no field path can reach it",
+                "argument `{}` is a tuple; only a dynamic array of tuples is supported",
                 param.name
             )));
-        }
-        out.push((param.name.clone(), leaf_type(&param.ty)?));
+        } else {
+            leaf_type(&param.ty)?
+        };
+        out.push((param.name.clone(), kind));
         if out.len() > MAX_LEAVES_PER_FORMAT {
             return Err(ReviewError::new(
                 ReviewReason::LimitExceeded,
@@ -836,6 +956,36 @@ fn collect_leaves(params: &[Param], out: &mut Vec<(String, LeafType)>) -> Result
         }
     }
     Ok(())
+}
+
+/// Every path a field can address, with the type it addresses: `name` for a
+/// scalar or `bytes`, `name.[]` for each element of a scalar array, and
+/// `name.[].component` for a component of each element of a tuple array.
+pub(crate) fn addressable(leaves: &[(String, LeafType)]) -> BTreeMap<String, &LeafType> {
+    let mut paths = BTreeMap::new();
+    for (name, kind) in leaves {
+        match kind {
+            LeafType::Array(element) => match element.as_ref() {
+                LeafType::Tuple(components) => {
+                    for (component, kind) in components {
+                        paths.insert(format!("{name}.[].{component}"), kind);
+                    }
+                }
+                scalar => {
+                    paths.insert(format!("{name}.[]"), scalar);
+                }
+            },
+            other => {
+                paths.insert(name.clone(), other);
+            }
+        }
+    }
+    paths
+}
+
+/// The array a path reaches into, if any: `calls` for `calls.[].to`.
+pub(crate) fn array_of(path: &str) -> Option<&str> {
+    path.split_once(".[]").map(|(array, _)| array)
 }
 
 /// A static scalar, dynamic `bytes`, or a dynamic array of one static scalar.

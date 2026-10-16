@@ -12,30 +12,69 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    AdmittedDescriptor, ReviewError, ReviewReason, admit, admit_document, deployments,
-    erc20_profile, parse_function,
+    AdmittedCall, AdmittedDescriptor, AdmittedField, AdmittedFormat, LeafType, ReviewError,
+    ReviewReason, admit, admit_document, deployments, erc20_profile, parse_function,
 };
 
 pub const TOKEN_SYMBOL_MAX_BYTES: usize = 16;
 pub const TOKEN_NAME_MAX_SCALARS: usize = 64;
 pub const TOKEN_NAME_MAX_BYTES: usize = 256;
 
-/// The compiled-in descriptor files: path, contents, and the deployment whose
-/// description also applies to unlisted instances (a Safe singleton, which
-/// every Safe proxy runs).
-pub const DESCRIPTORS: [(&str, &str, Option<&str>); 2] = [
+/// How a compiled-in description applies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Binding {
+    /// To the deployments it lists.
+    Listed,
+    /// Also, by selector, to addresses no entry lists, on the chains where it
+    /// lists this deployment: per-user proxies such as Safes, which all run
+    /// one singleton.
+    Instances(&'static str),
+    /// By selector, to addresses no entry lists, on every chain: a contract
+    /// standard such as ERC-4626, whose deployments cannot all be listed.
+    Standard,
+}
+
+/// The compiled-in descriptor files: path, contents and binding.
+pub const DESCRIPTORS: [(&str, &str, Binding); 5] = [
     (
         "safe/safe.json",
         include_str!("../catalogs/safe/safe.json"),
-        Some("0x41675c099f32341bf84bfc5382af534df5c7461a"),
+        Binding::Instances("0x41675c099f32341bf84bfc5382af534df5c7461a"),
     ),
     (
         "safe/safe-proxy-factory.json",
         include_str!("../catalogs/safe/safe-proxy-factory.json"),
-        None,
+        Binding::Listed,
+    ),
+    (
+        "morpho/bundler3.json",
+        include_str!("../catalogs/morpho/bundler3.json"),
+        Binding::Listed,
+    ),
+    (
+        "morpho/general-adapter1.json",
+        include_str!("../catalogs/morpho/general-adapter1.json"),
+        Binding::Listed,
+    ),
+    (
+        "standards/erc4626.json",
+        include_str!("../catalogs/standards/erc4626.json"),
+        Binding::Standard,
     ),
 ];
 pub const TOKENS: &str = include_str!("../catalogs/tokens.json");
+
+/// Safe's MultiSendCallOnly (1.3.0 twice, 1.4.1, 1.5.0): the only contract a
+/// Safe may delegatecall, and only to run a batch of plain calls. Its packed
+/// format is not ERC-7730, so it is described in code. The runtime code at
+/// each address was checked on each chain listed.
+pub const SAFE_BATCH: [&str; 4] = [
+    "0x40a2accbd92bca938b02010e17a5b8929b49130d",
+    "0xa1dabef33b3b82c7814b6d82a79e50f4ac44102b",
+    "0x9641d764fc13c8b624c04430c7356c1c7c8102e2",
+    "0xa83c336b20401af773b6219ba5027174338d1836",
+];
+pub const SAFE_BATCH_CHAINS: [u64; 6] = [1, 10, 100, 137, 8453, 42161];
 
 /// What a reviewed function is permitted to mean. It is derived from the
 /// signature: only the canonical ERC-20 `transfer` and `approve` get the
@@ -117,16 +156,19 @@ pub struct CatalogEntry {
 pub struct Catalog {
     descriptors: Vec<AdmittedDescriptor>,
     entries: BTreeMap<(u64, String), CatalogEntry>,
+    /// One entry per standard description, at the zero address on chain 0:
+    /// it describes no deployment.
+    standards: Vec<CatalogEntry>,
 }
 
 static BUILT_IN: LazyLock<Result<Catalog, ReviewError>> = LazyLock::new(|| {
     let descriptors = DESCRIPTORS
         .iter()
-        .map(|(path, text, instance)| {
+        .map(|(path, text, binding)| {
             let value = serde_json::from_str(text).map_err(|error| {
                 ReviewError::new(ReviewReason::CatalogRejected, format!("{path}: {error}"))
             })?;
-            Ok((value, *instance, false))
+            Ok((value, *binding))
         })
         .collect::<Result<Vec<_>, ReviewError>>()?;
     let tokens = serde_json::from_str(TOKENS).map_err(|error| {
@@ -145,25 +187,36 @@ impl Catalog {
         BUILT_IN.as_ref().map_err(Clone::clone)
     }
 
-    /// Admit descriptors (each with its instance address and whether its
-    /// deployments are upgradeable) and token rows. Every function a
-    /// descriptor formats is admitted. A token without a descriptor of its
-    /// own is read by the built-in ERC-20 profile.
+    /// Admit descriptors and token rows. Every function a descriptor formats
+    /// is admitted. A token without a descriptor of its own is read by the
+    /// built-in ERC-20 profile.
     pub fn build(
-        descriptors: &[(Value, Option<&str>, bool)],
+        descriptors: &[(Value, Binding)],
         tokens: Vec<TokenRecord>,
     ) -> Result<Self, ReviewError> {
         let (profile, functions) = erc20_profile();
         let mut catalog = Catalog {
-            descriptors: vec![admit_document(&profile, None, &functions)?],
+            descriptors: vec![
+                admit_document(&profile, None, &functions)?,
+                safe_batch_description(),
+            ],
             entries: BTreeMap::new(),
+            standards: Vec::new(),
         };
+        for chain_id in SAFE_BATCH_CHAINS {
+            for address in SAFE_BATCH {
+                catalog.insert(CatalogEntry {
+                    chain_id,
+                    contract_address: address.to_owned(),
+                    token_metadata: None,
+                    upgradeable: false,
+                    applies_to_instances: false,
+                    descriptor: SAFE_BATCH_DESCRIPTOR,
+                })?;
+            }
+        }
         let mut instance_selectors = BTreeSet::new();
-        for (descriptor, instance, upgradeable) in descriptors {
-            let bound = deployments(descriptor)?;
-            let (chain_id, address) = bound
-                .first()
-                .ok_or_else(|| rejected("a descriptor lists no deployments"))?;
+        for (descriptor, binding) in descriptors {
             let functions = descriptor
                 .pointer("/display/formats")
                 .and_then(Value::as_object)
@@ -176,22 +229,43 @@ impl Catalog {
                     })
                 })
                 .collect::<Result<Vec<_>, ReviewError>>()?;
-            let admitted = admit(descriptor, *chain_id, address, &functions)?;
             let index = catalog.descriptors.len();
-            if instance.is_some()
-                && admitted
-                    .calls
-                    .iter()
-                    .any(|call| call.action_class != ActionClass::Other)
-            {
-                // Token units or an ERC-20 class there would lend one
-                // token's identity to every unlisted address.
-                return Err(rejected(
-                    "an instance description may not admit ERC-20 calls",
-                ));
+            if *binding == Binding::Standard {
+                let admitted = admit_document(descriptor, None, &functions)?;
+                check_unlisted_reading(&admitted)?;
+                for call in &admitted.calls {
+                    if !instance_selectors.insert((0, call.selector)) {
+                        return Err(rejected(format!(
+                            "two standard descriptions admit the selector of `{}`",
+                            call.signature
+                        )));
+                    }
+                }
+                catalog.standards.push(CatalogEntry {
+                    chain_id: 0,
+                    contract_address: format!("0x{}", "0".repeat(40)),
+                    token_metadata: None,
+                    upgradeable: false,
+                    applies_to_instances: true,
+                    descriptor: index,
+                });
+                catalog.descriptors.push(admitted);
+                continue;
             }
+            let bound = deployments(descriptor)?;
+            let (chain_id, address) = bound
+                .first()
+                .ok_or_else(|| rejected("a descriptor lists no deployments"))?;
+            let admitted = admit(descriptor, *chain_id, address, &functions)?;
+            let instance = match binding {
+                Binding::Instances(address) => {
+                    check_unlisted_reading(&admitted)?;
+                    Some(*address)
+                }
+                _ => None,
+            };
             for (chain_id, address) in bound {
-                let applies_to_instances = instance.is_some_and(|instance| instance == address);
+                let applies_to_instances = instance == Some(address.as_str());
                 if applies_to_instances {
                     for call in &admitted.calls {
                         if !instance_selectors.insert((chain_id, call.selector)) {
@@ -206,7 +280,7 @@ impl Catalog {
                     chain_id,
                     contract_address: address,
                     token_metadata: None,
-                    upgradeable: *upgradeable,
+                    upgradeable: false,
                     applies_to_instances,
                     descriptor: index,
                 })?;
@@ -262,6 +336,12 @@ impl Catalog {
         Ok(())
     }
 
+    /// Whether a Safe may delegatecall this address: a MultiSendCallOnly.
+    pub fn is_safe_batch(&self, chain_id: u64, address: &str) -> bool {
+        self.entry(chain_id, address)
+            .is_some_and(|entry| entry.descriptor == SAFE_BATCH_DESCRIPTOR)
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -298,6 +378,7 @@ impl Catalog {
             .range((chain_id, String::new())..(chain_id + 1, String::new()))
             .map(|(_, entry)| entry)
             .filter(|entry| entry.applies_to_instances)
+            .chain(&self.standards)
             .find_map(|entry| {
                 let descriptor = &self.descriptors[entry.descriptor];
                 descriptor.call(selector).map(|_| (entry, descriptor, true))
@@ -325,6 +406,47 @@ impl TokenMetadata {
             )));
         }
         Ok(())
+    }
+}
+
+const SAFE_BATCH_DESCRIPTOR: usize = 1;
+
+/// A description read for addresses nobody listed may not admit ERC-20
+/// calls: token units or the transfer class there would lend one token's
+/// identity to every such address.
+fn check_unlisted_reading(admitted: &AdmittedDescriptor) -> Result<(), ReviewError> {
+    if admitted
+        .calls
+        .iter()
+        .any(|call| call.action_class != ActionClass::Other)
+    {
+        return Err(rejected(
+            "an instance or standard description may not admit ERC-20 calls",
+        ));
+    }
+    Ok(())
+}
+
+fn safe_batch_description() -> AdmittedDescriptor {
+    let signature = "multiSend(bytes transactions)";
+    AdmittedDescriptor {
+        contract_name: Some("Safe batch".to_owned()),
+        calls: vec![AdmittedCall {
+            signature: signature.to_owned(),
+            selector: parse_function(signature)
+                .expect("the batch signature parses")
+                .selector()
+                .0,
+            action_class: ActionClass::Other,
+            intent: None,
+            fields: vec![AdmittedField {
+                path: "transactions".to_owned(),
+                label: "Transaction".to_owned(),
+                format: AdmittedFormat::SafeBatch,
+            }],
+            leaves: vec![("transactions".to_owned(), LeafType::Bytes)],
+            constraints: Vec::new(),
+        }],
     }
 }
 

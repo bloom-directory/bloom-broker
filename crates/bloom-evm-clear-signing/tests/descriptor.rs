@@ -493,3 +493,128 @@ fn a_noncanonical_boolean_word_does_not_survive_the_round_trip() {
         ReviewReason::InvalidPayload
     );
 }
+
+const MULTICALL: &str = "multicall((address to, bytes data, uint256 value, bool skipRevert, bytes32 callbackHash)[] bundle)";
+
+fn multicall_fields() -> Value {
+    json!([
+        {"path": "bundle.[].data", "label": "Call", "format": "calldata",
+         "params": {"calleePath": "bundle.[].to", "amountPath": "bundle.[].value"}},
+        {"path": "bundle.[].to", "label": "Target", "format": "addressName"},
+        {"path": "bundle.[].value", "label": "Value", "format": "amount"},
+        {"path": "bundle.[].skipRevert", "label": "Skip revert", "visible": {"mustMatch": [false]}},
+        {"path": "bundle.[].callbackHash", "label": "Callback",
+         "visible": {"mustMatch": ["0x0000000000000000000000000000000000000000000000000000000000000000"]}}
+    ])
+}
+
+#[test]
+fn a_named_tuple_key_parses_to_the_canonical_selector() {
+    let named = parse_function(MULTICALL).unwrap();
+    let bare = parse_function("multicall((address,bytes,uint256,bool,bytes32)[] bundle)").unwrap();
+    assert_eq!(named.selector(), bare.selector());
+    let names: Vec<_> = named.inputs[0]
+        .components
+        .iter()
+        .map(|component| component.name.as_str())
+        .collect();
+    assert_eq!(names, ["to", "data", "value", "skipRevert", "callbackHash"]);
+    assert!(parse_function("f((address a, uint256 b) x").is_err());
+}
+
+fn multicall_input(calls: &[(&str, Vec<u8>, u64, bool, u8)]) -> Vec<u8> {
+    use alloy_dyn_abi::{DynSolValue, JsonAbiExt as _};
+    let calls = calls
+        .iter()
+        .map(|(to, data, value, skip, hash)| {
+            DynSolValue::Tuple(vec![
+                DynSolValue::Address(to.parse().unwrap()),
+                DynSolValue::Bytes(data.clone()),
+                DynSolValue::Uint(U256::from(*value), 256),
+                DynSolValue::Bool(*skip),
+                DynSolValue::FixedBytes([*hash; 32].into(), 32),
+            ])
+        })
+        .collect();
+    parse_function(MULTICALL)
+        .unwrap()
+        .abi_encode_input(&[DynSolValue::Array(calls)])
+        .unwrap()
+}
+
+/// A list of calls reads call by call: each element's embedded call is
+/// reviewed against the catalog with its own callee and value.
+#[test]
+fn a_list_of_calls_is_read_call_by_call() {
+    let bundler = "0x4444444444444444444444444444444444444444";
+    let descriptor = json!({
+        "context": {"contract": {"deployments": [{"chainId": CHAIN_ID, "address": bundler}]}},
+        "metadata": {"contractName": "Bundler"},
+        "display": {"formats": {MULTICALL: {"fields": multicall_fields()}}}
+    });
+    let catalog = build(vec![descriptor], vec![token(TOKEN, 6)]).unwrap();
+    let transfer = calldata(
+        "transfer(address,uint256)",
+        &[address_word(RECIPIENT), U256::from(2_500_000u64)],
+    );
+    let unlisted = "0x5555555555555555555555555555555555555555";
+    let input = multicall_input(&[
+        (TOKEN, transfer.clone(), 0, false, 0),
+        (unlisted, transfer, 0, false, 0),
+    ]);
+    let mut ctx = context(&input, false);
+    ctx.to = bundler.parse().unwrap();
+    let (call, used) = review_call(&catalog, &ctx).unwrap();
+    assert_eq!(
+        field(&call, "Call 1").value,
+        format!("transfer on Example Token {}", checksum(TOKEN))
+    );
+    assert_eq!(field(&call, "Call 1 · Amount").value, "2.5 EXA");
+    assert_eq!(field(&call, "Target 1").value, checksum(TOKEN));
+    assert_eq!(field(&call, "Call 2 · Raw token amount").value, "2500000");
+    assert!(call.structural);
+    assert_eq!(used.len(), 2);
+
+    // The fixed components are enforced on every element.
+    let callback = multicall_input(&[(TOKEN, Vec::new(), 0, false, 1)]);
+    let mut ctx = context(&callback, false);
+    ctx.to = bundler.parse().unwrap();
+    let error = review_call(&catalog, &ctx).unwrap_err();
+    assert_eq!(error.reason, ReviewReason::UnsupportedCall, "{error}");
+    assert!(error.detail.contains("callbackHash"), "{error}");
+}
+
+#[test]
+fn a_list_of_calls_must_show_every_component_from_its_own_element() {
+    // Leaving a component off the screen.
+    let mut missing = multicall_fields();
+    missing.as_array_mut().unwrap().remove(1);
+    let error = admit_one(MULTICALL, missing).unwrap_err();
+    assert!(error.detail.contains("bundle.[].to"), "{error}");
+
+    // A callee taken from outside the element.
+    let signature = "run((address to, bytes data)[] calls, address other)";
+    let error = admit_one(
+        signature,
+        json!([
+            {"path": "calls.[].data", "label": "Call", "format": "calldata",
+             "params": {"calleePath": "other"}},
+            {"path": "calls.[].to", "label": "To", "format": "addressName"},
+            {"path": "other", "label": "Other", "format": "addressName"}
+        ]),
+    )
+    .unwrap_err();
+    assert!(error.detail.contains("calleePath"), "{error}");
+
+    // A token amount per element would need a token per element.
+    let error = admit_one(
+        "pay((address to, uint256 amount)[] payments)",
+        json!([
+            {"path": "payments.[].to", "label": "To", "format": "addressName"},
+            {"path": "payments.[].amount", "label": "Amount", "format": "tokenAmount",
+             "params": {"tokenPath": "@.to"}}
+        ]),
+    )
+    .unwrap_err();
+    assert!(error.detail.contains("token amount"), "{error}");
+}

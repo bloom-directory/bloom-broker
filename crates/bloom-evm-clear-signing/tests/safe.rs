@@ -27,10 +27,10 @@ const REMOVE_OWNER: &str = "0x6a761202000000000000000000000000aefda71ded59b48920
 const CREATION: &str = "0x1688f0b900000000000000000000000029fcb43b46531bca003ddc8fcb67ffe91900c762000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000013528400000000000000000000000000000000000000000000000000000000000000164b63e800d0000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000fd0732dc9e303f09fcef3a7388ad10a83459ec9900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d081000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
 /// The compiled-in Safe descriptors, as `Catalog::built_in` admits them.
-fn safe_descriptors() -> Vec<(Value, Option<&'static str>, bool)> {
-    DESCRIPTORS
+fn safe_descriptors() -> Vec<(Value, Binding)> {
+    DESCRIPTORS[..2]
         .iter()
-        .map(|(_, text, instance)| (serde_json::from_str(text).unwrap(), *instance, false))
+        .map(|(_, text, binding)| (serde_json::from_str(text).unwrap(), *binding))
         .collect()
 }
 
@@ -200,11 +200,76 @@ fn an_owner_change_is_read_as_the_safe_calling_itself() {
     );
 }
 
+/// A real Base batch: the Safe sends ETH, then transfers USDC, both to its
+/// owner, through MultiSendCallOnly 1.4.1.
 #[test]
-fn a_safe_batch_is_a_delegatecall_and_is_refused() {
-    let error = review(SAFE, &hex_input(BATCH)).unwrap_err();
+fn a_safe_batch_is_read_call_by_call() {
+    let (call, entries) = review(SAFE, &hex_input(BATCH)).unwrap();
+    assert_eq!(
+        field(&call, "Safe transaction · Transaction 1"),
+        format!("Send 0.000005 ETH to {}", checksum(WALLET))
+    );
+    assert_eq!(
+        field(&call, "Safe transaction · Transaction 2"),
+        format!("transfer on USD Coin {}", checksum(USDC))
+    );
+    assert_eq!(
+        field(&call, "Safe transaction · Transaction 2 · Amount"),
+        "0 USDC"
+    );
+    assert_eq!(entries.len(), 3);
+}
+
+fn batch_entry(operation: u8, to: &str, value: u64, data: &[u8]) -> Vec<u8> {
+    let mut entry = vec![operation];
+    entry.extend_from_slice(to.parse::<Address>().unwrap().as_slice());
+    entry.extend_from_slice(&U256::from(value).to_be_bytes::<32>());
+    entry.extend_from_slice(&U256::from(data.len()).to_be_bytes::<32>());
+    entry.extend_from_slice(data);
+    entry
+}
+
+fn batch(packed: Vec<u8>) -> Vec<u8> {
+    let function = Function::parse("multiSend(bytes)").unwrap();
+    let data = function
+        .abi_encode_input(&[DynSolValue::Bytes(packed)])
+        .unwrap();
+    exec(BATCH_LIBRARY, 0, data, 1, 0)
+}
+
+const BATCH_LIBRARY: &str = "0x9641d764fc13c8b624c04430c7356c1c7c8102e2";
+
+#[test]
+fn only_the_batch_library_may_be_delegatecalled_and_only_for_plain_calls() {
+    // A delegatecall anywhere else runs that code as the Safe.
+    let error = review(SAFE, &exec(USDC, 0, Vec::new(), 1, 0)).unwrap_err();
     assert_eq!(error.reason, ReviewReason::UnsupportedCall, "{error}");
-    assert!(error.detail.contains("`operation` is 1"), "{error}");
+    assert!(error.detail.contains("MultiSendCallOnly"), "{error}");
+
+    for (what, packed) in [
+        ("a nested delegatecall", batch_entry(1, WALLET, 0, &[])),
+        (
+            "the zero address",
+            batch_entry(0, "0x0000000000000000000000000000000000000000", 1, &[]),
+        ),
+        ("an empty batch", Vec::new()),
+        (
+            "a truncated call",
+            batch_entry(0, WALLET, 0, &[1, 2, 3])[..86].to_vec(),
+        ),
+    ] {
+        let error = review(SAFE, &batch(packed)).unwrap_err();
+        assert_eq!(
+            error.reason,
+            ReviewReason::InvalidPayload,
+            "{what}: {error}"
+        );
+    }
+
+    // Every call is read under the same rules as outside a batch.
+    let unlimited = token_call("approve(address,uint256)", WALLET, U256::MAX);
+    let error = review(SAFE, &batch(batch_entry(0, USDC, 0, &unlimited))).unwrap_err();
+    assert_eq!(error.reason, ReviewReason::PolicyDenied, "{error}");
 }
 
 #[test]
@@ -327,7 +392,7 @@ fn instance_entries_cannot_overlap_or_borrow_token_identity() {
     let mut copy = safe_descriptors()[0].0.clone();
     copy["context"]["contract"]["deployments"] = json!([{"chainId": BASE, "address": other}]);
     let mut descriptors = safe_descriptors();
-    descriptors.push((copy, Some(other), false));
+    descriptors.push((copy, Binding::Instances(other)));
     let error = Catalog::build(&descriptors, Vec::new()).unwrap_err();
     assert_eq!(error.reason, ReviewReason::CatalogRejected, "{error}");
     assert!(error.detail.contains("ambiguous"), "{error}");

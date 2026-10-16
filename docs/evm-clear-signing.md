@@ -28,8 +28,9 @@ of the listed deployment. It is **not** proof of execution, contract safety, or
 the absence of an upgrade since the release. Broker reads no chain state and
 resolves no proxy.
 
-A review that read any address through an [instance entry](#instance-entries),
-or an embedded ERC-20 call by its shape alone, has the class
+A review that read any address through an
+[instance or standard description](#instance-and-standard-descriptions), an
+embedded ERC-20 call by its shape alone, or an unlisted token's amount, has the class
 `structural_description` instead: the description is used in the same way, but
 nothing establishes which contract the address is.
 
@@ -47,11 +48,13 @@ published subset, not full ERC-7730 conformance.
 - `metadata.owner`, `metadata.contractName`, `metadata.enums`.
 - `display.formats`, keyed by a function signature with named parameters.
 - Named static scalar arguments: `address`, `bool`, `uintN` (canonical widths)
-  and `bytesN`; dynamic `bytes`; and dynamic arrays of one static scalar
-  (`address[]`, `uint256[]`, ...).
-- Direct named field paths, optionally spelled `#.name`. An array argument is
-  addressed as `name.[]` and shown one element per line; nothing else may use
-  `.[]`.
+  and `bytesN`; dynamic `bytes`; dynamic arrays of one static scalar
+  (`address[]`, `uint256[]`, ...); and dynamic arrays of a tuple of those
+  scalars or `bytes`, with named components (`(address to, bytes data)[] calls`).
+- Named field paths, optionally spelled `#.name`: `name`, `name.[]` for each
+  element of a scalar array, and `name.[].component` for each element of a
+  tuple array. An array is shown element by element, each field labelled with
+  the element's position.
 - Always-visible fields in seven formats: `raw`, `addressName`, `tokenAmount`,
   `amount`, `date`, `enum`, and `calldata` (see [Embedded calls](#embedded-calls)).
   `bytes` takes `raw` or `calldata`. `tokenAmount` does not apply per element.
@@ -67,18 +70,19 @@ published subset, not full ERC-7730 conformance.
 - `interpolatedIntent`, `display.definitions`, `$ref` field references, field
   groups, `value` constants, `separator`, `encryption`.
 - Hidden or conditional fields (`visible` other than `"always"` or a lone
-  `mustMatch`), and `mustMatch` on an array.
+  `mustMatch`), and `mustMatch` on a whole array. `mustMatch` on
+  `name.[].component` holds for every element.
 - `tokenAmount` parameters other than `tokenPath` — in particular `threshold`
   and `message`, which is how the registry's ERC-20 template labels a large
   *finite* allowance "unlimited". An admitted derivative must drop them;
   Bloom's own maximum-U256 rule owns that warning.
 
   `tokenPath` itself takes either `"@.to"`, meaning the contract being called
-  is the token, or the name of an address argument of the same call. In the
-  second form the address that was actually decoded is looked up in the
-  catalog, so a call naming a token the catalog does not describe is
-  unsupported rather than shown with borrowed decimals, and that token's entry
-  becomes part of the frozen evidence. A token path that names a non-address argument, or no argument
+  is the token, or the name of a top-level address argument of the same call.
+  In the second form the address that was actually decoded is looked up in the
+  catalog, and that token's entry becomes part of the frozen evidence. A token
+  the catalog does not list is shown in raw units with its address, never with
+  borrowed decimals, and the review is structural. A token path that names a non-address argument, or no argument
   at all, is refused at admission.
 - `date` with `blockheight` encoding, which cannot be converted offline.
 - `enum` references outside a local `$.metadata.enums` map, and any value the
@@ -87,20 +91,10 @@ published subset, not full ERC-7730 conformance.
   catalog's token rows, not from the document.
 - Any argument left off the screen. Every decoded leaf must be covered by a
   visible field naming its actual path.
-- `string`, fixed-size and nested arrays, and signed integers.
+- `string`, fixed-size and nested arrays, tuples outside a dynamic array,
+  and signed integers.
 - `calldata` parameters other than `calleePath` and `amountPath`. `selector`,
   `spender` and `chainId` would each change how the inner call is read.
-- **Tuples**, deferred from this milestone rather than ruled out. The
-  limitation was measured against the pinned parser, not assumed:
-  `alloy_json_abi::Function::parse` rejects
-  `settle((address beneficiary, uint256 amount) terms, bool finalize)`
-  outright, and parses `settle((address,uint256) terms, bool finalize)` with
-  its components unnamed. So a field path like `terms.beneficiary` has nothing
-  to resolve against *through a signature key*. How to carry component names
-  is an open representation decision — a richer format key, the contract's
-  JSON ABI as a second input, or positional paths — and nothing here
-  forecloses any of them. It belongs with the router slice, which is the first
-  thing that needs it; Uniswap's `exactInputSingle` is exactly this shape.
 
 `addressName` name sources are inert: no ENS request, no account-type
 assertion, no sentinel substitution. The raw address is what is shown.
@@ -109,8 +103,10 @@ assertion, no sentinel substitution. The raw address is what is shown.
 
 A `calldata` field reads a call carried inside this one. `calleePath` names the
 contract it calls, as `"@.to"` or an address argument. The optional
-`amountPath` names a uint argument holding the native value it sends. The inner
-call is reviewed exactly as a top-level call:
+`amountPath` names a uint argument holding the native value it sends. In a list
+of calls (`bundle.[].data`), both come from the same element
+(`bundle.[].to`, `bundle.[].value`), so each call is read with its own target.
+The inner call is reviewed exactly as a top-level call:
 
 - An inner call Bloom cannot read makes the whole call unsupported.
 - Its policy refusals refuse, so an unlimited allowance inside a Safe is
@@ -129,7 +125,7 @@ call's warnings are prefixed the same way.
 Empty inner calldata is a plain value transfer, shown as `Send <amount> to
 <callee>`, or `No call` when the amount is zero. Calls nest at most two deep.
 
-## Instance entries
+## Instance and standard descriptions
 
 Some contracts exist once per user: every Safe is its own proxy, so no catalog
 can list them. ERC-7730 binds such a descriptor to the implementation and
@@ -144,6 +140,12 @@ deployments as the instance address:
 - On one chain, two instance descriptions may not admit the same selector.
 - An instance description admits no ERC-20 call and carries no token row, so
   it cannot lend a token's identity to unlisted addresses.
+
+A **standard** description (`Binding::Standard`, such as
+`catalogs/standards/erc4626.json`) has no deployments. It reads any address no
+entry or instance description covers, on any chain, by selector: a vault's
+`deposit`, `mint`, `withdraw` and `redeem`, with amounts in raw units because
+the vault's asset is not known offline. The same ERC-20 rule applies.
 
 Such a call gets the structural assurance and a warning that Bloom has not
 verified the address is that contract. Its evidence records the address it was
@@ -163,15 +165,27 @@ singletons and proxy factories (1.3.0, 1.4.1, 1.5.0) on chains 1, 10, 100, 137,
 address on each chain. Its `execTransaction` and owner-management functions are
 identical in 1.3.0 and 1.5.0.
 
-`mustMatch` holds the Safe safety rules:
+`mustMatch` and one rule in code hold the Safe safety rules:
 
-- `operation` must be a call, so delegatecalls, and with them `MultiSend`
-  batches, are refused.
+- A delegatecall runs code as the Safe, so `execTransaction` may delegatecall
+  only Safe's MultiSendCallOnly (1.3.0, 1.4.1, 1.5.0). That batch library's
+  packed format is not ERC-7730, so Broker reads it in code: each call is
+  shown as an embedded call, `Transaction 1`, `Transaction 2`, and reviewed as
+  a top-level call would be. A call inside a batch must be a plain call to a
+  nonzero address; an empty or truncated batch is refused.
 - No gas refund: `gasPrice`, `gasToken` and `refundReceiver` must be zero.
 - A new Safe uses an official singleton, has no setup call, no setup payment,
   and either an official fallback handler or none.
 
 Owner signatures are shown raw and are not checked by Bloom.
+
+## Morpho
+
+`catalogs/morpho` describes Bundler3's `multicall` and GeneralAdapter1's
+`erc20TransferFrom` and `erc4626Deposit` on chains 1, 10, 137, 8453 and 42161:
+the protected deposit the Morpho Petal stages. Every call component is shown
+or fixed: no callbacks and no skipped reverts. A withdrawal from the vault is
+read by the ERC-4626 standard description.
 
 ## Safety rules over the generic result
 
@@ -288,8 +302,9 @@ demonstrated with an owner approval.
 - **A token:** add a row to `catalogs/tokens.json`. Check `decimals()`,
   `symbol()` and `name()` on chain, and mark a proxy `upgradeable`.
 - **A contract:** add its ERC-7730 descriptor under `catalogs/` and a line to
-  `DESCRIPTORS`. A descriptor outside the subset fails the built-in catalog
-  test rather than reaching an owner.
+  `DESCRIPTORS`, binding it to its listed deployments, to per-user instances
+  of one deployment, or as a standard. A descriptor outside the subset fails
+  the built-in catalog test rather than reaching an owner.
 
 Either change ships with the next Broker release.
 

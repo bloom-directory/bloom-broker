@@ -71,7 +71,7 @@ pub fn token(address: &str, decimals: u8) -> TokenRecord {
 pub fn build(descriptors: Vec<Value>, tokens: Vec<TokenRecord>) -> Result<Catalog, ReviewError> {
     let descriptors: Vec<_> = descriptors
         .into_iter()
-        .map(|descriptor| (descriptor, None, false))
+        .map(|descriptor| (descriptor, Binding::Listed))
         .collect();
     Catalog::build(&descriptors, tokens)
 }

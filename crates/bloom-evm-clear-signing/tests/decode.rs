@@ -379,8 +379,10 @@ fn a_token_named_by_an_argument_is_resolved_from_the_catalog() {
     assert_eq!(used[1].contract_address, TOKEN);
 }
 
+/// An unlisted token's amount is shown in its raw units, never with decimals
+/// borrowed from somewhere else, and the reading is structural.
 #[test]
-fn a_token_the_catalog_does_not_describe_cannot_be_shown() {
+fn a_token_the_catalog_does_not_list_is_shown_in_raw_units() {
     let catalog = accepted_vault();
     let bytes = calldata(
         VAULT_DEPOSIT,
@@ -390,12 +392,13 @@ fn a_token_the_catalog_does_not_describe_cannot_be_shown() {
             address_word(RECIPIENT),
         ],
     );
-    let error = review_call(&catalog, &vault_context(&bytes)).unwrap_err();
-    assert_eq!(error.reason, ReviewReason::UnsupportedCall);
-    assert!(
-        error.detail.contains("no description of the token"),
-        "{error}"
+    let (call, used) = review_call(&catalog, &vault_context(&bytes)).unwrap();
+    assert_eq!(
+        field(&call, "Amount").value,
+        format!("1 raw units of {}", checksum(RECIPIENT))
     );
+    assert!(call.structural);
+    assert_eq!(used.len(), 1);
 }
 
 #[test]
