@@ -241,18 +241,12 @@ impl CeremonyBroker {
             .digest()
             .map_err(signer_error_to_machine)?;
         // RPC peers sample time independently. Clamp the browser session to
-        // Broker's two-minute deadline instead of rejecting transport latency.
+        // Broker's fifteen-minute deadline instead of rejecting transport latency.
         let expires_at_ms = prepared
             .contribution
             .expires_at_ms
             .get()
-            .min(now_ms.saturating_add(
-                if matches!(request.effect, CardEffect::SaveTraveler { .. }) {
-                    900_000
-                } else {
-                    120_000
-                },
-            ));
+            .min(now_ms.saturating_add(900_000));
         let ceremony_id = prepared.contribution.ceremony_id.clone();
         let session = self.new_session(NewBrowserSession {
             operation_id: operation_id.clone(),
