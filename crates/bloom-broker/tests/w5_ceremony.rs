@@ -8832,6 +8832,14 @@ if (!isGeneric(tokenReviewIcon("constructor", "prototype"))) {{
   throw new Error("prototype chain leaked into artwork selection");
 }}
 
+// Circle's USDC on Base gets the artwork; Binance-pegged "USDC" does not.
+if (src(tokenReviewIcon("8453", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")) !== "/assets/tokens/usdc.svg") {{
+  throw new Error("Base USDC lost its artwork");
+}}
+if (!isGeneric(tokenReviewIcon("56", "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"))) {{
+  throw new Error("a pegged copy took Circle's artwork");
+}}
+
 // Artwork is decorative: it carries no alternative text that could be read
 // as an identity, and the wrapper is hidden from assistive technology.
 const usdcIcon = tokenReviewIcon("1", USDC);

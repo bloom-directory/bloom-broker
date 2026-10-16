@@ -126,9 +126,21 @@ function reviewIcon(kind) {
 
 // Reviewed, bundled artwork. Never select a logo by publisher-supplied text.
 function tokenReviewIcon(chainId, address) {
+  // Circle's own USDC and Maker's own or official-bridge DAI only; bridged or
+  // pegged copies by other issuers keep the generic icon.
   const logos = {
     "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "usdc",
-    "1:0x6b175474e89094c44da98b954eedeac495271d0f": "dai"
+    "10:0x0b2c639c533813f4aa9d7837caf62653d097ff85": "usdc",
+    "137:0x3c499c542cef5e3811e1192ce70d8cc03d5c3359": "usdc",
+    "999:0xb88339cb7199b77e23db6e890353e22632ba630f": "usdc",
+    "8453:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": "usdc",
+    "42161:0xaf88d065e77c8cc2239327c5edb3a432268e5831": "usdc",
+    "43114:0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e": "usdc",
+    "59144:0x176211869ca2b568f2a7d4ee941e073a821ee1ff": "usdc",
+    "1:0x6b175474e89094c44da98b954eedeac495271d0f": "dai",
+    "10:0xda10009cbd5d07dd0cecc66161fc93d7c9000da1": "dai",
+    "42161:0xda10009cbd5d07dd0cecc66161fc93d7c9000da1": "dai",
+    "8453:0x50c5725949a6f0c72e6c4a641f24049a917db0cb": "dai"
   };
   const name = logos[`${chainId}:${String(address).toLowerCase()}`];
   if (!name) return reviewIcon("token");
