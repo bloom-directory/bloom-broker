@@ -14,6 +14,6 @@ review, including its chain, contract address, artwork and source.
   under Apache-2.0 (see `DAI-LICENSE.txt`). Adapted from JSX to SVG,
   colored white and placed on a gold circle.
 
-Initial identities: Ethereum (chain 1) USDC at
-`0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48` and DAI at
-`0x6B175474E89094C44Da98b954EedeAC495271d0F`.
+The identities are the `logos` table in `app.js`: Circle-issued USDC on
+chains 1, 10, 137, 999, 8453, 42161, 43114 and 59144, and DAI on chains 1,
+10, 42161 and 8453.

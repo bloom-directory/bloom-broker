@@ -3,9 +3,7 @@
 
 use alloy_json_abi::Function;
 use alloy_primitives::{Address, U256};
-use bloom_broker_api::{Base64UrlBytes, DecimalU64, Digest32, Token};
 use bloom_evm_clear_signing::*;
-use ed25519_dalek::{Signer as _, SigningKey};
 use serde_json::{Value, json};
 
 pub const CHAIN_ID: u64 = 1;
@@ -15,17 +13,6 @@ pub const RECIPIENT: &str = "0x2222222222222222222222222222222222222222";
 /// an argument, which is what an argument-based token path has to resolve.
 pub const VAULT: &str = "0x3333333333333333333333333333333333333333";
 pub const NOW_MS: u64 = 1_750_000_000_000;
-
-pub fn key(seed: u8) -> SigningKey {
-    SigningKey::from_bytes(&[seed; 32])
-}
-
-pub fn trusted(seed: u8, id: &str) -> TrustedCatalogKey {
-    TrustedCatalogKey {
-        key_id: Token::new(id).unwrap(),
-        verifying_key: key(seed).verifying_key(),
-    }
-}
 
 /// The reviewed ERC-20 derivative: the registry template without its
 /// finite-value threshold, which would have labelled a large finite
@@ -70,36 +57,23 @@ pub fn erc20_functions() -> Vec<AdmittedFunction> {
     ]
 }
 
-pub fn entry(descriptor: Value, functions: Vec<AdmittedFunction>, decimals: u8) -> CatalogEntry {
-    entry_at(TOKEN, descriptor, functions, Some(decimals))
-}
-
-pub fn entry_at(
-    address: &str,
-    descriptor: Value,
-    functions: Vec<AdmittedFunction>,
-    decimals: Option<u8>,
-) -> CatalogEntry {
-    CatalogEntry {
-        chain_id: DecimalU64::new(CHAIN_ID),
-        contract_address: address.into(),
-        admitted_functions: functions,
-        descriptor_digest: Some(descriptor_digest(&descriptor).unwrap()),
-        flattened_descriptor: Some(descriptor),
-        runtime_code_hash: Some(Digest32::from_bytes([3; 32])),
-        token_metadata: decimals.map(|decimals| TokenMetadata {
-            decimals,
-            symbol: "EXA".into(),
-            name: "Example Token".into(),
-        }),
+pub fn token(address: &str, decimals: u8) -> KnownToken {
+    KnownToken {
+        chain_id: CHAIN_ID,
+        address: address.into(),
+        symbol: "EXA".into(),
+        name: "Example Token".into(),
+        decimals,
         upgradeable: false,
-        implementation_hash: None,
-        observed_at_ms: DecimalU64::new(NOW_MS - 1000),
     }
 }
 
-pub fn erc20_entry() -> CatalogEntry {
-    entry(erc20_descriptor(), erc20_functions(), 6)
+pub fn build(descriptors: Vec<Value>, tokens: Vec<KnownToken>) -> Result<Catalog, ReviewError> {
+    let descriptors: Vec<_> = descriptors
+        .into_iter()
+        .map(|descriptor| (descriptor, Binding::Listed))
+        .collect();
+    Catalog::build(&descriptors, tokens)
 }
 
 /// A scalar-only third function whose token is an address argument rather
@@ -127,68 +101,24 @@ pub fn vault_descriptor() -> Value {
 
 pub const VAULT_DEPOSIT: &str = "deposit(address token, uint256 amount, address beneficiary)";
 
-pub fn vault_entry() -> CatalogEntry {
-    entry_at(
-        VAULT,
-        vault_descriptor(),
-        vec![AdmittedFunction {
-            signature: VAULT_DEPOSIT.into(),
-            action_class: ActionClass::Other,
-        }],
-        None,
+/// Both contracts: the vault being called, and the token its argument names.
+pub fn accepted_vault() -> Catalog {
+    build(
+        vec![erc20_descriptor(), vault_descriptor()],
+        vec![token(TOKEN, 6)],
     )
-}
-
-/// Both entries: the vault being called, and the token its argument names.
-pub fn accepted_vault() -> AcceptedCatalog {
-    let mut catalog = catalog(vec![erc20_entry(), vault_entry()]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    accept(&catalog).unwrap()
+    .unwrap()
 }
 
 pub fn vault_context(calldata: &[u8]) -> CallContext<'_> {
     CallContext {
         to: VAULT.parse().unwrap(),
-        ..context(calldata, false)
+        ..context(calldata)
     }
 }
 
-pub fn catalog(entries: Vec<CatalogEntry>) -> ClearSigningCatalog {
-    ClearSigningCatalog {
-        schema: CATALOG_SCHEMA.into(),
-        catalog_id: Token::new("bloom-tokens").unwrap(),
-        sequence: DecimalU64::new(7),
-        issued_at_ms: DecimalU64::new(NOW_MS - 10_000),
-        expires_at_ms: DecimalU64::new(NOW_MS + 86_400_000),
-        entries,
-        signatures: Vec::new(),
-    }
-}
-
-pub fn sign(catalog: &mut ClearSigningCatalog, seeds: &[(u8, &str)]) {
-    let mut message = CATALOG_SIGNATURE_DOMAIN.to_vec();
-    message.extend_from_slice(&catalog.unsigned_canonical_bytes().unwrap());
-    catalog.signatures = seeds
-        .iter()
-        .map(|(seed, id)| CatalogSignature {
-            key_id: Token::new(*id).unwrap(),
-            signature: Base64UrlBytes::from_bytes(&key(*seed).sign(&message).to_bytes()),
-        })
-        .collect();
-}
-
-pub fn accept(catalog: &ClearSigningCatalog) -> Result<AcceptedCatalog, ReviewError> {
-    catalog.accept(
-        serde_jcs::to_vec(catalog).unwrap().len(),
-        &[trusted(1, "publisher-1")],
-        1,
-    )
-}
-
-pub fn accepted_erc20() -> AcceptedCatalog {
-    let mut catalog = catalog(vec![erc20_entry()]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    accept(&catalog).unwrap()
+pub fn accepted_erc20() -> Catalog {
+    build(vec![erc20_descriptor()], vec![token(TOKEN, 6)]).unwrap()
 }
 
 pub fn calldata(signature: &str, words: &[U256]) -> Vec<u8> {
@@ -204,7 +134,7 @@ pub fn address_word(address: &str) -> U256 {
     U256::from_be_slice(address.parse::<Address>().unwrap().as_slice())
 }
 
-pub fn context(calldata: &[u8], unlimited: bool) -> CallContext<'_> {
+pub fn context(calldata: &[u8]) -> CallContext<'_> {
     CallContext {
         chain_id: CHAIN_ID,
         to: TOKEN.parse().unwrap(),
@@ -214,7 +144,6 @@ pub fn context(calldata: &[u8], unlimited: bool) -> CallContext<'_> {
             decimals: 18,
             symbol: "ETH".into(),
         }),
-        unlimited_allowance_allowed: unlimited,
     }
 }
 

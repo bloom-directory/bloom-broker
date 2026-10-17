@@ -6,20 +6,29 @@
 //! different decoder — so adding a contract is catalog data, while changing
 //! what Bloom promises about a call is code.
 
+use std::collections::BTreeSet;
+
 use alloy_dyn_abi::{DynSolValue, JsonAbiExt};
-use alloy_json_abi::Function;
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, U256, keccak256};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AcceptedCatalog, ActionClass, AdmittedFormat, AdmittedFunction, CatalogEntry, LeafType,
-    ReviewError, ReviewReason,
+    ActionClass, AdmittedFormat, CalleeSource, Catalog, CatalogEntry, LeafType, ReviewError,
+    ReviewReason, array_of,
 };
 
 pub const TRANSFER_SIGNATURE: &str = "transfer(address,uint256)";
 pub const APPROVE_SIGNATURE: &str = "approve(address,uint256)";
+const SAFE_EXEC_SIGNATURE: &str =
+    "execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)";
 /// Latest timestamp rendered as a date: 23:59:59 UTC, 31 December 9999.
 const MAX_TIMESTAMP_SECONDS: u64 = 253_402_300_799;
+/// Calls carried inside calls: a Safe executing a Safe's call is two.
+pub const MAX_NESTED_CALLS: usize = 2;
+/// Elements one array argument may show.
+pub const MAX_ARRAY_ITEMS: usize = 64;
+/// `bytes` longer than this are shown by length and hash; `raw` keeps them.
+const MAX_SHOWN_BYTES: usize = 128;
 
 /// Native currency units, taken from Bloom's own authenticated chain table
 /// rather than from anything a descriptor or catalog says.
@@ -36,7 +45,6 @@ pub struct CallContext<'a> {
     pub value: U256,
     pub calldata: &'a [u8],
     pub native: Option<NativeUnits>,
-    pub unlimited_allowance_allowed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -64,7 +72,39 @@ pub struct TokenIdentity {
 /// What clear signing establishes, and what it does not. One sentence, the
 /// same for every call, stated once per review.
 pub fn standing_assurance() -> String {
-    "Interpreted using a trusted signed description. Contract behavior has not been verified."
+    "Interpreted using Bloom's description of this contract. Contract behavior has not been verified."
+        .to_owned()
+}
+
+/// The sentence for a call Bloom read by the standard ERC-20 calldata shape
+/// alone, with no catalog description of the contract.
+pub const STRUCTURAL_ERC20_ASSURANCE: &str = "Decoded from the standard ERC-20 calldata shape. Bloom verified the exact arguments, but not that this contract is a token or follows ERC-20 behavior.";
+
+/// Exact canonical `transfer(address,uint256)` or `approve(address,uint256)`
+/// calldata: its class, counterparty and amount. Anything else, including
+/// dirty address padding or a wrong length, is `None`. A selector match is not
+/// deployment evidence: any contract can implement these four bytes.
+pub fn canonical_erc20(calldata: &[u8]) -> Option<(ActionClass, Address, U256)> {
+    if calldata.len() != 68 || calldata[4..16].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    let class = match calldata[..4] {
+        [0xa9, 0x05, 0x9c, 0xbb] => ActionClass::Transfer,
+        [0x09, 0x5e, 0xa7, 0xb3] => ActionClass::Allowance,
+        _ => return None,
+    };
+    Some((
+        class,
+        Address::from_slice(&calldata[16..36]),
+        U256::from_be_slice(&calldata[36..]),
+    ))
+}
+
+/// The assurance of a call that names a contract no signed entry lists: an
+/// instance read by its contract type, or an embedded ERC-20 call read by its
+/// shape. The reading is exact; what that contract is, is not established.
+pub fn structural_assurance() -> String {
+    "Interpreted using Bloom's contract descriptions, but this call reaches a contract Bloom has not identified. Bloom has not verified what that contract is or what it does."
         .to_owned()
 }
 
@@ -93,7 +133,10 @@ pub struct CallIntent {
     /// `zero`, `finite` or `unlimited`, decided on the decoded integer rather
     /// than on its rendering.
     pub magnitude: String,
-    pub token: TokenIdentity,
+    /// Absent for a call read by its ERC-20 shape alone: the amount is raw
+    /// units of a contract Bloom has not identified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<TokenIdentity>,
 }
 
 /// The reviewed contract call, as it is frozen into the manifest.
@@ -115,101 +158,52 @@ pub struct ClearSignedCall {
     /// Present only for the canonical ERC-20 actions; see [`CallIntent`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent_summary: Option<CallIntent>,
-    /// What reading this call against a signed description does and does not
+    /// What reading this call against a catalog description does and does not
     /// establish. Identical for every clear-signed call, so a review states
     /// it once; it is not a property of this call and never a warning.
     #[serde(default = "standing_assurance")]
     pub assurance: String,
+    /// Some part of this reading rests on no listed deployment: an instance
+    /// entry, or an embedded ERC-20 call read by its shape alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub structural: bool,
     /// Risks specific to this call: upgradeability, and what an allowance
     /// grants. Never the standing assurance.
     pub warnings: Vec<String>,
 }
 
-/// The complete signed entry a review selected, kept so activation and
-/// signing can tell whether the catalog still says the same thing.
+/// A catalog entry a review used, as the page shows it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelectedEntry {
     pub chain_id: String,
     pub contract_address: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub descriptor_digest: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_code_hash: Option<String>,
-    pub observed_at_ms: String,
     pub upgradeable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub implementation_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<TokenIdentity>,
-    /// The functions the entry admitted when the review was frozen.
-    ///
-    /// The descriptor digest covers how a call is displayed; this covers
-    /// whether the call was describable at all. Withdrawing a function, or
-    /// moving it to another action class, changes what the same descriptor
-    /// authorizes, and `recheck`'s `current != frozen` comparison can only see
-    /// that if the projection carries it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub admitted_functions: Vec<AdmittedFunction>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub applies_to_instances: bool,
+    /// The unlisted address this entry was read for, when it was matched as
+    /// an instance rather than by its own address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
 }
 
 impl SelectedEntry {
     pub fn of(entry: &CatalogEntry) -> Self {
         Self {
-            chain_id: entry.chain_id.as_str().to_owned(),
+            chain_id: entry.chain_id.to_string(),
             contract_address: entry.contract_address.clone(),
-            descriptor_digest: entry
-                .descriptor_digest
-                .as_ref()
-                .map(|digest| digest.as_str().to_owned()),
-            runtime_code_hash: entry
-                .runtime_code_hash
-                .as_ref()
-                .map(|digest| digest.as_str().to_owned()),
-            observed_at_ms: entry.observed_at_ms.as_str().to_owned(),
             upgradeable: entry.upgradeable,
-            implementation_hash: entry
-                .implementation_hash
-                .as_ref()
-                .map(|digest| digest.as_str().to_owned()),
             token: entry.token_metadata.as_ref().map(|metadata| TokenIdentity {
                 address: checksum(&entry.contract_address),
                 symbol: metadata.symbol.clone(),
                 name: metadata.name.clone(),
                 decimals: metadata.decimals,
             }),
-            admitted_functions: entry.admitted_functions.clone(),
+            applies_to_instances: entry.applies_to_instances,
+            instance: None,
         }
-    }
-
-    /// Enforce the wallet's observation-age bound in both directions. A future
-    /// timestamp is not fresh evidence: it describes an observation that has
-    /// not happened under Broker's trusted clock.
-    pub fn check_observation_age(
-        &self,
-        now_ms: u64,
-        maximum_age_ms: u64,
-    ) -> Result<(), ReviewError> {
-        let observed = self.observed_at_ms.parse::<u64>().unwrap_or(0);
-        if observed > now_ms {
-            return Err(ReviewError::new(
-                ReviewReason::CatalogRejected,
-                format!(
-                    "the publisher's observation of {} is later than trusted time",
-                    self.contract_address
-                ),
-            ));
-        }
-        if now_ms > observed.saturating_add(maximum_age_ms) {
-            return Err(ReviewError::new(
-                ReviewReason::EvidenceExpired,
-                format!(
-                    "the publisher's observation of {} is older than wallet policy allows",
-                    self.contract_address
-                ),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -228,23 +222,44 @@ fn invalid(message: impl Into<String>) -> ReviewError {
 /// become frozen evidence, so withdrawing or changing a token entry
 /// invalidates the review exactly as changing the contract's own entry does.
 pub fn review_call(
-    catalog: &AcceptedCatalog,
+    catalog: &Catalog,
     context: &CallContext<'_>,
 ) -> Result<(ClearSignedCall, Vec<SelectedEntry>), ReviewError> {
+    review_at(catalog, context, 0)
+}
+
+fn review_at(
+    catalog: &Catalog,
+    context: &CallContext<'_>,
+    depth: usize,
+) -> Result<(ClearSignedCall, Vec<SelectedEntry>), ReviewError> {
+    if depth > MAX_NESTED_CALLS {
+        return Err(ReviewError::new(
+            ReviewReason::LimitExceeded,
+            format!("calls are nested more than {MAX_NESTED_CALLS} deep"),
+        ));
+    }
     let address = format!("{:x}", context.to);
     let address = format!("0x{address}");
-    let entry = catalog.entry(context.chain_id, &address).ok_or_else(|| {
-        unsupported(format!(
-            "no signed description for {address} on chain {}",
-            context.chain_id
-        ))
-    })?;
-    let admitted = catalog
-        .descriptor(context.chain_id, &entry.contract_address)
-        .ok_or_else(|| unsupported("catalog entry carries token metadata but no descriptor"))?;
-    if context.calldata.len() < 4 {
-        return Err(invalid("contract call has no complete selector"));
+    let listed = catalog.entry(context.chain_id, &address);
+    if listed.is_none()
+        && let Some(reading) = canonical_erc20(context.calldata)
+    {
+        return shaped_erc20(context, reading).map(|call| (call, Vec::new()));
     }
+    let selector = context.calldata.get(..4);
+    let Some((entry, admitted, instance)) =
+        selector.and_then(|selector| catalog.resolve(context.chain_id, &address, selector))
+    else {
+        return Err(match (listed, selector) {
+            (None, _) => unsupported(format!(
+                "no description of {address} on chain {}",
+                context.chain_id
+            )),
+            (Some(_), None) => invalid("contract call has no complete selector"),
+            (Some(_), Some(_)) => unsupported("no admitted description for this function selector"),
+        });
+    };
     let call = admitted
         .call(&context.calldata[..4])
         .ok_or_else(|| unsupported("no admitted description for this function selector"))?;
@@ -258,8 +273,7 @@ pub fn review_call(
     // is what rejects trailing words, dirty address padding, noncanonical
     // booleans and short calldata in one place. Narrow-integer width is the
     // one thing it cannot see; `check_leaf` below covers that.
-    let function = Function::parse(&call.signature)
-        .map_err(|error| invalid(format!("admitted signature no longer parses: {error}")))?;
+    let function = crate::parse_function(&call.signature)?;
     let decoded = function
         .abi_decode_input(&context.calldata[4..])
         .map_err(|error| {
@@ -287,32 +301,196 @@ pub fn review_call(
     for ((path, declared), value) in call.leaves.iter().zip(&leaves) {
         check_leaf(path, declared, value)?;
     }
-
-    let mut used = vec![SelectedEntry::of(entry)];
-    let mut fields = Vec::with_capacity(call.fields.len());
-    for field in &call.fields {
+    // The decoded value at a field path; in element `index` when the path
+    // reaches into an array. Admission and `check_leaf` proved the shapes.
+    let top = |path: &str| {
+        let name = array_of(path).unwrap_or(path);
         let index = call
             .leaves
             .iter()
-            .position(|(path, _)| path == &field.path)
-            .expect("admission proved every field path is a decoded leaf");
-        let token = match &field.format {
-            AdmittedFormat::TokenAmount(source) => Some(resolve_token(
-                source, call, &leaves, entry, catalog, context,
-            )?),
-            _ => None,
+            .position(|(leaf, _)| leaf == name)
+            .expect("admission proved every path is a decoded leaf");
+        (&call.leaves[index].1, &leaves[index])
+    };
+    let value_at = |path: &str, index: usize| -> &DynSolValue {
+        let (kind, value) = top(path);
+        let (Some((_, rest)), DynSolValue::Array(items)) = (path.split_once(".[]"), value) else {
+            return value;
         };
-        if let Some(token) = &token
-            && !used.iter().any(|selected| selected == &token.entry)
-        {
-            used.push(token.entry.clone());
+        let item = &items[index];
+        match (kind, item, rest.strip_prefix('.')) {
+            (LeafType::Array(element), DynSolValue::Tuple(values), Some(component)) => {
+                let LeafType::Tuple(components) = element.as_ref() else {
+                    unreachable!("a component path is admitted only on a tuple array")
+                };
+                let position = components
+                    .iter()
+                    .position(|(name, _)| name == component)
+                    .expect("admission proved the component exists");
+                &values[position]
+            }
+            _ => item,
         }
-        fields.push(render_field(
-            field,
-            &leaves[index],
-            token.as_ref(),
-            context,
-        )?);
+    };
+    let length = |path: &str| match top(path).1 {
+        DynSolValue::Array(items) if array_of(path).is_some() => items.len(),
+        _ => 1,
+    };
+    // A Safe's delegatecall runs another contract's code as the Safe, with
+    // its storage and owners. The contracts allowed to are Safe's batch and
+    // deployment libraries, which only make plain calls or create contracts.
+    if crate::parse_function(&call.signature)?.signature() == SAFE_EXEC_SIGNATURE
+        && let (DynSolValue::Uint(operation, _), DynSolValue::Address(to)) =
+            (value_at("operation", 0), value_at("to", 0))
+        && !operation.is_zero()
+        && !catalog.is_safe_library(context.chain_id, &format!("0x{to:x}"))
+    {
+        return Err(unsupported(
+            "a Safe may delegatecall only Safe's own batch and deployment libraries",
+        ));
+    }
+    for (path, allowed) in &call.constraints {
+        for index in 0..length(path) {
+            let value = match_key(value_at(path, index));
+            if !allowed.contains(&value) {
+                return Err(unsupported(format!(
+                    "`{path}` is {value}, and the description admits only {}",
+                    allowed.join(", ")
+                )));
+            }
+        }
+    }
+
+    let mut selected = SelectedEntry::of(entry);
+    if instance {
+        selected.instance = Some(address.clone());
+    }
+    let mut used = vec![selected];
+    // Upgradeability is a property of a contract, not of a call: it reaches
+    // the page on every selected entry as `upgradeable` beside the
+    // publisher's observation, so it is not repeated here as a warning.
+    let mut warnings: Vec<String> = Vec::new();
+    if instance {
+        let kind = admitted.contract_name.as_deref().map_or(
+            "the contract it appears to be".to_owned(),
+            |name| {
+                let article = if name.starts_with(['A', 'E', 'I', 'O', 'U']) {
+                    "an"
+                } else {
+                    "a"
+                };
+                format!("{article} {name}")
+            },
+        );
+        warnings.push(format!(
+            "Bloom cannot check that {} is {kind}; it reads it as one.",
+            checksum(&address)
+        ));
+    }
+    // Fields in order; an array's fields are shown element by element, each
+    // labelled with its position, so a list of calls reads call by call.
+    let mut jobs = Vec::new();
+    let mut shown_arrays = BTreeSet::new();
+    for field in &call.fields {
+        match array_of(&field.path) {
+            None => jobs.push((field, field.label.clone(), 0)),
+            Some(array) if shown_arrays.insert(array) => {
+                for index in 0..length(&field.path) {
+                    for member in call
+                        .fields
+                        .iter()
+                        .filter(|member| array_of(&member.path) == Some(array))
+                    {
+                        jobs.push((member, format!("{} {}", member.label, index + 1), index));
+                    }
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    let mut structural = instance;
+    let mut fields = Vec::with_capacity(jobs.len());
+    for (field, label, index) in jobs {
+        let value = value_at(&field.path, index);
+        match (&field.format, value) {
+            (AdmittedFormat::Calldata { callee, amount }, DynSolValue::Bytes(data)) => {
+                let callee = match callee {
+                    CalleeSource::TargetContract => context.to,
+                    CalleeSource::Argument(path) => match value_at(path, index) {
+                        DynSolValue::Address(address) => *address,
+                        _ => return Err(invalid("callee path did not decode as an address")),
+                    },
+                };
+                let value = match amount.as_deref().map(|path| value_at(path, index)) {
+                    Some(DynSolValue::Uint(value, _)) => *value,
+                    Some(_) => return Err(invalid("amount path did not decode as an integer")),
+                    None => U256::ZERO,
+                };
+                let inner = CallContext {
+                    to: callee,
+                    value,
+                    calldata: data,
+                    ..context.clone()
+                };
+                structural |= render_embedded(
+                    catalog,
+                    &inner,
+                    &label,
+                    depth,
+                    &mut fields,
+                    &mut used,
+                    &mut warnings,
+                )?;
+            }
+            (AdmittedFormat::SafeBatch, DynSolValue::Bytes(packed)) => {
+                for (number, (to, value, data)) in safe_batch(packed)?.into_iter().enumerate() {
+                    let inner = CallContext {
+                        to,
+                        value,
+                        calldata: data,
+                        ..context.clone()
+                    };
+                    structural |= render_embedded(
+                        catalog,
+                        &inner,
+                        &format!("{label} {}", number + 1),
+                        depth,
+                        &mut fields,
+                        &mut used,
+                        &mut warnings,
+                    )?;
+                }
+            }
+            (AdmittedFormat::TokenAmount(source), DynSolValue::Uint(amount, _))
+                if let Err(token) =
+                    resolve_token(source, call, &leaves, entry, catalog, context)? =>
+            {
+                structural = true;
+                fields.push(DisplayField {
+                    label,
+                    format: "raw".to_owned(),
+                    value: format!("{amount} raw units of {token}"),
+                    raw: amount.to_string(),
+                });
+            }
+            _ => {
+                let token = match &field.format {
+                    AdmittedFormat::TokenAmount(source) => Some(
+                        resolve_token(source, call, &leaves, entry, catalog, context)?
+                            .expect("an unlisted token was shown in raw units above"),
+                    ),
+                    _ => None,
+                };
+                if let Some(token) = &token
+                    && !used.iter().any(|selected| selected == &token.entry)
+                {
+                    used.push(token.entry.clone());
+                }
+                let mut shown = render_field(field, value, token.as_ref(), context)?;
+                shown.label = label;
+                fields.push(shown);
+            }
+        }
     }
 
     // The standing assurance is not a warning about this call: it is the same
@@ -320,21 +498,18 @@ pub fn review_call(
     // `warnings` where the only way to tell it apart was to match its text.
     // Typed, a page can state it once per review and keep `warnings` for the
     // risks that actually differ between calls.
-    //
-    // Upgradeability is the same shape of problem one level up. It is a
-    // property of a contract, not of a call, and it already reaches the page
-    // on every selected entry as `upgradeable` beside the observation the
-    // publisher made. Emitting a sentence here as well meant a single-entry
-    // call carried the fact twice, timestamp and all. The page states it once
-    // per affected contract and keeps the timestamp in its details section.
-    let mut warnings: Vec<String> = Vec::new();
     let (action, intent_summary) =
         apply_safety_rules(call, &leaves, entry, context, &mut warnings)?;
 
     Ok((
         ClearSignedCall {
-            contract: checksum(&entry.contract_address),
-            contract_name: admitted.contract_name.clone(),
+            contract: checksum(&address),
+            contract_name: admitted.contract_name.clone().or_else(|| {
+                entry
+                    .token_metadata
+                    .as_ref()
+                    .map(|token| token.name.clone())
+            }),
             function_signature: call.signature.clone(),
             selector: format!("0x{}", hex_lower(&call.selector)),
             action: action.as_str().to_owned(),
@@ -342,11 +517,228 @@ pub fn review_call(
             fields,
             token: SelectedEntry::of(entry).token,
             intent_summary,
-            assurance: standing_assurance(),
+            assurance: if structural {
+                structural_assurance()
+            } else {
+                standing_assurance()
+            },
+            structural,
             warnings,
         },
         used,
     ))
+}
+
+/// The calls in Safe's packed MultiSend encoding: operation, address, value,
+/// data length and data, back to back. Only plain calls to a nonzero address
+/// are accepted; MultiSendCallOnly reverts on any other operation, and Safe
+/// 1.5.0 reads a zero address as the Safe itself.
+/// One call of a Safe batch: address, native value and calldata.
+type BatchCall<'a> = (Address, U256, &'a [u8]);
+
+fn safe_batch(packed: &[u8]) -> Result<Vec<BatchCall<'_>>, ReviewError> {
+    let mut calls = Vec::new();
+    let mut rest = packed;
+    while !rest.is_empty() {
+        if rest.len() < 85 || calls.len() == MAX_ARRAY_ITEMS {
+            return Err(invalid("Safe batch is truncated or has too many calls"));
+        }
+        let to = Address::from_slice(&rest[1..21]);
+        if rest[0] != 0 || to.is_zero() {
+            return Err(invalid(
+                "a Safe batch call must be a plain call to a nonzero address",
+            ));
+        }
+        let length = usize::try_from(U256::from_be_slice(&rest[53..85]))
+            .ok()
+            .filter(|length| *length <= rest.len() - 85)
+            .ok_or_else(|| invalid("Safe batch call data is truncated"))?;
+        calls.push((
+            to,
+            U256::from_be_slice(&rest[21..53]),
+            &rest[85..85 + length],
+        ));
+        rest = &rest[85 + length..];
+    }
+    if calls.is_empty() {
+        return Err(invalid("Safe batch is empty"));
+    }
+    Ok(calls)
+}
+
+/// An embedded call, shown as one heading line and then its own fields, each
+/// labelled under the heading. It is reviewed exactly as a top-level call
+/// would be, so its entries become evidence and its refusals refuse. Returns
+/// whether the reading is structural.
+fn render_embedded(
+    catalog: &Catalog,
+    inner: &CallContext<'_>,
+    label: &str,
+    depth: usize,
+    fields: &mut Vec<DisplayField>,
+    used: &mut Vec<SelectedEntry>,
+    warnings: &mut Vec<String>,
+) -> Result<bool, ReviewError> {
+    let raw = format!("0x{}", hex_lower(inner.calldata));
+    let callee = checksum(&format!("0x{:x}", inner.to));
+    if inner.calldata.is_empty() {
+        let value = if inner.value.is_zero() {
+            format!("No call (empty calldata to {callee})")
+        } else {
+            let native = inner.native.as_ref().ok_or_else(|| {
+                unsupported("Bloom has no authenticated native units for this chain")
+            })?;
+            format!(
+                "Send {} {} to {callee}",
+                format_base_units(&inner.value.to_string(), native.decimals),
+                native.symbol
+            )
+        };
+        fields.push(DisplayField {
+            label: label.to_owned(),
+            format: "calldata".to_owned(),
+            value,
+            raw,
+        });
+        return Ok(false);
+    }
+    let (call, entries) = review_at(catalog, inner, depth + 1)?;
+    // Named by its function, as a top-level call is: publisher intent text
+    // is never a heading.
+    let action = call
+        .function_signature
+        .split('(')
+        .next()
+        .unwrap_or_default();
+    fields.push(DisplayField {
+        label: label.to_owned(),
+        format: "calldata".to_owned(),
+        value: match &call.contract_name {
+            Some(name) => format!("{action} on {name} {}", call.contract),
+            None => format!("{action} on {}", call.contract),
+        },
+        raw,
+    });
+    for field in call.fields {
+        fields.push(DisplayField {
+            label: format!("{label} · {}", field.label),
+            ..field
+        });
+    }
+    // A Safe calling itself would otherwise repeat the outer call's warning.
+    for warning in call.warnings {
+        if !warnings.contains(&warning) {
+            warnings.push(format!("{label}: {warning}"));
+        }
+    }
+    for entry in entries {
+        if !used.contains(&entry) {
+            used.push(entry);
+        }
+    }
+    Ok(call.structural)
+}
+
+/// A transfer or approval to a contract the catalog does not list, read by
+/// its exact ERC-20 shape: the counterparty and the raw amount, under the same
+/// allowance policy as a listed token, with no token identity.
+fn shaped_erc20(
+    context: &CallContext<'_>,
+    (class, counterparty, amount): (ActionClass, Address, U256),
+) -> Result<ClearSignedCall, ReviewError> {
+    if !context.value.is_zero() {
+        return Err(invalid(
+            "admitted contract calls must carry zero native value",
+        ));
+    }
+    let contract = checksum(&format!("0x{:x}", context.to));
+    let counterparty_shown = checksum(&format!("0x{counterparty:x}"));
+    let (signature, action, role, label, amount_label) = match class {
+        ActionClass::Transfer => (
+            TRANSFER_SIGNATURE,
+            "transfer",
+            "recipient",
+            "Recipient",
+            "Raw token amount",
+        ),
+        _ => (
+            APPROVE_SIGNATURE,
+            "allowance",
+            "spender",
+            "Spender",
+            "Raw total allowance",
+        ),
+    };
+    let magnitude = if amount.is_zero() {
+        "zero"
+    } else if amount == U256::MAX {
+        "unlimited"
+    } else {
+        "finite"
+    };
+    let mut warnings = vec![format!(
+        "Bloom decoded an ERC-20-shaped call to {contract}, but has not verified that this contract is a token or follows ERC-20 behavior."
+    )];
+    if counterparty.is_zero() {
+        warnings.push(format!("The decoded {role} is the zero address."));
+    }
+    if class == ActionClass::Allowance {
+        match magnitude {
+            "zero" => warnings.push("This requests a total allowance of zero.".to_owned()),
+            "unlimited" => {
+                warnings.push(
+                    "The decoded allowance is the maximum uint256. If this contract behaves as ERC-20, the spender can use all current and future tokens without asking again, and the permission has no expiry."
+                        .to_owned(),
+                );
+            }
+            _ => {
+                warnings.push(
+                    "If this contract behaves as ERC-20, the spender can move tokens later without another approval. The permission does not expire with this review."
+                        .to_owned(),
+                );
+                warnings.push(
+                    "This requests a total allowance, not an increase to an existing allowance."
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    let amount = amount.to_string();
+    Ok(ClearSignedCall {
+        contract,
+        contract_name: None,
+        function_signature: signature.to_owned(),
+        selector: format!("0x{}", hex_lower(&context.calldata[..4])),
+        action: action.to_owned(),
+        intent: None,
+        fields: vec![
+            DisplayField {
+                label: label.to_owned(),
+                format: "addressName".to_owned(),
+                value: counterparty_shown.clone(),
+                raw: counterparty_shown.clone(),
+            },
+            DisplayField {
+                label: amount_label.to_owned(),
+                format: "raw".to_owned(),
+                value: amount.clone(),
+                raw: amount.clone(),
+            },
+        ],
+        token: None,
+        intent_summary: Some(CallIntent {
+            action: action.to_owned(),
+            counterparty_role: role.to_owned(),
+            counterparty: counterparty_shown,
+            amount: amount.clone(),
+            amount_display: format!("{amount} raw units"),
+            magnitude: magnitude.to_owned(),
+            token: None,
+        }),
+        assurance: STRUCTURAL_ERC20_ASSURANCE.to_owned(),
+        structural: true,
+        warnings,
+    })
 }
 
 /// The token a `tokenAmount` field is denominated in, and the catalog entry
@@ -359,16 +751,17 @@ struct ResolvedToken {
 /// Resolve a field's token from the signed catalog.
 ///
 /// For an argument token path, the address that was actually decoded is what
-/// is looked up — so a call naming a token the catalog does not describe is
-/// unsupported rather than shown with borrowed decimals.
+/// is looked up. A token the catalog does not list comes back as its
+/// address, and its amount is shown in raw units rather than with borrowed
+/// decimals.
 fn resolve_token(
     source: &crate::TokenSource,
     call: &crate::AdmittedCall,
     leaves: &[DynSolValue],
     entry: &CatalogEntry,
-    catalog: &AcceptedCatalog,
+    catalog: &Catalog,
     context: &CallContext<'_>,
-) -> Result<ResolvedToken, ReviewError> {
+) -> Result<Result<ResolvedToken, String>, ReviewError> {
     let token_entry = match source {
         crate::TokenSource::TargetContract => entry,
         crate::TokenSource::Argument(path) => {
@@ -381,11 +774,10 @@ fn resolve_token(
                 return Err(invalid("token path did not decode as an address"));
             };
             let address = format!("0x{address:x}");
-            catalog.entry(context.chain_id, &address).ok_or_else(|| {
-                unsupported(format!(
-                    "no signed description of the token {address} this call names"
-                ))
-            })?
+            match catalog.entry(context.chain_id, &address) {
+                Some(entry) if entry.token_metadata.is_some() => entry,
+                _ => return Ok(Err(checksum(&address))),
+            }
         }
     };
     let metadata = token_entry.token_metadata.as_ref().ok_or_else(|| {
@@ -394,7 +786,7 @@ fn resolve_token(
             checksum(&token_entry.contract_address)
         ))
     })?;
-    Ok(ResolvedToken {
+    Ok(Ok(ResolvedToken {
         identity: TokenIdentity {
             address: checksum(&token_entry.contract_address),
             symbol: metadata.symbol.clone(),
@@ -402,7 +794,7 @@ fn resolve_token(
             decimals: metadata.decimals,
         },
         entry: SelectedEntry::of(token_entry),
-    })
+    }))
 }
 
 /// The transfer and allowance rules. They read the generic decoded result and
@@ -416,9 +808,7 @@ fn apply_safety_rules(
     context: &CallContext<'_>,
     warnings: &mut Vec<String>,
 ) -> Result<(ActionClass, Option<CallIntent>), ReviewError> {
-    let canonical = Function::parse(&call.signature)
-        .map_err(|error| invalid(error.to_string()))?
-        .signature();
+    let canonical = crate::parse_function(&call.signature)?.signature();
     let expected = match canonical.as_str() {
         TRANSFER_SIGNATURE => Some(ActionClass::Transfer),
         APPROVE_SIGNATURE => Some(ActionClass::Allowance),
@@ -484,7 +874,7 @@ fn apply_safety_rules(
             identity.symbol
         ),
         magnitude: magnitude.to_owned(),
-        token: identity.clone(),
+        token: Some(identity.clone()),
     };
     if call.action_class == ActionClass::Transfer {
         if format!("0x{:x}", counterparty) == entry.contract_address {
@@ -501,12 +891,6 @@ fn apply_safety_rules(
         warnings.push("This sets the spender's allowance to zero, clearing it.".to_owned());
         "zero"
     } else if *amount == U256::MAX {
-        if !context.unlimited_allowance_allowed {
-            return Err(ReviewError::new(
-                ReviewReason::PolicyDenied,
-                "wallet policy denies unlimited allowances; enable them in a policy ceremony first",
-            ));
-        }
         warnings.push(format!(
             "If executed, this spender can use all your current and future {} without asking again. This permission has no expiry; changing it requires another transaction.",
             identity.symbol
@@ -538,7 +922,12 @@ fn render_field(
 ) -> Result<DisplayField, ReviewError> {
     let raw = raw_value(value)?;
     let display = match &field.format {
-        AdmittedFormat::Raw => raw.clone(),
+        AdmittedFormat::Raw => match value {
+            DynSolValue::Bytes(bytes) if bytes.len() > MAX_SHOWN_BYTES => {
+                format!("{} bytes, keccak256 {:#x}", bytes.len(), keccak256(bytes))
+            }
+            _ => raw.clone(),
+        },
         AdmittedFormat::AddressName => raw.clone(),
         AdmittedFormat::TokenAmount(_) => {
             let token = &token
@@ -578,6 +967,11 @@ fn render_field(
             })?;
             format!("{label} ({raw})")
         }
+        AdmittedFormat::Calldata { .. } | AdmittedFormat::SafeBatch => {
+            return Err(invalid(
+                "an embedded call is rendered as a call, not a value",
+            ));
+        }
     };
     Ok(DisplayField {
         label: field.label.clone(),
@@ -587,12 +981,21 @@ fn render_field(
     })
 }
 
+/// A decoded value in the form `mustMatch` values are admitted in.
+fn match_key(value: &DynSolValue) -> String {
+    match value {
+        DynSolValue::Address(address) => format!("0x{address:x}"),
+        other => raw_value(other).unwrap_or_default(),
+    }
+}
+
 fn raw_value(value: &DynSolValue) -> Result<String, ReviewError> {
     Ok(match value {
         DynSolValue::Address(address) => checksum(&format!("0x{address:x}")),
         DynSolValue::Uint(value, _) => value.to_string(),
         DynSolValue::Bool(value) => value.to_string(),
         DynSolValue::FixedBytes(bytes, size) => format!("0x{}", hex_lower(&bytes.0[..*size])),
+        DynSolValue::Bytes(bytes) => format!("0x{}", hex_lower(bytes)),
         other => {
             return Err(invalid(format!(
                 "argument decoded as an unsupported type: {other:?}"
@@ -634,6 +1037,28 @@ fn check_leaf(path: &str, declared: &LeafType, value: &DynSolValue) -> Result<()
         }
         (LeafType::Address, DynSolValue::Address(_)) | (LeafType::Bool, DynSolValue::Bool(_)) => {
             Ok(())
+        }
+        (LeafType::Bytes, DynSolValue::Bytes(_)) => Ok(()),
+        (LeafType::Tuple(components), DynSolValue::Tuple(values))
+            if components.len() == values.len() =>
+        {
+            components
+                .iter()
+                .zip(values)
+                .try_for_each(|((name, kind), value)| {
+                    check_leaf(&format!("{path}.[].{name}"), kind, value)
+                })
+        }
+        (LeafType::Array(element), DynSolValue::Array(items)) => {
+            if items.len() > MAX_ARRAY_ITEMS {
+                return Err(ReviewError::new(
+                    ReviewReason::LimitExceeded,
+                    format!("argument `{path}` has more than {MAX_ARRAY_ITEMS} elements"),
+                ));
+            }
+            items
+                .iter()
+                .try_for_each(|item| check_leaf(path, element, item))
         }
         (LeafType::FixedBytes(size), DynSolValue::FixedBytes(word, width)) if width == size => {
             if word.0[*size..].iter().any(|byte| *byte != 0) {

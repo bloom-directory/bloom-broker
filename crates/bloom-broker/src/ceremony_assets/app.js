@@ -85,7 +85,7 @@ const KINDS = {
   },
   sealed_approval: {
     title: "Approve transaction",
-    summary: "Approve exactly the operation described below for wallet <strong>{wallet}</strong>. Nothing outside this plan is authorized.",
+    summary: "Approve exactly this operation for wallet <strong>{wallet}</strong>; nothing outside this plan is authorized.",
     button: "Approve with passkey"
   }
 };
@@ -111,10 +111,19 @@ function el(tag, attrs = {}, ...children) {
 function reviewIcon(kind) {
   const svg = el("svg", {viewBox: "0 0 32 32", "aria-hidden": "true", focusable: "false"});
   if (kind === "ethereum") {
-    svg.append(el("path", {d: "M16 2 7 17l9 5 9-5ZM7 19l9 11 9-11-9 5Z", fill: "currentColor"}));
+    // The public Ethereum mark: blue disc, white diamond. Drawn here so a
+    // native send does not depend on a second asset request.
+    svg.append(el("circle", {cx: "16", cy: "16", r: "16", fill: "#627EEA"}),
+      el("path", {fill: "#fff", "fill-opacity": ".602", d: "M16.498 4v8.87l7.497 3.35z"}),
+      el("path", {fill: "#fff", d: "M16.498 4 9 16.22l7.498-3.35z"}),
+      el("path", {fill: "#fff", "fill-opacity": ".602", d: "M16.498 21.968v6.027L24 17.616z"}),
+      el("path", {fill: "#fff", d: "M16.498 27.995v-6.028L9 17.616z"}),
+      el("path", {fill: "#fff", "fill-opacity": ".2", d: "M16.498 20.573l7.497-4.353-7.497-3.348z"}),
+      el("path", {fill: "#fff", "fill-opacity": ".602", d: "M9 16.22l7.498 4.353v-7.701z"}));
   } else if (kind === "base") {
-    svg.append(el("circle", {cx: "16", cy: "16", r: "14", fill: "#0052ff"}),
-      el("path", {d: "M2 16h19", stroke: "white", "stroke-width": "3"}));
+    // Exact Square path from base/brand-kit, logo/TheSquare/Digital/Base_square_blue.svg.
+    svg.setAttribute("viewBox", "0 0 1280 1280");
+    svg.append(el("path", {fill: "#0000ff", d: "M0,101.12c0-34.64,0-51.95,6.53-65.28,6.25-12.76,16.56-23.07,29.32-29.32C49.17,0,66.48,0,101.12,0h1077.76c34.63,0,51.96,0,65.28,6.53,12.75,6.25,23.06,16.56,29.32,29.32,6.52,13.32,6.52,30.64,6.52,65.28v1077.76c0,34.63,0,51.96-6.52,65.28-6.26,12.75-16.57,23.06-29.32,29.32-13.32,6.52-30.65,6.52-65.28,6.52H101.12c-34.64,0-51.95,0-65.28-6.52-12.76-6.26-23.07-16.57-29.32-29.32-6.53-13.32-6.53-30.65-6.53-65.28V101.12Z"}));
   } else if (kind === "test") {
     svg.append(el("path", {d: "M12 3h8M14 3v10L6 26q-1 3 3 3h14q4 0 3-3l-8-13V3M10 20h12", fill: "none", stroke: "currentColor", "stroke-width": "2", "stroke-linejoin": "round"}));
   } else {
@@ -124,17 +133,60 @@ function reviewIcon(kind) {
   return svg;
 }
 
+function chainIcon(chainId) {
+  return {1: "ethereum", 8453: "base", 31337: "test"}[Number(chainId)] || "unknown";
+}
+
 // Reviewed, bundled artwork. Never select a logo by publisher-supplied text.
+// Circle's own USDC and Maker's own or official-bridge DAI only; bridged or
+// pegged copies by other issuers keep the generic icon.
+const TOKEN_LOGOS = {
+  "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": {file: "usdc", name: "USD Coin", symbol: "USDC"},
+  "10:0x0b2c639c533813f4aa9d7837caf62653d097ff85": {file: "usdc", name: "USD Coin", symbol: "USDC"},
+  "137:0x3c499c542cef5e3811e1192ce70d8cc03d5c3359": {file: "usdc", name: "USD Coin", symbol: "USDC"},
+  "999:0xb88339cb7199b77e23db6e890353e22632ba630f": {file: "usdc", name: "USD Coin", symbol: "USDC"},
+  "8453:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": {file: "usdc", name: "USD Coin", symbol: "USDC"},
+  "42161:0xaf88d065e77c8cc2239327c5edb3a432268e5831": {file: "usdc", name: "USD Coin", symbol: "USDC"},
+  "43114:0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e": {file: "usdc", name: "USD Coin", symbol: "USDC"},
+  "59144:0x176211869ca2b568f2a7d4ee941e073a821ee1ff": {file: "usdc", name: "USD Coin", symbol: "USDC"},
+  "1:0x6b175474e89094c44da98b954eedeac495271d0f": {file: "dai", name: "Dai Stablecoin", symbol: "DAI"},
+  "10:0xda10009cbd5d07dd0cecc66161fc93d7c9000da1": {file: "dai", name: "Dai Stablecoin", symbol: "DAI"},
+  "42161:0xda10009cbd5d07dd0cecc66161fc93d7c9000da1": {file: "dai", name: "Dai Stablecoin", symbol: "DAI"},
+  "8453:0x50c5725949a6f0c72e6c4a641f24049a917db0cb": {file: "dai", name: "Dai Stablecoin", symbol: "DAI"}
+};
+function tokenArt(chainId, address) {
+  const art = TOKEN_LOGOS[`${chainId}:${String(address || "").toLowerCase()}`];
+  return art && typeof art.file === "string" ? art : null;
+}
 function tokenReviewIcon(chainId, address) {
-  const logos = {
-    "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "usdc",
-    "1:0x6b175474e89094c44da98b954eedeac495271d0f": "dai"
-  };
-  const name = logos[`${chainId}:${String(address).toLowerCase()}`];
-  if (!name) return reviewIcon("token");
-  const image = el("img", {src: `/assets/tokens/${name}.svg`, alt: "", width: "40", height: "40"});
+  const art = tokenArt(chainId, address);
+  if (!art) return reviewIcon("token");
+  const image = el("img", {src: `/assets/tokens/${art.file}.svg`, alt: "", width: "56", height: "56"});
   image.onerror = () => image.replaceWith(reviewIcon("token"));
   return image;
+}
+// The mark sits with the amount. The address is its own row, so a label and
+// the amount cannot share a line. A logo is chosen only by chain and address.
+function assetCard({chainId, address, native, title, subtitle, amount, amountLabel, tone}) {
+  const art = address ? tokenArt(chainId, address) : null;
+  const mark = native ? reviewIcon(native) : tokenReviewIcon(chainId, address);
+  const icon = el("span", {
+    class: `ceremony-token-icon${art || native === "ethereum" || native === "base" ? " has-artwork" : ""}`,
+    "aria-hidden": "true"
+  }, mark);
+  const copy = el("div", {class: "ceremony-asset-copy"},
+    el("p", {class: "ceremony-party-name"}, title || art?.name || "Token"),
+    (subtitle || art?.symbol) ? el("p", {class: "ceremony-party-label"}, subtitle || art?.symbol) : null);
+  const amountNode = amount ? el("div", {class: `ceremony-asset-amount ${tone || ""}`},
+    amountLabel ? el("span", {class: "ceremony-amount-label"}, amountLabel) : null,
+    el("strong", {}, amount)) : null;
+  let addressRow = null;
+  if (address && /^0x[0-9a-fA-F]{40}$/.test(address)) {
+    const explorer = addressExplorer(chainId, address);
+    addressRow = el("p", {class: "ceremony-party-address ceremony-asset-address"},
+      explorer ? explorerAnchor(explorer, address, "Token contract") : el("code", {}, address));
+  }
+  return el("section", {class: "ceremony-asset", "aria-label": "Token"}, icon, copy, amountNode, addressRow);
 }
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, c => ({
@@ -292,22 +344,85 @@ function shortAddress(value) {
   const text = String(value || "");
   return /^0x[0-9a-fA-F]{40}$/.test(text) ? `${text.slice(0, 6)}…${text.slice(-4)}` : text;
 }
+// Why Bloom could not read a call, so the owner can judge it.
+function unreadDetail(payload) {
+  const reason = payload?.unread_reason ? ` Reason: ${payload.unread_reason}.` : "";
+  return `Bloom cannot say what this call does.${reason}`;
+}
+function reviewedContractCall(payload) {
+  return payload?.contract_call || null;
+}
+function reviewCallFields(call) {
+  return (call?.fields || []).filter(field =>
+    !field.label.startsWith("Owner signatures") &&
+    !(field.raw === "0" && ["Safe gas limit", "Base gas"].includes(field.label)));
+}
+// A transfer or approval read by its ERC-20 shape alone: the amount is raw
+// units of a contract Bloom has not identified, so there is no token.
+function shapeOnly(call) {
+  return Boolean(call?.intent_summary && !call.intent_summary.token);
+}
 // Headings describe the requested call. None of them promise an outcome:
 // Bloom has not executed anything, and a passkey response is an approval,
 // not a settlement.
 function callIntent(call) {
   const summary = call?.intent_summary;
   if (!summary) {
+    const fields = Object.fromEntries((call?.fields || []).map(field => [field.label, field.value]));
+    const signature = String(call?.function_signature || "");
+    if (signature.startsWith("createProxyWithNonce(")) {
+      const owners = (call.fields || [])
+        .filter(field => /^New Safe · Owner \d+$/.test(field.label))
+        .map(field => field.value);
+      const threshold = fields["New Safe · Signatures required"];
+      const ownerText = owners.length === 1 ? owners[0] : naturalList(owners);
+      return {
+        action: "call", eyebrow: "Safe creation",
+        heading: ownerText && threshold
+          ? `Create a Safe owned by ${ownerText}; ${threshold} signature${threshold === "1" ? "" : "s"} required`
+          : "Create a Safe",
+        detail: "", relation: "creates"
+      };
+    }
+    if (signature.startsWith("execTransaction(")) {
+      const inner = fields["Safe transaction"];
+      return {
+        action: "call", eyebrow: "Safe execution",
+        heading: inner || "Execute a Safe transaction",
+        detail: "", relation: "calls"
+      };
+    }
     return {
       action: "call",
       eyebrow: "Contract call",
-      heading: `Call ${String(call?.function_signature || "").split("(")[0] || "this contract"}`,
+      heading: `Call ${signature.split("(")[0] || "this contract"}`,
       detail: "",
       relation: "calls"
     };
   }
   const who = shortAddress(summary.counterparty);
   const symbol = summary.token?.symbol || "tokens";
+  const structural = shapeOnly(call);
+  if (structural && summary.action === "transfer") {
+    return {
+      action: "call", magnitude: summary.magnitude,
+      eyebrow: "ERC-20-shaped call",
+      heading: `Review transfer-shaped call for ${summary.amount_display}`,
+      detail: "The calldata names a recipient and raw amount. It does not prove that the contract will transfer tokens.",
+      relation: "calls"
+    };
+  }
+  if (structural) {
+    const amount = summary.magnitude === "unlimited" ? "maximum uint256"
+      : summary.magnitude === "zero" ? "zero" : summary.amount_display;
+    return {
+      action: "call", magnitude: summary.magnitude,
+      eyebrow: "ERC-20-shaped call",
+      heading: `Review approval-shaped call for ${amount}`,
+      detail: "The calldata names a spender and raw total. It does not prove that the contract will change a token allowance.",
+      relation: "calls"
+    };
+  }
   if (summary.action === "transfer") {
     return {
       action: "transfer", magnitude: summary.magnitude,
@@ -344,10 +459,6 @@ function callIntent(call) {
     relation: `may spend up to ${summary.amount_display} of`
   };
 }
-function formatObserved(milliseconds) {
-  const value = Number(milliseconds);
-  return Number.isFinite(value) ? new Date(value).toISOString().replace("T", " ").slice(0, 19) + " UTC" : "an unknown time";
-}
 // Round a displayed upper bound upwards using decimal integers. Floating
 // point rounding must never turn a maximum into an understated charge.
 function compactFeeCap(value) {
@@ -359,6 +470,99 @@ function compactFeeCap(value) {
   if (/[1-9]/.test(fraction.slice(6))) units += 1n;
   const decimals = (units % 1000000n).toString().padStart(6, "0").replace(/0+$/, "");
   return `${units / 1000000n}${decimals ? `.${decimals}` : ""} ${match[3]}`;
+}
+// Safe reviews arrive as flat "Label: value" lines. The page turns those into
+// a heading, one sentence, and separate rows. Function names, adapters, raw
+// units, and hashes stay in a second disclosure.
+function parseSafeAction(lines) {
+  const warnings = [];
+  const rows = [];
+  let rawAction = "";
+  for (const line of lines) {
+    if (line.startsWith("Warning: ")) {
+      warnings.push(line.slice(9));
+      continue;
+    }
+    if (line.startsWith("Action: ") && !rawAction) {
+      rawAction = line.slice(8);
+      continue;
+    }
+    const separator = line.indexOf(": ");
+    if (separator < 0) {
+      rows.push({label: line.replace(/^Safe transaction · /, ""), value: ""});
+      continue;
+    }
+    rows.push({
+      label: line.slice(0, separator).replace(/^Safe transaction · /, ""),
+      value: line.slice(separator + 2)
+    });
+  }
+  return {rawAction, rows, warnings};
+}
+function safeRowValue(rows, label) {
+  return rows.find(row => row.label === label)?.value || "";
+}
+function safeTechnical(row) {
+  if (!row.value) return true;
+  if (/^Action( \d+)?$/.test(row.label)) return true;
+  if (/^Action contract \d+$/.test(row.label)) return true;
+  if (/^Action sends \d+$/.test(row.label)) return true;
+  if (/^Transaction \d+$/.test(row.label) && !row.value.startsWith("Send ")) return true;
+  if (row.label === "Safe calls" || row.label === "Safe gas limit" || row.label === "Base gas") return true;
+  if (/raw units|Contract code|Highest share price|Callback|Skip on failure/i.test(row.label)) return true;
+  if (row.label === "Sent to" || row.label.endsWith(" · Sent to")) return true;
+  if ((row.label === "Safe sends" || row.label === "Value" || row.label === "Sends to the new contract")
+      && /^0(?:\.0+)? ETH$/.test(row.value)) return true;
+  return false;
+}
+function safeDecisionLabel(label) {
+  const nested = label.match(/^(Transaction \d+|Action \d+) · (.+)$/);
+  const name = nested ? nested[2] : label;
+  const prefix = nested && nested[1].startsWith("Transaction") ? `${nested[1]} ` : "";
+  if (name === "Shares go to") return `${prefix}Shares recipient`.trim();
+  if (name === "To" || name === "Recipient") return `${prefix}Recipient`.trim();
+  if (name === "Amount") return prefix ? `${nested[1]} amount` : "Amount";
+  if (name === "Value") return "Native value";
+  if (name === "Sends to the new contract") return "Value sent to the new contract";
+  return prefix ? `${nested[1]} ${name}` : name;
+}
+// Morpho records a maximum assets-per-share price, scaled by 1e27. Turning
+// that into a share count needs the vault's share decimals, which this review
+// does not carry.
+function safeShareBound(raw) {
+  if (!/^\d+$/.test(raw)) return "Bloom cannot read this share-price bound.";
+  return `The deposit reverts if one vault share would cost more than ${raw} asset units on a 1e27 scale. Bloom cannot show that as a minimum number of shares, because this review does not include the vault's share decimals.`;
+}
+function safeIdentityRisk(warning) {
+  const match = String(warning).match(/^(?:Bloom cannot check that |Bloom has not verified that )(0x[0-9a-fA-F]{40}) is a Safe\b/);
+  if (!match) return null;
+  return `Bloom has not checked that ${shortAddress(match[1])} is a Safe. This signature authorizes the transaction hash for that address, and a different contract there could accept it for another effect.`;
+}
+function safeAmount(rows) {
+  const named = rows.find(row => /(?:^|· )Amount$/.test(row.label) && /[A-Za-z]/.test(row.value));
+  if (named) return named.value;
+  const raw = rows.find(row => ["Token amount (base units)", "Raw token amount", "Raw total allowance"].includes(row.label));
+  return raw ? `${raw.value} base units` : "";
+}
+function safeUnlimitedAmount(amount) {
+  const numeric = String(amount).match(/^(\d+)(?:\.(\d+))?(?:\s|$)/);
+  return Boolean(numeric && BigInt(numeric[1] + (numeric[2] || "")) === (1n << 256n) - 1n);
+}
+function safeMovements(rows, rawAction) {
+  const bits = [];
+  for (const row of rows) {
+    if (/(?:^|· )Amount$/.test(row.label) && /[A-Za-z]/.test(row.value)) {
+      const prefix = row.label.replace(/Amount$/, "");
+      const action = prefix ? rows.find(other => other.label === prefix.replace(/ · $/, ""))?.value : rawAction;
+      // An allowance or a token pull inside a vault bundle is not a payment.
+      if (!String(action || "").startsWith("transfer on ")) continue;
+      const to = rows.find(other => other.label === `${prefix}To` || other.label === `${prefix}Recipient`);
+      bits.push(to ? `${row.value} to ${shortAddress(to.value)}` : row.value);
+    } else if (/^Transaction \d+$/.test(row.label) && /^Send .+ to 0x[0-9a-fA-F]{40}$/.test(row.value)) {
+      bits.push(row.value.replace(/^Send /, "").replace(/0x[0-9a-fA-F]{40}/g, match => shortAddress(match)));
+    }
+  }
+  return bits;
 }
 function describeTransfer(manifest) {
   const claim = manifest?.system_use_claim || manifest?.petal_use_claim;
@@ -375,7 +579,7 @@ function describeTransfer(manifest) {
     // second time. They stay in technical details, where the exact bytes are.
     // The one exception is native value riding along with a contract call:
     // that is a second thing being moved and nothing else says so.
-    const decoded = Boolean(payload.contract_call);
+    const decoded = Boolean(reviewedContractCall(payload));
     const movesNative = !/^0(\.0+)?(\s|$)/.test(String(payload.value_display || "0"));
     technical.push([label(payload.destination ? "Transaction to" : "Action"),
       payload.destination || "Deploy contract (CREATE)", Boolean(payload.destination)]);
@@ -417,7 +621,7 @@ function describeTransfer(manifest) {
   // to whom, in which token. The envelope facts stay underneath — they are
   // what was actually signed, and the description never replaces them.
   const appendCallFacts = (facts, technical, payload, prefix) => {
-    const call = payload.contract_call;
+    const call = reviewedContractCall(payload);
     const label = name => prefix ? `${prefix} ${name.toLowerCase()}` : name;
     // Complete argument coverage is a property of the review, so every
     // decoded argument is still listed even when the heading already named
@@ -430,7 +634,7 @@ function describeTransfer(manifest) {
     // the review, and only the two the typed intent already named are
     // dropped — never a field whose meaning is unsupported.
     for (const field of call.fields || []) {
-      if (summary && field.format === "tokenAmount" && field.raw === summary.amount) continue;
+      if (summary && field.raw === summary.amount) continue;
       if (summary && field.raw === summary.counterparty) continue;
       if (summary) facts.push([label(field.label), field.value, field.format === "addressName"]);
     }
@@ -443,12 +647,12 @@ function describeTransfer(manifest) {
     const facts = [];
     const technical = [];
     const clear = plan.evm_review?.clear_signing;
-    const calls = evmPayloads.filter(payload => payload.contract_call);
+    const calls = evmPayloads.filter(payload => reviewedContractCall(payload));
     for (const [index, payload] of evmPayloads.entries()) {
       const factStart = facts.length;
       const technicalStart = technical.length;
       const prefix = evmPayloads.length > 1 ? `Transaction ${index + 1}` : "";
-      if (payload.contract_call) appendCallFacts(facts, technical, payload, prefix);
+      if (reviewedContractCall(payload)) appendCallFacts(facts, technical, payload, prefix);
       appendEnvelopeFacts(facts, technical, payload, prefix);
       for (const row of facts.slice(factStart)) row[3] = payload.chain_id;
       for (const row of technical.slice(technicalStart)) row[3] = payload.chain_id;
@@ -457,7 +661,7 @@ function describeTransfer(manifest) {
     // visible rather than folded into the fact list or the details section.
     const warnings = [];
     for (const payload of calls) {
-      for (const warning of payload.contract_call.warnings || []) warnings.push(warning);
+      for (const warning of reviewedContractCall(payload).warnings || []) warnings.push(warning);
     }
     const interpretation = [];
     // Upgradeability belongs to a contract, so it is stated once per affected
@@ -466,16 +670,13 @@ function describeTransfer(manifest) {
     // exactly once. The consequence is the whole warning; when the review
     // touches a single upgradeable contract the identity is already on the
     // page, and when it touches more than one the address distinguishes them.
-    // Which deployment was observed, and when, is a detail and lives in the
-    // details section rather than beside the decision.
     const upgradeable = clear ? (clear.entries || []).filter(entry => entry.upgradeable) : [];
     for (const entry of upgradeable) {
       warnings.push(upgradeable.length > 1
         ? `Upgradeable contract ${shortAddress(entry.contract_address)} — its behavior can change.`
         : "Upgradeable contract — its behavior can change.");
       interpretation.push(["Upgradeable contract",
-        `${entry.contract_address} — the publisher observed this deployment at ` +
-        `${formatObserved(entry.observed_at_ms)}; its code may have changed since.`]);
+        `${entry.contract_address} — its code may have changed since this Bloom release described it.`]);
     }
     const first = evmPayloads[0];
     const oneNetwork = evmPayloads.every(payload => String(payload.chain_id) === String(first.chain_id));
@@ -493,11 +694,11 @@ function describeTransfer(manifest) {
           cards: evmPayloads.map((payload, index) => ({
             position: index + 1,
             chainId: payload.chain_id,
-            intent: payload.contract_call
-              ? callIntent(payload.contract_call)
+            intent: reviewedContractCall(payload)
+              ? callIntent(reviewedContractCall(payload))
               : payload.destination && payload.calldata_keccak
               ? {action: "opaque", eyebrow: "Contract call", heading: "Approve a call Bloom cannot read",
-                 detail: "No signed description is available. Bloom cannot say what this call does.",
+                 detail: unreadDetail(payload),
                  relation: "calls"}
               : {action: payload.destination ? "send" : "deploy",
                  eyebrow: payload.destination ? "Native transfer" : "Contract creation",
@@ -507,21 +708,25 @@ function describeTransfer(manifest) {
                    ? "Bloom checked the envelope: destination and value come from the transaction bytes."
                    : "This creates a new contract. Bloom does not verify what its code does.",
                  relation: payload.destination ? `sends ${payload.value_display} to` : "creates"},
-            counterparty: payload.contract_call?.intent_summary?.counterparty || payload.destination,
-            counterpartyRole: payload.contract_call?.intent_summary?.counterparty_role ||
-              (payload.contract_call || payload.calldata_keccak ? "contract" : "recipient"),
-            contract: payload.contract_call?.contract,
-            contractName: payload.contract_call?.intent_summary?.token
-              ? `${payload.contract_call.intent_summary.token.symbol} — ${payload.contract_call.intent_summary.token.name}`
-              : payload.contract_call?.contract_name
+            counterparty: reviewedContractCall(payload)?.intent_summary?.counterparty || payload.destination,
+            counterpartyRole: reviewedContractCall(payload)?.intent_summary?.counterparty_role ||
+              (reviewedContractCall(payload) || payload.calldata_keccak ? "contract" : "recipient"),
+            contract: reviewedContractCall(payload)?.contract,
+            contractName: reviewedContractCall(payload)?.intent_summary?.token
+              ? `${reviewedContractCall(payload).intent_summary.token.symbol} — ${reviewedContractCall(payload).intent_summary.token.name}`
+              : reviewedContractCall(payload)?.contract_name,
+            token: reviewedContractCall(payload)?.intent_summary?.token || null,
+            amountDisplay: reviewedContractCall(payload)?.intent_summary?.amount_display || null,
+            magnitude: reviewedContractCall(payload)?.intent_summary?.magnitude || null,
+            tokenAction: reviewedContractCall(payload)?.intent_summary?.action || null
           }))
         }
-      : first.contract_call
-        ? callIntent(first.contract_call)
+      : reviewedContractCall(first)
+        ? callIntent(reviewedContractCall(first))
         : first.destination
           ? (first.calldata_keccak
             ? {action: "opaque", eyebrow: "Contract call", heading: "Approve a call Bloom cannot read",
-               detail: "No signed description is available. Bloom cannot say what this call does.",
+               detail: unreadDetail(first),
                relation: "calls"}
             : {action: "send", eyebrow: "Native transfer",
                heading: `Send ${first.value_display}`,
@@ -530,17 +735,19 @@ function describeTransfer(manifest) {
           : {action: "deploy", eyebrow: "Contract creation", heading: "Deploy a contract",
              detail: "This creates a new contract from the initcode below. Bloom does not verify " +
                "what that code does.", relation: "creates"};
-    const summary = first.contract_call?.intent_summary;
+    const firstCall = reviewedContractCall(first);
+    const summary = firstCall?.intent_summary;
     const counterparty = summary?.counterparty ||
-      (first.contract_call ? null : first.destination);
+      (firstCall ? null : first.destination);
     const parties = [{role: "source", label: "From this wallet", value: first.sender}];
     if (counterparty) {
       parties.push({
-        role: intent.action === "allowance" ? "spender"
-          : intent.action === "transfer" || intent.action === "send" ? "recipient" : "contract",
-        label: intent.action === "allowance" ? "Spender"
-          : intent.action === "transfer" || intent.action === "send" ? "Recipient"
-          : "Contract being called",
+        role: summary?.counterparty_role || (intent.action === "allowance" ? "spender"
+          : intent.action === "transfer" || intent.action === "send" ? "recipient" : "contract"),
+        label: summary?.counterparty_role === "spender" ? "Spender"
+          : summary?.counterparty_role === "recipient" ? "Recipient"
+          : intent.action === "allowance" ? "Spender"
+          : intent.action === "transfer" || intent.action === "send" ? "Recipient" : "Contract being called",
         value: counterparty
       });
     }
@@ -550,7 +757,7 @@ function describeTransfer(manifest) {
     // addresses keep both roles, whatever their names say.
     if (summary?.token) {
       const sameAddress = summary.token.address.toLowerCase() ===
-        String(first.contract_call.contract).toLowerCase();
+        String(firstCall.contract).toLowerCase();
       parties.push({
         role: "token",
         label: sameAddress ? "Token contract — the contract being called"
@@ -560,57 +767,196 @@ function describeTransfer(manifest) {
       });
       if (!sameAddress) {
         parties.push({role: "contract", label: "Contract being called",
-          name: first.contract_call.contract_name || null,
-          value: first.contract_call.contract});
+          name: firstCall.contract_name || null,
+          value: firstCall.contract});
       }
-    } else if (first.contract_call) {
+    } else if (firstCall) {
       parties.push({role: "contract", label: "Contract being called",
-        name: first.contract_call.contract_name || null,
-        value: first.contract_call.contract});
+        name: firstCall.contract_name || null,
+        value: firstCall.contract});
     }
     // One sentence, from the review rather than from matching warning text.
-    const assurance = first.contract_call?.assurance ||
-      (clear ? "Interpreted using a trusted signed description. Contract behavior has not been verified."
-             : "Transaction destination, value and bytes checked. Contract behavior not verified.");
+    // A mixed batch never borrows the stronger assurance of its first member.
+    const structuralCalls = evmPayloads.filter(payload => shapeOnly(payload.contract_call));
+    const assurance = structuralCalls.length && clear
+      ? "This batch mixes trusted catalog descriptions with structural calldata readings. Structural readings verify exact arguments, not contract or token behavior."
+      : structuralCalls.length
+        ? (structuralCalls.length === 1 ? structuralCalls[0].contract_call.assurance
+          : "These calls match standard ERC-20 calldata shapes. Bloom verified their exact arguments, but not that the contracts are tokens or follow ERC-20 behavior.")
+        : firstCall?.assurance ||
+          (clear ? "Interpreted using Bloom's description of this contract. Contract behavior has not been verified."
+                 : "Transaction destination, value and bytes checked. Contract behavior not verified.");
     if (clear) {
-      interpretation.push(["Catalog", `${clear.catalog_id}, sequence ${clear.catalog_sequence}`]);
       interpretation.push(["Assurance class", clear.assurance]);
-      interpretation.push(["Verifier", `${clear.verifier_id} (${shortDigest(clear.verifier_digest)})`]);
-      // The catalog commitment is already in the complete signed manifest.
     }
     const networkIdentity = oneNetwork
       ? `EVM · ${network} · Chain ID ${first.chain_id}` : "EVM · Multiple networks";
-    return {intent, payloads: evmPayloads, parties: parties.map(party => ({...party, chainId: first.chain_id})), assurance, interpretation, facts, technical, warnings, networkIdentity,
+    // The amount, the token mark, and the counterparties are on the page.
+    // A sentence that points at a closed disclosure is how those disappeared.
+    const sentence = intent.action === "batch"
+      ? `One approval covers all ${evmPayloads.length} transactions on <strong>${escapeHtml(network)}</strong>, in the order below.`
+      : "";
+    return {intent, sentence, payloads: evmPayloads, parties: parties.map(party => ({...party, chainId: first.chain_id})), assurance, interpretation, mixedAssurance: Boolean(clear && structuralCalls.length), facts, technical, warnings, networkIdentity,
             chainId: evmPayloads.length === 1 ? first.chain_id : null,
             assetSummary: evmPayloads.length === 1 ? summary : null,
-            networkIcon: oneNetwork ? ({"1": "ethereum", "8453": "base", "31337": "test"}[first.chain_id] || "unknown") : "unknown",
+            networkIcon: oneNetwork ? chainIcon(first.chain_id) : "unknown",
             willVerify: true};
   }
   const safe = plan.safe_review;
   if (safe) {
     const network = chainLabel(safe.chain);
-    const facts = [
-      ["Safe", safe.safe, true],
-      ["Action", safe.action.join("\n")],
-      ["Destination", safe.destination, true],
-      [safe.operation === "delegatecall" ? "Outer call value (batch or deployment values are shown above)" : "Value", safe.value_display],
-      ["Network", network],
-      ["Signing owner", safe.owner, true],
-      ["Safe nonce", safe.nonce],
-      ["Operation", safe.operation],
-      ["Safe transaction hash", safe.safe_tx_hash, true],
-      ["Bloom verification", "Safe transaction rebuilt from the exact signing bytes. Safe configuration and call execution effects are not verified."],
-      ["Reported by the Petal, not verified", [
-        `Safe version ${safe.reported.version}`,
-        `Threshold ${safe.reported.threshold} of ${safe.reported.owners.length} owners`,
-        `Singleton ${safe.reported.singleton}`,
-        `Guard ${safe.reported.guard}`,
-        `Modules ${safe.reported.modules.join(", ") || "none"}`,
-        `Fallback handler ${safe.reported.fallback_handler}`,
-      ].join("\n")],
-    ];
-    const sentence = `Approve one Safe transaction on <strong>${escapeHtml(network)}</strong>: ${escapeHtml(safe.action[0].replace(/^Action: /, ""))}.`;
-    return {sentence, facts, willVerify: true};
+    // Warnings are lines inside `action`. The banner shows them; the other
+    // lines become one row each. Joining those lines into one cell hides the
+    // amount, the vault, and the recipient in a single unreadable string.
+    const parsed = parseSafeAction(safe.action);
+    const {rawAction, rows} = parsed;
+    const threshold = safeRowValue(rows, "Signatures required");
+    const thresholdText = threshold
+      ? `${threshold} signature${threshold === "1" ? "" : "s"}` : "";
+    const amount = safeAmount(rows);
+    const vaults = rows.filter(row => /(?:^|· )Vault$/.test(row.label));
+    const shareRecipients = rows.filter(row => /Shares go to$/.test(row.label));
+    const vault = vaults.length === 1 ? vaults[0].value : "";
+    const shares = shareRecipients.length === 1 ? shareRecipients[0].value : "";
+    const morphoBundle = rawAction.startsWith("multicall on Morpho Bundler3");
+    const nestedActions = rows.filter(row => /^Action \d+$/.test(row.label));
+    const simpleMorphoDeposit = morphoBundle && vault && shares &&
+      nestedActions.length === 2 &&
+      nestedActions[0].value.startsWith("erc20TransferFrom on ") &&
+      nestedActions[1].value.startsWith("erc4626Deposit on ");
+    const recipient = safeRowValue(rows, "Recipient") || safeRowValue(rows, "To");
+    const spender = safeRowValue(rows, "Spender");
+    const permission = rawAction.startsWith("approve on ");
+    const unlimited = permission && safeUnlimitedAmount(amount);
+    const sendTo = rawAction.match(/^Send (.+) to (0x[0-9a-fA-F]{40})$/);
+    const movements = safeMovements(rows, rawAction);
+    const safeShort = shortAddress(safe.safe);
+    let heading = rawAction.replace(/0x[0-9a-fA-F]{40}/g, match => shortAddress(match));
+    let sentence = `On <strong>${escapeHtml(network)}</strong>, Safe <strong>${escapeHtml(safeShort)}</strong> requests this action. Amounts, parties, and the nonce are listed below.`;
+    if (rawAction.startsWith("addOwnerWithThreshold")) {
+      heading = `Add owner ${shortAddress(safeRowValue(rows, "New owner"))}; ${thresholdText} still required`;
+      sentence = `Add <strong>${escapeHtml(shortAddress(safeRowValue(rows, "New owner")))}</strong> as an owner of Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>. ${escapeHtml(thresholdText)} will still be required.`;
+    } else if (rawAction.startsWith("removeOwner")) {
+      heading = `Remove owner ${shortAddress(safeRowValue(rows, "Removed owner"))}; ${thresholdText} still required`;
+      sentence = `Remove owner <strong>${escapeHtml(shortAddress(safeRowValue(rows, "Removed owner")))}</strong> from Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>. ${escapeHtml(thresholdText)} will still be required.`;
+    } else if (rawAction.startsWith("swapOwner")) {
+      heading = `Replace owner ${shortAddress(safeRowValue(rows, "Removed owner"))} with ${shortAddress(safeRowValue(rows, "New owner"))}`;
+      sentence = `Replace owner <strong>${escapeHtml(shortAddress(safeRowValue(rows, "Removed owner")))}</strong> with <strong>${escapeHtml(shortAddress(safeRowValue(rows, "New owner")))}</strong> on Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>.`;
+    } else if (rawAction.startsWith("changeThreshold")) {
+      heading = `Require ${thresholdText}`;
+      sentence = `Require <strong>${escapeHtml(thresholdText)}</strong> on Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>.`;
+    } else if (permission && amount && spender) {
+      heading = unlimited ? `Allow unlimited spending by ${shortAddress(spender)}`
+        : /^0(?:\.0+)?\s/.test(amount) ? `Clear spending permission for ${shortAddress(spender)}`
+        : `Allow ${shortAddress(spender)} to spend up to ${amount}`;
+      sentence = `Change this spender's permission to use tokens held by Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>.`;
+    } else if (rawAction.startsWith("transfer on ") && amount && recipient) {
+      heading = `Send ${amount} to ${shortAddress(recipient)}`;
+      sentence = `Send <strong>${escapeHtml(amount)}</strong> from Safe <strong>${escapeHtml(safeShort)}</strong> to <strong>${escapeHtml(shortAddress(recipient))}</strong> on <strong>${escapeHtml(network)}</strong>.`;
+    } else if (sendTo) {
+      heading = `Send ${sendTo[1]} to ${shortAddress(sendTo[2])}`;
+      sentence = `Send <strong>${escapeHtml(sendTo[1])}</strong> from Safe <strong>${escapeHtml(safeShort)}</strong> to <strong>${escapeHtml(shortAddress(sendTo[2]))}</strong> on <strong>${escapeHtml(network)}</strong>.`;
+    } else if (rawAction.startsWith("performCreate2")) {
+      heading = "Create a contract at a fixed address";
+      sentence = `Create a contract at a fixed address from Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>.`;
+    } else if (rawAction.startsWith("performCreate")) {
+      heading = "Create a contract";
+      sentence = `Create a contract from Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>.`;
+    } else if (simpleMorphoDeposit || rawAction.startsWith("erc4626Deposit")) {
+      const morpho = Boolean(simpleMorphoDeposit);
+      const vaultName = morpho ? "a Morpho vault" : "a vault";
+      heading = amount ? `Deposit ${amount} into ${vaultName}` : `Deposit into ${vaultName}`;
+      const who = !shares ? "the recipient in details"
+        : shares.toLowerCase() === String(safe.owner).toLowerCase() ? `your account ${shortAddress(shares)}`
+        : shares.toLowerCase() === String(safe.safe).toLowerCase() ? `this Safe ${shortAddress(shares)}`
+        : shortAddress(shares);
+      const deposited = amount ? `<strong>${escapeHtml(amount)}</strong>` : "tokens";
+      const into = vault ? `vault <strong>${escapeHtml(shortAddress(vault))}</strong>` : vaultName;
+      sentence = `Deposit ${deposited} into ${into} on <strong>${escapeHtml(network)}</strong>. Vault shares go to <strong>${escapeHtml(who)}</strong>.`;
+    } else if (morphoBundle) {
+      heading = "Review calls through Morpho";
+      sentence = `Review every call from Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong> in the details below.`;
+    } else if (rawAction.startsWith("multiSend") || movements.length > 1) {
+      const transactions = rows.filter(row => /^Transaction \d+$/.test(row.label));
+      const onlyTransfers = transactions.length > 0 && transactions.every(row =>
+        row.value.startsWith("transfer on ") || /^Send .+ to 0x[0-9a-fA-F]{40}$/.test(row.value));
+      heading = onlyTransfers && movements.length
+        ? `Send ${naturalList(movements.map(bit => bit.split(" to ")[0]))}`
+        : transactions.length ? `Review ${transactions.length} Safe actions` : "Review Safe actions";
+      sentence = onlyTransfers && movements.length
+        ? `From Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>: ${escapeHtml(naturalList(movements))}.`
+        : `One approval covers every action from Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>. Review each action below.`;
+    } else if (amount && recipient) {
+      heading = `Send ${amount} to ${shortAddress(recipient)}`;
+      sentence = `Send <strong>${escapeHtml(amount)}</strong> from Safe <strong>${escapeHtml(safeShort)}</strong> to <strong>${escapeHtml(shortAddress(recipient))}</strong> on <strong>${escapeHtml(network)}</strong>.`;
+    } else if (rawAction === "Contract call Bloom cannot read") {
+      const reason = safeRowValue(rows, "Reason");
+      heading = "Contract call Bloom cannot read";
+      sentence = `Bloom cannot read this Safe transaction on <strong>${escapeHtml(network)}</strong> for Safe <strong>${escapeHtml(safeShort)}</strong>.${reason ? ` ${escapeHtml(reason)}.` : ""}`;
+    }
+    const share = rows.find(row => /Highest share price/i.test(row.label));
+    const facts = rows
+      .filter(row => !safeTechnical(row))
+      .map(row => [safeDecisionLabel(row.label), row.value, /^0x[0-9a-fA-F]{40}$/.test(row.value)]);
+    facts.push(["Safe", safe.safe, true], ["Network", network], ["Nonce", safe.nonce]);
+    if (share) facts.push(["Share bound", safeShareBound(share.value)]);
+    const technical = [["Described as", rawAction, false]];
+    for (const row of rows.filter(safeTechnical)) {
+      technical.push([row.label, row.value, /^0x[0-9a-fA-F]{40}$/.test(row.value) || row.label === "Contract code"]);
+    }
+    technical.push(["Signing owner", safe.owner, true]);
+    if (safe.destination.toLowerCase() !== safe.safe.toLowerCase()) technical.push(["Calls", safe.destination, true]);
+    if (safe.operation === "delegatecall") technical.push(["Operation", "delegatecall"]);
+    technical.push(["Safe transaction hash", safe.safe_tx_hash, true]);
+    for (const warning of parsed.warnings) {
+      if (safeIdentityRisk(warning)) technical.push(["Safe identity check", warning, false]);
+    }
+    const warnings = parsed.warnings.map(warning => safeIdentityRisk(warning) || warning);
+    const safeCards = rawAction.startsWith("multiSend") ? rows
+      .filter(row => /^Transaction \d+$/.test(row.label))
+      .map(row => {
+        const value = name => safeRowValue(rows, `${row.label} · ${name}`);
+        const tokenCall = row.value.match(/^(approve|transfer) on (?:.+ )?(0x[0-9a-fA-F]{40})$/);
+        const morpho = row.value.startsWith("multicall on Morpho Bundler3 ");
+        const native = row.value.match(/^Send (.+) to (0x[0-9a-fA-F]{40})$/);
+        const address = tokenCall?.[2] || (morpho ? value("Action 1 · Token") : "");
+        const amount = tokenCall ? value("Amount") : morpho ? value("Action 1 · Amount") : native?.[1];
+        const permission = tokenCall?.[1] === "approve";
+        const unlimited = permission && safeUnlimitedAmount(amount);
+        return {
+          position: row.label,
+          title: permission ? "Token spending permission" : tokenCall ? "Token transfer"
+            : morpho ? "Calls through Morpho" : native ? "Native transfer" : "Contract call",
+          asset: address && amount ? {chainId: String(safe.chain_id), address, amount: unlimited ? "Unlimited" : amount,
+            amountLabel: permission ? "Spending limit" : morpho ? "Tokens supplied" : "Amount",
+            tone: unlimited ? "danger" : permission ? "permission" : "outgoing"}
+            : native ? {native: / ETH$/.test(amount) ? "ethereum" : "token", amount, amountLabel: "Amount"} : null,
+          parties: [
+            [permission ? "Spender" : "Recipient", permission ? value("Spender") : value("To") || value("Recipient") || native?.[2]],
+            ["Vault", morpho ? value("Action 2 · Vault") : ""],
+            ["Shares recipient", morpho ? value("Action 2 · Shares go to") : ""]
+          ].filter(([, address]) => /^0x[0-9a-fA-F]{40}$/.test(address || ""))
+        };
+      }) : [];
+    const tokens = rows.filter(row =>
+      /(?:^|· )Token$/.test(row.label) && /^0x[0-9a-fA-F]{40}$/.test(row.value));
+    const directToken = rawAction.match(/^(?:approve|transfer) on (?:.+ )?(0x[0-9a-fA-F]{40})$/)?.[1];
+    const tokenAddress = !rawAction.startsWith("multiSend") && movements.length <= 1
+      ? tokens.length === 1 ? tokens[0].value : directToken || "" : "";
+    const tokenAsset = tokenAddress && amount
+      ? {chainId: String(safe.chain_id), address: tokenAddress, amount: unlimited ? "Unlimited" : amount,
+          amountLabel: permission ? "Spending limit" : "Amount",
+          tone: unlimited ? "danger" : permission ? "permission" : "outgoing"}
+      : sendTo ? {native: / ETH$/.test(sendTo[1]) ? "ethereum" : "token",
+          title: / ETH$/.test(sendTo[1]) ? "Ether" : "Native asset", amount: sendTo[1],
+          amountLabel: "Amount", tone: "outgoing"} : null;
+    const safeRecipient = directToken ? recipient : sendTo?.[2];
+    const safeParties = (permission && spender) ? [["Spender", spender]]
+      : safeRecipient ? [["Recipient", safeRecipient]] : [];
+    return {sentence, facts, technical, warnings, willVerify: true, heading,
+      button: "Approve Safe signature", chainId: safe.chain_id, tokenAsset, safeCards, safeParties,
+      networkIdentity: `EVM · ${network} · Chain ID ${safe.chain_id}`,
+      networkIcon: chainIcon(safe.chain_id)};
   }
   if (!claim) return null;
   const debits = claim.declared_debits || [];
@@ -692,7 +1038,7 @@ function describePetalScope(scope) {
   const lifetime = Number(scope.maximum_lifetime_ms);
   const duration = Number.isFinite(lifetime) && lifetime > 0 ? fmtRemaining(lifetime) : "a limited time";
   return {
-    sentence: `Allow <strong>${app}</strong> to use a temporary Solana session key for up to <strong>${duration}</strong>. No funds move in this step, and your main wallet key stays inside Bloom.`,
+    sentence: `Allow <strong>${app}</strong> to use a temporary Solana session key for up to <strong>${duration}</strong>; no funds move, and your main wallet key stays inside Bloom.`,
     facts: [
       ["App", app],
       ["Package", scope.package_hash, true],
@@ -729,7 +1075,7 @@ function describePetalApproval(manifest) {
     ? `Up to ${naturalList(ceilings)} in total across the whole session, counting fees and any funds sent back to your wallet`
     : "None — Bloom will refuse any action that spends funds or pays a fee";
   return {
-    sentence: `Finish setting up a temporary <strong>${app}</strong> session. It can sign only the actions listed below until the timer expires. No funds move in this step, and your main wallet key stays inside Bloom.`,
+    sentence: `Finish setting up a temporary <strong>${app}</strong> session for only the actions in details; no funds move, and your main wallet key stays inside Bloom.`,
     facts: [
       ["App", app],
       ["Package", packageHash, true],
@@ -739,8 +1085,9 @@ function describePetalApproval(manifest) {
       ["Main wallet key", "Stays inside Bloom"]
     ],
     title: "Finish temporary session setup",
+    heading: "Create a temporary Petal session",
     button: "Finish session setup",
-    warning: `${app} creates transactions within these permissions. If the app is compromised, it could use the remaining session capacity before the timer expires.`
+    warning: `${app} creates transactions within these permissions; if compromised, it could use the remaining session capacity before the timer expires.`
   };
 }
 // Policy updates: say what changes, in the order a person cares about.
@@ -771,97 +1118,14 @@ function describePolicy(manifest) {
   if (Number.isFinite(before) && Number.isFinite(after) && before !== after) {
     lines.push(["Max approval lifetime", `${fmtRemaining(before)} → ${fmtRemaining(after)}`]);
   }
-  // Clear-signing settings are authority, so a change to them is shown as
-  // current → proposed rather than left to an empty diff. Each one says what
-  // it permits: none of them grants anyone an allowance by itself.
-  const CLEAR_SIGNING_SETTINGS = [
-    ["unlimited_allowance_allowed", "Unlimited-allowance requests",
-     "A request to approve the maximum possible amount is refused. A large finite amount is still shown with its exact value.",
-     "This wallet setting applies to all supported tokens. Each request will still need your approval " +
-     "and will name its token and spender. This setting does not move tokens or grant a spender an allowance."],
-    ["opaque_exact_allowed", "Requests Bloom cannot describe",
-     "A call with no signed description is refused.",
-     "A call with no signed description can be approved as exact bytes, carrying the " +
-     "inability-to-explain warning."]
-  ];
-  const clearBefore = diff.clear_signing?.before || null;
-  const clearAfter = diff.clear_signing?.after || null;
-  const intentLines = [];
-  // A wallet without clear signing reads no calldata and refuses nothing for
-  // it, so for the two refusals "off" means allowed, not blocked.
-  if (clearBefore && !clearAfter) {
-    lines.push(["Clear signing", "on → off"]);
-    intentLines.push(["Clear signing",
-      "Bloom stops reading contract calls for this wallet. Unlimited allowances and calls with no " +
-      "signed description are no longer refused: each is shown only as exact bytes for you to approve."]);
-  } else if (clearAfter) {
-    if (!clearBefore) lines.push(["Clear signing", "off → on"]);
-    for (const [key, title, whenOff, whenOn] of CLEAR_SIGNING_SETTINGS) {
-      const was = clearBefore ? Boolean(clearBefore[key]) : true;
-      const now = Boolean(clearAfter[key]);
-      if (was === now) continue;
-      lines.push([title, `${was ? "allowed" : "blocked"} → ${now ? "allowed" : "blocked"}`]);
-      intentLines.push([title, now ? whenOn : whenOff]);
-    }
-    for (const [key, title] of [["catalog_id", "Descriptions come from catalog"],
-                                ["signature_threshold", "Publisher signatures required"],
-                                ["maximum_observation_age_ms", "Oldest usable observation"]]) {
-      const was = clearBefore?.[key];
-      const now = clearAfter?.[key];
-      if (was === now || (was == null && now == null)) continue;
-      lines.push([title, `${was == null ? "none" : was} → ${now == null ? "none" : now}`]);
-    }
-    const wasVerifier = clearBefore?.verifier?.verifier_digest;
-    const nowVerifier = clearAfter?.verifier?.verifier_digest;
-    if (wasVerifier !== nowVerifier) {
-      lines.push(["Pinned verifier", `${shortDigest(wasVerifier) || "none"} → ${shortDigest(nowVerifier) || "none"}`, true]);
-      intentLines.push(["Pinned verifier",
-        "Reviews are accepted only from the build whose verifier sources hash to the new value. " +
-        "A different build stops being able to describe calls for this wallet."]);
-    }
-    // The trusted publisher keys are the root of trust for every description
-    // Bloom will later read calldata against, so a rotation is the largest
-    // authority change this diff can carry and has to be named key by key.
-    const keyLabel = k => `${k?.key_id || "unnamed"} (${shortDigest(k?.verifying_key) || "no key"})`;
-    const keyIdentity = k => `${k?.key_id || ""}\u0000${k?.verifying_key || ""}`;
-    const keysBefore = Array.isArray(clearBefore?.trusted_keys) ? clearBefore.trusted_keys : [];
-    const keysAfter = Array.isArray(clearAfter?.trusted_keys) ? clearAfter.trusted_keys : [];
-    const idsBefore = new Set(keysBefore.map(keyIdentity));
-    const idsAfter = new Set(keysAfter.map(keyIdentity));
-    const addedKeys = keysAfter.filter(k => !idsBefore.has(keyIdentity(k)));
-    const removedKeys = keysBefore.filter(k => !idsAfter.has(keyIdentity(k)));
-    for (const k of addedKeys) lines.push(["Trust descriptions signed by", keyLabel(k), true]);
-    for (const k of removedKeys) lines.push(["Stop trusting descriptions signed by", keyLabel(k), true]);
-    if (addedKeys.length) {
-      intentLines.push(["Trusted publisher",
-        "A new publisher becomes able to describe any contract call for this wallet. " +
-        "Every future approval screen for a contract call is written from descriptions it signs."]);
-    }
-    if (removedKeys.length && !addedKeys.length) {
-      intentLines.push(["Trusted publisher",
-        "Descriptions signed by the named publisher stop being accepted. Contract calls that only " +
-        "it described can no longer be read, and will be refused rather than approved unread."]);
-    }
-  }
-  // A clear-signing change that produced no line is a change this page cannot
-  // describe. Saying nothing changed would be a lie, so say that instead.
-  const clearSigningUndescribed = Boolean(diff.clear_signing) && lines.length === 0;
   const n = lines.length;
-  const sentence = clearSigningUndescribed
-    ? "This updates the clear-signing settings in a way this page cannot describe. " +
-      "Do not approve it; check \"What your passkey signs\" below and report it."
-    : n === 0
+  const sentence = n === 0
     ? "No rule changes are proposed."
-    : `Change <strong>${n} rule${n === 1 ? "" : "s"}</strong> for this wallet. Nothing moves; after approval Bloom applies the new rules to future transactions.`;
+    : `Change <strong>${n} rule${n === 1 ? "" : "s"}</strong> for this wallet; nothing moves, and Bloom applies the new rules to future transactions.`;
   const intent = n === 0 ? null : {
     action: "policy", eyebrow: "Wallet policy change",
-    heading: n === 1 && intentLines.length === 1 && intentLines[0][0] === "Unlimited-allowance requests"
-      ? (clearAfter?.unlimited_allowance_allowed
-          ? "Allow requests for unlimited token spending"
-          : "Block requests for unlimited token spending")
-      : `Change ${n} wallet rule${n === 1 ? "" : "s"}`,
-    detail: (intentLines.map(([, text]) => text).join(" ") ||
-      "These rules apply to future requests. Approving them moves no funds.")
+    heading: `Change ${n} wallet rule${n === 1 ? "" : "s"}`,
+    detail: "These rules apply to future requests. Approving them moves no funds."
   };
   return {sentence, intent, facts: lines};
 }
@@ -887,7 +1151,7 @@ function renderReview(session) {
   const contribution = session.signer_contribution || {};
   const wallet = contribution.wallet_id || manifest?.wallet_name || manifest?.wallet_id || "";
   panelKicker.textContent = "Step 1 of 2 · Check";
-  panelTitle.textContent = "Requested action";
+  panelTitle.textContent = meta.title;
   panelTitle.setAttribute("data-action", "");
   panelTitle.setAttribute("data-magnitude", "");
   approve.textContent = meta.button;
@@ -914,14 +1178,15 @@ function renderReview(session) {
   let summaryHtml = custodyManifest && manifest.summary
     ? escapeHtml(manifest.summary)
     : meta.summary.replace("{wallet}", escapeHtml(walletName || "this wallet"));
-  const warns = [];
+  const primaryWarnings = [];
+  const detailNotes = [];
   let transfer = null;
   let petalScope = null;
   let petalApproval = null;
   if (kind === "sealed_approval") {
     transfer = describeTransfer(session.review_manifest);
     if (transfer) {
-      if (transfer.sentence) summaryHtml = transfer.sentence;
+      if (transfer.sentence != null) summaryHtml = transfer.sentence;
       // The button names what is being approved. A passkey response means
       // approved — not signed, broadcast or confirmed.
       if (transfer.intent) {
@@ -937,6 +1202,7 @@ function renderReview(session) {
         transfer = petalApproval;
         summaryHtml = petalApproval.sentence;
         approve.textContent = petalApproval.button;
+        if (petalApproval.heading) panelTitle.textContent = petalApproval.heading;
         if (pageTitle) pageTitle.textContent = petalApproval.title;
       }
     }
@@ -953,13 +1219,16 @@ function renderReview(session) {
       approve.textContent = petalScope.button;
     }
   }
+  if (transfer?.heading) panelTitle.textContent = transfer.heading;
+  if (transfer?.button) approve.textContent = transfer.button;
   const contextualFacts = transfer?.intent ? new Set(["Network"]) : new Set();
-  if (transfer?.intent && pageTitle) {
+  if ((transfer?.intent || transfer?.networkIdentity) && pageTitle) {
     const network = transfer.networkIdentity || transfer.facts.find(([label]) => label === "Network")?.[1];
     pageTitle.textContent = network || ["Wallet settings", walletName].filter(Boolean).join(" · ");
     if (transfer.networkIdentity) pageTitle.replaceChildren(reviewIcon(transfer.networkIcon),
       el("span", {}, network));
-  } else fact("Wallet", walletName);
+  }
+  if (!transfer?.intent) fact("Wallet", walletName);
   if (kind !== "sealed_approval" &&
       session.signer_contribution?.wallet_seed_profile === "bip39-multicurve-v1") {
     fact("Wallet type", "BIP-39 recovery phrase (multi-chain)");
@@ -982,12 +1251,12 @@ function renderReview(session) {
   if (expiryHost) expiryHost.replaceChildren(expiry);
   else facts.append(el("dt", {}, "Expires"), el("dd", {}, expiry));
   if (kind === "sealed_approval") {
-    for (const item of session.review_manifest?.attributed_advisory_items || []) warns.push(item);
+    for (const item of session.review_manifest?.attributed_advisory_items || []) primaryWarnings.push(item);
     // Proof verification occurs during authorization, after this review.
     // Never suppress the plan's present-tense disclosure merely because the
     // Machine requested proof verification for the later signing step.
-    if (petalApproval) warns.push(petalApproval.warning);
-    else for (const item of planDisclosures(session.review_manifest)) warns.push(item);
+    if (petalApproval) primaryWarnings.push(petalApproval.warning);
+    else for (const item of planDisclosures(session.review_manifest)) detailNotes.push(item);
   }
   // Reading order: what this is, who it moves value or permission to, the
   // consequences, then the supporting facts. Byte-level identity is the last
@@ -1013,55 +1282,86 @@ function renderReview(session) {
     if (intent.detail) block.append(el("p", {class: "ceremony-detail"}, intent.detail));
     return block;
   };
-  const parts = [];
+  const decision = [];
+  const evidence = [];
+  if (transfer?.tokenAsset) {
+    decision.push(assetCard(transfer.tokenAsset));
+  }
+  for (const card of transfer?.safeCards || []) {
+    const section = el("section", {class: "ceremony-card"},
+      el("p", {class: "ceremony-card-position"}, card.position),
+      el("h2", {class: "ceremony-section-title"}, card.title),
+      card.asset ? assetCard(card.asset) : null);
+    for (const [label, value] of card.parties) {
+      section.append(partyRow({role: label.toLowerCase(), label, value, chainId: transfer.chainId}));
+    }
+    decision.push(section);
+  }
+  for (const [label, value] of transfer?.safeParties || []) {
+    decision.push(partyRow({role: label.toLowerCase(), label, value, chainId: transfer.chainId}));
+  }
   if (transfer?.intent) {
     panelTitle.textContent = transfer.intent.heading;
     panelTitle.setAttribute("data-action", transfer.intent.action);
     panelTitle.setAttribute("data-magnitude", transfer.intent.magnitude || "");
     const token = transfer.parties?.find(party => party.role === "token");
+    const summary = transfer.assetSummary;
     if (token && transfer.intent.action !== "batch") {
-      // Keep the full contract identity visible beside the decorative logo.
-      const asset = partyRow({...token, label: "Token contract"});
-      asset.className = "ceremony-party ceremony-asset-identity";
-      const icon = el("span", {class: "ceremony-token-icon", "aria-hidden": "true"},
-        tokenReviewIcon(token.chainId, token.value));
-      const summary = transfer.assetSummary;
+      const identity = summary?.token;
+      const unlimited = summary?.magnitude === "unlimited";
       const sending = summary?.action === "transfer";
-      if (sending) panelTitle.textContent = "Requested transfer";
-      const amount = summary && !sending ? el("div", {class: "ceremony-asset-amount permission"},
-        el("span", {class: "ceremony-amount-label"}, sending ? "You send · requested" : "Spending limit"),
-        el("strong", {}, sending ? `−${summary.amount_display}`
-          : summary.magnitude === "unlimited" ? "Unlimited" : summary.amount_display)) : null;
-      parts.push(el("section", {class: "ceremony-asset", "aria-label": "Token being transferred or approved"}, icon, asset, amount));
+      decision.push(assetCard({
+        chainId: token.chainId,
+        address: token.value,
+        title: identity?.name || token.name,
+        subtitle: identity?.symbol,
+        amount: !summary ? null : unlimited ? "Unlimited" : summary.amount_display,
+        amountLabel: sending ? "Amount" : "Spending limit",
+        tone: unlimited ? "danger" : sending ? "outgoing" : "permission"
+      }));
+    } else if (transfer.intent.action === "send") {
+      const display = String(transfer.payloads?.[0]?.value_display || "");
+      const eth = / ETH$/.test(display);
+      decision.push(assetCard({
+        native: eth ? "ethereum" : "token",
+        title: eth ? "Ether" : "Native asset",
+        amount: display,
+        amountLabel: "Amount",
+        tone: "outgoing"
+      }));
     }
-    if (transfer.intent.detail) parts.push(intentBlock(transfer.intent));
+    if (transfer.intent.detail) decision.push(intentBlock(transfer.intent));
     for (const [index, payload] of (transfer.payloads || []).entries()) {
-      const call = payload.contract_call;
+      const call = reviewedContractCall(payload);
       if (!call || call.intent_summary) continue;
       const argumentsList = el("dl", {class: "facts"});
-      for (const field of call.fields || []) {
+      for (const field of reviewCallFields(call)) {
         const explorer = addressExplorer(payload.chain_id, field.value);
         const value = explorer ? explorerAnchor(explorer, field.value, field.label)
           : el("code", {}, field.value);
         argumentsList.append(el("dt", {}, field.label), el("dd", {}, value));
       }
-      parts.push(el("section", {class: "ceremony-call-arguments"},
+      decision.push(el("section", {class: "ceremony-call-arguments"},
         el("h2", {class: "ceremony-section-title"}, transfer.payloads.length > 1 ? `Transaction ${index + 1} arguments` : "Function arguments"),
         el("code", {class: "ceremony-function"}, call.function_signature),
         argumentsList));
     }
-    const warningParts = [];
     if (transfer.warnings?.length) {
-      const warningGroup = el("aside", {class: "ceremony-warning", "aria-label": "Risks and consequences"});
-      if (transfer.intent.magnitude === "unlimited") {
-        warningGroup.setAttribute("data-severity", "danger");
-      }
-      for (const warning of transfer.warnings) warningGroup.append(el("p", {}, warning));
-      warningParts.push(warningGroup);
+      primaryWarnings.push(...transfer.warnings);
     }
     for (const card of transfer.intent.cards || []) {
+      const unlimited = card.magnitude === "unlimited";
       const wrapper = el("section", {class: "ceremony-card"},
         el("p", {class: "ceremony-card-position"}, `Transaction ${card.position}`),
+        card.token ? assetCard({
+          chainId: card.chainId,
+          address: card.token.address,
+          title: card.token.name,
+          subtitle: card.token.symbol,
+          amount: unlimited ? "Unlimited" : card.amountDisplay,
+          amountLabel: card.tokenAction === "transfer" ? "Amount" : "Spending limit",
+          tone: unlimited ? "danger" : card.tokenAction === "transfer" ? "outgoing" : "permission"
+        }) : null,
         intentBlock(card.intent, true));
       if (card.counterparty) {
         wrapper.append(el("div", {class: "ceremony-identity"},
@@ -1075,7 +1375,7 @@ function renderReview(session) {
           partyRow({role: "contract", label: "Contract called", name: card.contractName,
             value: card.contract, chainId: card.chainId})));
       }
-      parts.push(wrapper);
+      decision.push(wrapper);
     }
     if (transfer.parties?.length) {
       const isTransfer = ["transfer", "send"].includes(transfer.intent.action);
@@ -1083,7 +1383,8 @@ function renderReview(session) {
         transfer.intent.action === "batch" ? party.role === "source" : party !== token).sort((a, b) =>
           Number(b.role === "spender") - Number(a.role === "spender"));
       const flow = el("div", {class: `ceremony-identity ${isTransfer ? "ceremony-transfer-path" : "ceremony-permission"}`});
-      const movement = transfer.assetSummary?.action === "transfer" ? transfer.assetSummary.amount_display : null;
+      const movement = isTransfer && transfer.assetSummary?.action === "transfer"
+        ? transfer.assetSummary.amount_display : null;
       for (const party of parties) {
         if (isTransfer && party.role === "recipient") {
           flow.append(el("div", {class: "ceremony-flow-arrow", "aria-hidden": "true"}, "↓"));
@@ -1093,9 +1394,8 @@ function renderReview(session) {
         flow.append(partyRow({...party, change,
           ...(party.role === "source" ? {label: isTransfer ? "Sender" : "Your wallet", name: walletName} : {})}));
       }
-      parts.push(flow);
+      decision.push(flow);
     }
-    parts.push(...warningParts);
     for (const [index, payload] of (transfer.payloads || []).entries()) {
       if (!payload.calldata_keccak) continue;
       const name = payload.destination ? "Calldata" : "Initcode";
@@ -1104,13 +1404,13 @@ function renderReview(session) {
         el("summary", {}, `${prefix}${name} · ${payload.calldata_bytes} bytes`),
         payload.calldata_hex ? el("pre", {}, payload.calldata_hex)
           : el("p", {class: "ceremony-assurance"}, "This older review records only the data length and hash. Prepare a new review to see the bytes."));
-      if (!payload.contract_call) raw.setAttribute("open", "");
-      parts.push(payload.contract_call ? raw : el("section", {class: "ceremony-raw"}, raw));
+      if (!reviewedContractCall(payload)) raw.setAttribute("open", "");
+      evidence.push(reviewedContractCall(payload) ? raw : el("section", {class: "ceremony-raw"}, raw));
     }
   } else {
-    parts.push(el("p", {class: "summary", html: summaryHtml}));
+    if (transfer?.warnings?.length) primaryWarnings.push(...transfer.warnings);
   }
-  parts.push(facts);
+  evidence.push(facts);
   for (const [index, payload] of (transfer?.payloads || []).entries()) {
     const exact = payload.maximum_execution_gas_fee_display;
     const label = transfer.payloads.length > 1 ? `Transaction ${index + 1} gas fee` : "Gas fee";
@@ -1118,22 +1418,23 @@ function renderReview(session) {
       reviewIcon(exact.endsWith(" ETH") ? "ethereum" : "token"),
       el("span", {}, `Up to ${compactFeeCap(exact)}`))
       : el("span", {}, "Cannot be shown for this network");
-    parts.push(el("div", {class: "ceremony-fee", "aria-label": "Execution gas only; other network charges may apply"},
+    decision.push(el("div", {class: "ceremony-fee", "aria-label": "Execution gas only; other network charges may apply"},
       el("span", {class: "ceremony-fee-label"}, label), amount));
   }
-  if (meta.warn) warns.unshift(meta.warn);
-  for (const w of warns) parts.push(el("p", {class: "warn"}, w));
+  if (meta.warn) primaryWarnings.unshift(meta.warn);
+  for (const note of detailNotes) evidence.push(el("p", {class: "ceremony-assurance"}, note));
 
   if (transfer?.interpretation?.length) {
     const rows = el("dl", {class: "facts"});
     for (const [label, value, mono] of transfer.interpretation) {
       rows.append(el("dt", {}, label), el("dd", {}, mono ? el("code", {}, value) : value));
     }
-    parts.push(el("details", {class: "ceremony-details"},
+    evidence.push(el("details", {class: "ceremony-details"},
       el("summary", {}, "How this was interpreted"),
-      el("p", {}, "The catalog publisher is trusted to describe this deployment accurately, and a " +
-        "signature authenticates that claim. It is not proof of what the contract does, and Bloom " +
-        "did not execute anything."),
+      el("p", {}, transfer.mixedAssurance
+        ? "Catalogued calls are read with descriptions built into this Bloom release. Structural calls are decoded from their exact calldata without trusting a deployment identity. Neither reading proves execution behavior."
+        : "This call is read with a description of this deployment built into this Bloom release. " +
+          "It is not proof of what the contract does, and Bloom did not execute anything."),
       rows));
   }
   if (transfer?.technical?.length) {
@@ -1144,28 +1445,37 @@ function renderReview(session) {
         : mono ? el("code", {}, value) : value;
       technical.append(el("dt", {}, label), el("dd", {}, shown));
     }
-    parts.push(el("details", {class: "signed technical"},
-      el("summary", {}, "Technical details — nonce, fees, exact byte commitments"),
+    evidence.push(el("details", {class: "signed technical"},
+      el("summary", {}, "Raw values and byte commitments"),
       technical));
   }
   if (kind !== "key_derive" && custodyManifest && typeof manifest.canonical_plan === "string" &&
       manifest.canonical_plan.trim()) {
-    parts.push(el("details", {class: "signed ceremony-details"},
+    evidence.push(el("details", {class: "signed ceremony-details"},
       el("summary", {}, "The exact plan that was reviewed"),
       el("pre", {}, manifest.canonical_plan)));
   }
   const signed = session.review_manifest || {
     ceremony_kind: kind, signer_contribution: session.signer_contribution
   };
-  parts.push(el("details", {class: "signed"},
+  evidence.push(el("details", {class: "signed"},
     el("summary", {}, "What your passkey signs (signed manifest)"),
     el("pre", {}, canonicalJson(signed).replace(/,"/g, ',\n"'))));
-  const disclosures = parts.filter(node => node.tagName === "DETAILS");
-  reviewNode.replaceChildren(...parts.filter(node => node.tagName !== "DETAILS"),
+  const warning = primaryWarnings.filter(Boolean).length
+    ? el("aside", {class: "ceremony-warning", "aria-label": "Risk to review"},
+        el("p", {}, [...new Set(primaryWarnings.filter(Boolean))].join(" ")))
+    : null;
+  const primary = [];
+  if (summaryHtml) primary.push(el("p", {class: "summary", html: summaryHtml}));
+  const hero = decision.filter(node => String(node.className || "").includes("ceremony-asset"));
+  const rest = decision.filter(node => !String(node.className || "").includes("ceremony-asset"));
+  primary.push(...hero, ...rest);
+  if (warning) primary.push(warning);
+  reviewNode.replaceChildren(...primary,
     el("details", {class: "ceremony-details ceremony-evidence"},
       el("summary", {}, "Verification and technical details"),
       transfer?.assurance ? el("p", {class: "ceremony-assurance"}, transfer.assurance) : null,
-      ...disclosures));
+      ...evidence));
   startExpiry(session, expiry);
 }
 
@@ -1854,16 +2164,16 @@ function requireLiveApproval(session) {
 // including the typed intent; nothing here is a hand-drawn mockup.
 const PREVIEW_WALLET = "0x252aF4bf35C95d7d9AB3De1eB0Ee40D38DD3e5B4";
 const PREVIEW_SPENDER = "0x9fE46736679d2d9a65F0992F2272dE9f3c7fa6e0";
-const PREVIEW_TOKEN = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
+const PREVIEW_TOKEN = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const PREVIEW_TOKEN_IDENTITY =
-  {address: PREVIEW_TOKEN, symbol: "BDT", name: "Bloom Demo Token", decimals: 6};
+  {address: PREVIEW_TOKEN, symbol: "USDC", name: "USD Coin", decimals: 6};
 const PREVIEW_ASSURANCE =
-  "Interpreted using a trusted signed description. Contract behavior has not been verified.";
+  "Interpreted using Bloom's description of this contract. Contract behavior has not been verified.";
 const PREVIEW_ALLOWANCE_ADVISORY =
   "This spender can move your tokens later without another approval. The permission does not expire with this review.";
 function previewPayload(extra) {
   const payload = Object.assign({
-    chain_id: "31337", chain: "anvil", sender: PREVIEW_WALLET, destination: PREVIEW_TOKEN,
+    chain_id: "8453", chain: "base", sender: PREVIEW_WALLET, destination: PREVIEW_TOKEN,
     value: "0", value_display: "0 ETH", nonce: "7", gas_limit: "65410",
     fee: {kind: "eip1559", max_fee_per_gas: "3034880652", max_fee_per_gas_display: "3.03 gwei",
           max_priority_fee_per_gas: "151744032", max_priority_fee_per_gas_display: "0.15 gwei"},
@@ -1872,30 +2182,25 @@ function previewPayload(extra) {
     calldata_bytes: "68",
     calldata_keccak: "11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"
   }, extra);
-  const summary = payload.contract_call?.intent_summary;
+  const summary = reviewedContractCall(payload)?.intent_summary;
   if (summary) payload.calldata_hex = (summary.action === "transfer" ? "0xa9059cbb" : "0x095ea7b3") +
     summary.counterparty.slice(2).toLowerCase().padStart(64, "0") + BigInt(summary.amount).toString(16).padStart(64, "0");
   return payload;
 }
-function previewClearSigning() {
+function previewClearSigning(chainId = "8453", token = PREVIEW_TOKEN) {
   return {
-    assurance: "trusted_description", verifier_id: "evm-clear-signing-v1",
-    verifier_digest: "2c75ec2390991c0bbab6e17694525cd46ef65614fa31e62cadac6aab58751a15",
-    catalog_id: "bloom-demo-tokens", catalog_sequence: "5",
-    catalog_digest: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
-    catalog_expires_at_ms: String(Date.now() + 86400000),
-    entries: [{chain_id: "31337", contract_address: PREVIEW_TOKEN,
-               observed_at_ms: String(Date.now() - 3600000), upgradeable: false}]
+    assurance: "trusted_description",
+    entries: [{chain_id: chainId, contract_address: token, upgradeable: false}]
   };
 }
-function previewCall(action, amount, amountDisplay, magnitude, warnings) {
+function previewCall(action, amount, amountDisplay, magnitude, warnings, token = PREVIEW_TOKEN_IDENTITY) {
   const role = action === "transfer" ? "recipient" : "spender";
   return {
-    contract: PREVIEW_TOKEN, contract_name: "Bloom Demo Token",
+    contract: token.address, contract_name: token.name,
     function_signature: action === "transfer"
       ? "transfer(address to, uint256 amount)" : "approve(address spender, uint256 amount)",
     selector: action === "transfer" ? "0xa9059cbb" : "0x095ea7b3",
-    action, token: PREVIEW_TOKEN_IDENTITY, assurance: PREVIEW_ASSURANCE,
+    action, token, assurance: PREVIEW_ASSURANCE,
     fields: [
       {label: action === "transfer" ? "To" : "Spender", format: "addressName",
        value: PREVIEW_SPENDER, raw: PREVIEW_SPENDER},
@@ -1903,8 +2208,32 @@ function previewCall(action, amount, amountDisplay, magnitude, warnings) {
     ],
     intent_summary: {
       action, counterparty_role: role, counterparty: PREVIEW_SPENDER,
-      amount, amount_display: amountDisplay, magnitude, token: PREVIEW_TOKEN_IDENTITY
+      amount, amount_display: amountDisplay, magnitude, token
     },
+    warnings
+  };
+}
+function previewStructuralCall(action, amount, magnitude, warnings, contract = PREVIEW_TOKEN) {
+  const role = action === "transfer" ? "recipient" : "spender";
+  const amountDisplay = `${amount} raw units`;
+  return {
+    contract,
+    function_signature: action === "transfer"
+      ? "transfer(address,uint256)" : "approve(address,uint256)",
+    selector: action === "transfer" ? "0xa9059cbb" : "0x095ea7b3",
+    action,
+    fields: [
+      {label: action === "transfer" ? "Recipient" : "Spender", format: "addressName",
+       value: PREVIEW_SPENDER, raw: PREVIEW_SPENDER},
+      {label: action === "transfer" ? "Raw token amount" : "Raw total allowance",
+       format: "raw", value: amount, raw: amount}
+    ],
+    intent_summary: {
+      action, counterparty_role: role, counterparty: PREVIEW_SPENDER,
+      amount, amount_display: amountDisplay, magnitude
+    },
+    structural: true,
+    assurance: "Decoded from the standard ERC-20 calldata shape. Bloom verified the exact arguments, but not that this contract is a token or follows ERC-20 behavior.",
     warnings
   };
 }
@@ -1948,7 +2277,7 @@ const PREVIEW_PROTOCOL_CALLS = {
         "raw": "0x2222222222222222222222222222222222222222"
       }
     ],
-    "assurance": "Interpreted using a trusted signed description. Contract behavior has not been verified.",
+    "assurance": "Interpreted using Bloom's description of this contract. Contract behavior has not been verified.",
     "warnings": []
   },
   "operator-approval": {
@@ -1971,7 +2300,7 @@ const PREVIEW_PROTOCOL_CALLS = {
         "raw": "true"
       }
     ],
-    "assurance": "Interpreted using a trusted signed description. Contract behavior has not been verified.",
+    "assurance": "Interpreted using Bloom's description of this contract. Contract behavior has not been verified.",
     "warnings": []
   },
   "stake-static": {
@@ -1988,19 +2317,59 @@ const PREVIEW_PROTOCOL_CALLS = {
         "raw": "250000000"
       }
     ],
-    "assurance": "Interpreted using a trusted signed description. Contract behavior has not been verified.",
+    "assurance": "Interpreted using Bloom's description of this contract. Contract behavior has not been verified.",
     "warnings": []
   }
 };
 function previewProtocolCall(name) {
   const call = PREVIEW_PROTOCOL_CALLS[name];
-  const clear = {...previewClearSigning(), catalog_id: "synthetic-protocol-fixtures", entries: []};
+  const clear = {...previewClearSigning(), entries: []};
   const session = previewApproval([previewPayload({chain_id: "1", chain: "ethereum",
     destination: call.contract, contract_call: call})], clear);
   session.preview_status = "Synthetic descriptor test — not a deployed protocol integration";
   return session;
 }
+function previewSafeTransaction(action, extra = {}) {
+  const session = PREVIEWS.morpho();
+  const plan = JSON.parse(session.review_manifest.canonical_plan);
+  const warnings = plan.safe_review.action.filter(line => line.startsWith("Warning: "));
+  Object.assign(plan.safe_review, {destination: PREVIEW_TOKEN, operation: "call",
+    action: [...action, ...warnings]}, extra);
+  session.review_manifest.canonical_plan = JSON.stringify(plan);
+  return session;
+}
 const PREVIEWS = {
+  "safe-token-transfer": () => previewSafeTransaction([
+    `Action: transfer on USD Coin ${PREVIEW_TOKEN}`,
+    `To: ${PREVIEW_SPENDER}`, "Amount: 25 USDC"
+  ]),
+  "safe-allowance-unlimited": () => previewSafeTransaction([
+    `Action: approve on USD Coin ${PREVIEW_TOKEN}`,
+    `Spender: ${PREVIEW_SPENDER}`,
+    "Amount: 115792089237316195423570985008687907853269984665640564039457584007913129.639935 USDC",
+    "Warning: This spender can use all current and future USDC held by the Safe without asking again."
+  ]),
+  "safe-native-send": () => previewSafeTransaction([
+    `Action: Send 0.0001 ETH to ${PREVIEW_SPENDER}`
+  ], {destination: PREVIEW_SPENDER, value: "100000000000000", value_display: "0.0001 ETH"}),
+  "safe-morpho-batch": () => {
+    const session = PREVIEWS.morpho();
+    const plan = JSON.parse(session.review_manifest.canonical_plan);
+    const action = plan.safe_review.action;
+    plan.safe_review.destination = "0x9641d764fc13c8B624c04430C7356C1C7C8102e2";
+    plan.safe_review.operation = "delegatecall";
+    plan.safe_review.action = [
+      "Action: multiSend on Safe batch 0x9641d764fc13c8B624c04430C7356C1C7C8102e2",
+      "Transaction 1: approve on USD Coin 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "Transaction 1 · Spender: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+      "Transaction 1 · Amount: 2.5 USDC",
+      ...action.map(line => line.startsWith("Warning: ") ? line
+        : line.startsWith("Action: ") ? line.replace("Action: ", "Transaction 2: ")
+        : `Transaction 2 · ${line}`)
+    ];
+    session.review_manifest.canonical_plan = JSON.stringify(plan);
+    return session;
+  },
   "deposit-static": () => previewProtocolCall("deposit-static"),
   "stake-static": () => previewProtocolCall("stake-static"),
   "operator-approval": () => previewProtocolCall("operator-approval"),
@@ -2011,30 +2380,43 @@ const PREVIEWS = {
     return session;
   },
   transfer: () => previewApproval([previewPayload({
-    contract_call: previewCall("transfer", "250000000", "250 BDT", "finite", [])
+    contract_call: previewCall("transfer", "250000000", "250 USDC", "finite", [])
   })], previewClearSigning()),
+  "structural-transfer": () => previewApproval([previewPayload({
+    contract_call: previewStructuralCall("transfer", "250000000", "finite", [
+      `Bloom decoded an ERC-20-shaped call to ${PREVIEW_TOKEN}, but has not verified that this contract is a token or follows ERC-20 behavior.`])
+  })], null),
+  "structural-allowance-unlimited": () => previewApproval([previewPayload({
+    contract_call: previewStructuralCall("allowance",
+      "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+      "unlimited", [
+        `Bloom decoded an ERC-20-shaped call to ${PREVIEW_TOKEN}, but has not verified that this contract is a token or follows ERC-20 behavior.`,
+        "The decoded allowance is the maximum uint256. If this contract behaves as ERC-20, the spender can use all current and future tokens without asking again, and the permission has no expiry."])
+  })], null),
   "transfer-ethereum": () => {
+    const token = {...PREVIEW_TOKEN_IDENTITY, address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"};
     const session = previewApproval([previewPayload({chain_id: "1", chain: "ethereum",
-      contract_call: previewCall("transfer", "250000000", "250 BDT", "finite", [])
-    })], previewClearSigning());
-    session.preview_status = "Synthetic Ethereum example — addresses are for layout testing only";
+      destination: token.address,
+      contract_call: previewCall("transfer", "250000000", "250 USDC", "finite", [], token)
+    })], previewClearSigning("1", token.address));
+    session.preview_status = "Example transaction using Ethereum USDC — nothing can be approved";
     return session;
   },
   "allowance-finite": () => previewApproval([previewPayload({
-    contract_call: previewCall("allowance", "100000000", "100 BDT", "finite", [
+    contract_call: previewCall("allowance", "100000000", "100 USDC", "finite", [
       PREVIEW_ALLOWANCE_ADVISORY,
       "This sets the spender's total allowance to the amount shown. It is not added to any existing allowance."])
   })], previewClearSigning()),
   "allowance-zero": () => previewApproval([previewPayload({
-    contract_call: previewCall("allowance", "0", "0 BDT", "zero", [
+    contract_call: previewCall("allowance", "0", "0 USDC", "zero", [
       "This sets the spender's allowance to zero, clearing it."])
   })], previewClearSigning()),
   "allowance-unlimited": () => previewApproval([previewPayload({
     contract_call: previewCall("allowance",
       "115792089237316195423570985008687907853269984665640564039457584007913129639935",
-      "115792089237316195423570985008687907853269984665640564039457584007913129639.935935 BDT",
+      "115792089237316195423570985008687907853269984665640564039457584007913129.639935 USDC",
       "unlimited", [
-        "If executed, this spender can use all your current and future BDT without asking again. This permission has no expiry; changing it requires another transaction."])
+        "If executed, this spender can use all your current and future USDC without asking again. This permission has no expiry; changing it requires another transaction."])
   })], previewClearSigning()),
   "opaque-call": () => previewApproval([previewPayload({calldata_hex:
     "0xa9059cbb" + PREVIEW_SPENDER.slice(2).toLowerCase().padStart(64, "0") +
@@ -2044,33 +2426,25 @@ const PREVIEWS = {
     calldata_bytes: "0", calldata_keccak: undefined
   })], null),
   batch: () => previewApproval([
-    previewPayload({contract_call: previewCall("allowance", "100000000", "100 BDT", "finite", [
+    previewPayload({contract_call: previewCall("allowance", "100000000", "100 USDC", "finite", [
       PREVIEW_ALLOWANCE_ADVISORY,
       "This sets the spender's total allowance to the amount shown. It is not added to any existing allowance."])}),
     previewPayload({nonce: "8",
-      contract_call: previewCall("transfer", "250000000", "250 BDT", "finite", [])})
+      contract_call: previewCall("transfer", "250000000", "250 USDC", "finite", [])})
+  ], previewClearSigning()),
+  "mixed-assurance": () => previewApproval([
+    previewPayload({contract_call: previewCall("transfer", "250000000", "250 USDC", "finite", [])}),
+    previewPayload({nonce: "8", destination: PREVIEW_SPENDER,
+      contract_call: previewStructuralCall("transfer", "42", "finite", [
+        `Bloom decoded an ERC-20-shaped call to ${PREVIEW_SPENDER}, but has not verified that this contract is a token or follows ERC-20 behavior.`], PREVIEW_SPENDER)})
   ], previewClearSigning()),
   "long-identity": () => previewApproval([previewPayload({
     contract_call: Object.assign(
-      previewCall("transfer", "1", "0.000001 BDT", "finite", []),
+      previewCall("transfer", "1", "0.000001 USDC", "finite", []),
       {contract_name: "<script>alert(1)</script> Extremely Long Token Name That Should Wrap Rather Than Overflow",
        token: Object.assign({}, PREVIEW_TOKEN_IDENTITY,
          {name: "<b>Bloom</b> Demo Token With An Unusually Long Descriptive Name"})})
   })], previewClearSigning()),
-  "policy-unlimited": () => ({
-    ceremony_kind: "policy_update", expires_at_ms: Date.now() + 9 * 60 * 1000,
-    signer_contribution: {wallet_id: "clearsign-owner"},
-    review_manifest: {
-      schema: "bloom.custody_ceremony_review.v1", title: "Approve a policy change",
-      summary: "Review the policy change below.",
-      authority_diff: {
-        clear_signing: {
-          before: {unlimited_allowance_allowed: false},
-          after: {unlimited_allowance_allowed: true}
-        }
-      }
-    }
-  }),
   expiring: () => {
     const session = PREVIEWS.transfer();
     session.expires_at_ms = Date.now() + 25 * 1000;
@@ -2083,7 +2457,47 @@ const PREVIEWS = {
     session.preview_terminal = "cancelled";
     session.preview_status = "Cancelled";
     return session;
-  }
+  },
+  // The Safe review exercised by evm_manifest_is_rendered_as_primary_review_facts.
+  // A preview name is not a ceremony token and this session cannot be approved.
+  morpho: () => ({
+    ceremony_kind: "sealed_approval",
+    expires_at_ms: Date.now() + 9 * 60 * 1000,
+    signer_contribution: {},
+    review_manifest: {
+      schema: "bloom.review-manifest.v1",
+      canonical_plan: JSON.stringify({
+        safe_review: {
+          chain_id: "8453", chain: "base",
+          safe: "0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61",
+          owner: "0x86dB2acbF74856fd3286Cb5B755A5a05Ba445864",
+          nonce: "2", operation: "call",
+          destination: "0x6BFd8137e702540E7A42B74178A4a49Ba43920C4",
+          value: "0", value_display: "0 ETH",
+          action: [
+            "Action: multicall on Morpho Bundler3 0x6BFd8137e702540E7A42B74178A4a49Ba43920C4",
+            "Action 1: erc20TransferFrom on Morpho GeneralAdapter1 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+            "Action 1 · Amount: 2.5 USDC",
+            "Action 1 · Token: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "Action 1 · Sent to: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+            "Action contract 1: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+            "Action sends 1: 0 ETH",
+            "Action 2: erc4626Deposit on Morpho GeneralAdapter1 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+            "Action 2 · Vault: 0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca",
+            "Action 2 · Assets (raw units): 2500000",
+            "Action 2 · Highest share price (1e27 scale): 1097016817869820",
+            "Action 2 · Shares go to: 0x86dB2acbF74856fd3286Cb5B755A5a05Ba445864",
+            "Action contract 2: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+            "Action sends 2: 0 ETH",
+            "Warning: Bloom cannot check that 0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61 is a Safe; it reads it as one."
+          ],
+          safe_tx_hash: "0x5160acd8c69384337afae5de65027a3fef41f5ba421060d78f9d0c87fa1b3d17"
+        },
+        security_disclosures: ["Bloom rebuilt the Safe transaction from the exact signing bytes."]
+      }),
+      attributed_advisory_items: []
+    }
+  })
 };
 
 // Design previews. They render through this renderer — the one the Broker

@@ -11,7 +11,7 @@ use bloom_broker::{
         ReviewManifestContext,
     },
     clock::BrokerClock,
-    journal::{AuditSigner, BrokerJournal, FrozenReview, NewApprovalRecord},
+    journal::{AuditSigner, BrokerJournal, NewApprovalRecord},
     service::BrokerRpcService,
     signer_client::BrokerSignerClient,
 };
@@ -328,7 +328,7 @@ fn evm_manifest_is_rendered_as_primary_review_facts() {
         r#"
 class Node {{
   constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
-  setAttribute() {{}}
+  setAttribute(name, value) {{ this[name] = value; }}
   append(...children) {{ this.children.push(...children); }}
   replaceChildren(...children) {{ this.children = children; }}
 }}
@@ -436,7 +436,7 @@ for (const expected of ["Deploy a contract", "Initcode", "5 bytes", "0xcafe"]) {
   if (!rendered.includes(expected)) throw new Error(`creation not disclosed ${{expected}}: ${{rendered}}`);
 }}
 
-// A Safe review is the headline, with the Petal-reported state marked unverified.
+// A Safe review is the headline.
 renderReview({{
   ceremony_kind: "sealed_approval",
   expires_at_ms: Date.now() + 60000,
@@ -451,23 +451,267 @@ renderReview({{
       destination: "0x5000000000000000000000000000000000000000",
       value: "0", value_display: "0 ETH",
       action: ["Action: ERC-20 transfer", "Token: 0x5000000000000000000000000000000000000000",
-        "Recipient: 0x6000000000000000000000000000000000000000", "Token amount (base units): 123"],
-      safe_tx_hash: "0x9565",
-      reported: {{version: "1.4.1", singleton: "0x41", singleton_code_hash: "0x1f",
-        owners: ["0x3000000000000000000000000000000000000000", "0xaaaa"], threshold: "2",
-        guard: "0x0000000000000000000000000000000000000000", modules: [],
-        fallback_handler: "0x0000000000000000000000000000000000000000"}}
+        "Recipient: 0x6000000000000000000000000000000000000000", "Token amount (base units): 123",
+        "Warning: this removes this Bloom wallet from the Safe's owners"],
+      safe_tx_hash: "0x9565"
+    }}, security_disclosures: ["Safe transaction rebuilt from the exact signing bytes."]}}),
+    attributed_advisory_items: []
+  }}
+}});
+rendered = [nodes["panel-title"], nodes.review].map(allText).join(" ");
+for (const expected of ["Send 123 base units", "ERC-20 transfer",
+  "0x6000000000000000000000000000000000000000", "Token amount (base units)", "123",
+  "Nonce", "0x9565", "rebuilt from the exact signing bytes"]) {{
+  if (!rendered.includes(expected)) throw new Error(`Safe review not disclosed ${{expected}}: ${{rendered}}`);
+}}
+const safeFactText = (nodes.review.children.find(node => node.tagName === "DETAILS")?.children || [])
+  .filter(node => node && node.tagName === "DL" && node.className === "facts")
+  .map(allText).join(" ");
+if (safeFactText.includes("Token amount (base units): 123") || safeFactText.includes("What changes") || safeFactText.includes("; ")) {{
+  throw new Error(`Safe review still dumps action lines: ${{safeFactText}}`);
+}}
+const openTags = nodes.review.children.map(node => node.tagName);
+if (openTags.join(",") !== "P,SECTION,ASIDE,DETAILS") {{
+  throw new Error(`Safe open view is not summary, decision, warning, details: ${{openTags}}`);
+}}
+const banners = node => !node || typeof node === "string" ? [] : [
+  ...(node.className === "ceremony-warning" ? [node] : []),
+  ...(node.children || []).flatMap(banners)
+];
+if (!banners(nodes.review).some(node => allText(node).includes("removes this Bloom wallet"))) {{
+  throw new Error("Safe owner removal warning missing from the warning banner");
+}}
+
+// Safe self-calls use the change itself as the heading, not a Solidity
+// function name or the generic "Requested action" placeholder.
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "wallet-primary"}},
+  review_manifest: {{
+    schema: "bloom.review-manifest.v1",
+    canonical_plan: JSON.stringify({{safe_review: {{
+      chain_id: "8453", chain: "base",
+      safe: "0x1000000000000000000000000000000000000000",
+      owner: "0x3000000000000000000000000000000000000000",
+      nonce: "2", operation: "call",
+      destination: "0x1000000000000000000000000000000000000000",
+      value: "0", value_display: "0 ETH",
+      action: ["Action: addOwnerWithThreshold on Safe 0x1000000000000000000000000000000000000000",
+        "New owner: 0x7000000000000000000000000000000000000007",
+        "Signatures required: 1"],
+      safe_tx_hash: "0x9566"
     }}}}),
     attributed_advisory_items: []
   }}
 }});
-rendered = allText(nodes.review);
-for (const expected of ["Approve one Safe transaction", "ERC-20 transfer",
-  "0x6000000000000000000000000000000000000000", "Token amount (base units): 123",
-  "Safe nonce", "0x9565", "rebuilt from the exact signing bytes", "not verified",
-  "Reported by the Petal, not verified",
-  "Threshold 2 of 2 owners"]) {{
-  if (!rendered.includes(expected)) throw new Error(`Safe review not disclosed ${{expected}}: ${{rendered}}`);
+if (nodes["panel-title"].textContent !==
+    "Add owner 0x7000…0007; 1 signature still required") {{
+  throw new Error(`Safe owner heading stayed technical: ${{nodes["panel-title"].textContent}}`);
+}}
+if (allText(nodes.review).includes("Calls   0x1000000000000000000000000000000000000000")) {{
+  throw new Error("Safe self-call repeated the Safe as a Calls row");
+}}
+
+// Safe deployment helpers are implementation details, not approval language.
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "wallet-primary"}},
+  review_manifest: {{
+    schema: "bloom.review-manifest.v1",
+    canonical_plan: JSON.stringify({{safe_review: {{
+      chain_id: "8453", chain: "base",
+      safe: "0x1000000000000000000000000000000000000000",
+      owner: "0x3000000000000000000000000000000000000000",
+      nonce: "3", operation: "delegatecall",
+      destination: "0x9b35af71d77eaf8d7e40252370304687390a1a52",
+      value: "0", value_display: "0 ETH",
+      action: ["Action: performCreate on Safe CreateCall 0x9b35Af71d77eaf8d7e40252370304687390A1A52",
+        "Value: 0 ETH", "Initcode: 5 bytes"],
+      safe_tx_hash: "0x9567"
+    }}}}),
+    attributed_advisory_items: []
+  }}
+}});
+if (nodes["panel-title"].textContent !== "Create a contract") {{
+  throw new Error(`Safe deployment heading stayed technical: ${{nodes["panel-title"].textContent}}`);
+}}
+
+// A Morpho deposit has to show the amount, vault, and shares recipient
+// before details are opened, and details are rows rather than one dump.
+// The fixture is the non-authorizing /preview/morpho session.
+const morphoPreview = previewSession("morpho");
+if (!morphoPreview.is_preview || morphoPreview.ceremony_id) {{
+  throw new Error("morpho preview is a ceremony");
+}}
+renderReview(morphoPreview);
+if (nodes["panel-title"].textContent !== "Deposit 2.5 USDC into a Morpho vault") {{
+  throw new Error(`Morpho heading hid the amount: ${{nodes["panel-title"].textContent}}`);
+}}
+const morphoSummary = allText(nodes.review.children[0]);
+for (const expected of ["2.5 USDC", "0xc125…A2Ca", "0x86dB…5864", "Base"]) {{
+  if (!morphoSummary.includes(expected)) throw new Error(`Morpho summary hid ${{expected}}: ${{morphoSummary}}`);
+}}
+if (morphoSummary.includes("0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca") ||
+    morphoSummary.includes("erc4626Deposit") || morphoSummary.includes("; ")) {{
+  throw new Error(`Morpho summary dumped technical detail: ${{morphoSummary}}`);
+}}
+function walk(node, out = []) {{
+  if (!node || typeof node === "string") return out;
+  out.push(node);
+  for (const child of node.children || []) walk(child, out);
+  return out;
+}}
+function pairs(list) {{
+  const out = [];
+  const children = (list?.children || []).filter(child => child && typeof child !== "string");
+  for (let i = 0; i + 1 < children.length; i += 2) out.push([allText(children[i]).trim(), allText(children[i + 1]).trim()]);
+  return out;
+}}
+const morphoLists = walk(nodes.review).filter(node => node.tagName === "DL");
+const morphoFacts = pairs(morphoLists.find(node => node.className === "facts"));
+const morphoTechnical = pairs(morphoLists.find(node => String(node.className).includes("technical")));
+const factValue = label => morphoFacts.find(([name]) => name === label)?.[1] || "";
+for (const [label, expected] of [
+  ["Amount", "2.5 USDC"],
+  ["Token", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"],
+  ["Vault", "0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca"],
+  ["Shares recipient", "0x86dB2acbF74856fd3286Cb5B755A5a05Ba445864"],
+  ["Safe", "0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61"],
+  ["Network", "Base"],
+  ["Nonce", "2"]
+]) {{
+  if (!factValue(label).includes(expected)) {{
+    throw new Error(`Morpho detail ${{label}} was ${{JSON.stringify(factValue(label))}}`);
+  }}
+}}
+if (!factValue("Share bound").includes("share decimals") || factValue("Share bound") === "1097016817869820") {{
+  throw new Error(`Morpho share bound stayed raw: ${{factValue("Share bound")}}`);
+}}
+const factText = morphoFacts.map(pair => pair.join(" ")).join(" | ");
+if (factText.includes("erc4626Deposit") || factText.includes("erc20TransferFrom") ||
+    factText.includes("2500000") || factText.includes("; ")) {{
+  throw new Error(`Morpho decision rows include technical dump: ${{factText}}`);
+}}
+const technicalText = morphoTechnical.map(pair => pair.join(" ")).join(" | ");
+for (const expected of ["erc4626Deposit", "erc20TransferFrom", "2500000",
+  "0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+  "0x5160acd8c69384337afae5de65027a3fef41f5ba421060d78f9d0c87fa1b3d17",
+  "cannot check that"]) {{
+  if (!technicalText.includes(expected)) throw new Error(`Morpho technical detail hid ${{expected}}: ${{technicalText}}`);
+}}
+const morphoBanner = banners(nodes.review).map(allText).join(" ");
+if (!morphoBanner.includes("different contract") || morphoBanner.includes("cannot check that")) {{
+  throw new Error(`Morpho warning did not state the Safe-identity risk: ${{morphoBanner}}`);
+}}
+
+// Calling Bundler3 alone does not establish a deposit. Do not invent one
+// when the bundle only pulls tokens or reaches more than one vault.
+for (const extraVault of [false, true]) {{
+  const variant = previewSession("morpho");
+  const plan = JSON.parse(variant.review_manifest.canonical_plan);
+  if (extraVault) {{
+    plan.safe_review.action.push("Action 3: erc4626Deposit on Morpho GeneralAdapter1 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+      "Action 3 · Vault: 0x4000000000000000000000000000000000000000");
+  }} else {{
+    plan.safe_review.action = plan.safe_review.action.filter(line => !line.startsWith("Action 2"));
+  }}
+  variant.review_manifest.canonical_plan = JSON.stringify(plan);
+  renderReview(variant);
+  if (nodes["panel-title"].textContent !== "Review calls through Morpho") {{
+    throw new Error("Morpho bundle was mislabeled as a single deposit");
+  }}
+}}
+
+// A Safe batch states each movement in the heading and keeps one row per fact.
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "wallet-primary"}},
+  review_manifest: {{
+    schema: "bloom.review-manifest.v1",
+    canonical_plan: JSON.stringify({{safe_review: {{
+      chain_id: "8453", chain: "base",
+      safe: "0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61",
+      owner: "0x86dB2acbF74856fd3286Cb5B755A5a05Ba445864",
+      nonce: "3", operation: "delegatecall",
+      destination: "0x9641d764fc13c8B624c04430C7356C1C7C8102e2",
+      value: "0", value_display: "0 ETH",
+      action: [
+        "Action: multiSend on Safe batch 0x9641d764fc13c8B624c04430C7356C1C7C8102e2",
+        "Safe transaction · Transaction 1: transfer on USD Coin 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "Safe transaction · Transaction 1 · To: 0x4000000000000000000000000000000000000000",
+        "Safe transaction · Transaction 1 · Amount: 5 USDC",
+        "Safe transaction · Transaction 2: Send 0.0001 ETH to 0x6000000000000000000000000000000000000000",
+        "Warning: Bloom cannot check that 0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61 is a Safe; it reads it as one."
+      ],
+      safe_tx_hash: "0xaaaa"
+    }}}}),
+    attributed_advisory_items: []
+  }}
+}});
+if (nodes["panel-title"].textContent !== "Send 5 USDC and 0.0001 ETH") {{
+  throw new Error(`Safe batch heading hid the amounts: ${{nodes["panel-title"].textContent}}`);
+}}
+const batchSummary = allText(nodes.review.children[0]);
+if (!batchSummary.includes("5 USDC to 0x4000…0000") || !batchSummary.includes("0.0001 ETH to 0x6000…0000")) {{
+  throw new Error(`Safe batch summary hid a movement: ${{batchSummary}}`);
+}}
+
+// An approval in a Safe batch is a permission, not a second payment. A
+// mixed approval/Morpho bundle must not be headed as two USDC sends.
+const mixedSafe = previewSession("morpho");
+const mixedPlan = JSON.parse(mixedSafe.review_manifest.canonical_plan);
+mixedPlan.safe_review.action = [
+  "Action: multiSend on Safe batch 0x9641d764fc13c8B624c04430C7356C1C7C8102e2",
+  "Transaction 1: approve on USD Coin 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  "Transaction 1 · Spender: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+  "Transaction 1 · Amount: 2.5 USDC",
+  "Transaction 2: multicall on Morpho Bundler3 0x6BFd8137e702540E7A42B74178A4a49Ba43920C4",
+  "Transaction 2 · Action 1 · Amount: 2.5 USDC",
+  "Transaction 2 · Action 2 · Vault: 0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca"
+];
+mixedSafe.review_manifest.canonical_plan = JSON.stringify(mixedPlan);
+renderReview(mixedSafe);
+if (nodes["panel-title"].textContent !== "Review 2 Safe actions") {{
+  throw new Error("a spending permission was mislabeled as a payment");
+}}
+renderReview(previewSession("safe-morpho-batch"));
+const mixedPrimary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+for (const expected of ["Token spending permission", "Spending limit", "2.5 USDC", "Calls through Morpho", "Tokens supplied", "Vault", "Shares recipient"]) {{
+  if (!mixedPrimary.includes(expected)) throw new Error(`Safe action hidden before disclosure: ${{expected}}`);
+}}
+const mixedCards = nodes.review.children.filter(node => node.className === "ceremony-card");
+if (mixedCards.length !== 2 || mixedCards.some(card =>
+    !walk(card).some(node => node.tagName === "IMG" && node.src === "/assets/tokens/usdc.svg"))) {{
+  throw new Error("Safe approval/deposit cards lost their USDC artwork");
+}}
+
+// Safe's real ERC-20 reader puts the token contract in the action heading,
+// not in a separate Token field. Its artwork and permission still belong
+// beside the decision, including zero and maximum allowances.
+for (const amount of ["25 USDC", "0 USDC", "115792089237316195423570985008687907853269984665640564039457584007913129.639935 USDC"]) {{
+  const variant = previewSession("morpho");
+  const plan = JSON.parse(variant.review_manifest.canonical_plan);
+  plan.safe_review.action = [
+    "Action: approve on USD Coin 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "Spender: 0xb98c948CFA24072e58935BC004a8A7b376AE746A", `Amount: ${{amount}}`
+  ];
+  variant.review_manifest.canonical_plan = JSON.stringify(plan);
+  renderReview(variant);
+  const primary = nodes.review.children.filter(node => node.tagName !== "DETAILS");
+  const text = primary.map(allText).join(" ");
+  if (!primary.some(node => walk(node).some(child => child.tagName === "IMG" && child.src === "/assets/tokens/usdc.svg")) ||
+      !text.includes("Spending limit") || !text.includes("Spender")) {{
+    throw new Error("Safe allowance identity or spending limit is hidden");
+  }}
+  if (amount.startsWith("115792") && (!text.includes("Unlimited") || text.includes("115792"))) {{
+    throw new Error("Safe maximum allowance is not shown as Unlimited");
+  }}
+  if (amount === "0 USDC" && !nodes["panel-title"].textContent.includes("Clear spending permission")) {{
+    throw new Error("Safe zero allowance did not explain revocation");
+  }}
 }}
 
 // A batch member Bloom could not read is never shown as a plain send, and a
@@ -564,37 +808,6 @@ for (const expected of [
 // The old label understated the grant by calling it only a deploy permission.
 for (const stale of ["Allow deploying contracts on", "Stop allowing contract deployment on"]) {{
   if (rendered.includes(stale)) throw new Error(`stale policy wording ${{stale}}: ${{rendered}}`);
-}}
-
-// Without clear signing nothing is refused for being unreadable or
-// unlimited, so switching it off loosens the wallet and switching it on
-// tightens it. Each direction must say so.
-const strict = {{
-  catalog_id: "bloom-evm", signature_threshold: 2, maximum_observation_age_ms: 3600000,
-  unlimited_allowance_allowed: false, opaque_exact_allowed: false,
-  verifier: {{verifier_digest: "ab".repeat(32)}},
-  trusted_keys: [{{key_id: "publisher-1", verifying_key: "cd".repeat(32)}}]
-}};
-function renderClearSigning(before, after) {{
-  renderReview({{
-    ceremony_kind: "policy_update",
-    expires_at_ms: Date.now() + 60000,
-    signer_contribution: {{wallet_id: "wallet-primary"}},
-    review_manifest: {{schema: "bloom.review-manifest.v1",
-      authority_diff: {{clear_signing: {{before, after}}}}}}
-  }});
-  return [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
-}}
-const off = renderClearSigning(strict, null);
-if (!off.includes("on → off") || !off.includes("no longer refused") ||
-    off.includes("→ blocked") || off.includes("refused rather than approved unread")) {{
-  throw new Error(`disabling clear signing misdescribed: ${{off}}`);
-}}
-const on = renderClearSigning(null, strict);
-for (const expected of ["off → on", "Unlimited-allowance requests", "allowed → blocked",
-  "Descriptions come from catalog", "none → bloom-evm", "Publisher signatures required",
-  "none → 2", "Oldest usable observation", "none → 3600000", "publisher-1"]) {{
-  if (!on.includes(expected)) throw new Error(`enabling clear signing missing ${{expected}}: ${{on}}`);
 }}
 "#
     );
@@ -700,12 +913,15 @@ renderReview({{
 const primary = allText({{textContent: "", innerHTML: "", children:
   nodes.review.children.filter(child => child?.name !== "details")}});
 const technical = allText(nodes.review.children.find(child => child?.name === "details"));
-for (const phrase of ["this Petal", scope.package_hash, "No funds move", "buy tokens", "sell tokens",
-                      "return unused SOL", "main wallet key stays inside Bloom", "Up to 1h 0m"]) {{
+for (const phrase of ["this Petal", "no funds move", "main wallet key stays inside Bloom", "1h 0m"]) {{
   if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
 }}
 for (const internal of ["allowed_routes", "custody_operation_id", "package_hash", "r000010"]) {{
   if (primary.includes(internal)) throw new Error(`primary review exposed ${{internal}}: ${{primary}}`);
+}}
+for (const phrase of [scope.package_hash, "allowed_routes", "buy tokens", "sell tokens",
+                      "return unused SOL", "Up to 1h 0m"]) {{
+  if (!technical.includes(phrase)) throw new Error(`technical details omitted ${{phrase}}: ${{technical}}`);
 }}
 if (!technical.includes(scope.package_hash) || !technical.includes("allowed_routes")) {{
   throw new Error(`technical details omitted the exact signed scope: ${{technical}}`);
@@ -788,18 +1004,17 @@ renderReview({{
 const primary = allText({{textContent: "", innerHTML: "", children:
   nodes.review.children.filter(child => child?.name !== "details")}});
 const technical = allText(nodes.review.children.find(child => child?.name === "details"));
-for (const phrase of ["Finish setting up", "this Petal", packageHash, "buy tokens", "sell tokens",
-                      "return unused SOL", "Up to 256 signed actions",
-                      "Up to 0.5 SOL in total across the whole session",
-                      "main wallet key stays inside Bloom"]) {{
+for (const phrase of ["Finish setting up", "this Petal", "main wallet key stays inside Bloom"]) {{
   if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
 }}
 for (const internal of ["route_grants", "machine_asserted", "r000010",
                         "limits are asserted by the named Petal"]) {{
   if (primary.includes(internal)) throw new Error(`primary review exposed ${{internal}}: ${{primary}}`);
 }}
-if (!technical.includes(packageHash) || !technical.includes("route_grants")) {{
-  throw new Error(`technical details omitted the exact signed plan: ${{technical}}`);
+for (const phrase of [packageHash, "route_grants", "buy tokens", "sell tokens",
+                      "return unused SOL", "Up to 256 signed actions",
+                      "Up to 0.5 SOL in total across the whole session"]) {{
+  if (!technical.includes(phrase)) throw new Error(`technical details omitted ${{phrase}}: ${{technical}}`);
 }}
 if (nodes["page-title"].textContent !== "Finish temporary session setup" ||
     nodes.approve.textContent !== "Finish session setup") {{
@@ -819,10 +1034,9 @@ renderReview({{
     approval_id: "internal-approval-id"
   }}
 }});
-const unbudgeted = allText({{textContent: "", innerHTML: "", children:
-  nodes.review.children.filter(child => child?.name !== "details")}});
+const unbudgeted = allText(nodes.review.children.find(child => child?.name === "details"));
 if (!unbudgeted.includes("refuse any action that spends funds") || unbudgeted.includes("0.5 SOL")) {{
-  throw new Error(`an empty spending ceiling was not stated: ${{unbudgeted}}`);
+  throw new Error(`an empty spending ceiling was not stated in details: ${{unbudgeted}}`);
 }}
 "#
     );
@@ -2410,8 +2624,8 @@ async fn prepare_scoped_approval(
     match MachineBrokerService::dispatch(
         broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            requested_review_mode: None,
             operation_id,
             terms: terms.clone(),
             canonical_plan_facts_digest: digest("e7"),
@@ -2897,25 +3111,6 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .allowed_petal_packages
         .push(petal_package.clone());
     proposed_policy.allowed_petal_packages.push(digest("d5"));
-    proposed_policy.clear_signing = Some(bloom_broker_api::ClearSigningPolicy {
-        catalog_id: Token::new("safe-test-tokens").unwrap(),
-        trusted_keys: vec![bloom_broker_api::CatalogTrustedKey {
-            key_id: Token::new("safe-test-publisher").unwrap(),
-            verifying_key: Base64UrlBytes::from_bytes(
-                &SigningKey::from_bytes(&[5; 32]).verifying_key().to_bytes(),
-            ),
-        }],
-        signature_threshold: 1,
-        maximum_observation_age_ms: 86_400_000,
-        opaque_exact_allowed: false,
-        unlimited_allowance_allowed: false,
-        verifier: bloom_broker_api::RequiredVerifier {
-            verifier_id: Token::new(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_ID).unwrap(),
-            verifier_digest: Digest32::from_bytes(
-                bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES,
-            ),
-        },
-    });
     proposed_policy
         .allowed_destinations
         .push(PolicyDestination {
@@ -3384,8 +3579,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let stale_policy_error = MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            requested_review_mode: None,
             evm_review_payloads: vec![Base64UrlBytes::from_bytes(&creation)],
             safe_review_payloads: Vec::new(),
             operation_id: operation("d9"),
@@ -3462,8 +3657,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         MachineBrokerService::dispatch(
             &broker,
             MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                evm_reported_token: None,
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-                requested_review_mode: None,
                 evm_review_payloads: Vec::new(),
                 safe_review_payloads: envelope
                     .map(|bytes| vec![Base64UrlBytes::from_bytes(&bytes)])
@@ -3588,7 +3783,6 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     valid["owner"] = serde_json::json!(owner.to_string());
     valid["owners"] = serde_json::json!([owner.to_string()]);
     let token_contract = "0x1111111111111111111111111111111111111111";
-    let recipient = "0x2222222222222222222222222222222222222222";
     let mut calldata = vec![0xa9, 0x05, 0x9c, 0xbb];
     calldata.extend_from_slice(&[0; 12]);
     calldata.extend_from_slice(&[0x22; 20]);
@@ -3634,75 +3828,6 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         },
         ..safe_terms
     };
-    let missing_catalog = safe_prepare(
-        catalog_terms.clone(),
-        Some(serde_jcs::to_vec(&valid).unwrap()),
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        missing_catalog.message.contains("CATALOG_UNAVAILABLE"),
-        "{missing_catalog:?}"
-    );
-    use bloom_evm_clear_signing::{
-        ActionClass, AdmittedFunction, CATALOG_SCHEMA, CATALOG_SIGNATURE_DOMAIN, CatalogEntry,
-        CatalogSignature, ClearSigningCatalog, TokenMetadata, descriptor_digest,
-    };
-    let signature = "transfer(address _to, uint256 _value)";
-    let descriptor = serde_json::json!({
-        "context": {"contract": {"deployments": [{"chainId": 31337, "address": token_contract}]}},
-        "display": {"formats": {signature: {
-            "intent": "Send", "fields": [
-                {"path": "_to", "label": "To", "format": "addressName", "visible": "always"},
-                {"path": "_value", "label": "Amount", "format": "tokenAmount", "params": {"tokenPath": "@.to"}, "visible": "always"}
-            ]
-        }}}
-    });
-    let catalog_now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    let mut catalog = ClearSigningCatalog {
-        schema: CATALOG_SCHEMA.into(),
-        catalog_id: Token::new("safe-test-tokens").unwrap(),
-        sequence: DecimalU64::new(1),
-        issued_at_ms: DecimalU64::new(catalog_now_ms - 1000),
-        expires_at_ms: DecimalU64::new(catalog_now_ms + 86_400_000),
-        entries: vec![CatalogEntry {
-            chain_id: DecimalU64::new(31337),
-            contract_address: token_contract.into(),
-            admitted_functions: vec![AdmittedFunction {
-                signature: signature.into(),
-                action_class: ActionClass::Transfer,
-            }],
-            descriptor_digest: Some(descriptor_digest(&descriptor).unwrap()),
-            flattened_descriptor: Some(descriptor),
-            runtime_code_hash: None,
-            token_metadata: Some(TokenMetadata {
-                decimals: 6,
-                symbol: "EXA".into(),
-                name: "Example Token".into(),
-            }),
-            upgradeable: false,
-            implementation_hash: None,
-            observed_at_ms: DecimalU64::new(catalog_now_ms - 500),
-        }],
-        signatures: Vec::new(),
-    };
-    let mut message = CATALOG_SIGNATURE_DOMAIN.to_vec();
-    message.extend(catalog.unsigned_canonical_bytes().unwrap());
-    catalog.signatures.push(CatalogSignature {
-        key_id: Token::new("safe-test-publisher").unwrap(),
-        signature: Base64UrlBytes::from_bytes(
-            &SigningKey::from_bytes(&[5; 32]).sign(&message).to_bytes(),
-        ),
-    });
-    authority
-        .install_clear_signing_catalog_for_enrolled_wallets(
-            &catalog,
-            serde_jcs::to_vec(&catalog).unwrap().len(),
-        )
-        .unwrap();
     let response = safe_prepare(
         catalog_terms.clone(),
         Some(serde_jcs::to_vec(&valid).unwrap()),
@@ -3733,9 +3858,12 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         serde_json::from_str(manifest["canonical_plan"].as_str().unwrap()).unwrap();
     assert_eq!(plan["safe_review"]["owner"], owner.to_string());
     assert_eq!(manifest["safe_review"], plan["safe_review"]);
+    // Broker's catalog describes Safes on the chains Safe deploys to, not
+    // this test chain, so the transaction is shown as bytes Bloom cannot
+    // read, with the reason.
     let action = plan["safe_review"]["action"].to_string();
     assert!(
-        action.contains("EXA") && action.contains(recipient),
+        action.contains("Bloom cannot read") && action.contains("no description"),
         "{action}"
     );
     assert!(
@@ -3750,55 +3878,6 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                     .contains("rebuilt the Safe transaction")
             })
     );
-    // A Safe call read from the catalog is frozen with that evidence, so
-    // withdrawing the entry before signing blocks it as it would a native call.
-    let catalog_approval = catalog_terms.approval_id().unwrap();
-    let (kind, evidence) = authority.frozen_review(&catalog_approval).unwrap().unwrap();
-    assert_eq!(kind, bloom_broker::journal::ReviewKind::Clear);
-    assert!(evidence.is_some());
-    let current_policy: CanonicalWalletPolicy = serde_json::from_slice(
-        &authority
-            .policy_snapshot(&wallet_id)
-            .unwrap()
-            .canonical_policy
-            .decode(),
-    )
-    .unwrap();
-    let verifier = Digest32::from_bytes(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES);
-    authority
-        .recheck_clear_signing(
-            &catalog_approval,
-            &current_policy,
-            &verifier,
-            catalog_now_ms,
-        )
-        .unwrap();
-    catalog.sequence = DecimalU64::new(2);
-    catalog.entries.clear();
-    catalog.signatures.clear();
-    let mut message = CATALOG_SIGNATURE_DOMAIN.to_vec();
-    message.extend(catalog.unsigned_canonical_bytes().unwrap());
-    catalog.signatures.push(CatalogSignature {
-        key_id: Token::new("safe-test-publisher").unwrap(),
-        signature: Base64UrlBytes::from_bytes(
-            &SigningKey::from_bytes(&[5; 32]).sign(&message).to_bytes(),
-        ),
-    });
-    authority
-        .install_clear_signing_catalog_for_enrolled_wallets(
-            &catalog,
-            serde_jcs::to_vec(&catalog).unwrap().len(),
-        )
-        .unwrap();
-    let withdrawn = authority
-        .recheck_clear_signing(
-            &catalog_approval,
-            &current_policy,
-            &verifier,
-            catalog_now_ms,
-        )
-        .unwrap_err();
-    assert!(withdrawn.to_string().contains("withdrawn"), "{withdrawn}");
     broker
         .ceremony()
         .cancel(&operation("da"), approval_now_ms)
@@ -3810,8 +3889,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let approval_prepared = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            requested_review_mode: None,
             evm_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
             operation_id: approval_operation.clone(),
@@ -3946,8 +4025,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let exact_prepared = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            requested_review_mode: None,
             safe_review_payloads: Vec::new(),
             operation_id: exact_approval_operation.clone(),
             terms: exact_terms.clone(),
@@ -4180,8 +4259,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             MachineBrokerService::dispatch(
                 &broker,
                 MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                    evm_reported_token: None,
                     surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-                    requested_review_mode: None,
                     evm_review_payloads: Vec::new(),
                     safe_review_payloads: Vec::new(),
                     operation_id: operation(&format!("{:02x}", 0xc0 + index)),
@@ -4558,7 +4637,6 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                 approved_claim_digest: None,
                 provenance_jcs: None,
                 renewal_of: None,
-                review: &FrozenReview::legacy(),
             },
         )
         .unwrap();
@@ -4996,8 +5074,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         MachineBrokerService::dispatch(
             &restarted_scoped_broker,
             MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                evm_reported_token: None,
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-                requested_review_mode: None,
                 evm_review_payloads: Vec::new(),
                 safe_review_payloads: Vec::new(),
                 operation_id: operation("dc"),
@@ -5683,11 +5761,7 @@ async fn unreadable_safe_call_carries_a_signed_inability_to_explain_disclosure()
         "chain_id":"1", "chain":"ethereum", "safe":"0x1000000000000000000000000000000000000000",
         "owner":"0x3000000000000000000000000000000000000000", "nonce":"4", "operation":"call",
         "destination":"0x4000000000000000000000000000000000000000", "value":"0", "value_display":"0 ETH",
-        "action":["Action: Contract call", "Calldata selector: 0xdeadbeef"], "safe_tx_hash":"0x1234",
-        "reported":{"version":"1.4.1", "singleton":"0x41", "singleton_code_hash":"0x1f",
-            "owners":["0x3000000000000000000000000000000000000000"], "threshold":"1",
-            "guard":"0x0000000000000000000000000000000000000000", "modules":[],
-            "fallback_handler":"0x0000000000000000000000000000000000000000", "library_code_hash":null}
+        "action":["Action: Contract call Bloom cannot read", "Reason: no description of 0x4000000000000000000000000000000000000000 on chain 1"], "safe_tx_hash":"0x1234"
     })).unwrap();
     let prepared = broker
         .prepare_approval(
@@ -9008,6 +9082,14 @@ if (!isGeneric(tokenReviewIcon("constructor", "prototype"))) {{
   throw new Error("prototype chain leaked into artwork selection");
 }}
 
+// Circle's USDC on Base gets the artwork; Binance-pegged "USDC" does not.
+if (src(tokenReviewIcon("8453", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")) !== "/assets/tokens/usdc.svg") {{
+  throw new Error("Base USDC lost its artwork");
+}}
+if (!isGeneric(tokenReviewIcon("56", "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"))) {{
+  throw new Error("a pegged copy took Circle's artwork");
+}}
+
 // Artwork is decorative: it carries no alternative text that could be read
 // as an identity, and the wrapper is hidden from assistive technology.
 const usdcIcon = tokenReviewIcon("1", USDC);
@@ -9049,11 +9131,11 @@ if (!usdcIcon.replacedWith || !isGeneric(usdcIcon.replacedWith)) {{
 /// Upgradeability is one fact about one contract. It used to arrive twice —
 /// once from the verifier's per-call `warnings` and once from the page's walk
 /// over the selected catalog entries — so a single-entry review printed the
-/// same sentence and the same timestamp in two consecutive paragraphs. The
-/// catalog entries are now the only source, and the observation moves into
-/// the details section where the rest of the provenance already lives.
+/// same sentence in two consecutive paragraphs. The catalog entries are now
+/// the only source, and the caveat lives in the details section with the rest
+/// of the provenance.
 #[test]
-fn the_upgradeable_warning_is_stated_once_per_contract_and_keeps_its_timestamp_in_details() {
+fn the_upgradeable_warning_is_stated_once_per_contract_and_keeps_its_caveat_in_details() {
     let asset = include_str!("../src/ceremony_assets/app.js");
     let executable = asset
         .split_once("\nload().catch")
@@ -9130,12 +9212,12 @@ for (const stale of ["can be upgraded", "The publisher observed it at"]) {{
     throw new Error(`the superseded wording survived: ${{stale}}`);
   }}
 }}
-// The decision does not carry a timestamp; the details section does, once.
+// The decision carries no timestamp; the details section has the caveat, once.
 if (/\d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}} UTC/.test(view.primary)) {{
   throw new Error(`an observation timestamp is still beside the decision: ${{view.primary}}`);
 }}
-if (count(view.details, "the publisher observed this deployment at") !== 1) {{
-  throw new Error(`the observation is not stated exactly once in details: ${{view.details}}`);
+if (count(view.details, "its code may have changed since this Bloom release described it") !== 1) {{
+  throw new Error(`the upgrade caveat is not stated exactly once in details: ${{view.details}}`);
 }}
 if (!view.details.includes(TOKEN)) {{
   throw new Error("details do not say which contract is upgradeable");
@@ -9272,20 +9354,22 @@ function show(name) {{
 // A transfer names the amount and the recipient, and the recipient is a
 // recipient — never the contract, never a generic "To".
 let view = show("transfer");
-if (view.heading !== "Requested transfer") throw new Error(`transfer heading: ${{view.heading}}`);
+if (view.heading !== "Send 250 USDC") throw new Error(`transfer heading: ${{view.heading}}`);
 if (view.primary.includes(view.heading)) throw new Error("action title was printed twice");
-if (!view.primary.includes("−250 BDT") || !view.primary.includes("+250 BDT")) {{
+if (!view.primary.includes("−250 USDC") || !view.primary.includes("+250 USDC")) {{
   throw new Error("requested sender/recipient movements are missing");
 }}
 if (!view.technical.includes("Contract behavior has not been verified")) {{
   throw new Error("the interpretation limitation disappeared from details");
 }}
-if (!allText(nodes["page-title"]).includes("Chain ID 31337")) {{
+if (!allText(nodes["page-title"]).includes("Chain ID 8453")) {{
   throw new Error("the exact EVM chain is missing from the primary context");
 }}
-if (!view.primary.includes("BDT — Bloom Demo Token")) {{
-  throw new Error("the token's full name is missing from the primary review");
+if (!view.primary.includes("USD Coin") || !view.primary.includes("USDC")) {{
+  throw new Error("the token's full name is missing from the decision");
 }}
+const tokenImage = find(nodes.review, n => n.tagName === "IMG" && n.attrs.src === "/assets/tokens/usdc.svg");
+if (!tokenImage) throw new Error("Base USDC artwork is missing from the decision");
 if (view.action !== "transfer") throw new Error(`transfer action: ${{view.action}}`);
 if (!view.roles.includes("recipient")) throw new Error(`transfer roles: ${{view.roles}}`);
 if (view.roles.includes("spender")) throw new Error("a transfer must not name a spender");
@@ -9294,7 +9378,7 @@ if (view.button !== "Approve transfer") throw new Error(`transfer button: ${{vie
 if (!view.primary.includes("0x9fE46736679d2d9a65F0992F2272dE9f3c7fa6e0")) {{
   throw new Error("the recipient address is not on the page");
 }}
-if (!view.primary.includes("0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512")) {{
+if (!view.primary.includes("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")) {{
   throw new Error("the token contract address is not on the page");
 }}
 // The envelope's zero native value must not read as the thing being sent.
@@ -9302,7 +9386,7 @@ if (view.primary.includes("  0 ETH")) throw new Error(`primary showed the native
 // The potential cost stays with the decision, labelled as a ceiling.
 if (!view.primary.includes("Gas fee") ||
     !view.primary.includes("Up to 0.000199 ETH")) {{
-  throw new Error(`the execution gas ceiling is not visible: ${{view.primary}}`);
+  throw new Error(`the execution gas ceiling is not in details: ${{view.technical}}`);
 }}
 if (!view.technical.includes("0.000198510751634520 ETH")) {{
   throw new Error("the exact execution cap disappeared");
@@ -9337,7 +9421,7 @@ for (const detail of ["5f2a1c6b8d4e0937ab55c1e8d0f34721aa9c6b5e4d3f2a1908b7c6d5e
 // A finite allowance states the cap and that it is a total, and the
 // counterparty is a spender.
 view = show("allowance-finite");
-if (!view.heading.includes("to spend up to 100 BDT")) throw new Error(`finite heading: ${{view.heading}}`);
+if (!view.heading.includes("to spend up to 100 USDC")) throw new Error(`finite heading: ${{view.heading}}`);
 if (view.magnitude !== "finite") throw new Error(`finite magnitude: ${{view.magnitude}}`);
 if (!view.roles.includes("spender")) throw new Error(`finite roles: ${{view.roles}}`);
 if (view.button !== "Approve allowance") throw new Error(`finite button: ${{view.button}}`);
@@ -9353,13 +9437,13 @@ if (view.heading.includes("spend up to")) throw new Error("zero read as a spendi
 
 // Unlimited says so in the heading, and does not lead with the U256 maximum.
 view = show("allowance-unlimited");
-if (view.heading !== "Allow unlimited BDT spending") throw new Error(`unlimited heading: ${{view.heading}}`);
+if (view.heading !== "Allow unlimited USDC spending") throw new Error(`unlimited heading: ${{view.heading}}`);
 if (view.magnitude !== "unlimited") throw new Error(`unlimited magnitude: ${{view.magnitude}}`);
 if (view.heading.includes("115792089")) throw new Error("the U256 maximum led the heading");
 // Deciding must never require reading the raw integer.
 if (view.primary.includes("115792089")) throw new Error("the U256 maximum is still a primary fact");
 if (!view.technical.includes("115792089")) throw new Error("the exact maximum left technical details");
-if (!view.primary.includes("all your current and future BDT")) throw new Error("the unlimited warning is not visible");
+if (!view.primary.includes("all your current and future USDC")) throw new Error("the unlimited warning is not visible");
 const unfamiliar = previewSession("allowance-unlimited");
 const unfamiliarPlan = JSON.parse(unfamiliar.review_manifest.canonical_plan);
 unfamiliarPlan.evm_review.payloads[0].contract_call.warnings.push("A new warning the renderer does not recognise");
@@ -9374,9 +9458,40 @@ if (!view.all.includes("11579208923731619542357098500868790785326998466564056403
   throw new Error("the exact maximum lost precision");
 }}
 
+// A structural transfer is useful without borrowing a token identity or
+// decimals from the selector. Raw units and the unverified-contract warning
+// stay beside the decision.
+view = show("structural-transfer");
+if (view.heading !== "Review transfer-shaped call for 250000000 raw units") throw new Error(`structural heading: ${{view.heading}}`);
+if (view.primary.includes("−250000000 raw units") || view.primary.includes("+250000000 raw units")) {{
+  throw new Error(`a structural reading claimed token balance changes: ${{view.primary}}`);
+}}
+if (!view.primary.includes("has not verified that this contract is a token")) {{
+  throw new Error("the structural assurance warning is not visible");
+}}
+if (view.primary.includes("Bloom Demo Token") || view.primary.includes(" USDC")) {{
+  throw new Error("a structural reading borrowed catalog token identity");
+}}
+if (!view.technical.includes("Decoded from the standard ERC-20 calldata shape")) {{
+  throw new Error("the structural assurance explanation disappeared");
+}}
+if (view.action !== "call" || view.button !== "Approve call" || !view.roles.includes("recipient")) {{
+  throw new Error("a structural transfer was not presented as a decoded call");
+}}
+
+view = show("structural-allowance-unlimited");
+if (view.heading !== "Review approval-shaped call for maximum uint256") throw new Error(`structural unlimited heading: ${{view.heading}}`);
+if (!view.primary.includes("maximum uint256") || !view.primary.includes("current and future tokens")) {{
+  throw new Error("the structural unlimited warning is not visible");
+}}
+if (view.primary.includes("115792089")) throw new Error("raw maximum led the structural decision");
+if (!view.technical.includes("115792089237316195423570985008687907853269984665640564039457584007913129639")) {{
+  throw new Error("the exact structural allowance left the signed details");
+}}
+
 // An uninterpretable call says so instead of drawing a transfer.
 view = show("deposit-native-opaque");
-if (!view.primary.includes("Native value sent") || !view.primary.includes("1 ETH")) {{
+if (!view.technical.includes("Native value sent") || !view.technical.includes("1 ETH")) {{
   throw new Error("an opaque payable call hid the native value it sends");
 }}
 for (const name of ["deposit-static", "stake-static", "operator-approval"]) {{
@@ -9385,9 +9500,9 @@ for (const name of ["deposit-static", "stake-static", "operator-approval"]) {{
   if (view.primary.includes("Requested movements")) throw new Error(`invented balance changes: ${{name}}`);
 }}
 view = show("opaque-call");
-if (!view.primary.includes("0xa9059cbb")) throw new Error("opaque calldata is not visible");
+if (!view.technical.includes("0xa9059cbb")) throw new Error("opaque calldata is not in details");
 if (view.action !== "opaque") throw new Error(`opaque action: ${{view.action}}`);
-if (!view.primary.includes("cannot say what")) throw new Error(`opaque detail: ${{view.primary}}`);
+if (!view.heading.includes("Bloom cannot read")) throw new Error(`opaque heading: ${{view.heading}}`);
 view = show("operator-approval");
 if (!view.primary.includes("Function arguments") ||
     !view.primary.includes("setApprovalForAll(address operator, bool approved)") ||
@@ -9408,6 +9523,15 @@ if (view.primary.indexOf("Transaction 1") > view.primary.indexOf("Transaction 2"
 if (view.button !== "Approve all transactions") throw new Error(`batch button: ${{view.button}}`);
 if (!view.roles.includes("spender") || !view.roles.includes("recipient")) {{
   throw new Error("batch members lost their distinct spender and recipient roles");
+}}
+
+// One catalogued member cannot lend its assurance to a structural member.
+view = show("mixed-assurance");
+if (!view.technical.includes("mixes trusted catalog descriptions with structural calldata readings")) {{
+  throw new Error("a mixed batch borrowed the first member's stronger assurance");
+}}
+if (!view.primary.includes("has not verified that this contract is a token")) {{
+  throw new Error("the mixed batch hid its structural member's warning");
 }}
 
 // Markup in a publisher's name is text, not markup, and does not reach innerHTML.
@@ -9433,7 +9557,7 @@ call.intent = "Totally different publisher story";
 renamed.review_manifest.canonical_plan = JSON.stringify(plan);
 renderReview(renamed);
 const relabelled = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
-if (nodes["panel-title"].textContent !== "Requested transfer") {{
+if (nodes["panel-title"].textContent !== "Send 250 USDC") {{
   throw new Error(`relabelling changed the heading: ${{relabelled}}`);
 }}
 if (!relabelled.includes("Beneficiary")) {{
@@ -9528,82 +9652,6 @@ async fn a_preview_name_reaches_no_session_and_cannot_be_completed() {
             "preview name `{name}` completed a ceremony"
         );
     }
-}
-
-/// Enabling unlimited allowances is an authority change, so the page has to
-/// show it as current → proposed and say what it does and does not grant.
-/// An empty diff for a real widening is the defect this guards.
-#[test]
-fn the_policy_page_shows_the_clear_signing_authority_change() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
-    let script = format!(
-        r#"
-class Node {{
-  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = "";
-                       this.attrs = {{}}; this.hidden = false; }}
-  setAttribute(key, value) {{ this.attrs[key] = value; }}
-  append(...children) {{ this.children.push(...children); }}
-  replaceChildren(...children) {{ this.children = children; }}
-}}
-const nodes = {{}};
-globalThis.document = {{
-  getElementById: id => nodes[id] ||= new Node(id),
-  createElement: name => new Node(name),
-  createElementNS: (_, name) => new Node(name),
-  createTextNode: text => String(text)
-}};
-globalThis.location = {{hash: "", search: "", pathname: "/"}};
-globalThis.history = {{replaceState: () => {{}}}};
-globalThis.setInterval = () => 1;
-globalThis.clearInterval = () => {{}};
-{executable}
-function allText(node) {{
-  if (typeof node === "string") return node;
-  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
-}}
-renderReview(previewSession("policy-unlimited"));
-const rendered = allText({{textContent: "", innerHTML: "", children: [nodes["panel-title"], ...nodes.review.children]}});
-for (const phrase of ["Allow requests for unlimited token spending", "blocked → allowed",
-                      "does not move tokens or grant a spender an allowance", "Each request will still need your approval",
-                      "applies to all supported tokens", "will name its token and spender"]) {{
-  if (!rendered.includes(phrase)) throw new Error(`policy page omitted ${{phrase}}: ${{rendered}}`);
-}}
-if (nodes.approve.textContent !== "Approve policy change") {{
-  throw new Error(`policy button: ${{nodes.approve.textContent}}`);
-}}
-const blocked = previewSession("policy-unlimited");
-const change = blocked.review_manifest.authority_diff.clear_signing;
-[change.before, change.after] = [change.after, change.before];
-renderReview(blocked);
-if (nodes["panel-title"].textContent !== "Block requests for unlimited token spending") {{
-  throw new Error("disabling unlimited requests was labelled as enabling them");
-}}
-// A verifier re-pin is authority too: it decides which build may describe
-// calls for this wallet at all.
-const repin = previewSession("policy-unlimited");
-repin.review_manifest.authority_diff = {{clear_signing: {{
-  before: {{unlimited_allowance_allowed: false,
-           verifier: {{verifier_digest: "77f7d9d939a496a16a9e5d517bb57c8e8eea397751dabdac5f923e0f2e91cc20"}}}},
-  after: {{unlimited_allowance_allowed: false,
-          verifier: {{verifier_digest: "e12e0cbb6873ab1c2ef89cb2e7e41333d0238b574a4629f36ba6b16f21b38beb"}}}}
-}}}};
-renderReview(repin);
-const pinned = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
-for (const phrase of ["Pinned verifier", "77f7d9d9", "e12e0cbb", "stops being able to describe"]) {{
-  if (!pinned.includes(phrase)) throw new Error(`verifier re-pin omitted ${{phrase}}: ${{pinned}}`);
-}}
-"#
-    );
-    let output = run_node(&script);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 /// Two differently configured Brokers in one process isolate Host, Origin,
@@ -10228,82 +10276,6 @@ async fn destination_reports_an_already_registered_device_over_http() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-}
-
-/// The clear-signing trusted publisher keys are the root of trust for every
-/// contract description Broker will later read calldata against, so rotating
-/// them is the largest authority a policy update can move. `describePolicy`
-/// enumerated the clear-signing fields it renders and left `trusted_keys` out,
-/// so a keys-only rotation reached the owner as "No rule changes are proposed."
-/// under an "Approve policy change" button.
-#[test]
-fn a_trusted_publisher_key_rotation_is_named_on_the_policy_page() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
-    let script = format!(
-        r#"
-globalThis.document = {{getElementById: () => ({{}})}};
-globalThis.location = {{hash: "", search: "", pathname: "/"}};
-globalThis.history = {{replaceState: () => {{}}}};
-{executable}
-const settings = keys => ({{
-  catalog_id: "bloom-tokens",
-  trusted_keys: keys,
-  signature_threshold: 1,
-  maximum_observation_age_ms: "86400000",
-  opaque_exact_allowed: false,
-  unlimited_allowance_allowed: false,
-  verifier: {{verifier_id: "bloom-evm-clear-signing", verifier_digest: "{}"}}
-}});
-const oldKey = {{key_id: "publisher-1", verifying_key: "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE"}};
-const newKey = {{key_id: "publisher-1", verifying_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg"}};
-
-// Nothing else differs: only the Ed25519 verifying key behind the same id.
-const diff = clear_signing => describePolicy({{authority_diff: {{clear_signing}}}});
-const rotation = diff({{before: settings([oldKey]), after: settings([newKey])}});
-if (/No rule changes are proposed/.test(rotation.sentence)) {{
-  throw new Error("a trusted-key rotation was rendered as no change: " + rotation.sentence);
-}}
-const rotationFacts = JSON.stringify(rotation.facts);
-for (const needle of ["Stop trusting descriptions signed by", "Trust descriptions signed by"]) {{
-  if (!rotationFacts.includes(needle)) throw new Error("missing " + needle + " in " + rotationFacts);
-}}
-if (!rotation.intent) throw new Error("a key rotation must produce an action card");
-
-// Adding a second publisher is an addition only, and must still be named.
-const added = diff({{before: settings([oldKey]), after: settings([oldKey, {{key_id: "publisher-2", verifying_key: "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M"}}])}});
-if (!JSON.stringify(added.facts).includes("publisher-2")) {{
-  throw new Error("adding a publisher was not named: " + JSON.stringify(added.facts));
-}}
-
-// A clear-signing change this page cannot describe must not read as no change.
-const opaque = diff({{before: settings([oldKey]), after: settings([oldKey])}});
-if (/No rule changes are proposed/.test(opaque.sentence)) {{
-  throw new Error("an undescribable clear-signing change claimed nothing changed");
-}}
-if (!/cannot describe/.test(opaque.sentence)) {{
-  throw new Error("expected the undescribable-change wording, got: " + opaque.sentence);
-}}
-
-// A policy update with no clear-signing section keeps its existing wording.
-const none = describePolicy({{authority_diff: {{}}}});
-if (!/No rule changes are proposed/.test(none.sentence)) {{
-  throw new Error("an empty diff must still read as no change: " + none.sentence);
-}}
-process.stdout.write("trusted-keys-ok");
-"#,
-        "0".repeat(64)
-    );
-    let output = run_node(&script);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "trusted-keys-ok");
 }
 
 /// Runs a CommonJS script in Node, fed on stdin: the shipped asset alone is

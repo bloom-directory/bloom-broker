@@ -4967,6 +4967,7 @@ pub(crate) fn native_asset_metadata(chain: &str, asset: &str) -> Option<(u8, &'s
         | ("arbitrum", "native")
         | ("anvil", "native") => Some((18, "ETH")),
         ("polygon", "native") => Some((18, "POL")),
+        ("evm-100", "native") => Some((18, "xDAI")),
         ("evm-56", "native") => Some((18, "BNB")),
         ("evm-43114", "native") => Some((18, "AVAX")),
         ("evm-999", "native") => Some((18, "HYPE")),
@@ -5157,12 +5158,21 @@ fn review_disclosures(
         // bytes, but anything the input data would execute is still
         // unverified. This lives in the signed disclosures (not just the
         // page) so the honesty statement carries the manifest signature.
-        match &review.clear_signing {
-            Some(evidence) => disclosures.push(format!(
-                "Bloom decoded these transactions from their exact bytes and read their contract calls against catalog {}, whose publisher this wallet trusts to describe these contracts. Bloom has not executed the calls or established what the contracts do.",
-                evidence.catalog_id
-            )),
-            None => disclosures.push(
+        let calls = review
+            .payloads
+            .iter()
+            .filter_map(|payload| payload.contract_call.as_ref());
+        let structural = calls.clone().any(|call| call.structural);
+        match (calls.count() > 0, structural) {
+            (true, true) => disclosures.push(
+                "Bloom decoded these transactions from their exact bytes. Some readings rely on standard calldata shapes or reach contracts Bloom has not identified: they prove exact arguments, not contract or token behavior. Bloom has not executed the calls or established what the contracts do."
+                    .to_owned(),
+            ),
+            (true, false) => disclosures.push(
+                "Bloom decoded these transactions from their exact bytes and read their contract calls against Bloom's catalog of contract descriptions. Bloom has not executed the calls or established what the contracts do."
+                    .to_owned(),
+            ),
+            (false, _) => disclosures.push(
                 "Bloom decoded the destination and value from the exact transaction bytes. Bloom has not established the execution effects of any contract input data."
                     .to_owned(),
             ),
@@ -5198,7 +5208,10 @@ fn review_disclosures(
             request.terms.selector,
             bloom_signer_api::ApprovalSelector::Petal { .. }
         ) && assurance.is_none();
-    if machine_asserted {
+    // Exact EVM and Safe reviews are rebuilt from transaction bytes and do
+    // not display Petal-asserted limits. Keep this disclosure for the claim
+    // pages where those limits are actually part of the review.
+    if machine_asserted && evm_review.is_none() && safe_review.is_none() {
         let source = if system_claim.is_some() {
             "the named system component"
         } else {

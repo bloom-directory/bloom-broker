@@ -1,6 +1,5 @@
 //! Independently decode native EVM preimages for exact owner review. Machine
 //! descriptions are never used to infer transaction destination or authority.
-use crate::journal::ReviewKind;
 use alloy::{
     consensus::{SignableTransaction, Transaction, TxEip1559, TxLegacy},
     primitives::{Address, Signature, TxKind, keccak256},
@@ -8,11 +7,11 @@ use alloy::{
 };
 use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalSelector, ApprovalSubject, CanonicalWalletPolicy, CryptoSuite,
-    Digest32, ProtocolError, ProtocolErrorCode, ReviewMode, SigningPayloads,
+    Digest32, ProtocolError, ProtocolErrorCode, SigningPayloads,
 };
 use bloom_evm_clear_signing::{
-    AcceptedCatalog, CallContext, ClearSignedCall, ClearSigningEvidence, NativeUnits, ReviewError,
-    ReviewReason, SelectedEntry, review_call,
+    CallContext, Catalog, ClearSignedCall, ClearSigningEvidence, NativeUnits, SelectedEntry,
+    review_call,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -21,9 +20,8 @@ use sha2::{Digest as _, Sha256};
 #[serde(deny_unknown_fields)]
 pub struct EvmReview {
     pub payloads: Vec<EvmReviewPayload>,
-    /// Review-wide clear-signing facts: the catalog this reading came from,
-    /// the verifier that produced it, and every entry it used. Activation and
-    /// signing re-read these against the current catalog and policy.
+    /// Review-wide clear-signing facts: the assurance and every catalog entry
+    /// the readings used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clear_signing: Option<ClearSigningEvidence>,
 }
@@ -62,11 +60,15 @@ pub struct EvmReviewPayload {
     /// be shown rather than omitting the subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximum_execution_gas_fee_display: Option<String>,
-    /// The clear-signed reading of this call, when a signed description
-    /// covered it. Absent for native sends, deployments, and every member of
-    /// an explicitly opaque batch.
+    /// Broker's reading of this call: from the catalog, or from the exact
+    /// ERC-20 shape. Absent for native sends, deployments, calls Bloom cannot
+    /// read, and every member of an explicitly opaque batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract_call: Option<ClearSignedCall>,
+    /// Why a contract call has no reading: no description of the contract,
+    /// or bytes the description does not admit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -82,69 +84,6 @@ pub enum EvmFeeReview {
         max_priority_fee_per_gas: String,
         max_priority_fee_per_gas_display: String,
     },
-}
-
-/// What the wallet's authenticated policy and Broker's accepted catalog say
-/// about clear signing, resolved once per preparation.
-pub(crate) struct ClearSigningContext {
-    pub catalog: Option<AcceptedCatalog>,
-    pub verifier_digest: Digest32,
-    pub now_ms: u64,
-}
-
-/// Which review Broker produced, to be frozen with the approval record.
-///
-/// Read from Broker's own rendered review and the policy it reviewed
-/// against — never from the mode the caller requested, which is a request
-/// and not a result.
-pub(crate) fn review_kind(
-    review: Option<&EvmReview>,
-    policy: &CanonicalWalletPolicy,
-) -> ReviewKind {
-    let Some(review) = review else {
-        return ReviewKind::Legacy;
-    };
-    if policy.clear_signing.is_none() {
-        return ReviewKind::Legacy;
-    }
-    if review.clear_signing.is_some() {
-        return ReviewKind::Clear;
-    }
-    // A call with a destination and calldata that carries no reading is one
-    // the owner approved opaquely: a batch that could not be read under the
-    // clear mode fails preparation instead of reaching here.
-    let opaque = review.payloads.iter().any(|payload| {
-        payload.destination.is_some()
-            && payload.calldata_keccak.is_some()
-            && payload.contract_call.is_none()
-    });
-    if opaque {
-        ReviewKind::OpaqueExact
-    } else {
-        ReviewKind::Native
-    }
-}
-
-/// Carry the nine review reasons out on the existing transport codes rather
-/// than inventing a tenth: the reason and its owner sentence travel in the
-/// message, which is what the ceremony and the CLI both show.
-fn review_error(error: ReviewError) -> ProtocolError {
-    let code = match error.reason {
-        ReviewReason::InvalidPayload => ProtocolErrorCode::SelectorMismatch,
-        ReviewReason::LimitExceeded => ProtocolErrorCode::LimitExceededFrame,
-        ReviewReason::ClockUntrusted => ProtocolErrorCode::ClockUntrusted,
-        ReviewReason::CatalogUnavailable
-        | ReviewReason::EvidenceExpired
-        | ReviewReason::UnsupportedCall => ProtocolErrorCode::AssuranceUnavailable,
-        ReviewReason::CatalogRejected
-        | ReviewReason::PolicyDenied
-        | ReviewReason::ReviewChanged => ProtocolErrorCode::ClaimInvalid,
-    };
-    ProtocolError::new(code, error.to_string())
-}
-
-fn denied(reason: ReviewReason, message: impl Into<String>) -> ProtocolError {
-    review_error(ReviewError::new(reason, message))
 }
 
 fn invalid(message: impl Into<String>) -> ProtocolError {
@@ -182,7 +121,7 @@ pub(crate) fn review(
     request: &ApprovalPrepareRequest,
     policy: &CanonicalWalletPolicy,
     from: Address,
-    clear_signing: &ClearSigningContext,
+    catalog: &Catalog,
 ) -> Result<Option<EvmReview>, ProtocolError> {
     if request.evm_review_payloads.is_empty() {
         // No payloads means no review: returning None (rather than an empty
@@ -281,135 +220,86 @@ pub(crate) fn review(
         payloads,
         clear_signing: None,
     };
-    apply_review_mode(
-        &mut review,
-        &decoded_calls,
-        policy,
-        request.requested_review_mode,
-        clear_signing,
-    )?;
-    if let Some(evidence) = &review.clear_signing {
-        cap_approval_expiry(evidence, policy, request)?;
+    read_calls(&mut review, &decoded_calls, catalog);
+    if let Some(reported) = &request.evm_reported_token {
+        show_reported_token(&mut review, reported);
     }
     Ok(Some(review))
 }
 
-/// Cap the approval before a ceremony exists. Returning the permitted
-/// instant lets Machine regenerate terms under the existing
-/// operation-conflict rules instead of guessing.
-pub(crate) fn cap_approval_expiry(
-    evidence: &ClearSigningEvidence,
-    policy: &CanonicalWalletPolicy,
-    request: &ApprovalPrepareRequest,
-) -> Result<(), ProtocolError> {
-    let Some(settings) = &policy.clear_signing else {
-        return Ok(());
-    };
-    let permitted = evidence.permitted_expiry_ms(settings.maximum_observation_age_ms);
-    if request.terms.expires_at_ms.get() > permitted {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::ClaimInvalid,
-            format!(
-                "POLICY_DENIED: clear-signing evidence permits approval only until \
-                 {permitted}; regenerate the terms with an expiry at or before that. {}",
-                ReviewReason::PolicyDenied.owner_action()
-            ),
+/// Show an unlisted token's amount with the symbol and decimals the token
+/// reports, read by Machine. Only the display changes, and it says so: the
+/// exact raw amount stays in the fields. A report for any other contract, or
+/// one whose symbol is not a plain label, is ignored.
+fn show_reported_token(review: &mut EvmReview, reported: &bloom_broker_api::EvmReportedToken) {
+    let symbol = &reported.symbol;
+    if symbol.is_empty()
+        || symbol.len() > 16
+        || !symbol
+            .chars()
+            .all(|c| c.is_ascii_graphic() && !matches!(c, '<' | '>' | '&'))
+        || reported.decimals > 36
+    {
+        return;
+    }
+    for payload in &mut review.payloads {
+        let Some(call) = &mut payload.contract_call else {
+            continue;
+        };
+        if !call.contract.eq_ignore_ascii_case(&reported.address) {
+            continue;
+        }
+        let Some(intent) = call
+            .intent_summary
+            .as_mut()
+            .filter(|intent| intent.token.is_none())
+        else {
+            continue;
+        };
+        intent.amount_display = format!(
+            "{} {symbol}",
+            bloom_evm_clear_signing::format_base_units(&intent.amount, reported.decimals)
+        );
+        call.warnings.push(format!(
+            "{symbol} and its {} decimals are what the token contract reports about itself; \
+             Bloom has not verified them. The exact amount is {} raw units.",
+            reported.decimals, intent.amount
         ));
     }
-    Ok(())
 }
 
-/// One mode for the whole batch.
-///
-/// A member that cannot be described fails the batch; it is never split off,
-/// never shown beside clear-signed members, and never quietly downgraded to a
-/// digest the owner would have to trust blind. Native sends and deployments
-/// carry no calldata and keep their existing exact envelope review.
-fn apply_review_mode(
-    review: &mut EvmReview,
-    calls: &[Option<DecodedCall>],
-    policy: &CanonicalWalletPolicy,
-    requested: Option<ReviewMode>,
-    context: &ClearSigningContext,
-) -> Result<(), ProtocolError> {
-    let Some(settings) = policy.clear_signing.as_ref() else {
-        // An incapable wallet refuses a required mode rather than ignoring it.
-        if requested.is_some() {
-            return Err(denied(
-                ReviewReason::PolicyDenied,
-                "clear signing is not enabled for this wallet",
-            ));
-        }
-        return Ok(());
-    };
-    settings.validate()?;
-    if requested == Some(ReviewMode::OpaqueExact) && !settings.opaque_exact_allowed {
-        return Err(denied(
-            ReviewReason::PolicyDenied,
-            "wallet policy does not allow approving payloads Bloom cannot explain",
-        ));
-    }
+/// Read every contract call Broker can. A call it cannot read is shown as
+/// exact bytes with the reason, and the owner decides. Native sends and
+/// deployments keep their exact envelope review.
+fn read_calls(review: &mut EvmReview, calls: &[Option<DecodedCall>], catalog: &Catalog) {
     let mut entries: Vec<SelectedEntry> = Vec::new();
+    let mut structural = false;
     for (payload, call) in review.payloads.iter_mut().zip(calls) {
         let Some(call) = call else { continue };
-        let (clear, selected) = review_contract_call(call, policy, requested, context)?;
-        for entry in selected {
-            if !entries.contains(&entry) {
-                entries.push(entry);
+        match read_contract_call(call, catalog) {
+            Ok((clear, selected)) => {
+                structural |= clear.structural;
+                for entry in selected {
+                    if !entries.contains(&entry) {
+                        entries.push(entry);
+                    }
+                }
+                payload.contract_call = Some(clear);
             }
+            Err(error) => payload.unread_reason = Some(error.detail),
         }
-        payload.contract_call = clear;
     }
-    if let Some(catalog) = context.catalog.as_ref()
-        && !entries.is_empty()
-    {
-        review.clear_signing = Some(ClearSigningEvidence::new(
-            catalog,
-            &context.verifier_digest,
-            entries,
-        ));
+    if !entries.is_empty() {
+        review.clear_signing = Some(ClearSigningEvidence::new(entries, structural));
     }
-    Ok(())
 }
 
-/// Native and Safe calls spend the same catalog trust and wallet policy.
-/// An opaque request cannot bypass a readable call's policy refusals.
-pub(crate) fn review_contract_call(
+/// One contract call, read with the catalog. Native and Safe calls share it.
+pub(crate) fn read_contract_call(
     call: &DecodedCall,
-    policy: &CanonicalWalletPolicy,
-    requested: Option<ReviewMode>,
-    context: &ClearSigningContext,
-) -> Result<(Option<ClearSignedCall>, Vec<SelectedEntry>), ProtocolError> {
-    let settings = policy.clear_signing.as_ref().ok_or_else(|| {
-        denied(
-            ReviewReason::PolicyDenied,
-            "clear signing is not enabled for this wallet",
-        )
-    })?;
-    let opaque = requested == Some(ReviewMode::OpaqueExact);
-    if opaque && !settings.opaque_exact_allowed {
-        return Err(denied(
-            ReviewReason::PolicyDenied,
-            "wallet policy does not allow approving payloads Bloom cannot explain",
-        ));
-    }
-    let catalog = context
-        .catalog
-        .as_ref()
-        .filter(|catalog| !opaque || catalog.check_validity(context.now_ms).is_ok());
-    let Some(catalog) = catalog else {
-        if opaque {
-            return Ok((None, Vec::new()));
-        }
-        return Err(denied(
-            ReviewReason::CatalogUnavailable,
-            "no accepted clear-signing catalog is loaded",
-        ));
-    };
-    catalog
-        .check_validity(context.now_ms)
-        .map_err(review_error)?;
-    let reviewed = review_call(
+    catalog: &Catalog,
+) -> Result<(ClearSignedCall, Vec<SelectedEntry>), bloom_evm_clear_signing::ReviewError> {
+    review_call(
         catalog,
         &CallContext {
             chain_id: call.chain_id,
@@ -417,29 +307,11 @@ pub(crate) fn review_contract_call(
             value: call.value,
             calldata: &call.calldata,
             native: native_units(&chain_name(call.chain_id)),
-            unlimited_allowance_allowed: settings.unlimited_allowance_allowed,
         },
-    );
-    if opaque {
-        return match reviewed {
-            Err(error) if error.reason == ReviewReason::UnsupportedCall => Ok((None, Vec::new())),
-            Err(error) => Err(review_error(error)),
-            Ok(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::ClaimInvalid,
-                "POLICY_DENIED: Bloom can read this call, so it cannot be approved unread; request a clear-signed review",
-            )),
-        };
-    }
-    let (clear, selected) = reviewed.map_err(review_error)?;
-    for entry in &selected {
-        entry
-            .check_observation_age(context.now_ms, settings.maximum_observation_age_ms)
-            .map_err(review_error)?;
-    }
-    Ok((Some(clear), selected))
+    )
 }
 
-fn native_units(chain: &str) -> Option<NativeUnits> {
+pub(crate) fn native_units(chain: &str) -> Option<NativeUnits> {
     crate::ceremony::native_asset_metadata(chain, "native").map(|(decimals, symbol)| NativeUnits {
         decimals,
         symbol: symbol.to_owned(),
@@ -556,6 +428,7 @@ fn render<T: Transaction + SignableTransaction<Signature>>(
                 &chain_name,
             ),
             contract_call: None,
+            unread_reason: None,
         },
         call,
     ))
@@ -617,7 +490,7 @@ pub(crate) mod tests {
         let token = |s: &str| Token::new(s).unwrap();
         let digest = Digest32::from_bytes([1; 32]);
         ApprovalPrepareRequest {
-            requested_review_mode: None,
+            evm_reported_token: None,
             surface_selection: CeremonySurfaceSelection::Default,
             operation_id: OperationId::from_bytes([2; 32]),
             canonical_plan_facts_digest: digest.clone(),
@@ -676,18 +549,13 @@ pub(crate) mod tests {
                 destination: "exact".into(),
             }],
             required_verifiers: vec![],
-            clear_signing: None,
         }
     }
-    fn no_clear_signing() -> ClearSigningContext {
-        ClearSigningContext {
-            catalog: None,
-            verifier_digest: Digest32::from_bytes([0; 32]),
-            now_ms: 10,
-        }
+    fn no_clear_signing() -> &'static Catalog {
+        Catalog::built_in().unwrap()
     }
     fn review_ok(req: &ApprovalPrepareRequest) -> EvmReview {
-        review(req, &policy(), Address::ZERO, &no_clear_signing())
+        review(req, &policy(), Address::ZERO, no_clear_signing())
             .unwrap()
             .expect("review with payloads yields a review")
     }
@@ -704,7 +572,7 @@ pub(crate) mod tests {
         };
         let mut req = request(&approved.encoded_for_signing());
         req.evm_review_payloads = vec![Base64UrlBytes::from_bytes(&other.encoded_for_signing())];
-        let error = review(&req, &policy(), Address::ZERO, &no_clear_signing()).unwrap_err();
+        let error = review(&req, &policy(), Address::ZERO, no_clear_signing()).unwrap_err();
         assert!(
             error.message.contains("differs from the approved selector"),
             "{}",
@@ -723,7 +591,7 @@ pub(crate) mod tests {
             &request(&legacy.encoded_for_signing()),
             &policy(),
             Address::ZERO,
-            &no_clear_signing(),
+            no_clear_signing(),
         )
         .unwrap_err();
         assert!(
@@ -790,13 +658,13 @@ pub(crate) mod tests {
             assert_eq!(reviewed.nonce, "3");
             let mut altered = req.clone();
             altered.evm_review_payloads[0] = Base64UrlBytes::from_bytes(&[0]);
-            assert!(review(&altered, &policy(), Address::ZERO, &no_clear_signing()).is_err());
+            assert!(review(&altered, &policy(), Address::ZERO, no_clear_signing()).is_err());
             let mut denied = policy();
             denied.allowed_destinations.clear();
-            assert!(review(&req, &denied, Address::ZERO, &no_clear_signing()).is_err());
+            assert!(review(&req, &denied, Address::ZERO, no_clear_signing()).is_err());
             let mut wrong_chain = policy();
             wrong_chain.allowed_destinations[0].chain = Token::new("evm-1").unwrap();
-            assert!(review(&req, &wrong_chain, Address::ZERO, &no_clear_signing()).is_err());
+            assert!(review(&req, &wrong_chain, Address::ZERO, no_clear_signing()).is_err());
             let mut trailing = bytes;
             trailing.push(0);
             assert!(
@@ -804,7 +672,7 @@ pub(crate) mod tests {
                     &request(&trailing),
                     &policy(),
                     Address::ZERO,
-                    &no_clear_signing()
+                    no_clear_signing()
                 )
                 .is_err()
             );
@@ -852,7 +720,7 @@ pub(crate) mod tests {
                 &call_batch(0, 32),
                 &policy(),
                 Address::ZERO,
-                &no_clear_signing()
+                no_clear_signing()
             )
             .is_ok()
         );
@@ -860,7 +728,7 @@ pub(crate) mod tests {
             &call_batch(0, 33),
             &policy(),
             Address::ZERO,
-            &no_clear_signing(),
+            no_clear_signing(),
         )
         .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::LimitExceededFrame);
@@ -875,7 +743,7 @@ pub(crate) mod tests {
                 &call_batch(200 * kib, 1),
                 &policy(),
                 Address::ZERO,
-                &no_clear_signing()
+                no_clear_signing()
             )
             .is_ok()
         );
@@ -883,7 +751,7 @@ pub(crate) mod tests {
             &call_batch(256 * kib, 1),
             &policy(),
             Address::ZERO,
-            &no_clear_signing(),
+            no_clear_signing(),
         )
         .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::LimitExceededFrame);
@@ -893,7 +761,7 @@ pub(crate) mod tests {
                 &call_batch(60 * kib, 2),
                 &policy(),
                 Address::ZERO,
-                &no_clear_signing()
+                no_clear_signing()
             )
             .is_ok()
         );
@@ -901,7 +769,7 @@ pub(crate) mod tests {
             &call_batch(65 * kib, 2),
             &policy(),
             Address::ZERO,
-            &no_clear_signing(),
+            no_clear_signing(),
         )
         .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::LimitExceededFrame);
@@ -909,7 +777,7 @@ pub(crate) mod tests {
             &call_batch(60 * kib, 9),
             &policy(),
             Address::ZERO,
-            &no_clear_signing(),
+            no_clear_signing(),
         )
         .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::LimitExceededFrame);
@@ -1051,7 +919,7 @@ pub(crate) mod tests {
             &request(&signed),
             &policy(),
             Address::ZERO,
-            &no_clear_signing(),
+            no_clear_signing(),
         )
         .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::SelectorMismatch);
@@ -1080,7 +948,7 @@ pub(crate) mod tests {
                 &request(&canonical),
                 &policy(),
                 Address::ZERO,
-                &no_clear_signing()
+                no_clear_signing()
             )
             .unwrap()
             .is_some()
@@ -1099,7 +967,7 @@ pub(crate) mod tests {
             &request(&padded),
             &policy(),
             Address::ZERO,
-            &no_clear_signing(),
+            no_clear_signing(),
         )
         .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::SelectorMismatch);
@@ -1113,7 +981,7 @@ pub(crate) mod tests {
             &request(&relisted),
             &policy(),
             Address::ZERO,
-            &no_clear_signing(),
+            no_clear_signing(),
         )
         .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::SelectorMismatch);
@@ -1138,7 +1006,7 @@ pub(crate) mod tests {
                 &request(&typed),
                 &policy(),
                 Address::ZERO,
-                &no_clear_signing(),
+                no_clear_signing(),
             )
             .unwrap_err();
             assert_eq!(
@@ -1180,7 +1048,7 @@ pub(crate) mod tests {
             nonce: RequestNonce::from_bytes([11; 16]),
             claim_assurance: ClaimAssurance::MachineAsserted,
         });
-        let error = review(&req, &policy(), Address::ZERO, &no_clear_signing()).unwrap_err();
+        let error = review(&req, &policy(), Address::ZERO, no_clear_signing()).unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::MalformedFrame);
         assert!(error.message.contains("cannot carry a claim"), "{error:?}");
 
@@ -1204,7 +1072,7 @@ pub(crate) mod tests {
             },
             claim_assurance: ClaimAssurance::MachineAsserted,
         });
-        let error = review(&req, &policy(), Address::ZERO, &no_clear_signing()).unwrap_err();
+        let error = review(&req, &policy(), Address::ZERO, no_clear_signing()).unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::MalformedFrame);
         assert!(error.message.contains("cannot carry a claim"), "{error:?}");
     }
@@ -1239,7 +1107,7 @@ pub(crate) mod tests {
         ] {
             let mut req = request(&bytes);
             req.terms.subject = subject;
-            let error = review(&req, &policy(), Address::ZERO, &no_clear_signing()).unwrap_err();
+            let error = review(&req, &policy(), Address::ZERO, no_clear_signing()).unwrap_err();
             assert_eq!(error.code, ProtocolErrorCode::MalformedFrame);
             assert!(
                 error.message.contains("native transaction subject"),
@@ -1264,7 +1132,7 @@ pub(crate) mod tests {
         let mut req = request(&tx.encoded_for_signing());
         req.evm_review_payloads.clear();
         assert!(
-            review(&req, &policy(), Address::ZERO, &no_clear_signing())
+            review(&req, &policy(), Address::ZERO, no_clear_signing())
                 .unwrap()
                 .is_none()
         );
@@ -1319,30 +1187,27 @@ pub(crate) mod tests {
 /// One mode for the whole batch, and what a clear-signed member looks like
 /// once the catalog is in play.
 #[cfg(test)]
-pub(super) mod mode_tests {
+pub(crate) mod mode_tests {
     use super::tests::*;
     use super::*;
     use alloy::primitives::U256;
-    use bloom_broker_api::{Base64UrlBytes, DecimalU64, Token};
-    use bloom_evm_clear_signing::{
-        ActionClass, AdmittedFunction, CATALOG_SCHEMA, CATALOG_SIGNATURE_DOMAIN, CatalogEntry,
-        CatalogSignature, ClearSigningCatalog, TokenMetadata, TrustedCatalogKey, descriptor_digest,
-    };
-    use ed25519_dalek::{Signer as _, SigningKey};
+    use bloom_broker_api::Base64UrlBytes;
+    use bloom_broker_api::KnownToken;
+    use bloom_evm_clear_signing::{Binding, checksum};
 
     const TOKEN_ADDRESS: &str = "0x1111111111111111111111111111111111111111";
     const RECIPIENT: &str = "0x2222222222222222222222222222222222222222";
-    const NOW_MS: u64 = 1_750_000_000_000;
     const TRANSFER: &str = "transfer(address _to, uint256 _value)";
     const APPROVE: &str = "approve(address _spender, uint256 _value)";
 
-    pub(crate) fn accepted_catalog_at(observed_at_ms: u64) -> AcceptedCatalog {
-        accepted_catalog_on_chain(31337, observed_at_ms)
+    fn accepted_catalog() -> Catalog {
+        accepted_catalog_on_chain(31337)
     }
 
-    pub(crate) fn accepted_catalog_on_chain(chain_id: u64, observed_at_ms: u64) -> AcceptedCatalog {
+    pub(crate) fn accepted_catalog_on_chain(chain_id: u64) -> Catalog {
         let descriptor = serde_json::json!({
             "context": {"contract": {"deployments": [{"chainId": chain_id, "address": TOKEN_ADDRESS}]}},
+            "metadata": {"contractName": "Example Token"},
             "display": {"formats": {TRANSFER: {
                 "intent": "Send",
                 "fields": [
@@ -1359,95 +1224,15 @@ pub(super) mod mode_tests {
                 ]
             }}}
         });
-        let mut catalog = ClearSigningCatalog {
-            schema: CATALOG_SCHEMA.into(),
-            catalog_id: Token::new("bloom-tokens").unwrap(),
-            sequence: DecimalU64::new(1),
-            issued_at_ms: DecimalU64::new(NOW_MS - 1000),
-            expires_at_ms: DecimalU64::new(NOW_MS + 86_400_000),
-            entries: vec![CatalogEntry {
-                chain_id: DecimalU64::new(chain_id),
-                contract_address: TOKEN_ADDRESS.into(),
-                admitted_functions: vec![
-                    AdmittedFunction {
-                        signature: TRANSFER.into(),
-                        action_class: ActionClass::Transfer,
-                    },
-                    AdmittedFunction {
-                        signature: APPROVE.into(),
-                        action_class: ActionClass::Allowance,
-                    },
-                ],
-                descriptor_digest: Some(descriptor_digest(&descriptor).unwrap()),
-                flattened_descriptor: Some(descriptor),
-                runtime_code_hash: None,
-                token_metadata: Some(TokenMetadata {
-                    decimals: 6,
-                    symbol: "EXA".into(),
-                    name: "Example Token".into(),
-                }),
-                upgradeable: false,
-                implementation_hash: None,
-                observed_at_ms: DecimalU64::new(observed_at_ms),
-            }],
-            signatures: Vec::new(),
+        let token = KnownToken {
+            chain_id,
+            address: TOKEN_ADDRESS.into(),
+            symbol: "EXA".into(),
+            name: "Example Token".into(),
+            decimals: 6,
+            upgradeable: false,
         };
-        let key = SigningKey::from_bytes(&[5; 32]);
-        let mut message = CATALOG_SIGNATURE_DOMAIN.to_vec();
-        message.extend_from_slice(&catalog.unsigned_canonical_bytes().unwrap());
-        catalog.signatures = vec![CatalogSignature {
-            key_id: Token::new("publisher-1").unwrap(),
-            signature: Base64UrlBytes::from_bytes(&key.sign(&message).to_bytes()),
-        }];
-        let size = serde_jcs::to_vec(&catalog).unwrap().len();
-        catalog
-            .accept(
-                size,
-                &[TrustedCatalogKey {
-                    key_id: Token::new("publisher-1").unwrap(),
-                    verifying_key: key.verifying_key(),
-                }],
-                1,
-            )
-            .unwrap()
-    }
-
-    fn accepted_catalog() -> AcceptedCatalog {
-        accepted_catalog_at(NOW_MS - 500)
-    }
-
-    pub(crate) fn enabled_context() -> ClearSigningContext {
-        ClearSigningContext {
-            catalog: Some(accepted_catalog()),
-            verifier_digest: Digest32::from_bytes(
-                bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES,
-            ),
-            now_ms: NOW_MS,
-        }
-    }
-
-    fn enabled_policy() -> CanonicalWalletPolicy {
-        let mut policy = policy();
-        policy.clear_signing = Some(bloom_broker_api::ClearSigningPolicy {
-            catalog_id: Token::new("bloom-tokens").unwrap(),
-            trusted_keys: vec![bloom_broker_api::CatalogTrustedKey {
-                key_id: Token::new("publisher-1").unwrap(),
-                verifying_key: Base64UrlBytes::from_bytes(
-                    &SigningKey::from_bytes(&[5; 32]).verifying_key().to_bytes(),
-                ),
-            }],
-            signature_threshold: 1,
-            maximum_observation_age_ms: 86_400_000,
-            opaque_exact_allowed: false,
-            unlimited_allowance_allowed: false,
-            verifier: bloom_broker_api::RequiredVerifier {
-                verifier_id: Token::new(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_ID).unwrap(),
-                verifier_digest: Digest32::from_bytes(
-                    bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES,
-                ),
-            },
-        });
-        policy
+        Catalog::build(&[(descriptor, Binding::Listed)], vec![token]).unwrap()
     }
 
     fn transfer_calldata(to: &str, amount: u64) -> Vec<u8> {
@@ -1503,254 +1288,198 @@ pub(super) mod mode_tests {
     }
 
     #[test]
-    fn an_enabled_wallet_reads_a_contract_call_without_being_asked_to() {
+    fn a_catalogued_token_reads_with_its_name_and_units() {
         let request = batch(&[call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 2_500_000))]);
-        let review = review(
-            &request,
-            &enabled_policy(),
-            Address::ZERO,
-            &enabled_context(),
-        )
-        .unwrap()
-        .unwrap();
-        let call = review.payloads[0]
-            .contract_call
-            .as_ref()
-            .expect("clear call");
+        let review = review(&request, &policy(), Address::ZERO, &accepted_catalog())
+            .unwrap()
+            .unwrap();
+        let call = review.payloads[0].contract_call.as_ref().unwrap();
         assert_eq!(call.action, "transfer");
         assert!(call.fields.iter().any(|field| field.value == "2.5 EXA"));
-        let evidence = review.clear_signing.as_ref().expect("evidence");
+        let evidence = review.clear_signing.as_ref().unwrap();
         assert_eq!(evidence.assurance, "trusted_description");
         assert_eq!(evidence.entries.len(), 1);
-        // The bound is the observation age, one entry deep.
-        assert_eq!(
-            evidence.permitted_expiry_ms(86_400_000),
-            NOW_MS - 500 + 86_400_000
-        );
     }
 
+    /// Bloom never refuses a call for being unreadable: it shows the exact
+    /// bytes and why it could not read them, and the owner decides.
     #[test]
-    fn an_approval_cannot_outlive_its_evidence() {
-        // The entry was observed at NOW_MS - 500 and may be used for one day.
-        let permitted = NOW_MS - 500 + 86_400_000;
-        let mut request = batch(&[call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 1))]);
-        request.terms.expires_at_ms = DecimalU64::new(permitted + 1);
-        let error = review(
-            &request,
-            &enabled_policy(),
-            Address::ZERO,
-            &enabled_context(),
-        )
-        .unwrap_err();
-        assert!(
-            error.message.contains(&format!("only until {permitted}")),
-            "{}",
-            error.message
-        );
-
-        request.terms.expires_at_ms = DecimalU64::new(permitted);
-        review(
-            &request,
-            &enabled_policy(),
-            Address::ZERO,
-            &enabled_context(),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn one_undescribed_member_blocks_the_whole_clear_batch() {
+    fn an_unreadable_call_is_shown_as_exact_bytes_with_its_reason() {
+        let mut trailing = transfer_calldata(RECIPIENT, 1);
+        trailing.push(0);
         let request = batch(&[
             call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 1)),
             call(RECIPIENT, vec![0xde, 0xad, 0xbe, 0xef]),
+            call(TOKEN_ADDRESS, trailing),
         ]);
-        let error = review(
-            &request,
-            &enabled_policy(),
-            Address::ZERO,
-            &enabled_context(),
-        )
-        .unwrap_err();
-        assert!(
-            error.message.contains("UNSUPPORTED_CALL"),
-            "{}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn an_explicitly_opaque_batch_needs_policy_permission_and_stays_opaque() {
-        let mut request = batch(&[call(RECIPIENT, vec![0xde, 0xad, 0xbe, 0xef])]);
-        request.requested_review_mode = Some(ReviewMode::OpaqueExact);
-
-        let denied = review(
-            &request,
-            &enabled_policy(),
-            Address::ZERO,
-            &enabled_context(),
-        )
-        .unwrap_err();
-        assert!(
-            denied.message.contains("POLICY_DENIED"),
-            "{}",
-            denied.message
-        );
-
-        let mut policy = enabled_policy();
-        policy.clear_signing.as_mut().unwrap().opaque_exact_allowed = true;
-        let review = review(&request, &policy, Address::ZERO, &enabled_context())
-            .unwrap()
-            .unwrap();
-        // No downgrade badge, no partial reading: the member stays opaque and
-        // the evidence block is absent.
-        assert!(review.payloads[0].contract_call.is_none());
-        assert!(review.clear_signing.is_none());
-    }
-
-    #[test]
-    fn a_readable_call_cannot_be_downgraded_to_opaque() {
-        let mut policy = enabled_policy();
-        policy.clear_signing.as_mut().unwrap().opaque_exact_allowed = true;
-        let mut request = batch(&[call(
-            TOKEN_ADDRESS,
-            address_amount_calldata(APPROVE, RECIPIENT, U256::MAX),
-        )]);
-        request.requested_review_mode = Some(ReviewMode::OpaqueExact);
-        // Unlimited and refused: asking for an opaque review does not skip it.
-        let error = review(&request, &policy, Address::ZERO, &enabled_context()).unwrap_err();
-        assert!(error.message.contains("POLICY_DENIED"), "{}", error.message);
-
-        // Readable and allowed: still not approvable unread.
-        let mut request = batch(&[call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 1))]);
-        request.requested_review_mode = Some(ReviewMode::OpaqueExact);
-        let error = review(&request, &policy, Address::ZERO, &enabled_context()).unwrap_err();
-        assert!(
-            error.message.contains("cannot be approved unread")
-                && !error.message.contains("Change policy"),
-            "{}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn an_unlimited_allowance_is_refused_unless_policy_allows_it() {
-        let request = batch(&[call(
-            TOKEN_ADDRESS,
-            address_amount_calldata(APPROVE, RECIPIENT, U256::MAX),
-        )]);
-        let error = review(
-            &request,
-            &enabled_policy(),
-            Address::ZERO,
-            &enabled_context(),
-        )
-        .unwrap_err();
-        assert!(error.message.contains("POLICY_DENIED"), "{}", error.message);
-
-        let mut policy = enabled_policy();
-        policy
-            .clear_signing
-            .as_mut()
-            .unwrap()
-            .unlimited_allowance_allowed = true;
-        let review = review(&request, &policy, Address::ZERO, &enabled_context())
+        let review = review(&request, &policy(), Address::ZERO, &accepted_catalog())
             .unwrap()
             .unwrap();
         assert!(review.payloads[0].contract_call.is_some());
-    }
-
-    #[test]
-    fn a_wallet_without_clear_signing_refuses_a_required_mode_rather_than_ignoring_it() {
-        let mut request = batch(&[call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 1))]);
-        request.requested_review_mode = Some(ReviewMode::Clear);
-        let error = review(
-            &request,
-            &policy(),
-            Address::ZERO,
-            &ClearSigningContext {
-                catalog: None,
-                verifier_digest: Digest32::from_bytes([0; 32]),
-                now_ms: NOW_MS,
-            },
-        )
-        .unwrap_err();
-        assert!(error.message.contains("POLICY_DENIED"), "{}", error.message);
-    }
-
-    #[test]
-    fn an_enabled_wallet_with_no_catalog_refuses_the_contract_call() {
-        let request = batch(&[call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 1))]);
-        let error = review(
-            &request,
-            &enabled_policy(),
-            Address::ZERO,
-            &ClearSigningContext {
-                catalog: None,
-                verifier_digest: Digest32::from_bytes([0; 32]),
-                now_ms: NOW_MS,
-            },
-        )
-        .unwrap_err();
+        for unread in &review.payloads[1..] {
+            assert!(unread.contract_call.is_none());
+            assert!(unread.unread_reason.is_some());
+        }
         assert!(
-            error.message.contains("CATALOG_UNAVAILABLE"),
-            "{}",
-            error.message
+            review.payloads[1]
+                .unread_reason
+                .as_ref()
+                .unwrap()
+                .contains("no description")
         );
     }
 
     #[test]
-    fn a_stale_observation_stops_authorizing_even_from_a_valid_catalog() {
-        let request = batch(&[call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 1))]);
-        let mut policy = enabled_policy();
-        policy
-            .clear_signing
-            .as_mut()
+    fn an_unlisted_token_is_read_by_its_erc20_shape() {
+        let request = batch(&[call(RECIPIENT, transfer_calldata(TOKEN_ADDRESS, 2_500_000))]);
+        let decoded = review(&request, &policy(), Address::ZERO, &accepted_catalog())
             .unwrap()
-            .maximum_observation_age_ms = 100;
-        let error = review(&request, &policy, Address::ZERO, &enabled_context()).unwrap_err();
+            .unwrap();
+        let structural = decoded.payloads[0].contract_call.as_ref().unwrap();
+        assert_eq!(structural.contract, checksum(RECIPIENT));
+        let summary = structural.intent_summary.as_ref().unwrap();
+        assert_eq!(summary.amount, "2500000");
+        assert!(summary.amount_display.contains("raw units"));
+        assert!(structural.structural && summary.token.is_none());
+        assert!(structural.warnings[0].contains("has not verified"));
+        assert!(decoded.clear_signing.is_none());
+    }
+
+    /// The token's own symbol and decimals shape the display, marked as
+    /// unverified; a report naming another contract or carrying markup does not.
+    #[test]
+    fn an_unlisted_token_shows_the_amount_it_reports_about_itself() {
+        let read = |address: &str, symbol: &str| {
+            let mut request =
+                batch(&[call(RECIPIENT, transfer_calldata(TOKEN_ADDRESS, 2_500_000))]);
+            request.evm_reported_token = Some(bloom_broker_api::EvmReportedToken {
+                address: address.to_owned(),
+                symbol: symbol.to_owned(),
+                decimals: 6,
+            });
+            let review = review(&request, &policy(), Address::ZERO, &accepted_catalog())
+                .unwrap()
+                .unwrap();
+            review.payloads[0].contract_call.clone().unwrap()
+        };
+        let shown = read(&RECIPIENT.to_lowercase(), "BRETT");
+        let summary = shown.intent_summary.as_ref().unwrap();
+        assert_eq!(summary.amount_display, "2.5 BRETT");
+        assert_eq!(summary.amount, "2500000");
+        assert!(summary.token.is_none() && shown.structural);
         assert!(
-            error.message.contains("EVIDENCE_EXPIRED"),
-            "{}",
-            error.message
+            shown
+                .warnings
+                .iter()
+                .any(|w| w.contains("has not verified them"))
         );
+        for (address, symbol) in [(TOKEN_ADDRESS, "BRETT"), (RECIPIENT, "<b>X</b>")] {
+            let ignored = read(address, symbol);
+            assert!(
+                ignored
+                    .intent_summary
+                    .unwrap()
+                    .amount_display
+                    .contains("raw units")
+            );
+        }
     }
 
     #[test]
-    fn a_future_observation_cannot_authorize_a_review() {
-        let request = batch(&[call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 1))]);
-        let error = review(
-            &request,
-            &enabled_policy(),
-            Address::ZERO,
-            &ClearSigningContext {
-                catalog: Some(accepted_catalog_at(NOW_MS + 1)),
-                verifier_digest: Digest32::from_bytes(
-                    bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES,
-                ),
-                now_ms: NOW_MS,
-            },
-        )
-        .unwrap_err();
-        assert!(
-            error.message.contains("later than trusted time"),
-            "{}",
-            error.message
-        );
+    fn an_unlimited_allowance_is_shown_with_its_warning() {
+        for to in [TOKEN_ADDRESS, RECIPIENT] {
+            let request = batch(&[call(
+                to,
+                address_amount_calldata(APPROVE, TOKEN_ADDRESS, U256::MAX),
+            )]);
+            let decoded = review(&request, &policy(), Address::ZERO, &accepted_catalog())
+                .unwrap()
+                .unwrap();
+            let call = decoded.payloads[0].contract_call.as_ref().unwrap();
+            assert_eq!(call.intent_summary.as_ref().unwrap().magnitude, "unlimited");
+            assert!(!call.warnings.is_empty());
+        }
     }
 
     #[test]
-    fn a_plain_native_send_keeps_its_envelope_review_inside_an_enabled_wallet() {
+    fn a_mixed_batch_lists_only_the_catalogued_entries() {
+        let request = batch(&[
+            call(TOKEN_ADDRESS, transfer_calldata(RECIPIENT, 1_000_000)),
+            call(RECIPIENT, transfer_calldata(TOKEN_ADDRESS, 2)),
+        ]);
+        let review = review(&request, &policy(), Address::ZERO, &accepted_catalog())
+            .unwrap()
+            .unwrap();
+        assert!(
+            !review.payloads[0]
+                .contract_call
+                .as_ref()
+                .unwrap()
+                .structural
+        );
+        assert!(
+            review.payloads[1]
+                .contract_call
+                .as_ref()
+                .unwrap()
+                .structural
+        );
+        assert_eq!(review.clear_signing.as_ref().unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn a_plain_native_send_keeps_its_envelope_review() {
         let request = batch(&[call(RECIPIENT, Vec::new())]);
+        let review = review(&request, &policy(), Address::ZERO, &accepted_catalog())
+            .unwrap()
+            .unwrap();
+        assert!(review.payloads[0].contract_call.is_none());
+        assert!(review.payloads[0].unread_reason.is_none());
+        assert!(review.clear_signing.is_none());
+        assert_eq!(review.payloads[0].calldata_bytes, "0");
+    }
+
+    #[test]
+    fn a_safe_it_has_no_entry_for_is_read_as_a_safe() {
+        // A real Base execution: the Safe sends 0.00001 ETH to its owner.
+        let input = hex::decode("6a7612020000000000000000000000008d4fafba75a9dc50b4b296211509e856d2c6d081000000000000000000000000000000000000000000000000000009184e72a00000000000000000000000000000000000000000000000000000000000000001400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000160000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000411fca12a0c7a67fc6ca9ca271335af2680fae0ce704f5c75fe373ddce47674df33a341f86acbc619d6db40b37ef330f3f2dd47897f0551799f28f20ef7288d69b1b00000000000000000000000000000000000000000000000000000000000000").unwrap();
+        let owner = "0x8d4fafba75a9dc50b4b296211509e856d2c6d081";
+        let safe: Address = "0xaefda71ded59b48920131d03454893ec2ad93e88"
+            .parse()
+            .unwrap();
+        let payload = TxEip1559 {
+            chain_id: 8453,
+            nonce: 0,
+            gas_limit: 100_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(safe),
+            value: U256::ZERO,
+            input: input.into(),
+            access_list: Default::default(),
+        }
+        .encoded_for_signing();
+        let policy = policy();
         let review = review(
-            &request,
-            &enabled_policy(),
+            &batch(&[payload]),
+            &policy,
             Address::ZERO,
-            &enabled_context(),
+            Catalog::built_in().unwrap(),
         )
         .unwrap()
         .unwrap();
-        assert!(review.payloads[0].contract_call.is_none());
-        assert!(review.clear_signing.is_none());
-        assert_eq!(review.payloads[0].calldata_bytes, "0");
+        let call = review.payloads[0].contract_call.as_ref().unwrap();
+        assert_eq!(call.contract_name.as_deref(), Some("Safe"));
+        assert!(
+            call.fields.iter().any(|field| field.value
+                == format!(
+                    "Send 0.00001 ETH to {}",
+                    bloom_evm_clear_signing::checksum(owner)
+                )),
+            "{:?}",
+            call.fields
+        );
+        let evidence = review.clear_signing.as_ref().unwrap();
+        assert_eq!(evidence.assurance, "structural_description");
     }
 }

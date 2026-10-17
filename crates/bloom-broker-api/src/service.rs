@@ -63,10 +63,6 @@ pub struct ServiceCapabilities {
     pub schemas: Vec<Token>,
     pub backends: Vec<BackendPublicCapability>,
     pub assurance_verifiers: Vec<VerifierPublicCapability>,
-    /// One entry per stored clear-signing catalog, ordered by catalog identity.
-    /// Empty when none is stored.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub clear_signing: Vec<crate::ClearSigningStatus>,
     pub frame_max_bytes: DecimalU64,
 }
 
@@ -114,26 +110,24 @@ pub struct ApprovalPrepareRequest {
     /// preimage from each envelope and binds it to the exact selector.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub safe_review_payloads: Vec<Base64UrlBytes>,
-    /// The review mode the caller requires for this whole batch. Omitted
-    /// means `clear` in a wallet that has clear signing enabled, and leaves
-    /// the previous envelope behavior in one that has not. A peer that does
-    /// not understand this field rejects the frame rather than ignoring it,
-    /// so a required mode can never be silently dropped.
+    /// The symbol and decimals an unlisted token contract reports, read by
+    /// Machine. Broker uses them only to display an amount it decoded itself,
+    /// and labels that display as unverified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub requested_review_mode: Option<ReviewMode>,
+    pub evm_reported_token: Option<EvmReportedToken>,
     #[serde(default)]
     pub petal_use_claim: Option<PetalUseClaim>,
     #[serde(default)]
     pub system_use_claim: Option<SystemUseClaim>,
 }
 
-/// One mode for the whole batch. There is no mixed badge, no automatic
-/// split, and no downgrade from `clear` to `opaque_exact`.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewMode {
-    Clear,
-    OpaqueExact,
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvmReportedToken {
+    /// Lowercase `0x`-prefixed address of the called contract.
+    pub address: String,
+    pub symbol: String,
+    pub decimals: u8,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
