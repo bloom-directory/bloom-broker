@@ -541,8 +541,12 @@ function safeIdentityRisk(warning) {
 function safeAmount(rows) {
   const named = rows.find(row => /(?:^|· )Amount$/.test(row.label) && /[A-Za-z]/.test(row.value));
   if (named) return named.value;
-  const raw = rows.find(row => row.label === "Token amount (base units)" || row.label === "Raw token amount");
+  const raw = rows.find(row => ["Token amount (base units)", "Raw token amount", "Raw total allowance"].includes(row.label));
   return raw ? `${raw.value} base units` : "";
+}
+function safeUnlimitedAmount(amount) {
+  const numeric = String(amount).match(/^(\d+)(?:\.(\d+))?(?:\s|$)/);
+  return Boolean(numeric && BigInt(numeric[1] + (numeric[2] || "")) === (1n << 256n) - 1n);
 }
 function safeMovements(rows, rawAction) {
   const bits = [];
@@ -821,6 +825,9 @@ function describeTransfer(manifest) {
       nestedActions[0].value.startsWith("erc20TransferFrom on ") &&
       nestedActions[1].value.startsWith("erc4626Deposit on ");
     const recipient = safeRowValue(rows, "Recipient") || safeRowValue(rows, "To");
+    const spender = safeRowValue(rows, "Spender");
+    const permission = rawAction.startsWith("approve on ");
+    const unlimited = permission && safeUnlimitedAmount(amount);
     const sendTo = rawAction.match(/^Send (.+) to (0x[0-9a-fA-F]{40})$/);
     const movements = safeMovements(rows, rawAction);
     const safeShort = shortAddress(safe.safe);
@@ -838,6 +845,11 @@ function describeTransfer(manifest) {
     } else if (rawAction.startsWith("changeThreshold")) {
       heading = `Require ${thresholdText}`;
       sentence = `Require <strong>${escapeHtml(thresholdText)}</strong> on Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>.`;
+    } else if (permission && amount && spender) {
+      heading = unlimited ? `Allow unlimited spending by ${shortAddress(spender)}`
+        : /^0(?:\.0+)?\s/.test(amount) ? `Clear spending permission for ${shortAddress(spender)}`
+        : `Allow ${shortAddress(spender)} to spend up to ${amount}`;
+      sentence = `Change this spender's permission to use tokens held by Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>.`;
     } else if (rawAction.startsWith("transfer on ") && amount && recipient) {
       heading = `Send ${amount} to ${shortAddress(recipient)}`;
       sentence = `Send <strong>${escapeHtml(amount)}</strong> from Safe <strong>${escapeHtml(safeShort)}</strong> to <strong>${escapeHtml(shortAddress(recipient))}</strong> on <strong>${escapeHtml(network)}</strong>.`;
@@ -904,19 +916,20 @@ function describeTransfer(manifest) {
       .filter(row => /^Transaction \d+$/.test(row.label))
       .map(row => {
         const value = name => safeRowValue(rows, `${row.label} · ${name}`);
-        const tokenCall = row.value.match(/^(approve|transfer) on .+ (0x[0-9a-fA-F]{40})$/);
+        const tokenCall = row.value.match(/^(approve|transfer) on (?:.+ )?(0x[0-9a-fA-F]{40})$/);
         const morpho = row.value.startsWith("multicall on Morpho Bundler3 ");
         const native = row.value.match(/^Send (.+) to (0x[0-9a-fA-F]{40})$/);
         const address = tokenCall?.[2] || (morpho ? value("Action 1 · Token") : "");
         const amount = tokenCall ? value("Amount") : morpho ? value("Action 1 · Amount") : native?.[1];
         const permission = tokenCall?.[1] === "approve";
+        const unlimited = permission && safeUnlimitedAmount(amount);
         return {
           position: row.label,
           title: permission ? "Token spending permission" : tokenCall ? "Token transfer"
             : morpho ? "Calls through Morpho" : native ? "Native transfer" : "Contract call",
-          asset: address && amount ? {chainId: String(safe.chain_id), address, amount,
+          asset: address && amount ? {chainId: String(safe.chain_id), address, amount: unlimited ? "Unlimited" : amount,
             amountLabel: permission ? "Spending limit" : morpho ? "Tokens supplied" : "Amount",
-            tone: permission ? "permission" : "outgoing"}
+            tone: unlimited ? "danger" : permission ? "permission" : "outgoing"}
             : native ? {native: / ETH$/.test(amount) ? "ethereum" : "token", amount, amountLabel: "Amount"} : null,
           parties: [
             [permission ? "Spender" : "Recipient", permission ? value("Spender") : value("To") || value("Recipient") || native?.[2]],
@@ -927,13 +940,21 @@ function describeTransfer(manifest) {
       }) : [];
     const tokens = rows.filter(row =>
       /(?:^|· )Token$/.test(row.label) && /^0x[0-9a-fA-F]{40}$/.test(row.value));
-    const tokenAddress = tokens.length === 1 && movements.length <= 1 && !rawAction.startsWith("multiSend")
-      ? tokens[0].value : "";
+    const directToken = rawAction.match(/^(?:approve|transfer) on (?:.+ )?(0x[0-9a-fA-F]{40})$/)?.[1];
+    const tokenAddress = !rawAction.startsWith("multiSend") && movements.length <= 1
+      ? tokens.length === 1 ? tokens[0].value : directToken || "" : "";
     const tokenAsset = tokenAddress && amount
-      ? {chainId: String(safe.chain_id), address: tokenAddress, amount, amountLabel: "Amount", tone: "outgoing"}
-      : null;
+      ? {chainId: String(safe.chain_id), address: tokenAddress, amount: unlimited ? "Unlimited" : amount,
+          amountLabel: permission ? "Spending limit" : "Amount",
+          tone: unlimited ? "danger" : permission ? "permission" : "outgoing"}
+      : sendTo ? {native: / ETH$/.test(sendTo[1]) ? "ethereum" : "token",
+          title: / ETH$/.test(sendTo[1]) ? "Ether" : "Native asset", amount: sendTo[1],
+          amountLabel: "Amount", tone: "outgoing"} : null;
+    const safeRecipient = directToken ? recipient : sendTo?.[2];
+    const safeParties = (permission && spender) ? [["Spender", spender]]
+      : safeRecipient ? [["Recipient", safeRecipient]] : [];
     return {sentence, facts, technical, warnings, willVerify: true, heading,
-      button: "Approve Safe signature", chainId: safe.chain_id, tokenAsset, safeCards,
+      button: "Approve Safe signature", chainId: safe.chain_id, tokenAsset, safeCards, safeParties,
       networkIdentity: `EVM · ${network} · Chain ID ${safe.chain_id}`,
       networkIcon: chainIcon(safe.chain_id)};
   }
@@ -1264,13 +1285,7 @@ function renderReview(session) {
   const decision = [];
   const evidence = [];
   if (transfer?.tokenAsset) {
-    decision.push(assetCard({
-      chainId: transfer.tokenAsset.chainId,
-      address: transfer.tokenAsset.address,
-      amount: transfer.tokenAsset.amount,
-      amountLabel: transfer.tokenAsset.amountLabel,
-      tone: transfer.tokenAsset.tone
-    }));
+    decision.push(assetCard(transfer.tokenAsset));
   }
   for (const card of transfer?.safeCards || []) {
     const section = el("section", {class: "ceremony-card"},
@@ -1281,6 +1296,9 @@ function renderReview(session) {
       section.append(partyRow({role: label.toLowerCase(), label, value, chainId: transfer.chainId}));
     }
     decision.push(section);
+  }
+  for (const [label, value] of transfer?.safeParties || []) {
+    decision.push(partyRow({role: label.toLowerCase(), label, value, chainId: transfer.chainId}));
   }
   if (transfer?.intent) {
     panelTitle.textContent = transfer.intent.heading;
@@ -2311,7 +2329,29 @@ function previewProtocolCall(name) {
   session.preview_status = "Synthetic descriptor test — not a deployed protocol integration";
   return session;
 }
+function previewSafeTransaction(action, extra = {}) {
+  const session = PREVIEWS.morpho();
+  const plan = JSON.parse(session.review_manifest.canonical_plan);
+  const warnings = plan.safe_review.action.filter(line => line.startsWith("Warning: "));
+  Object.assign(plan.safe_review, {destination: PREVIEW_TOKEN, operation: "call",
+    action: [...action, ...warnings]}, extra);
+  session.review_manifest.canonical_plan = JSON.stringify(plan);
+  return session;
+}
 const PREVIEWS = {
+  "safe-token-transfer": () => previewSafeTransaction([
+    `Action: transfer on USD Coin ${PREVIEW_TOKEN}`,
+    `To: ${PREVIEW_SPENDER}`, "Amount: 25 USDC"
+  ]),
+  "safe-allowance-unlimited": () => previewSafeTransaction([
+    `Action: approve on USD Coin ${PREVIEW_TOKEN}`,
+    `Spender: ${PREVIEW_SPENDER}`,
+    "Amount: 115792089237316195423570985008687907853269984665640564039457584007913129.639935 USDC",
+    "Warning: This spender can use all current and future USDC held by the Safe without asking again."
+  ]),
+  "safe-native-send": () => previewSafeTransaction([
+    `Action: Send 0.0001 ETH to ${PREVIEW_SPENDER}`
+  ], {destination: PREVIEW_SPENDER, value: "100000000000000", value_display: "0.0001 ETH"}),
   "safe-morpho-batch": () => {
     const session = PREVIEWS.morpho();
     const plan = JSON.parse(session.review_manifest.canonical_plan);
@@ -2374,7 +2414,7 @@ const PREVIEWS = {
   "allowance-unlimited": () => previewApproval([previewPayload({
     contract_call: previewCall("allowance",
       "115792089237316195423570985008687907853269984665640564039457584007913129639935",
-      "115792089237316195423570985008687907853269984665640564039457584007913129639.935935 USDC",
+      "115792089237316195423570985008687907853269984665640564039457584007913129.639935 USDC",
       "unlimited", [
         "If executed, this spender can use all your current and future USDC without asking again. This permission has no expiry; changing it requires another transaction."])
   })], previewClearSigning()),

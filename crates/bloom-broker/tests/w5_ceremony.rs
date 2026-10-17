@@ -688,6 +688,32 @@ if (mixedCards.length !== 2 || mixedCards.some(card =>
   throw new Error("Safe approval/deposit cards lost their USDC artwork");
 }}
 
+// Safe's real ERC-20 reader puts the token contract in the action heading,
+// not in a separate Token field. Its artwork and permission still belong
+// beside the decision, including zero and maximum allowances.
+for (const amount of ["25 USDC", "0 USDC", "115792089237316195423570985008687907853269984665640564039457584007913129.639935 USDC"]) {{
+  const variant = previewSession("morpho");
+  const plan = JSON.parse(variant.review_manifest.canonical_plan);
+  plan.safe_review.action = [
+    "Action: approve on USD Coin 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "Spender: 0xb98c948CFA24072e58935BC004a8A7b376AE746A", `Amount: ${{amount}}`
+  ];
+  variant.review_manifest.canonical_plan = JSON.stringify(plan);
+  renderReview(variant);
+  const primary = nodes.review.children.filter(node => node.tagName !== "DETAILS");
+  const text = primary.map(allText).join(" ");
+  if (!primary.some(node => walk(node).some(child => child.tagName === "IMG" && child.src === "/assets/tokens/usdc.svg")) ||
+      !text.includes("Spending limit") || !text.includes("Spender")) {{
+    throw new Error("Safe allowance identity or spending limit is hidden");
+  }}
+  if (amount.startsWith("115792") && (!text.includes("Unlimited") || text.includes("115792"))) {{
+    throw new Error("Safe maximum allowance is not shown as Unlimited");
+  }}
+  if (amount === "0 USDC" && !nodes["panel-title"].textContent.includes("Clear spending permission")) {{
+    throw new Error("Safe zero allowance did not explain revocation");
+  }}
+}}
+
 // A batch member Bloom could not read is never shown as a plain send, and a
 // batch spanning two networks is not headed with the first one alone.
 const unread = (chain_id, chain) => ({{
