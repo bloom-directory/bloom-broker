@@ -586,7 +586,7 @@ for (const [label, expected] of [
     throw new Error(`Morpho detail ${{label}} was ${{JSON.stringify(factValue(label))}}`);
   }}
 }}
-if (!factValue("Share bound").includes("share decimals") || factValue("Share bound") === "1000000000") {{
+if (!factValue("Share bound").includes("share decimals") || factValue("Share bound") === "1097016817869820") {{
   throw new Error(`Morpho share bound stayed raw: ${{factValue("Share bound")}}`);
 }}
 const factText = morphoFacts.map(pair => pair.join(" ")).join(" | ");
@@ -657,6 +657,35 @@ if (nodes["panel-title"].textContent !== "Send 5 USDC and 0.0001 ETH") {{
 const batchSummary = allText(nodes.review.children[0]);
 if (!batchSummary.includes("5 USDC to 0x4000…0000") || !batchSummary.includes("0.0001 ETH to 0x6000…0000")) {{
   throw new Error(`Safe batch summary hid a movement: ${{batchSummary}}`);
+}}
+
+// An approval in a Safe batch is a permission, not a second payment. A
+// mixed approval/Morpho bundle must not be headed as two USDC sends.
+const mixedSafe = previewSession("morpho");
+const mixedPlan = JSON.parse(mixedSafe.review_manifest.canonical_plan);
+mixedPlan.safe_review.action = [
+  "Action: multiSend on Safe batch 0x9641d764fc13c8B624c04430C7356C1C7C8102e2",
+  "Transaction 1: approve on USD Coin 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  "Transaction 1 · Spender: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+  "Transaction 1 · Amount: 2.5 USDC",
+  "Transaction 2: multicall on Morpho Bundler3 0x6BFd8137e702540E7A42B74178A4a49Ba43920C4",
+  "Transaction 2 · Action 1 · Amount: 2.5 USDC",
+  "Transaction 2 · Action 2 · Vault: 0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca"
+];
+mixedSafe.review_manifest.canonical_plan = JSON.stringify(mixedPlan);
+renderReview(mixedSafe);
+if (nodes["panel-title"].textContent !== "Review 2 Safe actions") {{
+  throw new Error("a spending permission was mislabeled as a payment");
+}}
+renderReview(previewSession("safe-morpho-batch"));
+const mixedPrimary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+for (const expected of ["Token spending permission", "Spending limit", "2.5 USDC", "Calls through Morpho", "Tokens supplied", "Vault", "Shares recipient"]) {{
+  if (!mixedPrimary.includes(expected)) throw new Error(`Safe action hidden before disclosure: ${{expected}}`);
+}}
+const mixedCards = nodes.review.children.filter(node => node.className === "ceremony-card");
+if (mixedCards.length !== 2 || mixedCards.some(card =>
+    !walk(card).some(node => node.tagName === "IMG" && node.src === "/assets/tokens/usdc.svg"))) {{
+  throw new Error("Safe approval/deposit cards lost their USDC artwork");
 }}
 
 // A batch member Bloom could not read is never shown as a plain send, and a

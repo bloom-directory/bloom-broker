@@ -544,11 +544,14 @@ function safeAmount(rows) {
   const raw = rows.find(row => row.label === "Token amount (base units)" || row.label === "Raw token amount");
   return raw ? `${raw.value} base units` : "";
 }
-function safeMovements(rows) {
+function safeMovements(rows, rawAction) {
   const bits = [];
   for (const row of rows) {
     if (/(?:^|· )Amount$/.test(row.label) && /[A-Za-z]/.test(row.value)) {
       const prefix = row.label.replace(/Amount$/, "");
+      const action = prefix ? rows.find(other => other.label === prefix.replace(/ · $/, ""))?.value : rawAction;
+      // An allowance or a token pull inside a vault bundle is not a payment.
+      if (!String(action || "").startsWith("transfer on ")) continue;
       const to = rows.find(other => other.label === `${prefix}To` || other.label === `${prefix}Recipient`);
       bits.push(to ? `${row.value} to ${shortAddress(to.value)}` : row.value);
     } else if (/^Transaction \d+$/.test(row.label) && /^Send .+ to 0x[0-9a-fA-F]{40}$/.test(row.value)) {
@@ -819,7 +822,7 @@ function describeTransfer(manifest) {
       nestedActions[1].value.startsWith("erc4626Deposit on ");
     const recipient = safeRowValue(rows, "Recipient") || safeRowValue(rows, "To");
     const sendTo = rawAction.match(/^Send (.+) to (0x[0-9a-fA-F]{40})$/);
-    const movements = safeMovements(rows);
+    const movements = safeMovements(rows, rawAction);
     const safeShort = shortAddress(safe.safe);
     let heading = rawAction.replace(/0x[0-9a-fA-F]{40}/g, match => shortAddress(match));
     let sentence = `On <strong>${escapeHtml(network)}</strong>, Safe <strong>${escapeHtml(safeShort)}</strong> requests this action. Amounts, parties, and the nonce are listed below.`;
@@ -862,10 +865,15 @@ function describeTransfer(manifest) {
       heading = "Review calls through Morpho";
       sentence = `Review every call from Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong> in the details below.`;
     } else if (rawAction.startsWith("multiSend") || movements.length > 1) {
-      heading = movements.length ? `Send ${naturalList(movements.map(bit => bit.split(" to ")[0]))}` : "Send a batch from the Safe";
-      sentence = movements.length
+      const transactions = rows.filter(row => /^Transaction \d+$/.test(row.label));
+      const onlyTransfers = transactions.length > 0 && transactions.every(row =>
+        row.value.startsWith("transfer on ") || /^Send .+ to 0x[0-9a-fA-F]{40}$/.test(row.value));
+      heading = onlyTransfers && movements.length
+        ? `Send ${naturalList(movements.map(bit => bit.split(" to ")[0]))}`
+        : transactions.length ? `Review ${transactions.length} Safe actions` : "Review Safe actions";
+      sentence = onlyTransfers && movements.length
         ? `From Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>: ${escapeHtml(naturalList(movements))}.`
-        : sentence;
+        : `One approval covers every action from Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>. Review each action below.`;
     } else if (amount && recipient) {
       heading = `Send ${amount} to ${shortAddress(recipient)}`;
       sentence = `Send <strong>${escapeHtml(amount)}</strong> from Safe <strong>${escapeHtml(safeShort)}</strong> to <strong>${escapeHtml(shortAddress(recipient))}</strong> on <strong>${escapeHtml(network)}</strong>.`;
@@ -892,15 +900,40 @@ function describeTransfer(manifest) {
       if (safeIdentityRisk(warning)) technical.push(["Safe identity check", warning, false]);
     }
     const warnings = parsed.warnings.map(warning => safeIdentityRisk(warning) || warning);
+    const safeCards = rawAction.startsWith("multiSend") ? rows
+      .filter(row => /^Transaction \d+$/.test(row.label))
+      .map(row => {
+        const value = name => safeRowValue(rows, `${row.label} · ${name}`);
+        const tokenCall = row.value.match(/^(approve|transfer) on .+ (0x[0-9a-fA-F]{40})$/);
+        const morpho = row.value.startsWith("multicall on Morpho Bundler3 ");
+        const native = row.value.match(/^Send (.+) to (0x[0-9a-fA-F]{40})$/);
+        const address = tokenCall?.[2] || (morpho ? value("Action 1 · Token") : "");
+        const amount = tokenCall ? value("Amount") : morpho ? value("Action 1 · Amount") : native?.[1];
+        const permission = tokenCall?.[1] === "approve";
+        return {
+          position: row.label,
+          title: permission ? "Token spending permission" : tokenCall ? "Token transfer"
+            : morpho ? "Calls through Morpho" : native ? "Native transfer" : "Contract call",
+          asset: address && amount ? {chainId: String(safe.chain_id), address, amount,
+            amountLabel: permission ? "Spending limit" : morpho ? "Tokens supplied" : "Amount",
+            tone: permission ? "permission" : "outgoing"}
+            : native ? {native: / ETH$/.test(amount) ? "ethereum" : "token", amount, amountLabel: "Amount"} : null,
+          parties: [
+            [permission ? "Spender" : "Recipient", permission ? value("Spender") : value("To") || value("Recipient") || native?.[2]],
+            ["Vault", morpho ? value("Action 2 · Vault") : ""],
+            ["Shares recipient", morpho ? value("Action 2 · Shares go to") : ""]
+          ].filter(([, address]) => /^0x[0-9a-fA-F]{40}$/.test(address || ""))
+        };
+      }) : [];
     const tokens = rows.filter(row =>
       /(?:^|· )Token$/.test(row.label) && /^0x[0-9a-fA-F]{40}$/.test(row.value));
-    const tokenAddress = tokens.length === 1 && movements.length <= 1
+    const tokenAddress = tokens.length === 1 && movements.length <= 1 && !rawAction.startsWith("multiSend")
       ? tokens[0].value : "";
     const tokenAsset = tokenAddress && amount
       ? {chainId: String(safe.chain_id), address: tokenAddress, amount, amountLabel: "Amount", tone: "outgoing"}
       : null;
     return {sentence, facts, technical, warnings, willVerify: true, heading,
-      button: "Approve Safe signature", chainId: safe.chain_id, tokenAsset,
+      button: "Approve Safe signature", chainId: safe.chain_id, tokenAsset, safeCards,
       networkIdentity: `EVM · ${network} · Chain ID ${safe.chain_id}`,
       networkIcon: chainIcon(safe.chain_id)};
   }
@@ -1238,6 +1271,16 @@ function renderReview(session) {
       amountLabel: transfer.tokenAsset.amountLabel,
       tone: transfer.tokenAsset.tone
     }));
+  }
+  for (const card of transfer?.safeCards || []) {
+    const section = el("section", {class: "ceremony-card"},
+      el("p", {class: "ceremony-card-position"}, card.position),
+      el("h2", {class: "ceremony-section-title"}, card.title),
+      card.asset ? assetCard(card.asset) : null);
+    for (const [label, value] of card.parties) {
+      section.append(partyRow({role: label.toLowerCase(), label, value, chainId: transfer.chainId}));
+    }
+    decision.push(section);
   }
   if (transfer?.intent) {
     panelTitle.textContent = transfer.intent.heading;
@@ -2269,6 +2312,24 @@ function previewProtocolCall(name) {
   return session;
 }
 const PREVIEWS = {
+  "safe-morpho-batch": () => {
+    const session = PREVIEWS.morpho();
+    const plan = JSON.parse(session.review_manifest.canonical_plan);
+    const action = plan.safe_review.action;
+    plan.safe_review.destination = "0x9641d764fc13c8B624c04430C7356C1C7C8102e2";
+    plan.safe_review.operation = "delegatecall";
+    plan.safe_review.action = [
+      "Action: multiSend on Safe batch 0x9641d764fc13c8B624c04430C7356C1C7C8102e2",
+      "Transaction 1: approve on USD Coin 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "Transaction 1 · Spender: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+      "Transaction 1 · Amount: 2.5 USDC",
+      ...action.map(line => line.startsWith("Warning: ") ? line
+        : line.startsWith("Action: ") ? line.replace("Action: ", "Transaction 2: ")
+        : `Transaction 2 · ${line}`)
+    ];
+    session.review_manifest.canonical_plan = JSON.stringify(plan);
+    return session;
+  },
   "deposit-static": () => previewProtocolCall("deposit-static"),
   "stake-static": () => previewProtocolCall("stake-static"),
   "operator-approval": () => previewProtocolCall("operator-approval"),
@@ -2384,7 +2445,7 @@ const PREVIEWS = {
             "Action 2: erc4626Deposit on Morpho GeneralAdapter1 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
             "Action 2 · Vault: 0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca",
             "Action 2 · Assets (raw units): 2500000",
-            "Action 2 · Highest share price (1e27 scale): 1000000000",
+            "Action 2 · Highest share price (1e27 scale): 1097016817869820",
             "Action 2 · Shares go to: 0x86dB2acbF74856fd3286Cb5B755A5a05Ba445864",
             "Action contract 2: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
             "Action sends 2: 0 ETH",
