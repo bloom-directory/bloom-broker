@@ -222,3 +222,30 @@ textarea{resize:vertical}
   .action-buttons button{flex:1 1 auto}
 }
 @media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+.field-error{min-height:0;color:var(--error);font-size:12px}.field-error:empty{display:none}input[aria-invalid=true]{border-color:var(--error)}.form-error{margin:0;padding:14px 30px 0;color:var(--error);font-size:13px}
+.order-preview{margin:18px 0 0}.order-preview figcaption{color:var(--muted);font-size:13px;margin-bottom:8px}.order-preview-frame{max-height:60vh;overflow:auto;border:1px solid var(--rule);border-radius:10px;background:#fff}.order-preview-frame img{display:block;width:100%;height:auto}
+.page.browser-handoff{width:min(760px,100%)}
+.browser-handoff .layout{display:block;margin-top:28px}
+.browser-handoff .intro{position:static;padding:0;margin-bottom:24px}
+.browser-handoff h1{font-family:var(--sans);font-size:clamp(28px,5vw,36px);font-style:normal;font-weight:650;line-height:1.2;letter-spacing:-.02em}
+.browser-handoff .lede{margin-top:12px;font-size:16px;line-height:1.6}
+.browser-handoff .panel-title{font-family:var(--sans);font-size:23px;font-weight:650}
+.browser-handoff #status{color:var(--ink-2);font-size:16px;line-height:1.6}
+.browser-handoff #status:empty{display:none}
+.browser-handoff .expiry{margin:0 0 18px;font-size:14px;color:var(--ink-2)}
+.agent-instructions summary{font-size:14px;color:var(--ink-2);cursor:pointer}
+.agent-instructions ul{padding-left:22px;margin:16px 0 0}
+.agent-instructions li{margin:10px 0;font-size:16px;line-height:1.65;overflow-wrap:anywhere}
+.handoff-return{margin:20px 0 0;font-size:15px;color:var(--ink-2)}
+.browser-handoff.request-expired .panel-header{background:#f8e8e9}
+.browser-handoff.request-expired .panel-title{color:var(--error)}
+.browser-handoff.request-expired .expired{display:none}
+.browser-handoff.request-expired .handoff-return{display:none}
+.browser-handoff.request-expired button:disabled{cursor:not-allowed;opacity:1;background:#ded6ca;color:#554c40}
+
+.order-fields { margin: 1.25rem 0; }
+.order-fields table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+.order-fields th, .order-fields td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--ceremony-border); vertical-align: top; }
+.order-fields th { font-weight: 500; color: var(--ceremony-muted); width: 45%; }
+.order-fields td { font-weight: 600; word-break: break-word; }
+.order-fields-note { font-size: 0.85rem; color: var(--ceremony-muted); }

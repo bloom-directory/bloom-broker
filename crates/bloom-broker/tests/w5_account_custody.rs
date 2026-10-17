@@ -722,6 +722,9 @@ fn south_ceremony_kind(kind: CeremonyKind) -> bloom_signer_api::CeremonyKind {
         CeremonyKind::AccountRetire => bloom_signer_api::CeremonyKind::AccountRetire,
         CeremonyKind::PolicyUpdate => bloom_signer_api::CeremonyKind::PolicyUpdate,
         CeremonyKind::SealedApproval => bloom_signer_api::CeremonyKind::SealedApproval,
+        CeremonyKind::CardAdd => bloom_signer_api::CeremonyKind::CardAdd,
+        CeremonyKind::CardDelete => bloom_signer_api::CeremonyKind::CardDelete,
+        CeremonyKind::CardCheckout => bloom_signer_api::CeremonyKind::CardCheckout,
     }
 }
 

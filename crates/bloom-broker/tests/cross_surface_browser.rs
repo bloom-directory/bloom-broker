@@ -48,6 +48,21 @@ fn prepared() -> serde_json::Value {
 }
 
 #[test]
+fn late_card_validation_failure_cannot_reopen_terminal_approval() {
+    let output = run_browser(
+        r#"
+approve.disabled = true;
+approvalTerminal = true;
+statusNode.textContent = "Expired";
+reportApprovalFailure(new CardFieldError("Invalid CVC"));
+process.stdout.write(JSON.stringify({disabled: approve.disabled, status: statusNode.textContent}));
+"#,
+    );
+    assert_eq!(output["disabled"], true);
+    assert_eq!(output["status"], "Expired");
+}
+
+#[test]
 fn both_browser_prf_legs_decrypt_with_native_signer_hpke_and_canonical_aad() {
     for phase in ["source_prf", "destination_prf"] {
         let recipient = HpkeRecipient::generate();
