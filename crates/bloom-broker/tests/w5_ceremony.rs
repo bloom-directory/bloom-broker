@@ -540,41 +540,12 @@ if (nodes["panel-title"].textContent !== "Create a contract") {{
 
 // A Morpho deposit has to show the amount, vault, and shares recipient
 // before details are opened, and details are rows rather than one dump.
-renderReview({{
-  ceremony_kind: "sealed_approval",
-  expires_at_ms: Date.now() + 60000,
-  signer_contribution: {{wallet_id: "wallet-primary"}},
-  review_manifest: {{
-    schema: "bloom.review-manifest.v1",
-    canonical_plan: JSON.stringify({{safe_review: {{
-      chain_id: "8453", chain: "base",
-      safe: "0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61",
-      owner: "0x86dB2acbF74856fd3286Cb5B755A5a05Ba445864",
-      nonce: "2", operation: "call",
-      destination: "0x6BFd8137e702540E7A42B74178A4a49Ba43920C4",
-      value: "0", value_display: "0 ETH",
-      action: [
-        "Action: multicall on Morpho Bundler3 0x6BFd8137e702540E7A42B74178A4a49Ba43920C4",
-        "Action 1: erc20TransferFrom on Morpho GeneralAdapter1 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
-        "Action 1 · Amount: 2.5 USDC",
-        "Action 1 · Token: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-        "Action 1 · Sent to: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
-        "Action contract 1: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
-        "Action sends 1: 0 ETH",
-        "Action 2: erc4626Deposit on Morpho GeneralAdapter1 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
-        "Action 2 · Vault: 0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca",
-        "Action 2 · Assets (raw units): 2500000",
-        "Action 2 · Highest share price (1e27 scale): 1000000000",
-        "Action 2 · Shares go to: 0x86dB2acbF74856fd3286Cb5B755A5a05Ba445864",
-        "Action contract 2: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
-        "Action sends 2: 0 ETH",
-        "Warning: Bloom cannot check that 0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61 is a Safe; it reads it as one."
-      ],
-      safe_tx_hash: "0x5160acd8c69384337afae5de65027a3fef41f5ba421060d78f9d0c87fa1b3d17"
-    }}, security_disclosures: ["Bloom rebuilt the Safe transaction from the exact signing bytes."]}}),
-    attributed_advisory_items: []
-  }}
-}});
+// The fixture is the non-authorizing /preview/morpho session.
+const morphoPreview = previewSession("morpho");
+if (!morphoPreview.is_preview || morphoPreview.ceremony_id) {{
+  throw new Error("morpho preview is a ceremony");
+}}
+renderReview(morphoPreview);
 if (nodes["panel-title"].textContent !== "Deposit 2.5 USDC into a Morpho vault") {{
   throw new Error(`Morpho heading hid the amount: ${{nodes["panel-title"].textContent}}`);
 }}

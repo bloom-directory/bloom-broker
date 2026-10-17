@@ -1287,7 +1287,7 @@ function renderReview(session) {
       technical.append(el("dt", {}, label), el("dd", {}, shown));
     }
     parts.push(el("details", {class: "signed technical"},
-      el("summary", {}, "Technical details — nonce, fees, exact byte commitments"),
+      el("summary", {}, "Raw values and byte commitments"),
       technical));
   }
   if (kind !== "key_derive" && custodyManifest && typeof manifest.canonical_plan === "string" &&
@@ -2252,7 +2252,47 @@ const PREVIEWS = {
     session.preview_terminal = "cancelled";
     session.preview_status = "Cancelled";
     return session;
-  }
+  },
+  // The Safe review exercised by evm_manifest_is_rendered_as_primary_review_facts.
+  // A preview name is not a ceremony token and this session cannot be approved.
+  morpho: () => ({
+    ceremony_kind: "sealed_approval",
+    expires_at_ms: Date.now() + 9 * 60 * 1000,
+    signer_contribution: {},
+    review_manifest: {
+      schema: "bloom.review-manifest.v1",
+      canonical_plan: JSON.stringify({
+        safe_review: {
+          chain_id: "8453", chain: "base",
+          safe: "0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61",
+          owner: "0x86dB2acbF74856fd3286Cb5B755A5a05Ba445864",
+          nonce: "2", operation: "call",
+          destination: "0x6BFd8137e702540E7A42B74178A4a49Ba43920C4",
+          value: "0", value_display: "0 ETH",
+          action: [
+            "Action: multicall on Morpho Bundler3 0x6BFd8137e702540E7A42B74178A4a49Ba43920C4",
+            "Action 1: erc20TransferFrom on Morpho GeneralAdapter1 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+            "Action 1 · Amount: 2.5 USDC",
+            "Action 1 · Token: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "Action 1 · Sent to: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+            "Action contract 1: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+            "Action sends 1: 0 ETH",
+            "Action 2: erc4626Deposit on Morpho GeneralAdapter1 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+            "Action 2 · Vault: 0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca",
+            "Action 2 · Assets (raw units): 2500000",
+            "Action 2 · Highest share price (1e27 scale): 1000000000",
+            "Action 2 · Shares go to: 0x86dB2acbF74856fd3286Cb5B755A5a05Ba445864",
+            "Action contract 2: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+            "Action sends 2: 0 ETH",
+            "Warning: Bloom cannot check that 0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61 is a Safe; it reads it as one."
+          ],
+          safe_tx_hash: "0x5160acd8c69384337afae5de65027a3fef41f5ba421060d78f9d0c87fa1b3d17"
+        },
+        security_disclosures: ["Bloom rebuilt the Safe transaction from the exact signing bytes."]
+      }),
+      attributed_advisory_items: []
+    }
+  })
 };
 
 // Design previews. They render through this renderer — the one the Broker

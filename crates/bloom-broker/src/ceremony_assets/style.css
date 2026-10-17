@@ -158,6 +158,11 @@ body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-f
 .facts dt{color:var(--ceremony-muted)}
 .facts dd{margin:0;overflow-wrap:anywhere;white-space:pre-line}
 .facts code{font:var(--ceremony-address-size)/1.5 var(--ceremony-font-mono)}
+/* Technical rows have long labels and long values. A second column wraps
+   "units" onto its own line, so this list stacks. */
+.facts.technical{grid-template-columns:minmax(0,1fr);gap:2px 0}
+.facts.technical dt{padding-top:var(--ceremony-space-1)}
+.facts.technical dt:first-child{padding-top:0}
 
 details.ceremony-details,details.signed{margin:0}
 details.ceremony-details summary,details.signed summary{cursor:pointer;color:var(--ceremony-accent);font-size:15px}
@@ -204,6 +209,9 @@ textarea{resize:vertical}
   .brand-context{margin-left:auto}
   .facts{grid-template-columns:1fr;gap:2px 0}
   .facts dt{padding-top:var(--ceremony-space-1)}
+  /* 13px mono is about 4px wider than this column, so a 42-character address
+     left its last character alone on the next line. */
+  .facts code{font-size:12px}
   .ceremony-party-address{gap:var(--ceremony-space-1)}
   .ceremony-party-address code{display:block;flex:1 1 0;min-width:0;word-break:break-all;text-wrap:balance}
   .ceremony-address-link{flex:1 1 0}
