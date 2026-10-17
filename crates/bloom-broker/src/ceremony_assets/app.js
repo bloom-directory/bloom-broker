@@ -121,8 +121,9 @@ function reviewIcon(kind) {
       el("path", {fill: "#fff", "fill-opacity": ".2", d: "M16.498 20.573l7.497-4.353-7.497-3.348z"}),
       el("path", {fill: "#fff", "fill-opacity": ".602", d: "M9 16.22l7.498 4.353v-7.701z"}));
   } else if (kind === "base") {
-    svg.append(el("circle", {cx: "16", cy: "16", r: "16", fill: "#0052ff"}),
-      el("path", {d: "M2 16.5h20.5", stroke: "white", "stroke-width": "3.2", "stroke-linecap": "round"}));
+    // Exact Square path from base/brand-kit, logo/TheSquare/Digital/Base_square_blue.svg.
+    svg.setAttribute("viewBox", "0 0 1280 1280");
+    svg.append(el("path", {fill: "#0000ff", d: "M0,101.12c0-34.64,0-51.95,6.53-65.28,6.25-12.76,16.56-23.07,29.32-29.32C49.17,0,66.48,0,101.12,0h1077.76c34.63,0,51.96,0,65.28,6.53,12.75,6.25,23.06,16.56,29.32,29.32,6.52,13.32,6.52,30.64,6.52,65.28v1077.76c0,34.63,0,51.96-6.52,65.28-6.26,12.75-16.57,23.06-29.32,29.32-13.32,6.52-30.65,6.52-65.28,6.52H101.12c-34.64,0-51.95,0-65.28-6.52-12.76-6.26-23.07-16.57-29.32-29.32-6.53-13.32-6.53-30.65-6.53-65.28V101.12Z"}));
   } else if (kind === "test") {
     svg.append(el("path", {d: "M12 3h8M14 3v10L6 26q-1 3 3 3h14q4 0 3-3l-8-13V3M10 20h12", fill: "none", stroke: "currentColor", "stroke-width": "2", "stroke-linejoin": "round"}));
   } else {
