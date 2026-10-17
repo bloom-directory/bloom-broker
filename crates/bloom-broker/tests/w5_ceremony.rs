@@ -3954,8 +3954,11 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
 
     let parent_key = machine_registration_result.public_key_refs[0].clone();
     let derive_operation = operation("d2");
-    let scope_lifetime_ms = 60_000;
-    let approval_lifetime_ms = 30_000;
+    // This real-service fixture now includes Safe review and multiple restarts.
+    // Keep its authorization live while testing replay and revocation; the
+    // expired-term case below must not mask those separate rejection checks.
+    let scope_lifetime_ms = 10 * 60_000;
+    let approval_lifetime_ms = 5 * 60_000;
     let scope = PetalKeyScope {
         wallet_id: wallet_id.clone(),
         parent_key_ref: parent_key.clone(),
@@ -5055,15 +5058,16 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         petal_route,
         b"changed-replay",
     );
+    let replay_error = MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::SigningSign(changed_replay.clone()),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(
-        MachineBrokerService::dispatch(
-            &broker,
-            MachineBrokerRequest::SigningSign(changed_replay.clone()),
-        )
-        .await
-        .unwrap_err()
-        .code,
-        ProtocolErrorCode::OperationIdConflict
+        replay_error.code,
+        ProtocolErrorCode::OperationIdConflict,
+        "{replay_error:?}"
     );
     changed_replay.operation_id = operation("d6");
     changed_replay.operation_digest = petal_sign_request(
@@ -5578,8 +5582,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         terms.limits.max_signatures = DecimalU64::new(1);
         terms.request_nonce = RequestNonce::from_bytes([nonce; 16]);
         terms.wallet_revocation_epoch = current_epoch.clone();
-        // Issued now, for most of the scope's maximum lifetime: the
-        // ceremony's own validity window must fit inside the approval's.
+        // The fresh recovery window remains inside the scope's maximum lifetime;
+        // the ceremony's own validity must fit inside this approval's window.
         let now_ms: u64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -5777,20 +5781,19 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .is_err()
     );
 
-    let now_after_scope_ms: u64 = std::time::SystemTime::now()
+    let expired_at_ms: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis()
         .try_into()
         .unwrap();
-    if now_after_scope_ms <= approval_expires_at_ms {
-        tokio::time::sleep(std::time::Duration::from_millis(
-            approval_expires_at_ms - now_after_scope_ms + 25,
-        ))
-        .await;
-    }
     let mut expired_terms = approval_terms.clone();
     expired_terms.request_nonce = RequestNonce::from_bytes([0xdc; 16]);
+    // Exercise a valid but already elapsed window without sleeping out the
+    // live approval used for the replay/revocation checks above.
+    expired_terms.issued_at_ms = DecimalU64::new(expired_at_ms - 1_001);
+    expired_terms.not_before_ms = expired_terms.issued_at_ms.clone();
+    expired_terms.expires_at_ms = DecimalU64::new(expired_at_ms - 1);
     assert!(
         MachineBrokerService::dispatch(
             &restarted_scoped_broker,
