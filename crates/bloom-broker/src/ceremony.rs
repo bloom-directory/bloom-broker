@@ -2219,6 +2219,27 @@ impl CeremonyBroker {
             .map(|session| state_to_machine(session.state))
     }
 
+    /// The ceremony's status as of `now_ms`. Ceremonies expire only when
+    /// something sweeps them, so this sweeps first: an overdue ceremony
+    /// reads as expired rather than as still awaiting the owner, and a
+    /// Machine polling it can retire it and prepare a fresh one.
+    pub fn current_public_status(
+        &self,
+        operation_id: &OperationId,
+        now_ms: u64,
+    ) -> Result<BrokerCeremonyPublicStatus, ProtocolError> {
+        // The sweep is best-effort: a status read stays live (AC-18) even when
+        // the journal is latched or some other overdue session cannot be swept.
+        if let Err(error) = self.expire_sessions(now_ms) {
+            tracing::warn!(
+                event = "ceremony.status_sweep_failed",
+                protocol_error_code = error.code.as_str(),
+                "Broker answered ceremony status without sweeping overdue sessions"
+            );
+        }
+        self.public_status(operation_id)
+    }
+
     pub fn public_status(
         &self,
         operation_id: &OperationId,
@@ -2257,18 +2278,6 @@ impl CeremonyBroker {
             ceremony_url,
             receipt_digest,
         })
-    }
-
-    /// Public status as of `now_ms`. Status requests are a lifecycle boundary
-    /// just like opening the browser: sweep first so an elapsed AwaitingUser
-    /// session is reported as expired rather than as still awaiting the user.
-    pub fn current_public_status(
-        &self,
-        operation_id: &OperationId,
-        now_ms: u64,
-    ) -> Result<BrokerCeremonyPublicStatus, ProtocolError> {
-        self.expire_sessions(now_ms)?;
-        self.public_status(operation_id)
     }
 
     /// Return the owner-visible URL for an approval ceremony while it is
