@@ -179,11 +179,45 @@ fn open_journal(path: &std::path::Path) -> BrokerJournal {
 
 fn install_reservation_approval(journal: &BrokerJournal) {
     let approval_id = digest("22");
+    // Journal-only identities remain fixed for the reservation/audit fixtures,
+    // but persisted metadata must have the complete production terms shape.
+    let terms = bloom_broker_api::SealedApprovalTerms {
+        subject: bloom_broker_api::ApprovalSubject::Cli {
+            client_id: Token::new("journal-test").unwrap(),
+            command_class: Token::new("sign").unwrap(),
+        },
+        wallet_id: Token::new("wallet-1").unwrap(),
+        key_ref: serde_json::from_value(serde_json::to_value(request(1).key_ref).unwrap()).unwrap(),
+        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
+        selector: bloom_broker_api::ApprovalSelector::Exact {
+            ordered_payload_digests: vec![digest("33")],
+            ordered_hashes: vec![digest("55")],
+        },
+        limits: bloom_broker_api::ApprovalLimits {
+            max_operations: DecimalU64::new(1),
+            max_signatures: DecimalU64::new(1),
+            operation_rate_limits: vec![],
+            signature_rate_limits: vec![],
+            value_limits: vec![],
+        },
+        activation_mode: bloom_broker_api::ActivationMode::BootBound {},
+        wallet_revocation_epoch: DecimalU64::new(1),
+        policy_version: DecimalU64::new(1),
+        policy_digest: digest("66"),
+        provenance_digest: digest("77"),
+        request_nonce: bloom_broker_api::RequestNonce::from_bytes([1; 16]),
+        issued_at_ms: DecimalU64::new(1),
+        not_before_ms: DecimalU64::new(1),
+        expires_at_ms: DecimalU64::new(100000),
+        renewal_of: None,
+        session_budget: None,
+    };
+    let terms_jcs = String::from_utf8(terms.canonical_bytes().unwrap()).unwrap();
     journal
         .create_approval_record(
             &approval_id,
             &NewApprovalRecord {
-                terms_jcs: "{}",
+                terms_jcs: &terms_jcs,
                 review_manifest_digest: &digest("aa"),
                 approved_claim_digest: None,
                 provenance_jcs: None,
@@ -219,6 +253,7 @@ fn request(value: u8) -> UnsignedSignRequest {
         }),
     };
     let identity = SignOperationIdentity {
+        session_accounting_digest: None,
         operation_id: operation_id.clone(),
         approval_id: digest("22"),
         key_ref: key_ref.clone(),
@@ -231,6 +266,7 @@ fn request(value: u8) -> UnsignedSignRequest {
         policy_digest: digest("66"),
     };
     let mut request = UnsignedSignRequest {
+        session_accounting: None,
         schema: Token::new("bloom.sign-request/1").unwrap(),
         attempt_id: Digest32::new(format!("{value:02x}").repeat(32)).unwrap(),
         operation_id,

@@ -56,6 +56,7 @@ fn approval_terms() -> SealedApprovalTerms {
         not_before_ms: DecimalU64::new(10),
         expires_at_ms: DecimalU64::new(20),
         renewal_of: None,
+        session_budget: None,
     }
 }
 
@@ -206,6 +207,7 @@ fn signing_result() -> SigningResult {
 
 fn machine_sign() -> MachineSignRequest {
     MachineSignRequest {
+        session_use: None,
         operation_id: operation(30),
         operation_digest: digest(31),
         approval_id: digest(35),
@@ -268,7 +270,7 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
         operation_id: operation(30),
     };
     vec![
-        MachineBrokerRequest::SystemHello(hello()),
+        MachineBrokerRequest::SystemHello(historical_hello()),
         MachineBrokerRequest::BrokerReadiness(Empty {}),
         MachineBrokerRequest::BrokerCapabilities(Empty {}),
         MachineBrokerRequest::CeremonySurfaceStatus(Empty {}),
@@ -476,9 +478,9 @@ fn machine_responses() -> Vec<MachineBrokerResponse> {
         signer_contribution_digest: digest(55),
     };
     vec![
-        MachineBrokerResponse::SystemHello(hello()),
+        MachineBrokerResponse::SystemHello(historical_hello()),
         MachineBrokerResponse::BrokerReadiness(readiness()),
-        MachineBrokerResponse::BrokerCapabilities(capabilities()),
+        MachineBrokerResponse::BrokerCapabilities(historical_capabilities()),
         MachineBrokerResponse::CeremonySurfaceStatus(CeremonyExposureStatus {
             desired_mode: CeremonyExposureMode::LocalhostOnly,
             desired_revision: DecimalU64::new(1),
@@ -508,6 +510,7 @@ fn machine_responses() -> Vec<MachineBrokerResponse> {
             committed_signatures: DecimalU64::new(0),
             reserved_signatures: DecimalU64::new(0),
             quarantined_signatures: DecimalU64::new(0),
+            session_budget_state: None,
         }),
         MachineBrokerResponse::SealedApprovalRevoke(approval_status()),
         MachineBrokerResponse::SealedApprovalRevokeForKey(vec![approval_status()]),
@@ -655,4 +658,18 @@ fn capabilities_advertise_only_the_broker_owned_api_range() {
     assert_eq!(advertised.protocol_minor_max, BROKER_API_RANGE.minor_max);
     assert_eq!(advertised.protocol_major, BROKER_API_CURRENT.major);
     assert_eq!(advertised.protocol_minor_max, BROKER_API_CURRENT.minor);
+}
+
+// Freeze the historical vectors separately from current strict negotiation.
+// Optional session fields must remain omitted to preserve old signed bytes.
+fn historical_hello() -> HelloChallenge {
+    let mut hello = hello();
+    hello.protocol.minor = 7;
+    hello
+}
+fn historical_capabilities() -> ServiceCapabilities {
+    let mut capabilities = capabilities();
+    capabilities.protocol_minor_min = 7;
+    capabilities.protocol_minor_max = 7;
+    capabilities
 }

@@ -65,6 +65,9 @@ pub enum ApprovalSelector {
         ordered_payload_digests: Vec<Digest32>,
         ordered_hashes: Vec<Digest32>,
     },
+    SystemSession {
+        scope: crate::SystemSessionScope,
+    },
     Petal {
         package_hash: Digest32,
         route: String,
@@ -156,6 +159,8 @@ pub struct SealedApprovalTerms {
     pub not_before_ms: DecimalU64,
     pub expires_at_ms: DecimalU64,
     pub renewal_of: Option<Digest32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_budget: Option<crate::SessionBudget>,
 }
 
 impl SealedApprovalTerms {
@@ -173,7 +178,30 @@ impl SealedApprovalTerms {
             ));
         }
 
+        if let Some(budget) = &self.session_budget {
+            budget.validate()?;
+            if matches!(self.selector, ApprovalSelector::Exact { .. })
+                || budget.wallet_id != self.wallet_id
+                || budget.policy_version != self.policy_version
+                || budget.policy_digest != self.policy_digest
+                || budget.wallet_revocation_epoch != self.wallet_revocation_epoch
+                || !budget.member_keys.contains(&self.key_ref)
+                || budget.not_before_ms.get() > self.not_before_ms.get()
+                || budget.expires_at_ms.get() < self.expires_at_ms.get()
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::SelectorMismatch,
+                    "approval differs from its signed session budget",
+                ));
+            }
+        }
         match (&self.subject, &self.selector) {
+            (
+                ApprovalSubject::System { component_id, .. },
+                ApprovalSelector::SystemSession { scope },
+            ) if component_id == &scope.component_id => {
+                scope.validate()?;
+            }
             (
                 ApprovalSubject::Petal {
                     package_hash,
@@ -279,7 +307,7 @@ fn validate_suites(suites: &[CryptoSuite], key_spec: crate::KeySpec) -> Result<(
     Ok(())
 }
 
-fn validate_limits(limits: &ApprovalLimits) -> Result<(), ProtocolError> {
+pub(crate) fn validate_limits(limits: &ApprovalLimits) -> Result<(), ProtocolError> {
     if limits.max_operations.get() == 0 || limits.max_signatures.get() == 0 {
         return Err(ProtocolError::new(
             ProtocolErrorCode::LimitExceededOperations,
@@ -352,6 +380,7 @@ mod tests {
             not_before_ms: DecimalU64::new(1_900_000_000_000),
             expires_at_ms: DecimalU64::new(1_900_000_600_000),
             renewal_of: None,
+            session_budget: None,
         }
     }
 

@@ -381,6 +381,21 @@ process.stdout.write(JSON.stringify({ok:true}));
     assert_eq!(output, json!({"ok": true}));
 }
 
+#[test]
+fn onboarding_completion_requires_machine_reconciliation() {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/test-onboarding-flow.cjs");
+    let output = std::process::Command::new("node")
+        .arg(script)
+        .output()
+        .expect("Node.js is required to validate the shipped onboarding asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Runs a CommonJS script in Node, fed on stdin: the shipped asset alone is
 /// larger than Linux's 128 KiB limit on a single `node -e` argument.
 fn run_node(script: &str) -> std::process::Output {

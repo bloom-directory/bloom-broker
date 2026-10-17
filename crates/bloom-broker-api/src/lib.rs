@@ -13,6 +13,7 @@ mod policy;
 mod provenance;
 mod revocation;
 mod service;
+mod session;
 mod signing;
 pub mod solana_vectors;
 mod validation;
@@ -31,6 +32,7 @@ pub use policy::*;
 pub use provenance::*;
 pub use revocation::*;
 pub use service::*;
+pub use session::*;
 pub use signing::*;
 pub use wallet_account::*;
 
@@ -53,8 +55,10 @@ pub const RATE_LIMIT_DETAILS_MINOR: u16 = 4;
 /// The negotiated range moves as a unit, so there is no accepted minor that
 /// predates any field the Broker may emit. Older peers are refused at the
 /// hello before a response can carry a field their strict decoder rejects.
-pub const BROKER_API_MINOR_MIN: u16 = 7;
-pub const BROKER_API_MINOR_MAX: u16 = 7;
+/// Minor 1.8 adds owner-reviewed typed sessions and signed shared-budget accounting.
+/// Strict older decoders are refused before these fields or selectors can cross the edge.
+pub const BROKER_API_MINOR_MIN: u16 = 8;
+pub const BROKER_API_MINOR_MAX: u16 = 8;
 pub const BROKER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(BROKER_API_MAJOR, BROKER_API_MINOR_MAX);
 pub const BROKER_API_RANGE: ProtocolVersionRange =

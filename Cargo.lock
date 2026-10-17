@@ -1126,6 +1126,7 @@ version = "0.1.0"
 dependencies = [
  "bloom-rpc-wire",
  "hex",
+ "num-bigint 0.4.8",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -1276,7 +1277,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=27c3fef2f5b9225d55f1ad542223c824128c8e9e#27c3fef2f5b9225d55f1ad542223c824128c8e9e"
 dependencies = [
  "blake3",
  "bloom-audit-checkpoint",
@@ -1323,11 +1324,12 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=27c3fef2f5b9225d55f1ad542223c824128c8e9e#27c3fef2f5b9225d55f1ad542223c824128c8e9e"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek 3.0.0",
  "hex",
+ "num-bigint 0.4.8",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -1338,7 +1340,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-backend-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=27c3fef2f5b9225d55f1ad542223c824128c8e9e#27c3fef2f5b9225d55f1ad542223c824128c8e9e"
 dependencies = [
  "bloom-signer-api",
  "serde",
@@ -1349,7 +1351,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-backend-local"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=27c3fef2f5b9225d55f1ad542223c824128c8e9e#27c3fef2f5b9225d55f1ad542223c824128c8e9e"
 dependencies = [
  "bip32 0.6.0-rc.0",
  "bloom-signer-api",
@@ -1372,7 +1374,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=27c3fef2f5b9225d55f1ad542223c824128c8e9e#27c3fef2f5b9225d55f1ad542223c824128c8e9e"
 dependencies = [
  "bip39",
  "ed25519-dalek 3.0.0",
@@ -1389,7 +1391,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-process-hardening"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=27c3fef2f5b9225d55f1ad542223c824128c8e9e#27c3fef2f5b9225d55f1ad542223c824128c8e9e"
 dependencies = [
  "libc",
  "zeroize",
@@ -1398,7 +1400,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-vectors"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=27c3fef2f5b9225d55f1ad542223c824128c8e9e#27c3fef2f5b9225d55f1ad542223c824128c8e9e"
 
 [[package]]
 name = "bloom-solana-verify"
@@ -2390,7 +2392,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4318,14 +4320,14 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -4376,7 +4378,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5209,10 +5211,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5770,7 +5772,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -1,4 +1,8 @@
 "use strict";
+const onboardingFrame = window.parent !== window && location.search === '?onboarding=1';
+function notifyOnboarding(state) {
+  if (onboardingFrame) window.parent.postMessage({type:'bloom.onboarding.ceremony', ceremony_id:ceremonyId, state}, location.origin);
+}
 const statusNode = document.getElementById("status");
 const reviewNode = document.getElementById("review");
 const approve = document.getElementById("approve");
@@ -708,7 +712,38 @@ function describePetalApproval(manifest) {
   try { plan = JSON.parse(manifest?.canonical_plan || "{}"); } catch (_) { return null; }
   const terms = plan?.terms;
   const selector = terms?.selector;
-  if (selector?.kind !== "petal") return null;
+  if (selector?.kind !== "petal" && selector?.kind !== "system_session") return null;
+  const budget = terms?.session_budget;
+  const nominal = value => {
+    const digits = String(value || "0").padStart(7,"0");
+    return `${digits.slice(0,-6)}.${digits.slice(-6)}`;
+  };
+  const budgetFacts = budget ? [
+    ["Budget identity", plan.session_budget_id, true],
+    ["Shared budget", "These caps are shared by every approved grant and account in this budget, not granted again to each app"],
+    ["Per action", `${nominal(budget.nominal_limits?.per_action)} nominal stablecoin collateral units`],
+    ["Total", `${nominal(budget.nominal_limits?.lifetime)} nominal stablecoin collateral units`],
+    ...(budget.nominal_limits?.rolling_windows || []).map(w => ["Rolling cap", `${nominal(w.maximum)} nominal units per ${w.duration_ms} ms`]),
+    ["Covered assets", (budget.nominal_asset_scales || []).map(v => `${v.asset?.asset} on ${v.asset?.chain}: ${v.units_per_nominal_unit} base units per nominal unit`).join("; ")],
+    ["Separate asset caps", (budget.limits?.value_limits || []).map(v => `${v.lifetime} raw units of ${v.asset?.asset} on ${v.asset?.chain}`).join("; ")],
+    ["Member keys", (budget.member_keys || []).map(k => k.public_key_fingerprint).join(", "), true],
+    ["Accounting", "Owner-reviewed nominal collateral conversion, not a current USD price or guarantee against depegging. Unknown assets require a separate exact approval."]
+  ] : [];
+  const wallTime = value => Number.isFinite(Number(value)) && Number(value)>0 ? new Date(Number(value)).toISOString() : "See signed approval terms";
+  const lifetimeFacts = [
+    ["Valid from", wallTime(terms.not_before_ms)],
+    ["Expires", wallTime(terms.expires_at_ms)],
+    ["Activation", terms.activation_mode?.kind === "boot_bound" ? "Bound to the active Signer process. Signing stops after logout or service restart. This screen does not rearm it; end the old session and review a new session with its separately reviewed budget. Old accounting records remain stored." : canonicalJson(terms.activation_mode)]
+  ];
+  if (selector?.kind === "system_session") {
+    const scope=selector.scope || {};
+    return {
+      title: "Activate bounded transfer session", button: "Activate session",
+      sentence: "Allow repeated transfers within the exact accounts, assets, recipients, time and budget shown below. Matching transfers will not ask for another passkey approval.",
+      facts: [["Actions",(scope.actions || []).join(", ")],["Chains",(scope.chains || []).map(c=>`${c.chain} (${c.chain_id || c.genesis_hash})`).join("; ")],["Recipients",(scope.destinations || []).map(d=>`${d.destination} on ${d.chain}`).join("; "),true],["Per-action asset ceilings",(scope.per_action_value_limits || []).map(v=>`${v.maximum} raw units of ${v.asset?.asset} on ${v.asset?.chain}`).join("; ")],["Operation limit",terms?.limits?.max_operations],...budgetFacts,...lifetimeFacts],
+      warning: "Bloom decodes supported transfer bytes at signing. Token contract effects and nominal dollar value are not independently guaranteed. Anything outside this scope requires a new approval."
+    };
+  }
   const classes = Array.isArray(selector.allowed_operation_classes)
     ? selector.allowed_operation_classes.map(String) : [];
   const app = "this Petal";
@@ -729,14 +764,18 @@ function describePetalApproval(manifest) {
     ? `Up to ${naturalList(ceilings)} in total across the whole session, counting fees and any funds sent back to your wallet`
     : "None — Bloom will refuse any action that spends funds or pays a fee";
   return {
-    sentence: `Finish setting up a temporary <strong>${app}</strong> session. It can sign only the actions listed below until the timer expires. No funds move in this step, and your main wallet key stays inside Bloom.`,
+    sentence: budget
+      ? `Authorize repeated <strong>${app}</strong> actions within the scope and shared budgets below until this approval expires. No funds move in this step, and your main wallet key stays inside Bloom.`
+      : `Finish setting up a temporary <strong>${app}</strong> session. It can sign only the actions listed below until the timer expires. No funds move in this step, and your main wallet key stays inside Bloom.`,
     facts: [
       ["App", app],
       ["Package", packageHash, true],
       ["Can", naturalList(actions)],
       ["Limit", operationLimit],
       ["Spending ceiling", spending],
-      ["Main wallet key", "Stays inside Bloom"]
+      ["Main wallet key", "Stays inside Bloom"],
+      ...budgetFacts,
+      ...lifetimeFacts
     ],
     title: "Finish temporary session setup",
     button: "Finish session setup",
@@ -2279,6 +2318,7 @@ async function load() {
         "You cancelled this ceremony. No signature was created and nothing was broadcast."));
       cancel.hidden = true;
       approve.hidden = true;
+      notifyOnboarding('canceled');
     } catch (error) {
       // An expiry that landed while cancelling stays terminal: its message
       // stands and no control comes back.
@@ -2526,6 +2566,7 @@ async function finishBrowserResult(session, result) {
     renderDone(session, result);
   }
   await clearBrowserState(ceremonyId);
+  notifyOnboarding('completed');
 }
 
 function canonicalJson(value) {
