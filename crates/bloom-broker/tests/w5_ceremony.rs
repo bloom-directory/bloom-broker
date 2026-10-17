@@ -471,8 +471,8 @@ if (safeFactText.includes("Token amount (base units): 123") || safeFactText.incl
   throw new Error(`Safe review still dumps action lines: ${{safeFactText}}`);
 }}
 const openTags = nodes.review.children.map(node => node.tagName);
-if (openTags.join(",") !== "P,ASIDE,DETAILS") {{
-  throw new Error(`Safe open view is not summary, warning, details: ${{openTags}}`);
+if (openTags.join(",") !== "P,SECTION,ASIDE,DETAILS") {{
+  throw new Error(`Safe open view is not summary, decision, warning, details: ${{openTags}}`);
 }}
 const banners = node => !node || typeof node === "string" ? [] : [
   ...(node.className === "ceremony-warning" ? [node] : []),
@@ -9281,36 +9281,38 @@ function show(name) {{
 // A transfer names the amount and the recipient, and the recipient is a
 // recipient — never the contract, never a generic "To".
 let view = show("transfer");
-if (view.heading !== "Send 250 BDT") throw new Error(`transfer heading: ${{view.heading}}`);
+if (view.heading !== "Send 250 USDC") throw new Error(`transfer heading: ${{view.heading}}`);
 if (view.primary.includes(view.heading)) throw new Error("action title was printed twice");
-if (!view.technical.includes("−250 BDT") || !view.technical.includes("+250 BDT")) {{
+if (!view.primary.includes("−250 USDC") || !view.primary.includes("+250 USDC")) {{
   throw new Error("requested sender/recipient movements are missing");
 }}
 if (!view.technical.includes("Contract behavior has not been verified")) {{
   throw new Error("the interpretation limitation disappeared from details");
 }}
-if (!allText(nodes["page-title"]).includes("Chain ID 31337")) {{
+if (!allText(nodes["page-title"]).includes("Chain ID 8453")) {{
   throw new Error("the exact EVM chain is missing from the primary context");
 }}
-if (!view.technical.includes("BDT — Bloom Demo Token")) {{
-  throw new Error("the token's full name is missing from details");
+if (!view.primary.includes("USD Coin") || !view.primary.includes("USDC")) {{
+  throw new Error("the token's full name is missing from the decision");
 }}
+const tokenImage = find(nodes.review, n => n.tagName === "IMG" && n.attrs.src === "/assets/tokens/usdc.svg");
+if (!tokenImage) throw new Error("Base USDC artwork is missing from the decision");
 if (view.action !== "transfer") throw new Error(`transfer action: ${{view.action}}`);
 if (!view.roles.includes("recipient")) throw new Error(`transfer roles: ${{view.roles}}`);
 if (view.roles.includes("spender")) throw new Error("a transfer must not name a spender");
 if (view.button !== "Approve transfer") throw new Error(`transfer button: ${{view.button}}`);
 // Identity is the address. A name may accompany it and must never stand in.
-if (!view.technical.includes("0x9fE46736679d2d9a65F0992F2272dE9f3c7fa6e0")) {{
+if (!view.primary.includes("0x9fE46736679d2d9a65F0992F2272dE9f3c7fa6e0")) {{
   throw new Error("the recipient address is not on the page");
 }}
-if (!view.technical.includes("0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512")) {{
+if (!view.primary.includes("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")) {{
   throw new Error("the token contract address is not on the page");
 }}
 // The envelope's zero native value must not read as the thing being sent.
 if (view.primary.includes("  0 ETH")) throw new Error(`primary showed the native zero: ${{view.primary}}`);
 // The potential cost stays with the decision, labelled as a ceiling.
-if (!view.technical.includes("Gas fee") ||
-    !view.technical.includes("Up to 0.000199 ETH")) {{
+if (!view.primary.includes("Gas fee") ||
+    !view.primary.includes("Up to 0.000199 ETH")) {{
   throw new Error(`the execution gas ceiling is not in details: ${{view.technical}}`);
 }}
 if (!view.technical.includes("0.000198510751634520 ETH")) {{
@@ -9346,7 +9348,7 @@ for (const detail of ["5f2a1c6b8d4e0937ab55c1e8d0f34721aa9c6b5e4d3f2a1908b7c6d5e
 // A finite allowance states the cap and that it is a total, and the
 // counterparty is a spender.
 view = show("allowance-finite");
-if (!view.heading.includes("to spend up to 100 BDT")) throw new Error(`finite heading: ${{view.heading}}`);
+if (!view.heading.includes("to spend up to 100 USDC")) throw new Error(`finite heading: ${{view.heading}}`);
 if (view.magnitude !== "finite") throw new Error(`finite magnitude: ${{view.magnitude}}`);
 if (!view.roles.includes("spender")) throw new Error(`finite roles: ${{view.roles}}`);
 if (view.button !== "Approve allowance") throw new Error(`finite button: ${{view.button}}`);
@@ -9362,13 +9364,13 @@ if (view.heading.includes("spend up to")) throw new Error("zero read as a spendi
 
 // Unlimited says so in the heading, and does not lead with the U256 maximum.
 view = show("allowance-unlimited");
-if (view.heading !== "Allow unlimited BDT spending") throw new Error(`unlimited heading: ${{view.heading}}`);
+if (view.heading !== "Allow unlimited USDC spending") throw new Error(`unlimited heading: ${{view.heading}}`);
 if (view.magnitude !== "unlimited") throw new Error(`unlimited magnitude: ${{view.magnitude}}`);
 if (view.heading.includes("115792089")) throw new Error("the U256 maximum led the heading");
 // Deciding must never require reading the raw integer.
 if (view.primary.includes("115792089")) throw new Error("the U256 maximum is still a primary fact");
 if (!view.technical.includes("115792089")) throw new Error("the exact maximum left technical details");
-if (!view.primary.includes("all your current and future BDT")) throw new Error("the unlimited warning is not visible");
+if (!view.primary.includes("all your current and future USDC")) throw new Error("the unlimited warning is not visible");
 const unfamiliar = previewSession("allowance-unlimited");
 const unfamiliarPlan = JSON.parse(unfamiliar.review_manifest.canonical_plan);
 unfamiliarPlan.evm_review.payloads[0].contract_call.warnings.push("A new warning the renderer does not recognise");
@@ -9394,7 +9396,7 @@ if (view.primary.includes("−250000000 raw units") || view.primary.includes("+2
 if (!view.primary.includes("has not verified that this contract is a token")) {{
   throw new Error("the structural assurance warning is not visible");
 }}
-if (view.primary.includes("Bloom Demo Token") || view.primary.includes(" BDT")) {{
+if (view.primary.includes("Bloom Demo Token") || view.primary.includes(" USDC")) {{
   throw new Error("a structural reading borrowed catalog token identity");
 }}
 if (!view.technical.includes("Decoded from the standard ERC-20 calldata shape")) {{
@@ -9429,9 +9431,9 @@ if (!view.technical.includes("0xa9059cbb")) throw new Error("opaque calldata is 
 if (view.action !== "opaque") throw new Error(`opaque action: ${{view.action}}`);
 if (!view.heading.includes("Bloom cannot read")) throw new Error(`opaque heading: ${{view.heading}}`);
 view = show("operator-approval");
-if (!view.technical.includes("Function arguments") ||
-    !view.technical.includes("setApprovalForAll(address operator, bool approved)") ||
-    !view.technical.includes("true")) throw new Error("generic call arguments lost their function context");
+if (!view.primary.includes("Function arguments") ||
+    !view.primary.includes("setApprovalForAll(address operator, bool approved)") ||
+    !view.primary.includes("true")) throw new Error("generic call arguments lost their function context");
 
 // A batch keeps every member, in order, under one approval.
 view = show("batch");
@@ -9439,10 +9441,10 @@ if (view.action !== "batch") throw new Error(`batch action: ${{view.action}}`);
 if (allText(nodes["page-title"]).includes("Wallet settings")) {{
   throw new Error("a transaction batch was labelled as wallet settings");
 }}
-if (!view.technical.includes("Transaction 1") || !view.technical.includes("Transaction 2")) {{
+if (!view.primary.includes("Transaction 1") || !view.primary.includes("Transaction 2")) {{
   throw new Error("batch members are not listed in order");
 }}
-if (view.technical.indexOf("Transaction 1") > view.technical.indexOf("Transaction 2")) {{
+if (view.primary.indexOf("Transaction 1") > view.primary.indexOf("Transaction 2")) {{
   throw new Error("batch members are out of order");
 }}
 if (view.button !== "Approve all transactions") throw new Error(`batch button: ${{view.button}}`);
@@ -9482,7 +9484,7 @@ call.intent = "Totally different publisher story";
 renamed.review_manifest.canonical_plan = JSON.stringify(plan);
 renderReview(renamed);
 const relabelled = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
-if (nodes["panel-title"].textContent !== "Send 250 BDT") {{
+if (nodes["panel-title"].textContent !== "Send 250 USDC") {{
   throw new Error(`relabelling changed the heading: ${{relabelled}}`);
 }}
 if (!relabelled.includes("Beneficiary")) {{
