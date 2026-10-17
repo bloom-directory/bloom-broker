@@ -807,8 +807,16 @@ function describeTransfer(manifest) {
     const thresholdText = threshold
       ? `${threshold} signature${threshold === "1" ? "" : "s"}` : "";
     const amount = safeAmount(rows);
-    const vault = rows.find(row => /(?:^|· )Vault$/.test(row.label))?.value || "";
-    const shares = rows.find(row => /Shares go to$/.test(row.label))?.value || "";
+    const vaults = rows.filter(row => /(?:^|· )Vault$/.test(row.label));
+    const shareRecipients = rows.filter(row => /Shares go to$/.test(row.label));
+    const vault = vaults.length === 1 ? vaults[0].value : "";
+    const shares = shareRecipients.length === 1 ? shareRecipients[0].value : "";
+    const morphoBundle = rawAction.startsWith("multicall on Morpho Bundler3");
+    const nestedActions = rows.filter(row => /^Action \d+$/.test(row.label));
+    const simpleMorphoDeposit = morphoBundle && vault && shares &&
+      nestedActions.length === 2 &&
+      nestedActions[0].value.startsWith("erc20TransferFrom on ") &&
+      nestedActions[1].value.startsWith("erc4626Deposit on ");
     const recipient = safeRowValue(rows, "Recipient") || safeRowValue(rows, "To");
     const sendTo = rawAction.match(/^Send (.+) to (0x[0-9a-fA-F]{40})$/);
     const movements = safeMovements(rows);
@@ -839,8 +847,8 @@ function describeTransfer(manifest) {
     } else if (rawAction.startsWith("performCreate")) {
       heading = "Create a contract";
       sentence = `Create a contract from Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong>.`;
-    } else if (rawAction.startsWith("multicall on Morpho Bundler3") || rawAction.startsWith("erc4626Deposit")) {
-      const morpho = rawAction.startsWith("multicall on Morpho Bundler3");
+    } else if (simpleMorphoDeposit || rawAction.startsWith("erc4626Deposit")) {
+      const morpho = Boolean(simpleMorphoDeposit);
       const vaultName = morpho ? "a Morpho vault" : "a vault";
       heading = amount ? `Deposit ${amount} into ${vaultName}` : `Deposit into ${vaultName}`;
       const who = !shares ? "the recipient in details"
@@ -850,6 +858,9 @@ function describeTransfer(manifest) {
       const deposited = amount ? `<strong>${escapeHtml(amount)}</strong>` : "tokens";
       const into = vault ? `vault <strong>${escapeHtml(shortAddress(vault))}</strong>` : vaultName;
       sentence = `Deposit ${deposited} into ${into} on <strong>${escapeHtml(network)}</strong>. Vault shares go to <strong>${escapeHtml(who)}</strong>.`;
+    } else if (morphoBundle) {
+      heading = "Review calls through Morpho";
+      sentence = `Review every call from Safe <strong>${escapeHtml(safeShort)}</strong> on <strong>${escapeHtml(network)}</strong> in the details below.`;
     } else if (rawAction.startsWith("multiSend") || movements.length > 1) {
       heading = movements.length ? `Send ${naturalList(movements.map(bit => bit.split(" to ")[0]))}` : "Send a batch from the Safe";
       sentence = movements.length
@@ -881,8 +892,10 @@ function describeTransfer(manifest) {
       if (safeIdentityRisk(warning)) technical.push(["Safe identity check", warning, false]);
     }
     const warnings = parsed.warnings.map(warning => safeIdentityRisk(warning) || warning);
-    const tokenAddress = rows.find(row =>
-      /(?:^|· )Token$/.test(row.label) && /^0x[0-9a-fA-F]{40}$/.test(row.value))?.value || "";
+    const tokens = rows.filter(row =>
+      /(?:^|· )Token$/.test(row.label) && /^0x[0-9a-fA-F]{40}$/.test(row.value));
+    const tokenAddress = tokens.length === 1 && movements.length <= 1
+      ? tokens[0].value : "";
     const tokenAsset = tokenAddress && amount
       ? {chainId: String(safe.chain_id), address: tokenAddress, amount, amountLabel: "Amount", tone: "outgoing"}
       : null;

@@ -606,6 +606,24 @@ if (!morphoBanner.includes("different contract") || morphoBanner.includes("canno
   throw new Error(`Morpho warning did not state the Safe-identity risk: ${{morphoBanner}}`);
 }}
 
+// Calling Bundler3 alone does not establish a deposit. Do not invent one
+// when the bundle only pulls tokens or reaches more than one vault.
+for (const extraVault of [false, true]) {{
+  const variant = previewSession("morpho");
+  const plan = JSON.parse(variant.review_manifest.canonical_plan);
+  if (extraVault) {{
+    plan.safe_review.action.push("Action 3: erc4626Deposit on Morpho GeneralAdapter1 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+      "Action 3 · Vault: 0x4000000000000000000000000000000000000000");
+  }} else {{
+    plan.safe_review.action = plan.safe_review.action.filter(line => !line.startsWith("Action 2"));
+  }}
+  variant.review_manifest.canonical_plan = JSON.stringify(plan);
+  renderReview(variant);
+  if (nodes["panel-title"].textContent !== "Review calls through Morpho") {{
+    throw new Error("Morpho bundle was mislabeled as a single deposit");
+  }}
+}}
+
 // A Safe batch states each movement in the heading and keeps one row per fact.
 renderReview({{
   ceremony_kind: "sealed_approval",
