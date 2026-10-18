@@ -1,6 +1,6 @@
 {
   "$schema": "https://eips.ethereum.org/assets/eip-7730/erc7730-v2.schema.json",
-  "$comment": "The ERC-4626 vault standard, read for any address no entry lists. Derived from LedgerHQ/clear-signing-erc7730-registry ercs/calldata-erc4626-vaults.json; amounts are raw because the vault's asset is not known offline.",
+  "$comment": "The ERC-4626 vault standard, read for any address no entry lists. Derived from LedgerHQ/clear-signing-erc7730-registry ercs/calldata-erc4626-vaults.json. Bloom's vaultAssetAmount extension uses exact compiled vault-to-underlying bindings; unknown vault assets and share amounts remain raw.",
   "context": {
     "contract": {}
   },
@@ -14,8 +14,9 @@
         "fields": [
           {
             "path": "assets",
-            "label": "Assets (raw units)",
-            "format": "raw"
+            "label": "Assets",
+            "format": "vaultAssetAmount",
+            "params": {"vaultPath": "@.to"}
           },
           {
             "path": "receiver",
@@ -44,8 +45,9 @@
         "fields": [
           {
             "path": "assets",
-            "label": "Assets (raw units)",
-            "format": "raw"
+            "label": "Assets",
+            "format": "vaultAssetAmount",
+            "params": {"vaultPath": "@.to"}
           },
           {
             "path": "receiver",

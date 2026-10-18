@@ -66,8 +66,9 @@
           },
           {
             "path": "assets",
-            "label": "Assets (raw units)",
-            "format": "raw"
+            "label": "Assets",
+            "format": "vaultAssetAmount",
+            "params": {"vaultPath": "vault"}
           },
           {
             "path": "maxSharePriceE27",

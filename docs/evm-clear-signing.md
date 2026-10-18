@@ -216,8 +216,9 @@ deployments as the instance address:
 A **standard** description (`Binding::Standard`, such as
 `catalogs/standards/erc4626.json`) has no deployments. It reads any address no
 entry or instance description covers, on any chain, by selector: a vault's
-`deposit`, `mint`, `withdraw` and `redeem`, with amounts in raw units because
-the vault's asset is not known offline. The same ERC-20 rule applies.
+`deposit`, `mint`, `withdraw` and `redeem`. Underlying amounts use an exact
+compiled vault binding when available; unknown underlying assets and share
+quantities remain raw. The same ERC-20 rule applies.
 
 Such a call gets the structural assurance and a warning that Bloom has not
 verified the address is that contract. The review records the address it was
@@ -314,6 +315,24 @@ this reading. Fees, credited deposit amount, proof validity and settlement are
 not verified offline. Source revisions and deployments are recorded in the two
 `catalogs/privacy-pools` descriptors. No private relay payload is added to
 agent-visible records by this reader.
+
+### Vault underlying assets
+
+`vaultAssetAmount` is a Bloom extension whose `vaultPath` is `@.to` or a decoded
+address argument. It resolves only the compiled chain/vault binding in
+`catalogs/vault-assets.json`, then takes units and artwork identity from the
+underlying token's existing catalog entry. Unknown vaults keep explicit raw
+underlying units and no borrowed token identity. Share quantities remain shares;
+they never use the underlying token's decimals or logo.
+
+The initial Base binding covers vault
+`0xc1256ae5ff1cf2719d4937adb3bbccab2e00a2ca` and underlying USDC. Both public
+RPCs agreed at the recorded block, including its hash, asset and decimals.
+The runtime bytecode matched Sourcify's exact verified MetaMorpho source,
+whose inherited asset getter returns a private immutable asset. The file
+retains the block/code/source digests and verification limits. Broker remains
+offline: this is trusted release-time metadata, not a fresh code, price, balance
+or settlement attestation.
 
 ### Enso Router V2 inputs
 

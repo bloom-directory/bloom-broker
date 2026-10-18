@@ -636,6 +636,25 @@ for (const extraVault of [false, true]) {{
   }}
 }}
 
+// A pull's ticker/amount cannot establish the vault's underlying identity.
+for (const mismatch of ["amount", "asset", "missing"]) {{
+  const variant = previewSession("morpho");
+  const plan = JSON.parse(variant.review_manifest.canonical_plan);
+  plan.safe_review.action = plan.safe_review.action.flatMap(line => {{
+    if (mismatch === "amount" && line.startsWith("Action 2 · Assets: ")) return ["Action 2 · Assets: 3 USDC"];
+    if (line.startsWith("Action 2 · Assets asset: ")) {{
+      return mismatch === "missing" ? [] : mismatch === "asset"
+        ? ["Action 2 · Assets asset: 0x4000000000000000000000000000000000000000"] : [line];
+    }}
+    return [line];
+  }});
+  variant.review_manifest.canonical_plan = JSON.stringify(plan);
+  renderReview(variant);
+  if (nodes["panel-title"].textContent !== "Review calls through Morpho") {{
+    throw new Error(`Morpho deposit borrowed an unbound amount/asset: ${{mismatch}}`);
+  }}
+}}
+
 // A Safe batch states each movement in the heading and keeps one row per fact.
 renderReview({{
   ceremony_kind: "sealed_approval",

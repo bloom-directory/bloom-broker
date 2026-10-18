@@ -97,7 +97,16 @@ fn a_protected_deposit_reads_step_by_step() {
         field(&call, "Action 2"),
         format!("erc4626Deposit on Morpho GeneralAdapter1 {adapter}")
     );
-    assert_eq!(field(&call, "Action 2 · Assets (raw units)"), "2500000");
+    assert_eq!(field(&call, "Action 2 · Assets"), "2.5 USDC");
+    let asset = call
+        .fields
+        .iter()
+        .find(|field| field.label == "Action 2 · Assets")
+        .unwrap()
+        .asset
+        .as_ref()
+        .unwrap();
+    assert_eq!(asset.token.address.to_lowercase(), USDC);
     assert_eq!(field(&call, "Action 2 · Shares go to"), checksum(OWNER));
     assert!(!call.structural);
 }
@@ -118,7 +127,7 @@ fn a_vault_withdrawal_is_read_by_the_standard() {
     );
     let call = review(VAULT, &input).unwrap();
     assert_eq!(call.contract_name.as_deref(), Some("ERC-4626 vault"));
-    assert_eq!(field(&call, "Assets (raw units)"), "1000000");
+    assert_eq!(field(&call, "Assets"), "1 USDC");
     assert_eq!(field(&call, "Assets go to"), checksum(OWNER));
     assert!(call.structural);
     assert!(
@@ -126,4 +135,45 @@ fn a_vault_withdrawal_is_read_by_the_standard() {
         "{:?}",
         call.warnings
     );
+}
+
+#[test]
+fn vault_underlying_units_are_bound_to_the_exact_address_and_chain() {
+    let input = encode(
+        "deposit(uint256,address)",
+        &[uint(2_500_000), address(OWNER)],
+    );
+    let wrong_vault = "0xc1256ae5ff1cf2719d4937adb3bbccab2e00a2cb";
+    let call = review(wrong_vault, &input).unwrap();
+    assert!(field(&call, "Assets").starts_with("2500000 raw units"));
+    assert!(field(&call, "Assets").contains("identity unverified"));
+    assert!(call.fields.iter().all(|field| field.asset.is_none()));
+    let (call, _) = review_call(
+        Catalog::built_in().unwrap(),
+        &CallContext {
+            chain_id: 1,
+            to: VAULT.parse().unwrap(),
+            value: U256::ZERO,
+            calldata: &input,
+            native: Some(NativeUnits {
+                decimals: 18,
+                symbol: "ETH".into(),
+            }),
+        },
+    )
+    .unwrap();
+    assert!(field(&call, "Assets").starts_with("2500000 raw units"));
+    assert!(call.fields.iter().all(|field| field.asset.is_none()));
+}
+
+#[test]
+fn vault_shares_do_not_borrow_the_underlying_usdc_identity_or_units() {
+    let input = encode(
+        "redeem(uint256,address,address)",
+        &[uint(1_000_000), address(OWNER), address(OWNER)],
+    );
+    let call = review(VAULT, &input).unwrap();
+    assert_eq!(field(&call, "Shares (raw units)"), "1000000");
+    assert!(call.fields.iter().all(|field| field.asset.is_none()));
+    assert!(!call.fields.iter().any(|field| field.value.contains("USDC")));
 }

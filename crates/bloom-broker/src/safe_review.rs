@@ -321,9 +321,18 @@ pub(crate) fn review(
                             && !(field.raw == "0"
                                 && matches!(field.label.as_str(), "Safe gas limit" | "Base gas"))
                     })
-                    .map(|field| {
+                    .flat_map(|field| {
                         let label = field.label.trim_start_matches("Safe transaction · ");
-                        format!("{label}: {}", field.value)
+                        let mut rows = vec![format!("{label}: {}", field.value)];
+                        if let Some(asset) = &field.asset {
+                            rows.push(format!("{label} asset: {}", asset.token.address));
+                            if !field.raw.is_empty()
+                                && field.raw.bytes().all(|byte| byte.is_ascii_digit())
+                            {
+                                rows.push(format!("{label} (raw units): {}", field.raw));
+                            }
+                        }
+                        rows
                     }),
             );
             lines.extend(

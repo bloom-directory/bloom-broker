@@ -887,6 +887,32 @@ fn resolve_token(
     context: &CallContext<'_>,
 ) -> Result<Result<ResolvedToken, String>, ReviewError> {
     let token_entry = match source {
+        crate::TokenSource::VaultAsset(source) => {
+            let vault = match source {
+                CalleeSource::TargetContract => context.to,
+                CalleeSource::Argument(path) => {
+                    let index = call
+                        .leaves
+                        .iter()
+                        .position(|(leaf, _)| leaf == path)
+                        .expect("admission proved the vault argument");
+                    let DynSolValue::Address(vault) = &leaves[index] else {
+                        return Err(invalid("vault path did not decode as an address"));
+                    };
+                    *vault
+                }
+            };
+            let vault = format!("0x{vault:x}");
+            match catalog.vault_asset(context.chain_id, &vault) {
+                Some(token) => token,
+                None => {
+                    return Ok(Err(format!(
+                        "the underlying asset of vault {} (identity unverified)",
+                        checksum(&vault)
+                    )));
+                }
+            }
+        }
         crate::TokenSource::TargetContract => entry,
         crate::TokenSource::Argument(path) => {
             let index = call

@@ -103,6 +103,8 @@ pub enum TokenSource {
     /// symbol shown belong to the token the calldata names — not to one the
     /// publisher assumed.
     Argument(String),
+    /// The release's exact vault-to-underlying binding; never the vault's share units.
+    VaultAsset(CalleeSource),
 }
 
 impl AdmittedFormat {
@@ -781,6 +783,29 @@ fn admit_format(
         ))
     };
     match name {
+        "vaultAssetAmount" => {
+            only_keys(&params_map, &["vaultPath"], "vaultAssetAmount params")?;
+            let path = params_map
+                .get("vaultPath")
+                .and_then(Value::as_str)
+                .ok_or_else(|| rejected("vaultAssetAmount requires vaultPath"))?;
+            let vault = if path == "@.to" {
+                CalleeSource::TargetContract
+            } else {
+                let named = normalize_path(path)?;
+                if !paths
+                    .get(&named)
+                    .is_some_and(|kind| matches!(kind, LeafType::Address))
+                    || array_of(&named).is_some()
+                {
+                    return Err(rejected("vaultPath must name a decoded address argument"));
+                }
+                CalleeSource::Argument(named)
+            };
+            matches!(kind, LeafType::Uint(_))
+                .then_some(AdmittedFormat::TokenAmount(TokenSource::VaultAsset(vault)))
+                .ok_or_else(|| mismatched("unsigned integer"))
+        }
         "ensoToken" => {
             only_keys(&params_map, &["typePath"], "ensoToken params")?;
             let type_path = params_map

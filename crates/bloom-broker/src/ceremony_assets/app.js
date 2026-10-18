@@ -515,6 +515,7 @@ function safeTechnical(row) {
   if (/^Transaction \d+$/.test(row.label) && !row.value.startsWith("Send ")) return true;
   if (row.label === "Safe calls" || row.label === "Safe gas limit" || row.label === "Base gas") return true;
   if (/raw units|Contract code|Highest share price|Callback|Skip on failure/i.test(row.label)) return true;
+  if (row.label.endsWith(" asset")) return true;
   if (row.label === "Sent to" || row.label.endsWith(" · Sent to")) return true;
   if ((row.label === "Safe sends" || row.label === "Value" || row.label === "Sends to the new contract")
       && /^0(?:\.0+)? ETH$/.test(row.value)) return true;
@@ -544,7 +545,8 @@ function safeIdentityRisk(warning) {
   return `Bloom has not checked that ${shortAddress(match[1])} is a Safe. This signature authorizes the transaction hash for that address, and a different contract there could accept it for another effect.`;
 }
 function safeAmount(rows) {
-  const named = rows.find(row => /(?:^|· )Amount$/.test(row.label) && /[A-Za-z]/.test(row.value));
+  const named = rows.find(row => /(?:^|· )(Amount|Assets)$/.test(row.label) &&
+    /[A-Za-z]/.test(row.value) && !row.value.includes("raw units"));
   if (named) return named.value;
   const raw = rows.find(row => ["Token amount (base units)", "Raw token amount", "Raw total allowance"].includes(row.label));
   return raw ? `${raw.value} base units` : "";
@@ -908,7 +910,10 @@ function describeTransfer(manifest) {
     const simpleMorphoDeposit = morphoBundle && vault && shares &&
       nestedActions.length === 2 &&
       nestedActions[0].value.startsWith("erc20TransferFrom on ") &&
-      nestedActions[1].value.startsWith("erc4626Deposit on ");
+      nestedActions[1].value.startsWith("erc4626Deposit on ") &&
+      safeRowValue(rows, "Action 1 · Amount") === safeRowValue(rows, "Action 2 · Assets") &&
+      /^0x[0-9a-fA-F]{40}$/.test(safeRowValue(rows, "Action 2 · Assets asset")) &&
+      safeRowValue(rows, "Action 1 · Token").toLowerCase() === safeRowValue(rows, "Action 2 · Assets asset").toLowerCase();
     const recipient = safeRowValue(rows, "Recipient") || safeRowValue(rows, "To");
     const spender = safeRowValue(rows, "Spender");
     const permission = rawAction.startsWith("approve on ");
@@ -1026,8 +1031,10 @@ function describeTransfer(manifest) {
     const tokens = rows.filter(row =>
       /(?:^|· )Token$/.test(row.label) && /^0x[0-9a-fA-F]{40}$/.test(row.value));
     const directToken = rawAction.match(/^(?:approve|transfer) on (?:.+ )?(0x[0-9a-fA-F]{40})$/)?.[1];
+    const amountAssets = [...new Set(rows.filter(row => /(?:Amount|Assets) asset$/.test(row.label))
+      .map(row => row.value.toLowerCase()))];
     const tokenAddress = !rawAction.startsWith("multiSend") && movements.length <= 1
-      ? tokens.length === 1 ? tokens[0].value : directToken || "" : "";
+      ? tokens.length === 1 ? tokens[0].value : directToken || (amountAssets.length === 1 ? amountAssets[0] : "") : "";
     const tokenAsset = tokenAddress && amount
       ? {chainId: String(safe.chain_id), address: tokenAddress, amount: unlimited ? "Unlimited" : amount,
           amountLabel: permission ? "Spending limit" : "Amount",
@@ -1435,7 +1442,8 @@ function renderReview(session) {
           const asset = field.asset;
           decision.push(assetCard({chainId: String(asset.chain_id), address: asset.token.address,
             title: asset.token.name, subtitle: asset.token.symbol,
-            amount: asset.amount_display, amountLabel: field.label, tone: "outgoing"}));
+            amount: asset.amount_display, amountLabel: field.label,
+            tone: call.contract_name === "Enso Router V2" ? "outgoing" : "neutral"}));
           continue;
         }
         const explorer = addressExplorer(payload.chain_id, field.value);
@@ -2586,6 +2594,8 @@ const PREVIEWS = {
             "Action sends 1: 0 ETH",
             "Action 2: erc4626Deposit on Morpho GeneralAdapter1 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
             "Action 2 · Vault: 0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca",
+            "Action 2 · Assets: 2.5 USDC",
+            "Action 2 · Assets asset: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
             "Action 2 · Assets (raw units): 2500000",
             "Action 2 · Highest share price (1e27 scale): 1097016817869820",
             "Action 2 · Shares go to: 0x86dB2acbF74856fd3286Cb5B755A5a05Ba445864",

@@ -175,6 +175,7 @@ pub struct Catalog {
     /// One entry per standard description, at the zero address on chain 0:
     /// it describes no deployment.
     standards: Vec<CatalogEntry>,
+    vault_assets: BTreeMap<(u64, String), String>,
 }
 
 static BUILT_IN: LazyLock<Result<Catalog, ReviewError>> = LazyLock::new(|| {
@@ -187,10 +188,62 @@ static BUILT_IN: LazyLock<Result<Catalog, ReviewError>> = LazyLock::new(|| {
             Ok((value, *binding))
         })
         .collect::<Result<Vec<_>, ReviewError>>()?;
-    Catalog::build(&descriptors, bloom_broker_api::known_tokens().to_vec())
+    let mut catalog = Catalog::build(&descriptors, bloom_broker_api::known_tokens().to_vec())?;
+    catalog.admit_vault_assets(include_str!("../catalogs/vault-assets.json"))?;
+    Ok(catalog)
 });
 
 impl Catalog {
+    fn admit_vault_assets(&mut self, document: &str) -> Result<(), ReviewError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Bindings {
+            schema: String,
+            bindings: Vec<BindingRow>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct BindingRow {
+            chain_id: u64,
+            vault: String,
+            asset: String,
+            #[serde(rename = "observation")]
+            _observation: Value,
+        }
+        let document: Bindings = serde_json::from_str(document)
+            .map_err(|error| rejected(format!("vault asset bindings: {error}")))?;
+        if document.schema != "bloom.vault-asset-bindings.v1" || document.bindings.len() > 256 {
+            return Err(rejected("unsupported or oversized vault asset bindings"));
+        }
+        for binding in document.bindings {
+            if binding.chain_id == 0
+                || !crate::is_canonical_address(&binding.vault)
+                || !crate::is_canonical_address(&binding.asset)
+                || binding.vault == format!("0x{}", "0".repeat(40))
+                || !self
+                    .entry(binding.chain_id, &binding.asset)
+                    .is_some_and(|entry| entry.token_metadata.is_some())
+            {
+                return Err(rejected(
+                    "vault binding requires a canonical vault and catalogued underlying token",
+                ));
+            }
+            if self
+                .vault_assets
+                .insert((binding.chain_id, binding.vault), binding.asset)
+                .is_some()
+            {
+                return Err(rejected("duplicate vault asset binding"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn vault_asset(&self, chain_id: u64, vault: &str) -> Option<&CatalogEntry> {
+        self.vault_assets
+            .get(&(chain_id, vault.to_owned()))
+            .and_then(|asset| self.entry(chain_id, asset))
+    }
     /// The catalog compiled into this build. A test proves it admits, so the
     /// error is reachable only through a broken build.
     pub fn built_in() -> Result<&'static Catalog, ReviewError> {
@@ -212,6 +265,7 @@ impl Catalog {
             ],
             entries: BTreeMap::new(),
             standards: Vec::new(),
+            vault_assets: BTreeMap::new(),
         };
         for chain_id in SAFE_BATCH_CHAINS {
             for address in SAFE_BATCH {
