@@ -589,6 +589,8 @@ function describeTransfer(manifest) {
       try { chainId = BigInt(domainChain).toString(); } catch (_) {}
     }
     const hyperliquid = String(message.kind).startsWith("hyperliquid_");
+    const polymarket = message.kind === "polymarket_exact";
+    const authenticationScope = message.kind === "polymarket_auth_scope";
     const signingChain = chainId;
     const venueNetwork = fields.find(field => ["hyperliquidChain", "Hyperliquid environment"].includes(field.path))?.value;
     if (hyperliquid) chainId = null;
@@ -610,12 +612,25 @@ function describeTransfer(manifest) {
     for (const field of domain) {
       const row = [field.path === "chainId" && hyperliquid ? "Signing domain chain ID" : labels[field.path] || field.path,
         field.path === "chainId" && signingChain ? signingChain : field.value, true];
-      if (hyperliquid || (payment && ["primaryType", "version", "salt"].includes(field.path))) extraTechnical.push(row);
+      if (hyperliquid || (polymarket && ["primaryType", "version", "salt", "chainId"].includes(field.path))
+        || (payment && ["primaryType", "version", "salt"].includes(field.path))) extraTechnical.push(row);
       else primary.push(row);
     }
     if (payment) primary.push(["Valid from", time(payment.valid_after)], ["Valid until", time(payment.valid_before)]);
     else for (const field of fields) {
       const row = [hyperliquid ? messageLabels[field.path] || field.path : field.path, field.value, true];
+      if (polymarket) {
+        const labels = {"contents.maker": "Deposit wallet", "contents.signer": "Order signer",
+          wallet: "Deposit wallet", deadline: "Signed deadline", "Side (0 buy, 1 sell)": "Order side"};
+        row[0] = labels[field.path] || field.path;
+        if (field.path === "Side (0 buy, 1 sell)") row[1] = field.value === "0" ? "Buy" : field.value === "1" ? "Sell" : field.value;
+        if (field.path === "deadline") row[1] = time(field.value);
+        if (["contents.salt", "contents.signer", "contents.signatureType", "contents.timestamp",
+          "contents.metadata", "contents.builder", "name", "version", "chainId", "verifyingContract", "salt", "nonce"].includes(field.path)
+          || /^calls\..*\.data$/.test(field.path)) {
+          extraTechnical.push(row); continue;
+        }
+      }
       if (hyperliquid && (["nonce", "time", "Nonce (Unix milliseconds)"].includes(field.path)
         || (message.venue_asset && field.path === "USDC amount (HyperCore venue units)"))) extraTechnical.push(row);
       else primary.push(row);
@@ -629,17 +644,18 @@ function describeTransfer(manifest) {
     }
     const claimWarnings = claim?.operation_class === "gasless.relay"
       ? ["Relay's final destination and quoted output are separate Petal claims. This signature authorizes the payment to the recipient shown above."]
-      : claim && !["venice-x402.topup", "hyperliquid.usd_send", "hyperliquid.withdraw"].includes(claim.operation_class)
+      : claim && !["venice-x402.topup", "hyperliquid.usd_send", "hyperliquid.withdraw", "polymarket.clob_auth.v1"].includes(claim.operation_class)
         ? ["The Petal reports the destination and policy limits. These claims are not established by the message signature; review them separately from the signed authorization."] : [];
     return {
       intent: {action: "sign_message", heading: message.title || "Sign a message"},
-      button: payment ? "Approve payment authorization" : agent ? "Authorize trading agent"
+      button: authenticationScope ? "Allow one authentication" : payment ? "Approve payment authorization" : agent ? "Authorize trading agent"
         : hyperliquid ? "Approve exchange action" : "Approve message signature",
-      sentence: payment ? "Authorize this exact token payment within the signed validity window." : "Review the exact fields bound to this message signature.",
+      sentence: authenticationScope ? "Allow the fixed authentication profile below. Broker checks the fresh message when this permission is used."
+        : payment ? "Authorize this exact token payment within the signed validity window." : "Review the exact fields bound to this message signature.",
       chainId, networkIdentity: hyperliquid ? `Hyperliquid · ${venueNetwork || "Unknown environment"}`
-        : chainId ? `EVM · Chain ID ${chainId}` : "Message signature",
+        : chainId ? `${({1:"Ethereum",10:"Optimism",56:"BNB Chain",100:"Gnosis",137:"Polygon",8453:"Base",42161:"Arbitrum",43114:"Avalanche",59144:"Linea",999:"HyperEVM",4663:"Robinhood",4217:"Tempo"})[chainId] || "EVM"} · Chain ID ${chainId}` : "Message signature",
       networkIcon: chainId ? chainIcon(chainId) : "unknown",
-      facts: [], technical: [["Signing hash", message.payload_keccak, true],
+      facts: [], technical: [...(message.payload_keccak ? [["Signing hash", message.payload_keccak, true]] : []),
         ...extraTechnical, ...(message.venue_asset?.base_units ? [["USDC base units", message.venue_asset.base_units, true]] : []),
         ...(payment ? fields.map(field => [field.path, field.value, true]) : [])],
       messageFields: primary,

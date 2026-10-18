@@ -17,6 +17,47 @@ const MAX_DEPTH: usize = 12;
 
 mod hyperliquid;
 mod polymarket;
+pub(crate) mod polymarket_auth;
+
+/// Check at preparation AND signing use, including grants made by older
+/// Broker versions. Upgrading must not leave old opaque reusable grants usable.
+pub(crate) fn validate_selector(
+    terms: &bloom_broker_api::SealedApprovalTerms,
+    claim: Option<&bloom_broker_api::PetalUseClaim>,
+) -> Result<(), ProtocolError> {
+    if let ApprovalSelector::Petal {
+        allowed_operation_classes,
+        route_grants,
+        ..
+    } = &terms.selector
+    {
+        if allowed_operation_classes
+            .iter()
+            .chain(
+                route_grants
+                    .iter()
+                    .flat_map(|grant| &grant.allowed_operation_classes),
+            )
+            .any(|class| {
+                class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
+                    || bloom_broker_api::message_review_requires_exact(class.as_str())
+            })
+        {
+            return Err(invalid(
+                "Reviewed signatures cannot use an opaque reusable grant; prepare a new exact approval",
+            ));
+        }
+    }
+    if claim.is_some_and(|claim| {
+        claim.operation_class.as_str() == bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS
+    }) && !polymarket_auth::is_scope(terms)
+    {
+        return Err(invalid(
+            "CLOB authentication requires the versioned one-use scope",
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -818,7 +859,7 @@ mod tests {
         serde_json::to_vec(&json!({"schema":SCHEMA,"kind":"eip712","typed_data":data})).unwrap()
     }
 
-    fn request(bytes: Vec<u8>) -> ApprovalPrepareRequest {
+    pub(super) fn request(bytes: Vec<u8>) -> ApprovalPrepareRequest {
         let (preimage, _) = decode(&bytes, signer()).unwrap();
         let digest = Digest32::from_bytes([1; 32]);
         let token = |name: &str| Token::new(name).unwrap();

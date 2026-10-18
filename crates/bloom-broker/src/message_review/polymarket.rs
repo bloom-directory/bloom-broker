@@ -239,12 +239,16 @@ pub(super) fn decode(
             path: "Collateral contract (Polygon)".into(),
             value: collateral.into(),
         });
-        review.warnings.push("Collateral units use the compiled Polygon pUSD identity (6 decimals), checked against both exchanges at block 95772650. These contracts can upgrade; current implementations and outcome-token units/names are not verified at signing. pUSD is not Circle USDC. HTTP order options, order-book price, fees, fill and settlement are not established by this signature.".into());
+        review.fields.push(MessageField {
+            path: "Signed order expiry".into(),
+            value: "None; HTTP expiration is not part of this signature".into(),
+        });
+        review.warnings.push("pUSD is not Circle USDC. Its 6 decimals and exchange bindings were checked at Polygon block 95772650; these contracts can upgrade. Outcome identity/units, fees, fill and settlement are unverified. HTTP order options are not signed.".into());
     } else {
         review.title = "Authorize deposit-wallet calls".into();
         describe_calls(&prepared.preimage["calls"], &mut review)?;
     }
-    review.warnings.push("Bloom rebuilt the exact signature. Deposit-wallet ownership/current implementation, live nonce, balances and execution effects are not verified by this reading. Draft IDs, review-intent hashes and acknowledgement flags are unsigned metadata and are not presented as signed facts.".into());
+    review.warnings.push("Deposit-wallet ownership/implementation, live nonce, balances and execution effects are unverified. Draft IDs, intent hashes and acknowledgement flags are unsigned metadata.".into());
     Ok((preimage, review))
 }
 
@@ -356,6 +360,60 @@ mod tests {
         prepared.signing_preimage_hex = hex::encode(&preimage);
         prepared.signing_hash = keccak256(preimage);
         (prepared, signer)
+    }
+
+    #[test]
+    fn prepared_order_review_is_bound_to_exact_approval_and_rejects_claim_overrides() {
+        use bloom_broker_api::{
+            ApprovalSelector, Base64UrlBytes, ClaimAssurance, DeclaredFee, Digest32, PetalUseClaim,
+            RequestNonce, Token,
+        };
+        use sha2::{Digest as _, Sha256};
+        let (prepared, signer) = prepared_order();
+        let typed_envelope = serde_json::to_vec(&json!({"schema":super::super::SCHEMA,
+            "kind":"eip712","typed_data":typed(&prepared,&prepared.intent).unwrap()}))
+        .unwrap();
+        let mut request = super::super::tests::request(typed_envelope);
+        request.message_review_payloads = vec![Base64UrlBytes::from_bytes(
+            &serde_json::to_vec(&vec![&prepared]).unwrap(),
+        )];
+        request.petal_use_claim = Some(PetalUseClaim {
+            package_hash: Digest32::from_bytes([1; 32]),
+            route: "payment/a/0/confirm".into(),
+            operation_class: Token::new(&prepared.intent).unwrap(),
+            crypto_suite: bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: Digest32::from_bytes([9; 32]),
+            ordered_hashes: vec![],
+            declared_debits: vec![],
+            declared_destinations: vec![],
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([4; 16]),
+            claim_assurance: ClaimAssurance::MachineAsserted,
+        });
+        let raw = hex::decode(&prepared.signing_preimage_hex).unwrap();
+        request.terms.selector = ApprovalSelector::Exact {
+            ordered_payload_digests: vec![Digest32::from_bytes(Sha256::digest(&raw).into())],
+            ordered_hashes: vec![Digest32::from_bytes(keccak256(&raw).into())],
+        };
+        let review = super::super::review(&request, signer).unwrap().unwrap();
+        assert_eq!(review.kind, "polymarket_exact");
+        let mut changed = request.clone();
+        if let ApprovalSelector::Exact { ordered_hashes, .. } = &mut changed.terms.selector {
+            ordered_hashes[0] = Digest32::from_bytes([7; 32]);
+        }
+        assert!(super::super::review(&changed, signer).is_err());
+        let mut changed = request.clone();
+        changed.petal_use_claim.as_mut().unwrap().declared_fee = DeclaredFee::Fee {
+            chain: Token::new("polygon").unwrap(),
+            asset: "pusd".into(),
+            amount: bloom_broker_api::DecimalU256::parse("1").unwrap(),
+        };
+        assert!(super::super::review(&changed, signer).is_err());
+        let mut changed = request;
+        changed
+            .message_review_payloads
+            .push(changed.message_review_payloads[0].clone());
+        assert!(super::super::review(&changed, signer).is_err());
     }
 
     #[test]

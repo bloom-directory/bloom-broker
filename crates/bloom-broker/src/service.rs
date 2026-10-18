@@ -887,9 +887,37 @@ impl BrokerRpcService {
                 ));
             }
         }
+        let clob_auth = crate::message_review::polymarket_auth::is_scope(&request.terms);
+        crate::message_review::validate_selector(&request.terms, request.petal_use_claim.as_ref())?;
+        if clob_auth {
+            let claim = request.petal_use_claim.as_ref().ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::ClaimInvalid,
+                    "CLOB authentication requires its versioned claim",
+                )
+            })?;
+            crate::message_review::polymarket_auth::validate_claim(claim)?;
+            if !request.evm_review_payloads.is_empty()
+                || !request.safe_review_payloads.is_empty()
+                || !request.message_review_payloads.is_empty()
+                || !self
+                    .authority
+                    .subject_declares_operation_class(
+                        &request.terms.subject,
+                        bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS,
+                    )
+                    .map_err(authority_error)?
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::ClaimInvalid,
+                    "CLOB authentication must match installer provenance and cannot mix exact reviews",
+                ));
+            }
+        }
         if !request.evm_review_payloads.is_empty()
             || !request.safe_review_payloads.is_empty()
             || !request.message_review_payloads.is_empty()
+            || clob_auth
         {
             let response = self
                 .signer
@@ -935,7 +963,14 @@ impl BrokerRpcService {
                 context.evm_review = crate::evm_review::review(&request, &policy, from, catalog)?;
             }
             context.safe_review = crate::safe_review::review(&request, &policy, from, catalog)?;
-            context.message_review = crate::message_review::review(&request, from)?;
+            context.message_review = if clob_auth {
+                Some(crate::message_review::polymarket_auth::review(
+                    &request.terms,
+                    from,
+                )?)
+            } else {
+                crate::message_review::review(&request, from)?
+            };
         }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
             ApprovalSelector::Exact {
@@ -1192,7 +1227,10 @@ impl BrokerRpcService {
             .ok_or_else(|| {
                 ProtocolError::new(ProtocolErrorCode::ApprovalNotFound, "approval not found")
             })?;
-        let trusted_time_required = !terms.limits.operation_rate_limits.is_empty()
+        let clob_auth = crate::message_review::polymarket_auth::is_scope(&terms);
+        crate::message_review::validate_selector(&terms, request.petal_use_claim.as_ref())?;
+        let trusted_time_required = clob_auth
+            || !terms.limits.operation_rate_limits.is_empty()
             || !terms.limits.signature_rate_limits.is_empty()
             || terms
                 .limits
@@ -1207,6 +1245,30 @@ impl BrokerRpcService {
         // the only layer that can: authority is synchronous and journal-
         // backed, while the account projection comes from the Signer.
         let expected_signer_public_key = self.resolve_terms_signer_public_key(&terms).await?;
+        if clob_auth {
+            let response = self
+                .signer
+                .request_for_machine(BrokerSignerRequest::KeyGetPublic(
+                    translate_service::key_request_to_signer(bloom_broker_api::KeyRequest {
+                        key_ref: terms.key_ref.clone(),
+                    }),
+                ))
+                .await?;
+            let BrokerSignerResponse::KeyGetPublic(key) = response else {
+                return Err(response_mismatch("CLOB authentication public key"));
+            };
+            let key = translate_service::key_to_machine(key);
+            if key.key_ref != terms.key_ref {
+                return Err(response_mismatch("CLOB authentication key identity"));
+            }
+            let owner = evm_address_from_public_key(&key.canonical_public_key.decode())?;
+            crate::message_review::polymarket_auth::verify_use(
+                &terms,
+                &request,
+                owner,
+                reserved_at_ms,
+            )?;
+        }
         let decision = self
             .authority
             .authorize_for_clock_profile(

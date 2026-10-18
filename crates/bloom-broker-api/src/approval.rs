@@ -59,11 +59,16 @@ pub const POLYMARKET_REVIEW_OPERATION_CLASSES: &[&str] = &[
     "polymarket.onboard",
 ];
 
+/// Immutable v1 profile: Polygon ClobAuth, nonce 0, one signature, selected
+/// owner, fixed attestation and a timestamp within 300 seconds at use. A wider
+/// profile must have a new class so existing grants cannot silently widen.
+pub const POLYMARKET_CLOB_AUTH_CLASS: &str = "polymarket.clob_auth.v1";
+
 pub fn message_review_requires_exact(class: &str) -> bool {
     MESSAGE_REVIEW_OPERATION_CLASSES.contains(&class)
         || matches!(
             class,
-            "polymarket.order.poly1271" | "polymarket.relayer_batch"
+            "polymarket.order.poly1271" | "polymarket.relayer_batch" | "polymarket.onboard"
         )
 }
 
