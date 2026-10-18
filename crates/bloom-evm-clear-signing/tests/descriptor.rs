@@ -267,10 +267,9 @@ fn admit_one(signature: &str, fields: Value) -> Result<Catalog, ReviewError> {
 }
 
 #[test]
-fn strings_signed_integers_and_fixed_or_nested_arrays_are_outside_the_subset() {
+fn strings_signed_integers_and_dynamic_nested_arrays_are_outside_the_subset() {
     for (signature, path) in [
         ("note(string text)", "text"),
-        ("pair(uint256[2] amounts)", "amounts"),
         ("grid(uint256[][] cells)", "cells.[]"),
         ("signed(int256 delta)", "delta"),
     ] {
@@ -455,10 +454,7 @@ fn two_format_keys_selecting_the_same_function_are_ambiguous() {
 }
 
 #[test]
-fn a_tuple_argument_is_refused_because_no_path_can_reach_it() {
-    // Uniswap's `exactInputSingle` is shaped like this. The signature parser
-    // that format keys are written for drops the component names, so the
-    // router slice needs a second signed input before tuples can be read.
+fn unnamed_tuple_components_cannot_be_hidden_behind_a_raw_tuple() {
     let signature = "settle((address,uint256) terms, bool finalize)";
     let descriptor = json!({
         "context": {"contract": {"deployments": [{"chainId": CHAIN_ID, "address": TOKEN}]}},
@@ -471,7 +467,67 @@ fn a_tuple_argument_is_refused_because_no_path_can_reach_it() {
     });
     let error = build(vec![descriptor], Vec::new()).unwrap_err();
     assert_eq!(error.reason, ReviewReason::CatalogRejected);
-    assert!(error.detail.contains("tuple"), "{error}");
+    assert!(error.detail.contains("named"), "{error}");
+}
+
+#[test]
+fn nested_named_tuples_and_fixed_arrays_display_every_leaf() {
+    let signature = "settle((address recipient,uint256[2][2] amounts) terms, bool finalize)";
+    let mut fields =
+        vec![json!({"path":"terms.recipient","label":"Recipient","format":"addressName"})];
+    for row in 0..2 {
+        for column in 0..2 {
+            fields.push(json!({"path":format!("terms.amounts.[{row}].[{column}]"),"label":format!("Amount {row} {column}"),"format":"raw"}));
+        }
+    }
+    fields.push(json!({"path":"finalize","label":"Final","format":"raw"}));
+    let catalog = admit_one(signature, json!(fields)).unwrap();
+    let mut bytes = parse_function(signature).unwrap().selector().to_vec();
+    for word in [
+        address_word(RECIPIENT),
+        U256::from(11),
+        U256::from(12),
+        U256::from(21),
+        U256::from(22),
+        U256::from(1),
+    ] {
+        bytes.extend_from_slice(&word.to_be_bytes::<32>());
+    }
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
+    assert_eq!(field(&call, "Recipient").value, checksum(RECIPIENT));
+    assert_eq!(field(&call, "Amount 1 0").raw, "21");
+    fields.remove(2);
+    assert!(admit_one(signature, json!(fields)).is_err());
+    bytes.extend_from_slice(&[0; 32]);
+    assert!(review_call(&catalog, &context(&bytes)).is_err());
+    for signature in ["f(uint256[33] a)", "f(uint256[32][32] a)"] {
+        assert!(admit_one(signature, json!([])).is_err());
+    }
+}
+
+#[test]
+fn payable_calls_must_display_exact_native_value_and_cannot_hide_it() {
+    let signature = "deposit(uint256 commitment)";
+    let fields = json!([
+        {"path":"commitment","label":"Commitment","format":"raw"},
+        {"path":"@.value","label":"Deposit","format":"amount"}
+    ]);
+    let catalog = admit_one(signature, fields.clone()).unwrap();
+    let bytes = calldata(signature, &[U256::from(42)]);
+    let mut ctx = context(&bytes);
+    ctx.value = U256::from(2_000_000_000_000_000_000u64);
+    let (call, _) = review_call(&catalog, &ctx).unwrap();
+    assert_eq!(field(&call, "Deposit").value, "2 ETH");
+    let ordinary = admit_one(signature, json!([fields[0].clone()])).unwrap();
+    assert!(review_call(&ordinary, &ctx).is_err());
+    let mut hidden = fields.clone();
+    hidden[1]["visible"] = json!({"mustMatch":[0]});
+    assert!(admit_one(signature, hidden).is_err());
+    let mut raw = fields;
+    raw[1]["format"] = json!("raw");
+    assert!(admit_one(signature, raw).is_err());
+    ctx.native = None;
+    assert!(review_call(&catalog, &ctx).is_err());
 }
 
 #[test]

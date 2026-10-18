@@ -27,6 +27,8 @@ pub const TOKEN_NAME_MAX_BYTES: usize = 256;
 pub enum Binding {
     /// To the deployments it lists.
     Listed,
+    /// Listed deployments whose implementation can change.
+    ListedUpgradeable,
     /// Also, by selector, to addresses no entry lists, on the chains where it
     /// lists this deployment: per-user proxies such as Safes, which all run
     /// one singleton.
@@ -37,7 +39,7 @@ pub enum Binding {
 }
 
 /// The compiled-in descriptor files: path, contents and binding.
-pub const DESCRIPTORS: [(&str, &str, Binding); 6] = [
+pub const DESCRIPTORS: [(&str, &str, Binding); 8] = [
     (
         "safe/safe.json",
         include_str!("../catalogs/safe/safe.json"),
@@ -67,6 +69,16 @@ pub const DESCRIPTORS: [(&str, &str, Binding); 6] = [
         "standards/erc4626.json",
         include_str!("../catalogs/standards/erc4626.json"),
         Binding::Standard,
+    ),
+    (
+        "privacy-pools/entrypoint.json",
+        include_str!("../catalogs/privacy-pools/entrypoint.json"),
+        Binding::ListedUpgradeable,
+    ),
+    (
+        "privacy-pools/eth-pool.json",
+        include_str!("../catalogs/privacy-pools/eth-pool.json"),
+        Binding::Listed,
     ),
 ];
 
@@ -273,7 +285,7 @@ impl Catalog {
                     chain_id,
                     contract_address: address,
                     token_metadata: None,
-                    upgradeable: false,
+                    upgradeable: *binding == Binding::ListedUpgradeable,
                     applies_to_instances,
                     descriptor: index,
                 })?;
@@ -411,6 +423,11 @@ const SAFE_BATCH_DESCRIPTOR: usize = 1;
 /// calls: token units or the transfer class there would lend one token's
 /// identity to every such address.
 fn check_unlisted_reading(admitted: &AdmittedDescriptor) -> Result<(), ReviewError> {
+    if admitted.calls.iter().any(|call| call.native_value) {
+        return Err(rejected(
+            "native value requires a listed deployment, not an instance or standard binding",
+        ));
+    }
     if admitted
         .calls
         .iter()
@@ -440,6 +457,7 @@ fn safe_batch_description() -> AdmittedDescriptor {
                 label: "Transaction".to_owned(),
                 format: AdmittedFormat::SafeBatch,
             }],
+            native_value: false,
             leaves: vec![("transactions".to_owned(), LeafType::Bytes)],
             constraints: Vec::new(),
         }],

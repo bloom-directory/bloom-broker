@@ -263,7 +263,7 @@ fn review_at(
     let call = admitted
         .call(&context.calldata[..4])
         .ok_or_else(|| unsupported("no admitted description for this function selector"))?;
-    if !context.value.is_zero() {
+    if !context.value.is_zero() && !call.native_value {
         return Err(invalid(
             "admitted contract calls must carry zero native value",
         ));
@@ -303,7 +303,12 @@ fn review_at(
     }
     // The decoded value at a field path; in element `index` when the path
     // reaches into an array. Admission and `check_leaf` proved the shapes.
+    let native_kind = LeafType::Uint(256);
+    let native_value = DynSolValue::Uint(context.value, 256);
     let top = |path: &str| {
+        if path == "@.value" {
+            return (&native_kind, &native_value);
+        }
         let name = array_of(path).unwrap_or(path);
         let index = call
             .leaves
@@ -1077,7 +1082,9 @@ fn check_leaf(path: &str, declared: &LeafType, value: &DynSolValue) -> Result<()
 fn flatten(values: &[DynSolValue], out: &mut Vec<DynSolValue>) {
     for value in values {
         match value {
-            DynSolValue::Tuple(children) => flatten(children, out),
+            DynSolValue::Tuple(children) | DynSolValue::FixedArray(children) => {
+                flatten(children, out)
+            }
             other => out.push(other.clone()),
         }
     }

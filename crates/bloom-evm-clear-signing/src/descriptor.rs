@@ -149,6 +149,8 @@ pub struct AdmittedCall {
     /// Supplemental publisher text. Never the heading, never policy input.
     pub intent: Option<String>,
     pub fields: Vec<AdmittedField>,
+    /// Native value is admitted only when an always-visible amount field reads it.
+    pub native_value: bool,
     pub leaves: Vec<(String, LeafType)>,
     /// `mustMatch` rules: the argument at the path must equal one of the
     /// values, in the form `match_key` gives a decoded value. A constrained
@@ -174,6 +176,22 @@ impl AdmittedDescriptor {
 /// spells it. Exposed so a caller can derive the same selector this reader
 /// derives, rather than deriving one of its own.
 pub fn parse_function(signature: &str) -> Result<Function, ReviewError> {
+    let mut depth = 0usize;
+    for byte in signature.bytes() {
+        match byte {
+            b'(' => {
+                depth += 1;
+                if depth > 8 {
+                    return Err(rejected("function tuples exceed eight levels"));
+                }
+            }
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    if signature.len() > 8192 || signature.bytes().filter(|byte| *byte == b'[').count() > 32 {
+        return Err(rejected("function signature exceeds structural limits"));
+    }
     let parse_error = |error: String| {
         rejected(format!(
             "`{signature}` is not a function signature: {error}"
@@ -566,7 +584,8 @@ fn admit_call(
             format!("`{signature}` must decode 1-{MAX_LEAVES_PER_FORMAT} arguments"),
         ));
     }
-    let paths = addressable(&leaves);
+    let mut paths = addressable(&leaves);
+    let native_kind = LeafType::Uint(256);
 
     let declared = format
         .get("fields")
@@ -581,6 +600,7 @@ fn admit_call(
     let mut fields = Vec::with_capacity(declared.len());
     let mut constraints = Vec::new();
     let mut covered = BTreeSet::new();
+    let mut native_value = false;
     for field in declared {
         let field = object(field, "field")?;
         // A reference, a value constant, a field group or an encrypted field
@@ -610,6 +630,15 @@ fn admit_call(
                 .ok_or_else(|| rejected("field has no path"))?,
             "field.path",
         )?)?;
+        if path == "@.value" {
+            if allowed.is_some() || field.get("format").and_then(Value::as_str) != Some("amount") {
+                return Err(rejected(
+                    "native value must be an always-visible native amount",
+                ));
+            }
+            native_value = true;
+            paths.insert("@.value".to_owned(), &native_kind);
+        }
         let kind = *paths.get(path.as_str()).ok_or_else(|| {
             rejected(format!(
                 "field path `{path}` is not a decoded argument of `{signature}`"
@@ -668,6 +697,7 @@ fn admit_call(
         action_class,
         intent,
         fields,
+        native_value,
         leaves,
         constraints,
     })
@@ -886,9 +916,12 @@ fn admit_format(
 }
 
 /// `#.` is the upstream spelling for "relative to this structure". Accepted:
-/// `name`, `name.[]` and `name.[].component`, nothing else: no slices,
-/// container roots, maps or expressions.
+/// named components, bounded fixed indices and dynamic array elements.
+/// `@.value` is the sole container path; no slices, maps or expressions.
 fn normalize_path(path: &str) -> Result<String, ReviewError> {
+    if path == "@.value" {
+        return Ok(path.to_owned());
+    }
     let path = path.strip_prefix("#.").unwrap_or(path);
     let ident = |part: &str| {
         !part.is_empty()
@@ -897,11 +930,20 @@ fn normalize_path(path: &str) -> Result<String, ReviewError> {
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
             && !part.as_bytes()[0].is_ascii_digit()
     };
-    let valid = match path.split_once(".[]") {
-        None => ident(path),
-        Some((array, "")) => ident(array),
-        Some((array, rest)) => ident(array) && rest.strip_prefix('.').is_some_and(ident),
-    };
+    let mut segments = path.split('.');
+    let valid = segments.next().is_some_and(ident)
+        && segments.all(|part| {
+            ident(part)
+                || part == "[]"
+                || part
+                    .strip_prefix('[')
+                    .and_then(|part| part.strip_suffix(']'))
+                    .is_some_and(|index| {
+                        !index.is_empty()
+                            && index.bytes().all(|byte| byte.is_ascii_digit())
+                            && index.parse::<usize>().is_ok_and(|index| index < 32)
+                    })
+        });
     if !valid {
         return Err(rejected(format!(
             "field path `{path}` is not a named argument path"
@@ -916,6 +958,39 @@ fn collect_leaves(params: &[Param], out: &mut Vec<(String, LeafType)>) -> Result
             return Err(rejected(
                 "every argument must be named so a field path can reference it",
             ));
+        }
+        if let Some((base, length)) = param
+            .ty
+            .strip_suffix(']')
+            .and_then(|ty| ty.rsplit_once('['))
+            && !length.is_empty()
+        {
+            let length = length
+                .parse::<usize>()
+                .ok()
+                .filter(|length| (1..=32).contains(length))
+                .ok_or_else(|| rejected("fixed array length must be between one and 32"))?;
+            for index in 0..length {
+                let mut element = param.clone();
+                element.ty = base.to_owned();
+                element.name = format!("{}.[{index}]", param.name);
+                collect_leaves(&[element], out)?;
+            }
+            continue;
+        }
+        if param.ty == "tuple" {
+            let mut components = param.components.clone();
+            for component in &mut components {
+                if component.name.is_empty() {
+                    return Err(rejected("tuple component must be named"));
+                }
+                component.name = format!("{}.{}", param.name, component.name);
+            }
+            if components.is_empty() {
+                return Err(rejected("tuple must have named components"));
+            }
+            collect_leaves(&components, out)?;
+            continue;
         }
         let kind = if param.ty == "tuple[]" {
             // A list of calls or orders: each element's named components.
@@ -999,8 +1074,8 @@ fn leaf_type(ty: &str) -> Result<LeafType, ReviewError> {
     static_leaf_type(ty)
 }
 
-/// Canonical static scalars only. Signed integers, `string`, fixed-size and
-/// nested arrays are refused, so a decoded value always has one fixed width
+/// Canonical static scalars only. Arrays are handled by the bounded outer
+/// collector; signed integers and `string` are refused. Each scalar has one width
 /// and one unambiguous spelling. The parser has already turned a `uint` alias
 /// into `uint256`, which is the same type and the same selector.
 fn static_leaf_type(ty: &str) -> Result<LeafType, ReviewError> {

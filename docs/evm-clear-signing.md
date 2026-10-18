@@ -117,10 +117,16 @@ published subset, not full ERC-7730 conformance.
   and `bytesN`; dynamic `bytes`; dynamic arrays of one static scalar
   (`address[]`, `uint256[]`, ...); and dynamic arrays of a tuple of those
   scalars or `bytes`, with named components (`(address to, bytes data)[] calls`).
+- Named direct tuples and fixed arrays of admitted types, expanded to at most
+  32 leaves. Fixed dimensions are 1–32, with at most eight tuple levels.
 - Named field paths, optionally spelled `#.name`: `name`, `name.[]` for each
   element of a scalar array, and `name.[].component` for each element of a
   tuple array. An array is shown element by element, each field labelled with
   the element's position.
+- Nested component paths such as `proof.pubSignals.[2]` and the transaction
+  container path `@.value`. Native transaction value must use an always-visible
+  `amount` field and an explicitly listed deployment; it cannot be hidden,
+  shown as raw units, or admitted by instance/standard selector matching.
 - Always-visible fields in seven formats: `raw`, `addressName`, `tokenAmount`,
   `amount`, `date`, `enum`, and `calldata` (see [Embedded calls](#embedded-calls)).
   `bytes` takes `raw` or `calldata`. `tokenAmount` does not apply per element.
@@ -157,8 +163,7 @@ published subset, not full ERC-7730 conformance.
   catalog's token rows, not from the document.
 - Any argument left off the screen. Every decoded leaf must be covered by a
   visible field naming its actual path.
-- `string`, fixed-size and nested arrays, tuples outside a dynamic array,
-  and signed integers.
+- `string`, nested dynamic arrays, unnamed tuple components and signed integers.
 - `calldata` parameters other than `calleePath` and `amountPath`. `selector`,
   `spender` and `chainId` would each change how the inner call is read.
 
@@ -218,8 +223,8 @@ Such a call gets the structural assurance and a warning that Bloom has not
 verified the address is that contract. The review records the address it was
 read for.
 
-The address not being verified is bounded by an existing rule: an admitted
-call carries no native value. A call to an address that is not what it claims
+The address not being verified is bounded by a rule: an instance or standard
+reading carries no native value. A call to an address that is not what it claims
 can spend only gas and whatever allowances this wallet already gave that
 address.
 
@@ -297,6 +302,18 @@ longer than 128 bytes are shown by length and keccak-256.
 `upgradeable` is shown on the page for the contracts a review used. Broker
 cannot certify a proxy's current implementation; the page says its code may
 have changed since this release described it.
+
+### Privacy Pools
+
+The mainnet Entrypoint native deposit displays exact transaction value and note
+precommitment. Its UUPS proxy binding is explicitly upgradeable. The ETH pool's
+direct withdrawal displays the required caller/recipient, public-signal amount
+in ETH and every proof field. Only empty withdrawal data is admitted: relayed
+withdrawals have a different processor/recipient relationship and cannot borrow
+this reading. Fees, credited deposit amount, proof validity and settlement are
+not verified offline. Source revisions and deployments are recorded in the two
+`catalogs/privacy-pools` descriptors. No private relay payload is added to
+agent-visible records by this reader.
 
 ## The owner decides
 
