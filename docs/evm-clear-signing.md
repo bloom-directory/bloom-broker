@@ -35,6 +35,33 @@ behavior or decimals; a missing image uses the neutral icon.
 
 ## Assurance levels
 
+### Signed messages
+
+An exact Petal approval can supply one `message_review_payloads` envelope:
+`{"schema":"bloom.message.review.v1","kind":"eip712","typed_data":{...}}`
+or `{"schema":"bloom.message.review.v1","kind":"personal","message":"..."}`.
+Broker rebuilds the EIP-712 or EIP-191 preimage and checks both its SHA-256
+payload commitment and Keccak signing hash against the exact selector. It
+rejects mixed transaction/message reviews, batches, unused JSON members,
+recursive types and oversized structures. Every typed leaf is displayed.
+The reading and warnings are included in the signed review manifest.
+
+Canonical ERC-3009 payment authorizations show the exact payer, recipient,
+validity interval and amount. Units and artwork come only from the compiled
+chain/address token catalog; unknown contracts retain raw units. The payer
+must equal the approved signing account. A recognized login-message layout
+shows its signed website, account, URI, nonce and session fields. Other
+personal messages remain complete escaped text. This is not full ERC-4361
+validation: Bloom does not authenticate the named website, validate session
+permissions, or promise that a server accepts a timestamp or signature.
+
+Gasless Relay and Venice's login/payment operation classes require this
+envelope and refuse reusable or batch signing paths. For other Petals this
+reader remains optional until their callers forward an envelope. A protocol's hash-of-action fields remain
+hashes: decoding them does not establish the underlying order or action.
+
+### Contract calls
+
 Every reading is display: it is shown to the owner and signed with the review
 manifest, and no authority is derived from it. A reading has one of two
 assurance classes:

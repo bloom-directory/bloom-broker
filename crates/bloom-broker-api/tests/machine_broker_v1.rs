@@ -275,6 +275,7 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
             evm_reported_token: None,
             evm_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
             operation_id: operation(54),
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,

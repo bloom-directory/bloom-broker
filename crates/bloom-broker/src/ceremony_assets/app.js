@@ -554,6 +554,48 @@ function describeTransfer(manifest) {
   const claim = manifest?.system_use_claim || manifest?.petal_use_claim;
   let plan = {};
   try { plan = JSON.parse(manifest?.canonical_plan || "{}"); } catch (_) {}
+  const message = plan.message_review;
+  if (message) {
+    const payment = message.payment;
+    const domain = Array.isArray(message.domain) ? message.domain : [];
+    const fields = Array.isArray(message.fields) ? message.fields : [];
+    const labels = {primaryType: "Message type", name: "Application named in domain", version: "Version",
+      chainId: "Chain ID", verifyingContract: "Verifying contract", salt: "Domain salt"};
+    const domainChain = domain.find(field => field.path === "chainId")?.value
+      || fields.find(field => field.path === "Chain ID")?.value;
+    let chainId = payment?.chain_id || null;
+    if (!chainId && domainChain) {
+      try { chainId = BigInt(domainChain).toString(); } catch (_) {}
+    }
+    const time = value => {
+      try {
+        const seconds = BigInt(value);
+        if (seconds === 0n) return "Immediately (0 Unix seconds)";
+        if (seconds <= 253402300799n) return `${new Date(Number(seconds) * 1000).toISOString()} (${value} Unix seconds)`;
+      } catch (_) {}
+      return `${value} Unix seconds`;
+    };
+    const primary = domain.map(field => [labels[field.path] || field.path,
+      field.path === "chainId" && chainId ? chainId : field.value, true]);
+    if (payment) primary.push(["Valid from", time(payment.valid_after)], ["Valid until", time(payment.valid_before)]);
+    else primary.push(...fields.map(field => [field.path, field.value, true]));
+    return {
+      intent: {action: "sign_message", heading: message.title || "Sign a message"},
+      button: payment ? "Approve payment authorization" : "Approve message signature",
+      sentence: payment ? "Authorize this exact token payment within the signed validity window." : "Review the exact fields bound to this message signature.",
+      chainId, networkIdentity: chainId ? `EVM · Chain ID ${chainId}` : "Message signature",
+      networkIcon: chainId ? chainIcon(chainId) : "unknown",
+      facts: [], technical: [["Signing hash", message.payload_keccak, true],
+        ...(payment ? fields.map(field => [field.path, field.value, true]) : [])],
+      messageFields: primary,
+      parties: [{role: "source", label: "Signing account", value: message.signer, chainId},
+        ...(payment ? [{role: "recipient", label: "Authorized recipient", value: payment.recipient, chainId}] : [])],
+      warnings: message.warnings || [],
+      tokenAsset: payment ? {chainId, address: payment.token_address,
+        title: payment.token?.name || "Unverified token contract", subtitle: payment.token?.symbol,
+        amount: payment.amount_display, amountLabel: "Authorized payment", tone: "outgoing"} : null
+    };
+  }
   const evmPayloads = Array.isArray(plan.evm_review?.payloads) ? plan.evm_review.payloads : [];
   // Primary facts state the operation a person is accountable for; technical
   // facts (identities of the exact bytes, gas pricing, ordering) stay
@@ -1180,6 +1222,7 @@ function renderReview(session) {
           : transfer.intent.action === "transfer" || transfer.intent.action === "send" ? "Approve transfer"
           : transfer.intent.action === "batch" ? "Approve all transactions"
           : transfer.intent.action === "deploy" ? "Approve contract creation"
+          : transfer.intent.action === "sign_message" ? transfer.button
           : "Approve call";
       }
     } else {
@@ -1272,6 +1315,13 @@ function renderReview(session) {
   const evidence = [];
   if (transfer?.tokenAsset) {
     decision.push(assetCard(transfer.tokenAsset));
+  }
+  if (transfer?.messageFields?.length) {
+    const fields = el("dl", {class: "facts ceremony-message-fields"});
+    for (const [label, value, mono] of transfer.messageFields) {
+      fields.append(el("dt", {}, label), el("dd", {}, mono ? el("code", {}, value) : value));
+    }
+    decision.push(fields);
   }
   for (const card of transfer?.safeCards || []) {
     const section = el("section", {class: "ceremony-card"},

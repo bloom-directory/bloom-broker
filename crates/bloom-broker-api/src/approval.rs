@@ -32,6 +32,15 @@ const APPROVAL_DOMAIN: &[u8] = b"bloom-sealed-approval-terms/v1";
 /// the Safe Petal under this class is a release-trust requirement.
 pub const SAFE_CONFIRM_OPERATION_CLASS: &str = "safe.transaction.confirm";
 
+/// Released Petal operation classes whose exact signatures require a full
+/// message preimage review. Reusable grants cannot review future messages.
+pub const MESSAGE_REVIEW_OPERATION_CLASSES: &[&str] = &[
+    "gasless.relay",
+    "venice-x402.topup",
+    "venice-x402.chat",
+    "venice-x402.balance",
+];
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApprovalSubject {

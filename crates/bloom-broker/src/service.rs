@@ -809,8 +809,23 @@ impl BrokerRpcService {
                 .authority
                 .subject_declares_operation_class(&request.terms.subject, safe_class)
                 .map_err(authority_error)?;
+        let mut message_petal = false;
+        if matches!(request.terms.subject, ApprovalSubject::Petal { .. }) {
+            for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
+                message_petal |= self
+                    .authority
+                    .subject_declares_operation_class(&request.terms.subject, class)
+                    .map_err(authority_error)?;
+            }
+        }
         match &request.terms.selector {
             ApprovalSelector::Exact { .. } => {
+                if message_petal && request.message_review_payloads.is_empty() {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "This message operation requires a review envelope; upgrade Bloom Machine and the Petal",
+                    ));
+                }
                 if safe_petal && request.safe_review_payloads.is_empty() {
                     return Err(ProtocolError::new(
                         ProtocolErrorCode::SelectorMismatch,
@@ -830,11 +845,15 @@ impl BrokerRpcService {
                             .iter()
                             .flat_map(|grant| &grant.allowed_operation_classes),
                     )
-                    .any(|class| class.as_str() == safe_class)
+                    .any(|class| {
+                        class.as_str() == safe_class
+                            || bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
+                                .contains(&class.as_str())
+                    })
                 {
                     return Err(ProtocolError::new(
                         ProtocolErrorCode::SelectorMismatch,
-                        "Safe transactions require exact approval",
+                        "Reviewed Petal transactions and messages require exact approval",
                     ));
                 }
             }
@@ -845,7 +864,10 @@ impl BrokerRpcService {
                 "Safe review payloads require a Safe Petal subject",
             ));
         }
-        if !request.evm_review_payloads.is_empty() || !request.safe_review_payloads.is_empty() {
+        if !request.evm_review_payloads.is_empty()
+            || !request.safe_review_payloads.is_empty()
+            || !request.message_review_payloads.is_empty()
+        {
             let response = self
                 .signer
                 .request_for_machine(BrokerSignerRequest::KeyGetPublic(
@@ -890,6 +912,7 @@ impl BrokerRpcService {
                 context.evm_review = crate::evm_review::review(&request, &policy, from, catalog)?;
             }
             context.safe_review = crate::safe_review::review(&request, &policy, from, catalog)?;
+            context.message_review = crate::message_review::review(&request, from)?;
         }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
             ApprovalSelector::Exact {
@@ -1101,6 +1124,7 @@ impl BrokerRpcService {
         self.prepare_approval(ApprovalPrepareRequest {
             evm_reported_token: None,
             evm_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
             operation_id: request.operation_id,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,

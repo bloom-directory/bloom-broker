@@ -110,6 +110,10 @@ pub struct ApprovalPrepareRequest {
     /// preimage from each envelope and binds it to the exact selector.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub safe_review_payloads: Vec<Base64UrlBytes>,
+    /// Full typed-data/personal-message envelopes, independently rebuilt and
+    /// bound to the exact payload by Broker before owner review.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub message_review_payloads: Vec<Base64UrlBytes>,
     /// The symbol and decimals an unlisted token contract reports, read by
     /// Machine. Broker uses them only to display an amount it decoded itself,
     /// and labels that display as unverified.

@@ -2680,6 +2680,7 @@ async fn prepare_scoped_approval(
             petal_use_claim: None,
             system_use_claim: None,
             evm_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
         }),
     )
@@ -3630,6 +3631,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: vec![Base64UrlBytes::from_bytes(&creation)],
+            message_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
             operation_id: operation("d9"),
             terms: SealedApprovalTerms {
@@ -3708,6 +3710,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                 evm_reported_token: None,
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 evm_review_payloads: Vec::new(),
+                message_review_payloads: Vec::new(),
                 safe_review_payloads: envelope
                     .map(|bytes| vec![Base64UrlBytes::from_bytes(&bytes)])
                     .unwrap_or_default(),
@@ -3724,6 +3727,41 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         blind.message.contains("requires the review envelope"),
         "{blind:?}"
     );
+    for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
+        let mut provenance = safe_provenance.clone();
+        provenance.operation_classes[0].operation_class = Token::new(*class).unwrap();
+        sign_provenance(&mut provenance, &installer_key);
+        authority.install_provenance(&provenance).unwrap();
+        let terms = SealedApprovalTerms {
+            provenance_digest: provenance.digest().unwrap(),
+            ..safe_terms.clone()
+        };
+        let blind = safe_prepare(terms.clone(), None).await.unwrap_err();
+        assert!(
+            blind.message.contains("requires a review envelope"),
+            "{class}: {blind:?}"
+        );
+        let reusable = safe_prepare(
+            SealedApprovalTerms {
+                selector: ApprovalSelector::Petal {
+                    package_hash: safe_package.clone(),
+                    route: safe_route.into(),
+                    allowed_operation_classes: vec![Token::new(*class).unwrap()],
+                    route_grants: Vec::new(),
+                    required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+                },
+                ..terms
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            reusable.message.contains("require exact approval"),
+            "{class}: {reusable:?}"
+        );
+    }
+    authority.install_provenance(&safe_provenance).unwrap();
     let reusable = safe_prepare(
         SealedApprovalTerms {
             selector: ApprovalSelector::Petal {
@@ -3940,6 +3978,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
             operation_id: approval_operation.clone(),
             terms: approval_terms.clone(),
@@ -4075,6 +4114,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
             evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            message_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
             operation_id: exact_approval_operation.clone(),
             terms: exact_terms.clone(),
@@ -4310,6 +4350,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                     evm_reported_token: None,
                     surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                     evm_review_payloads: Vec::new(),
+                    message_review_payloads: Vec::new(),
                     safe_review_payloads: Vec::new(),
                     operation_id: operation(&format!("{:02x}", 0xc0 + index)),
                     terms: denied_terms,
@@ -5125,6 +5166,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                 evm_reported_token: None,
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 evm_review_payloads: Vec::new(),
+                message_review_payloads: Vec::new(),
                 safe_review_payloads: Vec::new(),
                 operation_id: operation("dc"),
                 terms: expired_terms,
@@ -5529,6 +5571,71 @@ async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
         serde_json::from_value(manifest["broker_signature"].clone()).unwrap();
     assert_eq!(broker_signature.decode().len(), 64);
     assert_eq!(
+        Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&manifest).unwrap()).into()),
+        response.review_manifest_digest
+    );
+}
+
+#[tokio::test]
+async fn independently_read_message_fields_are_bound_into_the_signed_manifest() {
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        Arc::new(MockSigner::new()),
+        Token::new("message-review-key").unwrap(),
+        SigningKey::from_bytes(&[31; 32]),
+    );
+    let message = serde_json::json!({
+        "kind":"personal", "title":"Sign a personal message",
+        "signer":"0x0000000000000000000000000000000000000007",
+        "payload_keccak":format!("0x{}", "11".repeat(32)),
+        "domain":[], "fields":[{"path":"message","value":"Exact signed text"}],
+        "warnings":["Execution effects remain unverified."]
+    });
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let response = broker
+        .prepare_approval(
+            approval_request(),
+            ReviewManifestContext {
+                message_review: Some(serde_json::from_value(message.clone()).unwrap()),
+                ..ReviewManifestContext::default()
+            },
+            now_ms,
+        )
+        .unwrap();
+    let session = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let projection: serde_json::Value =
+        serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let mut manifest = projection["review_manifest"].clone();
+    assert_eq!(manifest["message_review"], message);
+    let plan: serde_json::Value =
+        serde_json::from_str(manifest["canonical_plan"].as_str().unwrap()).unwrap();
+    assert_eq!(plan["message_review"], message);
+    assert!(
+        plan["security_disclosures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str().unwrap().contains("exact signing hash"))
+    );
+    assert_eq!(
+        Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&manifest).unwrap()).into()),
+        response.review_manifest_digest
+    );
+    manifest["message_review"]["fields"][0]["value"] = serde_json::json!("Changed text");
+    assert_ne!(
         Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&manifest).unwrap()).into()),
         response.review_manifest_digest
     );

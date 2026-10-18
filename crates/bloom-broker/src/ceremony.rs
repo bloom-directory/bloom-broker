@@ -396,6 +396,7 @@ pub struct ReviewManifestContext {
     pub claim_assurance: Option<ClaimAssurance>,
     pub evm_review: Option<crate::evm_review::EvmReview>,
     pub safe_review: Option<crate::safe_review::SafeReview>,
+    pub message_review: Option<crate::message_review::MessageReview>,
     pub attributed_advisory_items: Vec<String>,
 }
 
@@ -416,6 +417,8 @@ pub(crate) struct ReviewManifest {
     pub evm_review: Option<crate::evm_review::EvmReview>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub safe_review: Option<crate::safe_review::SafeReview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_review: Option<crate::message_review::MessageReview>,
     pub attributed_advisory_items: Vec<String>,
     pub issued_at_ms: DecimalU64,
     pub expires_at_ms: DecimalU64,
@@ -441,6 +444,8 @@ impl ReviewManifest {
             evm_review: &'a Option<crate::evm_review::EvmReview>,
             #[serde(skip_serializing_if = "Option::is_none")]
             safe_review: &'a Option<crate::safe_review::SafeReview>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            message_review: &'a Option<crate::message_review::MessageReview>,
             attributed_advisory_items: &'a [String],
             issued_at_ms: &'a DecimalU64,
             expires_at_ms: &'a DecimalU64,
@@ -459,6 +464,7 @@ impl ReviewManifest {
             claim_assurance: &self.claim_assurance,
             evm_review: &self.evm_review,
             safe_review: &self.safe_review,
+            message_review: &self.message_review,
             attributed_advisory_items: &self.attributed_advisory_items,
             issued_at_ms: &self.issued_at_ms,
             expires_at_ms: &self.expires_at_ms,
@@ -3465,6 +3471,7 @@ impl CeremonyBroker {
             manifest.system_use_claim.as_ref(),
             manifest.evm_review.as_ref(),
             manifest.safe_review.as_ref(),
+            manifest.message_review.as_ref(),
         );
         let canonical_plan = canonical_review_plan(
             request,
@@ -3473,6 +3480,7 @@ impl CeremonyBroker {
             manifest.system_use_claim.as_ref(),
             manifest.evm_review.as_ref(),
             manifest.safe_review.as_ref(),
+            manifest.message_review.as_ref(),
         )?;
         if manifest.approval_id != approval_id
             || manifest.approval_digest != approval_digest
@@ -3513,6 +3521,7 @@ impl CeremonyBroker {
             context.system_use_claim.as_ref(),
             context.evm_review.as_ref(),
             context.safe_review.as_ref(),
+            context.message_review.as_ref(),
         );
         let canonical_plan = canonical_review_plan(
             request,
@@ -3521,6 +3530,7 @@ impl CeremonyBroker {
             context.system_use_claim.as_ref(),
             context.evm_review.as_ref(),
             context.safe_review.as_ref(),
+            context.message_review.as_ref(),
         )?;
         let mut manifest = ReviewManifest {
             schema: Token::new("bloom.review-manifest.v1")?,
@@ -3543,6 +3553,7 @@ impl CeremonyBroker {
             claim_assurance: context.claim_assurance,
             evm_review: context.evm_review,
             safe_review: context.safe_review,
+            message_review: context.message_review,
             attributed_advisory_items: context.attributed_advisory_items,
             issued_at_ms: DecimalU64::new(now_ms),
             expires_at_ms: request.terms.expires_at_ms.clone(),
@@ -5002,6 +5013,7 @@ fn canonical_review_plan(
     system_claim: Option<&SystemUseClaim>,
     evm_review: Option<&crate::evm_review::EvmReview>,
     safe_review: Option<&crate::safe_review::SafeReview>,
+    message_review: Option<&crate::message_review::MessageReview>,
 ) -> Result<String, ProtocolError> {
     #[derive(Serialize)]
     struct AssetAmountReview {
@@ -5026,6 +5038,8 @@ fn canonical_review_plan(
         evm_review: Option<&'a crate::evm_review::EvmReview>,
         #[serde(skip_serializing_if = "Option::is_none")]
         safe_review: Option<&'a crate::safe_review::SafeReview>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_review: Option<&'a crate::message_review::MessageReview>,
     }
     let mut asset_amounts = Vec::new();
     // A system claim declares the same amounts a Petal claim does. Reading
@@ -5136,6 +5150,7 @@ fn canonical_review_plan(
         security_disclosures,
         evm_review,
         safe_review,
+        message_review,
     })
     .map_err(malformed)
 }
@@ -5147,10 +5162,12 @@ fn review_disclosures(
     system_claim: Option<&SystemUseClaim>,
     evm_review: Option<&crate::evm_review::EvmReview>,
     safe_review: Option<&crate::safe_review::SafeReview>,
+    message_review: Option<&crate::message_review::MessageReview>,
 ) -> Vec<String> {
     let mut disclosures = Vec::new();
     if evm_review.is_none()
         && safe_review.is_none()
+        && message_review.is_none()
         && (!request.exact_ordered_payload_digests.is_empty()
             || !request.exact_ordered_hashes.is_empty())
     {
@@ -5202,6 +5219,9 @@ fn review_disclosures(
                 .to_owned(),
         );
     }
+    if message_review.is_some() {
+        disclosures.push("Bloom rebuilt the message preimage and verified its exact signing hash. The displayed fields are signed; execution effects and unlisted application/token identities remain unverified.".into());
+    }
     if safe_review.is_some_and(crate::safe_review::is_opaque) {
         disclosures.push("Bloom cannot explain what the contract input data in this request does. Approving it authorizes exactly these bytes and nothing less.".to_owned());
     }
@@ -5217,7 +5237,8 @@ fn review_disclosures(
     // Exact EVM and Safe reviews are rebuilt from transaction bytes and do
     // not display Petal-asserted limits. Keep this disclosure for the claim
     // pages where those limits are actually part of the review.
-    if machine_asserted && evm_review.is_none() && safe_review.is_none() {
+    if machine_asserted && evm_review.is_none() && safe_review.is_none() && message_review.is_none()
+    {
         let source = if system_claim.is_some() {
             "the named system component"
         } else {
@@ -5823,6 +5844,7 @@ mod compatibility_tests {
             claim_assurance: None,
             evm_review: None,
             safe_review: None,
+            message_review: None,
             attributed_advisory_items: vec!["Petal route advisory".into()],
             issued_at_ms: DecimalU64::new(6),
             expires_at_ms: DecimalU64::new(7),
