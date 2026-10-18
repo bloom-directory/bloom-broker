@@ -57,6 +57,17 @@ pub struct DisplayField {
     /// The decoded argument exactly as it was signed, always retained beside
     /// the formatted value.
     pub raw: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<FieldAsset>,
+}
+
+/// Exact catalog identity and units for one decoded amount, including nested calls.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FieldAsset {
+    pub chain_id: u64,
+    pub token: TokenIdentity,
+    pub amount_display: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -443,6 +454,7 @@ fn review_at(
                             native.symbol
                         ),
                         raw: format!("0x{}", hex_lower(data)),
+                        asset: None,
                     });
                 } else if *token_type == U256::from(1) {
                     if data.len() != 64 || data[..12].iter().any(|byte| *byte != 0) {
@@ -479,6 +491,23 @@ fn review_at(
                         format: "tokenAmount".into(),
                         value,
                         raw: format!("0x{}", hex_lower(data)),
+                        asset: token.map(|entry| {
+                            let metadata = entry.token_metadata.as_ref().expect("filtered token");
+                            FieldAsset {
+                                chain_id: context.chain_id,
+                                token: TokenIdentity {
+                                    address: checksum(&identity),
+                                    symbol: metadata.symbol.clone(),
+                                    name: metadata.name.clone(),
+                                    decimals: metadata.decimals,
+                                },
+                                amount_display: format!(
+                                    "{} {}",
+                                    format_base_units(&amount.to_string(), metadata.decimals),
+                                    metadata.symbol
+                                ),
+                            }
+                        }),
                     });
                 } else {
                     return Err(unsupported(
@@ -549,6 +578,7 @@ fn review_at(
                     format: "raw".to_owned(),
                     value: format!("{amount} raw units of {token}"),
                     raw: amount.to_string(),
+                    asset: None,
                 });
             }
             _ => {
@@ -689,6 +719,7 @@ fn render_embedded(
             format: "calldata".to_owned(),
             value,
             raw,
+            asset: None,
         });
         return Ok(false);
     }
@@ -708,6 +739,7 @@ fn render_embedded(
             None => format!("{action} on {}", call.contract),
         },
         raw,
+        asset: None,
     });
     for field in call.fields {
         fields.push(DisplayField {
@@ -807,12 +839,14 @@ fn shaped_erc20(
                 format: "addressName".to_owned(),
                 value: counterparty_shown.clone(),
                 raw: counterparty_shown.clone(),
+                asset: None,
             },
             DisplayField {
                 label: amount_label.to_owned(),
                 format: "raw".to_owned(),
                 value: amount.clone(),
                 raw: amount.clone(),
+                asset: None,
             },
         ],
         token: None,
@@ -1065,11 +1099,17 @@ fn render_field(
             ));
         }
     };
+    let asset = token.map(|token| FieldAsset {
+        chain_id: context.chain_id,
+        token: token.identity.clone(),
+        amount_display: display.clone(),
+    });
     Ok(DisplayField {
         label: field.label.clone(),
         format: field.format.name().to_owned(),
         value: display,
         raw,
+        asset,
     })
 }
 

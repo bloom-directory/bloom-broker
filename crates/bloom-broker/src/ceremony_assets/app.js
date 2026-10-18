@@ -344,6 +344,10 @@ function unreadDetail(payload) {
 function reviewedContractCall(payload) {
   return payload?.contract_call || null;
 }
+function technicalCallField(call, field) {
+  return field.format === "raw" && (call.contract_name?.startsWith("Privacy Pools") ||
+    call.contract_name === "Enso Router V2");
+}
 function reviewCallFields(call) {
   return (call?.fields || []).filter(field =>
     !field.label.startsWith("Owner signatures") &&
@@ -362,6 +366,15 @@ function callIntent(call) {
   if (!summary) {
     const fields = Object.fromEntries((call?.fields || []).map(field => [field.label, field.value]));
     const signature = String(call?.function_signature || "");
+    if (call.contract_name === "Enso Router V2") {
+      return {action: "call", eyebrow: "Enso route inputs", heading: "Review Enso route inputs",
+        detail: "Source amounts are decoded. The shortcut's effects and quoted outputs remain unverified.", relation: "calls"};
+    }
+    if (call.contract_name?.startsWith("Privacy Pools")) {
+      return {action: "call", eyebrow: "Privacy Pools", heading: signature.startsWith("withdraw(")
+        ? "Review a direct ETH withdrawal" : "Review an ETH pool deposit",
+        detail: "Proof validity, pool fees and settlement are not verified by this reading.", relation: "calls"};
+    }
     if (signature.startsWith("createProxyWithNonce(")) {
       const owners = (call.fields || [])
         .filter(field => /^New Safe · Owner \d+$/.test(field.label))
@@ -708,6 +721,7 @@ function describeTransfer(manifest) {
       if (summary && field.raw === summary.amount) continue;
       if (summary && field.raw === summary.counterparty) continue;
       if (summary) facts.push([label(field.label), field.value, field.format === "addressName"]);
+      else if (technicalCallField(call, field)) technical.push([label(field.label), field.value, true]);
     }
     if (call.intent) technical.push([label("Publisher description"), call.intent]);
     technical.push([label("Function"), call.function_signature, true]);
@@ -1413,16 +1427,25 @@ function renderReview(session) {
     for (const [index, payload] of (transfer.payloads || []).entries()) {
       const call = reviewedContractCall(payload);
       if (!call || call.intent_summary) continue;
+      const protocolDetails = call.contract_name?.startsWith("Privacy Pools") || call.contract_name === "Enso Router V2";
       const argumentsList = el("dl", {class: "facts"});
       for (const field of reviewCallFields(call)) {
+        if (technicalCallField(call, field)) continue;
+        if (field.asset?.token) {
+          const asset = field.asset;
+          decision.push(assetCard({chainId: String(asset.chain_id), address: asset.token.address,
+            title: asset.token.name, subtitle: asset.token.symbol,
+            amount: asset.amount_display, amountLabel: field.label, tone: "outgoing"}));
+          continue;
+        }
         const explorer = addressExplorer(payload.chain_id, field.value);
         const value = explorer ? explorerAnchor(explorer, field.value, field.label)
           : el("code", {}, field.value);
         argumentsList.append(el("dt", {}, field.label), el("dd", {}, value));
       }
       decision.push(el("section", {class: "ceremony-call-arguments"},
-        el("h2", {class: "ceremony-section-title"}, transfer.payloads.length > 1 ? `Transaction ${index + 1} arguments` : "Function arguments"),
-        el("code", {class: "ceremony-function"}, call.function_signature),
+        el("h2", {class: "ceremony-section-title"}, transfer.payloads.length > 1 ? `Transaction ${index + 1} arguments` : protocolDetails ? "Call details" : "Function arguments"),
+        protocolDetails ? null : el("code", {class: "ceremony-function"}, call.function_signature),
         argumentsList));
     }
     if (transfer.warnings?.length) {

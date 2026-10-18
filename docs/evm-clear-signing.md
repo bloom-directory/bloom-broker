@@ -330,6 +330,13 @@ output, recipient, minimum-output, fees and settlement are not established by
 the source envelope. The review remains structural and displays that warning.
 It does not rename a quoted route into a verified swap.
 
+Decoded token-amount fields carry their exact catalog identity, chain and
+formatted amount to the approval UI, including inside nested calls. This gives
+source inputs their own asset cards without misidentifying the router as the
+token. Unknown addresses have no asset identity or borrowed logo. Privacy proof
+words and Enso's opaque shortcut bytes remain in the expandable technical review;
+amounts and counterparties lead the decision.
+
 ## The owner decides
 
 There is no setting. Every wallet gets every reading Broker can produce, and

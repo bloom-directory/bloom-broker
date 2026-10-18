@@ -49,6 +49,14 @@ fn source_amount_and_identity_are_read_but_shortcut_effects_stay_unverified() {
     );
     assert!(call.structural);
     assert!(call.intent_summary.is_none());
+    export_ui_fixture("enso-source", &call);
+    let asset = field(&call, "Source asset / amount")
+        .asset
+        .as_ref()
+        .unwrap();
+    assert_eq!(asset.chain_id, 8453);
+    assert_eq!(asset.token.address.to_lowercase(), USDC);
+    assert_eq!(asset.amount_display, "2.5 USDC");
     assert!(
         call.warnings
             .iter()
@@ -56,6 +64,7 @@ fn source_amount_and_identity_are_read_but_shortcut_effects_stay_unverified() {
     );
     assert!(review(&bytes, 1).is_err());
     let call = review(&encode(SINGLE, input(TOKEN, 2_500_000)), 0).unwrap();
+    assert!(field(&call, "Source asset / amount").asset.is_none());
     assert!(
         field(&call, "Source asset / amount")
             .value

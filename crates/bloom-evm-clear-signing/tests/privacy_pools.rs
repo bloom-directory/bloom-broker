@@ -17,6 +17,7 @@ fn native_deposit_reads_value_and_marks_the_upgradeable_entrypoint() {
     ctx.value = U256::from(2_500_000_000_000_000_000u64);
     let (call, selected) = review_call(Catalog::built_in().unwrap(), &ctx).unwrap();
     assert_eq!(field(&call, "Deposit").value, "2.5 ETH");
+    export_ui_fixture("privacy-deposit", &call);
     assert_eq!(field(&call, "Note precommitment").raw, "1234");
     assert!(selected.iter().any(|entry| entry.upgradeable));
     assert!(call.intent_summary.is_none());
@@ -44,6 +45,7 @@ fn direct_withdrawal_reads_recipient_amount_and_every_proof_word() {
     ctx.to = POOL.parse::<Address>().unwrap();
     let (call, selected) = review_call(Catalog::built_in().unwrap(), &ctx).unwrap();
     assert_eq!(field(&call, "Withdrawal").value, "1.25 ETH");
+    export_ui_fixture("privacy-withdrawal", &call);
     assert_eq!(
         field(&call, "Recipient / required caller").value,
         checksum(RECIPIENT)

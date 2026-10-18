@@ -14,6 +14,16 @@ pub const RECIPIENT: &str = "0x2222222222222222222222222222222222222222";
 pub const VAULT: &str = "0x3333333333333333333333333333333333333333";
 pub const NOW_MS: u64 = 1_750_000_000_000;
 
+pub fn export_ui_fixture(name: &str, call: &ClearSignedCall) {
+    if let Some(directory) = std::env::var_os("BLOOM_UI_FIXTURE_DIR") {
+        std::fs::write(
+            std::path::Path::new(&directory).join(format!("{name}.json")),
+            serde_json::to_vec_pretty(call).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
 /// The reviewed ERC-20 derivative: the registry template without its
 /// finite-value threshold, which would have labelled a large finite
 /// allowance unlimited.
