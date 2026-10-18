@@ -212,15 +212,22 @@ pub(super) fn decode(
             .to_owned();
         }
         let collateral_key = if prepared.preimage["side"] == 0 {
-            "maker_amount"
+            "Maker amount (raw protocol units)"
         } else {
-            "taker_amount"
+            "Taker amount (raw protocol units)"
         };
         let collateral = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb";
         let token = bloom_broker_api::tokens_on(137)
             .find(|token| token.address == collateral)
             .ok_or_else(|| invalid("Polymarket collateral is missing from the compiled catalog"))?;
-        let amount = text(&prepared.preimage, collateral_key)?;
+        // The typed reader has already coerced this signed uint256 to decimal.
+        // Never format the caller's original spelling (which can be hex).
+        let amount = &review
+            .fields
+            .iter()
+            .find(|field| field.path == collateral_key)
+            .ok_or_else(|| invalid("decoded order collateral amount is missing"))?
+            .value;
         review.collateral_asset = Some(bloom_evm_clear_signing::FieldAsset {
             chain_id: 137,
             token: bloom_evm_clear_signing::TokenIdentity {
@@ -482,6 +489,16 @@ mod tests {
             )
             .is_err()
         );
+        let mut hexadecimal = record.clone();
+        hexadecimal["preimage"]["maker_amount"] =
+            json!(format!("0x{:x}", alloy::primitives::U256::from(11_782_400)));
+        let (_, normalized) = decode(
+            &serde_json::to_vec(&vec![hexadecimal]).unwrap(),
+            signer,
+            &prepared.intent,
+        )
+        .unwrap();
+        assert_eq!(review, normalized);
         let mut changed = record;
         changed["preimage"]["draft_id"] = json!("a different unsigned label");
         let (_, changed) = decode(
