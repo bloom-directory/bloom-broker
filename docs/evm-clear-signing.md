@@ -15,6 +15,24 @@ file, signature, publisher key or import step, and Broker never fetches
 anything. Adding a contract inside this subset is catalog data. Changing what
 Bloom promises about a call is code.
 
+## Token artwork
+
+Approval pages use the same chain/address-bound token identities and amounts
+for every Petal. Artwork is bundled into Broker; the browser never contacts an
+image provider. `scripts/bundle-token-artwork.py` matches curated token lists
+and issuer image registries to existing token entries, bounds and rasterizes
+images, and generates the exact asset allowlist and browser bindings. Source
+URLs, source-document hashes, image digests and explicit missing-artwork
+reasons are retained in `ceremony_assets/tokens/artwork.json`. Existing
+issuer-reviewed SVG bindings take precedence. A reviewed neutral binding
+prevents a pegged copy from borrowing the issuer's mark.
+
+Regenerate with `uv run scripts/bundle-token-artwork.py`; use
+`--refresh-images` to refetch previously successful image URLs. CI runs the
+offline `python3 scripts/bundle-token-artwork.py --check` and the artwork
+boundary tests. A logo is decorative and never establishes identity, token
+behavior or decimals; a missing image uses the neutral icon.
+
 ## Assurance levels
 
 Every reading is display: it is shown to the owner and signed with the review
@@ -107,13 +125,14 @@ of calls (`bundle.[].data`), both come from the same element
 The inner call is reviewed exactly as a top-level call:
 
 - An inner call Bloom cannot read makes the whole call unsupported.
-- Its policy refusals refuse, so an unlimited allowance inside a Safe is
-  denied as it is outside one.
+- Its warnings are retained, so an unlimited allowance inside a Safe receives
+  the same strong warning as an allowance outside one. It is not denied just
+  for being unlimited or unreadable.
 - Its catalog entries are listed with the review.
 
 An inner canonical `transfer` or `approve` to a contract the catalog does not
 list is read by its shape, as at the top level: recipient or spender and raw
-amount, the unverified-token warning, and the same unlimited-allowance policy.
+amount, the unverified-token warning, and the same unlimited-allowance warning.
 The review is then `structural_description`.
 
 The page shows one heading line, `<function> on <contract>`, then the inner

@@ -137,31 +137,17 @@ function chainIcon(chainId) {
   return {1: "ethereum", 8453: "base", 31337: "test"}[Number(chainId)] || "unknown";
 }
 
-// Reviewed, bundled artwork. Never select a logo by publisher-supplied text.
-// Circle's own USDC and Maker's own or official-bridge DAI only; bridged or
-// pegged copies by other issuers keep the generic icon.
-const TOKEN_LOGOS = {
-  "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": {file: "usdc", name: "USD Coin", symbol: "USDC"},
-  "10:0x0b2c639c533813f4aa9d7837caf62653d097ff85": {file: "usdc", name: "USD Coin", symbol: "USDC"},
-  "137:0x3c499c542cef5e3811e1192ce70d8cc03d5c3359": {file: "usdc", name: "USD Coin", symbol: "USDC"},
-  "999:0xb88339cb7199b77e23db6e890353e22632ba630f": {file: "usdc", name: "USD Coin", symbol: "USDC"},
-  "8453:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": {file: "usdc", name: "USD Coin", symbol: "USDC"},
-  "42161:0xaf88d065e77c8cc2239327c5edb3a432268e5831": {file: "usdc", name: "USD Coin", symbol: "USDC"},
-  "43114:0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e": {file: "usdc", name: "USD Coin", symbol: "USDC"},
-  "59144:0x176211869ca2b568f2a7d4ee941e073a821ee1ff": {file: "usdc", name: "USD Coin", symbol: "USDC"},
-  "1:0x6b175474e89094c44da98b954eedeac495271d0f": {file: "dai", name: "Dai Stablecoin", symbol: "DAI"},
-  "10:0xda10009cbd5d07dd0cecc66161fc93d7c9000da1": {file: "dai", name: "Dai Stablecoin", symbol: "DAI"},
-  "42161:0xda10009cbd5d07dd0cecc66161fc93d7c9000da1": {file: "dai", name: "Dai Stablecoin", symbol: "DAI"},
-  "8453:0x50c5725949a6f0c72e6c4a641f24049a917db0cb": {file: "dai", name: "Dai Stablecoin", symbol: "DAI"}
-};
+// Reviewed, bundled artwork is generated from exact catalog identities.
+// Never select an image by publisher-supplied ticker or name.
 function tokenArt(chainId, address) {
-  const art = TOKEN_LOGOS[`${chainId}:${String(address || "").toLowerCase()}`];
+  const key = `${chainId}:${String(address || "").toLowerCase()}`;
+  const art = typeof REVIEWED_TOKEN_ARTWORK === "undefined" ? null : REVIEWED_TOKEN_ARTWORK[key];
   return art && typeof art.file === "string" ? art : null;
 }
 function tokenReviewIcon(chainId, address) {
   const art = tokenArt(chainId, address);
   if (!art) return reviewIcon("token");
-  const image = el("img", {src: `/assets/tokens/${art.file}.svg`, alt: "", width: "56", height: "56"});
+  const image = el("img", {src: `/assets/tokens/${art.file}`, alt: "", width: "56", height: "56"});
   image.onerror = () => image.replaceWith(reviewIcon("token"));
   return image;
 }

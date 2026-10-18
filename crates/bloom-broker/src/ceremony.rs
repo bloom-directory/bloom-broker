@@ -364,7 +364,10 @@ fn bounded(field: &str, value: u64, ceiling: u64) -> Result<(), ProtocolError> {
 }
 
 const SHELL_HTML: &str = include_str!("ceremony_assets/index.html");
-const APP_JS: &str = include_str!("ceremony_assets/app.js");
+const APP_JS: &str = concat!(
+    include_str!("ceremony_assets/token-artwork.js"),
+    include_str!("ceremony_assets/app.js")
+);
 const STYLE_CSS: &str = include_str!("ceremony_assets/style.css");
 const BLOOM_PRIMARY_SVG: &str = include_str!("ceremony_assets/bloom-primary.svg");
 
@@ -2544,7 +2547,7 @@ impl CeremonyBroker {
             .route("/assets/style.css", get(style_css))
             .route("/assets/theme.css", get(theme_css))
             .route("/assets/bloom-primary.svg", get(bloom_primary_svg))
-            .route("/assets/tokens/{name}", get(token_svg))
+            .route("/assets/tokens/{name}", get(token_image))
             .route("/api/session", get(read_session_by_token))
             .route("/api/session/{ceremony_id}", get(read_session))
             .route("/api/session/{ceremony_id}/result", get(read_result))
@@ -3905,13 +3908,16 @@ async fn bloom_primary_svg(State(broker): State<CeremonyBroker>, headers: Header
         .into_response()
 }
 
-async fn token_svg(
+async fn token_image(
     State(broker): State<CeremonyBroker>,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     if broker.validate_served_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Some(image) = crate::token_artwork::image(&name) {
+        return ([(header::CONTENT_TYPE, "image/png")], image).into_response();
     }
     let asset = match name.as_str() {
         "usdc.svg" => include_str!("ceremony_assets/tokens/usdc.svg"),

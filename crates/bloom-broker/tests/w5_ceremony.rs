@@ -194,7 +194,10 @@ impl AuditSigner for SwitchableAuditSigner {
 /// completed these ceremonies through the API rather than the page.
 #[test]
 fn the_shipped_page_handles_every_custody_ceremony_kind() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
 
     // Kinds whose completion is PRF plus a typed effect, with no operator
     // input. The page must list them, or it sends nothing at all.
@@ -231,7 +234,10 @@ fn the_shipped_page_handles_every_custody_ceremony_kind() {
 
 #[test]
 fn browser_crypto_self_test_executes_the_shipped_asset() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -260,7 +266,10 @@ cryptoSelfTest().then(
 
 #[test]
 fn custody_manifest_is_rendered_on_the_primary_review_surface() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -319,7 +328,10 @@ if (nodes["page-title"].textContent !== "Remove a passkey from a wallet" ||
 
 #[test]
 fn evm_manifest_is_rendered_as_primary_review_facts() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -748,7 +760,10 @@ if (!rendered.includes("Approve a call Bloom cannot read") || rendered.includes(
 
 #[test]
 fn policy_page_states_the_numeric_chain_exact_opt_in_scope() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -821,7 +836,10 @@ for (const stale of ["Allow deploying contracts on", "Stop allowing contract dep
 
 #[test]
 fn browser_cancel_disables_approve_before_awaiting_and_reports_the_outcome() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     // The approval page's handler; paired enrollment installs its own, which
     // disables both buttons synchronously through `terminate` instead.
     let start = asset
@@ -858,7 +876,10 @@ fn browser_cancel_disables_approve_before_awaiting_and_reports_the_outcome() {
 
 #[test]
 fn key_derive_primary_review_explains_the_session_without_internal_scope_json() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -941,7 +962,10 @@ if (nodes.approve.textContent !== "Create temporary key") {{
 
 #[test]
 fn reusable_pumpfun_approval_is_plain_language_with_raw_grants_collapsed() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -1055,7 +1079,10 @@ if (!unbudgeted.includes("refuse any action that spends funds") || unbudgeted.in
 /// `MALFORMED_FRAME: Invalid last symbol` from deep inside Signer).
 #[test]
 fn browser_page_accepts_hex_private_keys_and_converts_them_to_base64url() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -1106,7 +1133,10 @@ process.stdout.write("hex-normalization-ok");
 
 #[test]
 fn browser_ceremony_state_survives_reload_and_reuses_one_output_key() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     for required in [
         "tokenFromPath || readSessionToken()",
         "writeSessionToken(tokenFromPath)",
@@ -1137,7 +1167,10 @@ fn browser_ceremony_state_survives_reload_and_reuses_one_output_key() {
 
 #[test]
 fn browser_reload_recovers_the_ceremony_token_from_tab_storage() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -1175,7 +1208,10 @@ process.stdout.write("browser-reload-ok");
 
 #[test]
 fn browser_approval_failure_is_logged_displayed_and_retryable() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -1233,7 +1269,10 @@ process.stdout.write("browser-error-feedback-ok");
 
 #[test]
 fn transfer_review_promises_later_verification_without_claiming_it_already_happened() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     assert!(asset.contains("Estimated network fee"));
     assert!(asset.contains("Required before signing"));
     assert!(asset.contains("Bloom will decode the transaction"));
@@ -1317,7 +1356,10 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
 
 #[test]
 fn scoped_petal_key_browser_flow_never_collects_a_namespace_grant() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     assert!(asset.contains("session.signer_contribution?.petal_key_scope"));
     assert!(asset.contains("&& !scopedPetalKey"));
     assert!(asset.contains("Boolean(scopedPetalKey)"));
@@ -1340,7 +1382,10 @@ fn scoped_petal_key_browser_flow_never_collects_a_namespace_grant() {
 
 #[test]
 fn legacy_passkey_browser_flow_uses_assertion_prf_and_hides_raw_key_input() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     assert!(asset.contains("legacy_passkey_v1_prf"));
     assert!(asset.contains("const assertion = await getCredential(session, 0)"));
     assert!(asset.contains("credential_prf: encodeUrl(credentialPrf)"));
@@ -1352,7 +1397,10 @@ fn legacy_passkey_browser_flow_uses_assertion_prf_and_hides_raw_key_input() {
 
 #[test]
 fn bip39_browser_import_uses_profile_to_control_serialization() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let html = include_str!("../src/ceremony_assets/index.html");
     let css = include_str!("../src/ceremony_assets/style.css");
     let load = asset
@@ -9003,7 +9051,10 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
 /// earned. The logo is decorative; the address stays the identity.
 #[test]
 fn token_artwork_is_selected_by_chain_and_contract_and_nothing_else() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -9136,7 +9187,10 @@ if (!usdcIcon.replacedWith || !isGeneric(usdcIcon.replacedWith)) {{
 /// of the provenance.
 #[test]
 fn the_upgradeable_warning_is_stated_once_per_contract_and_keeps_its_caveat_in_details() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -9287,7 +9341,10 @@ if (!view.primary.includes("can move your tokens later without another approval"
 /// heading, the roles and the classification must not move.
 #[test]
 fn the_clear_signed_review_reads_its_meaning_only_from_the_typed_intent() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")

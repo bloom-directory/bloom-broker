@@ -10,4 +10,5 @@ pub mod journal;
 mod safe_review;
 pub mod service;
 pub mod signer_client;
+mod token_artwork;
 mod translation;
