@@ -145,7 +145,13 @@ function tokenArt(chainId, address) {
   return art && typeof art.file === "string" ? art : null;
 }
 function tokenReviewIcon(chainId, address) {
-  const art = tokenArt(chainId, address);
+  return artworkIcon(tokenArt(chainId, address));
+}
+function venueTokenArt(assetId) {
+  // Exact protocol/asset binding. Test collateral keeps a neutral mark.
+  return assetId === "hyperliquid:mainnet:usdc" ? {file: "usdc.svg", name: "USD Coin", symbol: "USDC"} : null;
+}
+function artworkIcon(art) {
   if (!art) return reviewIcon("token");
   const image = el("img", {src: `/assets/tokens/${art.file}`, alt: "", width: "56", height: "56"});
   image.onerror = () => image.replaceWith(reviewIcon("token"));
@@ -153,9 +159,9 @@ function tokenReviewIcon(chainId, address) {
 }
 // The mark sits with the amount. The address is its own row, so a label and
 // the amount cannot share a line. A logo is chosen only by chain and address.
-function assetCard({chainId, address, native, title, subtitle, amount, amountLabel, tone}) {
-  const art = address ? tokenArt(chainId, address) : null;
-  const mark = native ? reviewIcon(native) : tokenReviewIcon(chainId, address);
+function assetCard({chainId, address, venueAsset, native, title, subtitle, amount, amountLabel, tone}) {
+  const art = venueAsset ? venueTokenArt(venueAsset) : address ? tokenArt(chainId, address) : null;
+  const mark = native ? reviewIcon(native) : artworkIcon(art);
   const icon = el("span", {
     class: `ceremony-token-icon${art || native === "ethereum" || native === "base" ? " has-artwork" : ""}`,
     "aria-hidden": "true"
@@ -567,6 +573,16 @@ function describeTransfer(manifest) {
     if (!chainId && domainChain) {
       try { chainId = BigInt(domainChain).toString(); } catch (_) {}
     }
+    const hyperliquid = String(message.kind).startsWith("hyperliquid_");
+    const signingChain = chainId;
+    const venueNetwork = fields.find(field => ["hyperliquidChain", "Hyperliquid environment"].includes(field.path))?.value;
+    if (hyperliquid) chainId = null;
+    const messageType = domain.find(field => field.path === "primaryType")?.value;
+    const agent = hyperliquid && messageType === "HyperliquidTransaction:ApproveAgent";
+    const messageLabels = {hyperliquidChain: "Environment", destination: "Recipient",
+      agentAddress: "Trading agent", agentName: "Agent name in signature", nonce: "Nonce", time: "Nonce",
+      toPerp: "Move to perpetuals (false means spot)"};
+    const extraTechnical = [];
     const time = value => {
       try {
         const seconds = BigInt(value);
@@ -575,10 +591,20 @@ function describeTransfer(manifest) {
       } catch (_) {}
       return `${value} Unix seconds`;
     };
-    const primary = domain.map(field => [labels[field.path] || field.path,
-      field.path === "chainId" && chainId ? chainId : field.value, true]);
+    const primary = [];
+    for (const field of domain) {
+      const row = [field.path === "chainId" && hyperliquid ? "Signing domain chain ID" : labels[field.path] || field.path,
+        field.path === "chainId" && signingChain ? signingChain : field.value, true];
+      if (hyperliquid || (payment && ["primaryType", "version", "salt"].includes(field.path))) extraTechnical.push(row);
+      else primary.push(row);
+    }
     if (payment) primary.push(["Valid from", time(payment.valid_after)], ["Valid until", time(payment.valid_before)]);
-    else primary.push(...fields.map(field => [field.path, field.value, true]));
+    else for (const field of fields) {
+      const row = [hyperliquid ? messageLabels[field.path] || field.path : field.path, field.value, true];
+      if (hyperliquid && (["nonce", "time", "Nonce (Unix milliseconds)"].includes(field.path)
+        || (message.venue_asset && field.path === "USDC amount (HyperCore venue units)"))) extraTechnical.push(row);
+      else primary.push(row);
+    }
     for (const destination of claim?.declared_destinations || []) {
       primary.push([`Petal-reported destination (${chainLabel(destination.chain)})`, destination.destination, true]);
     }
@@ -586,14 +612,20 @@ function describeTransfer(manifest) {
       const label = {declared_debit: "Petal-reported debit", declared_fee: "Petal-reported fee", value_limit: "Approval value limit"}[amount.kind];
       if (label) primary.push([`${label} (${chainLabel(amount.chain)})`, amount.display]);
     }
-    const claimWarnings = claim ? ["The Petal reports the destination and policy limits. These claims are not established by the message signature; review them separately from the signed authorization."] : [];
+    const claimWarnings = claim?.operation_class === "gasless.relay"
+      ? ["Relay's final destination and quoted output are separate Petal claims. This signature authorizes the payment to the recipient shown above."]
+      : claim && !["venice-x402.topup", "hyperliquid.usd_send", "hyperliquid.withdraw"].includes(claim.operation_class)
+        ? ["The Petal reports the destination and policy limits. These claims are not established by the message signature; review them separately from the signed authorization."] : [];
     return {
       intent: {action: "sign_message", heading: message.title || "Sign a message"},
-      button: payment ? "Approve payment authorization" : "Approve message signature",
+      button: payment ? "Approve payment authorization" : agent ? "Authorize trading agent"
+        : hyperliquid ? "Approve exchange action" : "Approve message signature",
       sentence: payment ? "Authorize this exact token payment within the signed validity window." : "Review the exact fields bound to this message signature.",
-      chainId, networkIdentity: chainId ? `EVM · Chain ID ${chainId}` : "Message signature",
+      chainId, networkIdentity: hyperliquid ? `Hyperliquid · ${venueNetwork || "Unknown environment"}`
+        : chainId ? `EVM · Chain ID ${chainId}` : "Message signature",
       networkIcon: chainId ? chainIcon(chainId) : "unknown",
       facts: [], technical: [["Signing hash", message.payload_keccak, true],
+        ...extraTechnical, ...(message.venue_asset?.base_units ? [["USDC base units", message.venue_asset.base_units, true]] : []),
         ...(payment ? fields.map(field => [field.path, field.value, true]) : [])],
       messageFields: primary,
       parties: [{role: "source", label: "Signing account", value: message.signer, chainId},
@@ -601,7 +633,10 @@ function describeTransfer(manifest) {
       warnings: [...(message.warnings || []), ...claimWarnings],
       tokenAsset: payment ? {chainId, address: payment.token_address,
         title: payment.token?.name || "Unverified token contract", subtitle: payment.token?.symbol,
-        amount: payment.amount_display, amountLabel: "Authorized payment", tone: "outgoing"} : null
+        amount: payment.amount_display, amountLabel: "Authorized payment", tone: "outgoing"}
+        : message.venue_asset ? {venueAsset: message.venue_asset.asset_id,
+          title: message.venue_asset.name, subtitle: `HyperCore · ${message.venue_asset.environment}`,
+          amount: message.venue_asset.amount_display, amountLabel: "Signed amount", tone: "outgoing"} : null
     };
   }
   const evmPayloads = Array.isArray(plan.evm_review?.payloads) ? plan.evm_review.payloads : [];

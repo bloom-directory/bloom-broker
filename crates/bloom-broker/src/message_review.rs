@@ -15,6 +15,8 @@ const SCHEMA: &str = "bloom.message.review.v1";
 const MAX_FIELDS: usize = 256;
 const MAX_DEPTH: usize = 12;
 
+mod hyperliquid;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageReview {
@@ -26,7 +28,20 @@ pub struct MessageReview {
     pub fields: Vec<MessageField>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payment: Option<PaymentReview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub venue_asset: Option<VenueAssetReview>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VenueAssetReview {
+    pub asset_id: String,
+    pub name: String,
+    pub symbol: String,
+    pub environment: String,
+    pub amount_display: String,
+    pub base_units: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -55,8 +70,22 @@ pub struct PaymentReview {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Envelope {
-    Eip712 { schema: String, typed_data: Value },
-    Personal { schema: String, message: String },
+    Eip712 {
+        schema: String,
+        typed_data: Value,
+    },
+    Personal {
+        schema: String,
+        message: String,
+    },
+    HyperliquidL1 {
+        schema: String,
+        network: String,
+        action: Value,
+        nonce: u64,
+        vault_address: Option<String>,
+        expires_after: Option<u64>,
+    },
 }
 
 fn invalid(message: &str) -> ProtocolError {
@@ -73,7 +102,9 @@ fn bounded(value: &Value, depth: usize, nodes: &mut usize) -> Result<(), Protoco
             for (key, value) in values {
                 if key.is_empty()
                     || key.len() > 128
-                    || !key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                    || !key
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b':')
                 {
                     return Err(invalid("message review has an invalid property name"));
                 }
@@ -339,9 +370,39 @@ fn decode(bytes: &[u8], signer: Address) -> Result<(Vec<u8>, MessageReview), Pro
     let envelope: Envelope =
         serde_json::from_slice(bytes).map_err(|_| invalid("invalid message review envelope"))?;
     let mut review = MessageReview { kind: String::new(), title: String::new(), signer: format!("{signer:#x}"),
-        payload_keccak: String::new(), domain: Vec::new(), fields: Vec::new(), payment: None,
+        payload_keccak: String::new(), domain: Vec::new(), fields: Vec::new(), payment: None, venue_asset: None,
         warnings: vec!["Bloom verified the signed fields, not their execution effects or the identity of an unlisted application.".into()] };
     let preimage = match envelope {
+        Envelope::HyperliquidL1 {
+            schema,
+            network,
+            action,
+            nonce,
+            vault_address,
+            expires_after,
+        } => {
+            if schema != SCHEMA {
+                return Err(invalid("unsupported message review schema"));
+            }
+            bounded(&action, 0, &mut 0)?;
+            let (typed_data, fields, title) = hyperliquid::rebuild(
+                &network,
+                action,
+                nonce,
+                vault_address.as_deref(),
+                expires_after,
+            )?;
+            let nested = serde_json::to_vec(
+                &serde_json::json!({"schema":SCHEMA,"kind":"eip712","typed_data":typed_data}),
+            )
+            .map_err(|_| invalid("cannot encode reconstructed exchange message"))?;
+            let (preimage, mut review) = decode(&nested, signer)?;
+            review.kind = "hyperliquid_l1".into();
+            review.title = title;
+            review.fields = fields;
+            review.warnings.push("Bloom rebuilt the exchange action's MessagePack commitment. Market IDs, order bounds and fees are signed; Bloom has not checked market identity, available balance, fills or venue execution.".into());
+            return Ok((preimage, review));
+        }
         Envelope::Eip712 { schema, typed_data } => {
             if schema != SCHEMA {
                 return Err(invalid("unsupported message review schema"));
@@ -428,6 +489,7 @@ fn decode(bytes: &[u8], signer: Address) -> Result<(Vec<u8>, MessageReview), Pro
                 if review.payment.is_some() {
                     review.title = "Authorize a token payment".into();
                 }
+                hyperliquid::decorate(&typed, &mut review);
             }
             preimage
         }
@@ -595,6 +657,44 @@ fn validate_petal_profile(
         return Ok(());
     };
     let class = claim.operation_class.as_str();
+    if let Some(primary) = match class {
+        "hyperliquid.approve_agent" => Some("HyperliquidTransaction:ApproveAgent"),
+        "hyperliquid.usd_send" => Some("HyperliquidTransaction:UsdSend"),
+        "hyperliquid.usd_class_transfer" => Some("HyperliquidTransaction:UsdClassTransfer"),
+        "hyperliquid.withdraw" => Some("HyperliquidTransaction:Withdraw"),
+        _ => None,
+    } {
+        if review.kind != "hyperliquid_user"
+            || !review
+                .domain
+                .iter()
+                .any(|field| field.path == "primaryType" && field.value == primary)
+        {
+            return Err(invalid(
+                "Hyperliquid operation differs from the independently read signed message",
+            ));
+        }
+        hyperliquid::validate_payment(request, review, class)?;
+    }
+    if let Some(action) = match class {
+        "hyperliquid.order" => Some("order"),
+        "hyperliquid.cancel" => Some("cancel"),
+        "hyperliquid.cancel_by_cloid" => Some("cancelByCloid"),
+        "hyperliquid.schedule_cancel" => Some("scheduleCancel"),
+        "hyperliquid.update_leverage" => Some("updateLeverage"),
+        _ => None,
+    } {
+        if review.kind != "hyperliquid_l1"
+            || !review
+                .fields
+                .iter()
+                .any(|field| field.path == "Action" && field.value == action)
+        {
+            return Err(invalid(
+                "Hyperliquid operation differs from its MessagePack action",
+            ));
+        }
+    }
     let needs_payment = match class {
         "gasless.relay" => true,
         "venice-x402.topup" => review.kind != "siwe",
@@ -873,6 +973,66 @@ mod tests {
         let mut cycle = payment_data();
         cycle["types"]["Loop"] = json!([{"name":"next","type":"Loop"}]);
         assert!(decode(&envelope(cycle), signer()).is_err());
+    }
+
+    #[test]
+    fn exchange_action_review_binds_every_order_and_envelope_parameter() {
+        let envelope = json!({"schema":SCHEMA,"kind":"hyperliquid_l1","network":"mainnet", "nonce":123,
+            "vault_address":"0x0000000000000000000000000000000000000003", "expires_after":999999,
+            "action":{"type":"order","orders":[{"a":0,"b":true,"p":"100","s":"0.01","r":false,"t":{"limit":{"tif":"Gtc"}}}],"grouping":"na"}});
+        let original = request(serde_json::to_vec(&envelope).unwrap());
+        let reading = review(&original, signer()).unwrap().unwrap();
+        assert_eq!(reading.kind, "hyperliquid_l1");
+        assert_eq!(
+            reading.payload_keccak,
+            "0xd1d31414c406d9f99e01134e80157b5ef8ff36b0e554935a6a526134ac111438"
+        );
+        for (path, value) in [
+            ("/nonce", json!(124)),
+            ("/expires_after", json!(999998)),
+            ("/network", json!("testnet")),
+            (
+                "/vault_address",
+                json!("0x0000000000000000000000000000000000000004"),
+            ),
+            ("/action/orders/0/b", json!(false)),
+            ("/action/orders/0/p", json!("101")),
+        ] {
+            let mut changed = envelope.clone();
+            *changed.pointer_mut(path).unwrap() = value;
+            let mut request = original.clone();
+            request.message_review_payloads = vec![Base64UrlBytes::from_bytes(
+                &serde_json::to_vec(&changed).unwrap(),
+            )];
+            assert!(review(&request, signer()).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn agent_permissions_are_read_only_for_the_exact_hyperliquid_domain_and_type() {
+        let data = json!({"types":{
+            "EIP712Domain":[{"name":"name","type":"string"},{"name":"version","type":"string"},{"name":"chainId","type":"uint256"},{"name":"verifyingContract","type":"address"}],
+            "HyperliquidTransaction:ApproveAgent":[{"name":"hyperliquidChain","type":"string"},{"name":"agentAddress","type":"address"},{"name":"agentName","type":"string"},{"name":"nonce","type":"uint64"}]},
+            "primaryType":"HyperliquidTransaction:ApproveAgent", "domain":{"name":"HyperliquidSignTransaction","version":"1","chainId":421614,"verifyingContract":format!("{:#x}",Address::ZERO)},
+            "message":{"hyperliquidChain":"Mainnet","agentAddress":format!("{:#x}",Address::with_last_byte(8)),"agentName":"My agent","nonce":123}});
+        let (_, reading) = decode(&envelope(data.clone()), signer()).unwrap();
+        assert_eq!(reading.kind, "hyperliquid_user");
+        assert!(
+            reading
+                .fields
+                .iter()
+                .any(|field| field.path == "Venue permission"
+                    && field.value.contains("no spending ceiling"))
+        );
+        for (key, value) in [
+            ("chainId", json!(1)),
+            ("name", json!("Lookalike application")),
+        ] {
+            let mut altered = data.clone();
+            altered["domain"][key] = value;
+            let (_, reading) = decode(&envelope(altered), signer()).unwrap();
+            assert_eq!(reading.kind, "eip712");
+        }
     }
 
     #[test]

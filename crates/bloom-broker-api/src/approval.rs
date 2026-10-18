@@ -39,6 +39,15 @@ pub const MESSAGE_REVIEW_OPERATION_CLASSES: &[&str] = &[
     "venice-x402.topup",
     "venice-x402.chat",
     "venice-x402.balance",
+    "hyperliquid.approve_agent",
+    "hyperliquid.usd_send",
+    "hyperliquid.usd_class_transfer",
+    "hyperliquid.withdraw",
+    "hyperliquid.order",
+    "hyperliquid.cancel",
+    "hyperliquid.cancel_by_cloid",
+    "hyperliquid.schedule_cancel",
+    "hyperliquid.update_leverage",
 ];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

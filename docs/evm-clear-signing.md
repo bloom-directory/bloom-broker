@@ -60,6 +60,29 @@ envelope and refuse reusable or batch signing paths. For other Petals this
 reader remains optional until their callers forward an envelope. A protocol's hash-of-action fields remain
 hashes: decoding them does not establish the underlying order or action.
 
+Hyperliquid owner operations also carry review envelopes. User-signed typed
+messages are recognized only with the exact supported domain and canonical
+type; agent authorization explicitly states that the venue receives trading
+authority without the Petal's local spending/duration limits. Mainnet USDC
+venue balances have a specific asset binding; test collateral stays neutral.
+USD sends and withdrawals must declare the exact signed debit, recipient and
+approval amount. The EIP-712 chain ID is a signing domain, not the venue or
+withdrawal network.
+
+`kind: "hyperliquid_l1"` supplies `network`, `action`, `nonce`, optional
+`vault_address` and `expires_after`. Broker re-encodes supported orders,
+cancellations, scheduled cancellations and leverage changes as ordered
+MessagePack, rebuilds the action hash and EIP-712 Agent preimage, and checks
+the exact selector. Unused JSON is refused. Every action leaf, including
+builder fees, is displayed. An unknown market ID retains that exact ID and
+an unverified-identity warning; no ticker or market artwork is guessed.
+Existing delegated-agent grants remain a separate approval of future scope,
+not a claim that each later session action received an owner review.
+
+These operation-class contracts require coordinated Petal publication and
+Machine catalog repinning with the Broker release. Do not ship the reader's
+mandatory classes while the default catalog still distributes older callers.
+
 ### Contract calls
 
 Every reading is display: it is shown to the owner and signed with the review

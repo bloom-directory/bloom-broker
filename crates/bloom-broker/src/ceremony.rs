@@ -5237,7 +5237,24 @@ fn review_disclosures(
     // Exact EVM and Safe reviews are rebuilt from transaction bytes and do
     // not display Petal-asserted limits. Keep this disclosure for the claim
     // pages where those limits are actually part of the review.
-    if machine_asserted && evm_review.is_none() && safe_review.is_none() {
+    if machine_asserted && message_review.is_some() {
+        let bound_payment = message_review
+            .is_some_and(|review| review.payment.is_some() || review.venue_asset.is_some())
+            && claim.is_some_and(|claim| {
+                matches!(
+                    claim.operation_class.as_str(),
+                    "gasless.relay"
+                        | "venice-x402.topup"
+                        | "hyperliquid.usd_send"
+                        | "hyperliquid.withdraw"
+                )
+            });
+        disclosures.push(if bound_payment {
+            "Bloom matched the declared payment debit and approval amount to the signed message. Route quotes, other claims and execution effects remain unverified."
+        } else {
+            "Bloom verified the exact signed message fields. Petal-reported limits and other claims are separate; Bloom has not established them from this signature."
+        }.into());
+    } else if machine_asserted && evm_review.is_none() && safe_review.is_none() {
         let source = if system_claim.is_some() {
             "the named system component"
         } else {
