@@ -76,6 +76,8 @@ pub enum AdmittedFormat {
     /// Safe's packed `MultiSend` transactions, each read as an embedded call.
     /// Only the built-in Safe batch description uses it; no descriptor can.
     SafeBatch,
+    /// Enso Router V2's typed token input, using its adjacent type argument.
+    EnsoToken(String),
 }
 
 /// Which contract an embedded call is made to.
@@ -114,6 +116,7 @@ impl AdmittedFormat {
             Self::Enum(_) => "enum",
             Self::Calldata { .. } => "calldata",
             Self::SafeBatch => "safeBatch",
+            Self::EnsoToken(_) => "ensoToken",
         }
     }
 }
@@ -778,6 +781,20 @@ fn admit_format(
         ))
     };
     match name {
+        "ensoToken" => {
+            only_keys(&params_map, &["typePath"], "ensoToken params")?;
+            let type_path = params_map
+                .get("typePath")
+                .and_then(Value::as_str)
+                .ok_or_else(|| rejected("ensoToken requires typePath"))?;
+            let type_path = normalize_path(type_path)?;
+            if !matches!(kind, LeafType::Bytes) || !sibling(&type_path, &LeafType::Uint(8)) {
+                return Err(rejected(
+                    "ensoToken requires bytes and a sibling uint8 type",
+                ));
+            }
+            Ok(AdmittedFormat::EnsoToken(type_path))
+        }
         "raw" => {
             only_keys(&params_map, &[], "raw params")?;
             Ok(AdmittedFormat::Raw)

@@ -39,7 +39,7 @@ pub enum Binding {
 }
 
 /// The compiled-in descriptor files: path, contents and binding.
-pub const DESCRIPTORS: [(&str, &str, Binding); 8] = [
+pub const DESCRIPTORS: [(&str, &str, Binding); 9] = [
     (
         "safe/safe.json",
         include_str!("../catalogs/safe/safe.json"),
@@ -78,6 +78,11 @@ pub const DESCRIPTORS: [(&str, &str, Binding); 8] = [
     (
         "privacy-pools/eth-pool.json",
         include_str!("../catalogs/privacy-pools/eth-pool.json"),
+        Binding::Listed,
+    ),
+    (
+        "enso/router-v2.json",
+        include_str!("../catalogs/enso/router-v2.json"),
         Binding::Listed,
     ),
 ];

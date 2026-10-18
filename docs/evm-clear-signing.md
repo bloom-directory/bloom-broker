@@ -315,6 +315,21 @@ not verified offline. Source revisions and deployments are recorded in the two
 `catalogs/privacy-pools` descriptors. No private relay payload is added to
 agent-visible records by this reader.
 
+### Enso Router V2 inputs
+
+The listed Router V2 deployments read `routeSingle` and `routeMulti` source
+envelopes. Bloom's `ensoToken` format binds a bytes field to its sibling uint8
+`typePath`: native inputs show the transaction's actual value; ERC-20 inputs
+strictly decode `(address,uint256)` and use that exact chain/address's catalog
+units. Unknown tokens keep raw units. Empty lists, duplicate native inputs,
+dirty address padding, unsupported NFT inputs and ERC-20-only calls carrying
+native value are refused by this reading.
+
+This is partial coverage. The shortcut program remains explicitly undecoded;
+output, recipient, minimum-output, fees and settlement are not established by
+the source envelope. The review remains structural and displays that warning.
+It does not rename a quoted route into a verified swap.
+
 ## The owner decides
 
 There is no setting. Every wallet gets every reading Broker can produce, and

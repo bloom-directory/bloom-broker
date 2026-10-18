@@ -414,10 +414,83 @@ fn review_at(
         }
     }
     let mut structural = instance;
+    let mut enso_inputs = 0usize;
+    let mut enso_native_inputs = 0usize;
     let mut fields = Vec::with_capacity(jobs.len());
     for (field, label, index) in jobs {
         let value = value_at(&field.path, index);
         match (&field.format, value) {
+            (AdmittedFormat::EnsoToken(type_path), DynSolValue::Bytes(data)) => {
+                enso_inputs += 1;
+                let DynSolValue::Uint(token_type, _) = value_at(type_path, index) else {
+                    return Err(invalid("Enso token type is not uint8"));
+                };
+                if *token_type == U256::ZERO {
+                    enso_native_inputs += 1;
+                    if enso_native_inputs > 1 {
+                        return Err(invalid("Enso cannot receive duplicate native inputs"));
+                    }
+                    let native = context
+                        .native
+                        .as_ref()
+                        .ok_or_else(|| unsupported("no authenticated native units"))?;
+                    fields.push(DisplayField {
+                        label,
+                        format: "amount".into(),
+                        value: format!(
+                            "{} {} (transaction value)",
+                            format_base_units(&context.value.to_string(), native.decimals),
+                            native.symbol
+                        ),
+                        raw: format!("0x{}", hex_lower(data)),
+                    });
+                } else if *token_type == U256::from(1) {
+                    if data.len() != 64 || data[..12].iter().any(|byte| *byte != 0) {
+                        return Err(invalid(
+                            "Enso ERC-20 input must be canonical (address,uint256)",
+                        ));
+                    }
+                    let address = Address::from_slice(&data[12..32]);
+                    let amount = U256::from_be_slice(&data[32..]);
+                    let identity = format!("0x{:x}", address);
+                    let token = catalog
+                        .entry(context.chain_id, &identity)
+                        .filter(|entry| entry.token_metadata.is_some());
+                    let value = if let Some(entry) = token {
+                        let metadata = entry.token_metadata.as_ref().expect("filtered token");
+                        let selected = SelectedEntry::of(entry);
+                        if !used.contains(&selected) {
+                            used.push(selected);
+                        }
+                        format!(
+                            "{} {} ({})",
+                            format_base_units(&amount.to_string(), metadata.decimals),
+                            metadata.symbol,
+                            checksum(&identity)
+                        )
+                    } else {
+                        format!(
+                            "{amount} raw units of {} (identity unverified)",
+                            checksum(&identity)
+                        )
+                    };
+                    fields.push(DisplayField {
+                        label,
+                        format: "tokenAmount".into(),
+                        value,
+                        raw: format!("0x{}", hex_lower(data)),
+                    });
+                } else {
+                    return Err(unsupported(
+                        "Enso NFT token inputs are not supported by this reader",
+                    ));
+                }
+                structural = true;
+                let warning = "Enso input amounts are decoded. The shortcut program, output token, recipient, minimum output, fees and destination settlement are not independently decoded; route quotes are not signed guarantees.";
+                if !warnings.iter().any(|existing| existing == warning) {
+                    warnings.push(warning.into());
+                }
+            }
             (AdmittedFormat::Calldata { callee, amount }, DynSolValue::Bytes(data)) => {
                 let callee = match callee {
                     CalleeSource::TargetContract => context.to,
@@ -496,6 +569,18 @@ fn review_at(
                 fields.push(shown);
             }
         }
+    }
+
+    if enso_inputs == 0
+        && call
+            .fields
+            .iter()
+            .any(|field| matches!(field.format, AdmittedFormat::EnsoToken(_)))
+    {
+        return Err(unsupported("Enso route has no source inputs"));
+    }
+    if enso_inputs > 0 && enso_native_inputs == 0 && !context.value.is_zero() {
+        return Err(invalid("Enso ERC-20 inputs cannot carry native value"));
     }
 
     // The standing assurance is not a warning about this call: it is the same
@@ -972,7 +1057,9 @@ fn render_field(
             })?;
             format!("{label} ({raw})")
         }
-        AdmittedFormat::Calldata { .. } | AdmittedFormat::SafeBatch => {
+        AdmittedFormat::Calldata { .. }
+        | AdmittedFormat::SafeBatch
+        | AdmittedFormat::EnsoToken(_) => {
             return Err(invalid(
                 "an embedded call is rendered as a call, not a value",
             ));
