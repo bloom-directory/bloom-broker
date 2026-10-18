@@ -864,6 +864,27 @@ impl BrokerRpcService {
                 "Safe review payloads require a Safe Petal subject",
             ));
         }
+        if message_petal && !request.message_review_payloads.is_empty() {
+            let claim = request.petal_use_claim.as_ref().ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::ClaimInvalid,
+                    "Reviewed message operation requires its Petal claim",
+                )
+            })?;
+            if !self
+                .authority
+                .subject_declares_operation_class(
+                    &request.terms.subject,
+                    claim.operation_class.as_str(),
+                )
+                .map_err(authority_error)?
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::ClaimInvalid,
+                    "Message claim operation class differs from installer provenance",
+                ));
+            }
+        }
         if !request.evm_review_payloads.is_empty()
             || !request.safe_review_payloads.is_empty()
             || !request.message_review_payloads.is_empty()

@@ -583,7 +583,81 @@ pub(crate) fn review(
             "message review differs from the exact approved payload",
         ));
     }
+    validate_petal_profile(request, &review)?;
     Ok(Some(review))
+}
+
+fn validate_petal_profile(
+    request: &ApprovalPrepareRequest,
+    review: &MessageReview,
+) -> Result<(), ProtocolError> {
+    let Some(claim) = &request.petal_use_claim else {
+        return Ok(());
+    };
+    let class = claim.operation_class.as_str();
+    let needs_payment = match class {
+        "gasless.relay" => true,
+        "venice-x402.topup" => review.kind != "siwe",
+        "venice-x402.chat" | "venice-x402.balance" => {
+            if review.kind != "siwe" {
+                return Err(invalid("Venice login requires a signed login message"));
+            }
+            false
+        }
+        _ => false,
+    };
+    if !needs_payment {
+        return Ok(());
+    }
+    let payment = review.payment.as_ref().ok_or_else(|| {
+        invalid("This payment operation requires a canonical ERC-3009 authorization")
+    })?;
+    let chain: u64 = payment
+        .chain_id
+        .parse()
+        .map_err(|_| invalid("invalid payment chain"))?;
+    let matches_chain = |name: &str| {
+        name == format!("evm-{chain}")
+            || name == crate::evm_review::chain_name(chain)
+            || (chain == 43114 && name == "avalanche")
+    };
+    let [debit] = claim.declared_debits.as_slice() else {
+        return Err(invalid("Payment claim must declare its exact token debit"));
+    };
+    if !matches_chain(debit.asset.chain.as_str())
+        || !debit
+            .asset
+            .asset
+            .eq_ignore_ascii_case(&payment.token_address)
+        || debit.amount.as_str() != payment.amount
+    {
+        return Err(invalid(
+            "Payment claim debit differs from the signed authorization",
+        ));
+    }
+    if !request
+        .terms
+        .limits
+        .value_limits
+        .iter()
+        .any(|limit| limit.asset == debit.asset && limit.lifetime.as_str() == payment.amount)
+    {
+        return Err(invalid(
+            "Payment approval must account for its exact signed token amount",
+        ));
+    }
+    if class == "venice-x402.topup"
+        && (claim.declared_destinations.len() != 1
+            || !matches_chain(claim.declared_destinations[0].chain.as_str())
+            || !claim.declared_destinations[0]
+                .destination
+                .eq_ignore_ascii_case(&payment.recipient))
+    {
+        return Err(invalid(
+            "Payment claim recipient differs from the signed authorization",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -698,6 +772,68 @@ mod tests {
         let mut wrong = payment_data();
         wrong["message"]["validBefore"] = json!("0");
         assert!(decode(&envelope(wrong), signer()).is_err());
+    }
+
+    #[test]
+    fn known_payment_claims_must_account_for_the_signed_amount_and_recipient() {
+        use bloom_broker_api::{
+            AssetId, ClaimAssurance, DecimalU256, DeclaredDebit, DeclaredDestination, DeclaredFee,
+            PetalUseClaim, ValueLimit,
+        };
+        let mut request = request(envelope(payment_data()));
+        let asset = AssetId {
+            chain: Token::new("base").unwrap(),
+            asset: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".into(),
+        };
+        let amount = DecimalU256::parse("2500000").unwrap();
+        request.terms.limits.value_limits = vec![ValueLimit {
+            asset: asset.clone(),
+            lifetime: amount.clone(),
+            rolling_windows: vec![],
+        }];
+        request.petal_use_claim = Some(PetalUseClaim {
+            package_hash: Digest32::from_bytes([1; 32]),
+            route: "payment/a/0/confirm".into(),
+            operation_class: Token::new("venice-x402.topup").unwrap(),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: Digest32::from_bytes([2; 32]),
+            ordered_hashes: vec![],
+            declared_debits: vec![DeclaredDebit { asset, amount }],
+            declared_destinations: vec![DeclaredDestination {
+                chain: Token::new("base").unwrap(),
+                destination: "0x0000000000000000000000000000000000000008".into(),
+            }],
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([3; 16]),
+            claim_assurance: ClaimAssurance::MachineAsserted,
+        });
+        assert!(review(&request, signer()).unwrap().is_some());
+        let mut wrong = request.clone();
+        wrong
+            .petal_use_claim
+            .as_mut()
+            .unwrap()
+            .declared_debits
+            .clear();
+        assert!(review(&wrong, signer()).is_err());
+        let mut wrong = request.clone();
+        wrong.petal_use_claim.as_mut().unwrap().declared_debits[0].amount =
+            DecimalU256::parse("1").unwrap();
+        assert!(review(&wrong, signer()).is_err());
+        let mut wrong = request.clone();
+        wrong
+            .petal_use_claim
+            .as_mut()
+            .unwrap()
+            .declared_destinations[0]
+            .destination = format!("{:#x}", Address::ZERO);
+        assert!(review(&wrong, signer()).is_err());
+        let mut wrong = request.clone();
+        wrong.terms.limits.value_limits.clear();
+        assert!(review(&wrong, signer()).is_err());
+        request.petal_use_claim.as_mut().unwrap().operation_class =
+            Token::new("venice-x402.chat").unwrap();
+        assert!(review(&request, signer()).is_err());
     }
 
     #[test]

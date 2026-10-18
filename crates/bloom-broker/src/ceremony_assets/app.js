@@ -579,6 +579,14 @@ function describeTransfer(manifest) {
       field.path === "chainId" && chainId ? chainId : field.value, true]);
     if (payment) primary.push(["Valid from", time(payment.valid_after)], ["Valid until", time(payment.valid_before)]);
     else primary.push(...fields.map(field => [field.path, field.value, true]));
+    for (const destination of claim?.declared_destinations || []) {
+      primary.push([`Petal-reported destination (${chainLabel(destination.chain)})`, destination.destination, true]);
+    }
+    for (const amount of plan.asset_amounts || []) {
+      const label = {declared_debit: "Petal-reported debit", declared_fee: "Petal-reported fee", value_limit: "Approval value limit"}[amount.kind];
+      if (label) primary.push([`${label} (${chainLabel(amount.chain)})`, amount.display]);
+    }
+    const claimWarnings = claim ? ["The Petal reports the destination and policy limits. These claims are not established by the message signature; review them separately from the signed authorization."] : [];
     return {
       intent: {action: "sign_message", heading: message.title || "Sign a message"},
       button: payment ? "Approve payment authorization" : "Approve message signature",
@@ -590,7 +598,7 @@ function describeTransfer(manifest) {
       messageFields: primary,
       parties: [{role: "source", label: "Signing account", value: message.signer, chainId},
         ...(payment ? [{role: "recipient", label: "Authorized recipient", value: payment.recipient, chainId}] : [])],
-      warnings: message.warnings || [],
+      warnings: [...(message.warnings || []), ...claimWarnings],
       tokenAsset: payment ? {chainId, address: payment.token_address,
         title: payment.token?.name || "Unverified token contract", subtitle: payment.token?.symbol,
         amount: payment.amount_display, amountLabel: "Authorized payment", tone: "outgoing"} : null

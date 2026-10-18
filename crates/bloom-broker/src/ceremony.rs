@@ -5237,8 +5237,7 @@ fn review_disclosures(
     // Exact EVM and Safe reviews are rebuilt from transaction bytes and do
     // not display Petal-asserted limits. Keep this disclosure for the claim
     // pages where those limits are actually part of the review.
-    if machine_asserted && evm_review.is_none() && safe_review.is_none() && message_review.is_none()
-    {
+    if machine_asserted && evm_review.is_none() && safe_review.is_none() {
         let source = if system_claim.is_some() {
             "the named system component"
         } else {
