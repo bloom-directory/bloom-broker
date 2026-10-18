@@ -811,7 +811,10 @@ impl BrokerRpcService {
                 .map_err(authority_error)?;
         let mut message_petal = false;
         if matches!(request.terms.subject, ApprovalSubject::Petal { .. }) {
-            for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
+            for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
+                .iter()
+                .chain(bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES)
+            {
                 message_petal |= self
                     .authority
                     .subject_declares_operation_class(&request.terms.subject, class)
@@ -847,8 +850,7 @@ impl BrokerRpcService {
                     )
                     .any(|class| {
                         class.as_str() == safe_class
-                            || bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
-                                .contains(&class.as_str())
+                            || bloom_broker_api::message_review_requires_exact(class.as_str())
                     })
                 {
                     return Err(ProtocolError::new(

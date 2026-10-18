@@ -59,6 +59,7 @@ EXTRA = {
         ("0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82", 18),  # CAKE
     ],
     137: [
+        ("0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb", 6),  # Polymarket USD
         ("0x0b3f868e0be5597d5db7feb59e1cadbb0fdda50a", 18),  # SUSHI
         ("0x03b54a6e9a984069379fae1a4fc4dbae93b3bccd", 18),  # WSTETH
     ],

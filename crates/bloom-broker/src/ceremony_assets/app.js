@@ -649,6 +649,11 @@ function describeTransfer(manifest) {
       tokenAsset: payment ? {chainId, address: payment.token_address,
         title: payment.token?.name || "Unverified token contract", subtitle: payment.token?.symbol,
         amount: payment.amount_display, amountLabel: "Authorized payment", tone: "outgoing"}
+        : message.collateral_asset ? {chainId: message.collateral_asset.chain_id,
+          address: message.collateral_asset.token.address, title: message.collateral_asset.token.name,
+          subtitle: message.collateral_asset.token.symbol, amount: message.collateral_asset.amount_display,
+          amountLabel: "Order collateral amount",
+          tone: fields.some(field => field.path === "Side (0 buy, 1 sell)" && field.value === "1") ? "incoming" : "outgoing"}
         : message.venue_asset ? {venueAsset: message.venue_asset.asset_id,
           title: message.venue_asset.name, subtitle: `HyperCore · ${message.venue_asset.environment}`,
           amount: message.venue_asset.amount_display, amountLabel: "Signed amount", tone: "outgoing"} : null

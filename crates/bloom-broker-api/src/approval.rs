@@ -50,6 +50,23 @@ pub const MESSAGE_REVIEW_OPERATION_CLASSES: &[&str] = &[
     "hyperliquid.update_leverage",
 ];
 
+/// These callers use the batch host API with one exact prepared signature.
+/// Onboarding also has a separate reusable, single-use login grant; it is
+/// intentionally not converted into an exact timestamp-bound login approval.
+pub const POLYMARKET_REVIEW_OPERATION_CLASSES: &[&str] = &[
+    "polymarket.order.poly1271",
+    "polymarket.relayer_batch",
+    "polymarket.onboard",
+];
+
+pub fn message_review_requires_exact(class: &str) -> bool {
+    MESSAGE_REVIEW_OPERATION_CLASSES.contains(&class)
+        || matches!(
+            class,
+            "polymarket.order.poly1271" | "polymarket.relayer_batch"
+        )
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApprovalSubject {

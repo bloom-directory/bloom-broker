@@ -16,6 +16,7 @@ const MAX_FIELDS: usize = 256;
 const MAX_DEPTH: usize = 12;
 
 mod hyperliquid;
+mod polymarket;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +31,8 @@ pub struct MessageReview {
     pub payment: Option<PaymentReview>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub venue_asset: Option<VenueAssetReview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collateral_asset: Option<bloom_evm_clear_signing::FieldAsset>,
     pub warnings: Vec<String>,
 }
 
@@ -370,7 +373,7 @@ fn decode(bytes: &[u8], signer: Address) -> Result<(Vec<u8>, MessageReview), Pro
     let envelope: Envelope =
         serde_json::from_slice(bytes).map_err(|_| invalid("invalid message review envelope"))?;
     let mut review = MessageReview { kind: String::new(), title: String::new(), signer: format!("{signer:#x}"),
-        payload_keccak: String::new(), domain: Vec::new(), fields: Vec::new(), payment: None, venue_asset: None,
+        payload_keccak: String::new(), domain: Vec::new(), fields: Vec::new(), payment: None, venue_asset: None, collateral_asset: None,
         warnings: vec!["Bloom verified the signed fields, not their execution effects or the identity of an unlisted application.".into()] };
     let preimage = match envelope {
         Envelope::HyperliquidL1 {
@@ -637,7 +640,17 @@ pub(crate) fn review(
             "message review requires one recoverable secp256k1 payload",
         ));
     }
-    let (preimage, review) = decode(&request.message_review_payloads[0].decode(), signer)?;
+    let class = request
+        .petal_use_claim
+        .as_ref()
+        .map(|claim| claim.operation_class.as_str());
+    let (preimage, review) = if let Some(class) =
+        class.filter(|class| bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES.contains(class))
+    {
+        polymarket::decode(&request.message_review_payloads[0].decode(), signer, class)?
+    } else {
+        decode(&request.message_review_payloads[0].decode(), signer)?
+    };
     if Digest32::from_bytes(Sha256::digest(&preimage).into()) != ordered_payload_digests[0]
         || Digest32::from_bytes(keccak256(&preimage).0) != ordered_hashes[0]
     {
@@ -657,6 +670,22 @@ fn validate_petal_profile(
         return Ok(());
     };
     let class = claim.operation_class.as_str();
+    if bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES.contains(&class)
+        && review.kind != "polymarket_exact"
+    {
+        return Err(invalid(
+            "Polymarket exact approval requires its independently rebuilt prepared record",
+        ));
+    }
+    if bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES.contains(&class)
+        && (!claim.declared_debits.is_empty()
+            || !claim.declared_destinations.is_empty()
+            || !matches!(claim.declared_fee, bloom_broker_api::DeclaredFee::None))
+    {
+        return Err(invalid(
+            "Polymarket exact review derives its facts from signed fields, not financial claim overrides",
+        ));
+    }
     if let Some(primary) = match class {
         "hyperliquid.approve_agent" => Some("HyperliquidTransaction:ApproveAgent"),
         "hyperliquid.usd_send" => Some("HyperliquidTransaction:UsdSend"),

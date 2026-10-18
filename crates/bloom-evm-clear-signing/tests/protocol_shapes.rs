@@ -24,6 +24,23 @@ fn export(name: &str, call: &ClearSignedCall) {
 }
 
 #[test]
+fn empty_dynamic_array_is_visible_instead_of_disappearing() {
+    let signature = "f(address[] owners)";
+    let accepted = other(
+        signature,
+        json!([
+            {"path":"owners.[]", "label":"Owner", "format":"addressName"}
+        ]),
+    )
+    .unwrap();
+    let bytes = calldata(signature, &[U256::from(32), U256::ZERO]);
+    let (call, _) = review_call(&accepted, &context(&bytes)).unwrap();
+    assert_eq!(call.fields.len(), 1);
+    assert_eq!(call.fields[0].value, "Empty list");
+    assert_eq!(call.fields[0].raw, "[]");
+}
+
+#[test]
 fn scalar_vault_deposit_identifies_the_asset_but_does_not_invent_shares() {
     let accepted = accepted_vault();
     let bytes = calldata(

@@ -409,15 +409,22 @@ fn review_at(
     let mut shown_arrays = BTreeSet::new();
     for field in &call.fields {
         match array_of(&field.path) {
-            None => jobs.push((field, field.label.clone(), 0)),
+            None => jobs.push((field, field.label.clone(), Some(0))),
             Some(array) if shown_arrays.insert(array) => {
+                if length(&field.path) == 0 {
+                    jobs.push((field, field.label.clone(), None));
+                }
                 for index in 0..length(&field.path) {
                     for member in call
                         .fields
                         .iter()
                         .filter(|member| array_of(&member.path) == Some(array))
                     {
-                        jobs.push((member, format!("{} {}", member.label, index + 1), index));
+                        jobs.push((
+                            member,
+                            format!("{} {}", member.label, index + 1),
+                            Some(index),
+                        ));
                     }
                 }
             }
@@ -429,6 +436,16 @@ fn review_at(
     let mut enso_native_inputs = 0usize;
     let mut fields = Vec::with_capacity(jobs.len());
     for (field, label, index) in jobs {
+        let Some(index) = index else {
+            fields.push(DisplayField {
+                label,
+                format: "raw".into(),
+                value: "Empty list".into(),
+                raw: "[]".into(),
+                asset: None,
+            });
+            continue;
+        };
         let value = value_at(&field.path, index);
         match (&field.format, value) {
             (AdmittedFormat::EnsoToken(type_path), DynSolValue::Bytes(data)) => {

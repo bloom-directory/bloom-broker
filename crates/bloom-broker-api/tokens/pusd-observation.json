@@ -1,0 +1,37 @@
+{
+  "chain_id": 137,
+  "address": "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb",
+  "observations": [
+    {
+      "rpc_url": "https://polygon-bor-rpc.publicnode.com",
+      "block": 95772650,
+      "block_hash": "0xb5a84b2ddeac4c1bdf04a6fbfa2eea6d7af45471077fad8cfe7c87e0fb4f7f8b",
+      "decimals": "6",
+      "symbol": "\"pUSD\"",
+      "name": "\"Polymarket USD\"",
+      "implementation_slot": "0x000000000000000000000000ce84e053301a82937f90ee2c2c1889cab1db25de",
+      "exchanges": {
+        "0xe111180000d2663c0091e4f400237545b87b996b": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+        "0xe2222d279d744050d28e00520010520000310f59": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+      }
+    },
+    {
+      "rpc_url": "https://polygon.drpc.org",
+      "block": 95772650,
+      "block_hash": "0xb5a84b2ddeac4c1bdf04a6fbfa2eea6d7af45471077fad8cfe7c87e0fb4f7f8b",
+      "decimals": "6",
+      "symbol": "\"pUSD\"",
+      "name": "\"Polymarket USD\"",
+      "implementation_slot": "0x000000000000000000000000ce84e053301a82937f90ee2c2c1889cab1db25de",
+      "exchanges": {
+        "0xe111180000d2663c0091e4f400237545b87b996b": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+        "0xe2222d279d744050d28e00520010520000310f59": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+      }
+    }
+  ],
+  "limits": [
+    "Read-only snapshot, not a future-state guarantee",
+    "Proxy may upgrade",
+    "No reviewed issuer artwork; do not substitute Circle USDC artwork"
+  ]
+}
