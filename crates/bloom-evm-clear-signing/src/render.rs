@@ -561,6 +561,10 @@ fn review_at(
                 let value = match crate::enso::decode(data) {
                     Ok(mut program) => {
                         for step in &mut program.steps {
+                            if depth >= 2 {
+                                step.unread_reason = Some("Nested shortcut call reading reached the recursion bound; exact call bytes are retained.".into());
+                                continue;
+                            }
                             match (&step.calldata, step.value) {
                                 (Some(bytes), Some(value)) => {
                                     let inner = CallContext { to: step.target, value, calldata: bytes, ..context.clone() };
