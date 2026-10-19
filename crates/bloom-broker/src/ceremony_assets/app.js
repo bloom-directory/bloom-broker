@@ -346,7 +346,7 @@ function reviewedContractCall(payload) {
   return payload?.contract_call || null;
 }
 function technicalCallField(call, field) {
-  return field.format === "raw" && (call.contract_name?.startsWith("Privacy Pools") ||
+  return ["raw", "ensoShortcut"].includes(field.format) && (call.contract_name?.startsWith("Privacy Pools") ||
     call.contract_name === "Enso Router V2");
 }
 function reviewCallFields(call) {

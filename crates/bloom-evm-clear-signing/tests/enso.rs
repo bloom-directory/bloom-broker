@@ -45,10 +45,7 @@ fn source_amount_and_identity_are_read_but_shortcut_effects_stay_unverified() {
             .value
             .starts_with("2.5 USDC (")
     );
-    assert_eq!(
-        field(&call, "Shortcut program (not decoded)").raw,
-        "0x01020304"
-    );
+    assert_eq!(field(&call, "Shortcut program").raw, "0x01020304");
     assert!(call.structural);
     assert!(call.intent_summary.is_none());
     export_ui_fixture("enso-source", &call);
@@ -155,10 +152,7 @@ fn safe_route_reads_actual_token_minimum_and_receiver_without_borrowing_identity
         field(&call, "Output receiver").value.to_lowercase(),
         RECIPIENT
     );
-    assert_eq!(
-        field(&call, "Shortcut program (not decoded)").raw,
-        "0x01020304"
-    );
+    assert_eq!(field(&call, "Shortcut program").raw, "0x01020304");
     assert!(
         call.warnings
             .iter()
@@ -332,4 +326,52 @@ fn native_amounts_have_explicit_presentation_and_missing_units_never_guess() {
     ctx.native = None;
     ctx.value = U256::from(11);
     assert!(review_call(Catalog::built_in().unwrap(), &ctx).is_err());
+}
+
+#[test]
+fn shortcut_constants_receive_catalog_readings_and_runtime_slots_stay_explicit() {
+    let mut command = [0u8; 32];
+    command[..4].copy_from_slice(&[0xa9, 0x05, 0x9c, 0xbb]);
+    command[4] = 1;
+    command[5..11].fill(0xff);
+    command[5] = 0;
+    command[6] = 1;
+    command[11] = 1;
+    command[12..].copy_from_slice(&USDC.parse::<alloy_primitives::Address>().unwrap()[..]);
+    let shortcut = parse_function("executeShortcut(bytes32,bytes32,bytes32[],bytes[])")
+        .unwrap()
+        .abi_encode_input(&[
+            DynSolValue::FixedBytes(Default::default(), 32),
+            DynSolValue::FixedBytes(Default::default(), 32),
+            DynSolValue::Array(vec![
+                DynSolValue::FixedBytes(command.into(), 32),
+                DynSolValue::FixedBytes(command.into(), 32),
+            ]),
+            DynSolValue::Array(vec![
+                DynSolValue::Bytes(address_word(RECIPIENT).to_be_bytes::<32>().to_vec()),
+                DynSolValue::Bytes(U256::from(2_500_000).to_be_bytes::<32>().to_vec()),
+            ]),
+        ])
+        .unwrap();
+    let outer = parse_function(SINGLE)
+        .unwrap()
+        .abi_encode_input(&[input(USDC, 2_500_000), DynSolValue::Bytes(shortcut)])
+        .unwrap();
+    let call = review(&outer, 0).unwrap();
+    let program: serde_json::Value =
+        serde_json::from_str(&field(&call, "Shortcut program").value).unwrap();
+    assert!(program["steps"][0]["reading"].is_object(), "{program}");
+    assert!(program["steps"][1]["reading"].is_null());
+    assert!(
+        program["steps"][1]["unread_reason"]
+            .as_str()
+            .unwrap()
+            .contains("runtime")
+    );
+    assert!(
+        program["steps"][0]["reading"]
+            .to_string()
+            .contains("2.5 USDC")
+    );
+    export_ui_fixture("enso-shortcut", &call);
 }
