@@ -1971,7 +1971,9 @@ async fn activate_signing_approval(
             terms: terms.clone(),
             canonical_plan_facts_digest: terms.approval_digest().unwrap(),
             evm_review_payloads: Vec::new(),
-            message_review_payloads: if claim.is_some() {
+            message_review_payloads: if claim.is_some_and(|claim| {
+                bloom_broker_api::pumpfun_review_required(claim.operation_class.as_str())
+            }) {
                 vec![Base64UrlBytes::from_bytes(payload)]
             } else {
                 vec![]
@@ -2051,6 +2053,12 @@ fn signing_request(
 ) -> MachineSignRequest {
     let suite = terms.allowed_crypto_suites[0];
     let payload_hash = Digest32::from_bytes(Sha256::digest(payload).into());
+    let signing_hash = match suite {
+        CryptoSuite::Secp256k1Keccak256Recoverable => {
+            Digest32::from_bytes(alloy::primitives::keccak256(payload).into())
+        }
+        _ => payload_hash.clone(),
+    };
     let identity = bloom_signer_api::SignOperationIdentity {
         operation_id: sign_operation.clone(),
         approval_id: terms.approval_id().unwrap(),
@@ -2095,11 +2103,11 @@ fn signing_request(
                 bloom_signer_api::CryptoSuite::Secp256k1Sha256Recoverable
             }
             CryptoSuite::Secp256k1Keccak256Recoverable => {
-                panic!("helper hashes SHA-256 payloads only")
+                bloom_signer_api::CryptoSuite::Secp256k1Keccak256Recoverable
             }
         },
-        ordered_payload_digests: vec![payload_hash.clone()],
-        ordered_hashes: vec![payload_hash],
+        ordered_payload_digests: vec![payload_hash],
+        ordered_hashes: vec![signing_hash],
         petal_use_claim_digest: claim
             .as_ref()
             .map(|c| Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(c).unwrap()).into())),
@@ -2144,27 +2152,17 @@ fn signing_request(
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pump_review_binds_real_signer_to_the_reviewed_transaction() {
-    use bloom_broker_api::{
-        CanonicalWalletPolicy, ClaimAssurance, ClaimAssuranceLevel, DeclaredFee, PetalUseClaim,
-        PolicyCommitUpdateRequest, PolicyUpdateRequest,
-    };
-    use bloom_solana_clear_signing::message::parse_versioned_message;
-    use ed25519_dalek::{Signer as _, Verifier as _};
-
-    let directory = tempfile::tempdir().unwrap();
-    let mut stack = account_stack(directory.path(), "pump").await;
-    let authenticator = VirtualAuthenticator::generate();
-    let wallet_id = Token::new("pump-review").unwrap();
-    register_bip39_wallet(&mut stack, &wallet_id, &authenticator, None).await;
-    let package = digest("d1");
-    let route = "trade/pump-review/0/buy.json";
-    let class = Token::new("pumpfun.buy").unwrap();
-
-    // Authorize the fixture package through the real policy ceremony; do not
-    // bypass the wallet's installer or owner authority for the signing test.
-    let baseline = stack.authority.policy_snapshot(&wallet_id).unwrap();
+async fn authorize_fixture_petal(
+    stack: &mut AccountStack,
+    authenticator: &VirtualAuthenticator,
+    wallet_id: &Token,
+    package: &Digest32,
+    route: &str,
+    class: &Token,
+) -> ProvenanceRecord {
+    use bloom_broker_api::{CanonicalWalletPolicy, PolicyCommitUpdateRequest, PolicyUpdateRequest};
+    use ed25519_dalek::Signer as _;
+    let baseline = stack.authority.policy_snapshot(wallet_id).unwrap();
     let old: CanonicalWalletPolicy =
         serde_json::from_slice(&baseline.canonical_policy.decode()).unwrap();
     let mut proposed = old.clone();
@@ -2203,8 +2201,7 @@ async fn pump_review_binds_real_signer_to_the_reviewed_transaction() {
         Token::new("policy_update_credential_prf").unwrap(),
     );
     let receipt =
-        complete_custody_assertion(&stack, &request, &prepared.ceremony_url, &authenticator, 2)
-            .await;
+        complete_custody_assertion(stack, &request, &prepared.ceremony_url, authenticator, 2).await;
     MachineBrokerService::dispatch(
         stack.broker.as_ref(),
         MachineBrokerRequest::PolicyCommitUpdate(PolicyCommitUpdateRequest {
@@ -2227,6 +2224,34 @@ async fn pump_review_binds_real_signer_to_the_reviewed_transaction() {
     provenance.installer_signature =
         Base64UrlBytes::from_bytes(&SigningKey::from_bytes(&[5; 32]).sign(&signed).to_bytes());
     stack.authority.install_provenance(&provenance).unwrap();
+
+    provenance
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pump_review_binds_real_signer_to_the_reviewed_transaction() {
+    use bloom_broker_api::{ClaimAssurance, ClaimAssuranceLevel, DeclaredFee, PetalUseClaim};
+    use bloom_solana_clear_signing::message::parse_versioned_message;
+    use ed25519_dalek::Verifier as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut stack = account_stack(directory.path(), "pump").await;
+    let authenticator = VirtualAuthenticator::generate();
+    let wallet_id = Token::new("pump-review").unwrap();
+    register_bip39_wallet(&mut stack, &wallet_id, &authenticator, None).await;
+    let package = digest("d1");
+    let route = "trade/pump-review/0/buy.json";
+    let class = Token::new("pumpfun.buy").unwrap();
+
+    let provenance = authorize_fixture_petal(
+        &mut stack,
+        &authenticator,
+        &wallet_id,
+        &package,
+        route,
+        &class,
+    )
+    .await;
 
     let accounts = wallet_accounts(&stack, &wallet_id).await;
     let account = accounts
@@ -2356,6 +2381,195 @@ async fn pump_review_binds_real_signer_to_the_reviewed_transaction() {
             &ed25519_dalek::Signature::from_slice(&signature).unwrap(),
         )
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delegated_hyperliquid_witness_is_enforced_over_real_signer_transport() {
+    use alloy::primitives::keccak256;
+    use alloy_dyn_abi::eip712::TypedData;
+    use bloom_broker_api::{ClaimAssurance, ClaimAssuranceLevel, DeclaredFee, PetalUseClaim};
+    use serde_json::json;
+
+    // Encode this fixed cancellation independently of Broker's action enum.
+    fn payload(nonce: u64) -> Vec<u8> {
+        let mut action =
+            hex::decode("82a474797065a663616e63656ca763616e63656c739182a16100a16f2a").unwrap();
+        action.extend_from_slice(&nonce.to_be_bytes());
+        action.push(0); // no vault
+        let typed: TypedData = serde_json::from_value(json!({
+            "types": {
+                "EIP712Domain": [{"name":"name","type":"string"},{"name":"version","type":"string"},{"name":"chainId","type":"uint256"},{"name":"verifyingContract","type":"address"}],
+                "Agent": [{"name":"source","type":"string"},{"name":"connectionId","type":"bytes32"}]
+            },
+            "primaryType":"Agent",
+            "domain":{"name":"Exchange","version":"1","chainId":1337,"verifyingContract":"0x0000000000000000000000000000000000000000"},
+            "message":{"source":"a","connectionId":format!("{:#x}",keccak256(action))}
+        })).unwrap();
+        let mut raw = vec![0x19, 0x01];
+        raw.extend_from_slice(typed.domain.separator().as_slice());
+        raw.extend_from_slice(typed.hash_struct().unwrap().as_slice());
+        raw
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let mut stack = account_stack(directory.path(), "hyper").await;
+    let authenticator = VirtualAuthenticator::generate();
+    let wallet_id = Token::new("hyper-use-review").unwrap();
+    register_bip39_wallet(&mut stack, &wallet_id, &authenticator, None).await;
+    let package = digest("d1");
+    let route = "sessions/hyper-use-review/cancel.json";
+    let class = Token::new("hyperliquid.agent_action").unwrap();
+    let provenance = authorize_fixture_petal(
+        &mut stack,
+        &authenticator,
+        &wallet_id,
+        &package,
+        route,
+        &class,
+    )
+    .await;
+    let accounts = wallet_accounts(&stack, &wallet_id).await;
+    let account = accounts
+        .accounts
+        .iter()
+        .find(|a| a.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1)
+        .unwrap();
+    let nonce = 1_700_000_000_000u64;
+    let raw = payload(nonce);
+    let public = wallet_public(&stack, &wallet_id).await;
+    let mut terms = sign_terms(&public, account.key_ref.clone(), &raw, &provenance);
+    terms.subject = ApprovalSubject::Petal {
+        package_hash: package.clone(),
+        route: route.into(),
+        agent_id: None,
+    };
+    terms.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Keccak256Recoverable];
+    terms.selector = ApprovalSelector::Petal {
+        package_hash: package.clone(),
+        route: route.into(),
+        allowed_operation_classes: vec![class.clone()],
+        route_grants: vec![],
+        required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+    };
+    terms.limits.max_operations = DecimalU64::new(2);
+    terms.limits.max_signatures = DecimalU64::new(2);
+    let claim = |bytes: &[u8], nonce: u64| {
+        let mut hash = Sha256::new();
+        hash.update(b"bloom.petal.payload-batch.v1\0");
+        hash.update(1u64.to_be_bytes());
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+        PetalUseClaim {
+            package_hash: package.clone(),
+            route: route.into(),
+            operation_class: class.clone(),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: Digest32::from_bytes(hash.finalize().into()),
+            ordered_hashes: vec![Digest32::from_bytes(keccak256(bytes).into())],
+            declared_debits: vec![],
+            declared_destinations: vec![],
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([nonce as u8; 16]),
+            claim_assurance: ClaimAssurance::MachineAsserted,
+        }
+    };
+    activate_signing_approval(
+        &mut stack,
+        &authenticator,
+        &terms,
+        &raw,
+        3,
+        Some(&claim(&raw, nonce)),
+    )
+    .await;
+    let (broker, authority) = open_broker(
+        directory.path(),
+        &directory.path().join("signer-hyper.sock"),
+    );
+    stack.broker = broker;
+    stack.authority = authority;
+    stack.authority.install_provenance(&provenance).unwrap();
+
+    // Missing or changed witnesses must not consume either approved operation.
+    let missing = signing_request(
+        &terms,
+        &raw,
+        Some(claim(&raw, nonce)),
+        stack.next_operation(),
+    );
+    assert!(
+        MachineBrokerService::dispatch(
+            stack.broker.as_ref(),
+            MachineBrokerRequest::SigningSign(missing)
+        )
+        .await
+        .is_err()
+    );
+    let mut changed = signing_request(
+        &terms,
+        &raw,
+        Some(claim(&raw, nonce)),
+        stack.next_operation(),
+    );
+    changed.claim_assurance_evidence = Some(Base64UrlBytes::from_bytes(
+        &serde_json::to_vec(&json!({
+            "schema":"bloom.message.review.v1","kind":"hyperliquid_l1","network":"mainnet",
+            "action":{"type":"cancel","cancels":[{"a":0,"o":43}]},"nonce":nonce
+        }))
+        .unwrap(),
+    ));
+    assert!(
+        MachineBrokerService::dispatch(
+            stack.broker.as_ref(),
+            MachineBrokerRequest::SigningSign(changed)
+        )
+        .await
+        .is_err()
+    );
+
+    // Two fresh actions use the one existing grant, with no second ceremony.
+    // This tests the use-time profile on a derived wallet child, not venue
+    // effects, Petal session-key enrollment, local caps or order cancellation.
+    for nonce in [nonce, nonce + 1] {
+        let raw = payload(nonce);
+        let mut request = signing_request(
+            &terms,
+            &raw,
+            Some(claim(&raw, nonce)),
+            stack.next_operation(),
+        );
+        request.claim_assurance_evidence = Some(Base64UrlBytes::from_bytes(
+            &serde_json::to_vec(&json!({
+                "schema":"bloom.message.review.v1","kind":"hyperliquid_l1","network":"mainnet",
+                "action":{"type":"cancel","cancels":[{"a":0,"o":42}]},"nonce":nonce
+            }))
+            .unwrap(),
+        ));
+        let result = match MachineBrokerService::dispatch(
+            stack.broker.as_ref(),
+            MachineBrokerRequest::SigningSign(request),
+        )
+        .await
+        .unwrap()
+        {
+            MachineBrokerResponse::SigningSign(result) => result,
+            other => panic!("unexpected delegated sign response: {other:?}"),
+        };
+        assert_eq!(result.signatures.len(), 1);
+        let bytes = result.signatures[0].bytes.decode();
+        let signature = k256::ecdsa::Signature::from_slice(&bytes[..64]).unwrap();
+        let recovery = k256::ecdsa::RecoveryId::from_byte(bytes[64]).unwrap();
+        let recovered = k256::ecdsa::VerifyingKey::recover_from_prehash(
+            keccak256(&raw).as_slice(),
+            &signature,
+            recovery,
+        )
+        .unwrap();
+        let spki = k256::PublicKey::from_sec1_bytes(recovered.to_encoded_point(false).as_bytes())
+            .unwrap()
+            .to_public_key_der()
+            .unwrap();
+        assert_eq!(account.canonical_public_key.decode(), spki.as_bytes());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
