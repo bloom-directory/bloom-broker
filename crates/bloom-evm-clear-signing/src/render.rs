@@ -483,7 +483,7 @@ fn review_at(
                         .ok_or_else(|| unsupported("no authenticated native units"))?;
                     fields.push(DisplayField {
                         label,
-                        format: "amount".into(),
+                        format: "nativeAmount".into(),
                         value: format!(
                             "{} {} ({})",
                             format_base_units(&amount.to_string(), native.decimals),
@@ -1147,14 +1147,21 @@ fn render_field(
             )
         }
         AdmittedFormat::Amount => {
-            let native = context.native.as_ref().ok_or_else(|| {
-                unsupported("Bloom has no authenticated native units for this chain")
-            })?;
-            format!(
-                "{} {}",
-                format_base_units(&raw, native.decimals),
-                native.symbol
-            )
+            match context.native.as_ref() {
+                Some(native) => format!(
+                    "{} {}",
+                    format_base_units(&raw, native.decimals),
+                    native.symbol
+                ),
+                // Zero needs no scaling. This permits an ERC-20-only route on
+                // chains such as Tempo without inventing a native currency.
+                None if raw == "0" => "0 (no native value)".into(),
+                None => {
+                    return Err(unsupported(
+                        "Bloom has no authenticated native units for this chain",
+                    ));
+                }
+            }
         }
         AdmittedFormat::Date => {
             let seconds: u64 = raw

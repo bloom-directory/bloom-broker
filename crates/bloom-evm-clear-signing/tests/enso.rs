@@ -287,6 +287,9 @@ fn safe_route_is_bound_to_reviewed_deployments_and_canonical_output_data() {
         ctx.chain_id = chain;
         ctx.to = router.parse().unwrap();
         ctx.value = U256::ZERO;
+        if chain == 4217 {
+            ctx.native = None;
+        }
         assert!(review_call(Catalog::built_in().unwrap(), &ctx).is_ok());
         ctx.to = RECIPIENT.parse().unwrap();
         assert!(review_call(Catalog::built_in().unwrap(), &ctx).is_err());
@@ -306,4 +309,27 @@ fn safe_route_is_bound_to_reviewed_deployments_and_canonical_output_data() {
         }
     }
     assert!(review(&safe_encode(SAFE_SINGLE, input(USDC, 1), dirty), 0).is_err());
+}
+
+#[test]
+fn native_amounts_have_explicit_presentation_and_missing_units_never_guess() {
+    let bytes = safe_encode(
+        SAFE_SINGLE,
+        native_minimum(vec![]),
+        native_minimum(U256::from(7).to_be_bytes::<32>().to_vec()),
+    );
+    let call = review(&bytes, 11).unwrap();
+    assert_eq!(field(&call, "Source asset / amount").format, "nativeAmount");
+    assert_eq!(
+        field(&call, "Requested minimum balance increase").format,
+        "nativeAmount"
+    );
+    let mut ctx = context(&bytes);
+    ctx.chain_id = 4217;
+    ctx.to = "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"
+        .parse()
+        .unwrap();
+    ctx.native = None;
+    ctx.value = U256::from(11);
+    assert!(review_call(Catalog::built_in().unwrap(), &ctx).is_err());
 }

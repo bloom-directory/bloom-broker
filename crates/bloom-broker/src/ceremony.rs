@@ -5048,6 +5048,8 @@ pub(crate) fn native_asset_metadata(chain: &str, asset: &str) -> Option<(u8, &'s
         | ("optimism", "native")
         | ("base", "native")
         | ("arbitrum", "native")
+        | ("evm-59144", "native")
+        | ("evm-4663", "native")
         | ("anvil", "native") => Some((18, "ETH")),
         ("polygon", "native") => Some((18, "POL")),
         ("evm-100", "native") => Some((18, "xDAI")),

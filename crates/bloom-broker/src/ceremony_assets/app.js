@@ -1483,6 +1483,16 @@ function renderReview(session) {
             tone: call.contract_name === "Enso Router V2" ? "outgoing" : "neutral"}));
           continue;
         }
+        if (field.format === "nativeAmount") {
+          // The reader marks native amounts explicitly. Never infer asset
+          // identity from a descriptor label or a ticker in formatted text.
+          const ether = [1, 10, 8453, 42161, 59144, 4663, 31337].includes(Number(payload.chain_id));
+          decision.push(assetCard({native: ether ? "ethereum" : "token",
+            title: ether ? "Ether" : "Native asset",
+            amount: String(field.value).replace(/ \((transaction value|minimum balance increase)\)$/, ""),
+            amountLabel: field.label, tone: "outgoing"}));
+          continue;
+        }
         const explorer = addressExplorer(payload.chain_id, field.value);
         const value = explorer ? explorerAnchor(explorer, field.value, field.label)
           : el("code", {}, field.value);
