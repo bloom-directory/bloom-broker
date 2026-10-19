@@ -368,6 +368,10 @@ function callIntent(call) {
     const fields = Object.fromEntries((call?.fields || []).map(field => [field.label, field.value]));
     const signature = String(call?.function_signature || "");
     if (call.contract_name === "Enso Router V2") {
+      if (signature.startsWith("safeRoute")) {
+        return {action: "call", eyebrow: "Enso route checks", heading: "Review Enso route checks",
+          detail: "Check the source amounts, receiver and requested output minimums. Shortcut effects, fees and received funds remain unverified.", relation: "calls"};
+      }
       return {action: "call", eyebrow: "Enso route inputs", heading: "Review Enso route inputs",
         detail: "Source amounts are decoded. The shortcut's effects and quoted outputs remain unverified.", relation: "calls"};
     }

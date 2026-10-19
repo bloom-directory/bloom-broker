@@ -78,6 +78,8 @@ pub enum AdmittedFormat {
     SafeBatch,
     /// Enso Router V2's typed token input, using its adjacent type argument.
     EnsoToken(String),
+    /// Enso's requested output balance increase, not its input/value encoding.
+    EnsoTokenOutput(String),
 }
 
 /// Which contract an embedded call is made to.
@@ -119,6 +121,7 @@ impl AdmittedFormat {
             Self::Calldata { .. } => "calldata",
             Self::SafeBatch => "safeBatch",
             Self::EnsoToken(_) => "ensoToken",
+            Self::EnsoTokenOutput(_) => "ensoTokenOutput",
         }
     }
 }
@@ -806,7 +809,7 @@ fn admit_format(
                 .then_some(AdmittedFormat::TokenAmount(TokenSource::VaultAsset(vault)))
                 .ok_or_else(|| mismatched("unsigned integer"))
         }
-        "ensoToken" => {
+        "ensoToken" | "ensoTokenOutput" => {
             only_keys(&params_map, &["typePath"], "ensoToken params")?;
             let type_path = params_map
                 .get("typePath")
@@ -818,7 +821,11 @@ fn admit_format(
                     "ensoToken requires bytes and a sibling uint8 type",
                 ));
             }
-            Ok(AdmittedFormat::EnsoToken(type_path))
+            Ok(if name == "ensoTokenOutput" {
+                AdmittedFormat::EnsoTokenOutput(type_path)
+            } else {
+                AdmittedFormat::EnsoToken(type_path)
+            })
         }
         "raw" => {
             only_keys(&params_map, &[], "raw params")?;

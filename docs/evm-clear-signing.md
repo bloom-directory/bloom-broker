@@ -345,7 +345,7 @@ retains the block/code/source digests and verification limits. Broker remains
 offline: this is trusted release-time metadata, not a fresh code, price, balance
 or settlement attestation.
 
-### Enso Router V2 inputs
+### Enso Router V2 inputs and requested output checks
 
 The listed Router V2 deployments read `routeSingle` and `routeMulti` source
 envelopes. Bloom's `ensoToken` format binds a bytes field to its sibling uint8
@@ -355,9 +355,19 @@ units. Unknown tokens keep raw units. Empty lists, duplicate native inputs,
 dirty address padding, unsupported NFT inputs and ERC-20-only calls carrying
 native value are refused by this reading.
 
+`safeRouteSingle` and `safeRouteMulti` also read the receiver and output
+balance-increase minimums. `ensoTokenOutput` uses the output's own canonical
+bytes: native output minimums decode one uint256 instead of borrowing the
+transaction value, while ERC-20 minimums bind their exact token address and
+units. Outputs never count as source inputs or authorize native input value.
+An empty output list explicitly warns that no minimum requires funds to
+arrive. Unknown tokens stay raw and unsupported NFT layouts remain explicit.
+
 This is partial coverage. The shortcut program remains explicitly undecoded;
-output, recipient, minimum-output, fees and settlement are not established by
-the source envelope. The review remains structural and displays that warning.
+ordinary source envelopes do not establish outputs or recipients. Safe-route
+fields describe requested contract balance checks, not proof of received
+funds, runtime code, intermediate effects, fees or settlement. The review
+remains structural and displays that warning.
 It does not rename a quoted route into a verified swap.
 
 Decoded token-amount fields carry their exact catalog identity, chain and

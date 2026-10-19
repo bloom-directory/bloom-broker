@@ -434,6 +434,7 @@ fn review_at(
     let mut structural = instance;
     let mut enso_inputs = 0usize;
     let mut enso_native_inputs = 0usize;
+    let mut enso_outputs = 0usize;
     let mut fields = Vec::with_capacity(jobs.len());
     for (field, label, index) in jobs {
         let Some(index) = index else {
@@ -448,16 +449,34 @@ fn review_at(
         };
         let value = value_at(&field.path, index);
         match (&field.format, value) {
-            (AdmittedFormat::EnsoToken(type_path), DynSolValue::Bytes(data)) => {
-                enso_inputs += 1;
+            (
+                AdmittedFormat::EnsoToken(type_path) | AdmittedFormat::EnsoTokenOutput(type_path),
+                DynSolValue::Bytes(data),
+            ) => {
+                let output = matches!(field.format, AdmittedFormat::EnsoTokenOutput(_));
+                if !output {
+                    enso_inputs += 1;
+                } else {
+                    enso_outputs += 1;
+                }
                 let DynSolValue::Uint(token_type, _) = value_at(type_path, index) else {
                     return Err(invalid("Enso token type is not uint8"));
                 };
                 if *token_type == U256::ZERO {
-                    enso_native_inputs += 1;
-                    if enso_native_inputs > 1 {
-                        return Err(invalid("Enso cannot receive duplicate native inputs"));
-                    }
+                    let amount = if output {
+                        if data.len() != 32 {
+                            return Err(invalid(
+                                "Enso native output must encode one uint256 minimum",
+                            ));
+                        }
+                        U256::from_be_slice(data)
+                    } else {
+                        enso_native_inputs += 1;
+                        if enso_native_inputs > 1 {
+                            return Err(invalid("Enso cannot receive duplicate native inputs"));
+                        }
+                        context.value
+                    };
                     let native = context
                         .native
                         .as_ref()
@@ -466,9 +485,14 @@ fn review_at(
                         label,
                         format: "amount".into(),
                         value: format!(
-                            "{} {} (transaction value)",
-                            format_base_units(&context.value.to_string(), native.decimals),
-                            native.symbol
+                            "{} {} ({})",
+                            format_base_units(&amount.to_string(), native.decimals),
+                            native.symbol,
+                            if output {
+                                "minimum balance increase"
+                            } else {
+                                "transaction value"
+                            }
                         ),
                         raw: format!("0x{}", hex_lower(data)),
                         asset: None,
@@ -476,7 +500,7 @@ fn review_at(
                 } else if *token_type == U256::from(1) {
                     if data.len() != 64 || data[..12].iter().any(|byte| *byte != 0) {
                         return Err(invalid(
-                            "Enso ERC-20 input must be canonical (address,uint256)",
+                            "Enso ERC-20 token must be canonical (address,uint256)",
                         ));
                     }
                     let address = Address::from_slice(&data[12..32]);
@@ -528,14 +552,10 @@ fn review_at(
                     });
                 } else {
                     return Err(unsupported(
-                        "Enso NFT token inputs are not supported by this reader",
+                        "Enso NFT token inputs/outputs are not supported by this reader",
                     ));
                 }
                 structural = true;
-                let warning = "Enso input amounts are decoded. The shortcut program, output token, recipient, minimum output, fees and destination settlement are not independently decoded; route quotes are not signed guarantees.";
-                if !warnings.iter().any(|existing| existing == warning) {
-                    warnings.push(warning.into());
-                }
             }
             (AdmittedFormat::Calldata { callee, amount }, DynSolValue::Bytes(data)) => {
                 let callee = match callee {
@@ -628,6 +648,26 @@ fn review_at(
     }
     if enso_inputs > 0 && enso_native_inputs == 0 && !context.value.is_zero() {
         return Err(invalid("Enso ERC-20 inputs cannot carry native value"));
+    }
+    if enso_inputs > 0 {
+        let warning = if call
+            .fields
+            .iter()
+            .any(|field| matches!(field.format, AdmittedFormat::EnsoTokenOutput(_)))
+        {
+            "Enso inputs, requested output minimums and receiver are decoded from calldata. These are requested balance-increase checks, not proof of received funds. The shortcut program, runtime code, intermediate effects, fees and settlement are not independently decoded or verified."
+        } else {
+            "Enso input amounts are decoded. The shortcut program, output token, recipient, minimum output, fees and destination settlement are not independently decoded; route quotes are not signed guarantees."
+        };
+        warnings.push(warning.into());
+        if enso_outputs == 0
+            && call
+                .fields
+                .iter()
+                .any(|field| matches!(field.format, AdmittedFormat::EnsoTokenOutput(_)))
+        {
+            warnings.push("This Enso call has no output minimums. The receiver field alone does not require any funds to arrive.".into());
+        }
     }
 
     // The standing assurance is not a warning about this call: it is the same
@@ -1136,7 +1176,8 @@ fn render_field(
         }
         AdmittedFormat::Calldata { .. }
         | AdmittedFormat::SafeBatch
-        | AdmittedFormat::EnsoToken(_) => {
+        | AdmittedFormat::EnsoToken(_)
+        | AdmittedFormat::EnsoTokenOutput(_) => {
             return Err(invalid(
                 "an embedded call is rendered as a call, not a value",
             ));

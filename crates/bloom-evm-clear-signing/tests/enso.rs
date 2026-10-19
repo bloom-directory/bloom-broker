@@ -9,6 +9,8 @@ const ROUTER: &str = "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf";
 const USDC: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 const SINGLE: &str = "routeSingle((uint8 tokenType,bytes data) tokenIn,bytes data)";
 const MULTI: &str = "routeMulti((uint8 tokenType,bytes data)[] tokensIn,bytes data)";
+const SAFE_SINGLE: &str = "safeRouteSingle((uint8 tokenType,bytes data) tokenIn,(uint8 tokenType,bytes data) tokenOut,address receiver,bytes data)";
+const SAFE_MULTI: &str = "safeRouteMulti((uint8 tokenType,bytes data)[] tokensIn,(uint8 tokenType,bytes data)[] tokensOut,address receiver,bytes data)";
 
 fn input(address: &str, amount: u64) -> DynSolValue {
     let mut data = address_word(address).to_be_bytes::<32>().to_vec();
@@ -117,4 +119,175 @@ fn native_input_uses_transaction_value_and_duplicate_native_inputs_are_refused()
         )
         .is_err()
     );
+}
+
+fn safe_encode(signature: &str, inputs: DynSolValue, outputs: DynSolValue) -> Vec<u8> {
+    parse_function(signature)
+        .unwrap()
+        .abi_encode_input(&[
+            inputs,
+            outputs,
+            DynSolValue::Address(RECIPIENT.parse().unwrap()),
+            DynSolValue::Bytes(vec![1, 2, 3, 4]),
+        ])
+        .unwrap()
+}
+
+fn native_minimum(data: Vec<u8>) -> DynSolValue {
+    DynSolValue::Tuple(vec![
+        DynSolValue::Uint(U256::ZERO, 8),
+        DynSolValue::Bytes(data),
+    ])
+}
+
+#[test]
+fn safe_route_reads_actual_token_minimum_and_receiver_without_borrowing_identity() {
+    let bytes = safe_encode(SAFE_SINGLE, input(USDC, 2_500_000), input(USDC, 1_250_000));
+    let call = review(&bytes, 0).unwrap();
+    let minimum = field(&call, "Requested minimum balance increase");
+    assert!(minimum.value.starts_with("1.25 USDC"));
+    assert_eq!(minimum.asset.as_ref().unwrap().amount_display, "1.25 USDC");
+    assert_eq!(
+        minimum.asset.as_ref().unwrap().token.address.to_lowercase(),
+        USDC
+    );
+    assert_eq!(
+        field(&call, "Output receiver").value.to_lowercase(),
+        RECIPIENT
+    );
+    assert_eq!(
+        field(&call, "Shortcut program (not decoded)").raw,
+        "0x01020304"
+    );
+    assert!(
+        call.warnings
+            .iter()
+            .any(|w| w.contains("not proof of received funds"))
+    );
+    export_ui_fixture("enso-output", &call);
+    let unknown = review(
+        &safe_encode(SAFE_SINGLE, input(USDC, 2_500_000), input(TOKEN, 7)),
+        0,
+    )
+    .unwrap();
+    let minimum = field(&unknown, "Requested minimum balance increase");
+    assert!(minimum.asset.is_none());
+    assert!(minimum.value.starts_with("7 raw units"));
+    assert!(!minimum.value.contains("USDC"));
+    assert!(
+        review(&bytes, 1).is_err(),
+        "an output cannot authorize native input value"
+    );
+}
+
+#[test]
+fn safe_route_native_minimum_uses_output_bytes_not_transaction_value() {
+    let output = native_minimum(
+        U256::from(1_000_000_000_000_000_000u64)
+            .to_be_bytes::<32>()
+            .to_vec(),
+    );
+    let bytes = safe_encode(SAFE_SINGLE, input(USDC, 2_500_000), output.clone());
+    let call = review(&bytes, 0).unwrap();
+    assert_eq!(
+        field(&call, "Requested minimum balance increase").value,
+        "1 ETH (minimum balance increase)"
+    );
+    for malformed in [vec![], vec![0; 31], vec![0; 33], vec![0; 64]] {
+        assert!(
+            review(
+                &safe_encode(SAFE_SINGLE, input(USDC, 1), native_minimum(malformed)),
+                0
+            )
+            .is_err()
+        );
+    }
+    // Outputs may repeat, and are never counted as native inputs. Source
+    // native input remains the transaction value, not its arbitrary data.
+    let bytes = safe_encode(
+        SAFE_MULTI,
+        DynSolValue::Array(vec![native_minimum(vec![])]),
+        DynSolValue::Array(vec![output.clone(), output]),
+    );
+    let call = review(&bytes, 2_000_000_000_000_000_000).unwrap();
+    assert_eq!(
+        field(&call, "Source asset / amount 1").value,
+        "2 ETH (transaction value)"
+    );
+    assert_eq!(
+        field(&call, "Requested minimum balance increase 2").value,
+        "1 ETH (minimum balance increase)"
+    );
+}
+
+#[test]
+fn safe_route_arrays_preserve_element_binding_and_show_absent_output_checks() {
+    let bytes = safe_encode(
+        SAFE_MULTI,
+        DynSolValue::Array(vec![input(USDC, 2_500_000)]),
+        DynSolValue::Array(vec![input(TOKEN, 7), input(USDC, 1_250_000)]),
+    );
+    let call = review(&bytes, 0).unwrap();
+    assert!(
+        field(&call, "Requested minimum balance increase 1")
+            .asset
+            .is_none()
+    );
+    assert_eq!(
+        field(&call, "Requested minimum balance increase 2")
+            .asset
+            .as_ref()
+            .unwrap()
+            .amount_display,
+        "1.25 USDC"
+    );
+    let bytes = safe_encode(
+        SAFE_MULTI,
+        DynSolValue::Array(vec![input(USDC, 1)]),
+        DynSolValue::Array(vec![]),
+    );
+    let call = review(&bytes, 0).unwrap();
+    assert_eq!(field(&call, "Output token type").value, "Empty list");
+    assert!(
+        call.warnings
+            .iter()
+            .any(|w| w.contains("no output minimums"))
+    );
+    export_ui_fixture("enso-output-empty", &call);
+    let bytes = safe_encode(
+        SAFE_MULTI,
+        DynSolValue::Array(vec![]),
+        DynSolValue::Array(vec![input(USDC, 1)]),
+    );
+    assert!(
+        review(&bytes, 0).is_err(),
+        "an output cannot replace missing source inputs"
+    );
+}
+
+#[test]
+fn safe_route_is_bound_to_reviewed_deployments_and_canonical_output_data() {
+    let bytes = safe_encode(SAFE_SINGLE, input(USDC, 1), input(USDC, 2));
+    for chain in [1, 10, 56, 100, 137, 8453, 42161, 43114] {
+        let mut ctx = context(&bytes);
+        ctx.chain_id = chain;
+        ctx.to = ROUTER.parse().unwrap();
+        ctx.value = U256::ZERO;
+        assert!(review_call(Catalog::built_in().unwrap(), &ctx).is_ok());
+    }
+    let mut ctx = context(&bytes);
+    ctx.chain_id = 8453;
+    ctx.to = RECIPIENT.parse().unwrap();
+    ctx.value = U256::ZERO;
+    assert!(review_call(Catalog::built_in().unwrap(), &ctx).is_err());
+    ctx.to = ROUTER.parse().unwrap();
+    ctx.chain_id = 31337;
+    assert!(review_call(Catalog::built_in().unwrap(), &ctx).is_err());
+    let mut dirty = input(USDC, 2);
+    if let DynSolValue::Tuple(ref mut values) = dirty {
+        if let DynSolValue::Bytes(ref mut bytes) = values[1] {
+            bytes[0] = 1;
+        }
+    }
+    assert!(review(&safe_encode(SAFE_SINGLE, input(USDC, 1), dirty), 0).is_err());
 }

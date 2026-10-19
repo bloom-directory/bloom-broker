@@ -3418,8 +3418,11 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
 
     let parent_key = machine_registration_result.public_key_refs[0].clone();
     let derive_operation = operation("d2");
-    let scope_lifetime_ms = 60_000;
-    let approval_lifetime_ms = 30_000;
+    // This scenario exercises many real ceremonies. Its active-authority
+    // assertions must not race a 30-second deadline on a loaded CI host.
+    // Expiry is exercised separately below with an already-expired request.
+    let scope_lifetime_ms = 300_000;
+    let approval_lifetime_ms = 120_000;
     let scope = PetalKeyScope {
         wallet_id: wallet_id.clone(),
         parent_key_ref: parent_key.clone(),
@@ -5170,33 +5173,32 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .as_millis()
         .try_into()
         .unwrap();
-    if now_after_scope_ms <= approval_expires_at_ms {
-        tokio::time::sleep(std::time::Duration::from_millis(
-            approval_expires_at_ms - now_after_scope_ms + 25,
-        ))
-        .await;
-    }
     let mut expired_terms = approval_terms.clone();
     expired_terms.request_nonce = RequestNonce::from_bytes([0xdc; 16]);
-    assert!(
-        MachineBrokerService::dispatch(
-            &restarted_scoped_broker,
-            MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
-                evm_reported_token: None,
-                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-                evm_review_payloads: Vec::new(),
-                message_review_payloads: Vec::new(),
-                safe_review_payloads: Vec::new(),
-                operation_id: operation("dc"),
-                terms: expired_terms,
-                canonical_plan_facts_digest: digest("dd"),
-                petal_use_claim: None,
-                system_use_claim: None,
-            }),
-        )
-        .await
-        .is_err()
-    );
+    expired_terms.issued_at_ms = DecimalU64::new(now_after_scope_ms - 30_000);
+    expired_terms.not_before_ms = expired_terms.issued_at_ms.clone();
+    expired_terms.expires_at_ms = DecimalU64::new(now_after_scope_ms - 1);
+    expired_terms.validate().unwrap();
+    let expired = MachineBrokerService::dispatch(
+        &restarted_scoped_broker,
+        MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_reported_token: None,
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            evm_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
+            operation_id: operation("dc"),
+            terms: expired_terms,
+            canonical_plan_facts_digest: digest("dd"),
+            petal_use_claim: None,
+            system_use_claim: None,
+        }),
+    )
+    .await
+    .unwrap_err();
+    // The terms are well formed, but a current review manifest cannot fit
+    // inside their already-ended lifetime.
+    assert_eq!(expired.code, ProtocolErrorCode::SelectorMismatch);
 
     // Stop Broker before panic-revoking through Signer's independently
     // authenticated control socket. Recreate Broker afterwards and prove its
