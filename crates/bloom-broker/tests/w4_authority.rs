@@ -2,9 +2,9 @@ use bloom_broker::{
     assurance_verifiers::SolanaSystemTransferVerifier,
     authority::{
         AssuranceRegistry, AssuranceVerifier, AuthorizationInput, BrokerAuthority,
-        CanonicalWalletPolicy, CeremonyApprovalGrant, EpochReconciliation, PolicyAsset,
-        PolicyDestination, ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject,
-        VerifierCapability, canonical_policy_authority_diff,
+        CanonicalWalletPolicy, CeremonyApprovalGrant, EpochReconciliation, FrozenReview,
+        PolicyAsset, PolicyDestination, ProvenanceOperationClass, ProvenanceRecord,
+        ProvenanceSubject, VerifierCapability, canonical_policy_authority_diff,
     },
     journal::{AuditSigner, BrokerJournal},
 };
@@ -292,6 +292,7 @@ impl Harness {
 
     fn policy_snapshot(&self, version: u64) -> SignedPolicySnapshot {
         let policy = CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: self.wallet.clone(),
             maximum_approval_lifetime_ms: 100_000,
             allowed_petal_packages: vec![digest(9)],
@@ -424,7 +425,12 @@ impl Harness {
             Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(claim).unwrap()).into());
         let approval_id = self
             .authority
-            .prepare_approval_with_claim(terms, &review, Some(&claim_digest))
+            .prepare_approval_with_claim(
+                terms,
+                &review,
+                Some(&claim_digest),
+                &FrozenReview::legacy(),
+            )
             .unwrap();
         let grant = self.signed_grant(terms, approval_id, operation(3));
         self.authority.activate_approval(&grant, 1_500).unwrap();
@@ -466,6 +472,11 @@ fn ac18_wallet_delete_fails_closed_under_audit_degradation() {
         .policy_snapshot(&harness.wallet)
         .expect("baseline policy");
     let mut receipt = CustodyResult {
+        surface: Some(bloom_broker_api::CeremonySurfaceRef {
+            surface_id: Token::new("local").unwrap(),
+            identity_digest: digest(91),
+        }),
+        credential_authority_generation: Some(DecimalU64::new(0)),
         ceremony_kind: CeremonyKind::WalletDelete,
         custody_operation_id: operation(90),
         public_status: CeremonyState::Completed,
@@ -563,6 +574,100 @@ fn a_home_with_nothing_to_migrate_grows_no_legacy_authority_file() {
         "opening a fresh home must not create an empty legacy authority store"
     );
     drop(authority);
+}
+
+#[cfg(unix)]
+fn open_authority_at(
+    legacy_path: &std::path::Path,
+    journal_path: &std::path::Path,
+) -> Result<BrokerAuthority, bloom_broker::authority::AuthorityError> {
+    let journal =
+        Arc::new(BrokerJournal::open(journal_path, Arc::new(TestAuditSigner)).expect("journal"));
+    BrokerAuthority::open(
+        legacy_path,
+        journal,
+        BTreeMap::new(),
+        token("installer-key"),
+        SigningKey::from_bytes(&[2; 32]).verifying_key(),
+        token("ceremony-key"),
+        SigningKey::from_bytes(&[3; 32]).verifying_key(),
+        token("revocation-key"),
+        SigningKey::from_bytes(&[4; 32]).verifying_key(),
+        AssuranceRegistry::compiled(vec![]).unwrap(),
+    )
+}
+
+/// A legacy store reached through a symlink whose target is missing is not
+/// "nothing to migrate": the entry is there, its state is not. Starting
+/// without it would drop the authority state the upgrade was meant to carry
+/// over, so startup fails and no empty store is created at the target.
+#[cfg(unix)]
+#[test]
+fn a_dangling_legacy_store_symlink_fails_startup_instead_of_skipping_migration() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("journal.sqlite");
+    let legacy_path = directory.path().join("authority.sqlite");
+    let target = directory
+        .path()
+        .join("unavailable-volume")
+        .join("authority.sqlite");
+    std::os::unix::fs::symlink(&target, &legacy_path).unwrap();
+
+    let error = open_authority_at(&legacy_path, &journal_path)
+        .err()
+        .expect("a dangling legacy store symlink must fail startup");
+    assert!(
+        error.to_string().contains("authority.sqlite"),
+        "the error must name the legacy store: {error}"
+    );
+    assert!(
+        !target.exists(),
+        "a missing target must not be created by the open"
+    );
+}
+
+/// The symlink itself is not the problem: a legacy store that is reachable
+/// through one opens and migrates exactly as a regular file does.
+#[cfg(unix)]
+#[test]
+fn a_legacy_store_reached_through_a_symlink_is_migrated() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("journal.sqlite");
+    let target = directory.path().join("volume").join("authority.sqlite");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let legacy = rusqlite::Connection::open(&target).unwrap();
+    legacy
+        .execute_batch(
+            "CREATE TABLE policies(wallet_id TEXT PRIMARY KEY, version TEXT NOT NULL, digest TEXT NOT NULL, snapshot_jcs TEXT NOT NULL, policy_jcs TEXT NOT NULL);
+             CREATE TABLE wallet_epochs(wallet_id TEXT PRIMARY KEY, epoch TEXT NOT NULL, reconciled INTEGER NOT NULL);
+             CREATE TABLE provenance_catalog(subject_jcs TEXT PRIMARY KEY, record_digest TEXT NOT NULL, record_jcs TEXT NOT NULL);
+             CREATE TABLE mutation_quota(principal TEXT PRIMARY KEY, window_started_ms TEXT NOT NULL, mutations TEXT NOT NULL);
+             CREATE TABLE signer_approval_tombstones(approval_id TEXT PRIMARY KEY, wallet_id TEXT NOT NULL, tombstone_jcs TEXT NOT NULL);
+             CREATE TABLE pending_petal_key_scopes(custody_operation_id TEXT PRIMARY KEY, scope_digest TEXT NOT NULL, scope_jcs TEXT NOT NULL);
+             CREATE TABLE petal_key_scopes(key_ref_jcs TEXT PRIMARY KEY, scope_digest TEXT NOT NULL, scope_jcs TEXT NOT NULL, activated_at_ms TEXT NOT NULL, expires_at_ms TEXT NOT NULL, custody_receipt_digest TEXT NOT NULL);
+             INSERT INTO mutation_quota VALUES ('linked-principal', '100', '2');",
+        )
+        .unwrap();
+    drop(legacy);
+    let legacy_path = directory.path().join("authority.sqlite");
+    std::os::unix::fs::symlink(&target, &legacy_path).unwrap();
+
+    let authority = open_authority_at(&legacy_path, &journal_path)
+        .expect("a legacy store behind a live symlink must open");
+    drop(authority);
+
+    let migrated = rusqlite::Connection::open(&journal_path).unwrap();
+    assert_eq!(
+        migrated
+            .query_row(
+                "SELECT mutations FROM mutation_quota WHERE principal='linked-principal'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "2",
+        "the legacy row must be carried over through the symlink"
+    );
 }
 
 #[test]
@@ -878,6 +983,11 @@ fn initial_policy_adoption_requires_outer_receipt_and_does_not_poison_key_pin() 
     let accepted_snapshot =
         initial_policy_snapshot(&wallet, &accepted_key, token("accepted-policy-key"));
     let mut receipt = CustodyResult {
+        surface: Some(bloom_broker_api::CeremonySurfaceRef {
+            surface_id: Token::new("local").unwrap(),
+            identity_digest: digest(91),
+        }),
+        credential_authority_generation: Some(DecimalU64::new(0)),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation(91),
         public_status: CeremonyState::Completed,
@@ -925,6 +1035,43 @@ fn initial_policy_adoption_requires_outer_receipt_and_does_not_poison_key_pin() 
         .authority
         .adopt_custody_receipt(&receipt, 1_000)
         .unwrap();
+}
+
+#[test]
+fn lineage_only_petal_record_loads_but_cannot_prepare_approval() {
+    let harness = Harness::new();
+    let mut record = harness.provenance();
+    record.subject = ProvenanceSubject::Petal {
+        package_hash: digest(9),
+        route: "__lineage__".into(),
+    };
+    record.operation_classes.clear();
+    record.installer_signature = Base64UrlBytes::from_bytes(&[]);
+    sign_zeroed(
+        &mut record,
+        |value| &mut value.installer_signature,
+        PROVENANCE_DOMAIN,
+        &harness.installer_key,
+    );
+    let catalog = ProvenanceCatalog {
+        schema: PROVENANCE_CATALOG_SCHEMA.into(),
+        records: vec![record.clone()],
+    };
+    catalog.validate_shape().unwrap();
+    harness
+        .authority
+        .synchronize_provenance_catalog(&catalog)
+        .expect("lineage-only catalog record loads");
+    harness
+        .authority
+        .install_provenance(&record)
+        .expect("single-record install also accepts lineage-only metadata");
+    let terms = petal_terms(&harness, &record);
+    let error = harness
+        .authority
+        .prepare_approval(&terms, &digest(7))
+        .expect_err("no operation class may be approved");
+    assert!(error_code(error).contains("PROVENANCE_INVALID"));
 }
 
 #[test]
@@ -978,6 +1125,11 @@ fn petal_scoped_key_is_frozen_to_installer_provenance_and_petal_approvals() {
     child.locator = "petal-child-1".into();
     child.public_key_fingerprint = digest(95);
     let mut receipt = CustodyResult {
+        surface: Some(bloom_broker_api::CeremonySurfaceRef {
+            surface_id: Token::new("local").unwrap(),
+            identity_digest: digest(91),
+        }),
+        credential_authority_generation: Some(DecimalU64::new(0)),
         ceremony_kind: CeremonyKind::KeyDerive,
         custody_operation_id: scope.custody_operation_id.clone(),
         public_status: CeremonyState::Succeeded,
@@ -2790,6 +2942,7 @@ fn initial_policy_snapshot(
         allowed_petal_packages: Vec::new(),
         allowed_destinations: Vec::new(),
         required_verifiers: Vec::new(),
+        clear_signing: None,
     };
     let canonical = serde_jcs::to_vec(&policy).unwrap();
     let mut snapshot = SignedPolicySnapshot {
@@ -2922,6 +3075,11 @@ fn signed_allocation_receipt(
     children: Vec<KeyRef>,
 ) -> CustodyResult {
     let mut receipt = CustodyResult {
+        surface: Some(bloom_broker_api::CeremonySurfaceRef {
+            surface_id: Token::new("local").unwrap(),
+            identity_digest: digest(91),
+        }),
+        credential_authority_generation: Some(DecimalU64::new(0)),
         ceremony_kind: CeremonyKind::AccountAllocate,
         custody_operation_id: replay_id.clone(),
         public_status: CeremonyState::Succeeded,
@@ -3183,6 +3341,11 @@ fn scoped_petal_child_on(harness: &Harness) -> (ProvenanceRecord, PetalKeyScope,
     child.locator = "petal-child-1".into();
     child.public_key_fingerprint = digest(95);
     let mut receipt = CustodyResult {
+        surface: Some(bloom_broker_api::CeremonySurfaceRef {
+            surface_id: Token::new("local").unwrap(),
+            identity_digest: digest(91),
+        }),
+        credential_authority_generation: Some(DecimalU64::new(0)),
         ceremony_kind: CeremonyKind::KeyDerive,
         custody_operation_id: scope.custody_operation_id.clone(),
         public_status: CeremonyState::Succeeded,

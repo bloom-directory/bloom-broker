@@ -11,12 +11,16 @@ use std::{
 use bloom_audit_checkpoint::{CheckpointDecision, CheckpointDecisionOutcome, CheckpointSink};
 use bloom_signer_api::{
     Base64UrlBytes, BrokerSignerRequest, BrokerSignerResponse, CeremonyCompleteRequest,
-    CeremonyKind, CustodyBindOutputRecipientRequest, CustodyCompleteRequest, CustodyPrepareRequest,
-    CustodyResult, Digest32, IdRequest, OperationId, PolicyUpdateCeremonyCompleteRequest,
+    CeremonyKind, CrossSurfaceCompleteDestinationRequest, CrossSurfaceCompleteSourceRequest,
+    CrossSurfaceHandoff, CrossSurfacePairStartRequest, CrossSurfacePairing,
+    CrossSurfacePrepareSourceRequest, CrossSurfaceSourcePrepared,
+    CustodyBindOutputRecipientRequest, CustodyCompleteRequest, CustodyPrepareRequest,
+    CustodyResult, Digest32, Empty, IdRequest, OperationId, PolicyUpdateCeremonyCompleteRequest,
     PolicyUpdateCeremonyPrepareRequest, ProtocolError, ProtocolErrorCode, SignerActivationReceipt,
     SignerCeremonyCompleteRequest, SignerCeremonyCompleteResponse, SignerCeremonyPrepareRequest,
     SignerCeremonyPrepareResponse, SignerCeremonyStatus, SignerPreparedApproval,
-    SignerPreparedCustody, Token, TypedRequestMethod, is_read_only_method,
+    SignerPreparedCustody, SurfaceEffectiveReport, SurfaceStatus, Token, TypedRequestMethod,
+    is_read_only_method,
 };
 use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
 
@@ -386,6 +390,85 @@ fn journal_error(error: crate::journal::JournalError) -> ProtocolError {
 }
 
 impl CeremonySigner for BrokerSignerClient {
+    fn surface_status(&self) -> Result<SurfaceStatus, ProtocolError> {
+        match self.request(BrokerSignerRequest::SurfaceStatus(Empty {}))? {
+            BrokerSignerResponse::SurfaceStatus(status) => Ok(status),
+            _ => Err(response_mismatch("surface.status")),
+        }
+    }
+
+    fn report_surface_effective(
+        &self,
+        report: SurfaceEffectiveReport,
+    ) -> Result<SurfaceStatus, ProtocolError> {
+        match self.request(BrokerSignerRequest::SurfaceReportEffective(report))? {
+            BrokerSignerResponse::SurfaceReportEffective(status) => Ok(status),
+            _ => Err(response_mismatch("surface.report_effective")),
+        }
+    }
+
+    fn cross_surface_pair_start(
+        &self,
+        request: CrossSurfacePairStartRequest,
+    ) -> Result<CrossSurfacePairing, ProtocolError> {
+        match self.request(BrokerSignerRequest::CrossSurfacePairStart(request))? {
+            BrokerSignerResponse::CrossSurfacePairStart(value) => Ok(value),
+            _ => Err(response_mismatch("cross_surface.pair_start")),
+        }
+    }
+
+    fn cross_surface_prepare_source(
+        &self,
+        request: CrossSurfacePrepareSourceRequest,
+    ) -> Result<CrossSurfaceSourcePrepared, ProtocolError> {
+        match self.request(BrokerSignerRequest::CrossSurfacePrepareSource(request))? {
+            BrokerSignerResponse::CrossSurfacePrepareSource(value) => Ok(value),
+            _ => Err(response_mismatch("cross_surface.prepare_source")),
+        }
+    }
+
+    fn cross_surface_complete_source(
+        &self,
+        request: CrossSurfaceCompleteSourceRequest,
+    ) -> Result<CrossSurfaceHandoff, ProtocolError> {
+        match self.request(BrokerSignerRequest::CrossSurfaceCompleteSource(request))? {
+            BrokerSignerResponse::CrossSurfaceCompleteSource(value) => Ok(value),
+            _ => Err(response_mismatch("cross_surface.complete_source")),
+        }
+    }
+
+    fn cross_surface_complete_destination(
+        &self,
+        request: CrossSurfaceCompleteDestinationRequest,
+    ) -> Result<CustodyResult, ProtocolError> {
+        match self.request(BrokerSignerRequest::CrossSurfaceCompleteDestination(
+            request,
+        ))? {
+            BrokerSignerResponse::CrossSurfaceCompleteDestination(value) => Ok(value),
+            _ => Err(response_mismatch("cross_surface.complete_destination")),
+        }
+    }
+
+    fn cross_surface_already_registered(
+        &self,
+        request: bloom_signer_api::CrossSurfaceAlreadyRegisteredRequest,
+    ) -> Result<bloom_signer_api::CeremonyPublicStatus, ProtocolError> {
+        match self.request(BrokerSignerRequest::CrossSurfaceAlreadyRegistered(request))? {
+            BrokerSignerResponse::CrossSurfaceAlreadyRegistered(value) => Ok(value),
+            _ => Err(response_mismatch("cross_surface.already_registered")),
+        }
+    }
+
+    fn credential_list_public(
+        &self,
+        request: bloom_signer_api::WalletRequest,
+    ) -> Result<Vec<bloom_signer_api::CredentialPublic>, ProtocolError> {
+        match self.request(BrokerSignerRequest::CredentialListPublic(request))? {
+            BrokerSignerResponse::CredentialListPublic(value) => Ok(value),
+            _ => Err(response_mismatch("credential.list_public")),
+        }
+    }
+
     fn prepare_approval(
         &self,
         request: bloom_signer_api::CeremonyPrepareRequest,
@@ -765,6 +848,28 @@ mod tests {
 
     #[test]
     fn signer_worker_preserves_trusted_service_span_and_dispatcher() {
+        // Other parallel tests register this checkpoint callsite under the
+        // default no-op dispatcher. Run the captured-dispatch regression in
+        // its own process so tracing's global interest cache cannot race it.
+        const ISOLATED: &str = "BLOOM_ISOLATED_SIGNER_TRACING_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "signer_client::tests::signer_worker_preserves_trusted_service_span_and_dispatcher",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated trusted-span regression failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let _tracing_test = CHECKPOINT_TRACING_TEST_LOCK.lock().unwrap();
         let capture = bloom_service_observability::CapturedWriter::default();
         let subscriber = tracing_subscriber::registry().with(

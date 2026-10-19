@@ -3,6 +3,7 @@
 mod approval;
 mod ceremony;
 mod claims;
+mod clear_signing;
 mod codec;
 mod crypto;
 mod error;
@@ -20,6 +21,7 @@ mod wallet_account;
 pub use approval::*;
 pub use ceremony::*;
 pub use claims::*;
+pub use clear_signing::*;
 pub use codec::*;
 pub use crypto::*;
 pub use error::*;
@@ -53,8 +55,8 @@ pub const RATE_LIMIT_DETAILS_MINOR: u16 = 4;
 /// The negotiated range moves as a unit, so there is no accepted minor that
 /// predates any field the Broker may emit. Older peers are refused at the
 /// hello before a response can carry a field their strict decoder rejects.
-pub const BROKER_API_MINOR_MIN: u16 = 6;
-pub const BROKER_API_MINOR_MAX: u16 = 6;
+pub const BROKER_API_MINOR_MIN: u16 = 7;
+pub const BROKER_API_MINOR_MAX: u16 = 7;
 pub const BROKER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(BROKER_API_MAJOR, BROKER_API_MINOR_MAX);
 pub const BROKER_API_RANGE: ProtocolVersionRange =

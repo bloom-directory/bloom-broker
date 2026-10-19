@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Base64UrlBytes, BootEpoch, CeremonyKind, CustodyPrepareRequest, CustodyPrepareResponse,
-    CustodyResult, DecimalU64, Digest32, HelloChallenge, KeyRef, MachineSignRequest, OperationId,
-    PetalUseClaim, PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
-    PolicyUpdateRequest, ProtocolError, RevocationState, SealedApprovalPrepareResponse,
-    SealedApprovalTerms, ServiceFuture, SignedPolicySnapshot, SigningResult, SystemUseClaim, Token,
-    WalletAccountsPublic,
+    Base64UrlBytes, BootEpoch, CeremonyCrossSurfacePrepareRequest,
+    CeremonyCrossSurfacePrepareResponse, CeremonyKind, CustodyPrepareRequest,
+    CustodyPrepareResponse, CustodyResult, DecimalU64, Digest32, HelloChallenge, KeyRef,
+    MachineSignRequest, OperationId, PetalUseClaim, PolicyCommitReceipt, PolicyCommitUpdateRequest,
+    PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError, RevocationState,
+    SealedApprovalPrepareResponse, SealedApprovalTerms, ServiceFuture, SignedPolicySnapshot,
+    SigningResult, SystemUseClaim, Token, WalletAccountsPublic,
 };
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -62,6 +63,10 @@ pub struct ServiceCapabilities {
     pub schemas: Vec<Token>,
     pub backends: Vec<BackendPublicCapability>,
     pub assurance_verifiers: Vec<VerifierPublicCapability>,
+    /// One entry per stored clear-signing catalog, ordered by catalog identity.
+    /// Empty when none is stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clear_signing: Vec<crate::ClearSigningStatus>,
     pub frame_max_bytes: DecimalU64,
 }
 
@@ -94,12 +99,41 @@ pub struct KeyRequest {
 #[serde(deny_unknown_fields)]
 pub struct ApprovalPrepareRequest {
     pub operation_id: OperationId,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::CeremonySurfaceSelection::is_default"
+    )]
+    pub surface_selection: crate::CeremonySurfaceSelection,
     pub terms: SealedApprovalTerms,
     pub canonical_plan_facts_digest: Digest32,
+    /// Optional native EVM signing preimages. Broker verifies the exact selector
+    /// and decodes these bytes itself before constructing the owner review.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evm_review_payloads: Vec<Base64UrlBytes>,
+    /// Canonical Safe review envelopes. Broker reconstructs the Safe EIP-712
+    /// preimage from each envelope and binds it to the exact selector.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safe_review_payloads: Vec<Base64UrlBytes>,
+    /// The review mode the caller requires for this whole batch. Omitted
+    /// means `clear` in a wallet that has clear signing enabled, and leaves
+    /// the previous envelope behavior in one that has not. A peer that does
+    /// not understand this field rejects the frame rather than ignoring it,
+    /// so a required mode can never be silently dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_review_mode: Option<ReviewMode>,
     #[serde(default)]
     pub petal_use_claim: Option<PetalUseClaim>,
     #[serde(default)]
     pub system_use_claim: Option<SystemUseClaim>,
+}
+
+/// One mode for the whole batch. There is no mixed badge, no automatic
+/// split, and no downgrade from `clear` to `opaque_exact`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewMode {
+    Clear,
+    OpaqueExact,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -266,6 +300,8 @@ pub enum CredentialState {
 pub struct CredentialPublic {
     pub credential_id: Base64UrlBytes,
     pub wallet_id: Token,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<crate::CeremonySurfaceRef>,
     pub created_at_ms: DecimalU64,
     pub state: CredentialState,
 }
@@ -298,6 +334,12 @@ pub enum CeremonyState {
     Expired,
     #[serde(rename = "FAILED")]
     Failed,
+    /// Terminal passkey addition that changed nothing: the new device's
+    /// passkey provider already held one of the wallet's passkeys for that
+    /// site (a synced copy or an earlier registration). The device can already
+    /// approve for the wallet; there is nothing to retry.
+    #[serde(rename = "ALREADY_REGISTERED")]
+    AlreadyRegistered,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -327,6 +369,8 @@ pub enum MachineBrokerRequest {
     BrokerReadiness(Empty),
     #[serde(rename = "broker.capabilities")]
     BrokerCapabilities(Empty),
+    #[serde(rename = "ceremony.surface_status")]
+    CeremonySurfaceStatus(Empty),
     #[serde(rename = "action.validate")]
     ActionValidate(Digest32),
     #[serde(rename = "sealed_approval.prepare")]
@@ -395,6 +439,8 @@ pub enum MachineBrokerRequest {
     CredentialListPublic(WalletRequest),
     #[serde(rename = "credential.add_prepare")]
     CredentialAddPrepare(CustodyPrepareRequest),
+    #[serde(rename = "credential.cross_surface_prepare")]
+    CredentialCrossSurfacePrepare(CeremonyCrossSurfacePrepareRequest),
     #[serde(rename = "credential.replace_prepare")]
     CredentialReplacePrepare(CustodyPrepareRequest),
     #[serde(rename = "credential.remove_prepare")]
@@ -418,6 +464,8 @@ pub enum MachineBrokerResponse {
     BrokerReadiness(Readiness),
     #[serde(rename = "broker.capabilities")]
     BrokerCapabilities(ServiceCapabilities),
+    #[serde(rename = "ceremony.surface_status")]
+    CeremonySurfaceStatus(crate::CeremonyExposureStatus),
     #[serde(rename = "action.validate")]
     ActionValidate(Digest32),
     #[serde(rename = "sealed_approval.prepare")]
@@ -486,6 +534,8 @@ pub enum MachineBrokerResponse {
     CredentialListPublic(Vec<CredentialPublic>),
     #[serde(rename = "credential.add_prepare")]
     CredentialAddPrepare(CustodyPrepareResponse),
+    #[serde(rename = "credential.cross_surface_prepare")]
+    CredentialCrossSurfacePrepare(CeremonyCrossSurfacePrepareResponse),
     #[serde(rename = "credential.replace_prepare")]
     CredentialReplacePrepare(CustodyPrepareResponse),
     #[serde(rename = "credential.remove_prepare")]
@@ -555,6 +605,7 @@ impl crate::TypedRequestMethod for MachineBrokerRequest {
             | Request::CredentialReplacePrepare(request)
             | Request::CredentialRemovePrepare(request)
             | Request::RecoveryPrepare(request) => Some(request.custody_operation_id.clone()),
+            Request::CredentialCrossSurfacePrepare(request) => Some(request.operation_id.clone()),
             _ => None,
         })
     }
