@@ -1228,6 +1228,10 @@ impl BrokerRpcService {
                 ProtocolError::new(ProtocolErrorCode::ApprovalNotFound, "approval not found")
             })?;
         let clob_auth = crate::message_review::polymarket_auth::is_scope(&terms);
+        let hyperliquid_agent = request
+            .petal_use_claim
+            .as_ref()
+            .is_some_and(|claim| claim.operation_class.as_str() == "hyperliquid.agent_action");
         crate::message_review::validate_selector(&terms, request.petal_use_claim.as_ref())?;
         let trusted_time_required = clob_auth
             || !terms.limits.operation_rate_limits.is_empty()
@@ -1245,7 +1249,7 @@ impl BrokerRpcService {
         // the only layer that can: authority is synchronous and journal-
         // backed, while the account projection comes from the Signer.
         let expected_signer_public_key = self.resolve_terms_signer_public_key(&terms).await?;
-        if clob_auth {
+        if clob_auth || hyperliquid_agent {
             let response = self
                 .signer
                 .request_for_machine(BrokerSignerRequest::KeyGetPublic(
@@ -1255,19 +1259,24 @@ impl BrokerRpcService {
                 ))
                 .await?;
             let BrokerSignerResponse::KeyGetPublic(key) = response else {
-                return Err(response_mismatch("CLOB authentication public key"));
+                return Err(response_mismatch("message profile public key"));
             };
             let key = translate_service::key_to_machine(key);
             if key.key_ref != terms.key_ref {
-                return Err(response_mismatch("CLOB authentication key identity"));
+                return Err(response_mismatch("message profile key identity"));
             }
             let owner = evm_address_from_public_key(&key.canonical_public_key.decode())?;
-            crate::message_review::polymarket_auth::verify_use(
-                &terms,
-                &request,
-                owner,
-                reserved_at_ms,
-            )?;
+            if hyperliquid_agent {
+                crate::message_review::verify_hyperliquid_agent_use(&request, owner)?;
+            }
+            if clob_auth {
+                crate::message_review::polymarket_auth::verify_use(
+                    &terms,
+                    &request,
+                    owner,
+                    reserved_at_ms,
+                )?;
+            }
         }
         let decision = self
             .authority

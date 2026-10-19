@@ -79,6 +79,17 @@ an unverified-identity warning; no ticker or market artwork is guessed.
 Existing delegated-agent grants remain a separate approval of future scope,
 not a claim that each later session action received an owner review.
 
+Every `hyperliquid.agent_action` signing use must carry the same complete L1
+witness in `claim_assurance_evidence`. Broker independently reconstructs its
+preimage before authority reservation or signing; a missing or mismatched
+witness is refused, including for grants prepared before this upgrade. This
+uses the existing evidence channel and does not add a ceremony per trade.
+The claim remains `MachineAsserted`: market identities, venue effects and
+Petal-local session limits are not independently established. Use-time
+batches retain the input/node/array bounds and allow up to 4096 reading
+fields; owner pages retain their 256-field display bound. Upgrade the
+Hyperliquid package with Broker; older hash-only agent callers are refused.
+
 These operation-class contracts require coordinated Petal publication and
 Machine catalog repinning with the Broker release. Do not ship the reader's
 mandatory classes while the default catalog still distributes older callers.

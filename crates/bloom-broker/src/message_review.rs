@@ -19,6 +19,54 @@ mod hyperliquid;
 mod polymarket;
 pub(crate) mod polymarket_auth;
 
+/// A standing agent grant authorizes future actions, so its exact witness
+/// arrives at signing use rather than through a new owner ceremony. This
+/// establishes the action/preimage only, not venue effects or local caps.
+pub(crate) fn verify_hyperliquid_agent_use(
+    request: &bloom_broker_api::MachineSignRequest,
+    signer: Address,
+) -> Result<MessageReview, ProtocolError> {
+    let claim = request
+        .petal_use_claim
+        .as_ref()
+        .ok_or_else(|| invalid("Agent action requires its claim"))?;
+    if claim.operation_class.as_str() != "hyperliquid.agent_action"
+        || request.crypto_suite != CryptoSuite::Secp256k1Keccak256Recoverable
+        || claim.crypto_suite != request.crypto_suite
+        || !claim.declared_debits.is_empty()
+        || !claim.declared_destinations.is_empty()
+        || claim.declared_fee != bloom_broker_api::DeclaredFee::None
+    {
+        return Err(invalid(
+            "Agent action has an unsupported class, suite or financial claim",
+        ));
+    }
+    let evidence = request.claim_assurance_evidence.as_ref().ok_or_else(|| {
+        invalid("Agent action requires its full use-time witness; upgrade the Hyperliquid package")
+    })?;
+    // Use-time batches do not render a new owner page. Keep the same input
+    // size/node/array bounds while allowing all their leaves to be checked.
+    let (preimage, review) = decode_with_exchange_limit(&evidence.decode(), signer, 4096)?;
+    if review.kind != "hyperliquid_l1" {
+        return Err(invalid(
+            "Delegated Hyperliquid actions require an ordered L1 action witness",
+        ));
+    }
+    let payload = match &request.payloads {
+        bloom_broker_api::SigningPayloads::Single { payload } => payload,
+        bloom_broker_api::SigningPayloads::Batch { children } if children.len() == 1 => {
+            &children[0]
+        }
+        _ => return Err(invalid("Agent action requires exactly one signing payload")),
+    };
+    if payload.decode() != preimage {
+        return Err(invalid(
+            "Agent action witness differs from its actual signing bytes",
+        ));
+    }
+    Ok(review)
+}
+
 /// Check at preparation AND signing use, including grants made by older
 /// Broker versions. Upgrading must not leave old opaque reusable grants usable.
 pub(crate) fn validate_selector(
@@ -408,6 +456,14 @@ fn login_fields(
 }
 
 fn decode(bytes: &[u8], signer: Address) -> Result<(Vec<u8>, MessageReview), ProtocolError> {
+    decode_with_exchange_limit(bytes, signer, MAX_FIELDS)
+}
+
+fn decode_with_exchange_limit(
+    bytes: &[u8],
+    signer: Address,
+    exchange_field_limit: usize,
+) -> Result<(Vec<u8>, MessageReview), ProtocolError> {
     if bytes.len() > bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES {
         return Err(invalid("message review envelope exceeds its size bound"));
     }
@@ -435,6 +491,7 @@ fn decode(bytes: &[u8], signer: Address) -> Result<(Vec<u8>, MessageReview), Pro
                 nonce,
                 vault_address.as_deref(),
                 expires_after,
+                exchange_field_limit,
             )?;
             let nested = serde_json::to_vec(
                 &serde_json::json!({"schema":SCHEMA,"kind":"eip712","typed_data":typed_data}),
@@ -1013,6 +1070,136 @@ mod tests {
             wrong[section]["displayAmount"] = json!("0.01 USDC");
             assert!(decode(&envelope(wrong), signer()).is_err());
         }
+    }
+
+    #[test]
+    fn delegated_exchange_witness_is_checked_against_the_actual_use_payload() {
+        use bloom_broker_api::{
+            ClaimAssurance, DeclaredFee, MachineSignRequest, PetalUseClaim, ProvenanceSubject,
+            SigningPayloads,
+        };
+        let witness = json!({"schema":SCHEMA,"kind":"hyperliquid_l1","network":"mainnet",
+            "action":{"type":"cancel","cancels":[{"a":0,"o":42}]},"nonce":1_700_000_000_000u64});
+        let bytes = serde_json::to_vec(&witness).unwrap();
+        let (raw, _) = decode(&bytes, signer()).unwrap();
+        let base = request(bytes.clone());
+        let mut input = MachineSignRequest {
+            operation_id: base.operation_id,
+            operation_digest: Digest32::from_bytes([4; 32]),
+            approval_id: Digest32::from_bytes([5; 32]),
+            key_ref: base.terms.key_ref,
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payloads: SigningPayloads::Single {
+                payload: Base64UrlBytes::from_bytes(&raw),
+            },
+            petal_use_claim: Some(PetalUseClaim {
+                package_hash: Digest32::from_bytes([1; 32]),
+                route: "agent/cancel".into(),
+                operation_class: Token::new("hyperliquid.agent_action").unwrap(),
+                crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+                payload_digest: Digest32::from_bytes([6; 32]),
+                ordered_hashes: vec![],
+                declared_debits: vec![],
+                declared_destinations: vec![],
+                declared_fee: DeclaredFee::None,
+                nonce: RequestNonce::from_bytes([7; 16]),
+                claim_assurance: ClaimAssurance::MachineAsserted,
+            }),
+            system_use_claim: None,
+            claim_assurance_evidence: Some(Base64UrlBytes::from_bytes(&bytes)),
+            provenance: ProvenanceSubject::Petal {
+                package_hash: Digest32::from_bytes([1; 32]),
+                route: "agent/cancel".into(),
+            },
+        };
+        let reading = verify_hyperliquid_agent_use(&input, signer()).unwrap();
+        assert_eq!(reading.kind, "hyperliquid_l1");
+        assert!(
+            reading
+                .fields
+                .iter()
+                .any(|field| field.path == "Action" && field.value == "cancel")
+        );
+        for (key, value) in [
+            ("nonce", json!(1_700_000_000_001u64)),
+            ("network", json!("testnet")),
+            (
+                "vault_address",
+                json!(format!("{:#x}", Address::with_last_byte(9))),
+            ),
+            ("expires_after", json!(1_900_000_000_000u64)),
+        ] {
+            let mut altered = witness.clone();
+            altered[key] = value;
+            let mut changed = input.clone();
+            changed.claim_assurance_evidence = Some(Base64UrlBytes::from_bytes(
+                &serde_json::to_vec(&altered).unwrap(),
+            ));
+            assert!(
+                verify_hyperliquid_agent_use(&changed, signer()).is_err(),
+                "{key}"
+            );
+        }
+        let mut altered = witness.clone();
+        altered["action"]["cancels"][0]["o"] = json!(43);
+        let mut changed = input.clone();
+        changed.claim_assurance_evidence = Some(Base64UrlBytes::from_bytes(
+            &serde_json::to_vec(&altered).unwrap(),
+        ));
+        assert!(verify_hyperliquid_agent_use(&changed, signer()).is_err());
+        let mut changed = input.clone();
+        changed.claim_assurance_evidence = None;
+        assert!(verify_hyperliquid_agent_use(&changed, signer()).is_err());
+        let mut changed = input.clone();
+        changed.crypto_suite = CryptoSuite::Secp256k1Sha256Recoverable;
+        assert!(verify_hyperliquid_agent_use(&changed, signer()).is_err());
+        let mut changed = input.clone();
+        changed.payloads = SigningPayloads::Batch {
+            children: vec![Base64UrlBytes::from_bytes(&raw); 2],
+        };
+        assert!(verify_hyperliquid_agent_use(&changed, signer()).is_err());
+        let mut changed = input.clone();
+        changed.claim_assurance_evidence = Some(Base64UrlBytes::from_bytes(
+            &serde_json::to_vec(&json!({
+            "schema":SCHEMA,"kind":"personal","message":"not an exchange action"}))
+            .unwrap(),
+        ));
+        assert!(verify_hyperliquid_agent_use(&changed, signer()).is_err());
+        let mut changed = input.clone();
+        changed.petal_use_claim.as_mut().unwrap().declared_fee = DeclaredFee::Fee {
+            chain: Token::new("hyperliquid").unwrap(),
+            asset: "usdc".into(),
+            amount: bloom_broker_api::DecimalU256::parse("1").unwrap(),
+        };
+        assert!(verify_hyperliquid_agent_use(&changed, signer()).is_err());
+        let mut fresh = witness;
+        fresh["nonce"] = json!(1_700_000_000_123u64);
+        let evidence = serde_json::to_vec(&fresh).unwrap();
+        let (raw, _) = decode(&evidence, signer()).unwrap();
+        input.payloads = SigningPayloads::Single {
+            payload: Base64UrlBytes::from_bytes(&raw),
+        };
+        input.claim_assurance_evidence = Some(Base64UrlBytes::from_bytes(&evidence));
+        verify_hyperliquid_agent_use(&input, signer()).unwrap();
+        let mut batch = fresh;
+        batch["action"]["cancels"] =
+            Value::Array((0..128).map(|oid| json!({"a":0,"o":oid})).collect());
+        let evidence = serde_json::to_vec(&batch).unwrap();
+        assert!(
+            decode(&evidence, signer()).is_err(),
+            "owner display retains its smaller field bound"
+        );
+        let (raw, expanded) = decode_with_exchange_limit(&evidence, signer(), 4096).unwrap();
+        assert!(expanded.fields.len() > MAX_FIELDS);
+        input.payloads = SigningPayloads::Single {
+            payload: Base64UrlBytes::from_bytes(&raw),
+        };
+        input.claim_assurance_evidence = Some(Base64UrlBytes::from_bytes(&evidence));
+        verify_hyperliquid_agent_use(&input, signer()).unwrap();
+        assert_eq!(
+            input.petal_use_claim.unwrap().claim_assurance,
+            ClaimAssurance::MachineAsserted
+        );
     }
 
     #[test]

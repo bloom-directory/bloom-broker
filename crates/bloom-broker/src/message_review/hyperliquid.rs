@@ -102,8 +102,13 @@ fn field(path: impl Into<String>, value: impl ToString) -> MessageField {
     }
 }
 
-fn collect(value: &Value, path: &str, fields: &mut Vec<MessageField>) -> Result<(), ProtocolError> {
-    if fields.len() >= super::MAX_FIELDS {
+fn collect(
+    value: &Value,
+    path: &str,
+    fields: &mut Vec<MessageField>,
+    limit: usize,
+) -> Result<(), ProtocolError> {
+    if fields.len() >= limit {
         return Err(invalid("exchange action exceeds its display bound"));
     }
     match value {
@@ -112,7 +117,7 @@ fn collect(value: &Value, path: &str, fields: &mut Vec<MessageField>) -> Result<
                 fields.push(field(path, "{}"));
             }
             for (name, value) in values {
-                collect(value, &format!("{path}.{name}"), fields)?;
+                collect(value, &format!("{path}.{name}"), fields, limit)?;
             }
         }
         Value::Array(values) => {
@@ -120,7 +125,7 @@ fn collect(value: &Value, path: &str, fields: &mut Vec<MessageField>) -> Result<
                 fields.push(field(path, "[]"));
             }
             for (index, value) in values.iter().enumerate() {
-                collect(value, &format!("{path}[{}]", index + 1), fields)?;
+                collect(value, &format!("{path}[{}]", index + 1), fields, limit)?;
             }
         }
         value => {
@@ -172,6 +177,7 @@ pub(super) fn rebuild(
     nonce: u64,
     vault: Option<&str>,
     expires: Option<u64>,
+    field_limit: usize,
 ) -> Result<(Value, Vec<MessageField>, String), ProtocolError> {
     let source = match network {
         "mainnet" => "a",
@@ -239,7 +245,7 @@ pub(super) fn rebuild(
                 .unwrap_or_else(|| "No expiry included".into()),
         ),
     ];
-    collect(&canonical, "action", &mut fields)?;
+    collect(&canonical, "action", &mut fields, field_limit)?;
     let title = match action {
         Action::Order { .. } => "Sign exchange orders",
         Action::Cancel { .. } | Action::CancelByCloid { .. } => "Cancel exchange orders",
@@ -435,6 +441,7 @@ mod tests {
             123,
             Some("0x0000000000000000000000000000000000000003"),
             Some(999999),
+            super::super::MAX_FIELDS,
         )
         .unwrap();
         let td: alloy_dyn_abi::eip712::TypedData = serde_json::from_value(typed).unwrap();
@@ -449,7 +456,17 @@ mod tests {
         );
         let mut extra = action;
         extra["orders"][0]["displayAmount"] = json!("fake");
-        assert!(rebuild("mainnet", extra, 123, None, None).is_err());
-        assert!(rebuild("unknown", json!({"type":"scheduleCancel"}), 123, None, None).is_err());
+        assert!(rebuild("mainnet", extra, 123, None, None, super::super::MAX_FIELDS).is_err());
+        assert!(
+            rebuild(
+                "unknown",
+                json!({"type":"scheduleCancel"}),
+                123,
+                None,
+                None,
+                super::super::MAX_FIELDS
+            )
+            .is_err()
+        );
     }
 }
