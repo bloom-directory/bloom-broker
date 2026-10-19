@@ -347,6 +347,12 @@ or settlement attestation.
 
 ### Enso Router V2 inputs and requested output checks
 
+The catalog covers all twelve networks accepted by the Enso Petal: Ethereum,
+Base, Polygon, BNB, Arbitrum, Optimism, Avalanche, Gnosis, HyperEVM, Linea,
+Tempo and Robinhood. Addresses are network-specific; another deployment or
+network does not inherit an Enso identity. The Petal prepares same-chain routes
+with Router V2 output checks and preserves their actual floor across refresh.
+
 The listed Router V2 deployments read `routeSingle` and `routeMulti` source
 envelopes. Bloom's `ensoToken` format binds a bytes field to its sibling uint8
 `typePath`: native inputs show the transaction's actual value; ERC-20 inputs

@@ -268,12 +268,28 @@ fn safe_route_arrays_preserve_element_binding_and_show_absent_output_checks() {
 #[test]
 fn safe_route_is_bound_to_reviewed_deployments_and_canonical_output_data() {
     let bytes = safe_encode(SAFE_SINGLE, input(USDC, 1), input(USDC, 2));
-    for chain in [1, 10, 56, 100, 137, 8453, 42161, 43114] {
+    let deployments = [
+        (1, ROUTER),
+        (10, ROUTER),
+        (56, ROUTER),
+        (100, ROUTER),
+        (137, ROUTER),
+        (8453, ROUTER),
+        (42161, ROUTER),
+        (43114, ROUTER),
+        (999, ROUTER),
+        (59144, "0xa146d46823f3f594b785200102be5385cafce9b5"),
+        (4217, "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"),
+        (4663, "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"),
+    ];
+    for (chain, router) in deployments {
         let mut ctx = context(&bytes);
         ctx.chain_id = chain;
-        ctx.to = ROUTER.parse().unwrap();
+        ctx.to = router.parse().unwrap();
         ctx.value = U256::ZERO;
         assert!(review_call(Catalog::built_in().unwrap(), &ctx).is_ok());
+        ctx.to = RECIPIENT.parse().unwrap();
+        assert!(review_call(Catalog::built_in().unwrap(), &ctx).is_err());
     }
     let mut ctx = context(&bytes);
     ctx.chain_id = 8453;

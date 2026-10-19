@@ -1,6 +1,6 @@
 {
   "$schema": "https://eips.ethereum.org/assets/eip-7730/erc7730-v2.schema.json",
-  "$comment": "Enso Router V2 input envelopes and safe-route output balance-increase checks; Bloom ensoToken/ensoTokenOutput extensions. Source: EnsoBuild/shortcuts-client-contracts 483408a3219451858abcd92c2f7b19a9783c14cc src/interfaces/IEnsoRouter.sol, src/router/EnsoRouter.sol and broadcast/EnsoRouterDeployer.s.sol/<chain>/run-latest.json. No runtime code or shortcut program attestation.",
+  "$comment": "Enso Router V2 input envelopes and safe-route output balance-increase checks; Bloom ensoToken/ensoTokenOutput extensions. Source: EnsoBuild/shortcuts-client-contracts 483408a3219451858abcd92c2f7b19a9783c14cc src/interfaces/IEnsoRouter.sol, src/router/EnsoRouter.sol and broadcast/EnsoRouterDeployer.s.sol/<chain>/run-latest.json; Tempo 4217 and Robinhood 4663 deployments: https://docs.enso.build/pages/build/reference/deployments.md retrieved 2026-10-19. Covers all 12 networks accepted by the Enso Petal's chain parser. No runtime code or shortcut program attestation.",
   "context": {
     "contract": {
       "deployments": [
@@ -35,6 +35,22 @@
         {
           "chainId": 43114,
           "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+        },
+        {
+          "chainId": 999,
+          "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+        },
+        {
+          "chainId": 59144,
+          "address": "0xa146d46823f3f594b785200102be5385cafce9b5"
+        },
+        {
+          "chainId": 4217,
+          "address": "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"
+        },
+        {
+          "chainId": 4663,
+          "address": "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"
         }
       ]
     }
