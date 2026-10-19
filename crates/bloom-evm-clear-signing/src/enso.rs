@@ -283,6 +283,7 @@ pub(crate) fn decode(data: &[u8]) -> Result<Program, String> {
         steps: Vec::new(),
     };
     let mut cursor = 0;
+    let mut expanded_bytes = 0usize;
     while cursor < commands.len() {
         let position = cursor;
         let DynSolValue::FixedBytes(word, 32) = &commands[cursor] else {
@@ -344,6 +345,10 @@ pub(crate) fn decode(data: &[u8]) -> Result<Program, String> {
             let data = encode(&args)?.map(|data| [&word[..4], &data].concat());
             (args.into_iter().map(|a| a.description).collect(), data)
         };
+        expanded_bytes += calldata.as_ref().map_or(0, Vec::len);
+        if expanded_bytes > MAX_BYTES {
+            return Err("expanded shortcut calls exceed 64 KiB".into());
+        }
         let selector = calldata
             .as_ref()
             .map(|data| &data[..data.len().min(4)])
