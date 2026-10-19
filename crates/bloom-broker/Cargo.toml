@@ -17,6 +17,7 @@ bloom-broker-api = { path = "../bloom-broker-api" }
 bloom-evm-clear-signing.workspace = true
 bloom-signer-api.workspace = true
 bloom-solana-verify.workspace = true
+bloom-solana-clear-signing.workspace = true
 bloom-relay-client.workspace = true
 bloom-relay-protocol.workspace = true
 bloom-platform-containment.workspace = true

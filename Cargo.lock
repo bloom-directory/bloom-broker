@@ -1087,6 +1087,7 @@ dependencies = [
  "bloom-signer",
  "bloom-signer-api",
  "bloom-signer-vectors",
+ "bloom-solana-clear-signing",
  "bloom-solana-verify",
  "bloom-triad-local-transport",
  "bloom-trusted-time",
@@ -1398,6 +1399,21 @@ dependencies = [
 name = "bloom-signer-vectors"
 version = "0.1.0"
 source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+
+[[package]]
+name = "bloom-solana-clear-signing"
+version = "0.1.0"
+dependencies = [
+ "bloom-broker-api",
+ "bloom-solana-verify",
+ "bs58",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "solana-message",
+ "thiserror",
+]
 
 [[package]]
 name = "bloom-solana-verify"

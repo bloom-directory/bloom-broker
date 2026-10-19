@@ -109,6 +109,7 @@ function el(tag, attrs = {}, ...children) {
 // Bundled geometric symbols, never images fetched by ticker. Network marks
 // are selected by numeric chain ID. Unknown tokens use a neutral coin.
 function reviewIcon(kind) {
+  if (kind === "solana") return el("img", {src: "/assets/networks/solana.svg", alt: "Solana", width: "32", height: "32"});
   const svg = el("svg", {viewBox: "0 0 32 32", "aria-hidden": "true", focusable: "false"});
   if (kind === "ethereum") {
     // The public Ethereum mark: blue disc, white diamond. Drawn here so a
@@ -591,6 +592,7 @@ function describeTransfer(manifest) {
     const hyperliquid = String(message.kind).startsWith("hyperliquid_");
     const polymarket = message.kind === "polymarket_exact";
     const authenticationScope = message.kind === "polymarket_auth_scope";
+    const solana = message.kind === "solana_message";
     const signingChain = chainId;
     const venueNetwork = fields.find(field => ["hyperliquidChain", "Hyperliquid environment"].includes(field.path))?.value;
     if (hyperliquid) chainId = null;
@@ -609,6 +611,9 @@ function describeTransfer(manifest) {
       return `${value} Unix seconds`;
     };
     const primary = [];
+    const solanaFeeBudget = solana && fields.some(field => field.path === "Requested priority fee ceiling");
+    const solanaCompute = new Set(solanaFeeBudget ? fields.filter(field => /^Instruction \d+$/.test(field.path)
+      && field.value.startsWith("Compute budget ·")).map(field => field.path) : []);
     for (const field of domain) {
       const row = [field.path === "chainId" && hyperliquid ? "Signing domain chain ID" : labels[field.path] || field.path,
         field.path === "chainId" && signingChain ? signingChain : field.value, true];
@@ -619,6 +624,12 @@ function describeTransfer(manifest) {
     if (payment) primary.push(["Valid from", time(payment.valid_after)], ["Valid until", time(payment.valid_before)]);
     else for (const field of fields) {
       const row = [hyperliquid ? messageLabels[field.path] || field.path : field.path, field.value, true];
+      if (solana && (["Transaction binding (recent blockhash excluded)", "Recent blockhash (refreshable)", "Message SHA-256"].includes(field.path)
+        || field.path.endsWith(" · Exact instruction bytes") || field.path.endsWith(" · Program")
+        || ([...solanaCompute].some(prefix => field.path === prefix || field.path.startsWith(`${prefix} ·`)))
+        || (/ \(index \d+\)$/.test(field.path) && !/ · (mint|base_mint|quote_mint|user|source|destination|rent recipient|new account) \(index /.test(field.path)))) {
+        extraTechnical.push(row); continue;
+      }
       if (polymarket) {
         const labels = {"contents.maker": "Deposit wallet", "contents.signer": "Order signer",
           wallet: "Deposit wallet", deadline: "Signed deadline", "Side (0 buy, 1 sell)": "Order side"};
@@ -648,13 +659,14 @@ function describeTransfer(manifest) {
         ? ["The Petal reports the destination and policy limits. These claims are not established by the message signature; review them separately from the signed authorization."] : [];
     return {
       intent: {action: "sign_message", heading: message.title || "Sign a message"},
-      button: authenticationScope ? "Allow one authentication" : payment ? "Approve payment authorization" : agent ? "Authorize trading agent"
+      button: solana ? "Approve Solana transaction" : authenticationScope ? "Allow one authentication" : payment ? "Approve payment authorization" : agent ? "Authorize trading agent"
         : hyperliquid ? "Approve exchange action" : "Approve message signature",
-      sentence: authenticationScope ? "Allow the fixed authentication profile below. Broker checks the fresh message when this permission is used."
+      sentence: solana ? "Approve one transaction. Only its recent blockhash may refresh; every other signed byte remains bound to this review."
+        : authenticationScope ? "Allow the fixed authentication profile below. Broker checks the fresh message when this permission is used."
         : payment ? "Authorize this exact token payment within the signed validity window." : "Review the exact fields bound to this message signature.",
-      chainId, networkIdentity: hyperliquid ? `Hyperliquid · ${venueNetwork || "Unknown environment"}`
+      chainId, networkIdentity: solana ? "Solana · cluster not encoded in message" : hyperliquid ? `Hyperliquid · ${venueNetwork || "Unknown environment"}`
         : chainId ? `${({1:"Ethereum",10:"Optimism",56:"BNB Chain",100:"Gnosis",137:"Polygon",8453:"Base",42161:"Arbitrum",43114:"Avalanche",59144:"Linea",999:"HyperEVM",4663:"Robinhood",4217:"Tempo"})[chainId] || "EVM"} · Chain ID ${chainId}` : "Message signature",
-      networkIcon: chainId ? chainIcon(chainId) : "unknown",
+      networkIcon: solana ? "solana" : chainId ? chainIcon(chainId) : "unknown",
       facts: [], technical: [...(message.payload_keccak ? [["Signing hash", message.payload_keccak, true]] : []),
         ...extraTechnical, ...(message.venue_asset?.base_units ? [["USDC base units", message.venue_asset.base_units, true]] : []),
         ...(payment ? fields.map(field => [field.path, field.value, true]) : [])],

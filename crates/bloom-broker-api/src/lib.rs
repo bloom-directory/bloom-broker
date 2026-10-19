@@ -13,6 +13,7 @@ mod provenance;
 mod revocation;
 mod service;
 mod signing;
+mod solana_review;
 pub mod solana_vectors;
 mod tokens;
 mod validation;
@@ -31,6 +32,7 @@ pub use provenance::*;
 pub use revocation::*;
 pub use service::*;
 pub use signing::*;
+pub use solana_review::*;
 pub use tokens::*;
 pub use wallet_account::*;
 

@@ -888,6 +888,10 @@ impl BrokerRpcService {
             }
         }
         let clob_auth = crate::message_review::polymarket_auth::is_scope(&request.terms);
+        let pump_review = crate::solana_review::is_scope(&request.terms)
+            || request.petal_use_claim.as_ref().is_some_and(|c| {
+                bloom_broker_api::pumpfun_review_required(c.operation_class.as_str())
+            });
         crate::message_review::validate_selector(&request.terms, request.petal_use_claim.as_ref())?;
         if clob_auth {
             let claim = request.petal_use_claim.as_ref().ok_or_else(|| {
@@ -918,6 +922,7 @@ impl BrokerRpcService {
             || !request.safe_review_payloads.is_empty()
             || !request.message_review_payloads.is_empty()
             || clob_auth
+            || pump_review
         {
             let response = self
                 .signer
@@ -934,43 +939,54 @@ impl BrokerRpcService {
             if key.key_ref != request.terms.key_ref {
                 return Err(response_mismatch("EVM review key identity"));
             }
-            let from = evm_address_from_public_key(&key.canonical_public_key.decode())?;
-            let snapshot = self
-                .authority
-                .policy_snapshot(&request.terms.wallet_id)
-                .map_err(authority_error)?;
-            // Review against the policy these terms are bound to, so the
-            // creation opt-in is never read from a different version.
-            if snapshot.version != request.terms.policy_version
-                || snapshot.policy_digest != request.terms.policy_digest
-            {
-                return Err(authority_error(AuthorityError::Denied {
-                    code: "POLICY_SNAPSHOT_MISMATCH",
-                    message: "approval is not bound to Broker's verified current policy".into(),
-                }));
-            }
-            let policy: bloom_broker_api::CanonicalWalletPolicy =
-                serde_json::from_slice(&snapshot.canonical_policy.decode()).map_err(|_| {
-                    ProtocolError::new(
-                        ProtocolErrorCode::SelectorMismatch,
-                        "invalid canonical policy",
-                    )
-                })?;
-            let catalog = bloom_evm_clear_signing::Catalog::built_in().map_err(|error| {
-                ProtocolError::new(ProtocolErrorCode::AssuranceUnavailable, error.to_string())
-            })?;
-            if !request.evm_review_payloads.is_empty() {
-                context.evm_review = crate::evm_review::review(&request, &policy, from, catalog)?;
-            }
-            context.safe_review = crate::safe_review::review(&request, &policy, from, catalog)?;
-            context.message_review = if clob_auth {
-                Some(crate::message_review::polymarket_auth::review(
-                    &request.terms,
-                    from,
-                )?)
+            if pump_review {
+                let signer = crate::translation::wallet_account::ed25519_raw_key(
+                    &key.canonical_public_key.decode(),
+                )?;
+                context.message_review = Some(crate::solana_review::prepare(
+                    &request,
+                    bloom_solana_verify::Pubkey::from_bytes(signer),
+                )?);
             } else {
-                crate::message_review::review(&request, from)?
-            };
+                let from = evm_address_from_public_key(&key.canonical_public_key.decode())?;
+                let snapshot = self
+                    .authority
+                    .policy_snapshot(&request.terms.wallet_id)
+                    .map_err(authority_error)?;
+                // Review against the policy these terms are bound to, so the
+                // creation opt-in is never read from a different version.
+                if snapshot.version != request.terms.policy_version
+                    || snapshot.policy_digest != request.terms.policy_digest
+                {
+                    return Err(authority_error(AuthorityError::Denied {
+                        code: "POLICY_SNAPSHOT_MISMATCH",
+                        message: "approval is not bound to Broker's verified current policy".into(),
+                    }));
+                }
+                let policy: bloom_broker_api::CanonicalWalletPolicy =
+                    serde_json::from_slice(&snapshot.canonical_policy.decode()).map_err(|_| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::SelectorMismatch,
+                            "invalid canonical policy",
+                        )
+                    })?;
+                let catalog = bloom_evm_clear_signing::Catalog::built_in().map_err(|error| {
+                    ProtocolError::new(ProtocolErrorCode::AssuranceUnavailable, error.to_string())
+                })?;
+                if !request.evm_review_payloads.is_empty() {
+                    context.evm_review =
+                        crate::evm_review::review(&request, &policy, from, catalog)?;
+                }
+                context.safe_review = crate::safe_review::review(&request, &policy, from, catalog)?;
+                context.message_review = if clob_auth {
+                    Some(crate::message_review::polymarket_auth::review(
+                        &request.terms,
+                        from,
+                    )?)
+                } else {
+                    crate::message_review::review(&request, from)?
+                };
+            }
         }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
             ApprovalSelector::Exact {
@@ -1232,6 +1248,10 @@ impl BrokerRpcService {
             .petal_use_claim
             .as_ref()
             .is_some_and(|claim| claim.operation_class.as_str() == "hyperliquid.agent_action");
+        let pump_review = crate::solana_review::is_scope(&terms)
+            || request.petal_use_claim.as_ref().is_some_and(|c| {
+                bloom_broker_api::pumpfun_review_required(c.operation_class.as_str())
+            });
         crate::message_review::validate_selector(&terms, request.petal_use_claim.as_ref())?;
         let trusted_time_required = clob_auth
             || !terms.limits.operation_rate_limits.is_empty()
@@ -1249,7 +1269,7 @@ impl BrokerRpcService {
         // the only layer that can: authority is synchronous and journal-
         // backed, while the account projection comes from the Signer.
         let expected_signer_public_key = self.resolve_terms_signer_public_key(&terms).await?;
-        if clob_auth || hyperliquid_agent {
+        if clob_auth || hyperliquid_agent || pump_review {
             let response = self
                 .signer
                 .request_for_machine(BrokerSignerRequest::KeyGetPublic(
@@ -1265,17 +1285,44 @@ impl BrokerRpcService {
             if key.key_ref != terms.key_ref {
                 return Err(response_mismatch("message profile key identity"));
             }
-            let owner = evm_address_from_public_key(&key.canonical_public_key.decode())?;
-            if hyperliquid_agent {
-                crate::message_review::verify_hyperliquid_agent_use(&request, owner)?;
-            }
-            if clob_auth {
-                crate::message_review::polymarket_auth::verify_use(
+            if pump_review {
+                let record = self
+                    .journal
+                    .approval_record(&request.approval_id)
+                    .map_err(journal_error)?
+                    .ok_or_else(|| response_mismatch("Solana approval record"))?;
+                let activation = record
+                    .activation_operation_id
+                    .ok_or_else(|| response_mismatch("Solana approval activation"))?;
+                let activation =
+                    OperationId::new(activation).map_err(|e| response_mismatch(&e.to_string()))?;
+                let approved = self.ceremony.bound_message_review(
+                    &activation,
+                    &request.approval_id,
+                    &record.review_manifest_digest,
+                )?;
+                let signer = crate::translation::wallet_account::ed25519_raw_key(
+                    &key.canonical_public_key.decode(),
+                )?;
+                crate::solana_review::verify_use(
                     &terms,
                     &request,
-                    owner,
-                    reserved_at_ms,
+                    bloom_solana_verify::Pubkey::from_bytes(signer),
+                    &approved,
                 )?;
+            } else {
+                let owner = evm_address_from_public_key(&key.canonical_public_key.decode())?;
+                if hyperliquid_agent {
+                    crate::message_review::verify_hyperliquid_agent_use(&request, owner)?;
+                }
+                if clob_auth {
+                    crate::message_review::polymarket_auth::verify_use(
+                        &terms,
+                        &request,
+                        owner,
+                        reserved_at_ms,
+                    )?;
+                }
             }
         }
         let decision = self

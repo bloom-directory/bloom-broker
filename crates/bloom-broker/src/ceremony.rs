@@ -370,6 +370,7 @@ const APP_JS: &str = concat!(
 );
 const STYLE_CSS: &str = include_str!("ceremony_assets/style.css");
 const BLOOM_PRIMARY_SVG: &str = include_str!("ceremony_assets/bloom-primary.svg");
+const SOLANA_NETWORK_SVG: &str = include_str!("ceremony_assets/networks/solana.svg");
 
 /// Optional owner-installed ceremony CSS, read once at startup from the path
 /// named in the Broker configuration and held in memory.
@@ -2268,6 +2269,59 @@ impl CeremonyBroker {
         })
     }
 
+    /// Recover the exact signed owner review through the journal's activation
+    /// operation and manifest digest. Session storage alone is not authority:
+    /// a changed manifest cannot match the approval's committed digest.
+    pub(crate) fn bound_message_review(
+        &self,
+        operation_id: &OperationId,
+        approval_id: &Digest32,
+        expected_manifest_digest: &str,
+    ) -> Result<crate::message_review::MessageReview, ProtocolError> {
+        let id = self
+            .inner
+            .operations
+            .lock()
+            .get(operation_id)
+            .cloned()
+            .ok_or_else(|| {
+                protocol(
+                    ProtocolErrorCode::SelectorMismatch,
+                    "Owner transaction review is missing; prepare a new approval",
+                )
+            })?;
+        let sessions = self.inner.sessions.lock();
+        let session = sessions.get(&id).ok_or_else(|| {
+            protocol(
+                ProtocolErrorCode::SelectorMismatch,
+                "Owner transaction review is missing",
+            )
+        })?;
+        let manifest: ReviewManifest = serde_json::from_value(
+            session.projection.review_manifest.clone().ok_or_else(|| {
+                protocol(
+                    ProtocolErrorCode::SelectorMismatch,
+                    "Owner transaction review is missing",
+                )
+            })?,
+        )
+        .map_err(malformed)?;
+        if &manifest.approval_id != approval_id
+            || digest(&manifest)?.as_str() != expected_manifest_digest
+        {
+            return Err(protocol(
+                ProtocolErrorCode::SelectorMismatch,
+                "Owner transaction review differs from its committed manifest",
+            ));
+        }
+        manifest.message_review.ok_or_else(|| {
+            protocol(
+                ProtocolErrorCode::SelectorMismatch,
+                "This grant predates Solana transaction review; prepare a new approval",
+            )
+        })
+    }
+
     /// Public status as of `now_ms`. Status requests are a lifecycle boundary
     /// just like opening the browser: sweep first so an elapsed AwaitingUser
     /// session is reported as expired rather than as still awaiting the user.
@@ -2553,6 +2607,7 @@ impl CeremonyBroker {
             .route("/assets/style.css", get(style_css))
             .route("/assets/theme.css", get(theme_css))
             .route("/assets/bloom-primary.svg", get(bloom_primary_svg))
+            .route("/assets/networks/solana.svg", get(solana_network_svg))
             .route("/assets/tokens/{name}", get(token_image))
             .route("/api/session", get(read_session_by_token))
             .route("/api/session/{ceremony_id}", get(read_session))
@@ -3919,6 +3974,17 @@ async fn bloom_primary_svg(State(broker): State<CeremonyBroker>, headers: Header
         .into_response()
 }
 
+async fn solana_network_svg(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    if broker.validate_served_host(&headers).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+        SOLANA_NETWORK_SVG,
+    )
+        .into_response()
+}
+
 async fn token_image(
     State(broker): State<CeremonyBroker>,
     Path(name): Path<String>,
@@ -5219,7 +5285,9 @@ fn review_disclosures(
                 .to_owned(),
         );
     }
-    if message_review.is_some() {
+    if message_review.is_some_and(|review| review.kind == "solana_message") {
+        disclosures.push("Bloom parsed the signed Solana message and bound every byte except the refreshable recent blockhash to this owner review. Lookup-table contents, program code, token units, execution effects and settlement remain unverified.".into());
+    } else if message_review.is_some() {
         disclosures.push("Bloom rebuilt the message preimage and verified its exact signing hash. The displayed fields are signed; execution effects and unlisted application/token identities remain unverified.".into());
     }
     if safe_review.is_some_and(crate::safe_review::is_opaque) {
