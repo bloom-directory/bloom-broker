@@ -2381,6 +2381,33 @@ async fn pump_review_binds_real_signer_to_the_reviewed_transaction() {
             &ed25519_dalek::Signature::from_slice(&signature).unwrap(),
         )
         .unwrap();
+
+    // Refresh is allowed before signing, not after consuming the approval.
+    // Reopen Broker again to ensure a second blockhash cannot get another
+    // signature by losing process-local state while the first remains valid.
+    let (broker, authority) =
+        open_broker(directory.path(), &directory.path().join("signer-pump.sock"));
+    stack.broker = broker;
+    stack.authority = authority;
+    stack.authority.install_provenance(&provenance).unwrap();
+    message.message.recent_blockhash = [0x66; 32];
+    let second = message.serialize();
+    let request = signing_request(
+        &terms,
+        &second,
+        Some(claim(&second)),
+        stack.next_operation(),
+    );
+    let rejected = MachineBrokerService::dispatch(
+        stack.broker.as_ref(),
+        MachineBrokerRequest::SigningSign(request),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        rejected.code,
+        bloom_broker_api::ProtocolErrorCode::LimitExceededOperations
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
