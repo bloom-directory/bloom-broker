@@ -369,8 +369,23 @@ units. Outputs never count as source inputs or authorize native input value.
 An empty output list explicitly warns that no minimum requires funds to
 arrive. Unknown tokens stay raw and unsupported NFT layouts remain explicit.
 
-This is partial coverage. The shortcut program remains explicitly undecoded;
-ordinary source envelopes do not establish outputs or recipients. Safe-route
+The `ensoShortcut` format reads canonical `executeShortcut` programs against
+Enso Weiroll revision `900250114203727ff236d3f6313673c17c2d90dd`. It reads
+CALL, STATICCALL and value calls, raw calldata, extended indices, nested
+arrays/tuples and whole-state arguments. Constant inputs reconstruct the exact
+inner calldata and use the existing catalog reader. Return values remain
+symbolic: reading an overwritten state slot never reuses its initial literal.
+Unknown calls retain their target, arguments, bytes and inability-to-read reason.
+The pinned VM does not support delegatecall; other program entry points and
+malformed programs retain exact bytes and an explicit undecoded warning.
+
+Programs are bounded to 64 KiB source and total reconstructed call bytes,
+64 command words, 128 initial slots, eight dynamic nesting levels and the
+VM's ten-entry dynamic table. Recursive call interpretation remains bounded.
+Technical details retain the complete structured program and nested readings.
+
+This is partial coverage: ordinary source envelopes do not establish outputs
+or recipients. Runtime return values, code and effects are not verified. Safe-route
 fields describe requested contract balance checks, not proof of received
 funds, runtime code, intermediate effects, fees or settlement. The review
 remains structural and displays that warning.
@@ -380,7 +395,7 @@ Decoded token-amount fields carry their exact catalog identity, chain and
 formatted amount to the approval UI, including inside nested calls. This gives
 source inputs their own asset cards without misidentifying the router as the
 token. Unknown addresses have no asset identity or borrowed logo. Privacy proof
-words and Enso's opaque shortcut bytes remain in the expandable technical review;
+words and Enso's full shortcut program remain in the expandable technical review;
 amounts and counterparties lead the decision.
 
 ## The owner decides

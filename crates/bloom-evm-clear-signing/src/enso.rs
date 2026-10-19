@@ -519,4 +519,17 @@ mod tests {
         ];
         assert!(encode(&args).is_err());
     }
+
+    #[test]
+    fn repeated_state_expansion_is_bounded_independently_of_source_size() {
+        let word = command(0x21, &[0], 0xff);
+        let encoded = shortcut(&[word; 64], vec![vec![1; 2048]]);
+        assert!(encoded.len() < MAX_BYTES);
+        assert!(
+            decode(&encoded)
+                .err()
+                .unwrap()
+                .contains("expanded shortcut calls")
+        );
+    }
 }
