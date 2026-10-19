@@ -80,6 +80,8 @@ pub enum AdmittedFormat {
     EnsoToken(String),
     /// Enso's requested output balance increase, not its input/value encoding.
     EnsoTokenOutput(String),
+    /// The pinned Enso Weiroll command/state envelope. Runtime results remain symbolic.
+    EnsoShortcut,
 }
 
 /// Which contract an embedded call is made to.
@@ -122,6 +124,7 @@ impl AdmittedFormat {
             Self::SafeBatch => "safeBatch",
             Self::EnsoToken(_) => "ensoToken",
             Self::EnsoTokenOutput(_) => "ensoTokenOutput",
+            Self::EnsoShortcut => "ensoShortcut",
         }
     }
 }
@@ -826,6 +829,12 @@ fn admit_format(
             } else {
                 AdmittedFormat::EnsoToken(type_path)
             })
+        }
+        "ensoShortcut" => {
+            only_keys(&params_map, &[], "ensoShortcut params")?;
+            matches!(kind, LeafType::Bytes)
+                .then_some(AdmittedFormat::EnsoShortcut)
+                .ok_or_else(|| mismatched("bytes"))
         }
         "raw" => {
             only_keys(&params_map, &[], "raw params")?;

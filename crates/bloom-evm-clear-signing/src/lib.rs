@@ -16,6 +16,7 @@
 
 mod catalog;
 mod descriptor;
+mod enso;
 mod render;
 
 pub use catalog::*;

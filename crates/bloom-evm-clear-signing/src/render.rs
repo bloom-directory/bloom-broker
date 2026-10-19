@@ -557,6 +557,41 @@ fn review_at(
                 }
                 structural = true;
             }
+            (AdmittedFormat::EnsoShortcut, DynSolValue::Bytes(data)) => {
+                let value = match crate::enso::decode(data) {
+                    Ok(mut program) => {
+                        for step in &mut program.steps {
+                            match (&step.calldata, step.value) {
+                                (Some(bytes), Some(value)) => {
+                                    let inner = CallContext { to: step.target, value, calldata: bytes, ..context.clone() };
+                                    match review_at(catalog, &inner, depth + 1) {
+                                        Ok((reading, entries)) => {
+                                            for entry in entries { if !used.contains(&entry) { used.push(entry); } }
+                                            step.reading = Some(reading);
+                                        }
+                                        Err(error) => step.unread_reason = Some(error.to_string()),
+                                    }
+                                }
+                                _ => step.unread_reason = Some("Call arguments or native value depend on preceding runtime return data; initial slot values are not reused.".into()),
+                            }
+                        }
+                        serde_json::to_string_pretty(&program)
+                            .map_err(|_| invalid("shortcut reading cannot be serialized"))?
+                    }
+                    Err(reason) => {
+                        warnings.push(format!("Shortcut program not independently decoded: {reason}. Exact bytes are retained."));
+                        format!("Undecoded shortcut: {reason}")
+                    }
+                };
+                fields.push(DisplayField {
+                    label,
+                    format: "ensoShortcut".into(),
+                    value,
+                    raw: format!("0x{}", hex_lower(data)),
+                    asset: None,
+                });
+                structural = true;
+            }
             (AdmittedFormat::Calldata { callee, amount }, DynSolValue::Bytes(data)) => {
                 let callee = match callee {
                     CalleeSource::TargetContract => context.to,
@@ -655,9 +690,9 @@ fn review_at(
             .iter()
             .any(|field| matches!(field.format, AdmittedFormat::EnsoTokenOutput(_)))
         {
-            "Enso inputs, requested output minimums and receiver are decoded from calldata. These are requested balance-increase checks, not proof of received funds. The shortcut program, runtime code, intermediate effects, fees and settlement are not independently decoded or verified."
+            "Enso inputs, requested output minimums and receiver are decoded from calldata. These are requested balance-increase checks, not proof of received funds. Shortcut commands and constant calls are read in technical details; runtime return values, code, intermediate effects, fees and settlement are not verified."
         } else {
-            "Enso input amounts are decoded. The shortcut program, output token, recipient, minimum output, fees and destination settlement are not independently decoded; route quotes are not signed guarantees."
+            "Enso input amounts and supported shortcut commands are decoded. Ordinary route envelopes do not constrain output token, recipient or minimum output. Runtime values, fees and destination settlement are not verified; route quotes are not signed guarantees."
         };
         warnings.push(warning.into());
         if enso_outputs == 0
@@ -1184,7 +1219,8 @@ fn render_field(
         AdmittedFormat::Calldata { .. }
         | AdmittedFormat::SafeBatch
         | AdmittedFormat::EnsoToken(_)
-        | AdmittedFormat::EnsoTokenOutput(_) => {
+        | AdmittedFormat::EnsoTokenOutput(_)
+        | AdmittedFormat::EnsoShortcut => {
             return Err(invalid(
                 "an embedded call is rendered as a call, not a value",
             ));
