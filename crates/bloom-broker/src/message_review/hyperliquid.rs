@@ -135,6 +135,7 @@ fn collect(
                 "action.isCross" => "Cross margin".into(),
                 "action.leverage" => "Leverage".into(),
                 "action.time" => "Scheduled cancellation (Unix milliseconds)".into(),
+                "action.f" => "Fast cancellation".into(),
                 "action.grouping" => "Order grouping".into(),
                 "action.builder.b" => "Builder fee recipient".into(),
                 "action.builder.f" => "Builder fee rate (tenths of a basis point)".into(),
@@ -156,6 +157,18 @@ fn collect(
                         _ => suffix,
                     };
                     format!("{}] · {name}", order.trim_start_matches("action."))
+                }
+                _ if path.starts_with("action.cancels[") => {
+                    let (cancel, suffix) = path
+                        .split_once(']')
+                        .ok_or_else(|| invalid("invalid cancellation path"))?;
+                    let name = match suffix {
+                        ".a" | ".asset" => "Market ID (identity unverified)",
+                        ".o" => "Order ID",
+                        ".cloid" => "Client order ID",
+                        _ => suffix,
+                    };
+                    format!("{}] · {name}", cancel.trim_start_matches("action."))
                 }
                 _ => path.trim_start_matches("action.").into(),
             };
@@ -423,6 +436,37 @@ pub(super) fn validate_payment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancellations_label_identifiers_without_claiming_market_identity() {
+        for (action, label, value) in [
+            (
+                json!({"type":"cancel","cancels":[{"a":7,"o":123}],"f":true}),
+                "Order ID",
+                "123",
+            ),
+            (
+                json!({"type":"cancelByCloid","cancels":[{"asset":7,"cloid":"0x00000000000000000000000000000001"}],"f":true}),
+                "Client order ID",
+                "0x00000000000000000000000000000001",
+            ),
+        ] {
+            let (_, fields, _) =
+                rebuild("mainnet", action, 123, None, None, super::super::MAX_FIELDS).unwrap();
+            assert!(fields.iter().any(|f| f.path
+                == "cancels[1] · Market ID (identity unverified)"
+                && f.value == "7"));
+            assert!(
+                fields
+                    .iter()
+                    .any(|f| f.path == format!("cancels[1] · {label}") && f.value == value)
+            );
+            assert!(
+                fields
+                    .iter()
+                    .any(|f| f.path == "Fast cancellation" && f.value == "true")
+            );
+        }
+    }
     #[test]
     fn venue_usdc_quantities_are_exact_and_never_rounded() {
         assert_eq!(usdc_base_units("1.234567").unwrap(), "1234567");

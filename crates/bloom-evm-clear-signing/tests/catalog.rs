@@ -9,6 +9,30 @@ use support::*;
 
 const LOCK: &str = "lock(address beneficiary, uint256 amount, uint256 unlockTime)";
 
+#[test]
+fn maximum_chain_lookup_keeps_direct_and_standard_resolution_without_overflow() {
+    let catalog = Catalog::built_in().unwrap();
+    let selector = &calldata(
+        "deposit(uint256,address)",
+        &[U256::from(1), address_word(RECIPIENT)],
+    )[..4];
+    for chain in [u64::MAX - 1, u64::MAX] {
+        assert!(catalog.resolve(chain, VAULT, selector).is_some());
+        assert!(catalog.resolve(chain, VAULT, &[0xff; 4]).is_none());
+        let mut descriptor = erc20_descriptor();
+        descriptor["context"]["contract"]["deployments"][0]["chainId"] = json!(chain);
+        let mut metadata = token(TOKEN, 6);
+        metadata.chain_id = chain;
+        let direct = build(vec![descriptor], vec![metadata]).unwrap();
+        let transfer = calldata(
+            "transfer(address,uint256)",
+            &[address_word(RECIPIENT), U256::from(1)],
+        );
+        assert!(!direct.resolve(chain, TOKEN, &transfer[..4]).unwrap().2);
+        assert!(direct.resolve(chain, VAULT, &[0xff; 4]).is_none());
+    }
+}
+
 /// The catalog this build ships must admit, or clear signing is down.
 #[test]
 fn the_built_in_catalog_admits_and_lists_the_safe_deployments() {

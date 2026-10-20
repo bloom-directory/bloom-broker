@@ -452,7 +452,8 @@ impl Catalog {
             return Some((entry, &self.descriptors[entry.descriptor], false));
         }
         self.entries
-            .range((chain_id, String::new())..(chain_id + 1, String::new()))
+            .range((chain_id, String::new())..)
+            .take_while(|((entry_chain, _), _)| *entry_chain == chain_id)
             .map(|(_, entry)| entry)
             .filter(|entry| entry.applies_to_instances)
             .chain(&self.standards)

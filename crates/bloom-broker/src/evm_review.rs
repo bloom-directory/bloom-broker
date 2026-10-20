@@ -550,6 +550,7 @@ pub(crate) mod tests {
                 destination: "exact".into(),
             }],
             required_verifiers: vec![],
+            clear_signing: None,
         }
     }
     fn no_clear_signing() -> &'static Catalog {

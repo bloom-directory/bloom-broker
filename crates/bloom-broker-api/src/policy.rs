@@ -14,6 +14,30 @@ pub struct CanonicalWalletPolicy {
     pub allowed_petal_packages: Vec<Digest32>,
     pub allowed_destinations: Vec<PolicyDestination>,
     pub required_verifiers: Vec<RequiredVerifier>,
+    /// Released policy authority retained verbatim until an owner removes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_signing: Option<LegacyClearSigningPolicy>,
+}
+
+/// Compatibility representation only. The compiled reader does not enforce
+/// these restrictions; wallets carrying them must migrate before signing.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyClearSigningPolicy {
+    pub catalog_id: Token,
+    pub trusted_keys: Vec<LegacyCatalogTrustedKey>,
+    pub signature_threshold: u8,
+    pub maximum_observation_age_ms: u64,
+    pub opaque_exact_allowed: bool,
+    pub unlimited_allowance_allowed: bool,
+    pub verifier: RequiredVerifier,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyCatalogTrustedKey {
+    pub key_id: Token,
+    pub verifying_key: Base64UrlBytes,
 }
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]

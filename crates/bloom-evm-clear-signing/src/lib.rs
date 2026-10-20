@@ -2,15 +2,14 @@
 //!
 //! Broker is the only semantic authority here. This crate is compiled into
 //! it: there is no path, library name or runtime loading API, and no
-//! JavaScript runtime. It reads a signed local catalog and the flattened
-//! ERC-7730 descriptors inside it, decodes exact calldata with one strict
+//! JavaScript runtime. It reads the compiled catalog and flattened
+//! ERC-7730 descriptors, decodes exact calldata with one strict
 //! generic ABI path, and produces the typed facts an owner reviews.
 //!
 //! What it does *not* do: fetch anything, read the chain, resolve a proxy,
 //! resolve a name, simulate execution, or claim that a described call is
-//! safe. The assurance class is [`TRUSTED_DESCRIPTION`] — the publisher is
-//! trusted to describe the listed deployment, and a signature authenticates
-//! that assertion and nothing more. A call read through an instance entry is
+//! safe. The assurance class is [`TRUSTED_DESCRIPTION`] — the Broker release
+//! is trusted to describe the listed deployment. A call read through an instance entry is
 //! [`STRUCTURAL_DESCRIPTION`]: the description is trusted, but nothing
 //! establishes that the address runs that contract.
 

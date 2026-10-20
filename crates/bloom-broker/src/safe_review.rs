@@ -528,6 +528,7 @@ mod tests {
                 destination: "exact".into(),
             }],
             required_verifiers: vec![],
+            clear_signing: None,
         }
     }
 

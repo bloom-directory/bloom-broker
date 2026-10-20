@@ -71,6 +71,8 @@ pub struct PolicyAuthorityDiff {
     pub removed_destinations: Vec<PolicyAuthorityDestination>,
     pub added_required_verifiers: Vec<PolicyAuthorityVerifier>,
     pub removed_required_verifiers: Vec<PolicyAuthorityVerifier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_legacy_clear_signing: Option<bloom_broker_api::LegacyClearSigningPolicy>,
 }
 
 impl PolicyAuthorityDiff {
@@ -167,6 +169,9 @@ pub fn canonical_policy_authority_diff(
         removed_destinations,
         added_required_verifiers,
         removed_required_verifiers,
+        removed_legacy_clear_signing: (current.clear_signing != proposed.clear_signing)
+            .then(|| current.clear_signing.clone())
+            .flatten(),
     }
 }
 
@@ -1194,6 +1199,7 @@ impl BrokerAuthority {
             .validate()
             .map_err(|error| denied("PETAL_KEY_SCOPE_INVALID", error.to_string()))?;
         let (_snapshot, policy) = self.current_policy(&scope.wallet_id)?;
+        ensure_policy_signing_enabled(&policy)?;
         if scope.maximum_lifetime_ms.get() > policy.maximum_approval_lifetime_ms {
             return Err(denied(
                 "POLICY_LIFETIME_EXCEEDED",
@@ -1578,6 +1584,7 @@ impl BrokerAuthority {
             ));
         }
         let (snapshot, policy) = self.current_policy(&terms.wallet_id)?;
+        ensure_policy_signing_enabled(&policy)?;
         if terms.policy_version != snapshot.version || terms.policy_digest != snapshot.policy_digest
         {
             return Err(denied(
@@ -1828,6 +1835,8 @@ impl BrokerAuthority {
         let terms: SealedApprovalTerms =
             serde_json::from_str(&record.terms_jcs).map_err(storage)?;
         self.ensure_key_not_stopped(&terms)?;
+        let (_, policy) = self.current_policy(&terms.wallet_id)?;
+        ensure_policy_signing_enabled(&policy)?;
         let review_digest = Digest32::new(record.review_manifest_digest)
             .map_err(|error| denied("STORAGE_CORRUPTION", error.to_string()))?;
         let (current_epoch, reconciled) = self.epoch_state(&terms.wallet_id)?;
@@ -1917,6 +1926,8 @@ impl BrokerAuthority {
         let terms: SealedApprovalTerms =
             serde_json::from_str(&record.terms_jcs).map_err(storage)?;
         let signer_terms = crate::translation::approval::validated_terms_to_signer(terms.clone());
+        let (_, policy) = self.current_policy(&terms.wallet_id)?;
+        ensure_policy_signing_enabled(&policy)?;
         let review_digest = Digest32::new(record.review_manifest_digest)
             .map_err(|error| denied("STORAGE_CORRUPTION", error.to_string()))?;
         let (current_epoch, reconciled) = self.epoch_state(&terms.wallet_id)?;
@@ -2276,6 +2287,7 @@ impl BrokerAuthority {
                 ));
             }
         }
+        ensure_policy_signing_enabled(&proposed)?;
         let authority_diff = canonical_policy_authority_diff(&current, &proposed);
         if authority_diff.digest().map_err(storage)? != request.authority_diff_digest {
             return Err(denied(
@@ -2359,6 +2371,7 @@ impl BrokerAuthority {
             ));
         }
         let (snapshot, policy) = self.current_policy(&terms.wallet_id)?;
+        ensure_policy_signing_enabled(&policy)?;
         if snapshot.version != terms.policy_version || snapshot.policy_digest != terms.policy_digest
         {
             return Err(denied(
@@ -3512,6 +3525,16 @@ fn is_canonical_index(segment: &str) -> bool {
         return false;
     }
     segment.parse::<u32>().is_ok()
+}
+
+fn ensure_policy_signing_enabled(policy: &CanonicalWalletPolicy) -> Result<(), AuthorityError> {
+    if policy.clear_signing.is_some() {
+        return Err(denied(
+            "POLICY_MIGRATION_REQUIRED",
+            "legacy catalog trust, freshness, verifier and refusal rules require an owner-approved policy replacement before signing",
+        ));
+    }
+    Ok(())
 }
 
 fn verify_policy_snapshot(

@@ -306,6 +306,7 @@ impl Harness {
                 },
             ],
             required_verifiers: vec![],
+            clear_signing: None,
         };
         signed_policy_snapshot(self, version, &policy)
     }
@@ -1733,7 +1734,7 @@ fn native_solana_destination_refusal_names_the_conflicting_policy_chain() {
         },
     );
     let mut terms = solana_terms(&harness, &provenance, &message, 85);
-    terms.policy_version = snapshot.version;
+    terms.policy_version = snapshot.version.clone();
     terms.policy_digest = snapshot.policy_digest;
     harness.activate_with_system_claim(&terms, &provenance, &claim);
     let input = solana_input(
@@ -2090,6 +2091,98 @@ fn policy_update_rejects_a_machine_claimed_diff_that_broker_did_not_derive() {
         harness.authority.validate_policy_update(&request).unwrap(),
         exact_diff
     );
+}
+
+#[test]
+fn legacy_restrictions_survive_reload_and_block_grants_until_explicit_policy_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let harness = Harness::open_at(directory.path());
+    let baseline = harness.policy_snapshot(1);
+    let mut legacy: CanonicalWalletPolicy =
+        serde_json::from_slice(&baseline.canonical_policy.decode()).unwrap();
+    legacy.clear_signing = Some(bloom_broker_api::LegacyClearSigningPolicy {
+        catalog_id: token("bloom-tokens"),
+        trusted_keys: vec![bloom_broker_api::LegacyCatalogTrustedKey {
+            key_id: token("publisher"),
+            verifying_key: Base64UrlBytes::from_bytes(&[7; 32]),
+        }],
+        signature_threshold: 1,
+        maximum_observation_age_ms: 86_400_000,
+        opaque_exact_allowed: false,
+        unlimited_allowance_allowed: false,
+        verifier: bloom_broker_api::RequiredVerifier {
+            verifier_id: token("evm-clear-signing-v1"),
+            verifier_digest: digest(42),
+        },
+    });
+    let snapshot = signed_policy_snapshot(&harness, 2, &legacy);
+    harness.authority.install_policy(&snapshot).unwrap();
+    let mut terms = exact_terms(&harness, b"legacy");
+    terms.policy_version = snapshot.version.clone();
+    terms.policy_digest = snapshot.policy_digest.clone();
+    assert!(
+        error_code(
+            harness
+                .authority
+                .prepare_approval(&terms, &digest(7))
+                .unwrap_err()
+        )
+        .contains("POLICY_MIGRATION_REQUIRED")
+    );
+    let mut proposed = legacy.clone();
+    proposed.clear_signing = None;
+    let bytes = serde_jcs::to_vec(&proposed).unwrap();
+    let diff = canonical_policy_authority_diff(&legacy, &proposed);
+    assert_eq!(diff.removed_legacy_clear_signing, legacy.clear_signing);
+    let request = PolicyUpdateRequest {
+        operation_id: operation(90),
+        wallet_id: harness.wallet.clone(),
+        baseline_version: snapshot.version.clone(),
+        baseline_digest: snapshot.policy_digest.clone(),
+        proposed_canonical_policy: Base64UrlBytes::from_bytes(&bytes),
+        proposed_policy_digest: Digest32::from_bytes(Sha256::digest(&bytes).into()),
+        authority_diff_digest: diff.digest().unwrap(),
+        assurance_level: token("user_verified"),
+    };
+    assert_eq!(
+        harness.authority.validate_policy_update(&request).unwrap(),
+        diff
+    );
+    // Preparing/cancelling the migration must not mutate the stored policy.
+    assert_eq!(
+        harness.authority.policy_snapshot(&harness.wallet).unwrap(),
+        snapshot
+    );
+    drop(harness);
+    let reopened = Harness::open_at(directory.path());
+    assert_eq!(
+        reopened
+            .authority
+            .policy_snapshot(&reopened.wallet)
+            .unwrap(),
+        snapshot
+    );
+    assert!(
+        reopened
+            .authority
+            .prepare_approval(&terms, &digest(7))
+            .is_err()
+    );
+    let committed = signed_policy_snapshot(&reopened, 3, &proposed);
+    reopened.authority.install_policy(&committed).unwrap();
+    assert!(
+        reopened
+            .authority
+            .prepare_approval(&terms, &digest(7))
+            .is_err(),
+        "old policy-bound grants stay invalid"
+    );
+    terms.policy_version = committed.version;
+    terms.policy_digest = committed.policy_digest;
+    reopened
+        .authority
+        .prepare_approval(&terms, &digest(7))
+        .unwrap();
 }
 
 fn exact_terms(harness: &Harness, payload: &[u8]) -> SealedApprovalTerms {
@@ -2648,6 +2741,7 @@ fn initial_policy_snapshot(
         allowed_petal_packages: Vec::new(),
         allowed_destinations: Vec::new(),
         required_verifiers: Vec::new(),
+        clear_signing: None,
     };
     let canonical = serde_jcs::to_vec(&policy).unwrap();
     let mut snapshot = SignedPolicySnapshot {

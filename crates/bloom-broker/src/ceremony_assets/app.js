@@ -1242,6 +1242,14 @@ function describePolicy(manifest) {
   for (const p of diff.removed_petal_packages || []) lines.push(["Remove app (petal)", shortDigest(p), true]);
   for (const v of diff.added_required_verifiers || []) lines.push(["Require verifier", v.verifier_id || canonicalJson(v), true]);
   for (const v of diff.removed_required_verifiers || []) lines.push(["Drop verifier", v.verifier_id || canonicalJson(v), true]);
+  const legacy = diff.removed_legacy_clear_signing;
+  if (legacy) {
+    lines.push(["Remove legacy catalog trust", `${legacy.catalog_id}: ${legacy.signature_threshold} trusted signature(s); publisher keys and observation freshness limits stop being enforced`]);
+    lines.push(["Remove pinned catalog verifier", `${legacy.verifier.verifier_id} (${legacy.verifier.verifier_digest})`, true]);
+    if (!legacy.opaque_exact_allowed) lines.push(["Allow opaque exact review", "Unknown calls may be reviewed as exact bytes with warnings"]);
+    if (!legacy.unlimited_allowance_allowed) lines.push(["Allow unlimited allowance review", "Maximum allowances may be requested with explicit warnings"]);
+    lines.push(["Use compiled descriptions", "Descriptions and warnings come from the Broker release; they do not enforce the removed rules"]);
+  }
   const before = Number(diff.maximum_approval_lifetime_ms_before);
   const after = Number(diff.maximum_approval_lifetime_ms_after);
   if (Number.isFinite(before) && Number.isFinite(after) && before !== after) {

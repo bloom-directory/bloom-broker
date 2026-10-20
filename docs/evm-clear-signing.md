@@ -279,7 +279,7 @@ These inspect the decoded values; they do not select a different decoder.
 | Class | Rules |
 | --- | --- |
 | `transfer` | Must be canonical `transfer(address,uint256)`. Zero recipient refused; the token contract is not a valid recipient of its own transfer; listed decimals required; a zero amount is displayed honestly. |
-| `allowance` | Must be canonical `approve(address,uint256)`. Zero spender refused; zero means clearing the allowance; a finite value sets a total, not an increment; exact U256 maximum is unlimited and is denied unless policy allows it. |
+| `allowance` | Must be canonical `approve(address,uint256)`. Zero spender refused; zero means clearing the allowance; a finite value sets a total, not an increment; exact U256 maximum receives a strong unlimited-allowance warning. |
 | `other` | Neutral heading, supplemental intent, every argument shown, no economic guarantee invented. |
 
 The class is derived from the function signature, never declared: only the
