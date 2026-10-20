@@ -1,7 +1,7 @@
 [
   {
-    "preimage_hex": "1901d79297fcdf2ffcd4ae223d01edaa2ba214ff8f401d7c9300d995d17c82aa4040225ebfc51a3e2afecf113c25bb7636a702c76a8e18bc582c30f478a1e55067a3",
-    "hash_hex": "14736c07bdde8937ebbb0e1b5596c0a125da6a831f50e351bec6908c0abb2e3d",
+    "preimage_hex": "1901d79297fcdf2ffcd4ae223d01edaa2ba214ff8f401d7c9300d995d17c82aa4040777b5978e5a5101240027e5357c7e489f6090589bacc6413c290516dfc336c47",
+    "hash_hex": "9a1e431de1fe475322c242fb1683d63f13a866cdcfdd2851ff7a627eb141e77f",
     "witness": {
       "action": {
         "cancels": [
@@ -10,7 +10,6 @@
             "o": 42
           }
         ],
-        "f": true,
         "type": "cancel"
       },
       "expires_after": null,
@@ -39,6 +38,27 @@
       "kind": "hyperliquid_l1",
       "network": "testnet",
       "nonce": 124,
+      "schema": "bloom.message.review.v1",
+      "vault_address": null
+    }
+  },
+  {
+    "preimage_hex": "1901d79297fcdf2ffcd4ae223d01edaa2ba214ff8f401d7c9300d995d17c82aa404083e79768a6e5354434b6bf409d64d6775ca38691d17d2162092774a828eb5515",
+    "hash_hex": "7b7ee8cfb2b8f1d4baa8892d95c7e1b46afa4ee7f864170973f94e1b301c9eaf",
+    "witness": {
+      "action": {
+        "cancels": [
+          {
+            "asset": 0,
+            "cloid": "0x00112233445566778899aabbccddeeff"
+          }
+        ],
+        "type": "cancelByCloid"
+      },
+      "expires_after": null,
+      "kind": "hyperliquid_l1",
+      "network": "testnet",
+      "nonce": 125,
       "schema": "bloom.message.review.v1",
       "vault_address": null
     }

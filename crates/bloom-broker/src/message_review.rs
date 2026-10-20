@@ -1084,6 +1084,7 @@ mod tests {
             "../tests/fixtures/hyperliquid-producer-cancel.json"
         ))
         .unwrap();
+        let mut cancellations = std::collections::BTreeSet::new();
         for record in produced {
             let bytes = serde_json::to_vec(&record["witness"]).unwrap();
             let (raw, _) = decode(&bytes, signer()).unwrap();
@@ -1124,27 +1125,59 @@ mod tests {
             };
 
             let reading = verify_hyperliquid_agent_use(&input, signer()).unwrap();
+            let action = &record["witness"]["action"];
+            let fast = action.get("f").and_then(Value::as_bool).unwrap_or(false);
+            let by_client_id = action["type"] == "cancelByCloid";
+            cancellations.insert(if fast {
+                "fast"
+            } else if by_client_id {
+                "client"
+            } else {
+                "normal"
+            });
+            if fast {
+                assert!(
+                    reading
+                        .fields
+                        .iter()
+                        .any(|field| field.path == "Fast cancellation" && field.value == "true")
+                );
+            }
+            let (label, value) = if by_client_id {
+                (
+                    "cancels[1] · Client order ID",
+                    "0x00112233445566778899aabbccddeeff",
+                )
+            } else {
+                ("cancels[1] · Order ID", "42")
+            };
             assert!(
                 reading
                     .fields
                     .iter()
-                    .any(|field| field.path == "Fast cancellation" && field.value == "true")
+                    .any(|field| field.path == label && field.value == value)
             );
-            assert!(
-                reading
-                    .fields
-                    .iter()
-                    .any(|field| field.path == "cancels[1] · Order ID" && field.value == "42")
-            );
+            assert!(reading.fields.iter().any(|field| field.path
+                == "cancels[1] · Market ID (identity unverified)"
+                && field.value == "0"));
             input.claim_assurance_evidence = None;
             assert!(verify_hyperliquid_agent_use(&input, signer()).is_err());
             let mut changed = record["witness"].clone();
-            changed["action"]["cancels"][0]["o"] = json!(43);
+            if by_client_id {
+                changed["action"]["cancels"][0]["cloid"] =
+                    json!("0xff112233445566778899aabbccddeeff");
+            } else {
+                changed["action"]["cancels"][0]["o"] = json!(43);
+            }
             input.claim_assurance_evidence = Some(Base64UrlBytes::from_bytes(
                 &serde_json::to_vec(&changed).unwrap(),
             ));
             assert!(verify_hyperliquid_agent_use(&input, signer()).is_err());
         }
+        assert_eq!(
+            cancellations,
+            ["client", "fast", "normal"].into_iter().collect()
+        );
     }
 
     #[test]
