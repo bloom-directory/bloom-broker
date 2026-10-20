@@ -28,6 +28,7 @@ jobs:
         run: |
           python3 scripts/test_token_artwork.py
           python3 -B scripts/test_token_derivation.py
+          python3 -B crates/bloom-broker-api/tokens/tokens.py --offline crates/bloom-broker-api/tokens/fixtures/pusd-inputs-2026-10-20.json.gz --check crates/bloom-broker-api/tokens/fixtures/pusd-derived-2026-10-20.json
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run tests

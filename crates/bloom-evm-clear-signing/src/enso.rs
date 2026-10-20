@@ -25,11 +25,11 @@ pub(crate) struct Program {
 #[derive(Serialize)]
 pub(crate) struct Step {
     command_word: usize,
-    call_type: &'static str,
+    pub call_type: &'static str,
     pub target: Address,
-    selector: String,
+    pub selector: String,
     arguments: Vec<String>,
-    native_value: String,
+    pub native_value: String,
     output: String,
     #[serde(skip)]
     pub value: Option<U256>,

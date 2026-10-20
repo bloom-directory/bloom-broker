@@ -360,6 +360,11 @@ fn shortcut_constants_receive_catalog_readings_and_runtime_slots_stay_explicit()
     let call = review(&outer, 0).unwrap();
     let program: serde_json::Value =
         serde_json::from_str(&field(&call, "Shortcut program").value).unwrap();
+    let visible = field(&call, "Encoded command 1");
+    assert_eq!(visible.format, "text");
+    assert!(visible.value.contains("2.5 USDC"));
+    assert!(visible.value.contains(RECIPIENT));
+    assert!(field(&call, "Encoded command 2").value.contains("runtime"));
     assert!(program["steps"][0]["reading"].is_object(), "{program}");
     assert!(program["steps"][1]["reading"].is_null());
     assert!(

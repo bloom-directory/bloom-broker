@@ -2115,6 +2115,7 @@ fn legacy_restrictions_survive_reload_and_block_grants_until_explicit_policy_rep
             verifier_digest: digest(42),
         },
     });
+    legacy.required_verifiers = vec![legacy.clear_signing.as_ref().unwrap().verifier.clone()];
     let snapshot = signed_policy_snapshot(&harness, 2, &legacy);
     harness.authority.install_policy(&snapshot).unwrap();
     let mut terms = exact_terms(&harness, b"legacy");
@@ -2131,9 +2132,11 @@ fn legacy_restrictions_survive_reload_and_block_grants_until_explicit_policy_rep
     );
     let mut proposed = legacy.clone();
     proposed.clear_signing = None;
+    proposed.required_verifiers.clear();
     let bytes = serde_jcs::to_vec(&proposed).unwrap();
     let diff = canonical_policy_authority_diff(&legacy, &proposed);
     assert_eq!(diff.removed_legacy_clear_signing, legacy.clear_signing);
+    assert_eq!(diff.removed_required_verifiers.len(), 1);
     let request = PolicyUpdateRequest {
         operation_id: operation(90),
         wallet_id: harness.wallet.clone(),

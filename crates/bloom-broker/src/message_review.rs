@@ -1073,6 +1073,81 @@ mod tests {
     }
 
     #[test]
+    fn compiled_petal_witnesses_reconstruct_the_exact_host_payloads() {
+        use bloom_broker_api::{
+            ClaimAssurance, DeclaredFee, MachineSignRequest, PetalUseClaim, ProvenanceSubject,
+            SigningPayloads,
+        };
+        // Captured from the actual component through Machine's installed
+        // package/VM host boundary, account 1, delegated cancellation route.
+        let produced: Vec<Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/hyperliquid-producer-cancel.json"
+        ))
+        .unwrap();
+        for record in produced {
+            let bytes = serde_json::to_vec(&record["witness"]).unwrap();
+            let (raw, _) = decode(&bytes, signer()).unwrap();
+            assert_eq!(hex::encode(&raw), record["preimage_hex"].as_str().unwrap());
+            assert_eq!(
+                hex::encode(keccak256(&raw)),
+                record["hash_hex"].as_str().unwrap()
+            );
+            let base = request(bytes.clone());
+            let mut input = MachineSignRequest {
+                operation_id: base.operation_id,
+                operation_digest: Digest32::from_bytes([4; 32]),
+                approval_id: Digest32::from_bytes([5; 32]),
+                key_ref: base.terms.key_ref,
+                crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+                payloads: SigningPayloads::Single {
+                    payload: Base64UrlBytes::from_bytes(&raw),
+                },
+                petal_use_claim: Some(PetalUseClaim {
+                    package_hash: Digest32::from_bytes([1; 32]),
+                    route: "agent/cancel".into(),
+                    operation_class: Token::new("hyperliquid.agent_action").unwrap(),
+                    crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+                    payload_digest: Digest32::from_bytes([6; 32]),
+                    ordered_hashes: vec![],
+                    declared_debits: vec![],
+                    declared_destinations: vec![],
+                    declared_fee: DeclaredFee::None,
+                    nonce: RequestNonce::from_bytes([7; 16]),
+                    claim_assurance: ClaimAssurance::MachineAsserted,
+                }),
+                system_use_claim: None,
+                claim_assurance_evidence: Some(Base64UrlBytes::from_bytes(&bytes)),
+                provenance: ProvenanceSubject::Petal {
+                    package_hash: Digest32::from_bytes([1; 32]),
+                    route: "agent/cancel".into(),
+                },
+            };
+
+            let reading = verify_hyperliquid_agent_use(&input, signer()).unwrap();
+            assert!(
+                reading
+                    .fields
+                    .iter()
+                    .any(|field| field.path == "Fast cancellation" && field.value == "true")
+            );
+            assert!(
+                reading
+                    .fields
+                    .iter()
+                    .any(|field| field.path == "cancels[1] · Order ID" && field.value == "42")
+            );
+            input.claim_assurance_evidence = None;
+            assert!(verify_hyperliquid_agent_use(&input, signer()).is_err());
+            let mut changed = record["witness"].clone();
+            changed["action"]["cancels"][0]["o"] = json!(43);
+            input.claim_assurance_evidence = Some(Base64UrlBytes::from_bytes(
+                &serde_json::to_vec(&changed).unwrap(),
+            ));
+            assert!(verify_hyperliquid_agent_use(&input, signer()).is_err());
+        }
+    }
+
+    #[test]
     fn delegated_exchange_witness_is_checked_against_the_actual_use_payload() {
         use bloom_broker_api::{
             ClaimAssurance, DeclaredFee, MachineSignRequest, PetalUseClaim, ProvenanceSubject,

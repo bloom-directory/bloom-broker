@@ -15,6 +15,7 @@ is skipped if it carries characters a label may not. A proxy
 import json
 import argparse
 import hashlib
+import gzip
 from pathlib import Path
 import sys
 import time
@@ -226,6 +227,8 @@ def derive(observations):
         code, decimals, symbol, name, *slots = observation["results"]
         if len(slots) != len(PROXY_SLOTS) or observation["proxy_slots"] != PROXY_SLOTS:
             raise ValueError("proxy observations do not name the checked slots")
+        if any(not isinstance(slot, str) or len(slot) != 66 for slot in slots):
+            raise ValueError("missing proxy-slot response")
         reason = None
         if not code or code == "0x":
             reason = "no code"
@@ -349,7 +352,11 @@ def main():
         with args.capture.open("x") as destination:
             json.dump(document, destination, ensure_ascii=False, sort_keys=True, indent=2)
     else:
-        document = json.loads(args.offline.read_text())
+        if args.offline.suffix == ".gz":
+            with gzip.open(args.offline, "rt") as source:
+                document = json.load(source)
+        else:
+            document = json.loads(args.offline.read_text())
     kept, excluded = offline(document)
     if args.check and json.loads(args.check.read_text()) != kept:
         raise ValueError("derived catalog differs from the expected rows")

@@ -5441,10 +5441,20 @@ fn open_audited_ceremony_store(
                 )
                 .map_err(storage)?;
         }
-        transaction.commit().map_err(storage)?;
-        connection
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS store_compatibility (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                minimum_state_version INTEGER NOT NULL
+            );
+            INSERT INTO store_compatibility(id, minimum_state_version) VALUES (1, 3)
+            ON CONFLICT(id) DO UPDATE SET minimum_state_version = MAX(minimum_state_version, 3);",
+            )
+            .map_err(storage)?;
+        transaction
             .pragma_update(None, "user_version", CEREMONY_STORAGE_VERSION)
             .map_err(storage)?;
+        transaction.commit().map_err(storage)?;
     }
     Ok(database)
 }

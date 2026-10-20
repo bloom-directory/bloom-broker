@@ -579,6 +579,46 @@ fn review_at(
                                 _ => step.unread_reason = Some("Call arguments or native value depend on preceding runtime return data; initial slot values are not reused.".into()),
                             }
                         }
+                        // Keep useful calls visible in the primary review. The
+                        // complete bounded program and raw bytes remain below.
+                        for (index, step) in program.steps.iter().enumerate() {
+                            let mut summary = format!(
+                                "{} {} · selector {} · native value {} wei",
+                                step.call_type, step.target, step.selector, step.native_value
+                            );
+                            if let Some(reading) = &step.reading {
+                                summary.push_str(&format!(" · {}", reading.function_signature));
+                                for field in reading
+                                    .fields
+                                    .iter()
+                                    .filter(|field| {
+                                        field.format != "raw" && field.format != "ensoShortcut"
+                                    })
+                                    .take(6)
+                                {
+                                    let value: String = field.value.chars().take(128).collect();
+                                    summary.push_str(&format!("; {}: {value}", field.label));
+                                    if field.value.chars().count() > 128 {
+                                        summary.push('…');
+                                    }
+                                }
+                                if reading.fields.len() > 6 {
+                                    summary.push_str("; remaining arguments in program details");
+                                }
+                            } else if let Some(reason) = &step.unread_reason {
+                                summary.push_str(&format!("; {reason}"));
+                            }
+                            fields.push(DisplayField {
+                                label: format!("Encoded command {}", index + 1),
+                                format: "text".into(),
+                                value: summary,
+                                raw: step
+                                    .reconstructed_calldata
+                                    .clone()
+                                    .unwrap_or_else(|| step.selector.clone()),
+                                asset: None,
+                            });
+                        }
                         serde_json::to_string_pretty(&program)
                             .map_err(|_| invalid("shortcut reading cannot be serialized"))?
                     }

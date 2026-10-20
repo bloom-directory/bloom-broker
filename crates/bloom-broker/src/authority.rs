@@ -36,6 +36,7 @@ const APPROVAL_TOMBSTONE_DOMAIN: &[u8] = b"bloom-approval-tombstone/v1";
 const WALLET_TOMBSTONE_DOMAIN: &[u8] = b"bloom-wallet-tombstone/v1";
 const POLICY_AUTHORITY_DIFF_DOMAIN: &[u8] = b"bloom-policy-authority-diff/v1";
 const SIGN_OPERATION_DOMAIN: &[u8] = b"bloom-sign-operation/v1";
+pub const BROKER_STATE_VERSION: i64 = 3;
 
 #[derive(Serialize)]
 struct MachineSignOperationIdentity {
@@ -512,9 +513,14 @@ impl BrokerAuthority {
             let mut connection = connection
                 .lock()
                 .map_err(|_| AuthorityError::Storage("authority mutex poisoned".into()))?;
+            enforce_authority_state_floor(&connection)?;
             connection.pragma_update(None, "foreign_keys", "ON")?;
             connection.execute_batch(
                 "
+            CREATE TABLE IF NOT EXISTS store_compatibility (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                minimum_state_version INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS policies (
                 wallet_id TEXT PRIMARY KEY,
                 version TEXT NOT NULL,
@@ -577,6 +583,7 @@ impl BrokerAuthority {
             ",
             )?;
             migrate_legacy_authority(&mut connection, &legacy_connection, &journal)?;
+            enforce_authority_state_floor(&connection)?;
         }
         let mut policy_keys = policy_keys;
         {
@@ -692,6 +699,11 @@ impl BrokerAuthority {
         correlation: &PolicyInstallCorrelation,
     ) -> Result<(), AuthorityError> {
         for required in &policy.required_verifiers {
+            // Retain the released verifier pin for inspection/migration.
+            // The signing guard refuses it; it never becomes a substitute verifier.
+            if required.verifier_id.as_str() == "evm-clear-signing-v1" {
+                continue;
+            }
             if !self.assurance.verifiers.contains_key(&(
                 required.verifier_id.as_str().to_owned(),
                 required.verifier_digest.as_str().to_owned(),
@@ -3525,6 +3537,26 @@ fn is_canonical_index(segment: &str) -> bool {
         return false;
     }
     segment.parse::<u32>().is_ok()
+}
+
+fn enforce_authority_state_floor(connection: &Connection) -> Result<(), AuthorityError> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='store_compatibility')",
+        [], |row| row.get(0),
+    )?;
+    if exists {
+        let floor: Option<i64> = connection
+            .query_row(
+                "SELECT minimum_state_version FROM store_compatibility WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if floor.is_some_and(|floor| floor > BROKER_STATE_VERSION) {
+            return Err(AuthorityError::Storage("unsupported Broker state floor; restore a compatible backup instead of downgrading".into()));
+        }
+    }
+    Ok(())
 }
 
 fn ensure_policy_signing_enabled(policy: &CanonicalWalletPolicy) -> Result<(), AuthorityError> {
