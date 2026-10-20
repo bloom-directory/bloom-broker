@@ -8,10 +8,14 @@ list. A curated list's symbol and name are written, else the chain's; either
 is skipped if it carries characters a label may not. A proxy
 (EIP-1967 or the ZeppelinOS slot Circle uses) is marked upgradeable.
 
-    python3 -I tokens.py > tokens.json      # exclusions go to stderr
+    python3 -I tokens.py --capture inputs.json > tokens.json
+    python3 -I tokens.py --offline inputs.json --check tokens.json
 """
 
 import json
+import argparse
+import hashlib
+from pathlib import Path
 import sys
 import time
 import urllib.error
@@ -166,7 +170,7 @@ def safe_name(name):
     )
 
 
-def candidates():
+def candidates(fetch=get):
     """Tokens with whether their list's labels are curated (Uniswap's are;
     CoinGecko's call wrapped xDAI "XDAI")."""
     seen = set()
@@ -178,13 +182,13 @@ def candidates():
             "name": asset["tokenName"],
             "decimals": asset["tokenDecimals"],
         }
-        for asset in get(ROBINHOOD)["assets"]
+        for asset in fetch(ROBINHOOD)["assets"]
         if asset["status"] == "ASSET_STATUS_ACTIVE"
         for deployment in asset["deployments"]
     ]
     lists = [
-        (get(UNISWAP.format(UNISWAP_VERSION))["tokens"], True),
-        (get(GNOSIS)["tokens"], False),
+        (fetch(UNISWAP.format(UNISWAP_VERSION))["tokens"], True),
+        (fetch(GNOSIS)["tokens"], False),
         (stocks, True),
         (
             [
@@ -204,61 +208,151 @@ def candidates():
                 yield {**token, "curated": curated}
 
 
-def main():
+def derive(observations):
+    """Pure derivation from captured identities and raw chain responses."""
     kept, excluded = [], []
+    seen = set()
+    for observation in observations:
+        token = observation["token"]
+        chain, address = observation["chain_id"], observation["address"]
+        if chain != token["chainId"] or address != token["address"].lower():
+            raise ValueError("observation identity differs from its candidate")
+        if (chain, address) in seen or not isinstance(chain, int) or chain not in RPC:
+            raise ValueError("duplicate or unsupported token identity")
+        seen.add((chain, address))
+        if len(address) != 42 or not address.startswith("0x"):
+            raise ValueError("invalid token address")
+        int(address[2:], 16)
+        code, decimals, symbol, name, *slots = observation["results"]
+        if len(slots) != len(PROXY_SLOTS) or observation["proxy_slots"] != PROXY_SLOTS:
+            raise ValueError("proxy observations do not name the checked slots")
+        reason = None
+        if not code or code == "0x":
+            reason = "no code"
+        elif not decimals or len(decimals) != 66:
+            reason = "no decimals()"
+        else:
+            decimals = int(decimals, 16)
+            # The list's labels tell bridged USDC.e from native USDC, which
+            # both call themselves USDC; the chain's are the fallback.
+            symbols = (token["symbol"], text(symbol))
+            names = (token["name"], text(name))
+            if not token["curated"]:
+                symbols, names = symbols[::-1], names[::-1]
+            symbol = next((s for s in symbols if safe_symbol(s)), None)
+            name = next((n for n in names if safe_name(n)), None)
+            if decimals != token["decimals"] or decimals > 255:
+                reason = f"decimals {decimals} != list {token['decimals']}"
+            elif symbol is None or name is None:
+                reason = "no safe symbol or name"
+        if reason:
+            excluded.append((chain, address, token["symbol"], reason))
+            continue
+        kept.append(
+            {
+                "chain_id": chain,
+                "address": address,
+                "symbol": symbol,
+                "name": name,
+                "decimals": decimals,
+                "upgradeable": any(slot and int(slot, 16) for slot in slots),
+            }
+        )
+    kept.sort(key=lambda token: (token["chain_id"], token["address"]))
+    return kept, excluded
+
+
+def canonical(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+
+
+def capture(only=()):
+    sources = {}
+    def acquire(url):
+        data = get(url)
+        sources[url] = {"data": data, "sha256": hashlib.sha256(canonical(data)).hexdigest()}
+        return data
     by_chain = {}
-    for token in candidates():
+    for token in candidates(acquire):
+        if only and f"{token['chainId']}:{token['address'].lower()}" not in only:
+            continue
         by_chain.setdefault(token["chainId"], []).append(token)
+    observations = []
+    blocks = {}
     for chain, tokens in sorted(by_chain.items()):
+        block = rpc(chain, [("eth_getBlockByNumber", ["latest", False])])[0]
+        number, block_hash = block["number"], block["hash"]
+        if not number.startswith("0x") or len(block_hash) != 66:
+            raise ValueError("RPC returned an invalid block identity")
+        blocks[str(chain)] = {"number": number, "hash": block_hash}
         size = BATCH.get(chain, 20)
         for start in range(0, len(tokens), size):
-            batch = tokens[start : start + size]
+            batch = tokens[start:start + size]
             calls = []
             for token in batch:
                 address = token["address"].lower()
-                calls.append(("eth_getCode", [address, "latest"]))
+                calls.append(("eth_getCode", [address, number]))
                 for selector in (DECIMALS, SYMBOL, NAME):
-                    calls.append(("eth_call", [{"to": address, "data": selector}, "latest"]))
+                    calls.append(("eth_call", [{"to": address, "data": selector}, number]))
                 for slot in PROXY_SLOTS:
-                    calls.append(("eth_getStorageAt", [address, slot, "latest"]))
+                    calls.append(("eth_getStorageAt", [address, slot, number]))
             results = rpc(chain, calls)
             width = 4 + len(PROXY_SLOTS)
             for index, token in enumerate(batch):
-                code, decimals, symbol, name, *slots = results[index * width : (index + 1) * width]
-                address = token["address"].lower()
-                reason = None
-                if not code or code == "0x":
-                    reason = "no code"
-                elif not decimals or len(decimals) != 66:
-                    reason = "no decimals()"
-                else:
-                    decimals = int(decimals, 16)
-                    # The list's labels tell bridged USDC.e from native USDC, which
-                    # both call themselves USDC; the chain's are the fallback.
-                    symbols = (token["symbol"], text(symbol))
-                    names = (token["name"], text(name))
-                    if not token["curated"]:
-                        symbols, names = symbols[::-1], names[::-1]
-                    symbol = next((s for s in symbols if safe_symbol(s)), None)
-                    name = next((n for n in names if safe_name(n)), None)
-                    if decimals != token["decimals"] or decimals > 255:
-                        reason = f"decimals {decimals} != list {token['decimals']}"
-                    elif symbol is None or name is None:
-                        reason = "no safe symbol or name"
-                if reason:
-                    excluded.append((chain, address, token["symbol"], reason))
-                    continue
-                kept.append(
-                    {
-                        "chain_id": chain,
-                        "address": address,
-                        "symbol": symbol,
-                        "name": name,
-                        "decimals": decimals,
-                        "upgradeable": any(slot and int(slot, 16) for slot in slots),
-                    }
-                )
-    kept.sort(key=lambda token: (token["chain_id"], token["address"]))
+                observations.append({"chain_id": chain, "address": token["address"].lower(),
+                    "token": token, "proxy_slots": PROXY_SLOTS,
+                    "results": results[index * width:(index + 1) * width]})
+        checked = rpc(chain, [("eth_getBlockByNumber", [number, False])])[0]
+        if not checked or checked["hash"] != block_hash:
+            raise ValueError(f"chain {chain}: block changed during capture")
+    if only and len(observations) != len(set(only)):
+        raise ValueError("requested identity absent from recorded candidates")
+    return {"schema": 1, "scope": sorted(only), "sources": sources, "blocks": blocks, "observations": observations}
+
+
+def offline(document):
+    if document["schema"] != 1:
+        raise ValueError("unsupported capture schema")
+    def recorded(url):
+        source = document["sources"][url]
+        if hashlib.sha256(canonical(source["data"])).hexdigest() != source["sha256"]:
+            raise ValueError("source digest mismatch")
+        return source["data"]
+    expected = {(t["chainId"], t["address"].lower()): t for t in candidates(recorded)}
+    if document.get("scope"):
+        expected = {key: value for key, value in expected.items()
+                    if f"{key[0]}:{key[1]}" in document["scope"]}
+    actual = {}
+    for row in document["observations"]:
+        key = (row["chain_id"], row["address"])
+        if row["token"] != expected.get(key) or key in actual:
+            raise ValueError("captured candidate differs from the recorded sources")
+        block = document["blocks"][str(row["chain_id"])]
+        if not block["number"].startswith("0x") or len(block["hash"]) != 66:
+            raise ValueError("missing pinned block identity")
+        actual[key] = row
+    if actual.keys() != expected.keys():
+        raise ValueError("capture does not cover the recorded candidates")
+    return derive(document["observations"])
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--capture", type=Path, help="acquire public inputs at pinned blocks")
+    mode.add_argument("--offline", type=Path, help="derive from captured inputs without network")
+    parser.add_argument("--only", action="append", default=[], help="capture one chain-id:address; repeat for a scoped update")
+    parser.add_argument("--check", type=Path, help="compare derived rows to an existing JSON file")
+    args = parser.parse_args()
+    if args.capture:
+        document = capture(args.only)
+        with args.capture.open("x") as destination:
+            json.dump(document, destination, ensure_ascii=False, sort_keys=True, indent=2)
+    else:
+        document = json.loads(args.offline.read_text())
+    kept, excluded = offline(document)
+    if args.check and json.loads(args.check.read_text()) != kept:
+        raise ValueError("derived catalog differs from the expected rows")
     print("[")
     print(",\n".join("  " + json.dumps(token, ensure_ascii=False) for token in kept))
     print("]")

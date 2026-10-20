@@ -1305,6 +1305,25 @@ pub(crate) mod mode_tests {
         assert_eq!(evidence.entries.len(), 1);
     }
 
+    #[test]
+    fn maximum_chain_preparation_reads_an_unknown_contract_without_panicking() {
+        let encoded = call(RECIPIENT, vec![0xde, 0xad, 0xbe, 0xef]);
+        let mut tx = TxEip1559::decode(&mut &encoded[1..]).unwrap();
+        tx.chain_id = u64::MAX;
+        let bytes = tx.encoded_for_signing();
+        let request = batch(&[bytes]);
+        let review = review(
+            &request,
+            &policy(),
+            Address::ZERO,
+            Catalog::built_in().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(review.payloads[0].chain_id, u64::MAX.to_string());
+        assert!(review.payloads[0].unread_reason.is_some());
+    }
+
     /// Bloom never refuses a call for being unreadable: it shows the exact
     /// bytes and why it could not read them, and the owner decides.
     #[test]

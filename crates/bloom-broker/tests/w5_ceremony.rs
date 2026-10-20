@@ -7863,7 +7863,7 @@ fn schema1_release_state_migrates_pending_and_preserves_completed_receipt() {
         migrated_store
             .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
             .unwrap(),
-        2
+        3
     );
     let completed_jcs_after: String = migrated_store
         .query_row(

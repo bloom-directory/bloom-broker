@@ -26,8 +26,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Verify bundled token artwork and source boundaries
         run: |
-          python3 scripts/bundle-token-artwork.py --check
           python3 scripts/test_token_artwork.py
+          python3 -B scripts/test_token_derivation.py
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run tests

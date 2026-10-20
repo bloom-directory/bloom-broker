@@ -1559,6 +1559,8 @@ impl BrokerAuthority {
             .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?;
         self.validate_scoped_key_terms(terms)?;
         self.ensure_key_not_stopped(terms)?;
+        let (snapshot, policy) = self.current_policy(&terms.wallet_id)?;
+        ensure_policy_signing_enabled(&policy)?;
         let approval_id = terms
             .approval_id()
             .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?;
@@ -1583,8 +1585,6 @@ impl BrokerAuthority {
                 "approval ID is durably tombstoned",
             ));
         }
-        let (snapshot, policy) = self.current_policy(&terms.wallet_id)?;
-        ensure_policy_signing_enabled(&policy)?;
         if terms.policy_version != snapshot.version || terms.policy_digest != snapshot.policy_digest
         {
             return Err(denied(
@@ -3528,7 +3528,12 @@ fn is_canonical_index(segment: &str) -> bool {
 }
 
 fn ensure_policy_signing_enabled(policy: &CanonicalWalletPolicy) -> Result<(), AuthorityError> {
-    if policy.clear_signing.is_some() {
+    if policy.clear_signing.is_some()
+        || policy
+            .required_verifiers
+            .iter()
+            .any(|required| required.verifier_id.as_str() == "evm-clear-signing-v1")
+    {
         return Err(denied(
             "POLICY_MIGRATION_REQUIRED",
             "legacy catalog trust, freshness, verifier and refusal rules require an owner-approved policy replacement before signing",

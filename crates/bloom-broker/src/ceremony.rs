@@ -198,7 +198,9 @@ const OUTPUT_ACK_TTL_MS: u64 = 15 * 60 * 1_000;
 const REMOTE_PRECOMMIT_SESSION_MS: u64 = 5 * 60 * 1_000;
 const REMOTE_COOKIE_MAX_MS: u64 = 25 * 60 * 1_000;
 const CROSS_SURFACE_DEADLINE_MS: u64 = 10 * 60 * 1_000;
-const CEREMONY_STORAGE_VERSION: i64 = 2;
+// Version 3 stores compiled-reader manifests and legacy-policy removal diffs.
+// Released readers must refuse the store before interpreting those sessions.
+const CEREMONY_STORAGE_VERSION: i64 = 3;
 
 /// Compiled default bound on simultaneously live ceremony sessions. This is
 /// the independent limit on concurrent resource usage; the rolling creation
@@ -3993,9 +3995,6 @@ async fn token_image(
     if broker.validate_served_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if let Some(image) = crate::token_artwork::image(&name) {
-        return ([(header::CONTENT_TYPE, "image/png")], image).into_response();
-    }
     let asset = match name.as_str() {
         "usdc.svg" => include_str!("ceremony_assets/tokens/usdc.svg"),
         "dai.svg" => include_str!("ceremony_assets/tokens/dai.svg"),
@@ -5906,7 +5905,7 @@ mod remote_storage_tests {
         guard_ceremony_storage_version(&connection).unwrap();
         connection.pragma_update(None, "user_version", 1).unwrap();
         guard_ceremony_storage_version(&connection).unwrap();
-        connection.pragma_update(None, "user_version", 3).unwrap();
+        connection.pragma_update(None, "user_version", 4).unwrap();
         assert!(guard_ceremony_storage_version(&connection).is_err());
     }
 }

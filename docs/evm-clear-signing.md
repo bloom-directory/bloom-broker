@@ -19,19 +19,26 @@ Bloom promises about a call is code.
 
 Approval pages use the same chain/address-bound token identities and amounts
 for every Petal. Artwork is bundled into Broker; the browser never contacts an
-image provider. `scripts/bundle-token-artwork.py` matches curated token lists
-and issuer image registries to existing token entries, bounds and rasterizes
-images, and generates the exact asset allowlist and browser bindings. Source
-URLs, source-document hashes, image digests and explicit missing-artwork
-reasons are retained in `ceremony_assets/tokens/artwork.json`. Existing
-issuer-reviewed SVG bindings take precedence. A reviewed neutral binding
-prevents a pegged copy from borrowing the issuer's mark.
-
-Regenerate with `uv run scripts/bundle-token-artwork.py`; use
-`--refresh-images` to refetch previously successful image URLs. CI runs the
-offline `python3 scripts/bundle-token-artwork.py --check` and the artwork
-boundary tests. A logo is decorative and never establishes identity, token
+image provider. The small static browser mapping retains issuer-reviewed
+SVGs bound to exact chain/address identities. Reviewed neutral bindings
+prevent pegged copies and pUSD from borrowing Circle's mark. CI checks this
+mapping and browser identity boundaries offline. Long-tail artwork and its
+acquisition pipeline remain preserved at Broker commit `2b7033a39163513a39b387a83abbaca80fcd0268`
+for separate review. A logo is decorative and never establishes identity, token
 behavior or decimals; a missing image uses the neutral icon.
+
+## Released policy migration
+
+Released catalog restrictions retain their exact canonical representation and
+signature. Wallets carrying that extension or its required verifier cannot
+prepare, activate or use signing authority until an owner approves a policy
+replacement. Inspection and cancellation remain available. The policy ceremony
+names removed trust keys, freshness and verifier restrictions and opaque or
+unlimited-allowance refusals. Compiled descriptions do not enforce those rules.
+Unrelated policy fields are retained unless explicitly changed. Policy-version
+and digest binding keep old grants invalid after replacement. Broker stores
+advance to version 3 before writing these manifests; released readers refuse
+that version. Restore a pre-upgrade backup when returning to a released binary.
 
 ## Assurance levels
 

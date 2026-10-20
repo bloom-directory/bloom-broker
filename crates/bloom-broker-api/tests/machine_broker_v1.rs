@@ -582,19 +582,19 @@ where
 
 #[test]
 fn every_machine_broker_variant_matches_frozen_v1_frames() {
-    // The unreleased 1.7 fixture combines the remote-ceremony methods and
+    // The signing release's 1.8 fixture combines the remote-ceremony methods and
     // surface selection with native and Safe review fields. Empty review
     // vectors remain omitted from pre-existing approval request frames.
     assert_eq!(MachineBrokerMethod::ALL.len(), 45);
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "950b2fc2235205a19fa41058e6c14fb00eba4730415e0545830322cf8d6780cb",
+        "1749dae9a684ec9a1be412c4a94d584485cc1f0fb28a468afb3f1dcf405e62a4",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "7889a9d1f237553511ddcf311543652f4c199aec2a8069950217e5a5feda9128",
+        "32bd9b02398991399b065111e6cacfa8c98667f5454babca2873dab05d314276",
     );
 }
 
