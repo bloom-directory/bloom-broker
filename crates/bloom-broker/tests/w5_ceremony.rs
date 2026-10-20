@@ -1,3 +1,30 @@
+#[test]
+#[ignore = "requires disposable released and upgraded stores"]
+fn pm80_released_reader_refuses_the_upgraded_floor_and_accepts_the_backup() {
+    for (variable, compatible) in [("BLOOM_PM80_RELEASED_STORE", true), ("BLOOM_PM80_UPGRADED_STORE", false)] {
+        let source = std::path::PathBuf::from(std::env::var_os(variable).expect(variable));
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["broker-journal.sqlite", "broker-authority.sqlite"] {
+            std::fs::copy(source.join(name), temp.path().join(name)).unwrap();
+        }
+        let journal = Arc::new(BrokerJournal::open(temp.path().join("broker-journal.sqlite"), Arc::new(ServiceTestAuditSigner)).unwrap());
+        let result = BrokerAuthority::open(
+            temp.path().join("broker-authority.sqlite"), journal, BTreeMap::new(),
+            Token::new("installer-key").unwrap(), SigningKey::from_bytes(&[5;32]).verifying_key(),
+            Token::new("signer-ceremony-key").unwrap(), SigningKey::from_bytes(&[9;32]).verifying_key(),
+            Token::new("signer-revocation-key").unwrap(), SigningKey::from_bytes(&[4;32]).verifying_key(),
+            AssuranceRegistry::compiled(Vec::new()).unwrap(),
+        );
+        if compatible {
+            let authority = result.unwrap();
+            assert!(authority.policy_snapshot(&Token::new("quiet-lilac").unwrap()).is_ok());
+        } else {
+            let error = result.err().expect("released reader must refuse upgraded state");
+            assert!(error.to_string().contains("requires at least 3"), "{error}");
+        }
+    }
+}
+
 use axum::{
     body::Body,
     http::{Request, StatusCode, Version, header},
