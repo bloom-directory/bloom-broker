@@ -1302,6 +1302,58 @@ fn ac08_exact_selector_rejects_payload_hash_order_count_key_and_suite_changes() 
 }
 
 #[test]
+fn catalog_upgrade_retains_predecessor_but_refuses_its_existing_grant() {
+    let (harness, predecessor, _scope, child) = scoped_petal_child();
+    let terms = scoped_petal_terms(&harness, &predecessor, &child);
+    harness.activate(&terms, Some(&predecessor));
+    let mut retired = predecessor.clone();
+    retired.petal_lineage.as_mut().unwrap().active = false;
+    sign_zeroed(
+        &mut retired,
+        |value| &mut value.installer_signature,
+        PROVENANCE_DOMAIN,
+        &harness.installer_key,
+    );
+    let mut successor = predecessor.clone();
+    successor.subject = ProvenanceSubject::Petal {
+        package_hash: digest(10),
+        route: "/sign".into(),
+    };
+    let lineage = successor.petal_lineage.as_mut().unwrap();
+    lineage.release_sequence = DecimalU64::new(2);
+    lineage.predecessor_package_hashes = vec![digest(9)];
+    sign_zeroed(
+        &mut successor,
+        |value| &mut value.installer_signature,
+        PROVENANCE_DOMAIN,
+        &harness.installer_key,
+    );
+    harness
+        .authority
+        .synchronize_provenance_catalog(&ProvenanceCatalog {
+            schema: PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![retired, successor],
+        })
+        .unwrap();
+    let request = petal_input(
+        &terms,
+        &predecessor,
+        operation(121),
+        CryptoSuite::Secp256k1Sha256Recoverable,
+    );
+    assert!(error_code(harness.authority.authorize(&request).unwrap_err()).contains("PROVENANCE"));
+    assert!(
+        error_code(
+            harness
+                .authority
+                .prepare_approval(&terms, &digest(7))
+                .unwrap_err()
+        )
+        .contains("PROVENANCE")
+    );
+}
+
+#[test]
 fn expired_petal_authority_cannot_reserve_a_signature() {
     let harness = Harness::new();
     let provenance = harness.provenance();
