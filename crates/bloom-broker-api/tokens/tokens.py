@@ -283,6 +283,9 @@ def capture(only=()):
     observations = []
     blocks = {}
     for chain, tokens in sorted(by_chain.items()):
+        observed_chain = rpc(chain, [("eth_chainId", [])])[0]
+        if int(observed_chain, 16) != chain:
+            raise ValueError(f"chain {chain}: RPC chain ID mismatch ({observed_chain})")
         block = rpc(chain, [("eth_getBlockByNumber", ["latest", False])])[0]
         number, block_hash = block["number"], block["hash"]
         if not number.startswith("0x") or len(block_hash) != 66:

@@ -380,3 +380,59 @@ fn shortcut_constants_receive_catalog_readings_and_runtime_slots_stay_explicit()
     );
     export_ui_fixture("enso-shortcut", &call);
 }
+
+#[test]
+fn raw_shortcut_summaries_do_not_claim_header_selectors_for_runtime_data() {
+    for (overwrite, raw, bytes, expected) in [
+        (None, true, vec![1, 2, 3, 4, 5], "selector 0x01020304"),
+        (Some(0), true, vec![0; 32], "selector runtime-derived"),
+        (Some(0xfe), true, vec![0; 32], "selector runtime-derived"),
+        (Some(0), false, vec![0; 32], "selector 0xdeadbeef"),
+        (None, true, vec![], "selector none"),
+        (None, true, vec![1, 2, 3], "selector none"),
+    ] {
+        let mut command = [0u8; 32];
+        command[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        command[4] = if raw { 0x21 } else { 1 };
+        command[5..11].fill(0xff);
+        command[5] = if raw { 0 } else { 0x80 };
+        command[11] = 0xff;
+        command[12..].copy_from_slice(&USDC.parse::<alloy_primitives::Address>().unwrap()[..]);
+        let mut commands = Vec::new();
+        if let Some(output) = overwrite {
+            let mut first = command;
+            first[4] = 1;
+            first[5] = 0xff;
+            first[11] = output;
+            commands.push(DynSolValue::FixedBytes(first.into(), 32));
+        }
+        commands.push(DynSolValue::FixedBytes(command.into(), 32));
+        let shortcut = parse_function("executeShortcut(bytes32,bytes32,bytes32[],bytes[])")
+            .unwrap()
+            .abi_encode_input(&[
+                DynSolValue::FixedBytes(Default::default(), 32),
+                DynSolValue::FixedBytes(Default::default(), 32),
+                DynSolValue::Array(commands),
+                DynSolValue::Array(vec![DynSolValue::Bytes(bytes)]),
+            ])
+            .unwrap();
+        let outer = parse_function(SINGLE)
+            .unwrap()
+            .abi_encode_input(&[input(USDC, 1), DynSolValue::Bytes(shortcut)])
+            .unwrap();
+        let call = review(&outer, 0).unwrap();
+        let label = if overwrite.is_some() {
+            "Encoded command 2"
+        } else {
+            "Encoded command 1"
+        };
+        let summary = &field(&call, label).value;
+        assert!(summary.contains(expected), "{summary}");
+        if raw {
+            assert!(!summary.contains("deadbeef"), "{summary}");
+            if overwrite.is_some() {
+                assert!(summary.contains("Entire calldata"));
+            }
+        }
+    }
+}

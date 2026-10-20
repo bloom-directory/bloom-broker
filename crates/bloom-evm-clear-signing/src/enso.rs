@@ -28,6 +28,7 @@ pub(crate) struct Step {
     pub call_type: &'static str,
     pub target: Address,
     pub selector: String,
+    header_selector: String,
     arguments: Vec<String>,
     pub native_value: String,
     output: String,
@@ -349,10 +350,12 @@ pub(crate) fn decode(data: &[u8]) -> Result<Program, String> {
         if expanded_bytes > MAX_BYTES {
             return Err("expanded shortcut calls exceed 64 KiB".into());
         }
-        let selector = calldata
-            .as_ref()
-            .map(|data| &data[..data.len().min(4)])
-            .unwrap_or(&word[..4]);
+        let selector = match &calldata {
+            Some(data) if data.len() >= 4 => format!("0x{}", hex::encode(&data[..4])),
+            Some(_) => "none (calldata shorter than four bytes)".into(),
+            None if flags & 0x20 != 0 => "runtime-derived".into(),
+            None => format!("0x{}", hex::encode(&word[..4])),
+        };
         let output_index = word[11];
         let output = if output_index == 0xff {
             "discard return data".into()
@@ -382,7 +385,8 @@ pub(crate) fn decode(data: &[u8]) -> Result<Program, String> {
             command_word: position,
             call_type: kind,
             target: Address::from_slice(&word[12..]),
-            selector: format!("0x{}", hex::encode(selector)),
+            selector,
+            header_selector: format!("0x{}", hex::encode(&word[..4])),
             arguments: args,
             native_value,
             output,
@@ -428,6 +432,67 @@ mod tests {
         word[11] = output;
         word[12..].fill(0x11);
         word
+    }
+
+    #[test]
+    fn pinned_encoder_vectors_match_the_reader() {
+        #[derive(serde::Deserialize)]
+        struct Vector {
+            name: String,
+            state: Vec<String>,
+            selector: String,
+            indices: String,
+            calldata: String,
+            flags: u8,
+        }
+        let vectors: Vec<Vector> =
+            serde_json::from_str(include_str!("../tests/fixtures/weiroll/vectors.json")).unwrap();
+        assert_eq!(vectors.len(), 7);
+        for vector in vectors {
+            let mut word = command(vector.flags, &[], 0xff);
+            word[..4].copy_from_slice(&hex::decode(&vector.selector).unwrap());
+            let indices: [u8; 32] = hex::decode(&vector.indices).unwrap().try_into().unwrap();
+            let state = vector
+                .state
+                .iter()
+                .map(|s| hex::decode(s).unwrap())
+                .collect();
+            let program = decode(&shortcut(&[word, indices], state)).unwrap();
+            assert_eq!(
+                program.steps[0].calldata,
+                Some(hex::decode(vector.calldata).unwrap()),
+                "{}",
+                vector.name
+            );
+        }
+    }
+
+    #[test]
+    fn effective_selector_tracks_raw_data_and_symbolic_overwrites() {
+        let mut raw = command(0x21, &[0], 0xff);
+        raw[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        for bytes in [vec![], vec![1, 2, 3], vec![1, 2, 3, 4, 5]] {
+            let program = decode(&shortcut(&[raw], vec![bytes.clone()])).unwrap();
+            assert_eq!(
+                program.steps[0].selector,
+                if bytes.len() < 4 {
+                    "none (calldata shorter than four bytes)"
+                } else {
+                    "0x01020304"
+                }
+            );
+        }
+        for output in [0, 0xfe] {
+            let program = decode(&shortcut(
+                &[command(1, &[], output), raw, command(1, &[0x80], 0xff)],
+                vec![vec![0; 32]],
+            ))
+            .unwrap();
+            assert_eq!(program.steps[1].selector, "runtime-derived");
+            assert_eq!(program.steps[1].header_selector, "0xdeadbeef");
+            assert!(program.steps[1].calldata.is_none());
+            assert_eq!(program.steps[2].selector, "0xa9059cbb");
+        }
     }
 
     #[test]

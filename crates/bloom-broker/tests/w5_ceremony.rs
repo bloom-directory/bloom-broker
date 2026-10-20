@@ -154,7 +154,12 @@ async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
     );
     let old: CanonicalWalletPolicy =
         serde_json::from_slice(&baseline.canonical_policy.decode()).unwrap();
-    if old.clear_signing.is_none() {
+    let mut terms: SealedApprovalTerms =
+        serde_json::from_value(serde_json::to_value(approval_request().terms).unwrap()).unwrap();
+    terms.wallet_id = wallet_id.clone();
+    terms.policy_version = baseline.version.clone();
+    terms.policy_digest = baseline.policy_digest.clone();
+    let current = if old.clear_signing.is_none() {
         let observed = MachineBrokerService::dispatch(
             &broker,
             MachineBrokerRequest::PolicyRead(WalletRequest {
@@ -166,183 +171,216 @@ async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
         assert!(
             matches!(observed, MachineBrokerResponse::PolicyRead(snapshot) if snapshot == original)
         );
-        signer_server.abort();
-        return;
-    }
-    let mut terms: SealedApprovalTerms =
-        serde_json::from_value(serde_json::to_value(approval_request().terms).unwrap()).unwrap();
-    terms.wallet_id = wallet_id.clone();
-    terms.policy_version = baseline.version.clone();
-    terms.policy_digest = baseline.policy_digest.clone();
-    let denied = authority
-        .prepare_approval(&terms, &digest("a1"))
-        .unwrap_err();
-    assert!(
-        denied.to_string().contains("POLICY_MIGRATION_REQUIRED"),
-        "{denied}"
-    );
-    let mut proposed = old.clone();
-    proposed.clear_signing = None;
-    let authority_diff = canonical_policy_authority_diff(&old, &proposed);
-    assert_eq!(
-        authority_diff.removed_legacy_clear_signing,
-        old.clear_signing
-    );
-    let bytes = serde_jcs::to_vec(&proposed).unwrap();
-    let mut update = PolicyUpdateRequest {
-        operation_id: operation("f1"),
-        wallet_id: wallet_id.clone(),
-        baseline_version: baseline.version.clone(),
-        baseline_digest: baseline.policy_digest.clone(),
-        proposed_canonical_policy: Base64UrlBytes::from_bytes(&bytes),
-        proposed_policy_digest: Digest32::from_bytes(sha2::Sha256::digest(&bytes).into()),
-        authority_diff_digest: authority_diff.digest().unwrap(),
-        assurance_level: Token::new("user_verified").unwrap(),
-    };
-    // Cancelling a real owner migration must leave the signed policy intact.
-    MachineBrokerService::dispatch(
-        &broker,
-        MachineBrokerRequest::PolicyValidateUpdate(update.clone()),
-    )
-    .await
-    .unwrap();
-    MachineBrokerService::dispatch(
-        &broker,
-        MachineBrokerRequest::CeremonyCancel(bloom_broker_api::IdRequest {
-            id: Digest32::from_bytes(update.operation_id.to_bytes()),
-        }),
-    )
-    .await
-    .unwrap();
-    assert_eq!(authority.policy_snapshot(&wallet_id).unwrap(), original);
-    update.operation_id = operation("f2");
-    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
-    let prepared = match MachineBrokerService::dispatch(
-        &broker,
-        MachineBrokerRequest::PolicyValidateUpdate(update.clone()),
-    )
-    .await
-    .unwrap()
-    {
-        MachineBrokerResponse::PolicyValidateUpdate(prepared) => prepared,
-        other => panic!("unexpected prepare: {other:?}"),
-    };
-    assert_eq!(authority.policy_snapshot(&wallet_id).unwrap(), original);
-    let token = url_token(&prepared.ceremony_url);
-    let session_response = broker
-        .ceremony()
-        .router()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", token)
-                .body(Body::empty())
-                .unwrap(),
+        // A plain released policy requires no owner migration. Continue through
+        // the same real approval/signing path as the migrated policy below.
+        baseline.clone()
+    } else {
+        let denied = authority
+            .prepare_approval(&terms, &digest("a1"))
+            .unwrap_err();
+        assert!(
+            denied.to_string().contains("POLICY_MIGRATION_REQUIRED"),
+            "{denied}"
+        );
+        let mut proposed = old.clone();
+        proposed.clear_signing = None;
+        let authority_diff = canonical_policy_authority_diff(&old, &proposed);
+        assert_eq!(
+            authority_diff.removed_legacy_clear_signing,
+            old.clear_signing
+        );
+        let bytes = serde_jcs::to_vec(&proposed).unwrap();
+        let mut update = PolicyUpdateRequest {
+            operation_id: operation("f1"),
+            wallet_id: wallet_id.clone(),
+            baseline_version: baseline.version.clone(),
+            baseline_digest: baseline.policy_digest.clone(),
+            proposed_canonical_policy: Base64UrlBytes::from_bytes(&bytes),
+            proposed_policy_digest: Digest32::from_bytes(sha2::Sha256::digest(&bytes).into()),
+            authority_diff_digest: authority_diff.digest().unwrap(),
+            assurance_level: Token::new("user_verified").unwrap(),
+        };
+        // Cancelling a real owner migration must leave the signed policy intact.
+        MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::PolicyValidateUpdate(update.clone()),
         )
         .await
         .unwrap();
-    let session: serde_json::Value = serde_json::from_slice(
-        &session_response
-            .into_body()
-            .collect()
+        MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::CeremonyCancel(bloom_broker_api::IdRequest {
+                id: Digest32::from_bytes(update.operation_id.to_bytes()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(authority.policy_snapshot(&wallet_id).unwrap(), original);
+        update.operation_id = operation("f2");
+        tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+        let prepared = match MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::PolicyValidateUpdate(update.clone()),
+        )
+        .await
+        .unwrap()
+        {
+            MachineBrokerResponse::PolicyValidateUpdate(prepared) => prepared,
+            other => panic!("unexpected prepare: {other:?}"),
+        };
+        assert_eq!(authority.policy_snapshot(&wallet_id).unwrap(), original);
+        let token = url_token(&prepared.ceremony_url);
+        let session_response = broker
+            .ceremony()
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session")
+                    .header(header::HOST, "localhost:18734")
+                    .header("x-bloom-ceremony-token", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .unwrap();
-    assert_eq!(
-        session["review_manifest"]["authority_diff"],
-        serde_json::to_value(&authority_diff).unwrap()
-    );
-    let challenge: CeremonyChallenge =
-        serde_json::from_value(session["challenges"][0]["binding"].clone()).unwrap();
-    let contribution: CustodySignerContribution =
-        serde_json::from_value(session["signer_contribution"].clone()).unwrap();
-    let assertion = authenticator.assertion(&challenge.canonical_bytes().unwrap(), 3);
-    let aad = CustodyHpkeAad {
-        surface: bloom_signer_api::legacy_local_surface(),
-        ceremony_id: contribution.ceremony_id.clone(),
-        ceremony_kind: CeremonyKind::PolicyUpdate,
-        custody_operation_id: update.operation_id.clone(),
-        signer_nonce: contribution.signer_nonce.clone(),
-        signer_contribution_digest: contribution.digest().unwrap(),
-        wallet_id: Some(wallet_id.clone()),
-        key_ref: None,
-        credential_id: Some(assertion.credential_id.clone()),
-        expected_input_class: Token::new("policy_update_credential_prf").unwrap(),
-    }
-    .canonical_bytes()
-    .unwrap();
-    let plaintext = serde_jcs::to_vec(&serde_json::json!({
-        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
-        "effect": {"kind": "policy_update"},
-    }))
-    .unwrap();
-    let encrypted_input = seal_hpke(
-        &contribution.hpke_recipient_key,
-        b"bloom-custody-input/v1",
-        &aad,
-        &plaintext,
-    )
-    .unwrap();
-    let completed = signer_ceremony
-        .complete_policy_update(
-            PolicyUpdateCeremonyCompleteRequest {
-                custody: CustodyCompleteRequest {
-                    ceremony_kind: CeremonyKind::PolicyUpdate,
-                    custody_operation_id: update.operation_id.clone(),
-                    ceremony_id: contribution.ceremony_id,
-                    proof: WebAuthnCeremonyProof::Assertion { assertion },
-                    encrypted_input: Some(encrypted_input),
-                    public_binding_digest: update.terms_digest().unwrap(),
-                },
-            },
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let session: serde_json::Value = serde_json::from_slice(
+            &session_response
+                .into_body()
+                .collect()
+                .await
                 .unwrap()
-                .as_millis()
-                .try_into()
-                .unwrap(),
+                .to_bytes(),
         )
         .unwrap();
-
-    broker
-        .ceremony()
-        .expire_sessions(contribution.expires_at_ms.get() + 1)
+        assert_eq!(
+            session["review_manifest"]["authority_diff"],
+            serde_json::to_value(&authority_diff).unwrap()
+        );
+        let challenge: CeremonyChallenge =
+            serde_json::from_value(session["challenges"][0]["binding"].clone()).unwrap();
+        let contribution: CustodySignerContribution =
+            serde_json::from_value(session["signer_contribution"].clone()).unwrap();
+        let assertion = authenticator.assertion(&challenge.canonical_bytes().unwrap(), 3);
+        let aad = CustodyHpkeAad {
+            surface: bloom_signer_api::legacy_local_surface(),
+            ceremony_id: contribution.ceremony_id.clone(),
+            ceremony_kind: CeremonyKind::PolicyUpdate,
+            custody_operation_id: update.operation_id.clone(),
+            signer_nonce: contribution.signer_nonce.clone(),
+            signer_contribution_digest: contribution.digest().unwrap(),
+            wallet_id: Some(wallet_id.clone()),
+            key_ref: None,
+            credential_id: Some(assertion.credential_id.clone()),
+            expected_input_class: Token::new("policy_update_credential_prf").unwrap(),
+        }
+        .canonical_bytes()
         .unwrap();
-    let _recovered = broker_custody_result(&broker, update.operation_id.clone()).await;
-    let committed = match MachineBrokerService::dispatch(
-        &broker,
-        MachineBrokerRequest::PolicyCommitUpdate(PolicyCommitUpdateRequest {
-            operation_id: update.operation_id.clone(),
-            ceremony_receipt: custody_result_to_machine(&completed),
-        }),
-    )
-    .await
-    .unwrap()
-    {
-        MachineBrokerResponse::PolicyCommitUpdate(receipt) => receipt,
-        other => panic!("unexpected commit: {other:?}"),
+        let plaintext = serde_jcs::to_vec(&serde_json::json!({
+            "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+            "effect": {"kind": "policy_update"},
+        }))
+        .unwrap();
+        let encrypted_input = seal_hpke(
+            &contribution.hpke_recipient_key,
+            b"bloom-custody-input/v1",
+            &aad,
+            &plaintext,
+        )
+        .unwrap();
+        let completed = signer_ceremony
+            .complete_policy_update(
+                PolicyUpdateCeremonyCompleteRequest {
+                    custody: CustodyCompleteRequest {
+                        ceremony_kind: CeremonyKind::PolicyUpdate,
+                        custody_operation_id: update.operation_id.clone(),
+                        ceremony_id: contribution.ceremony_id,
+                        proof: WebAuthnCeremonyProof::Assertion { assertion },
+                        encrypted_input: Some(encrypted_input),
+                        public_binding_digest: update.terms_digest().unwrap(),
+                    },
+                },
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        broker
+            .ceremony()
+            .expire_sessions(contribution.expires_at_ms.get() + 1)
+            .unwrap();
+        let _recovered = broker_custody_result(&broker, update.operation_id.clone()).await;
+        let committed = match MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::PolicyCommitUpdate(PolicyCommitUpdateRequest {
+                operation_id: update.operation_id.clone(),
+                ceremony_receipt: custody_result_to_machine(&completed),
+            }),
+        )
+        .await
+        .unwrap()
+        {
+            MachineBrokerResponse::PolicyCommitUpdate(receipt) => receipt,
+            other => panic!("unexpected commit: {other:?}"),
+        };
+        assert_eq!(
+            committed.committed.version.get(),
+            original.version.get() + 1
+        );
+        let migrated: CanonicalWalletPolicy =
+            serde_json::from_slice(&committed.committed.canonical_policy.decode()).unwrap();
+        assert_eq!(migrated, proposed);
+        assert!(
+            authority.prepare_approval(&terms, &digest("a1")).is_err(),
+            "old policy-bound grants remain invalid"
+        );
+        assert_eq!(
+            rusqlite::Connection::open(&broker_journal_path)
+                .unwrap()
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            3
+        );
+        committed.committed
     };
-    assert_eq!(
-        committed.committed.version.get(),
-        original.version.get() + 1
-    );
-    let migrated: CanonicalWalletPolicy =
-        serde_json::from_slice(&committed.committed.canonical_policy.decode()).unwrap();
-    assert_eq!(migrated, proposed);
-    assert!(
-        authority.prepare_approval(&terms, &digest("a1")).is_err(),
-        "old policy-bound grants remain invalid"
-    );
-    assert_eq!(
-        rusqlite::Connection::open(&broker_journal_path)
-            .unwrap()
-            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+    let reopened = BrokerAuthority::open(
+        &broker_authority_path,
+        journal.clone(),
+        BTreeMap::new(),
+        Token::new("installer-key").unwrap(),
+        SigningKey::from_bytes(&[5; 32]).verifying_key(),
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]).verifying_key(),
+        Token::new("signer-revocation-key").unwrap(),
+        SigningKey::from_bytes(&[4; 32]).verifying_key(),
+        AssuranceRegistry::compiled(Vec::new()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reopened.policy_snapshot(&wallet_id).unwrap(), current);
+    let authority = Arc::new(reopened);
+    let broker = BrokerRpcService::new(
+        authority.clone(),
+        journal.clone(),
+        Arc::new(
+            BrokerClock::new(
+                journal.clone(),
+                test_time_source(),
+                broker_identity.boot_epoch.clone(),
+            )
             .unwrap(),
-        3
-    );
+        ),
+        broker.ceremony().clone(),
+        signer_client.clone(),
+        Token::new("broker-app-1").unwrap(),
+        SigningKey::from_bytes(&[7; 32]),
+        broker_identity.boot_epoch.clone(),
+        digest("e3"),
+        "test",
+    )
+    .unwrap();
     let public = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::WalletGetPublic(WalletRequest {
@@ -404,8 +442,8 @@ async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
         .unwrap();
     let mut approval_terms = terms.clone();
     approval_terms.key_ref = account_key;
-    approval_terms.policy_version = committed.committed.version.clone();
-    approval_terms.policy_digest = committed.committed.policy_digest.clone();
+    approval_terms.policy_version = current.version.clone();
+    approval_terms.policy_digest = current.policy_digest.clone();
     approval_terms.wallet_revocation_epoch = public.wallet_revocation_epoch;
     approval_terms.provenance_digest =
         Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&provenance).unwrap()).into());

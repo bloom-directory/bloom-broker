@@ -576,7 +576,11 @@ fn review_at(
                                         Err(error) => step.unread_reason = Some(error.to_string()),
                                     }
                                 }
-                                _ => step.unread_reason = Some("Call arguments or native value depend on preceding runtime return data; initial slot values are not reused.".into()),
+                                _ => step.unread_reason = Some(if step.selector == "runtime-derived" {
+                                    "Entire calldata, including its selector, depends on preceding runtime return data; the command header is not the effective selector."
+                                } else {
+                                    "Call arguments or native value depend on preceding runtime return data; initial slot values are not reused."
+                                }.into()),
                             }
                         }
                         // Keep useful calls visible in the primary review. The

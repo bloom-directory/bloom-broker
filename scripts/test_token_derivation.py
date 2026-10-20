@@ -56,6 +56,8 @@ class DerivationTests(unittest.TestCase):
 
     def test_capture_refuses_a_block_changed_during_reads(self):
         def rpc(chain, calls):
+            if calls[0][0] == "eth_chainId":
+                return [hex(chain)]
             if calls[0][0] == "eth_getBlockByNumber":
                 return [{"number": "0x1", "hash": "0x" + ("11" if calls[0][1][0] == "latest" else "22") * 32}]
             return ["0x"] * len(calls)
@@ -63,6 +65,13 @@ class DerivationTests(unittest.TestCase):
         with patch.object(tokens, "candidates", return_value=iter([candidate])), patch.object(tokens, "rpc", side_effect=rpc):
             with self.assertRaisesRegex(ValueError, "block changed"):
                 tokens.capture()
+
+    def test_capture_refuses_wrong_chain_before_reading_observations(self):
+        candidate = self.inputs()["observations"][0]["token"]
+        with patch.object(tokens, "candidates", return_value=iter([candidate])), patch.object(tokens, "rpc", return_value=["0x89"]) as rpc:
+            with self.assertRaisesRegex(ValueError, "chain ID mismatch"):
+                tokens.capture()
+            rpc.assert_called_once_with(1, [("eth_chainId", [])])
 
 
 if __name__ == "__main__":

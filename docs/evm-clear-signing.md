@@ -428,30 +428,20 @@ read is shown as exact bytes with the reason, as anywhere else.
 
 ## Adding to the catalog
 
-- **Tokens:** before each release, run `python3 -I tokens/tokens.py >
-  tokens/tokens.json` in `crates/bloom-broker-api`. It rebuilds the list from the Uniswap default list,
-  CoinGecko's Gnosis list and Robinhood's Stock Token registry, keeps a token
-  only if its address has code and its `decimals()` matches, and marks
-  proxies `upgradeable`. A new family of tokens is a new source in
-  `tokens.py`, not a hand-edited row.
+- **Tokens:** capture only the identities being updated with
+  `python3 -I tokens/tokens.py --capture /tmp/token-inputs.json --only CHAIN_ID:ADDRESS`
+  from `crates/bloom-broker-api`. Capture verifies the RPC chain ID, pins the
+  block and records source digests and observations. Review the captured inputs,
+  then derive with `--offline /tmp/token-inputs.json > /tmp/token-derived.json`.
+  Check recorded output with `--offline INPUT --check OUTPUT`. Ordinary builds
+  and releases stay offline; no network-wide token refresh is required.
+  A new token source belongs in `tokens.py`, not a hand-edited provenance claim.
 - **A contract:** add its ERC-7730 descriptor under `catalogs/` and a line to
   `DESCRIPTORS`, binding it to its listed deployments, to per-user instances
   of one deployment, or as a standard. A descriptor outside the subset fails
   the built-in catalog test rather than reaching an owner.
 
 Either change ships with the next Broker release.
-
-## Durable-state compatibility
-
-Storing a policy that carries the extension raises the store's minimum state
-version to 2 in the same transaction. A build below that floor refuses to open
-the store before it mutates anything.
-
-A build predating the floor has no floor to read. It fails one step later
-instead: its strict decoder rejects the unknown `clear_signing` field while
-loading the policy. That is fail-closed rather than silent, but it is a
-different message, and rollback is never made to work by dropping the field.
-The same rule applies to backup and restore.
 
 An unsafe or unreadable theme stops startup because it controls what the
 owner sees. The theme file is opened without following symlinks, and
