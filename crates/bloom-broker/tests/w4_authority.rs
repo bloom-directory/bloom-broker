@@ -1302,6 +1302,30 @@ fn ac08_exact_selector_rejects_payload_hash_order_count_key_and_suite_changes() 
 }
 
 #[test]
+fn expired_petal_authority_cannot_reserve_a_signature() {
+    let harness = Harness::new();
+    let provenance = harness.provenance();
+    let terms = petal_terms(&harness, &provenance);
+    harness.activate(&terms, Some(&provenance));
+    let mut input = petal_input(
+        &terms,
+        &provenance,
+        operation(20),
+        CryptoSuite::Secp256k1Sha256Recoverable,
+    );
+    input.reserved_at_ms = terms.expires_at_ms.get() + 1;
+    input.observed_utc_ms = Some(input.reserved_at_ms);
+    assert!(
+        error_code(harness.authority.authorize(&input).unwrap_err())
+            .contains("APPROVAL_OUTSIDE_VALIDITY")
+    );
+    // A failed expired use cannot consume the grant or claim nonce.
+    input.reserved_at_ms = terms.expires_at_ms.get();
+    input.observed_utc_ms = Some(input.reserved_at_ms);
+    harness.authority.authorize(&input).unwrap();
+}
+
+#[test]
 fn authorization_rechecks_broker_owned_current_provenance_catalog() {
     let harness = Harness::new();
     let provenance = harness.provenance();
