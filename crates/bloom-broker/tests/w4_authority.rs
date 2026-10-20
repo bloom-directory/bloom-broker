@@ -1,3 +1,28 @@
+#[test]
+fn legacy_removal_diff_matches_machine_vector_without_other_authority_changes() {
+    let vector: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/legacy-policy-removal.json")).unwrap();
+    let current: bloom_broker_api::CanonicalWalletPolicy =
+        serde_json::from_value(vector["current"].clone()).unwrap();
+    let proposed: bloom_broker_api::CanonicalWalletPolicy =
+        serde_json::from_value(vector["proposed"].clone()).unwrap();
+    let diff = canonical_policy_authority_diff(&current, &proposed);
+    assert_eq!(
+        serde_json::to_value(&diff).unwrap(),
+        vector["authority_diff"]
+    );
+    assert_eq!(
+        diff.digest().unwrap().as_str(),
+        "65f348e08a8ded736ad13843456a1afbaacf16bf5518147b1d7d900f703e7401"
+    );
+    assert_eq!(proposed.allowed_destinations, current.allowed_destinations);
+    assert_eq!(
+        proposed.allowed_petal_packages,
+        current.allowed_petal_packages
+    );
+    assert_eq!(proposed.required_verifiers.len(), 1);
+}
+
 use bloom_broker::{
     assurance_verifiers::SolanaSystemTransferVerifier,
     authority::{
