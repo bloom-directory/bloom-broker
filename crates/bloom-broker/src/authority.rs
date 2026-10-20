@@ -542,7 +542,32 @@ impl BrokerAuthority {
                     ))
                 })?,
             ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            // `NotFound` also covers a missing *parent*: a mistyped
+            // directory in the configured path would otherwise read as a
+            // home with nothing to migrate, which is the same silent skip
+            // as a dangling link. Only a missing entry inside a directory
+            // that exists means there is nothing to migrate.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let parent = legacy_path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                match std::fs::metadata(parent) {
+                    Ok(metadata) if metadata.is_dir() => None,
+                    Ok(_) => {
+                        return Err(AuthorityError::Storage(format!(
+                            "the legacy authority store's directory {} is not a directory",
+                            parent.display()
+                        )));
+                    }
+                    Err(error) => {
+                        return Err(AuthorityError::Storage(format!(
+                            "cannot read the legacy authority store's directory {}: {error}",
+                            parent.display()
+                        )));
+                    }
+                }
+            }
             Err(error) => {
                 return Err(AuthorityError::Storage(format!(
                     "cannot tell whether the legacy authority store at {} exists: {error}",

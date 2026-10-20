@@ -626,6 +626,29 @@ fn a_dangling_legacy_store_symlink_fails_startup_instead_of_skipping_migration()
     );
 }
 
+/// A missing directory in the configured path is a misconfiguration, not a
+/// home with nothing to migrate: the store the Broker was told to carry over
+/// can never be found there. Startup fails and nothing is created.
+#[cfg(unix)]
+#[test]
+fn a_missing_legacy_store_directory_fails_startup_instead_of_skipping_migration() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("journal.sqlite");
+    let legacy_path = directory
+        .path()
+        .join("no-such-dir")
+        .join("authority.sqlite");
+
+    let error = open_authority_at(&legacy_path, &journal_path)
+        .err()
+        .expect("a legacy store path inside a missing directory must fail startup");
+    assert!(
+        error.to_string().contains("no-such-dir"),
+        "the error must name the missing directory: {error}"
+    );
+    assert!(!legacy_path.parent().unwrap().exists());
+}
+
 /// The symlink itself is not the problem: a legacy store that is reachable
 /// through one opens and migrates exactly as a regular file does.
 #[cfg(unix)]
