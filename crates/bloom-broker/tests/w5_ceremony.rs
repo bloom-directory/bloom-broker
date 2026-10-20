@@ -2530,7 +2530,7 @@ fn peer_acl(identity: &LocalIdentity, effective_uid: u32) -> PeerAcl {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_service_requires_completion_then_commits_and_replays_over_authenticated_rpc() {
-    let authenticator = VirtualAuthenticator::generate();
+    let authenticator = VirtualAuthenticator::from_seed(b"pm80-disposable-policy-owner");
     let directory = tempfile::tempdir().unwrap();
     let signer_database = directory.path().join("signer.sqlite");
     let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
@@ -2858,6 +2858,23 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let petal_route = "/petals/fixture/sign";
     let mut proposed_policy = baseline_policy.clone();
     proposed_policy.maximum_approval_lifetime_ms += 1;
+    if std::env::var_os("BLOOM_PM80_LEGACY_POLICY").is_some() {
+        proposed_policy.clear_signing = Some(bloom_broker_api::ClearSigningPolicy {
+            catalog_id: Token::new("bloom-tokens").unwrap(),
+            trusted_keys: vec![bloom_broker_api::CatalogTrustedKey {
+                key_id: Token::new("fixture-publisher").unwrap(),
+                verifying_key: Base64UrlBytes::from_bytes(&SigningKey::from_bytes(&[7;32]).verifying_key().to_bytes()),
+            }],
+            signature_threshold: 1,
+            maximum_observation_age_ms: 86_400_000,
+            opaque_exact_allowed: false,
+            unlimited_allowance_allowed: false,
+            verifier: bloom_broker_api::RequiredVerifier {
+                verifier_id: Token::new(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_ID).unwrap(),
+                verifier_digest: Digest32::from_bytes(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES),
+            },
+        });
+    }
     proposed_policy
         .allowed_petal_packages
         .push(petal_package.clone());
@@ -3064,6 +3081,25 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         committed.committed
     );
 
+    if let Some(output) = std::env::var_os("BLOOM_PM80_RELEASED_STORE_OUT") {
+        let output = std::path::PathBuf::from(output);
+        std::fs::create_dir_all(&output).unwrap();
+        for entry in std::fs::read_dir(directory.path()).unwrap() {
+            let entry = entry.unwrap();
+            if !entry.file_type().unwrap().is_file() { continue; }
+            let name = entry.file_name();
+            if name.to_string_lossy().ends_with(".sqlite") {
+                let destination = output.join(&name).to_string_lossy().replace('\'', "''");
+                rusqlite::Connection::open(entry.path()).unwrap()
+                    .execute_batch(&format!("VACUUM INTO '{destination}'")).unwrap();
+            } else if !name.to_string_lossy().ends_with("-wal") && !name.to_string_lossy().ends_with("-shm") {
+                std::fs::copy(entry.path(), output.join(&name)).unwrap();
+            }
+        }
+        std::fs::write(output.join("policy-snapshot.json"), serde_json::to_vec_pretty(&committed.committed).unwrap()).unwrap();
+        signer_server.abort();
+        return;
+    }
     // Exercise the complete generic Petal sub-key path over the production
     // Broker and Signer services. No venue-specific derivation or signing
     // branch participates in this flow.
