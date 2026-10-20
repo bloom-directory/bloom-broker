@@ -583,7 +583,7 @@ fn review_at(
                         // complete bounded program and raw bytes remain below.
                         for (index, step) in program.steps.iter().enumerate() {
                             let mut summary = format!(
-                                "{} {} · selector {} · native value {} wei",
+                                "{} {} · selector {} · native value {}",
                                 step.call_type, step.target, step.selector, step.native_value
                             );
                             if let Some(reading) = &step.reading {
