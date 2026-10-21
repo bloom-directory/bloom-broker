@@ -390,6 +390,15 @@ fn journal_error(error: crate::journal::JournalError) -> ProtocolError {
 }
 
 impl CeremonySigner for BrokerSignerClient {
+    fn derived_accounts_public(
+        &self,
+        request: bloom_signer_api::WalletRequest,
+    ) -> Result<Vec<bloom_signer_api::DerivedAccountDescriptor>, ProtocolError> {
+        match self.request(BrokerSignerRequest::DerivedAccountList(request))? {
+            BrokerSignerResponse::DerivedAccountList(value) => Ok(value),
+            _ => Err(response_mismatch("wallet.derived_accounts")),
+        }
+    }
     fn surface_status(&self) -> Result<SurfaceStatus, ProtocolError> {
         match self.request(BrokerSignerRequest::SurfaceStatus(Empty {}))? {
             BrokerSignerResponse::SurfaceStatus(status) => Ok(status),

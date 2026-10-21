@@ -1830,6 +1830,83 @@ function renderResult(session, plaintext) {
     parts.push(el("pre", {}, text));
   }
   reviewNode.replaceChildren(...parts);
+  if (kind === "wallet_export" && session.signer_contribution?.wallet_id) reviewNode.append(
+    el("p", {}, el("a", {href: walletPageUrl(session.signer_contribution.wallet_id)}, "Return to wallet")));
+}
+
+function walletPageUrl(wallet) { return "/wallet/" + encodeURIComponent(wallet); }
+function createdWalletView(accounts, created = true) {
+  markDone(created ? "Wallet created" : accounts.wallet_id);
+  document.getElementById("review-deadline").textContent = "";
+  document.getElementById("action-expiry").textContent = "";
+  document.getElementById("ceremony-actions").hidden = true;
+  document.getElementById("page-title").textContent = "Your wallet";
+  document.getElementById("page-lede").textContent = "Addresses and backup";
+  const parts = [el("p", {class: "summary"}, created ? "Your wallet was created and is protected by your passkey." : "Your public addresses and wallet backup."),
+    el("dl", {class: "facts"}, el("dt", {}, "Wallet"), el("dd", {}, accounts.wallet_id)),
+    el("h2", {class: "ceremony-section-title"}, "Your addresses")];
+  for (const account of accounts.accounts || []) {
+    for (const chain of account.chain_projections || []) {
+      const label = chain.chain_family === "evm" ? "Ethereum and EVM networks" : chain.chain_family === "solana" ? "Solana" : chain.chain_family;
+      const copy = el("button", {type: "button", class: "secondary"}, "Copy address");
+      copy.onclick = async () => {
+        try { await navigator.clipboard.writeText(chain.address); copy.textContent = "Copied"; }
+        catch (_) { copy.textContent = "Select the address to copy"; }
+      };
+      parts.push(el("section", {class: "ceremony-call-arguments"},
+        el("h3", {class: "ceremony-section-title"}, label),
+        el("p", {class: "ceremony-assurance"}, describeKey(account.key_ref).account.replace(/ \(m\/[^)]*\)$/, "") || "Initial account"),
+        el("p", {class: "ceremony-party-address"}, el("code", {}, chain.address)),
+        copy));
+    }
+  }
+  if (!accounts.accounts?.length) parts.push(el("p", {class: "ceremony-warning"}, "Addresses could not be loaded. Your wallet was created; do not create it again."));
+  const backup = el("button", {type: "button"}, "Back up wallet");
+  backup.onclick = async () => {
+    backup.disabled = true;
+    try {
+      const prepared = await mutate(`/api/wallet/${encodeURIComponent(accounts.wallet_id)}/backup`, {});
+      const target = new URL(prepared.ceremony_url, location.href);
+      if (target.origin !== location.origin || !target.pathname.startsWith("/ceremony/")) throw new Error("Unexpected backup destination");
+      location.assign(target.href);
+    } catch (error) {
+      backup.disabled = false;
+      statusNode.textContent = Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0
+        ? `Please wait ${Math.ceil(error.retryAfterMs / 1000)} seconds before starting another backup.`
+        : "Could not open backup. Finish or cancel any pending wallet request, then try again.";
+    }
+  };
+  parts.push(el("section", {class: "ceremony-call-arguments"},
+    el("h2", {class: "ceremony-section-title"}, "Back up your wallet"),
+    el("p", {}, "Your passkey approves actions in Bloom. Your recovery phrase restores the wallet and its addresses in a compatible wallet, even if you lose the passkey."),
+    el("p", {}, "Keep the phrase offline in a safe place. Anyone with it can control the wallet. A fresh passkey approval is required to show it."),
+    el("div", {class: "result-actions"}, backup,
+      created ? el("a", {class: "ceremony-address-link", href: walletPageUrl(accounts.wallet_id)}, "Later — return to wallet") : null),
+    el("p", {class: "ceremony-assurance"}, "A backup is not confirmed by creating a wallet or skipping this step.")));
+  parts.push(el("p", {}, el("a", {href: walletPageUrl(accounts.wallet_id)}, "Bookmark this wallet page"), " to return to your addresses and backup."));
+  reviewNode.replaceChildren(...parts);
+}
+
+async function showCreatedWallet(session, recovery = null) {
+  const wallet = session.signer_contribution?.wallet_id;
+  if (!wallet || remoteCeremony) return false;
+  const response = await fetch(`/api/wallet/${encodeURIComponent(wallet)}`, {credentials: "same-origin", cache: "no-store"});
+  if (!response.ok) return false;
+  createdWalletView(await response.json());
+  if (recovery?.recovery_id && recovery?.recovery_secret) {
+    const download = el("button", {type: "button", class: "secondary"}, "Download Bloom recovery code");
+    download.onclick = () => {
+      const url = URL.createObjectURL(new Blob([JSON.stringify(recovery)], {type: "application/json"}));
+      const link = el("a", {href: url, download: "bloom-recovery-code.json"});
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
+    reviewNode.append(el("details", {class: "ceremony-details"},
+      el("summary", {}, "Bloom recovery code"),
+      el("p", {}, "This code restores access on this Bloom host. It is different from your portable recovery phrase. Keep it private and offline."),
+      download));
+  }
+  return true;
 }
 
 function renderDone(session, result) {
@@ -1845,6 +1922,7 @@ function renderDone(session, result) {
 // Read before anything rewrites the URL below. A preview is decided by the
 // path it was opened at, never by what the tab happens to still hold.
 const previewPath = location.pathname.startsWith("/preview") ? location.pathname : "";
+const walletPath = location.pathname.startsWith("/wallet/") ? location.pathname : "";
 const tokenFromPath = location.pathname.startsWith("/ceremony/")
   ? location.pathname.slice("/ceremony/".length) : "";
 const remoteCeremony = location.protocol === "https:";
@@ -1854,7 +1932,7 @@ const sessionTokenKey = "bloom.ceremony.token.v1";
 let token = remoteCeremony ? remoteFragment : (tokenFromPath || readSessionToken());
 let ceremonyId = null;
 if (!remoteCeremony && tokenFromPath) writeSessionToken(tokenFromPath);
-if ((remoteCeremony || token) && !previewPath) history.replaceState(null, "", "/ceremony/");
+if ((remoteCeremony || token) && !previewPath && !walletPath) history.replaceState(null, "", "/ceremony/");
 const authHeaders = remoteCeremony ? {} : {"x-bloom-ceremony-token": token};
 const ceremonyRpId = remoteCeremony ? location.hostname : "localhost";
 const te = new TextEncoder();
@@ -3394,6 +3472,16 @@ function renderPreview(name) {
 }
 
 async function load() {
+  if (walletPath) {
+    const wallet = decodeURIComponent(walletPath.slice("/wallet/".length));
+    const response = await fetch(`/api/wallet/${encodeURIComponent(wallet)}`, {credentials: "same-origin", cache: "no-store"});
+    if (!response.ok) throw new Error("Wallet is unavailable on this Bloom host");
+    createdWalletView(await response.json(), false);
+    approve.hidden = true;
+    cancel.hidden = true;
+    statusNode.textContent = "";
+    return;
+  }
   if (previewPath) {
     const name = previewPath.slice("/preview".length).replace(/^\//, "") || "index";
     if (name === "tokens") {
@@ -3486,6 +3574,13 @@ async function load() {
     if (result.encrypted_browser_result) outputRecipient = await outputRecipientFor(session, true);
     return finishBrowserResult(session, result);
   }
+  if (session.ceremony_kind === "wallet_registration" && await showCreatedWallet(session)) {
+    approvalTerminal = true;
+    approve.hidden = true;
+    cancel.hidden = true;
+    statusNode.textContent = "Created.";
+    return;
+  }
   if (priorResult.status !== 409) throw new Error("Ceremony is unavailable");
   if (session.cross_surface) return loadCrossSurface(session);
   const legacyPasskeyImport = session.ceremony_kind === "wallet_import" &&
@@ -3553,6 +3648,8 @@ async function load() {
       if (pageLede) pageLede.textContent = "Nothing was signed or sent. You can close this tab.";
       reviewNode.replaceChildren(el("p", {class: "summary"},
         "You cancelled this ceremony. No signature was created and nothing was broadcast."));
+      if (session.ceremony_kind === "wallet_export" && session.signer_contribution?.wallet_id) reviewNode.append(
+        el("p", {}, el("a", {href: walletPageUrl(session.signer_contribution.wallet_id)}, "Return to wallet — backup was cancelled")));
       cancel.hidden = true;
       approve.hidden = true;
     } catch (error) {
@@ -3796,10 +3893,14 @@ async function finishBrowserResult(session, result) {
       te.encode(outputAad),
       result.encrypted_browser_result
     );
-    renderResult(session, plaintext);
+    if (session.ceremony_kind === "wallet_registration") {
+      let recovery;
+      try { recovery = JSON.parse(new TextDecoder().decode(plaintext)); } catch (_) {}
+      if (!await showCreatedWallet(session, recovery)) throw new Error("Could not load the created wallet; keep this tab open");
+    } else renderResult(session, plaintext);
     await mutate(`/api/session/${ceremonyId}/ack`, {});
   } else {
-    renderDone(session, result);
+    if (session.ceremony_kind !== "wallet_registration" || !await showCreatedWallet(session)) renderDone(session, result);
   }
   await clearBrowserState(ceremonyId);
 }
@@ -3850,11 +3951,15 @@ async function mutate(url, body) {
   });
   if (!response.ok) {
     let detail = "";
+    let retryAfterMs;
     try {
       const failure = await response.json();
       detail = typeof failure?.message === "string" ? failure.message : "";
+      retryAfterMs = Number(failure?.rate_limit?.retry_after_ms);
     } catch (_) {}
-    throw new Error(detail || `Ceremony request failed (${response.status})`);
+    const error = new Error(detail || `Ceremony request failed (${response.status})`);
+    error.retryAfterMs = retryAfterMs;
+    throw error;
   }
   return response.status === 204 ? null : response.json();
 }

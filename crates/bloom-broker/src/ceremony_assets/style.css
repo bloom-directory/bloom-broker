@@ -199,7 +199,7 @@ textarea{resize:vertical}
 .expired{color:var(--ceremony-danger);font-weight:600}
 .ok{color:var(--ceremony-success)}
 .result-title{margin:0;font:400 24px var(--ceremony-font-display)}
-.result-actions{display:flex;gap:var(--ceremony-space-1)}
+.result-actions{display:flex;align-items:center;flex-wrap:wrap;gap:var(--ceremony-space-2);margin-top:var(--ceremony-space-2)}
 .words{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:var(--ceremony-space-1);margin:0;padding:0;list-style:none;counter-reset:w}
 .words li{display:flex;gap:var(--ceremony-space-1);align-items:baseline;padding:10px 12px;border:1px solid var(--ceremony-border);border-radius:8px;font:15px var(--ceremony-font-mono)}
 .words li::before{counter-increment:w;content:counter(w);min-width:1.6em;color:var(--ceremony-muted);font-size:13px}

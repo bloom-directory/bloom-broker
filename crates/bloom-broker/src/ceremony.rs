@@ -540,6 +540,15 @@ impl PolicyUpdateReviewManifest {
 /// Typed Broker-to-Signer seam. Broker only forwards raw proof and opaque HPKE
 /// envelopes; no method accepts plaintext PRF or custody input.
 pub trait CeremonySigner: Send + Sync {
+    fn derived_accounts_public(
+        &self,
+        _request: bloom_signer_api::WalletRequest,
+    ) -> Result<Vec<bloom_signer_api::DerivedAccountDescriptor>, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "account listing unavailable",
+        ))
+    }
     fn surface_status(&self) -> Result<SurfaceStatus, SignerProtocolError>;
 
     fn report_surface_effective(
@@ -2617,6 +2626,9 @@ impl CeremonyBroker {
             .route("/api/session", get(read_session_by_token))
             .route("/api/session/{ceremony_id}", get(read_session))
             .route("/api/session/{ceremony_id}/result", get(read_result))
+            .route("/wallet/{wallet}", get(wallet_shell))
+            .route("/api/wallet/{wallet}", get(read_wallet))
+            .route("/api/wallet/{wallet}/backup", post(prepare_wallet_backup))
             .route(
                 "/api/session/{ceremony_id}/complete",
                 post(complete_session),
@@ -4054,6 +4066,148 @@ async fn read_session_by_token(
         return StatusCode::NOT_FOUND.into_response();
     };
     Json(&session.projection).into_response()
+}
+
+// Local owner pages expose public addresses, never custody material. They
+// cannot enumerate wallets. Export preparation requires the exact local origin;
+// Signer still requires a fresh passkey ceremony before releasing any secret.
+fn authorize_wallet_page(
+    broker: &CeremonyBroker,
+    headers: &HeaderMap,
+    mutation: bool,
+) -> Result<(), ProtocolError> {
+    if !broker.serves_local() {
+        return Err(not_found());
+    }
+    broker.validate_served_host(headers)?;
+    require_exact_header_name(headers, "sec-fetch-site", "same-origin")?;
+    if mutation {
+        broker.validate_served_origin(headers)?;
+        require_exact_header(headers, header::CONTENT_TYPE, "application/json")?;
+    }
+    Ok(())
+}
+
+async fn wallet_shell(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    if !broker.serves_local() || broker.validate_served_host(&headers).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    Html(SHELL_HTML).into_response()
+}
+
+async fn read_wallet(
+    State(broker): State<CeremonyBroker>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if authorize_wallet_page(&broker, &headers, false).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Ok(wallet) = Token::new(id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let descriptors =
+        match broker
+            .inner
+            .signer
+            .derived_accounts_public(bloom_signer_api::WalletRequest {
+                wallet_id: wallet.clone(),
+            }) {
+            Ok(value) => value,
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        };
+    let Some(first) = descriptors.first() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if descriptors.iter().any(|item| {
+        item.wallet_seed_ref.wallet_id != wallet
+            || item.wallet_seed_ref.profile != first.wallet_seed_ref.profile
+    }) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    match crate::translation::wallet_account::wallet_accounts_to_machine(
+        bloom_broker_api::Token::new(wallet.as_str()).expect("validated wallet token"),
+        first.wallet_seed_ref.profile,
+        &descriptors,
+        &crate::translation::wallet_account::production_chain_targets(),
+    ) {
+        Ok(accounts) => Json(accounts).into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn prepare_wallet_backup(
+    State(broker): State<CeremonyBroker>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(_body): Json<BrowserAck>,
+) -> Response {
+    if authorize_wallet_page(&broker, &headers, true).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Ok(wallet) = Token::new(id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let now = unix_time_ms();
+    if broker.expire_sessions(now).is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    // Reloading the page or double-clicking resumes a pending backup. A
+    // cancelled/expired backup can be prepared afresh, with a new passkey proof.
+    let pending = broker
+        .inner
+        .sessions
+        .lock()
+        .values()
+        .find(|session| {
+            session.wallet_id.as_ref() == Some(&wallet)
+                && session.ceremony_kind == CeremonyKind::WalletExport
+                && session.origin == broker.served_origin
+                && session.state == CeremonyState::AwaitingUser
+                && session.expires_at_ms > now
+        })
+        .cloned();
+    if let Some(session) = pending {
+        if let Some(response) =
+            broker.stable_custody_response(&session.operation_id, &session.request_digest)
+        {
+            return match response {
+                Ok(value) => Json(value).into_response(),
+                Err(_) => StatusCode::CONFLICT.into_response(),
+            };
+        }
+    }
+    let mut bytes = [0; 32];
+    if SysRng.try_fill_bytes(&mut bytes).is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let operation = OperationId::new(hex::encode(bytes)).expect("hex digest");
+    let terms = match digest(
+        &serde_json::json!({"kind":"wallet_export", "wallet_id":wallet, "operation":operation}),
+    ) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    match broker.prepare_custody(
+        CustodyPrepareRequest {
+            surface: bloom_signer_api::legacy_local_surface(),
+            ceremony_kind: CeremonyKind::WalletExport,
+            custody_operation_id: operation,
+            wallet_id: Some(wallet),
+            key_ref: None,
+            exact_terms_digest: terms,
+            expected_input_class: Token::new("generic-custody-v1").expect("static token"),
+            browser_output_recipient_key: None,
+            petal_key_scope: None,
+            legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_requests: vec![],
+        },
+        now,
+    ) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(error)).into_response(),
+    }
 }
 
 async fn read_result(
