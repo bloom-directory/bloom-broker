@@ -54,6 +54,31 @@ fn the_built_in_catalog_admits_and_lists_the_safe_deployments() {
     assert!(catalog.len() > 1000);
 }
 
+/// Exercise every shipped token through the actual decoder, not a row count.
+#[test]
+fn every_compiled_token_decodes_its_symbol_decimals_and_transfer_amount() {
+    let catalog = Catalog::built_in().unwrap();
+    for token in bloom_broker_api::known_tokens() {
+        let units = U256::from(10).pow(U256::from(token.decimals));
+        let bytes = calldata(
+            "transfer(address,uint256)",
+            &[address_word(RECIPIENT), units],
+        );
+        let mut ctx = context(&bytes);
+        ctx.chain_id = token.chain_id;
+        ctx.to = token.address.parse().unwrap();
+        let (call, _) = review_call(catalog, &ctx).unwrap_or_else(|error| {
+            panic!("{}:{} failed: {error:?}", token.chain_id, token.address)
+        });
+        let summary = call.intent_summary.unwrap();
+        let identity = summary.token.unwrap();
+        assert_eq!(identity.symbol, token.symbol);
+        assert_eq!(identity.name, token.name);
+        assert_eq!(identity.decimals, token.decimals);
+        assert_eq!(summary.amount_display, format!("1 {}", token.symbol));
+    }
+}
+
 /// The extension proof. A third static function becomes reviewable by
 /// publishing signed catalog data: no decoder, selector switch, formatter
 /// branch or executable plugin is added to reach it.

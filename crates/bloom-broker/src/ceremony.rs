@@ -367,6 +367,9 @@ fn bounded(field: &str, value: u64, ceiling: u64) -> Result<(), ProtocolError> {
 
 const SHELL_HTML: &str = include_str!("ceremony_assets/index.html");
 const APP_JS: &str = concat!(
+    "const REVIEWED_ENSO_ROUTER = ",
+    include_str!("../../bloom-evm-clear-signing/catalogs/enso/router-v2.json"),
+    ";\n",
     include_str!("ceremony_assets/token-artwork.js"),
     include_str!("ceremony_assets/app.js")
 );
@@ -2650,6 +2653,7 @@ impl CeremonyBroker {
         #[cfg(feature = "triad-dev-harness")]
         let router = router
             .route("/preview", get(ceremony_resume_shell))
+            .route("/preview/tokens.json", get(preview_tokens))
             .route("/preview/{name}", get(ceremony_resume_shell));
         router
             .layer(DefaultBodyLimit::max(MAX_CEREMONY_BODY_BYTES))
@@ -3925,6 +3929,14 @@ async fn ceremony_shell(
         return StatusCode::NOT_FOUND.into_response();
     }
     Html(SHELL_HTML).into_response()
+}
+
+#[cfg(feature = "triad-dev-harness")]
+async fn preview_tokens(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    if broker.validate_served_host(&headers).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    Json(bloom_broker_api::known_tokens()).into_response()
 }
 
 async fn app_js(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {

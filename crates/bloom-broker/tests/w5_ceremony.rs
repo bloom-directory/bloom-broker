@@ -949,6 +949,9 @@ if (nodes["page-title"].textContent !== "Remove a passkey from a wallet" ||
 #[test]
 fn evm_manifest_is_rendered_as_primary_review_facts() {
     let asset = concat!(
+        "const REVIEWED_ENSO_ROUTER = ",
+        include_str!("../../bloom-evm-clear-signing/catalogs/enso/router-v2.json"),
+        ";\n",
         include_str!("../src/ceremony_assets/token-artwork.js"),
         include_str!("../src/ceremony_assets/app.js")
     );
@@ -956,6 +959,7 @@ fn evm_manifest_is_rendered_as_primary_review_facts() {
         .split_once("\nload().catch")
         .expect("asset must invoke load")
         .0;
+    let tokens = serde_json::to_string(bloom_broker_api::known_tokens()).unwrap();
     let script = format!(
         r#"
 class Node {{
@@ -1103,7 +1107,7 @@ if (safeFactText.includes("Token amount (base units): 123") || safeFactText.incl
   throw new Error(`Safe review still dumps action lines: ${{safeFactText}}`);
 }}
 const openTags = nodes.review.children.map(node => node.tagName);
-if (openTags.join(",") !== "P,SECTION,DIV,DIV,ASIDE,DETAILS") {{
+if (openTags.join(",") !== "P,SECTION,DIV,ASIDE,DETAILS") {{
   throw new Error(`Safe open view is not summary, decision, warning, details: ${{openTags}}`);
 }}
 const banners = node => !node || typeof node === "string" ? [] : [
@@ -1408,6 +1412,30 @@ if (!outputCard || !allText(outputCard).includes("not guaranteed received") ||
     walk(outputCard).some(node => String(node.className).includes("outgoing"))) {{
   throw new Error("Enso requested output is presented as money leaving or guaranteed receipt");
 }}
+renderReview(previewSession("safe-token-transfer"));
+const safeFlow = nodes.review.children.find(node => String(node.className).includes("ceremony-transfer-path"));
+if (!safeFlow || !allText(safeFlow).includes("−25 USDC") || !allText(safeFlow).includes("+25 USDC")) {{
+  throw new Error("Safe transfer omitted requested sender and recipient deltas");
+}}
+renderReview(previewSession("enso-allowance"));
+if (!nodes["panel-title"].textContent.includes("Enso Router V2") || !allText(nodes.review).includes("Enso Router V2")) {{
+  throw new Error("Enso allowance hides the catalogued spender name");
+}}
+if (catalogPartyName("123456", PREVIEW_PM80_READINGS["enso-output"].contract)) throw new Error("Enso label leaked onto an unlisted chain");
+renderReview(previewSession("enso-shortcut"));
+const shortcutPrimary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+if (!shortcutPrimary.includes("Send 2.5 USDC") || !shortcutPrimary.includes("Arguments determined during execution") || shortcutPrimary.includes("selector 0xa9059cbb")) {{
+  throw new Error("Enso shortcut still dumps encoded commands instead of their bounded reading");
+}}
+for (const token of {tokens}) {{
+  const preview = previewCatalogToken(token);
+  if (!preview.is_preview || preview.ceremony_id) throw new Error("Catalog preview gained authority");
+  renderReview(preview);
+  const text = allText(nodes.review);
+  if (!text.includes(token.symbol) || !text.includes(token.name) || !nodes["panel-title"].textContent.includes(`1 ${{token.symbol}}`)) {{
+    throw new Error(`Catalog renderer omitted ${{token.chain_id}}:${{token.address}}`);
+  }}
+}}
 
 // A batch member Bloom could not read is never shown as a plain send, and a
 // batch spanning two networks is not headed with the first one alone.
@@ -1431,6 +1459,18 @@ if (!rendered.includes("Approve a call Bloom cannot read") || rendered.includes(
     !rendered.includes("Approve 2 transactions on more than one network")) {{
   throw new Error(`unread batch misdescribed: ${{rendered}}`);
 }}
+(async () => {{
+  globalThis.fetch = async () => ({{ok: true, json: async () => {tokens}}});
+  document.querySelector = () => null;
+  await renderTokenCatalog();
+  const input = walk(nodes.review).find(node => node.tagName === "INPUT");
+  input.value = "WBTC";
+  input.oninput();
+  const text = allText(nodes.review);
+  if (!text.includes("WBTC") || text.includes("USD Coin (USDC)")) throw new Error("Token catalog search did not filter symbols");
+  walk(nodes.review).find(node => node.tagName === "BUTTON").onclick();
+  if (!nodes["panel-title"].textContent.includes("1 WBTC") || !approve.hidden || !cancel.hidden) throw new Error("Catalog selection is not a non-authorizing transfer preview");
+}})().catch(error => {{ console.error(error); process.exitCode = 1; }});
 "#
     );
     let output = run_node(&script);
@@ -10471,10 +10511,38 @@ async fn a_preview_name_reaches_no_session_and_cannot_be_completed() {
         }
     );
 
+    // The browser reads the same catalog compiled into the decoder.
+    let tokens = app
+        .clone()
+        .oneshot(get("/preview/tokens.json", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokens.status(),
+        if cfg!(feature = "triad-dev-harness") {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        }
+    );
+    if cfg!(feature = "triad-dev-harness") {
+        let bytes = axum::body::to_bytes(tokens.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let listed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            listed,
+            serde_json::to_value(bloom_broker_api::known_tokens()).unwrap()
+        );
+    }
+
     // Every approval path refuses a preview name. It is not a token, so it
     // resolves to nothing: there is no session to read and none to complete.
     for name in [
         "transfer",
+        "tokens",
+        "tokens.json",
+        "transfer-dai",
         "allowance-unlimited",
         "batch",
         "index",

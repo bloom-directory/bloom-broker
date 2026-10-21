@@ -338,6 +338,14 @@ function shortAddress(value) {
   const text = String(value || "");
   return /^0x[0-9a-fA-F]{40}$/.test(text) ? `${text.slice(0, 6)}…${text.slice(-4)}` : text;
 }
+function catalogPartyName(chainId, address) {
+  // Reuse the compiled decoder descriptor; a ticker or guest label is not
+  // evidence that an address is a protocol deployment.
+  if (typeof REVIEWED_ENSO_ROUTER === "undefined") return null;
+  const listed = REVIEWED_ENSO_ROUTER.context.contract.deployments.some(deployment =>
+    String(deployment.chainId) === String(chainId) && deployment.address.toLowerCase() === String(address).toLowerCase());
+  return listed ? "Enso Router V2" : null;
+}
 // Why Bloom could not read a call, so the owner can judge it.
 function unreadDetail(payload) {
   const reason = payload?.unread_reason ? ` Reason: ${payload.unread_reason}.` : "";
@@ -363,7 +371,7 @@ function shapeOnly(call) {
 // Headings describe the requested call. None of them promise an outcome:
 // Bloom has not executed anything, and a passkey response is an approval,
 // not a settlement.
-function callIntent(call) {
+function callIntent(call, chainId) {
   const summary = call?.intent_summary;
   if (!summary) {
     const fields = Object.fromEntries((call?.fields || []).map(field => [field.label, field.value]));
@@ -411,7 +419,7 @@ function callIntent(call) {
       relation: "calls"
     };
   }
-  const who = shortAddress(summary.counterparty);
+  const who = catalogPartyName(chainId, summary.counterparty) || shortAddress(summary.counterparty);
   const symbol = summary.token?.symbol || "tokens";
   const structural = shapeOnly(call);
   if (structural && summary.action === "transfer") {
@@ -828,7 +836,7 @@ function describeTransfer(manifest) {
             position: index + 1,
             chainId: payload.chain_id,
             intent: reviewedContractCall(payload)
-              ? callIntent(reviewedContractCall(payload))
+              ? callIntent(reviewedContractCall(payload), payload.chain_id)
               : payload.destination && payload.calldata_keccak
               ? {action: "opaque", eyebrow: "Contract call", heading: "Approve a call Bloom cannot read",
                  detail: unreadDetail(payload),
@@ -855,7 +863,7 @@ function describeTransfer(manifest) {
           }))
         }
       : reviewedContractCall(first)
-        ? callIntent(reviewedContractCall(first))
+        ? callIntent(reviewedContractCall(first), first.chain_id)
         : first.destination
           ? (first.calldata_keccak
             ? {action: "opaque", eyebrow: "Contract call", heading: "Approve a call Bloom cannot read",
@@ -1095,7 +1103,8 @@ function describeTransfer(manifest) {
       ...((permission && spender) ? [["Spender · allowed to use these tokens", spender]]
         : safeRecipient ? [["Recipient", safeRecipient]] : [])
     ];
-    return {sentence, facts, technical, warnings, willVerify: true, heading,
+    const safeMovement = !permission && directToken && safeRecipient && amount ? amount : null;
+    return {sentence, facts, technical, warnings, willVerify: true, heading, safeMovement,
       button: "Approve Safe signature", chainId: safe.chain_id, tokenAsset, safeCards, safeParties,
       networkIdentity: `EVM · ${network} · Chain ID ${safe.chain_id}`,
       networkIcon: chainIcon(safe.chain_id)};
@@ -1427,6 +1436,16 @@ function renderReview(session) {
     row.append(el("p", {class: "ceremony-party-address"}, identity));
     return row;
   };
+  const partyFlow = (parties, movement, isTransfer) => {
+    const flow = el("div", {class: `ceremony-identity ${isTransfer ? "ceremony-transfer-path" : "ceremony-permission"}`});
+    for (const party of parties) {
+      if (isTransfer && party.role === "recipient") flow.append(el("div", {class: "ceremony-flow-arrow", "aria-hidden": "true"}, "↓"));
+      const change = movement && ["source", "recipient"].includes(party.role)
+        ? `${party.role === "source" ? "−" : "+"}${movement}` : null;
+      flow.append(partyRow({...party, change}));
+    }
+    return flow;
+  };
   const intentBlock = (intent, nested = false) => {
     const block = el("section", {class: "ceremony-intent", "data-action": intent.action});
     if (intent.magnitude) block.setAttribute("data-magnitude", intent.magnitude);
@@ -1465,8 +1484,12 @@ function renderReview(session) {
     }
     decision.push(section);
   }
-  for (const [label, value] of transfer?.safeParties || []) {
-    decision.push(partyRow({role: label.toLowerCase(), label, value, chainId: transfer.chainId}));
+  if (transfer?.safeParties?.length) {
+    const parties = transfer.safeParties.map(([label, value]) => ({label, value, chainId: transfer.chainId,
+      role: label.startsWith("Sender") || label.startsWith("Token holder") ? "source"
+        : label === "Recipient" ? "recipient" : label.startsWith("Spender") ? "spender" : "signer"}));
+    if (transfer.safeMovement) parties.sort((a, b) => Number(a.role === "signer") - Number(b.role === "signer"));
+    decision.push(partyFlow(parties, transfer.safeMovement, Boolean(transfer.safeMovement)));
   }
   if (transfer?.intent) {
     panelTitle.textContent = transfer.intent.heading;
@@ -1504,8 +1527,37 @@ function renderReview(session) {
       if (!call || call.intent_summary) continue;
       const protocolDetails = call.contract_name?.startsWith("Privacy Pools") || call.contract_name === "Enso Router V2";
       const argumentsList = el("dl", {class: "facts"});
+      let shortcut;
+      if (call.contract_name === "Enso Router V2") {
+        try { shortcut = JSON.parse(call.fields.find(field => field.format === "ensoShortcut")?.value); } catch (_) {}
+      }
       for (const field of reviewCallFields(call)) {
         if (technicalCallField(call, field)) continue;
+        const command = field.label.match(/^Encoded command (\d+)$/);
+        const step = command && shortcut?.steps?.[Number(command[1]) - 1];
+        if (step) {
+          const reading = step.reading;
+          const intent = reading ? callIntent(reading) : null;
+          const section = el("section", {class: "ceremony-card"},
+            el("p", {class: "ceremony-card-position"}, field.label),
+            el("h3", {class: "ceremony-section-title"}, intent?.heading || "Arguments determined during execution"));
+          if (reading?.intent_summary?.counterparty) {
+            const summary = reading.intent_summary;
+            section.append(partyRow({role: summary.counterparty_role,
+              label: summary.counterparty_role === "recipient" ? "Recipient named in this call" : "Spender named in this call",
+              value: summary.counterparty, chainId: payload.chain_id}));
+          }
+          section.append(el("p", {}, reading
+            ? "Decoded instruction only. This does not establish the route's overall result."
+            : "This call uses results from earlier calls. Bloom cannot determine its exact arguments before execution."));
+          section.append(partyRow({role: "contract", label: "Contract called by this instruction", value: step.target, chainId: payload.chain_id}));
+          section.append(el("dl", {class: "facts"},
+            el("dt", {}, "Execution mode"), el("dd", {}, step.call_type),
+            el("dt", {}, "Native value for this instruction"), el("dd", {}, step.native_value)));
+          decision.push(section);
+          evidence.push(el("p", {}, `${field.label}: ${field.value}`));
+          continue;
+        }
         if (field.asset?.token) {
           const asset = field.asset;
           decision.push(assetCard({chainId: String(asset.chain_id), address: asset.token.address,
@@ -1571,19 +1623,11 @@ function renderReview(session) {
       const parties = [...transfer.parties].filter(party =>
         transfer.intent.action === "batch" ? party.role === "source" : party !== token).sort((a, b) =>
           Number(b.role === "spender") - Number(a.role === "spender"));
-      const flow = el("div", {class: `ceremony-identity ${isTransfer ? "ceremony-transfer-path" : "ceremony-permission"}`});
       const movement = isTransfer && transfer.assetSummary?.action === "transfer"
         ? transfer.assetSummary.amount_display : null;
-      for (const party of parties) {
-        if (isTransfer && party.role === "recipient") {
-          flow.append(el("div", {class: "ceremony-flow-arrow", "aria-hidden": "true"}, "↓"));
-        }
-        const change = movement && ["source", "recipient"].includes(party.role)
-          ? `${party.role === "source" ? "−" : "+"}${movement}` : null;
-        flow.append(partyRow({...party, change,
-          ...(party.role === "source" ? {label: isTransfer ? "Sender" : "Your wallet", name: walletName} : {})}));
-      }
-      decision.push(flow);
+      decision.push(partyFlow(parties.map(party => ({...party,
+          name: catalogPartyName(party.chainId, party.value) || party.name,
+          ...(party.role === "source" ? {label: isTransfer ? "Sender" : "Your wallet", name: walletName} : {})})), movement, isTransfer));
     }
     for (const [index, payload] of (transfer.payloads || []).entries()) {
       if (!payload.calldata_keccak) continue;
@@ -2899,6 +2943,54 @@ function previewDecodedMessage(name) {
   session.review_manifest.canonical_plan = JSON.stringify({message_review: PREVIEW_PM80_READINGS[name]});
   return session;
 }
+function previewCatalogToken(token) {
+  const amount = (10n ** BigInt(token.decimals)).toString();
+  const clear = previewClearSigning(String(token.chain_id), token.address);
+  clear.entries[0].upgradeable = token.upgradeable;
+  const session = previewApproval([previewPayload({chain_id: String(token.chain_id), chain: `evm-${token.chain_id}`,
+    destination: token.address, value_display: "0 native units", maximum_execution_gas_fee_display: undefined, fee: undefined,
+    contract_call: previewCall("transfer", amount, `1 ${token.symbol}`, "finite", [], token)
+  })], clear);
+  session.preview_status = "Compiled token catalog · Synthetic transfer · Not a live request";
+  session.is_preview = true;
+  return session;
+}
+async function renderTokenCatalog() {
+  const response = await fetch("/preview/tokens.json");
+  if (!response.ok) throw new Error("Could not load the compiled token catalog");
+  const tokens = await response.json();
+  const banner = document.getElementById("preview-banner");
+  if (banner) {
+    banner.hidden = false;
+    banner.textContent = "Preview only · No transactions can be approved.";
+  }
+  panelTitle.textContent = "Token catalog";
+  statusNode.textContent = "Browse this build's compiled token coverage";
+  const input = el("input", {type: "search", placeholder: "Symbol, name, chain ID or contract address", "aria-label": "Find a token"});
+  const results = el("div", {class: "words"});
+  const heading = el("p", {}, `${tokens.length} deployments · ${new Set(tokens.map(token => token.chain_id)).size} chains · ${new Set(tokens.map(token => token.symbol)).size} distinct symbols`);
+  const render = () => {
+    const query = input.value?.trim().toLowerCase() || "";
+    const matches = tokens.filter(token => `${token.symbol} ${token.name} ${token.chain_id} ${token.address}`.toLowerCase().includes(query));
+    results.replaceChildren(el("p", {}, `${matches.length} matches`), ...matches.map(token => {
+      const button = el("button", {type: "button"}, `Preview 1 ${token.symbol} · Chain ${token.chain_id}`);
+      button.onclick = () => {
+        renderReview(previewCatalogToken(token));
+        statusNode.replaceChildren(el("a", {href: "/preview/tokens"}, "Back to token catalog"),
+          " · Synthetic transfer · Not a live request");
+      };
+      return el("section", {class: "ceremony-card"}, el("p", {}, `${token.name} (${token.symbol}) · ${token.decimals} decimals`),
+        el("code", {}, token.address), button);
+    }));
+  };
+  input.oninput = render;
+  reviewNode.replaceChildren(heading, el("p", {}, "Names, symbols and decimals come from this build's shared token catalog. Artwork is available for only a subset. These are example transfers, not verified balances or live transactions."), input, results);
+  approve.hidden = true;
+  cancel.hidden = true;
+  const actions = document.querySelector(".ceremony-actions");
+  if (actions) actions.hidden = true;
+  render();
+}
 const PREVIEWS = {
   "enso-output": () => previewDecodedEnso("enso-output"),
   "enso-shortcut": () => previewDecodedEnso("enso-shortcut"),
@@ -2908,7 +3000,9 @@ const PREVIEWS = {
     const router = PREVIEW_PM80_READINGS["enso-output"].contract;
     call.intent_summary.counterparty = router;
     for (const field of call.fields) if (field.format === "addressName") field.value = router;
-    return previewAccountOne(previewApproval([previewPayload({contract_call: call})], previewClearSigning()));
+    const session = previewAccountOne(previewApproval([previewPayload({contract_call: call})], previewClearSigning()));
+    session.preview_status = "Enso Router V2 spending permission · Synthetic prerequisite allowance · Not a live request";
+    return session;
   },
   "polymarket-auth": () => previewDecodedMessage("polymarket-auth"),
   "polymarket-order": () => previewDecodedMessage("polymarket-order"),
@@ -3131,11 +3225,16 @@ function renderPreview(name) {
 async function load() {
   if (previewPath) {
     const name = previewPath.slice("/preview".length).replace(/^\//, "") || "index";
+    if (name === "tokens") {
+      await renderTokenCatalog();
+      return;
+    }
     if (name === "index") {
       const pageTitle = document.getElementById("page-title");
       if (pageTitle) pageTitle.textContent = "Previews";
       statusNode.textContent = "Choose a preview";
       reviewNode.replaceChildren(el("ul", {class: "words"},
+        el("li", {}, el("a", {href: "/preview/tokens"}, "Browse every compiled token · searchable transfer previews")),
         ...Object.keys(PREVIEWS).map(key =>
           el("li", {}, el("a", {href: `/preview/${key}`}, ({
             "transfer-ethereum": "USDC transfer · Ethereum · ordinary wallet",
