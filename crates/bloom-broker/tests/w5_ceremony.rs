@@ -674,9 +674,11 @@ async fn card_intake_reclaims_only_owned_stale_sockets() {
     let socket = dir.path().join("facts.sock");
     let listener = bind_checkout_intake(&socket).unwrap();
     assert!(bind_checkout_intake(&socket).is_err());
-    drop(listener);
+    // Close the descriptor synchronously before probing a stale endpoint;
+    // Tokio can otherwise retain its I/O resource until the reactor runs.
+    drop(listener.into_std().unwrap());
     let replacement = bind_checkout_intake(&socket).unwrap();
-    drop(replacement);
+    drop(replacement.into_std().unwrap());
     fs::remove_file(&socket).unwrap();
     fs::write(&socket, "preserved fixture file").unwrap();
     assert!(bind_checkout_intake(&socket).is_err());
