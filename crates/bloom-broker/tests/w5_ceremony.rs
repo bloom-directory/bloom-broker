@@ -1365,6 +1365,21 @@ for (const amount of ["25 USDC", "0 USDC", "115792089237316195423570985008687907
   }}
 }}
 
+// Decoder-backed PM80 examples must retain the scope that the owner reviews.
+for (const [name, expected] of [
+  ["enso-output", ["2.5 USDC", "1.25 USDC", "Output receiver"]],
+  ["enso-shortcut", ["Encoded command 1", "Encoded command 2", "runtime"]],
+  ["enso-allowance", ["Spending limit", "2.5 USDC", "Spender"]],
+  ["polymarket-auth", ["Polymarket", "One signature"]],
+  ["polymarket-order", ["prediction-market buy order", "11.7824 pUSD"]]
+]) {{
+  const preview = previewSession(name);
+  if (!preview.is_preview || preview.ceremony_id) throw new Error("PM80 fixture gained ceremony authority");
+  renderReview(preview);
+  const text = [nodes["panel-title"], nodes.review].map(allText).join(" ");
+  for (const field of expected) if (!text.includes(field)) throw new Error(`${{name}} omitted ${{field}}`);
+}}
+
 // A batch member Bloom could not read is never shown as a plain send, and a
 // batch spanning two networks is not headed with the first one alone.
 const unread = (chain_id, chain) => ({{
@@ -10429,7 +10444,17 @@ async fn a_preview_name_reaches_no_session_and_cannot_be_completed() {
 
     // Every approval path refuses a preview name. It is not a token, so it
     // resolves to nothing: there is no session to read and none to complete.
-    for name in ["transfer", "allowance-unlimited", "batch", "index"] {
+    for name in [
+        "transfer",
+        "allowance-unlimited",
+        "batch",
+        "index",
+        "enso-output",
+        "enso-shortcut",
+        "enso-allowance",
+        "polymarket-auth",
+        "polymarket-order",
+    ] {
         let session = app
             .clone()
             .oneshot(get("/api/session", Some(name)))

@@ -2504,7 +2504,391 @@ function previewSafeTransaction(action, extra = {}) {
   session.review_manifest.canonical_plan = JSON.stringify(plan);
   return session;
 }
+// Public decoder fixtures exported by the existing Enso and Polymarket tests.
+const PREVIEW_PM80_READINGS = {
+  "enso-output": {
+    "contract": "0xF75584eF6673aD213a685a1B58Cc0330B8eA22Cf",
+    "contract_name": "Enso Router V2",
+    "function_signature": "safeRouteSingle((uint8 tokenType,bytes data) tokenIn,(uint8 tokenType,bytes data) tokenOut,address receiver,bytes data)",
+    "selector": "0x21025a06",
+    "action": "other",
+    "intent": "Route through Enso with requested output balance-increase checks; shortcut effects remain unverified",
+    "fields": [
+      {
+        "label": "Native value",
+        "format": "amount",
+        "value": "0 ETH",
+        "raw": "0"
+      },
+      {
+        "label": "Input token type",
+        "format": "raw",
+        "value": "1",
+        "raw": "1"
+      },
+      {
+        "label": "Source asset / amount",
+        "format": "tokenAmount",
+        "value": "2.5 USDC (0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913)",
+        "raw": "0x000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda0291300000000000000000000000000000000000000000000000000000000002625a0",
+        "asset": {
+          "chain_id": 8453,
+          "token": {
+            "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "symbol": "USDC",
+            "name": "USD Coin",
+            "decimals": 6
+          },
+          "amount_display": "2.5 USDC"
+        }
+      },
+      {
+        "label": "Output token type",
+        "format": "raw",
+        "value": "1",
+        "raw": "1"
+      },
+      {
+        "label": "Requested minimum balance increase",
+        "format": "tokenAmount",
+        "value": "1.25 USDC (0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913)",
+        "raw": "0x000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda0291300000000000000000000000000000000000000000000000000000000001312d0",
+        "asset": {
+          "chain_id": 8453,
+          "token": {
+            "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "symbol": "USDC",
+            "name": "USD Coin",
+            "decimals": 6
+          },
+          "amount_display": "1.25 USDC"
+        }
+      },
+      {
+        "label": "Output receiver",
+        "format": "addressName",
+        "value": "0x2222222222222222222222222222222222222222",
+        "raw": "0x2222222222222222222222222222222222222222"
+      },
+      {
+        "label": "Shortcut program",
+        "format": "ensoShortcut",
+        "value": "Undecoded shortcut: unknown shortcut entry-point selector",
+        "raw": "0x01020304"
+      }
+    ],
+    "assurance": "Interpreted using Bloom's contract descriptions, but this call reaches a contract Bloom has not identified. Bloom has not verified what that contract is or what it does.",
+    "structural": true,
+    "warnings": [
+      "Shortcut program not independently decoded: unknown shortcut entry-point selector. Exact bytes are retained.",
+      "Enso inputs, requested output minimums and receiver are decoded from calldata. These are requested balance-increase checks, not proof of received funds. Shortcut commands and constant calls are read in technical details; runtime return values, code, intermediate effects, fees and settlement are not verified."
+    ]
+  },
+  "enso-shortcut": {
+    "contract": "0xF75584eF6673aD213a685a1B58Cc0330B8eA22Cf",
+    "contract_name": "Enso Router V2",
+    "function_signature": "routeSingle((uint8 tokenType,bytes data) tokenIn,bytes data)",
+    "selector": "0xb94c3609",
+    "action": "other",
+    "intent": "Route inputs through Enso; shortcut effects and quoted outputs remain unverified",
+    "fields": [
+      {
+        "label": "Native value",
+        "format": "amount",
+        "value": "0 ETH",
+        "raw": "0"
+      },
+      {
+        "label": "Input token type",
+        "format": "raw",
+        "value": "1",
+        "raw": "1"
+      },
+      {
+        "label": "Source asset / amount",
+        "format": "tokenAmount",
+        "value": "2.5 USDC (0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913)",
+        "raw": "0x000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda0291300000000000000000000000000000000000000000000000000000000002625a0",
+        "asset": {
+          "chain_id": 8453,
+          "token": {
+            "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "symbol": "USDC",
+            "name": "USD Coin",
+            "decimals": 6
+          },
+          "amount_display": "2.5 USDC"
+        }
+      },
+      {
+        "label": "Encoded command 1",
+        "format": "text",
+        "value": "CALL 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 \u00b7 selector 0xa9059cbb \u00b7 native value 0 raw native units \u00b7 transfer(address to, uint256 amount); To: 0x2222222222222222222222222222222222222222; Amount: 2.5 USDC",
+        "raw": "0xa9059cbb000000000000000000000000222222222222222222222222222222222222222200000000000000000000000000000000000000000000000000000000002625a0"
+      },
+      {
+        "label": "Encoded command 2",
+        "format": "text",
+        "value": "CALL 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 \u00b7 selector 0xa9059cbb \u00b7 native value 0 raw native units; Call arguments or native value depend on preceding runtime return data; initial slot values are not reused.",
+        "raw": "0xa9059cbb"
+      },
+      {
+        "label": "Shortcut program",
+        "format": "ensoShortcut",
+        "value": "{\n  \"account_id\": \"0x0000000000000000000000000000000000000000000000000000000000000000\",\n  \"request_id\": \"0x0000000000000000000000000000000000000000000000000000000000000000\",\n  \"initial_state\": [\n    \"0x0000000000000000000000002222222222222222222222222222222222222222\",\n    \"0x00000000000000000000000000000000000000000000000000000000002625a0\"\n  ],\n  \"steps\": [\n    {\n      \"command_word\": 0,\n      \"call_type\": \"CALL\",\n      \"target\": \"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913\",\n      \"selector\": \"0xa9059cbb\",\n      \"header_selector\": \"0xa9059cbb\",\n      \"arguments\": [\n        \"state[0] = 0x0000000000000000000000002222222222222222222222222222222222222222\",\n        \"state[1] = 0x00000000000000000000000000000000000000000000000000000000002625a0\"\n      ],\n      \"native_value\": \"0 raw native units\",\n      \"output\": \"write 32-byte return to state[1]\",\n      \"reconstructed_calldata\": \"0xa9059cbb000000000000000000000000222222222222222222222222222222222222222200000000000000000000000000000000000000000000000000000000002625a0\",\n      \"reading\": {\n        \"contract\": \"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\",\n        \"contract_name\": \"USD Coin\",\n        \"function_signature\": \"transfer(address to, uint256 amount)\",\n        \"selector\": \"0xa9059cbb\",\n        \"action\": \"transfer\",\n        \"fields\": [\n          {\n            \"label\": \"To\",\n            \"format\": \"addressName\",\n            \"value\": \"0x2222222222222222222222222222222222222222\",\n            \"raw\": \"0x2222222222222222222222222222222222222222\"\n          },\n          {\n            \"label\": \"Amount\",\n            \"format\": \"tokenAmount\",\n            \"value\": \"2.5 USDC\",\n            \"raw\": \"2500000\",\n            \"asset\": {\n              \"chain_id\": 8453,\n              \"token\": {\n                \"address\": \"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\",\n                \"symbol\": \"USDC\",\n                \"name\": \"USD Coin\",\n                \"decimals\": 6\n              },\n              \"amount_display\": \"2.5 USDC\"\n            }\n          }\n        ],\n        \"token\": {\n          \"address\": \"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\",\n          \"symbol\": \"USDC\",\n          \"name\": \"USD Coin\",\n          \"decimals\": 6\n        },\n        \"intent_summary\": {\n          \"action\": \"transfer\",\n          \"counterparty_role\": \"recipient\",\n          \"counterparty\": \"0x2222222222222222222222222222222222222222\",\n          \"amount\": \"2500000\",\n          \"amount_display\": \"2.5 USDC\",\n          \"magnitude\": \"finite\",\n          \"token\": {\n            \"address\": \"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\",\n            \"symbol\": \"USDC\",\n            \"name\": \"USD Coin\",\n            \"decimals\": 6\n          }\n        },\n        \"assurance\": \"Interpreted using Bloom's description of this contract. Contract behavior has not been verified.\",\n        \"warnings\": []\n      }\n    },\n    {\n      \"command_word\": 1,\n      \"call_type\": \"CALL\",\n      \"target\": \"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913\",\n      \"selector\": \"0xa9059cbb\",\n      \"header_selector\": \"0xa9059cbb\",\n      \"arguments\": [\n        \"state[0] = 0x0000000000000000000000002222222222222222222222222222222222222222\",\n        \"state[1] from command word 0 return\"\n      ],\n      \"native_value\": \"0 raw native units\",\n      \"output\": \"write 32-byte return to state[1]\",\n      \"unread_reason\": \"Call arguments or native value depend on preceding runtime return data; initial slot values are not reused.\"\n    }\n  ]\n}",
+        "raw": "0x95352c9f00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000e00000000000000000000000000000000000000000000000000000000000000002a9059cbb010001ffffffff01833589fcd6edb6e08f4c7c32d4f71b54bda02913a9059cbb010001ffffffff01833589fcd6edb6e08f4c7c32d4f71b54bda0291300000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000200000000000000000000000002222222222222222222222222222222222222222000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000002625a0"
+      }
+    ],
+    "assurance": "Interpreted using Bloom's contract descriptions, but this call reaches a contract Bloom has not identified. Bloom has not verified what that contract is or what it does.",
+    "structural": true,
+    "warnings": [
+      "Enso input amounts and supported shortcut commands are decoded. Ordinary route envelopes do not constrain output token, recipient or minimum output. Runtime values, fees and destination settlement are not verified; route quotes are not signed guarantees."
+    ]
+  },
+  "enso-source": {
+    "contract": "0xF75584eF6673aD213a685a1B58Cc0330B8eA22Cf",
+    "contract_name": "Enso Router V2",
+    "function_signature": "routeSingle((uint8 tokenType,bytes data) tokenIn,bytes data)",
+    "selector": "0xb94c3609",
+    "action": "other",
+    "intent": "Route inputs through Enso; shortcut effects and quoted outputs remain unverified",
+    "fields": [
+      {
+        "label": "Native value",
+        "format": "amount",
+        "value": "0 ETH",
+        "raw": "0"
+      },
+      {
+        "label": "Input token type",
+        "format": "raw",
+        "value": "1",
+        "raw": "1"
+      },
+      {
+        "label": "Source asset / amount",
+        "format": "tokenAmount",
+        "value": "2.5 USDC (0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913)",
+        "raw": "0x000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda0291300000000000000000000000000000000000000000000000000000000002625a0",
+        "asset": {
+          "chain_id": 8453,
+          "token": {
+            "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "symbol": "USDC",
+            "name": "USD Coin",
+            "decimals": 6
+          },
+          "amount_display": "2.5 USDC"
+        }
+      },
+      {
+        "label": "Shortcut program",
+        "format": "ensoShortcut",
+        "value": "Undecoded shortcut: unknown shortcut entry-point selector",
+        "raw": "0x01020304"
+      }
+    ],
+    "assurance": "Interpreted using Bloom's contract descriptions, but this call reaches a contract Bloom has not identified. Bloom has not verified what that contract is or what it does.",
+    "structural": true,
+    "warnings": [
+      "Shortcut program not independently decoded: unknown shortcut entry-point selector. Exact bytes are retained.",
+      "Enso input amounts and supported shortcut commands are decoded. Ordinary route envelopes do not constrain output token, recipient or minimum output. Runtime values, fees and destination settlement are not verified; route quotes are not signed guarantees."
+    ]
+  },
+  "polymarket-auth": {
+    "kind": "polymarket_auth_scope",
+    "title": "Allow one Polymarket CLOB authentication",
+    "signer": "0x0000000000000000000000000000000000000007",
+    "payload_keccak": "",
+    "domain": [
+      {
+        "path": "name",
+        "value": "ClobAuthDomain"
+      },
+      {
+        "path": "version",
+        "value": "1"
+      },
+      {
+        "path": "chainId",
+        "value": "137"
+      }
+    ],
+    "fields": [
+      {
+        "path": "Permission profile",
+        "value": "polymarket.clob_auth.v1"
+      },
+      {
+        "path": "Signed attestation",
+        "value": "This message attests that I control the given wallet"
+      },
+      {
+        "path": "Nonce",
+        "value": "0"
+      },
+      {
+        "path": "Signature limit",
+        "value": "One signature in one operation"
+      },
+      {
+        "path": "Timestamp",
+        "value": "Fresh Unix seconds within 300 seconds of Broker time at signing"
+      }
+    ],
+    "warnings": [
+      "This permission can create or derive CLOB API credentials. Those credentials authorize account API operations; review the Petal's access separately. It cannot sign an order, wallet batch or payment. The timestamp is chosen after approval and verified when used; no exact message hash exists yet."
+    ]
+  },
+  "polymarket-order": {
+    "kind": "polymarket_exact",
+    "title": "Sign a prediction-market buy order",
+    "signer": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+    "payload_keccak": "0xef5ec6a9a480c3a4f7bdf0b8a5dbf06c9fa11d7ad6a7b3273901528378fc0c36",
+    "domain": [
+      {
+        "path": "primaryType",
+        "value": "TypedDataSign"
+      },
+      {
+        "path": "chainId",
+        "value": "0x89"
+      },
+      {
+        "path": "name",
+        "value": "Polymarket CTF Exchange"
+      },
+      {
+        "path": "verifyingContract",
+        "value": "0xe111180000d2663c0091e4f400237545b87b996b"
+      },
+      {
+        "path": "version",
+        "value": "2"
+      }
+    ],
+    "fields": [
+      {
+        "path": "contents.salt",
+        "value": "479249096354"
+      },
+      {
+        "path": "contents.maker",
+        "value": "0x6c625c75652cf2cdf2bfe94ad59cb6f79b899a18"
+      },
+      {
+        "path": "contents.signer",
+        "value": "0x6c625c75652cf2cdf2bfe94ad59cb6f79b899a18"
+      },
+      {
+        "path": "Outcome token ID (market identity unverified)",
+        "value": "7496871387824498705150337097986995704782987980926026827618928384721521953608"
+      },
+      {
+        "path": "Maker amount (raw protocol units)",
+        "value": "11782400"
+      },
+      {
+        "path": "Taker amount (raw protocol units)",
+        "value": "21040000"
+      },
+      {
+        "path": "Side (0 buy, 1 sell)",
+        "value": "0"
+      },
+      {
+        "path": "contents.signatureType",
+        "value": "3"
+      },
+      {
+        "path": "contents.timestamp",
+        "value": "1765432100000"
+      },
+      {
+        "path": "contents.metadata",
+        "value": "0x0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "path": "contents.builder",
+        "value": "0x0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "path": "name",
+        "value": "DepositWallet"
+      },
+      {
+        "path": "version",
+        "value": "1"
+      },
+      {
+        "path": "chainId",
+        "value": "137"
+      },
+      {
+        "path": "verifyingContract",
+        "value": "0x6c625c75652cf2cdf2bfe94ad59cb6f79b899a18"
+      },
+      {
+        "path": "salt",
+        "value": "0x0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "path": "Collateral contract (Polygon)",
+        "value": "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
+      },
+      {
+        "path": "Signed order expiry",
+        "value": "None; HTTP expiration is not part of this signature"
+      }
+    ],
+    "collateral_asset": {
+      "chain_id": 137,
+      "token": {
+        "address": "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb",
+        "symbol": "pUSD",
+        "name": "Polymarket USD",
+        "decimals": 6
+      },
+      "amount_display": "11.7824 pUSD"
+    },
+    "warnings": [
+      "Bloom verified the signed fields, not their execution effects or the identity of an unlisted application.",
+      "pUSD is not Circle USDC. Its 6 decimals and exchange bindings were checked at Polygon block 95772650; these contracts can upgrade. Outcome identity/units, fees, fill and settlement are unverified. HTTP order options are not signed.",
+      "Deposit-wallet ownership/implementation, live nonce, balances and execution effects are unverified. Draft IDs, intent hashes and acknowledgement flags are unsigned metadata."
+    ]
+  }
+};
+function previewAccountOne(session) {
+  session.signer_contribution.key_ref = {
+    derivation: {wallet_seed_ref: "pm80-preview", path: "m/44'/60'/0'/0/1"}
+  };
+  session.preview_status = "Decoder fixture · Not a live request";
+  return session;
+}
+function previewDecodedEnso(name) {
+  const call = PREVIEW_PM80_READINGS[name];
+  return previewAccountOne(previewApproval([previewPayload({
+    destination: call.contract, contract_call: call
+  })], {...previewClearSigning(), entries: []}));
+}
+function previewDecodedMessage(name) {
+  const session = previewAccountOne(previewApproval([], null));
+  session.review_manifest.canonical_plan = JSON.stringify({message_review: PREVIEW_PM80_READINGS[name]});
+  return session;
+}
 const PREVIEWS = {
+  "enso-output": () => previewDecodedEnso("enso-output"),
+  "enso-shortcut": () => previewDecodedEnso("enso-shortcut"),
+  "enso-source": () => previewDecodedEnso("enso-source"),
+  "enso-allowance": () => {
+    const call = previewCall("allowance", "2500000", "2.5 USDC", "finite", [PREVIEW_ALLOWANCE_ADVISORY]);
+    const router = PREVIEW_PM80_READINGS["enso-output"].contract;
+    call.intent_summary.counterparty = router;
+    for (const field of call.fields) if (field.format === "addressName") field.value = router;
+    return previewAccountOne(previewApproval([previewPayload({contract_call: call})], previewClearSigning()));
+  },
+  "polymarket-auth": () => previewDecodedMessage("polymarket-auth"),
+  "polymarket-order": () => previewDecodedMessage("polymarket-order"),
   "safe-token-transfer": () => previewSafeTransaction([
     `Action: transfer on USD Coin ${PREVIEW_TOKEN}`,
     `To: ${PREVIEW_SPENDER}`, "Amount: 25 USDC"
