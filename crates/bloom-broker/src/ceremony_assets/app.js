@@ -381,8 +381,8 @@ function callIntent(call, chainId) {
         return {action: "call", eyebrow: "Enso route checks", heading: "Review Enso route checks",
           detail: "Review the source amount and where the output should go. The minimum below is a requested balance check, not a guaranteed return. Shortcut effects, fees and received funds remain unverified.", relation: "calls"};
       }
-      return {action: "call", eyebrow: "Enso route inputs", heading: "Review Enso route inputs",
-        detail: "Source amounts are decoded. The shortcut's effects and quoted outputs remain unverified.", relation: "calls"};
+      return {action: "call", eyebrow: "Enso calls", heading: "Review Enso calls",
+        detail: "This request does not protect what you receive: it sets no output token, recipient or minimum return. The calls below are instructions, not confirmed transfers.", relation: "calls"};
     }
     if (call.contract_name?.startsWith("Privacy Pools")) {
       return {action: "call", eyebrow: "Privacy Pools", heading: signature.startsWith("withdraw(")
@@ -1527,35 +1527,47 @@ function renderReview(session) {
       if (!call || call.intent_summary) continue;
       const protocolDetails = call.contract_name?.startsWith("Privacy Pools") || call.contract_name === "Enso Router V2";
       const argumentsList = el("dl", {class: "facts"});
+      let argumentCount = 0;
       let shortcut;
       if (call.contract_name === "Enso Router V2") {
         try { shortcut = JSON.parse(call.fields.find(field => field.format === "ensoShortcut")?.value); } catch (_) {}
       }
       for (const field of reviewCallFields(call)) {
         if (technicalCallField(call, field)) continue;
+        if (call.contract_name === "Enso Router V2" && field.label === "Native value" && field.raw === "0") {
+          evidence.push(el("p", {}, `${field.label}: ${field.value}`));
+          continue;
+        }
         const command = field.label.match(/^Encoded command (\d+)$/);
         const step = command && shortcut?.steps?.[Number(command[1]) - 1];
         if (step) {
           const reading = step.reading;
+          const runtimeDependent = !step.reconstructed_calldata || !/^\d+ raw native units$/.test(step.native_value);
           const intent = reading ? callIntent(reading) : null;
           const section = el("section", {class: "ceremony-card"},
-            el("p", {class: "ceremony-card-position"}, field.label),
-            el("h3", {class: "ceremony-section-title"}, intent?.heading || "Arguments determined during execution"));
+            el("p", {class: "ceremony-card-position"}, `Call ${command[1]}`),
+            el("h3", {class: "ceremony-section-title"}, intent?.heading || (runtimeDependent
+              ? "Details depend on earlier calls" : "Call Bloom cannot interpret")));
           if (reading?.intent_summary?.counterparty) {
             const summary = reading.intent_summary;
             section.append(partyRow({role: summary.counterparty_role,
-              label: summary.counterparty_role === "recipient" ? "Recipient named in this call" : "Spender named in this call",
+              label: summary.counterparty_role === "recipient" ? "Recipient" : "Spender",
               value: summary.counterparty, chainId: payload.chain_id}));
           }
-          section.append(el("p", {}, reading
-            ? "Decoded instruction only. This does not establish the route's overall result."
-            : "This call uses results from earlier calls. Bloom cannot determine its exact arguments before execution."));
-          section.append(partyRow({role: "contract", label: "Contract called by this instruction", value: step.target, chainId: payload.chain_id}));
-          section.append(el("dl", {class: "facts"},
-            el("dt", {}, "Execution mode"), el("dd", {}, step.call_type),
-            el("dt", {}, "Native value for this instruction"), el("dd", {}, step.native_value)));
+          if (!reading) {
+            section.append(el("p", {}, runtimeDependent
+              ? "Bloom cannot determine the exact arguments of this call before execution."
+              : "The call data is available, but Bloom cannot explain this instruction. Its bytes and decoding reason are in technical details."));
+          }
+          if (!reading || step.target.toLowerCase() !== reading.contract.toLowerCase()) {
+            section.append(partyRow({role: "contract", label: "Called contract", value: step.target, chainId: payload.chain_id}));
+          }
+          if (step.call_type !== "CALL") section.append(el("p", {}, `Execution mode: ${step.call_type}`));
+          if (step.native_value !== "0 raw native units") {
+            section.append(el("p", {}, `Native value: ${step.native_value}`));
+          }
           decision.push(section);
-          evidence.push(el("p", {}, `${field.label}: ${field.value}`));
+          evidence.push(el("p", {}, `${field.label}: ${field.value}. Execution mode: ${step.call_type}. Native value: ${step.native_value}`));
           continue;
         }
         if (field.asset?.token) {
@@ -1581,8 +1593,9 @@ function renderReview(session) {
         const value = explorer ? explorerAnchor(explorer, field.value, field.label)
           : el("code", {}, field.value);
         argumentsList.append(el("dt", {}, field.label), el("dd", {}, value));
+        argumentCount++;
       }
-      decision.push(el("section", {class: "ceremony-call-arguments"},
+      if (argumentCount || call.contract_name !== "Enso Router V2") decision.push(el("section", {class: "ceremony-call-arguments"},
         el("h2", {class: "ceremony-section-title"}, transfer.payloads.length > 1 ? `Transaction ${index + 1} arguments` : protocolDetails ? "Call details" : "Function arguments"),
         protocolDetails ? null : el("code", {class: "ceremony-function"}, call.function_signature),
         argumentsList));
@@ -2969,6 +2982,7 @@ async function renderTokenCatalog() {
   const input = el("input", {type: "search", placeholder: "Symbol, name, chain ID or contract address", "aria-label": "Find a token"});
   const results = el("div", {class: "words"});
   const heading = el("p", {}, `${tokens.length} deployments · ${new Set(tokens.map(token => token.chain_id)).size} chains · ${new Set(tokens.map(token => token.symbol)).size} distinct symbols`);
+  const artworkCount = tokens.filter(token => tokenArt(token.chain_id, token.address)).length;
   const render = () => {
     const query = input.value?.trim().toLowerCase() || "";
     const matches = tokens.filter(token => `${token.symbol} ${token.name} ${token.chain_id} ${token.address}`.toLowerCase().includes(query));
@@ -2979,12 +2993,13 @@ async function renderTokenCatalog() {
         statusNode.replaceChildren(el("a", {href: "/preview/tokens"}, "Back to token catalog"),
           " · Synthetic transfer · Not a live request");
       };
-      return el("section", {class: "ceremony-card"}, el("p", {}, `${token.name} (${token.symbol}) · ${token.decimals} decimals`),
-        el("code", {}, token.address), button);
+      return el("section", {class: "ceremony-card"},
+        assetCard({chainId: token.chain_id, address: token.address, title: token.name, subtitle: token.symbol}),
+        el("p", {}, `${token.decimals} decimals · ${tokenArt(token.chain_id, token.address) ? "Bundled token logo" : "Neutral icon · no bundled logo"}`), button);
     }));
   };
   input.oninput = render;
-  reviewNode.replaceChildren(heading, el("p", {}, "Names, symbols and decimals come from this build's shared token catalog. Artwork is available for only a subset. These are example transfers, not verified balances or live transactions."), input, results);
+  reviewNode.replaceChildren(heading, el("p", {}, `All ${tokens.length} entries have names, ticker symbols and decimals. ${artworkCount} deployments have bundled token logos; the rest use neutral icons. These are example transfers, not verified balances or live transactions.`), input, results);
   approve.hidden = true;
   cancel.hidden = true;
   const actions = document.querySelector(".ceremony-actions");

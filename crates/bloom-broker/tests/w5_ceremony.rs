@@ -1424,8 +1424,30 @@ if (!nodes["panel-title"].textContent.includes("Enso Router V2") || !allText(nod
 if (catalogPartyName("123456", PREVIEW_PM80_READINGS["enso-output"].contract)) throw new Error("Enso label leaked onto an unlisted chain");
 renderReview(previewSession("enso-shortcut"));
 const shortcutPrimary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
-if (!shortcutPrimary.includes("Send 2.5 USDC") || !shortcutPrimary.includes("Arguments determined during execution") || shortcutPrimary.includes("selector 0xa9059cbb")) {{
+if (!shortcutPrimary.includes("Send 2.5 USDC") || !shortcutPrimary.includes("Details depend on earlier calls") || shortcutPrimary.includes("selector 0xa9059cbb") ||
+    shortcutPrimary.includes("0 raw native units") || shortcutPrimary.includes("Execution mode") || shortcutPrimary.includes("Call details")) {{
   throw new Error("Enso shortcut still dumps encoded commands instead of their bounded reading");
+}}
+const riskyShortcut = previewSession("enso-shortcut");
+const riskyPlan = JSON.parse(riskyShortcut.review_manifest.canonical_plan);
+const programField = riskyPlan.evm_review.payloads[0].contract_call.fields.find(field => field.format === "ensoShortcut");
+const program = JSON.parse(programField.value);
+program.steps[1].native_value = "17 raw native units";
+program.steps[1].call_type = "DELEGATECALL";
+programField.value = JSON.stringify(program);
+riskyShortcut.review_manifest.canonical_plan = JSON.stringify(riskyPlan);
+renderReview(riskyShortcut);
+const riskyPrimary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+if (!riskyPrimary.includes("17 raw native units") || !riskyPrimary.includes("DELEGATECALL")) {{
+  throw new Error("Simplified Enso view hid nonzero native value or privileged execution");
+}}
+program.steps[1].reconstructed_calldata = "0xabcdef01";
+programField.value = JSON.stringify(program);
+riskyShortcut.review_manifest.canonical_plan = JSON.stringify(riskyPlan);
+renderReview(riskyShortcut);
+const unreadPrimary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+if (!unreadPrimary.includes("Call Bloom cannot interpret") || unreadPrimary.includes("Details depend on earlier calls")) {{
+  throw new Error("An undecodable static call was falsely labelled runtime-dependent");
 }}
 for (const token of {tokens}) {{
   const preview = previewCatalogToken(token);
@@ -1463,11 +1485,13 @@ if (!rendered.includes("Approve a call Bloom cannot read") || rendered.includes(
   globalThis.fetch = async () => ({{ok: true, json: async () => {tokens}}});
   document.querySelector = () => null;
   await renderTokenCatalog();
+  if (!walk(nodes.review).some(node => node.tagName === "IMG" && node.src === "/assets/tokens/usdc.svg") ||
+      !allText(nodes.review).includes("Neutral icon · no bundled logo")) throw new Error("Catalog omitted bundled logos or misrepresented neutral icons");
   const input = walk(nodes.review).find(node => node.tagName === "INPUT");
   input.value = "WBTC";
   input.oninput();
   const text = allText(nodes.review);
-  if (!text.includes("WBTC") || text.includes("USD Coin (USDC)")) throw new Error("Token catalog search did not filter symbols");
+  if (!text.includes("WBTC") || text.includes("USD Coin")) throw new Error("Token catalog search did not filter symbols");
   walk(nodes.review).find(node => node.tagName === "BUTTON").onclick();
   if (!nodes["panel-title"].textContent.includes("1 WBTC") || !approve.hidden || !cancel.hidden) throw new Error("Catalog selection is not a non-authorizing transfer preview");
 }})().catch(error => {{ console.error(error); process.exitCode = 1; }});
