@@ -668,9 +668,14 @@ mod tests {
     /// rule this build does not know, which may spell data in case.
     #[test]
     fn undecodable_entries_still_compare_by_exact_spelling() {
+        // One per family, plus an unknown chain: each spelling fails its
+        // chain's decoder, so it falls back to exact comparison.
         for (chain_name, text) in [
             ("localnet", "Whatever-This-Is"),
             ("ethereum", "0xRecipient"),
+            ("solana", "Not-Base58-0OIl"),
+            ("cosmos", "Cosmos1NotBech32"),
+            ("bitcoin", "Bc1NotAnAddress"),
         ] {
             let c = chain(chain_name);
             assert!(matches!(comparable(&c, text), Comparable::Literal(_)));

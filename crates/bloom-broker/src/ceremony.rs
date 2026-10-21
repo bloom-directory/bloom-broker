@@ -5382,14 +5382,7 @@ fn migrate_legacy_ceremonies(
 ) -> Result<(), ProtocolError> {
     // The legacy file is opened as it is and is no longer given the table,
     // so one without it, such as an empty file, has nothing to migrate.
-    let legacy_has_sessions: bool = legacy
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ceremony_sessions')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(storage)?;
-    if !legacy_has_sessions {
+    if !crate::legacy_store::has_table(legacy, "ceremony_sessions").map_err(storage)? {
         return Ok(());
     }
     let legacy_path: String = legacy
@@ -5436,12 +5429,7 @@ fn migrate_legacy_ceremonies(
     if migrated {
         return Ok(());
     }
-    // Never the plain path: the journal connection creates missing databases.
-    target
-        .execute(
-            "ATTACH DATABASE ?1 AS ceremony_legacy",
-            [crate::legacy_store::attach_uri(&legacy_path)],
-        )
+    crate::legacy_store::attach(target, &legacy_path, "ceremony_legacy", "ceremony")
         .map_err(storage)?;
     journal.verify_migration_target(target).map_err(storage)?;
     let migration = (|| -> Result<(), ProtocolError> {
@@ -5984,8 +5972,14 @@ mod legacy_attach_tests {
             )
             .unwrap();
 
-        migrate_legacy_ceremonies(&mut target, &legacy, &journal)
+        let error = migrate_legacy_ceremonies(&mut target, &legacy, &journal)
             .expect_err("a legacy store that is gone cannot be migrated");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot attach the legacy ceremony store"),
+            "the error must say which store could not be attached: {error}"
+        );
         assert!(
             !legacy_path.exists(),
             "the attach must not recreate a vanished legacy store"

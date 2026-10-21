@@ -680,6 +680,39 @@ fn an_uninspectable_legacy_store_path_fails_startup_instead_of_skipping_migratio
     }
 }
 
+/// A directory the Broker may not search hides whether a store is there, so
+/// startup fails rather than reading the store as absent. Root can search any
+/// directory, so the case cannot be set up as root and is skipped there.
+#[cfg(unix)]
+#[test]
+fn a_legacy_store_in_an_unsearchable_directory_fails_startup() {
+    use std::os::unix::fs::PermissionsExt as _;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root can search a mode 000 directory");
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let locked = directory.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = open_authority_at(
+        &locked.join("authority.sqlite"),
+        &directory.path().join("journal.sqlite"),
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let error = result
+        .err()
+        .expect("a legacy store in an unsearchable directory must fail startup");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot tell whether the legacy authority store"),
+        "{error}"
+    );
+}
+
 /// The symlink itself is not the problem: a legacy store that is reachable
 /// through one opens and migrates exactly as a regular file does.
 #[cfg(unix)]
@@ -705,7 +738,8 @@ fn a_legacy_store_reached_through_a_symlink_is_migrated() {
 
 /// The migration attaches the legacy store through a `file:` URI, where `%`,
 /// `?` and `#` are syntax. A store whose path contains them must still be the
-/// one that is attached.
+/// one that is attached, as must one whose path has a space, `+` or non-ASCII
+/// text, which a form-style encoder would rewrite.
 #[cfg(unix)]
 #[test]
 fn a_legacy_store_whose_path_contains_uri_syntax_is_migrated() {
@@ -713,7 +747,7 @@ fn a_legacy_store_whose_path_contains_uri_syntax_is_migrated() {
     let journal_path = directory.path().join("journal.sqlite");
     let legacy_path = directory
         .path()
-        .join("odd%41?#dir")
+        .join("odd %41?#+é dir")
         .join("authority.sqlite");
     seed_legacy_store(&legacy_path);
 
@@ -2136,32 +2170,62 @@ fn destination_case_is_read_by_each_chains_own_rule() {
         .expect("the exact policy spelling is allowed");
 }
 
-/// A policy entry allows a destination on its own chain only. The same 20
-/// bytes on another EVM chain can be an undeployed address or someone else's
-/// contract, so an entry under `base` must not allow them under `optimism`,
-/// in either spelling. The refusal-hint test covers only the message; this
-/// covers the decision.
+/// A policy entry allows a destination on its own chain only. The comparison
+/// key is `(chain, decoded destination)` for every kind of entry, and the
+/// decoded value carries no chain: the same 20 bytes, the same bech32 string
+/// or the same `petal:` class reduce alike under any chain. Dropping the chain
+/// from the key for any one family would widen every policy entry of that
+/// family to every other chain, so each family is pinned here, each with its
+/// own-chain control. For EVM that matters most: the same 20 bytes on another
+/// chain can be an undeployed address or someone else's contract.
 #[test]
-fn an_evm_destination_allowed_on_one_chain_is_refused_on_another() {
-    const CHECKSUMMED: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-    const LOWERCASE: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+fn a_destination_allowed_on_one_chain_is_refused_on_another() {
+    const EVM_CHECKSUMMED: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    const EVM_LOWERCASE: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    const COSMOS: &str = "cosmos1w508d6qejxtdg4y5r3zarvary0c5xw7k6ah60c";
+    const PETAL_CLASS: &str = "petal:near-intents";
+    // Undecodable on a chain this build does not know, so compared by its
+    // exact spelling.
+    const LITERAL: &str = "Whatever-This-Is";
+
+    // (entry chain, entry, other chain, declared spellings, family)
+    let cases = [
+        (
+            "base",
+            EVM_CHECKSUMMED,
+            "optimism",
+            &[EVM_CHECKSUMMED, EVM_LOWERCASE][..],
+            "EVM",
+        ),
+        ("cosmos", COSMOS, "osmosis", &[COSMOS][..], "Cosmos"),
+        (
+            "base",
+            PETAL_CLASS,
+            "solana",
+            &[PETAL_CLASS][..],
+            "petal class",
+        ),
+        ("localnet", LITERAL, "devnet", &[LITERAL][..], "literal"),
+    ];
 
     let harness = Harness::new();
     let provenance = harness.provenance();
     let mut policy: CanonicalWalletPolicy =
         serde_json::from_slice(&harness.policy_snapshot(1).canonical_policy.decode()).unwrap();
-    policy.allowed_destinations.push(PolicyDestination {
-        chain: token("base"),
-        destination: CHECKSUMMED.into(),
-    });
+    for (chain, destination, ..) in cases {
+        policy.allowed_destinations.push(PolicyDestination {
+            chain: token(chain),
+            destination: destination.into(),
+        });
+    }
     let snapshot = signed_policy_snapshot(&harness, 2, &policy);
     harness.authority.install_policy(&snapshot).unwrap();
 
     let mut terms = petal_terms(&harness, &provenance);
     terms.policy_version = snapshot.version.clone();
     terms.policy_digest = snapshot.policy_digest.clone();
-    terms.limits.max_operations = DecimalU64::new(8);
-    terms.limits.max_signatures = DecimalU64::new(8);
+    terms.limits.max_operations = DecimalU64::new(16);
+    terms.limits.max_signatures = DecimalU64::new(16);
     terms.limits.value_limits = vec![
         value_limit("ethereum", "token", "1000"),
         value_limit("ethereum", "eth", "1000"),
@@ -2188,22 +2252,33 @@ fn an_evm_destination_allowed_on_one_chain_is_refused_on_another() {
         input
     };
 
-    for (operation_id, spelling) in [(101, CHECKSUMMED), (102, LOWERCASE)] {
-        let error = error_code(
-            harness
-                .authority
-                .authorize(&declaring(operation(operation_id), "optimism", spelling))
-                .unwrap_err(),
-        );
-        assert!(error.contains("DESTINATION_NOT_ALLOWED"), "{error}");
+    let mut operation_id = 100;
+    for (chain, _, other_chain, spellings, family) in cases {
+        for spelling in spellings {
+            operation_id += 1;
+            let error = error_code(
+                harness
+                    .authority
+                    .authorize(&declaring(operation(operation_id), other_chain, spelling))
+                    .unwrap_err(),
+            );
+            assert!(
+                error.contains("DESTINATION_NOT_ALLOWED"),
+                "a {family} entry under {chain} must not allow {spelling} under {other_chain}: {error}"
+            );
+        }
+        // The chain the entry names still allows it, so the refusals above
+        // are about the chain and nothing else.
+        operation_id += 1;
+        harness
+            .authority
+            .authorize(&declaring(
+                operation(operation_id),
+                chain,
+                spellings.last().unwrap(),
+            ))
+            .unwrap_or_else(|error| panic!("a {family} entry must allow its own chain: {error:?}"));
     }
-
-    // The chain the entry names still allows the address, so the refusals
-    // above are about the chain and nothing else.
-    harness
-        .authority
-        .authorize(&declaring(operation(103), "base", LOWERCASE))
-        .expect("the entry's own chain allows the address in either spelling");
 }
 
 #[test]

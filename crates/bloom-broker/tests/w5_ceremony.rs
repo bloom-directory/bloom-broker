@@ -7499,12 +7499,13 @@ fn open_ceremony_at(
     CeremonyBroker::open(legacy_path, Arc::new(MockSigner::new()), journal)
 }
 
-/// Writes a legacy ceremony store holding one cancelled session, the way an
-/// older package left it, and returns that session's operation.
+/// Writes a legacy ceremony store holding one cancelled session and returns
+/// that session's operation.
 fn seed_legacy_ceremony_store(path: &std::path::Path) -> OperationId {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    // Older packages kept sessions in their own file; a journal opened at the
-    // legacy path stores them exactly there.
+    // Older packages kept sessions in their own file. A broker whose journal
+    // is that file writes real sessions there; the file then also holds the
+    // journal's other tables, which the migration ignores.
     let journal = Arc::new(BrokerJournal::open(path, Arc::new(ServiceTestAuditSigner)).unwrap());
     let broker = CeremonyBroker::open_with_manifest_signer_audited(
         path,
@@ -7557,24 +7558,75 @@ fn a_home_with_nothing_to_migrate_grows_no_legacy_ceremony_file() {
     );
 }
 
-/// A legacy ceremony file that a previous release created empty, or that
-/// predates the sessions table, has nothing to migrate. It opens, and it is
-/// left exactly as it was.
+/// Legacy ceremony files with nothing to migrate open, and are left exactly
+/// as they were, with no migration recorded. Every release before this one
+/// gave the file an empty `ceremony_sessions` table, so that is the shape most
+/// upgraded homes have; a file without the table, empty or not, has nothing
+/// to migrate either.
 #[test]
 fn a_legacy_ceremony_file_without_sessions_is_left_untouched() {
     let directory = tempfile::tempdir().unwrap();
-    let legacy_path = directory.path().join("ceremonies.sqlite");
-    std::fs::write(&legacy_path, b"").unwrap();
+    fn older_release(path: &std::path::Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE ceremony_sessions (
+                    ceremony_id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL UNIQUE,
+                    session_jcs TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+    }
+    fn other_tables(path: &std::path::Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch("CREATE TABLE policies(wallet_id TEXT PRIMARY KEY);")
+            .unwrap();
+    }
+    fn empty_file(path: &std::path::Path) {
+        std::fs::write(path, b"").unwrap();
+    }
+    let shapes = [
+        (
+            "an older release's empty table",
+            older_release as fn(&std::path::Path),
+        ),
+        ("a file with other tables only", other_tables),
+        ("an empty file", empty_file),
+    ];
 
-    let broker = open_ceremony_at(&legacy_path, &directory.path().join("journal.sqlite"))
-        .expect("an empty legacy file means nothing to migrate");
-    drop(broker);
+    for (index, (shape, write)) in shapes.into_iter().enumerate() {
+        let legacy_path = directory.path().join(format!("ceremonies-{index}.sqlite"));
+        write(&legacy_path);
+        let before = std::fs::read(&legacy_path).unwrap();
+        let journal = Arc::new(
+            BrokerJournal::open(
+                directory.path().join(format!("journal-{index}.sqlite")),
+                Arc::new(ServiceTestAuditSigner),
+            )
+            .unwrap(),
+        );
 
-    assert_eq!(
-        std::fs::metadata(&legacy_path).unwrap().len(),
-        0,
-        "the legacy file must not be written to"
-    );
+        let broker =
+            CeremonyBroker::open(&legacy_path, Arc::new(MockSigner::new()), journal.clone())
+                .unwrap_or_else(|error| panic!("{shape} means nothing to migrate: {error}"));
+        drop(broker);
+
+        assert_eq!(
+            std::fs::read(&legacy_path).unwrap(),
+            before,
+            "{shape} must not be written to"
+        );
+        assert!(
+            !journal
+                .audit_entries()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.event_type == "storage.ceremony_migrated"),
+            "{shape} must not record a migration"
+        );
+    }
 }
 
 /// A legacy store reached through a symlink whose target is missing is not
@@ -7635,15 +7687,47 @@ fn an_unreachable_legacy_ceremony_path_fails_startup() {
     assert!(!directory.path().join("no-such-dir").exists());
 }
 
+/// A directory the Broker may not search hides whether a store is there, so
+/// startup fails rather than reading the store as absent. Root can search any
+/// directory, so the case cannot be set up as root and is skipped there.
+#[test]
+fn a_legacy_ceremony_store_in_an_unsearchable_directory_fails_startup() {
+    use std::os::unix::fs::PermissionsExt as _;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root can search a mode 000 directory");
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let locked = directory.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = open_ceremony_at(
+        &locked.join("ceremonies.sqlite"),
+        &directory.path().join("journal.sqlite"),
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let error = result
+        .err()
+        .expect("a legacy store in an unsearchable directory must fail startup");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot tell whether the legacy ceremony store"),
+        "{error}"
+    );
+}
+
 /// A populated legacy store behind a live symlink, in a directory whose name
-/// is URI syntax for the migration's `file:` attach, still has its sessions
-/// carried over.
+/// is URI syntax for the migration's `file:` attach or would be rewritten by a
+/// form-style encoder, still has its sessions carried over.
 #[test]
 fn a_legacy_ceremony_store_behind_a_symlink_at_an_unusual_path_is_migrated() {
     let directory = tempfile::tempdir().unwrap();
     let target = directory
         .path()
-        .join("volume%41?#dir")
+        .join("volume %41?#+é dir")
         .join("ceremonies.sqlite");
     let operation_id = seed_legacy_ceremony_store(&target);
     let legacy_path = directory.path().join("ceremonies.sqlite");

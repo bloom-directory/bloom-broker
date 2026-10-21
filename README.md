@@ -26,9 +26,9 @@ key* is a canonical 32-byte Ed25519 key as 64 lowercase hex characters.
 
 | Field | Meaning |
 | --- | --- |
-| `journal_path` | Broker's durable audit journal (SQLite). |
-| `authority_path` | Durable authority state: approvals, policy, declared usage. |
-| `ceremony_path` | Durable ceremony state. |
+| `journal_path` | Broker's durable audit journal (SQLite). It also holds authority state (approvals, policy, declared usage) and ceremony state, so those commit atomically with their audit records. |
+| `authority_path` | Legacy authority store from older packages. Startup migrates it into the journal once and keeps the file; it is never created, so new installs have none. A dangling link, a missing directory or an unreadable entry here fails startup. |
+| `ceremony_path` | Legacy ceremony store, handled the same way as `authority_path`. |
 | `signer_socket_path` | Unix socket Broker dials to reach Signer; the peer is still authenticated against the edge-manifest pin. |
 | `provenance_catalog_path` | Provenance catalog. Its metadata must describe a root-owned, non-symlink regular file that is not group- or other-writable; link count and size are not part of that check. The contents are then read and refused if they exceed 1 MiB, fail to parse, or fail shape validation. |
 

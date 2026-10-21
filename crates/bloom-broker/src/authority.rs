@@ -3817,12 +3817,7 @@ fn migrate_legacy_authority(
     legacy: &Connection,
     journal: &BrokerJournal,
 ) -> Result<(), AuthorityError> {
-    let legacy_has_schema: bool = legacy.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='policies')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !legacy_has_schema {
+    if !crate::legacy_store::has_table(legacy, "policies")? {
         return Ok(());
     }
     let legacy_path: String = legacy.query_row(
@@ -3856,11 +3851,8 @@ fn migrate_legacy_authority(
     if migrated {
         return Ok(());
     }
-    // Never the plain path: the journal connection creates missing databases.
-    target.execute(
-        "ATTACH DATABASE ?1 AS authority_legacy",
-        [crate::legacy_store::attach_uri(&legacy_path)],
-    )?;
+    crate::legacy_store::attach(target, &legacy_path, "authority_legacy", "authority")
+        .map_err(AuthorityError::Storage)?;
     journal.verify_migration_target(target)?;
     let migration = (|| -> Result<(), AuthorityError> {
         let transaction = target.transaction()?;
@@ -4791,8 +4783,14 @@ mod legacy_attach_tests {
         let connection = journal.shared_connection();
         let mut target = connection.lock().unwrap();
 
-        migrate_legacy_authority(&mut target, &legacy, &journal)
+        let error = migrate_legacy_authority(&mut target, &legacy, &journal)
             .expect_err("a legacy store that is gone cannot be migrated");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot attach the legacy authority store"),
+            "the error must say which store could not be attached: {error}"
+        );
         assert!(
             !legacy_path.exists(),
             "the attach must not recreate a vanished legacy store"
