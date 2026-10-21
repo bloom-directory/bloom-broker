@@ -1103,7 +1103,7 @@ if (safeFactText.includes("Token amount (base units): 123") || safeFactText.incl
   throw new Error(`Safe review still dumps action lines: ${{safeFactText}}`);
 }}
 const openTags = nodes.review.children.map(node => node.tagName);
-if (openTags.join(",") !== "P,SECTION,ASIDE,DETAILS") {{
+if (openTags.join(",") !== "P,SECTION,DIV,DIV,ASIDE,DETAILS") {{
   throw new Error(`Safe open view is not summary, decision, warning, details: ${{openTags}}`);
 }}
 const banners = node => !node || typeof node === "string" ? [] : [
@@ -1382,6 +1382,31 @@ for (const [name, expected] of [
   if (!primary.includes("Signing account") || !primary.includes("EVM account 1")) {{
     throw new Error(`${{name}} hides the numbered signing account inside technical details`);
   }}
+}}
+
+// Roles and identities must be visible without expanding technical details.
+for (const [name, expected] of [
+  ["safe-token-transfer", ["Sender · Safe address", "Signing owner · EOA", "Recipient", "25 USDC"]],
+  ["safe-allowance-unlimited", ["Token holder · Safe address", "Signing owner · EOA", "Spender · allowed to use these tokens"]],
+  ["transfer-dai", ["Dai Stablecoin", "12.5 DAI", "Sender"]],
+  ["native-send", ["Ether", "0.01 ETH", "Sender"]],
+  ["structural-transfer", ["Token identity and decimals are unverified", "250000000 raw units"]],
+  ["polymarket-order", ["Market / outcome", "Unverified", "11.7824 pUSD"]]
+]) {{
+  renderReview(previewSession(name));
+  const primary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+  for (const field of expected) if (![nodes["panel-title"].textContent, primary].join(" ").includes(field)) throw new Error(`${{name}} hides ${{field}}`);
+  if (name === "polymarket-order" && primary.includes("11782400")) throw new Error("Raw collateral competes with the readable amount");
+}}
+renderReview(previewSession("safe-token-transfer"));
+if (!walk(nodes.review).some(node => node.href === "https://basescan.org/token/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")) {{
+  throw new Error("Token card does not link to the token explorer page");
+}}
+renderReview(previewSession("enso-output"));
+const outputCard = nodes.review.children.find(node => allText(node).includes("1.25 USDC"));
+if (!outputCard || !allText(outputCard).includes("not guaranteed received") ||
+    walk(outputCard).some(node => String(node.className).includes("outgoing"))) {{
+  throw new Error("Enso requested output is presented as money leaving or guaranteed receipt");
 }}
 
 // A batch member Bloom could not read is never shown as a plain send, and a

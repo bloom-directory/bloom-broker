@@ -176,6 +176,7 @@ function assetCard({chainId, address, venueAsset, native, title, subtitle, amoun
   let addressRow = null;
   if (address && /^0x[0-9a-fA-F]{40}$/.test(address)) {
     const explorer = addressExplorer(chainId, address);
+    if (explorer) explorer.url = explorer.url.replace("/address/", "/token/");
     addressRow = el("p", {class: "ceremony-party-address ceremony-asset-address"},
       explorer ? explorerAnchor(explorer, address, "Token contract") : el("code", {}, address));
   }
@@ -370,7 +371,7 @@ function callIntent(call) {
     if (call.contract_name === "Enso Router V2") {
       if (signature.startsWith("safeRoute")) {
         return {action: "call", eyebrow: "Enso route checks", heading: "Review Enso route checks",
-          detail: "Check the source amounts, receiver and requested output minimums. Shortcut effects, fees and received funds remain unverified.", relation: "calls"};
+          detail: "Review the source amount and where the output should go. The minimum below is a requested balance check, not a guaranteed return. Shortcut effects, fees and received funds remain unverified.", relation: "calls"};
       }
       return {action: "call", eyebrow: "Enso route inputs", heading: "Review Enso route inputs",
         detail: "Source amounts are decoded. The shortcut's effects and quoted outputs remain unverified.", relation: "calls"};
@@ -418,7 +419,7 @@ function callIntent(call) {
       action: "call", magnitude: summary.magnitude,
       eyebrow: "ERC-20-shaped call",
       heading: `Review transfer-shaped call for ${summary.amount_display}`,
-      detail: "The calldata names a recipient and raw amount. It does not prove that the contract will transfer tokens.",
+      detail: "Token identity and decimals are unverified, so no token symbol or converted amount is shown. The calldata names a recipient and raw amount; it does not prove that tokens will move.",
       relation: "calls"
     };
   }
@@ -635,6 +636,14 @@ function describeTransfer(manifest) {
         extraTechnical.push(row); continue;
       }
       if (polymarket) {
+        if (field.path === "Outcome token ID (market identity unverified)") {
+          primary.push(["Market / outcome", "Unverified — check the exact outcome token ID below"]);
+          extraTechnical.push([field.path, field.value, true]);
+          continue;
+        }
+        if (["Maker amount (raw protocol units)", "Taker amount (raw protocol units)", "Collateral contract (Polygon)"].includes(field.path)) {
+          extraTechnical.push(row); continue;
+        }
         const labels = {"contents.maker": "Deposit wallet", "contents.signer": "Order signer",
           wallet: "Deposit wallet", deadline: "Signed deadline", "Side (0 buy, 1 sell)": "Order side"};
         row[0] = labels[field.path] || field.path;
@@ -1080,8 +1089,12 @@ function describeTransfer(manifest) {
           title: / ETH$/.test(sendTo[1]) ? "Ether" : "Native asset", amount: sendTo[1],
           amountLabel: "Amount", tone: "outgoing"} : null;
     const safeRecipient = directToken ? recipient : sendTo?.[2];
-    const safeParties = (permission && spender) ? [["Spender", spender]]
-      : safeRecipient ? [["Recipient", safeRecipient]] : [];
+    const safeParties = [
+      [permission ? "Token holder · Safe address" : "Sender · Safe address", safe.safe],
+      ["Signing owner · EOA", safe.owner],
+      ...((permission && spender) ? [["Spender · allowed to use these tokens", spender]]
+        : safeRecipient ? [["Recipient", safeRecipient]] : [])
+    ];
     return {sentence, facts, technical, warnings, willVerify: true, heading,
       button: "Approve Safe signature", chainId: safe.chain_id, tokenAsset, safeCards, safeParties,
       networkIdentity: `EVM · ${network} · Chain ID ${safe.chain_id}`,
@@ -1497,8 +1510,9 @@ function renderReview(session) {
           const asset = field.asset;
           decision.push(assetCard({chainId: String(asset.chain_id), address: asset.token.address,
             title: asset.token.name, subtitle: asset.token.symbol,
-            amount: asset.amount_display, amountLabel: field.label,
-            tone: call.contract_name === "Enso Router V2" ? "outgoing" : "neutral"}));
+            amount: asset.amount_display, amountLabel: field.label === "Requested minimum balance increase"
+              ? "Minimum requested · not guaranteed received" : field.label,
+            tone: call.contract_name === "Enso Router V2" && /^Source asset/.test(field.label) ? "outgoing" : "neutral"}));
           continue;
         }
         if (field.format === "nativeAmount") {
@@ -1508,7 +1522,7 @@ function renderReview(session) {
           decision.push(assetCard({native: ether ? "ethereum" : "token",
             title: ether ? "Ether" : "Native asset",
             amount: String(field.value).replace(/ \((transaction value|minimum balance increase)\)$/, ""),
-            amountLabel: field.label, tone: "outgoing"}));
+            amountLabel: field.label, tone: /^Source asset/.test(field.label) ? "outgoing" : "neutral"}));
           continue;
         }
         const explorer = addressExplorer(payload.chain_id, field.value);
@@ -2961,6 +2975,14 @@ const PREVIEWS = {
     session.preview_status = "Example transaction using Ethereum USDC — nothing can be approved";
     return session;
   },
+  "transfer-dai": () => {
+    const token = {address: "0x6B175474E89094C44Da98b954EedeAC495271d0F", name: "Dai Stablecoin", symbol: "DAI", decimals: 18};
+    const session = previewApproval([previewPayload({chain_id: "1", chain: "ethereum", destination: token.address,
+      contract_call: previewCall("transfer", "12500000000000000000", "12.5 DAI", "finite", [], token)
+    })], previewClearSigning("1", token.address));
+    session.preview_status = "Synthetic DAI transfer · Not a live request";
+    return session;
+  },
   "allowance-finite": () => previewApproval([previewPayload({
     contract_call: previewCall("allowance", "100000000", "100 USDC", "finite", [
       PREVIEW_ALLOWANCE_ADVISORY,
@@ -3115,7 +3137,14 @@ async function load() {
       statusNode.textContent = "Choose a preview";
       reviewNode.replaceChildren(el("ul", {class: "words"},
         ...Object.keys(PREVIEWS).map(key =>
-          el("li", {}, el("a", {href: `/preview/${key}`}, key)))));
+          el("li", {}, el("a", {href: `/preview/${key}`}, ({
+            "transfer-ethereum": "USDC transfer · Ethereum · ordinary wallet",
+            "transfer-dai": "DAI transfer · Ethereum · ordinary wallet",
+            "native-send": "Ether transfer · Base · ordinary wallet",
+            "safe-token-transfer": "USDC transfer · Base · Safe signature",
+            "safe-allowance-unlimited": "Unlimited USDC permission · Safe signature",
+            "structural-transfer": "Unverified token identity · transfer-shaped calldata"
+          })[key] || key)))));
       approve.hidden = true;
       cancel.hidden = true;
       return;
