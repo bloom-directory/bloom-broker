@@ -927,7 +927,7 @@ function renderCardReview(session) {
   if (effect.kind === "checkout" || effect.kind === "site_checkout") {
     const payment = effect.facts;
     const website = el("span");
-    const domain = manifest.registrable_domain;
+    const domain = manifest.host;
     const index = domain ? payment.origin.lastIndexOf(domain) : -1;
     if (index >= 0) website.append(payment.origin.slice(0, index), el("strong", {}, domain), payment.origin.slice(index + domain.length));
     else website.textContent = payment.origin;

@@ -33,11 +33,80 @@ pub struct OrderField {
 }
 const MAX_ORDER_FIELDS: usize = 60;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(label: &str, value: &str) -> bool {
+        checked_order_fields(vec![OrderField {
+            label: label.into(),
+            value: value.into(),
+        }])
+        .is_ok()
+    }
+
+    #[test]
+    fn order_fields_reject_card_numbers_even_under_innocent_labels() {
+        for value in [
+            "4111111111111111",
+            "4111 1111 1111 1111",
+            "4111-1111-1111-1111",
+            "378282246310005",
+        ] {
+            assert!(!check("Reference", value), "{value}");
+        }
+        assert!(check("Reference", "4111111111111112"));
+        assert!(check("Order", "12345"));
+    }
+
+    #[test]
+    fn order_fields_reject_security_codes_but_allow_other_short_numbers() {
+        for label in ["CVC", "cvv2", "Security code", "Card SECURITY"] {
+            for value in ["123", "1234"] {
+                assert!(!check(label, value));
+            }
+        }
+        assert!(check("Quantity", "123"));
+        assert!(check("Security note", "front desk"));
+    }
+}
+
 fn checked_order_fields(fields: Vec<OrderField>) -> Result<Vec<OrderField>, ProtocolError> {
     if fields.len() > MAX_ORDER_FIELDS
-        || fields
-            .iter()
-            .any(|f| f.label.chars().count() > 120 || f.value.chars().count() > 200)
+        || fields.iter().any(|f| {
+            let digits: Vec<u8> = f
+                .value
+                .bytes()
+                .filter(u8::is_ascii_digit)
+                .map(|b| b - b'0')
+                .collect();
+            let numeric = f
+                .value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b == b' ' || b == b'-');
+            let card_number = numeric
+                && (13..=19).contains(&digits.len())
+                && digits
+                    .iter()
+                    .rev()
+                    .enumerate()
+                    .map(|(i, &d)| {
+                        let d = if i % 2 == 1 { d * 2 } else { d };
+                        u32::from(if d > 9 { d - 9 } else { d })
+                    })
+                    .sum::<u32>()
+                    .is_multiple_of(10);
+            let label = f.label.to_lowercase();
+            let security_code = (3..=4).contains(&f.value.len())
+                && f.value.bytes().all(|b| b.is_ascii_digit())
+                && ["cvc", "cvv", "security"]
+                    .iter()
+                    .any(|word| label.contains(word));
+            f.label.chars().count() > 120
+                || f.value.chars().count() > 200
+                || card_number
+                || security_code
+        })
     {
         return Err(kind_mismatch());
     }
@@ -212,11 +281,11 @@ impl CeremonyBroker {
             return Err(operation_conflict());
         }
         let kind = request.effect.ceremony_kind();
-        let domain = match &request.effect {
+        let host = match &request.effect {
             CardEffect::Checkout { facts, .. } | CardEffect::SiteCheckout { facts, .. } => {
                 url::Url::parse(&facts.origin)
                     .ok()
-                    .and_then(|u| u.host_str().and_then(psl::domain_str).map(str::to_owned))
+                    .and_then(|u| u.host_str().map(str::to_owned))
             }
             _ => None,
         };
@@ -233,8 +302,7 @@ impl CeremonyBroker {
         } else {
             None
         };
-        let review = serde_json::json!({"card_effect":request.effect, "card":card, "traveler":traveler, "registrable_domain":domain,
-            "heading":custody_review_text(kind).0, "body":custody_review_text(kind).1});
+        let review = serde_json::json!({"card_effect":request.effect, "card":card, "traveler":traveler, "host":host});
         let origin = self.origin_for_surface(&prepared.contribution.surface)?;
         let contribution_digest = prepared
             .contribution

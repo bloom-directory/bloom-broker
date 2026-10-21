@@ -3363,7 +3363,7 @@ fn peer_acl(identity: &LocalIdentity, effective_uid: u32) -> PeerAcl {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn policy_service_requires_completion_then_commits_and_replays_over_authenticated_rpc() {
+async fn card_and_policy_services_complete_over_authenticated_rpc() {
     let authenticator = VirtualAuthenticator::generate();
     let directory = tempfile::tempdir().unwrap();
     let signer_database = directory.path().join("signer.sqlite");
@@ -3459,6 +3459,52 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         Arc::new(AcceptingCheckpointSink),
     )
     .unwrap();
+    // Exercise the card-specific BrokerSignerClient methods against the real
+    // Signer service over the authenticated Unix socket, including completion.
+    let card_broker = CeremonyBroker::new(Arc::new(signer_client.clone()));
+    let card_id = Token::new("socket-test-card").unwrap();
+    let card_add = card_broker
+        .prepare_card(
+            operation("c1"),
+            bloom_signer_api::CardEffect::Add {
+                card_id: card_id.clone(),
+                label: "Synthetic socket card".into(),
+            },
+            now_ms,
+        )
+        .unwrap();
+    let session = card_session_json(&card_broker, &card_add).await;
+    let card_auth = VirtualAuthenticator::generate_for_registration(
+        serde_json::from_value(session["webauthn_options"]["registration_user_handle"].clone())
+            .unwrap(),
+        "http://localhost:18734",
+    );
+    assert_eq!(card_approve(&card_broker, &card_add, &card_auth, serde_json::json!({
+        "credential_prf":Base64UrlBytes::from_bytes(&card_auth.deterministic_prf()),
+        "card":{"number":"4242424242424242","expiry_month":12,"expiry_year":2034,"name":"Synthetic Test"}
+    }), 1).await.0, StatusCode::OK);
+    assert_eq!(signer_client.card_list().unwrap()[0].card_id, card_id);
+    assert_eq!(
+        signer_client.card_status(&operation("c1")).unwrap().state,
+        bloom_signer_api::CardOperationState::Succeeded
+    );
+    let delete = signer_client
+        .prepare_card(
+            bloom_signer_api::CardPrepareRequest {
+                operation_id: operation("c2"),
+                surface: bloom_signer_api::legacy_local_surface(),
+                effect: bloom_signer_api::CardEffect::Delete { card_id },
+            },
+            now_ms,
+        )
+        .unwrap();
+    assert_eq!(delete.contribution.ceremony_kind, CeremonyKind::CardDelete);
+    assert_eq!(
+        signer_client.card_cancel(&operation("c2")).unwrap().state,
+        bloom_signer_api::CardOperationState::Cancelled
+    );
+    assert_eq!(signer_client.card_list().unwrap().len(), 1);
+    drop(card_broker);
     let authority = Arc::new(
         BrokerAuthority::open(
             &broker_authority_path,

@@ -1,4 +1,6 @@
 //! Public card requests. Checkout facts and recipient keys have no Machine RPC.
+//! Projections are nominal northbound types; `translation::cards` maps the
+//! Signer types explicitly, without coupling this API to Signer internals.
 use crate::{OperationId, Token};
 use serde::{Deserialize, Serialize};
 
