@@ -1841,11 +1841,16 @@ function createdWalletView(accounts, created = true) {
   document.getElementById("action-expiry").textContent = "";
   document.getElementById("ceremony-actions").hidden = true;
   document.getElementById("page-title").textContent = "Your wallet";
-  document.getElementById("page-lede").textContent = "Addresses and backup";
-  const parts = [el("p", {class: "summary"}, created ? "Your wallet was created and is protected by your passkey." : "Your public addresses and wallet backup."),
-    el("dl", {class: "facts"}, el("dt", {}, "Wallet"), el("dd", {}, accounts.wallet_id)),
-    el("h2", {class: "ceremony-section-title"}, "Your addresses")];
-  for (const account of accounts.accounts || []) {
+  document.getElementById("page-lede").textContent = "Wallet";
+  const protection = el("p", {class: "wallet-protection"}, el("span", {"aria-hidden": "true"}, "●"), " Passkey protected");
+  const addressGrid = el("div", {class: "wallet-address-grid"});
+  const parts = [el("div", {class: "wallet-intro"}, created ? el("p", {class: "wallet-name"}, accounts.wallet_id) : null, protection),
+    el("section", {class: "wallet-receive"},
+      el("div", {class: "wallet-section-heading"}, el("h2", {}, "Your addresses"), el("span", {}, "Receive assets")),
+      addressGrid)];
+  const sortedAccounts = [...(accounts.accounts || [])].sort((a, b) =>
+    Number(b.chain_projections?.[0]?.chain_family === "evm") - Number(a.chain_projections?.[0]?.chain_family === "evm"));
+  for (const account of sortedAccounts) {
     for (const chain of account.chain_projections || []) {
       const label = chain.chain_family === "evm" ? "Ethereum and EVM networks" : chain.chain_family === "solana" ? "Solana" : chain.chain_family;
       const copy = el("button", {type: "button", class: "secondary"}, "Copy address");
@@ -1853,10 +1858,13 @@ function createdWalletView(accounts, created = true) {
         try { await navigator.clipboard.writeText(chain.address); copy.textContent = "Copied"; }
         catch (_) { copy.textContent = "Select the address to copy"; }
       };
-      parts.push(el("section", {class: "ceremony-call-arguments"},
-        el("h3", {class: "ceremony-section-title"}, label),
-        el("p", {class: "ceremony-assurance"}, describeKey(account.key_ref).account.replace(/ \(m\/[^)]*\)$/, "") || "Initial account"),
-        el("p", {class: "ceremony-party-address"}, el("code", {}, chain.address)),
+      copy.className = "secondary wallet-copy";
+      addressGrid.append(el("section", {class: "wallet-address-card"},
+        el("div", {class: "wallet-network"},
+          el("span", {class: "wallet-network-icon", "aria-hidden": "true"}, reviewIcon(chain.chain_family === "evm" ? "ethereum" : chain.chain_family === "solana" ? "solana" : "unknown")),
+          el("div", {}, el("h3", {}, chain.chain_family === "evm" ? "Ethereum & EVM" : label),
+            el("p", {}, describeKey(account.key_ref).account.replace(/ \(m\/[^)]*\)$/, "") || "Initial account"))),
+        el("p", {class: "wallet-address"}, el("code", {}, chain.address)),
         copy));
     }
   }
@@ -1876,15 +1884,20 @@ function createdWalletView(accounts, created = true) {
         : "Could not open backup. Finish or cancel any pending wallet request, then try again.";
     }
   };
-  parts.push(el("section", {class: "ceremony-call-arguments"},
-    el("h2", {class: "ceremony-section-title"}, "Back up your wallet"),
-    el("p", {}, "Your passkey approves actions in Bloom. Your recovery phrase restores the wallet and its addresses in a compatible wallet, even if you lose the passkey."),
-    el("p", {}, "Keep the phrase offline in a safe place. Anyone with it can control the wallet. A fresh passkey approval is required to show it."),
-    el("div", {class: "result-actions"}, backup,
-      created ? el("a", {class: "ceremony-address-link", href: walletPageUrl(accounts.wallet_id)}, "Later — return to wallet") : null),
-    el("p", {class: "ceremony-assurance"}, "A backup is not confirmed by creating a wallet or skipping this step.")));
-  parts.push(el("p", {}, el("a", {href: walletPageUrl(accounts.wallet_id)}, "Bookmark this wallet page"), " to return to your addresses and backup."));
-  reviewNode.replaceChildren(...parts);
+  parts.push(el("section", {class: "wallet-backup"},
+    el("div", {class: "wallet-backup-copy"},
+      el("span", {class: "wallet-eyebrow"}, "Recovery"),
+      el("h2", {}, "Back up your wallet"),
+      el("p", {}, "Save your recovery phrase offline. It restores your wallet if you lose access to your passkey.")),
+    el("div", {class: "wallet-backup-actions"}, backup,
+      el("span", {}, "Requires your passkey"),
+      created ? el("a", {href: walletPageUrl(accounts.wallet_id)}, "Later — return to wallet") : null),
+    el("details", {class: "wallet-backup-details"},
+      el("summary", {}, "About your backup"),
+      el("p", {}, "Your passkey approves actions in Bloom. Your recovery phrase restores the wallet and its addresses in a compatible wallet. Anyone with the phrase can control the wallet; keep it private and offline."),
+      el("p", {}, "Your phrase is never shown automatically. Creating this wallet or choosing Later does not confirm a saved backup."))));
+  parts.push(el("p", {class: "wallet-footer"}, el("a", {href: walletPageUrl(accounts.wallet_id)}, "Keep this wallet page"), " — your addresses and backup are always here."));
+  reviewNode.replaceChildren(el("div", {class: "wallet-home"}, ...parts));
 }
 
 async function showCreatedWallet(session, recovery = null) {

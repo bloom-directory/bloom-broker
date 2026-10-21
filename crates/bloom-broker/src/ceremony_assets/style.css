@@ -200,6 +200,46 @@ textarea{resize:vertical}
 .ok{color:var(--ceremony-success)}
 .result-title{margin:0;font:400 24px var(--ceremony-font-display)}
 .result-actions{display:flex;align-items:center;flex-wrap:wrap;gap:var(--ceremony-space-2);margin-top:var(--ceremony-space-2)}
+.wallet-home{display:grid;gap:32px}
+.wallet-intro{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:-12px}
+.wallet-name{margin:0;font-size:18px;font-weight:600;overflow-wrap:anywhere}
+.wallet-protection{display:inline-flex;align-items:center;gap:6px;margin:0;color:var(--ceremony-success);font-size:13px}
+.wallet-protection span{font-size:8px}
+.wallet-section-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:14px}
+.wallet-section-heading h2{margin:0;font-size:16px;font-weight:600}
+.wallet-section-heading>span{font-size:13px;color:var(--ceremony-muted)}
+.wallet-address-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.wallet-address-card{min-width:0;padding:22px;border:1px solid var(--ceremony-border);border-radius:16px;background:var(--ceremony-surface);box-shadow:0 3px 12px #15130f04}
+.wallet-network{display:flex;align-items:center;gap:12px}
+.wallet-network-icon{display:flex;align-items:center;justify-content:center;width:42px;height:42px;flex:none;border-radius:13px;background:var(--ceremony-bg)}
+.wallet-network-icon svg,.wallet-network-icon img{width:28px;height:28px}
+.wallet-network h3{margin:0;font-size:16px;font-weight:600}
+.wallet-network p{margin:2px 0 0;font-size:12px;color:var(--ceremony-muted)}
+.wallet-address{margin:22px 0 18px;overflow-wrap:anywhere;user-select:all}
+.wallet-address code{font:13px/1.8 var(--ceremony-font-mono)}
+button.wallet-copy{width:100%;min-height:40px;border-radius:9px;font-size:13px;background:var(--ceremony-bg)}
+.wallet-backup{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:20px 28px;padding:26px;border:1px solid #8a2a3a20;border-radius:16px;background:linear-gradient(120deg,#f8f0ed,var(--ceremony-surface))}
+.wallet-eyebrow{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--ceremony-accent)}
+.wallet-backup h2{margin:5px 0 8px;font-size:23px;font-weight:600;letter-spacing:-.025em}
+.wallet-backup-copy>p{max-width:40ch;margin:0;font-size:14px;line-height:1.7;color:var(--ceremony-muted)}
+.wallet-backup-actions{display:flex;flex-direction:column;justify-content:center;align-items:center;gap:8px}
+.wallet-backup-actions button{box-shadow:0 3px 8px #8a2a3a12}
+.wallet-backup-actions>span,.wallet-backup-actions>a{font-size:12px;color:var(--ceremony-muted)}
+.wallet-backup-details{grid-column:1/-1;padding-top:15px;border-top:1px solid #8a2a3a18;font-size:13px;color:var(--ceremony-muted)}
+.wallet-backup-details summary{cursor:pointer}
+.wallet-backup-details p{max-width:65ch;margin:12px 0 0}
+.wallet-footer{margin:0;text-align:center;font-size:12px;color:var(--ceremony-muted)}
+.wallet-home a{color:var(--ceremony-accent);text-decoration-color:var(--ceremony-border);text-underline-offset:3px}
+@media(max-width:600px){
+  .wallet-home{gap:24px}
+  .wallet-address-grid{grid-template-columns:1fr;gap:12px}
+  .wallet-address-card{padding:20px}
+  .wallet-intro{align-items:flex-start;flex-direction:column;gap:8px}
+  .wallet-backup{grid-template-columns:1fr;padding:22px;gap:18px}
+  .wallet-backup-actions{align-items:stretch;text-align:center}
+  .wallet-backup-details{grid-column:1}
+  .wallet-footer{line-height:1.8}
+}
 .words{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:var(--ceremony-space-1);margin:0;padding:0;list-style:none;counter-reset:w}
 .words li{display:flex;gap:var(--ceremony-space-1);align-items:baseline;padding:10px 12px;border:1px solid var(--ceremony-border);border-radius:8px;font:15px var(--ceremony-font-mono)}
 .words li::before{counter-increment:w;content:counter(w);min-width:1.6em;color:var(--ceremony-muted);font-size:13px}
