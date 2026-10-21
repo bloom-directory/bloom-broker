@@ -1423,6 +1423,15 @@ function renderReview(session) {
   };
   const decision = [];
   const evidence = [];
+  if (kind === "sealed_approval" && transfer && keyInfo.account) {
+    // Account selection comes from the Signer key reference, not guest text.
+    // Keep the complete derivation in technical facts while naming the
+    // numbered account before any potentially long call arguments.
+    const accountLabel = keyInfo.account.replace(/ \(m\/[^)]*\)$/, "");
+    decision.push(el("dl", {class: "facts ceremony-account"},
+      el("dt", {}, "Signing account"),
+      el("dd", {}, [walletName, accountLabel].filter(Boolean).join(" · "))));
+  }
   if (transfer?.tokenAsset) {
     decision.push(assetCard(transfer.tokenAsset));
   }

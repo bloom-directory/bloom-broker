@@ -1378,6 +1378,10 @@ for (const [name, expected] of [
   renderReview(preview);
   const text = [nodes["panel-title"], nodes.review].map(allText).join(" ");
   for (const field of expected) if (!text.includes(field)) throw new Error(`${{name}} omitted ${{field}}`);
+  const primary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+  if (!primary.includes("Signing account") || !primary.includes("EVM account 1")) {{
+    throw new Error(`${{name}} hides the numbered signing account inside technical details`);
+  }}
 }}
 
 // A batch member Bloom could not read is never shown as a plain send, and a
