@@ -1371,6 +1371,7 @@ for (const amount of ["25 USDC", "0 USDC", "115792089237316195423570985008687907
 
 // Decoder-backed PM80 examples must retain the scope that the owner reviews.
 for (const [name, expected] of [
+  ["enso-swap", ["0.001 ETH", "2.985 USDC", "Receiver"]],
   ["enso-output", ["2.5 USDC", "1.25 USDC", "Output receiver"]],
   ["enso-shortcut", ["Encoded command 1", "Encoded command 2", "runtime"]],
   ["enso-allowance", ["Spending limit", "2.5 USDC", "Spender"]],
@@ -1407,10 +1408,27 @@ if (!walk(nodes.review).some(node => node.href === "https://basescan.org/token/0
   throw new Error("Token card does not link to the token explorer page");
 }}
 renderReview(previewSession("enso-output"));
+for (const empty of [false, true]) {{
+  const noMinimum = structuredClone(PREVIEW_PM80_READINGS["enso-output"]);
+  noMinimum.fields = noMinimum.fields.filter(field => !empty || !field.label.startsWith("Requested minimum balance increase"));
+  if (!empty) noMinimum.fields.find(field => field.label.startsWith("Requested minimum balance increase")).raw = "0x" + "0".repeat(128);
+  if (ensoHasMinimum(noMinimum) || callIntent(noMinimum).heading.includes("swap")) throw new Error("Empty or zero output checks falsely protected");
+}}
 const outputCard = nodes.review.children.find(node => allText(node).includes("1.25 USDC"));
 if (!outputCard || !allText(outputCard).includes("not guaranteed received") ||
     walk(outputCard).some(node => String(node.className).includes("outgoing"))) {{
   throw new Error("Enso requested output is presented as money leaving or guaranteed receipt");
+}}
+const unknownOutput = previewSession("enso-output");
+const unknownPlan = JSON.parse(unknownOutput.review_manifest.canonical_plan);
+const unknownMinimum = unknownPlan.evm_review.payloads[0].contract_call.fields.find(field => field.label === "Requested minimum balance increase");
+delete unknownMinimum.asset;
+unknownMinimum.value = "7 raw units of an unverified token";
+unknownOutput.review_manifest.canonical_plan = JSON.stringify(unknownPlan);
+renderReview(unknownOutput);
+const unknownPrimary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+if (!unknownPrimary.includes("7 raw units") || !unknownPrimary.includes("Token identity and decimals are unverified") || unknownPrimary.includes("7 USDC")) {{
+  throw new Error("Unknown Enso output was hidden or borrowed an identified token's units");
 }}
 renderReview(previewSession("safe-token-transfer"));
 const safeFlow = nodes.review.children.find(node => String(node.className).includes("ceremony-transfer-path"));
@@ -1424,7 +1442,8 @@ if (!nodes["panel-title"].textContent.includes("Enso Router V2") || !allText(nod
 if (catalogPartyName("123456", PREVIEW_PM80_READINGS["enso-output"].contract)) throw new Error("Enso label leaked onto an unlisted chain");
 renderReview(previewSession("enso-shortcut"));
 const shortcutPrimary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
-if (!shortcutPrimary.includes("Send 2.5 USDC") || !shortcutPrimary.includes("Details depend on earlier calls") || shortcutPrimary.includes("selector 0xa9059cbb") ||
+if (!shortcutPrimary.includes("No output protection") || !shortcutPrimary.includes("cannot be determined before execution") || shortcutPrimary.includes("selector 0xa9059cbb") ||
+    shortcutPrimary.includes("Send 2.5 USDC") || shortcutPrimary.includes("Called contract") ||
     shortcutPrimary.includes("0 raw native units") || shortcutPrimary.includes("Execution mode") || shortcutPrimary.includes("Call details")) {{
   throw new Error("Enso shortcut still dumps encoded commands instead of their bounded reading");
 }}
@@ -1446,7 +1465,7 @@ programField.value = JSON.stringify(program);
 riskyShortcut.review_manifest.canonical_plan = JSON.stringify(riskyPlan);
 renderReview(riskyShortcut);
 const unreadPrimary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
-if (!unreadPrimary.includes("Call Bloom cannot interpret") || unreadPrimary.includes("Details depend on earlier calls")) {{
+if (!unreadPrimary.includes("Bloom cannot interpret every call") || unreadPrimary.includes("cannot be determined before execution")) {{
   throw new Error("An undecodable static call was falsely labelled runtime-dependent");
 }}
 for (const token of {tokens}) {{

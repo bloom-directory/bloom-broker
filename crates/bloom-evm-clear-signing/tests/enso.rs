@@ -37,6 +37,56 @@ fn review(bytes: &[u8], value: u64) -> Result<ClearSignedCall, ReviewError> {
 }
 
 #[test]
+fn petal_protected_swap_is_independently_decoded() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/enso/petal-protected-swap.json")).unwrap();
+    let tx = &fixture["transaction"];
+    let bytes = hex::decode(tx["data_hex"].as_str().unwrap().trim_start_matches("0x")).unwrap();
+    let call = review(&bytes, tx["value_wei"].as_str().unwrap().parse().unwrap()).unwrap();
+    assert_eq!(
+        field(&call, "Source asset / amount").value,
+        "0.001 ETH (transaction value)"
+    );
+    assert_eq!(
+        field(&call, "Requested minimum balance increase")
+            .asset
+            .as_ref()
+            .unwrap()
+            .amount_display,
+        "2.985 USDC"
+    );
+    assert_eq!(
+        field(&call, "Output receiver").value.to_lowercase(),
+        fixture["sender"].as_str().unwrap().to_lowercase()
+    );
+    export_ui_fixture("enso-swap", &call);
+    let app = include_str!("../../bloom-broker/src/ceremony_assets/app.js");
+    let source = app
+        .split_once("const PREVIEW_ENSO_PETAL_SWAP = ")
+        .unwrap()
+        .1
+        .trim_start()
+        .split_once("\n};")
+        .unwrap()
+        .0;
+    let source: serde_json::Value = serde_json::from_str(&format!("{source}\n}}")).unwrap();
+    assert_eq!(source, fixture, "UI must preserve the Petal output bytes");
+    let readings = app
+        .split_once("const PREVIEW_PM80_READINGS = ")
+        .unwrap()
+        .1
+        .split_once("\n};")
+        .unwrap()
+        .0;
+    let readings: serde_json::Value = serde_json::from_str(&format!("{readings}\n}}")).unwrap();
+    assert_eq!(
+        readings["enso-swap"],
+        serde_json::to_value(&call).unwrap(),
+        "UI preview must match the independent decoder"
+    );
+}
+
+#[test]
 fn source_amount_and_identity_are_read_but_shortcut_effects_stay_unverified() {
     let bytes = encode(SINGLE, input(USDC, 2_500_000));
     let call = review(&bytes, 0).unwrap();

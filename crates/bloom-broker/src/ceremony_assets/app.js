@@ -368,6 +368,11 @@ function reviewCallFields(call) {
 function shapeOnly(call) {
   return Boolean(call?.intent_summary && !call.intent_summary.token);
 }
+function ensoHasMinimum(call) {
+  return call.function_signature.startsWith("safeRoute") && (call.fields || []).some(field =>
+    /^Requested minimum balance increase(?: \d+)?$/.test(field.label) &&
+    /^0x(?:[a-f0-9]{64}){1,2}$/i.test(field.raw) && BigInt("0x" + field.raw.slice(-64)) > 0n);
+}
 // Headings describe the requested call. None of them promise an outcome:
 // Bloom has not executed anything, and a passkey response is an approval,
 // not a settlement.
@@ -377,12 +382,12 @@ function callIntent(call, chainId) {
     const fields = Object.fromEntries((call?.fields || []).map(field => [field.label, field.value]));
     const signature = String(call?.function_signature || "");
     if (call.contract_name === "Enso Router V2") {
-      if (signature.startsWith("safeRoute")) {
-        return {action: "call", eyebrow: "Enso route checks", heading: "Review Enso route checks",
-          detail: "Review the source amount and where the output should go. The minimum below is a requested balance check, not a guaranteed return. Shortcut effects, fees and received funds remain unverified.", relation: "calls"};
+      if (ensoHasMinimum(call)) {
+        return {action: "call", eyebrow: "Enso", heading: "Review Enso swap",
+          detail: "The signed call requests a minimum balance increase at the receiver. Router V2 checks it during execution and reverts if it is not met. This is not a quote or proof of receipt.", relation: "calls"};
       }
       return {action: "call", eyebrow: "Enso calls", heading: "Review Enso calls",
-        detail: "This request does not protect what you receive: it sets no output token, recipient or minimum return. The calls below are instructions, not confirmed transfers.", relation: "calls"};
+        detail: "", relation: "calls"};
     }
     if (call.contract_name?.startsWith("Privacy Pools")) {
       return {action: "call", eyebrow: "Privacy Pools", heading: signature.startsWith("withdraw(")
@@ -1455,7 +1460,9 @@ function renderReview(session) {
   };
   const decision = [];
   const evidence = [];
-  if (kind === "sealed_approval" && transfer && keyInfo.account) {
+  let outputWarning = null;
+  const accountName = [walletName, keyInfo.account?.replace(/ \(m\/[^)]*\)$/, "")].filter(Boolean).join(" · ");
+  if (kind === "sealed_approval" && transfer && keyInfo.account && !transfer.parties?.some(party => party.role === "source")) {
     // Account selection comes from the Signer key reference, not guest text.
     // Keep the complete derivation in technical facts while naming the
     // numbered account before any potentially long call arguments.
@@ -1527,6 +1534,19 @@ function renderReview(session) {
       if (!call || call.intent_summary) continue;
       const protocolDetails = call.contract_name?.startsWith("Privacy Pools") || call.contract_name === "Enso Router V2";
       const argumentsList = el("dl", {class: "facts"});
+      const enso = call.contract_name === "Enso Router V2";
+      const execution = [];
+      const unknownEffects = [];
+      if (enso) {
+        if (!ensoHasMinimum(call)) {
+          outputWarning = el("aside", {class: "ceremony-warning", "aria-label": "No output protection"},
+            el("strong", {}, "No output protection"),
+            el("p", {}, call.function_signature.startsWith("safeRoute")
+              ? "This request sets no positive output minimum. You may spend the input without receiving the expected output."
+              : "This request sets no output token, receiver or minimum return. You may spend the input without receiving the expected output."));
+        }
+        evidence.push(el("p", {}, call.warnings?.join(" ") || call.assurance));
+      }
       let argumentCount = 0;
       let shortcut;
       if (call.contract_name === "Enso Router V2") {
@@ -1534,7 +1554,7 @@ function renderReview(session) {
       }
       for (const field of reviewCallFields(call)) {
         if (technicalCallField(call, field)) continue;
-        if (call.contract_name === "Enso Router V2" && field.label === "Native value" && field.raw === "0") {
+        if (enso && field.label === "Native value") {
           evidence.push(el("p", {}, `${field.label}: ${field.value}`));
           continue;
         }
@@ -1555,6 +1575,8 @@ function renderReview(session) {
               value: summary.counterparty, chainId: payload.chain_id}));
           }
           if (!reading) {
+            unknownEffects.push(runtimeDependent ? "Some call effects depend on earlier results and cannot be determined before execution."
+              : "Bloom cannot interpret every call in this route.");
             section.append(el("p", {}, runtimeDependent
               ? "Bloom cannot determine the exact arguments of this call before execution."
               : "The call data is available, but Bloom cannot explain this instruction. Its bytes and decoding reason are in technical details."));
@@ -1562,11 +1584,15 @@ function renderReview(session) {
           if (!reading || step.target.toLowerCase() !== reading.contract.toLowerCase()) {
             section.append(partyRow({role: "contract", label: "Called contract", value: step.target, chainId: payload.chain_id}));
           }
-          if (step.call_type !== "CALL") section.append(el("p", {}, `Execution mode: ${step.call_type}`));
+          if (step.call_type !== "CALL") {
+            section.append(el("p", {}, `Execution mode: ${step.call_type}`));
+            decision.push(el("aside", {class: "ceremony-warning"}, `Route includes ${step.call_type} execution.`));
+          }
           if (step.native_value !== "0 raw native units") {
             section.append(el("p", {}, `Native value: ${step.native_value}`));
+            decision.push(el("p", {}, `Additional instruction value: ${step.native_value}`));
           }
-          decision.push(section);
+          execution.push(section);
           evidence.push(el("p", {}, `${field.label}: ${field.value}. Execution mode: ${step.call_type}. Native value: ${step.native_value}`));
           continue;
         }
@@ -1574,8 +1600,8 @@ function renderReview(session) {
           const asset = field.asset;
           decision.push(assetCard({chainId: String(asset.chain_id), address: asset.token.address,
             title: asset.token.name, subtitle: asset.token.symbol,
-            amount: asset.amount_display, amountLabel: field.label === "Requested minimum balance increase"
-              ? "Minimum requested · not guaranteed received" : field.label,
+            amount: asset.amount_display, amountLabel: enso && /^Source asset/.test(field.label) ? "You pay"
+              : /^Requested minimum balance increase/.test(field.label) ? "Minimum requested · not guaranteed received" : field.label,
             tone: call.contract_name === "Enso Router V2" && /^Source asset/.test(field.label) ? "outgoing" : "neutral"}));
           continue;
         }
@@ -1586,7 +1612,21 @@ function renderReview(session) {
           decision.push(assetCard({native: ether ? "ethereum" : "token",
             title: ether ? "Ether" : "Native asset",
             amount: String(field.value).replace(/ \((transaction value|minimum balance increase)\)$/, ""),
-            amountLabel: field.label, tone: /^Source asset/.test(field.label) ? "outgoing" : "neutral"}));
+            amountLabel: enso && /^Source asset/.test(field.label) ? "You pay" : field.label,
+            tone: /^Source asset/.test(field.label) ? "outgoing" : "neutral"}));
+          continue;
+        }
+        if (enso && field.label === "Output receiver") {
+          const self = field.value.toLowerCase() === String(payload.sender).toLowerCase();
+          decision.push(partyRow({role: "recipient", label: self ? "Receiver · Signing account" : "Receiver",
+            name: self ? accountName : null, value: field.value, chainId: payload.chain_id}));
+          continue;
+        }
+        if (enso && field.format === "tokenAmount" && !field.asset?.token) {
+          decision.push(el("section", {class: "ceremony-call-arguments"},
+            el("h2", {class: "ceremony-section-title"}, field.label),
+            el("p", {}, "Token identity and decimals are unverified."),
+            el("code", {}, field.value)));
           continue;
         }
         const explorer = addressExplorer(payload.chain_id, field.value);
@@ -1595,13 +1635,20 @@ function renderReview(session) {
         argumentsList.append(el("dt", {}, field.label), el("dd", {}, value));
         argumentCount++;
       }
-      if (argumentCount || call.contract_name !== "Enso Router V2") decision.push(el("section", {class: "ceremony-call-arguments"},
+      if (enso) {
+        if (!shortcut?.steps?.length) unknownEffects.push("Shortcut effects are not independently verified.");
+        decision.push(el("p", {class: "ceremony-assurance"}, [...new Set(unknownEffects), "Fees and final receipt remain unverified."].join(" ")));
+        if (execution.length) evidence.push(el("details", {class: "ceremony-details"},
+          el("summary", {}, "Execution details"), ...execution));
+      }
+      if (argumentCount || !enso) (enso ? evidence : decision).push(el("section", {class: "ceremony-call-arguments"},
         el("h2", {class: "ceremony-section-title"}, transfer.payloads.length > 1 ? `Transaction ${index + 1} arguments` : protocolDetails ? "Call details" : "Function arguments"),
         protocolDetails ? null : el("code", {class: "ceremony-function"}, call.function_signature),
         argumentsList));
     }
     if (transfer.warnings?.length) {
-      primaryWarnings.push(...transfer.warnings);
+      const enso = transfer.payloads?.some(payload => payload.contract_call?.contract_name === "Enso Router V2");
+      if (!enso) primaryWarnings.push(...transfer.warnings);
     }
     for (const card of transfer.intent.cards || []) {
       const unlimited = card.magnitude === "unlimited";
@@ -1633,14 +1680,19 @@ function renderReview(session) {
     }
     if (transfer.parties?.length) {
       const isTransfer = ["transfer", "send"].includes(transfer.intent.action);
+      const enso = transfer.payloads?.some(payload => payload.contract_call?.contract_name === "Enso Router V2");
       const parties = [...transfer.parties].filter(party =>
-        transfer.intent.action === "batch" ? party.role === "source" : party !== token).sort((a, b) =>
+        (transfer.intent.action === "batch" ? party.role === "source" : party !== token) && !(enso && party.role === "contract") &&
+        !(enso && party.role === "source" && transfer.payloads.some(payload => payload.contract_call?.fields?.some(field =>
+          field.label === "Output receiver" && field.value.toLowerCase() === String(party.value).toLowerCase())))).sort((a, b) =>
           Number(b.role === "spender") - Number(a.role === "spender"));
       const movement = isTransfer && transfer.assetSummary?.action === "transfer"
         ? transfer.assetSummary.amount_display : null;
       decision.push(partyFlow(parties.map(party => ({...party,
           name: catalogPartyName(party.chainId, party.value) || party.name,
-          ...(party.role === "source" ? {label: isTransfer ? "Sender" : "Your wallet", name: walletName} : {})})), movement, isTransfer));
+          ...(party.role === "source" ? {label: isTransfer ? "Sender" : "Signing account", name: accountName} : {})})), movement, isTransfer));
+      if (enso) evidence.push(partyRow({role: "contract", label: "Contract called", name: "Enso Router V2",
+        value: transfer.payloads[0].destination, chainId: transfer.chainId}));
     }
     for (const [index, payload] of (transfer.payloads || []).entries()) {
       if (!payload.calldata_keccak) continue;
@@ -1663,7 +1715,7 @@ function renderReview(session) {
     const amount = exact ? el("span", {class: "ceremony-fee-amount"},
       reviewIcon(exact.endsWith(" ETH") ? "ethereum" : "token"),
       el("span", {}, `Up to ${compactFeeCap(exact)}`))
-      : el("span", {}, "Cannot be shown for this network");
+      : el("span", {}, "Not available in this review");
     decision.push(el("div", {class: "ceremony-fee", "aria-label": "Execution gas only; other network charges may apply"},
       el("span", {class: "ceremony-fee-label"}, label), amount));
   }
@@ -1712,10 +1764,16 @@ function renderReview(session) {
         el("p", {}, [...new Set(primaryWarnings.filter(Boolean))].join(" ")))
     : null;
   const primary = [];
+  if (outputWarning) primary.push(outputWarning);
   if (summaryHtml) primary.push(el("p", {class: "summary", html: summaryHtml}));
   const hero = decision.filter(node => String(node.className || "").includes("ceremony-asset"));
   const rest = decision.filter(node => !String(node.className || "").includes("ceremony-asset"));
-  primary.push(...hero, ...rest);
+  const enso = transfer?.payloads?.some(payload => payload.contract_call?.contract_name === "Enso Router V2");
+  hero.forEach((card, index) => {
+    if (enso && index) primary.push(el("div", {class: "ceremony-flow-arrow", "aria-hidden": "true"}, "↓"));
+    primary.push(card);
+  });
+  primary.push(...rest);
   if (warning) primary.push(warning);
   reviewNode.replaceChildren(...primary,
     el("details", {class: "ceremony-details ceremony-evidence"},
@@ -2584,8 +2642,93 @@ function previewSafeTransaction(action, extra = {}) {
   session.review_manifest.canonical_plan = JSON.stringify(plan);
   return session;
 }
+// Exact public output of the Petal's deterministic protected-swap test.
+// The shortcut is mocked; this is not an executable venue quote.
+const PREVIEW_ENSO_PETAL_SWAP = {
+  "chain_id": 8453,
+  "provenance": "Enso Petal protected_swap_ceremony_fixture; mocked 3 USDC quote; no execution or settlement evidence",
+  "sender": "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+  "transaction": {
+    "approve_spender": null,
+    "approve_token": null,
+    "chain": "base",
+    "data_hex": "0x21025a0600000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000100000000000000000000000000742d35cc6634c0532925a3b844bc9e7595f0beb100000000000000000000000000000000000000000000000000000000000001a000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000038d7ea4c68000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000040000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda0291300000000000000000000000000000000000000000000000000000000002d8c280000000000000000000000000000000000000000000000000000000000000000",
+    "label": "route",
+    "to": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+    "value_wei": "1000000000000000"
+  }
+};
 // Public decoder fixtures exported by the existing Enso and Polymarket tests.
 const PREVIEW_PM80_READINGS = {
+  "enso-swap":
+  {
+    "contract": "0xF75584eF6673aD213a685a1B58Cc0330B8eA22Cf",
+    "contract_name": "Enso Router V2",
+    "function_signature": "safeRouteSingle((uint8 tokenType,bytes data) tokenIn,(uint8 tokenType,bytes data) tokenOut,address receiver,bytes data)",
+    "selector": "0x21025a06",
+    "action": "other",
+    "intent": "Route through Enso with requested output balance-increase checks; shortcut effects remain unverified",
+    "fields": [
+      {
+        "label": "Native value",
+        "format": "amount",
+        "value": "0.001 ETH",
+        "raw": "1000000000000000"
+      },
+      {
+        "label": "Input token type",
+        "format": "raw",
+        "value": "0",
+        "raw": "0"
+      },
+      {
+        "label": "Source asset / amount",
+        "format": "nativeAmount",
+        "value": "0.001 ETH (transaction value)",
+        "raw": "0x00000000000000000000000000000000000000000000000000038d7ea4c68000"
+      },
+      {
+        "label": "Output token type",
+        "format": "raw",
+        "value": "1",
+        "raw": "1"
+      },
+      {
+        "label": "Requested minimum balance increase",
+        "format": "tokenAmount",
+        "value": "2.985 USDC (0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913)",
+        "raw": "0x000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda0291300000000000000000000000000000000000000000000000000000000002d8c28",
+        "asset": {
+          "chain_id": 8453,
+          "token": {
+            "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "symbol": "USDC",
+            "name": "USD Coin",
+            "decimals": 6
+          },
+          "amount_display": "2.985 USDC"
+        }
+      },
+      {
+        "label": "Output receiver",
+        "format": "addressName",
+        "value": "0x742d35cC6634c0532925A3b844bc9E7595F0beB1",
+        "raw": "0x742d35cC6634c0532925A3b844bc9E7595F0beB1"
+      },
+      {
+        "label": "Shortcut program",
+        "format": "ensoShortcut",
+        "value": "Undecoded shortcut: unknown shortcut entry-point selector",
+        "raw": "0x"
+      }
+    ],
+    "assurance": "Interpreted using Bloom's contract descriptions, but this call reaches a contract Bloom has not identified. Bloom has not verified what that contract is or what it does.",
+    "structural": true,
+    "warnings": [
+      "Shortcut program not independently decoded: unknown shortcut entry-point selector. Exact bytes are retained.",
+      "Enso inputs, requested output minimums and receiver are decoded from calldata. These are requested balance-increase checks, not proof of received funds. Shortcut commands and constant calls are read in technical details; runtime return values, code, intermediate effects, fees and settlement are not verified."
+    ]
+  },
   "enso-output": {
     "contract": "0xF75584eF6673aD213a685a1B58Cc0330B8eA22Cf",
     "contract_name": "Enso Router V2",
@@ -3007,6 +3150,19 @@ async function renderTokenCatalog() {
   render();
 }
 const PREVIEWS = {
+  "enso-swap": () => {
+    const call = PREVIEW_PM80_READINGS["enso-swap"];
+    const tx = PREVIEW_ENSO_PETAL_SWAP.transaction;
+    const session = previewAccountOne(previewApproval([previewPayload({
+      sender: PREVIEW_ENSO_PETAL_SWAP.sender, chain_id: String(PREVIEW_ENSO_PETAL_SWAP.chain_id),
+      destination: tx.to, contract_call: call, value: tx.value_wei, value_display: "0.001 ETH",
+      calldata_hex: tx.data_hex, calldata_bytes: String((tx.data_hex.length - 2) / 2),
+      calldata_keccak: undefined, payload_keccak: undefined,
+      maximum_execution_gas_fee_display: undefined, fee: undefined
+    })], {...previewClearSigning(), entries: []}));
+    session.preview_status = "Petal-generated protected swap · Mock quote · Not a live request";
+    return session;
+  },
   "enso-output": () => previewDecodedEnso("enso-output"),
   "enso-shortcut": () => previewDecodedEnso("enso-shortcut"),
   "enso-source": () => previewDecodedEnso("enso-source"),
@@ -3252,6 +3408,8 @@ async function load() {
         el("li", {}, el("a", {href: "/preview/tokens"}, "Browse every compiled token · searchable transfer previews")),
         ...Object.keys(PREVIEWS).map(key =>
           el("li", {}, el("a", {href: `/preview/${key}`}, ({
+            "enso-swap": "Enso protected swap · Petal-generated calldata · Start here",
+            "enso-shortcut": "Enso edge case · No output protection · Runtime-dependent calls",
             "transfer-ethereum": "USDC transfer · Ethereum · ordinary wallet",
             "transfer-dai": "DAI transfer · Ethereum · ordinary wallet",
             "native-send": "Ether transfer · Base · ordinary wallet",

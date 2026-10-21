@@ -29,7 +29,7 @@ try {
       }
       return route.continue();
     });
-    const cases = ["enso-shortcut", "enso-output", "enso-allowance", "polymarket-order",
+    const cases = ["enso-swap", "enso-shortcut", "enso-output", "enso-allowance", "polymarket-order",
       "safe-token-transfer", "transfer-dai", "structural-transfer", "catalog-wbtc"];
     for (const name of cases) {
       await page.goto(new URL(`/preview/${name === "catalog-wbtc" ? "tokens" : name}`, base).href);
@@ -39,6 +39,18 @@ try {
       }
       await page.locator("#preview-banner").waitFor({state: "visible"});
       await page.waitForFunction(() => document.querySelector("#status").textContent !== "Loading…");
+      if (name === "enso-shortcut") {
+        await page.getByRole("complementary", {name: "No output protection"}).waitFor();
+        if (await page.getByText("Execution details", {exact: true}).isVisible()) {
+          throw new Error("Execution mechanics escaped the collapsed technical section");
+        }
+      }
+      if (name === "enso-swap") {
+        await page.getByText("2.985 USDC", {exact: true}).waitFor();
+        if (await page.getByRole("complementary", {name: "No output protection"}).count()) {
+          throw new Error("Positive protected minimum shown as unprotected");
+        }
+      }
       const images = await page.evaluate(async () => Promise.all([...document.images].map(async image => {
         try { await image.decode(); } catch (_) {}
         return {src: image.currentSrc || image.src, loaded: image.naturalWidth > 0};
@@ -61,6 +73,7 @@ try {
         reports.push({name, width, expanded, screenshot, images});
       }
       if (await page.locator("#approve").isVisible()) throw new Error("Preview exposes approval controls");
+      if (await page.locator("#cancel").isVisible()) throw new Error("Preview exposes cancellation controls");
     }
     if (external.length || errors.length) throw new Error(JSON.stringify({external, errors}));
     await context.close();
