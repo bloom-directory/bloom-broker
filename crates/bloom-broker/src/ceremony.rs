@@ -4007,6 +4007,9 @@ async fn token_image(
     if broker.validate_served_host(&headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
+    if let Some(image) = crate::token_artwork::image(&name) {
+        return ([(header::CONTENT_TYPE, "image/png")], image).into_response();
+    }
     let asset = match name.as_str() {
         "usdc.svg" => include_str!("ceremony_assets/tokens/usdc.svg"),
         "dai.svg" => include_str!("ceremony_assets/tokens/dai.svg"),

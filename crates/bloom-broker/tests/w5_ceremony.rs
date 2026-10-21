@@ -7894,6 +7894,7 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
     }
     for name in [
         "unknown.svg",
+        "0000000000000000000000000000000000000000000000000000000000000000.png",
         "usdc.svg.bak",
         "style.css",
         "..%2Fstyle.css",
@@ -7914,6 +7915,45 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
             refused.status(),
             StatusCode::NOT_FOUND,
             "{name} must not resolve through the token artwork route"
+        );
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../src/ceremony_assets/tokens/artwork.json")).unwrap();
+    let pngs: std::collections::BTreeSet<_> = manifest["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["file"].as_str().filter(|name| name.ends_with(".png")))
+        .collect();
+    for name in pngs {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assets/tokens/{name}"))
+                    .header(header::HOST, "localhost:18734")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "missing bundled PNG {name}"
+        );
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let expected = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/ceremony_assets/tokens/generated")
+                .join(name),
+        )
+        .unwrap();
+        assert_eq!(
+            bytes.as_ref(),
+            expected.as_slice(),
+            "wrong bundled PNG {name}"
         );
     }
     let wrong_host_artwork = app
