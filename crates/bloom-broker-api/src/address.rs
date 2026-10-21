@@ -663,17 +663,24 @@ mod tests {
 
     /// Decoding widens what matches; it must never narrow it. Chains this
     /// build cannot decode, and placeholder spellings that are not addresses
-    /// at all, have to keep comparing exactly as they did before.
+    /// at all, have to keep comparing exactly as they did before, letter case
+    /// included: folding case here would widen every entry on a chain whose
+    /// rule this build does not know, which may spell data in case.
     #[test]
     fn undecodable_entries_still_compare_by_exact_spelling() {
         for (chain_name, text) in [
-            ("localnet", "whatever-this-is"),
-            ("ethereum", "0xrecipient"),
+            ("localnet", "Whatever-This-Is"),
+            ("ethereum", "0xRecipient"),
         ] {
             let c = chain(chain_name);
             assert!(matches!(comparable(&c, text), Comparable::Literal(_)));
             assert_eq!(comparable(&c, text), comparable(&c, text));
             assert_ne!(comparable(&c, text), comparable(&c, "something-else"));
+            assert_ne!(
+                comparable(&c, text),
+                comparable(&c, &text.to_ascii_lowercase()),
+                "an undecodable {chain_name} entry must not match another spelling"
+            );
         }
     }
 

@@ -524,8 +524,9 @@ impl BrokerAuthority {
         // up without the authority state it was supposed to carry over. Any
         // other error (a permission problem, an unreadable mount) fails here
         // for the same reason. An entry that is present is opened without the
-        // create flag, so a dangling or disappearing target fails startup
-        // instead of silently becoming an empty store.
+        // create flag, and the migration attaches it the same way, so a
+        // dangling or disappearing target fails startup instead of silently
+        // becoming an empty store.
         let legacy_path = path.as_ref();
         let legacy = match std::fs::symlink_metadata(legacy_path) {
             Ok(_) => Some(
@@ -3865,6 +3866,23 @@ fn petal_payload_batch_digest(payloads: &[Vec<u8>]) -> Digest32 {
     Digest32::from_bytes(digest.finalize().into())
 }
 
+/// A `file:` URI that opens `path` read-write but never creates it. SQLite
+/// decodes `%HH` in a URI path and starts the query and fragment at `?` and
+/// `#`, so those three are escaped; everything else is taken literally.
+fn legacy_attach_uri(path: &str) -> String {
+    let mut uri = String::from("file:");
+    for character in path.chars() {
+        match character {
+            '%' => uri.push_str("%25"),
+            '?' => uri.push_str("%3f"),
+            '#' => uri.push_str("%23"),
+            other => uri.push(other),
+        }
+    }
+    uri.push_str("?mode=rw");
+    uri
+}
+
 // AC-18 requires Broker authority effects and the Broker audit record to share
 // one SQLite commit. Older packages stored authority tables in a second file.
 // On first open, copy that file into the journal database and record the source
@@ -3915,7 +3933,14 @@ fn migrate_legacy_authority(
     if migrated {
         return Ok(());
     }
-    target.execute("ATTACH DATABASE ?1 AS authority_legacy", [&legacy_path])?;
+    // The journal connection creates missing databases, so attaching the
+    // plain path would turn a legacy store that disappeared since it was
+    // opened into an empty file, and the next start would read that file as a
+    // home with nothing to migrate. Attach it without the create flag instead.
+    target.execute(
+        "ATTACH DATABASE ?1 AS authority_legacy",
+        [legacy_attach_uri(&legacy_path)],
+    )?;
     journal.verify_migration_target(target)?;
     let migration = (|| -> Result<(), AuthorityError> {
         let transaction = target.transaction()?;
@@ -4811,5 +4836,68 @@ mod path_index_tests {
             "m/44'/501'/1'/0'",
             Some(0),
         ));
+    }
+}
+
+#[cfg(test)]
+mod legacy_attach_tests {
+    use super::*;
+    use crate::journal::AuditSigner;
+
+    struct TestAuditSigner;
+
+    impl AuditSigner for TestAuditSigner {
+        fn key_id(&self) -> Token {
+            Token::new("broker-audit-test").unwrap()
+        }
+
+        fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String> {
+            Ok(Base64UrlBytes::from_bytes(message))
+        }
+
+        fn verify(
+            &self,
+            key_id: &Token,
+            message: &[u8],
+            signature: &Base64UrlBytes,
+        ) -> Result<(), String> {
+            (key_id == &self.key_id() && signature.decode() == message)
+                .then_some(())
+                .ok_or_else(|| "test audit signature mismatch".into())
+        }
+    }
+
+    /// The startup probe opens the legacy store without the create flag, but
+    /// the migration attaches it afresh on the journal connection, which does
+    /// create. A store that disappears between the two, such as a volume going
+    /// away mid-start, would come back as an empty file, and the next start
+    /// would read that file as a home with nothing to migrate.
+    #[test]
+    fn a_legacy_store_that_vanishes_before_the_attach_is_not_recreated() {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy_path = directory.path().join("authority.sqlite");
+        let legacy = Connection::open(&legacy_path).unwrap();
+        legacy
+            .execute_batch("CREATE TABLE policies(wallet_id TEXT PRIMARY KEY);")
+            .unwrap();
+        // The open connection keeps the file; only its directory entry goes,
+        // which is what the migration sees when the store vanishes after the
+        // probe.
+        std::fs::remove_file(&legacy_path).unwrap();
+
+        let journal = BrokerJournal::open(
+            directory.path().join("journal.sqlite"),
+            Arc::new(TestAuditSigner),
+        )
+        .unwrap();
+        let connection = journal.shared_connection();
+        let mut target = connection.lock().unwrap();
+
+        migrate_legacy_authority(&mut target, &legacy, &journal)
+            .expect_err("a legacy store that is gone cannot be migrated");
+        assert!(
+            !legacy_path.exists(),
+            "the attach must not recreate a vanished legacy store"
+        );
     }
 }

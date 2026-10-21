@@ -601,16 +601,19 @@ fn open_authority_at(
 /// "nothing to migrate": the entry is there, its state is not. Starting
 /// without it would drop the authority state the upgrade was meant to carry
 /// over, so startup fails and no empty store is created at the target.
+///
+/// The target's directory exists, as for a mounted volume whose file is
+/// gone. Inside a missing directory the open could not create the file
+/// anyway, and the last assertion would hold whatever the code did.
 #[cfg(unix)]
 #[test]
 fn a_dangling_legacy_store_symlink_fails_startup_instead_of_skipping_migration() {
     let directory = tempfile::tempdir().unwrap();
     let journal_path = directory.path().join("journal.sqlite");
     let legacy_path = directory.path().join("authority.sqlite");
-    let target = directory
-        .path()
-        .join("unavailable-volume")
-        .join("authority.sqlite");
+    let volume = directory.path().join("mounted-volume");
+    std::fs::create_dir(&volume).unwrap();
+    let target = volume.join("authority.sqlite");
     std::os::unix::fs::symlink(&target, &legacy_path).unwrap();
 
     let error = open_authority_at(&legacy_path, &journal_path)
@@ -649,6 +652,34 @@ fn a_missing_legacy_store_directory_fails_startup_instead_of_skipping_migration(
     assert!(!legacy_path.parent().unwrap().exists());
 }
 
+/// Only a missing entry means there is nothing to migrate. When the entry
+/// cannot be inspected at all, because a component of the path is a file or
+/// a symlink loop, the Broker cannot tell whether a store is there, and
+/// reading that as "absent" would skip the migration. Startup fails instead.
+#[cfg(unix)]
+#[test]
+fn an_uninspectable_legacy_store_path_fails_startup_instead_of_skipping_migration() {
+    let directory = tempfile::tempdir().unwrap();
+    let plain_file = directory.path().join("plain-file");
+    std::fs::write(&plain_file, b"not a directory").unwrap();
+    let looping = directory.path().join("loop");
+    std::os::unix::fs::symlink(&looping, &looping).unwrap();
+
+    for (index, parent) in [&plain_file, &looping].into_iter().enumerate() {
+        let legacy_path = parent.join("authority.sqlite");
+        let journal_path = directory.path().join(format!("journal-{index}.sqlite"));
+        let error = open_authority_at(&legacy_path, &journal_path)
+            .err()
+            .unwrap_or_else(|| panic!("{} must fail startup", legacy_path.display()));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot tell whether the legacy authority store"),
+            "{error}"
+        );
+    }
+}
+
 /// The symlink itself is not the problem: a legacy store that is reachable
 /// through one opens and migrates exactly as a regular file does.
 #[cfg(unix)]
@@ -657,8 +688,48 @@ fn a_legacy_store_reached_through_a_symlink_is_migrated() {
     let directory = tempfile::tempdir().unwrap();
     let journal_path = directory.path().join("journal.sqlite");
     let target = directory.path().join("volume").join("authority.sqlite");
-    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-    let legacy = rusqlite::Connection::open(&target).unwrap();
+    seed_legacy_store(&target);
+    let legacy_path = directory.path().join("authority.sqlite");
+    std::os::unix::fs::symlink(&target, &legacy_path).unwrap();
+
+    let authority = open_authority_at(&legacy_path, &journal_path)
+        .expect("a legacy store behind a live symlink must open");
+    drop(authority);
+
+    assert_eq!(
+        migrated_quota(&journal_path),
+        "2",
+        "the legacy row must be carried over through the symlink"
+    );
+}
+
+/// The migration attaches the legacy store through a `file:` URI, where `%`,
+/// `?` and `#` are syntax. A store whose path contains them must still be the
+/// one that is attached.
+#[cfg(unix)]
+#[test]
+fn a_legacy_store_whose_path_contains_uri_syntax_is_migrated() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("journal.sqlite");
+    let legacy_path = directory
+        .path()
+        .join("odd%41?#dir")
+        .join("authority.sqlite");
+    seed_legacy_store(&legacy_path);
+
+    let authority = open_authority_at(&legacy_path, &journal_path)
+        .expect("a legacy store at an unusual path must open");
+    drop(authority);
+
+    assert_eq!(migrated_quota(&journal_path), "2");
+}
+
+/// Writes a legacy authority store with the old schema and one row that a
+/// migration has to carry over.
+#[cfg(unix)]
+fn seed_legacy_store(path: &std::path::Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let legacy = rusqlite::Connection::open(path).unwrap();
     legacy
         .execute_batch(
             "CREATE TABLE policies(wallet_id TEXT PRIMARY KEY, version TEXT NOT NULL, digest TEXT NOT NULL, snapshot_jcs TEXT NOT NULL, policy_jcs TEXT NOT NULL);
@@ -671,26 +742,20 @@ fn a_legacy_store_reached_through_a_symlink_is_migrated() {
              INSERT INTO mutation_quota VALUES ('linked-principal', '100', '2');",
         )
         .unwrap();
-    drop(legacy);
-    let legacy_path = directory.path().join("authority.sqlite");
-    std::os::unix::fs::symlink(&target, &legacy_path).unwrap();
+}
 
-    let authority = open_authority_at(&legacy_path, &journal_path)
-        .expect("a legacy store behind a live symlink must open");
-    drop(authority);
-
-    let migrated = rusqlite::Connection::open(&journal_path).unwrap();
-    assert_eq!(
-        migrated
-            .query_row(
-                "SELECT mutations FROM mutation_quota WHERE principal='linked-principal'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-        "2",
-        "the legacy row must be carried over through the symlink"
-    );
+/// The `linked-principal` row from [`seed_legacy_store`], read back from the
+/// journal it was migrated into.
+#[cfg(unix)]
+fn migrated_quota(journal_path: &std::path::Path) -> String {
+    rusqlite::Connection::open(journal_path)
+        .unwrap()
+        .query_row(
+            "SELECT mutations FROM mutation_quota WHERE principal='linked-principal'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 #[test]
@@ -2069,6 +2134,76 @@ fn destination_case_is_read_by_each_chains_own_rule() {
         .authority
         .authorize(&declaring(operation(94), "solana", SOLANA_MIXED))
         .expect("the exact policy spelling is allowed");
+}
+
+/// A policy entry allows a destination on its own chain only. The same 20
+/// bytes on another EVM chain can be an undeployed address or someone else's
+/// contract, so an entry under `base` must not allow them under `optimism`,
+/// in either spelling. The refusal-hint test covers only the message; this
+/// covers the decision.
+#[test]
+fn an_evm_destination_allowed_on_one_chain_is_refused_on_another() {
+    const CHECKSUMMED: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    const LOWERCASE: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+
+    let harness = Harness::new();
+    let provenance = harness.provenance();
+    let mut policy: CanonicalWalletPolicy =
+        serde_json::from_slice(&harness.policy_snapshot(1).canonical_policy.decode()).unwrap();
+    policy.allowed_destinations.push(PolicyDestination {
+        chain: token("base"),
+        destination: CHECKSUMMED.into(),
+    });
+    let snapshot = signed_policy_snapshot(&harness, 2, &policy);
+    harness.authority.install_policy(&snapshot).unwrap();
+
+    let mut terms = petal_terms(&harness, &provenance);
+    terms.policy_version = snapshot.version.clone();
+    terms.policy_digest = snapshot.policy_digest.clone();
+    terms.limits.max_operations = DecimalU64::new(8);
+    terms.limits.max_signatures = DecimalU64::new(8);
+    terms.limits.value_limits = vec![
+        value_limit("ethereum", "token", "1000"),
+        value_limit("ethereum", "eth", "1000"),
+    ];
+    harness.activate(&terms, Some(&provenance));
+
+    let declaring = |operation_id, chain: &str, destination: &str| {
+        let mut input = petal_input(
+            &terms,
+            &provenance,
+            operation_id,
+            CryptoSuite::Secp256k1Sha256Recoverable,
+        );
+        input
+            .request
+            .petal_use_claim
+            .as_mut()
+            .unwrap()
+            .declared_destinations = vec![DeclaredDestination {
+            chain: token(chain),
+            destination: destination.into(),
+        }];
+        bind_operation_digest(&mut input, &terms);
+        input
+    };
+
+    for (operation_id, spelling) in [(101, CHECKSUMMED), (102, LOWERCASE)] {
+        let error = error_code(
+            harness
+                .authority
+                .authorize(&declaring(operation(operation_id), "optimism", spelling))
+                .unwrap_err(),
+        );
+        assert!(error.contains("DESTINATION_NOT_ALLOWED"), "{error}");
+    }
+
+    // The chain the entry names still allows the address, so the refusals
+    // above are about the chain and nothing else.
+    harness
+        .authority
+        .authorize(&declaring(operation(103), "base", LOWERCASE))
+        .expect("the entry's own chain allows the address in either spelling");
 }
 
 #[test]
