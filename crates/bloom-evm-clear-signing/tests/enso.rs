@@ -41,6 +41,8 @@ fn petal_protected_swap_is_independently_decoded() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/enso/petal-protected-swap.json")).unwrap();
     let tx = &fixture["transaction"];
+    assert_eq!(fixture["chain_id"], 8453);
+    assert_eq!(tx["to"].as_str().unwrap().to_lowercase(), ROUTER);
     let bytes = hex::decode(tx["data_hex"].as_str().unwrap().trim_start_matches("0x")).unwrap();
     let call = review(&bytes, tx["value_wei"].as_str().unwrap().parse().unwrap()).unwrap();
     assert_eq!(
