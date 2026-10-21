@@ -7490,6 +7490,174 @@ fn ac18_populated_ceremony_migration_is_atomic_idempotent_and_retains_source() {
     assert_eq!(marker, 0);
 }
 
+fn open_ceremony_at(
+    legacy_path: &std::path::Path,
+    journal_path: &std::path::Path,
+) -> Result<CeremonyBroker, ProtocolError> {
+    let journal =
+        Arc::new(BrokerJournal::open(journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    CeremonyBroker::open(legacy_path, Arc::new(MockSigner::new()), journal)
+}
+
+/// Writes a legacy ceremony store holding one cancelled session, the way an
+/// older package left it, and returns that session's operation.
+fn seed_legacy_ceremony_store(path: &std::path::Path) -> OperationId {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Older packages kept sessions in their own file; a journal opened at the
+    // legacy path stores them exactly there.
+    let journal = Arc::new(BrokerJournal::open(path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let broker = CeremonyBroker::open_with_manifest_signer_audited(
+        path,
+        Arc::new(MockSigner::new()),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[7; 32]),
+        journal,
+        CeremonyLimits::default(),
+    )
+    .unwrap();
+    let operation_id = operation("3a");
+    broker
+        .prepare_custody(
+            CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
+                ceremony_kind: CeremonyKind::WalletDelete,
+                custody_operation_id: operation_id.clone(),
+                wallet_id: Some(Token::new("wallet-legacy-store").unwrap()),
+                key_ref: None,
+                exact_terms_digest: digest("3a"),
+                expected_input_class: Token::new("policy-document").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_requests: Vec::new(),
+            },
+            50_000,
+        )
+        .unwrap();
+    broker.cancel(&operation_id, 50_001).unwrap();
+    operation_id
+}
+
+/// Ceremony state lives in the journal; the legacy file is only a migration
+/// source. Creating it puts an empty store exactly where someone debugging
+/// ceremony state looks first.
+#[test]
+fn a_home_with_nothing_to_migrate_grows_no_legacy_ceremony_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let legacy_path = directory.path().join("ceremonies.sqlite");
+
+    let broker = open_ceremony_at(&legacy_path, &directory.path().join("journal.sqlite"))
+        .expect("a fresh home opens");
+    drop(broker);
+
+    assert!(
+        !legacy_path.exists(),
+        "opening a fresh home must not create an empty legacy ceremony store"
+    );
+}
+
+/// A legacy ceremony file that a previous release created empty, or that
+/// predates the sessions table, has nothing to migrate. It opens, and it is
+/// left exactly as it was.
+#[test]
+fn a_legacy_ceremony_file_without_sessions_is_left_untouched() {
+    let directory = tempfile::tempdir().unwrap();
+    let legacy_path = directory.path().join("ceremonies.sqlite");
+    std::fs::write(&legacy_path, b"").unwrap();
+
+    let broker = open_ceremony_at(&legacy_path, &directory.path().join("journal.sqlite"))
+        .expect("an empty legacy file means nothing to migrate");
+    drop(broker);
+
+    assert_eq!(
+        std::fs::metadata(&legacy_path).unwrap().len(),
+        0,
+        "the legacy file must not be written to"
+    );
+}
+
+/// A legacy store reached through a symlink whose target is missing is not
+/// "nothing to migrate": the entry is there, its sessions are not. The
+/// target's directory exists, as for a mounted volume whose file is gone, so
+/// an open that could create would succeed and leave an empty store there.
+#[test]
+fn a_dangling_legacy_ceremony_symlink_fails_startup_and_creates_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let legacy_path = directory.path().join("ceremonies.sqlite");
+    let volume = directory.path().join("mounted-volume");
+    std::fs::create_dir(&volume).unwrap();
+    let target = volume.join("ceremonies.sqlite");
+    std::os::unix::fs::symlink(&target, &legacy_path).unwrap();
+
+    let error = open_ceremony_at(&legacy_path, &directory.path().join("journal.sqlite"))
+        .err()
+        .expect("a dangling legacy ceremony symlink must fail startup");
+    assert!(
+        error.to_string().contains("ceremonies.sqlite"),
+        "the error must name the legacy store: {error}"
+    );
+    assert!(
+        !target.exists(),
+        "a missing target must not be created by the open"
+    );
+}
+
+/// A missing directory in the configured path, or a path that cannot be
+/// inspected because a component is a file or a symlink loop, cannot be read
+/// as a home with nothing to migrate.
+#[test]
+fn an_unreachable_legacy_ceremony_path_fails_startup() {
+    let directory = tempfile::tempdir().unwrap();
+    let plain_file = directory.path().join("plain-file");
+    std::fs::write(&plain_file, b"not a directory").unwrap();
+    let looping = directory.path().join("loop");
+    std::os::unix::fs::symlink(&looping, &looping).unwrap();
+
+    for (index, (parent, expected)) in [
+        (
+            directory.path().join("no-such-dir"),
+            "cannot read the legacy ceremony store's directory",
+        ),
+        (plain_file, "cannot tell whether the legacy ceremony store"),
+        (looping, "cannot tell whether the legacy ceremony store"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let legacy_path = parent.join("ceremonies.sqlite");
+        let journal_path = directory.path().join(format!("journal-{index}.sqlite"));
+        let error = open_ceremony_at(&legacy_path, &journal_path)
+            .err()
+            .unwrap_or_else(|| panic!("{} must fail startup", legacy_path.display()));
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+    assert!(!directory.path().join("no-such-dir").exists());
+}
+
+/// A populated legacy store behind a live symlink, in a directory whose name
+/// is URI syntax for the migration's `file:` attach, still has its sessions
+/// carried over.
+#[test]
+fn a_legacy_ceremony_store_behind_a_symlink_at_an_unusual_path_is_migrated() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory
+        .path()
+        .join("volume%41?#dir")
+        .join("ceremonies.sqlite");
+    let operation_id = seed_legacy_ceremony_store(&target);
+    let legacy_path = directory.path().join("ceremonies.sqlite");
+    std::os::unix::fs::symlink(&target, &legacy_path).unwrap();
+
+    let migrated = open_ceremony_at(&legacy_path, &directory.path().join("journal.sqlite"))
+        .expect("a legacy store behind a live symlink must open");
+    assert_eq!(
+        migrated.status(&operation_id),
+        Some(CeremonyState::Cancelled),
+        "the legacy session must be carried over"
+    );
+}
+
 #[test]
 fn schema1_release_state_migrates_pending_and_preserves_completed_receipt() {
     const SCHEMA1_BROKER_COMMIT: &str = "dd2add2b9d41540521d08c77d19fb467a2d8029e";

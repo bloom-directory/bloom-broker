@@ -7,6 +7,7 @@ pub mod clock;
 pub mod config;
 mod evm_review;
 pub mod journal;
+mod legacy_store;
 mod safe_review;
 pub mod service;
 pub mod signer_client;

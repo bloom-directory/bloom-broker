@@ -24,7 +24,7 @@ use bloom_evm_clear_signing::{
 use bloom_signer_api::SignerActivationReceipt;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use num_bigint::BigUint;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
@@ -510,72 +510,12 @@ impl BrokerAuthority {
         revocation_key: VerifyingKey,
         assurance: AssuranceRegistry,
     ) -> Result<Self, AuthorityError> {
-        // Only open the legacy authority store when it is actually there.
-        // `Connection::open` creates the file, and a home with nothing to
-        // migrate would otherwise grow an empty `authority.db` sitting exactly
-        // where someone debugging authority state looks first — the real
-        // tables live in the journal.
-        //
-        // Only a missing directory entry means there is nothing to migrate.
-        // `symlink_metadata` inspects the entry itself: `exists` and
-        // `try_exists` follow symlinks, so a legacy store reached through a
-        // link whose target is missing or temporarily unavailable would read
-        // as absent and the migration would be skipped, bringing the Broker
-        // up without the authority state it was supposed to carry over. Any
-        // other error (a permission problem, an unreadable mount) fails here
-        // for the same reason. An entry that is present is opened without the
-        // create flag, and the migration attaches it the same way, so a
-        // dangling or disappearing target fails startup instead of silently
-        // becoming an empty store.
-        let legacy_path = path.as_ref();
-        let legacy = match std::fs::symlink_metadata(legacy_path) {
-            Ok(_) => Some(
-                Connection::open_with_flags(
-                    legacy_path,
-                    OpenFlags::SQLITE_OPEN_READ_WRITE
-                        | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                        | OpenFlags::SQLITE_OPEN_URI,
-                )
-                .map_err(|error| {
-                    AuthorityError::Storage(format!(
-                        "cannot open the legacy authority store at {}: {error}",
-                        legacy_path.display()
-                    ))
-                })?,
-            ),
-            // `NotFound` also covers a missing *parent*: a mistyped
-            // directory in the configured path would otherwise read as a
-            // home with nothing to migrate, which is the same silent skip
-            // as a dangling link. Only a missing entry inside a directory
-            // that exists means there is nothing to migrate.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let parent = legacy_path
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."));
-                match std::fs::metadata(parent) {
-                    Ok(metadata) if metadata.is_dir() => None,
-                    Ok(_) => {
-                        return Err(AuthorityError::Storage(format!(
-                            "the legacy authority store's directory {} is not a directory",
-                            parent.display()
-                        )));
-                    }
-                    Err(error) => {
-                        return Err(AuthorityError::Storage(format!(
-                            "cannot read the legacy authority store's directory {}: {error}",
-                            parent.display()
-                        )));
-                    }
-                }
-            }
-            Err(error) => {
-                return Err(AuthorityError::Storage(format!(
-                    "cannot tell whether the legacy authority store at {} exists: {error}",
-                    legacy_path.display()
-                )));
-            }
-        };
+        // Only a legacy store that is actually there is opened, and never
+        // created; the real tables live in the journal. A dangling link, a
+        // vanished target or a mistyped directory fails startup instead of
+        // reading as a home with nothing to migrate.
+        let legacy = crate::legacy_store::open(path.as_ref(), "authority")
+            .map_err(AuthorityError::Storage)?;
         Self::from_connection(
             legacy,
             journal,
@@ -3866,23 +3806,6 @@ fn petal_payload_batch_digest(payloads: &[Vec<u8>]) -> Digest32 {
     Digest32::from_bytes(digest.finalize().into())
 }
 
-/// A `file:` URI that opens `path` read-write but never creates it. SQLite
-/// decodes `%HH` in a URI path and starts the query and fragment at `?` and
-/// `#`, so those three are escaped; everything else is taken literally.
-fn legacy_attach_uri(path: &str) -> String {
-    let mut uri = String::from("file:");
-    for character in path.chars() {
-        match character {
-            '%' => uri.push_str("%25"),
-            '?' => uri.push_str("%3f"),
-            '#' => uri.push_str("%23"),
-            other => uri.push(other),
-        }
-    }
-    uri.push_str("?mode=rw");
-    uri
-}
-
 // AC-18 requires Broker authority effects and the Broker audit record to share
 // one SQLite commit. Older packages stored authority tables in a second file.
 // On first open, copy that file into the journal database and record the source
@@ -3933,13 +3856,10 @@ fn migrate_legacy_authority(
     if migrated {
         return Ok(());
     }
-    // The journal connection creates missing databases, so attaching the
-    // plain path would turn a legacy store that disappeared since it was
-    // opened into an empty file, and the next start would read that file as a
-    // home with nothing to migrate. Attach it without the create flag instead.
+    // Never the plain path: the journal connection creates missing databases.
     target.execute(
         "ATTACH DATABASE ?1 AS authority_legacy",
-        [legacy_attach_uri(&legacy_path)],
+        [crate::legacy_store::attach_uri(&legacy_path)],
     )?;
     journal.verify_migration_target(target)?;
     let migration = (|| -> Result<(), AuthorityError> {
@@ -4842,36 +4762,14 @@ mod path_index_tests {
 #[cfg(test)]
 mod legacy_attach_tests {
     use super::*;
-    use crate::journal::AuditSigner;
-
-    struct TestAuditSigner;
-
-    impl AuditSigner for TestAuditSigner {
-        fn key_id(&self) -> Token {
-            Token::new("broker-audit-test").unwrap()
-        }
-
-        fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String> {
-            Ok(Base64UrlBytes::from_bytes(message))
-        }
-
-        fn verify(
-            &self,
-            key_id: &Token,
-            message: &[u8],
-            signature: &Base64UrlBytes,
-        ) -> Result<(), String> {
-            (key_id == &self.key_id() && signature.decode() == message)
-                .then_some(())
-                .ok_or_else(|| "test audit signature mismatch".into())
-        }
-    }
+    use crate::legacy_store::TestAuditSigner;
 
     /// The startup probe opens the legacy store without the create flag, but
     /// the migration attaches it afresh on the journal connection, which does
-    /// create. A store that disappears between the two, such as a volume going
-    /// away mid-start, would come back as an empty file, and the next start
-    /// would read that file as a home with nothing to migrate.
+    /// create. A store that disappears between the two would come back as an
+    /// empty file, and every later start would read that file as a home with
+    /// nothing to migrate, even where the store sits behind a link that would
+    /// otherwise fail startup.
     #[test]
     fn a_legacy_store_that_vanishes_before_the_attach_is_not_recreated() {
         let directory = tempfile::tempdir().unwrap();
