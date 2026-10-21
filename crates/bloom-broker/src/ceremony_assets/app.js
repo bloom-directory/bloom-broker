@@ -1601,7 +1601,7 @@ function renderReview(session) {
           decision.push(assetCard({chainId: String(asset.chain_id), address: asset.token.address,
             title: asset.token.name, subtitle: asset.token.symbol,
             amount: asset.amount_display, amountLabel: enso && /^Source asset/.test(field.label) ? "You pay"
-              : /^Requested minimum balance increase/.test(field.label) ? "Minimum requested · not guaranteed received" : field.label,
+              : /^Requested minimum balance increase/.test(field.label) ? "Minimum output" : field.label,
             tone: call.contract_name === "Enso Router V2" && /^Source asset/.test(field.label) ? "outgoing" : "neutral"}));
           continue;
         }

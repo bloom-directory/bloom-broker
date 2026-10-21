@@ -1415,7 +1415,8 @@ for (const empty of [false, true]) {{
   if (ensoHasMinimum(noMinimum) || callIntent(noMinimum).heading.includes("swap")) throw new Error("Empty or zero output checks falsely protected");
 }}
 const outputCard = nodes.review.children.find(node => allText(node).includes("1.25 USDC"));
-if (!outputCard || !allText(outputCard).includes("not guaranteed received") ||
+if (!outputCard || !allText(outputCard).includes("Minimum output") ||
+    !allText(nodes.review).includes("reverts if it is not met") || !allText(nodes.review).includes("not a quote or proof of receipt") ||
     walk(outputCard).some(node => String(node.className).includes("outgoing"))) {{
   throw new Error("Enso requested output is presented as money leaving or guaranteed receipt");
 }}
@@ -10393,8 +10394,8 @@ const unitless = JSON.parse(noUnits.review_manifest.canonical_plan);
 delete unitless.evm_review.payloads[0].maximum_execution_gas_fee_display;
 noUnits.review_manifest.canonical_plan = JSON.stringify(unitless);
 renderReview(noUnits);
-const shown = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
-if (!shown.includes("Cannot be shown")) {{
+const shown = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+if (!shown.includes("Gas fee") || !shown.includes("Not available in this review")) {{
   throw new Error(`an unpriceable fee vanished instead of saying so: ${{shown}}`);
 }}
 renderReview(previewSession("transfer"));
