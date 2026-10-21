@@ -95,7 +95,8 @@ fn checked_order_fields(fields: Vec<OrderField>) -> Result<Vec<OrderField>, Prot
                         u32::from(if d > 9 { d - 9 } else { d })
                     })
                     .sum::<u32>()
-                    .is_multiple_of(10);
+                    % 10
+                    == 0;
             let label = f.label.to_lowercase();
             let security_code = (3..=4).contains(&f.value.len())
                 && f.value.bytes().all(|b| b.is_ascii_digit())
