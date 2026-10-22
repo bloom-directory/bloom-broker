@@ -28,6 +28,7 @@ bloom-evm-clear-signing = { path = "crates/bloom-evm-clear-signing" }
 alloy-dyn-abi = "1.7.3"
 alloy-json-abi = "1.7.3"
 alloy-primitives = "1.7.3"
+bech32 = "0.11"
 bs58 = "0.5"
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
 bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
