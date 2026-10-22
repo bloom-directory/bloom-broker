@@ -172,7 +172,7 @@ function assetCard({chainId, address, venueAsset, native, title, subtitle, amoun
     (subtitle || art?.symbol) ? el("p", {class: "ceremony-party-label"}, subtitle || art?.symbol) : null);
   const amountNode = amount ? el("div", {class: `ceremony-asset-amount ${tone || ""}`},
     amountLabel ? el("span", {class: "ceremony-amount-label"}, amountLabel) : null,
-    el("strong", {}, amount)) : null;
+    el("strong", {}, tone === "incoming" ? `+${amount}` : amount)) : null;
   let addressRow = null;
   if (address && /^0x[0-9a-fA-F]{40}$/.test(address)) {
     const explorer = addressExplorer(chainId, address);
@@ -1602,7 +1602,8 @@ function renderReview(session) {
             title: asset.token.name, subtitle: asset.token.symbol,
             amount: asset.amount_display, amountLabel: enso && /^Source asset/.test(field.label) ? "You pay"
               : /^Requested minimum balance increase/.test(field.label) ? "Minimum output" : field.label,
-            tone: call.contract_name === "Enso Router V2" && /^Source asset/.test(field.label) ? "outgoing" : "neutral"}));
+            tone: enso && /^Source asset/.test(field.label) ? "outgoing"
+              : enso && ensoHasMinimum(call) && /^Requested minimum balance increase/.test(field.label) ? "incoming" : "neutral"}));
           continue;
         }
         if (field.format === "nativeAmount") {
@@ -1612,8 +1613,10 @@ function renderReview(session) {
           decision.push(assetCard({native: ether ? "ethereum" : "token",
             title: ether ? "Ether" : "Native asset",
             amount: String(field.value).replace(/ \((transaction value|minimum balance increase)\)$/, ""),
-            amountLabel: enso && /^Source asset/.test(field.label) ? "You pay" : field.label,
-            tone: /^Source asset/.test(field.label) ? "outgoing" : "neutral"}));
+            amountLabel: enso && /^Source asset/.test(field.label) ? "You pay"
+              : enso && /^Requested minimum balance increase/.test(field.label) ? "Minimum output" : field.label,
+            tone: /^Source asset/.test(field.label) ? "outgoing"
+              : enso && ensoHasMinimum(call) && /^Requested minimum balance increase/.test(field.label) ? "incoming" : "neutral"}));
           continue;
         }
         if (enso && field.label === "Output receiver") {

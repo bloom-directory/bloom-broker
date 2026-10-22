@@ -1415,7 +1415,8 @@ for (const empty of [false, true]) {{
   if (ensoHasMinimum(noMinimum) || callIntent(noMinimum).heading.includes("swap")) throw new Error("Empty or zero output checks falsely protected");
 }}
 const outputCard = nodes.review.children.find(node => allText(node).includes("1.25 USDC"));
-if (!outputCard || !allText(outputCard).includes("Minimum output") ||
+if (!outputCard || !allText(outputCard).includes("Minimum output") || !allText(outputCard).includes("+1.25 USDC") ||
+    !walk(outputCard).some(node => String(node.className).includes("incoming")) ||
     !allText(nodes.review).includes("reverts if it is not met") || !allText(nodes.review).includes("not a quote or proof of receipt") ||
     walk(outputCard).some(node => String(node.className).includes("outgoing"))) {{
   throw new Error("Enso requested output is presented as money leaving or guaranteed receipt");

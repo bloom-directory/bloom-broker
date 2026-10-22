@@ -46,7 +46,7 @@ try {
         }
       }
       if (name === "enso-swap") {
-        await page.getByText("2.985 USDC", {exact: true}).waitFor();
+        await page.getByText("+2.985 USDC", {exact: true}).waitFor();
         if (await page.getByRole("complementary", {name: "No output protection"}).count()) {
           throw new Error("Positive protected minimum shown as unprotected");
         }
