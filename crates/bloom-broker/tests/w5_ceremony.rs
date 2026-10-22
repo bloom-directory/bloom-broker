@@ -779,7 +779,7 @@ async fn card_add_delete_and_expiry_use_real_signer_proofs() {
 }
 
 #[tokio::test]
-async fn cancelling_a_consumed_card_operation_fails_closed() {
+async fn cancelling_a_card_operation_the_signer_already_closed_succeeds() {
     use bloom_signer_api::CardEffect;
     let signer = real_ceremony_signer();
     let broker = CeremonyBroker::new(signer.clone());
@@ -796,12 +796,8 @@ async fn cancelling_a_consumed_card_operation_fails_closed() {
         )
         .unwrap();
     signer.card_cancel(&operation_id).unwrap();
-    let error = broker.cancel(&operation_id, now + 1).unwrap_err();
-    assert_eq!(error.code, ProtocolErrorCode::OperationIdConflict);
-    assert_eq!(
-        broker.status(&operation_id),
-        Some(CeremonyState::AwaitingUser)
-    );
+    broker.cancel(&operation_id, now + 1).unwrap();
+    assert_eq!(broker.status(&operation_id), Some(CeremonyState::Cancelled));
 }
 
 /// The released Broker (v0.3.2, 85e9a999) has no card ceremony kinds and

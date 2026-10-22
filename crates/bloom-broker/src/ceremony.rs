@@ -2826,7 +2826,16 @@ impl CeremonyBroker {
                 .get(&ceremony_id)
                 .is_some_and(|s| cards::is_card(s.ceremony_kind))
             {
-                let _ = self.inner.signer.card_cancel(&operation_id);
+                if let Err(error) = self.cancel_signer_or_already_released(&operation_id, true) {
+                    // The Signer's own expiry still closes a prepared card
+                    // operation; record why this cancel did not.
+                    tracing::warn!(
+                        event = "ceremony.card_cancel_failed",
+                        operation_id = operation_id.as_str(),
+                        code = ?error.code,
+                        "Broker could not cancel an expiring card operation in Signer"
+                    );
+                }
                 let mut snapshot = self
                     .inner
                     .sessions
@@ -3665,10 +3674,7 @@ impl CeremonyBroker {
                 .map_err(|_| storage("ceremony database mutex poisoned"))?
         };
         let transaction = database.transaction().map_err(storage)?;
-        let pending_card = matches!(
-            session.ceremony_kind,
-            CeremonyKind::CardAdd | CeremonyKind::CardDelete | CeremonyKind::CardCheckout
-        ) && !is_terminal(session.state);
+        let pending_card = cards::is_card(session.ceremony_kind) && !is_terminal(session.state);
         let table = if pending_card {
             "pending_card_sessions"
         } else {
