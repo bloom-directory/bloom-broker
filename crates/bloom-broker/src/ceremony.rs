@@ -3392,8 +3392,9 @@ impl CeremonyBroker {
             .map_err(|_| storage("ceremony database mutex poisoned"))?;
         let mut statement = database
             .prepare(
-                "SELECT ceremony_id, operation_id, session_jcs
-                 FROM ceremony_sessions",
+                "SELECT ceremony_id, operation_id, session_jcs FROM ceremony_sessions
+                 UNION ALL
+                 SELECT ceremony_id, operation_id, session_jcs FROM pending_card_sessions",
             )
             .map_err(storage)?;
         let rows = statement
@@ -3664,13 +3665,24 @@ impl CeremonyBroker {
                 .map_err(|_| storage("ceremony database mutex poisoned"))?
         };
         let transaction = database.transaction().map_err(storage)?;
+        let pending_card = matches!(
+            session.ceremony_kind,
+            CeremonyKind::CardAdd | CeremonyKind::CardDelete | CeremonyKind::CardCheckout
+        ) && !is_terminal(session.state);
+        let table = if pending_card {
+            "pending_card_sessions"
+        } else {
+            "ceremony_sessions"
+        };
         transaction
             .execute(
-                "INSERT INTO ceremony_sessions(ceremony_id, operation_id, session_jcs)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(ceremony_id) DO UPDATE SET
-                    operation_id = excluded.operation_id,
-                    session_jcs = excluded.session_jcs",
+                &format!(
+                    "INSERT INTO {table}(ceremony_id, operation_id, session_jcs)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(ceremony_id) DO UPDATE SET
+                        operation_id = excluded.operation_id,
+                        session_jcs = excluded.session_jcs"
+                ),
                 params![
                     session.projection.ceremony_id.as_str(),
                     session.operation_id.as_str(),
@@ -3678,6 +3690,14 @@ impl CeremonyBroker {
                 ],
             )
             .map_err(storage)?;
+        if !pending_card {
+            transaction
+                .execute(
+                    "DELETE FROM pending_card_sessions WHERE ceremony_id = ?1",
+                    [session.projection.ceremony_id.as_str()],
+                )
+                .map_err(storage)?;
+        }
         if let Some(journal) = &self.inner.journal {
             journal
                 .append_external_audit(
@@ -5447,11 +5467,18 @@ fn open_audited_ceremony_store(
             )
         })?;
         guard_ceremony_storage_version(&connection)?;
+        // Pending card sessions live apart: the released Broker cannot decode
+        // card kinds and refuses to start on a pending row it cannot read.
         connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS ceremony_sessions (
                     ceremony_id TEXT PRIMARY KEY,
                     operation_id TEXT NOT NULL,
+                    session_jcs TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS pending_card_sessions (
+                    ceremony_id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL UNIQUE,
                     session_jcs TEXT NOT NULL
                 );",
             )

@@ -804,6 +804,69 @@ async fn cancelling_a_consumed_card_operation_fails_closed() {
     );
 }
 
+/// The released Broker (v0.3.2, 85e9a999) has no card ceremony kinds and
+/// refuses to start on a non-terminal row it cannot decode. Pending card
+/// sessions must stay out of the table it reads; terminal ones go there so it
+/// keeps their replay protection.
+#[tokio::test]
+async fn released_broker_never_reads_a_pending_card_session() {
+    use bloom_signer_api::CardEffect;
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("journal.sqlite");
+    let journal =
+        Arc::new(BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let signer = real_ceremony_signer();
+    let open = || {
+        CeremonyBroker::open(
+            directory.path().join("ceremony.sqlite"),
+            signer.clone(),
+            journal.clone(),
+        )
+        .unwrap()
+    };
+    let broker = open();
+    let (pending, cancelled) = (operation("96"), operation("97"));
+    for id in [&pending, &cancelled] {
+        let card_id = Token::new(format!("card-{}", &id.as_str()[..4])).unwrap();
+        broker
+            .prepare_card(
+                id.clone(),
+                CardEffect::Add {
+                    card_id,
+                    label: "Synthetic card".into(),
+                },
+                card_test_now(),
+            )
+            .unwrap();
+    }
+    broker.cancel(&cancelled, card_test_now()).unwrap();
+    let released_rows = || -> Vec<(String, String)> {
+        let db = rusqlite::Connection::open(&journal_path).unwrap();
+        let mut statement = db
+            .prepare(
+                "SELECT json_extract(session_jcs, '$.operation_id'),
+                        json_extract(session_jcs, '$.state')
+                 FROM ceremony_sessions",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let rows = released_rows();
+    assert_eq!(
+        rows,
+        vec![(cancelled.as_str().to_string(), "CANCELLED".to_string())]
+    );
+    drop(broker);
+    let restarted = open();
+    assert_eq!(restarted.status(&pending), Some(CeremonyState::Expired));
+    assert_eq!(restarted.status(&cancelled), Some(CeremonyState::Cancelled));
+    assert_eq!(released_rows().len(), 2);
+}
+
 /// Bind IPv4 on port 0, hold it, bind IPv6 on the same selected port, and
 /// return the held pair plus its explicit nonzero endpoint. Retries selection
 /// if the second bind collides. Test setup only, never 18734.
