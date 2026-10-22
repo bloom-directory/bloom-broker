@@ -437,6 +437,92 @@ pub(super) fn validate_payment(
 mod tests {
     use super::*;
     #[test]
+    fn shared_signing_vectors_freeze_ordered_bytes_and_hashes() {
+        // Identical to bloom-petal-hyperliquid/route/tests/fixtures/hyperliquid-signing.json.
+        let vectors: Vec<Value> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/hyperliquid-signing.json"
+        ))
+        .unwrap();
+        assert_eq!(vectors.len(), 40);
+        for vector in vectors {
+            let action: Action = serde_json::from_value(vector["action"].clone()).unwrap();
+            assert_eq!(
+                hex::encode(rmp_serde::to_vec_named(&action).unwrap()),
+                vector["messagepack"],
+                "{vector}"
+            );
+            let (typed, _, _) = rebuild(
+                vector["network"].as_str().unwrap(),
+                vector["action"].clone(),
+                vector["nonce"].as_u64().unwrap(),
+                vector["vault_address"].as_str(),
+                vector["expires_after"].as_u64(),
+                super::super::MAX_FIELDS,
+            )
+            .unwrap();
+            assert_eq!(
+                typed["message"]["connectionId"], vector["action_hash"],
+                "{vector}"
+            );
+            let td: alloy_dyn_abi::eip712::TypedData = serde_json::from_value(typed).unwrap();
+            let mut preimage = vec![0x19, 0x01];
+            preimage.extend_from_slice(td.domain().separator().as_slice());
+            preimage.extend_from_slice(td.hash_struct().unwrap().as_slice());
+            assert_eq!(hex::encode(preimage), vector["preimage"], "{vector}");
+            assert_eq!(
+                format!("{:#x}", td.eip712_signing_hash().unwrap()),
+                vector["hash"],
+                "{vector}"
+            );
+        }
+    }
+    #[test]
+    fn owner_batch_boundaries_match_the_petal_preflight() {
+        for (item, accepted) in [
+            (
+                json!({"a":0,"b":true,"p":"100","s":"0.01","r":false,"t":{"limit":{"tif":"Gtc"}}}),
+                41,
+            ),
+            (
+                json!({"a":0,"b":true,"p":"100","s":"0.01","r":false,"t":{"limit":{"tif":"Gtc"}},"c":"0x00000000000000000000000000000001"}),
+                35,
+            ),
+            (
+                json!({"a":0,"b":true,"p":"100","s":"0.01","r":false,"t":{"trigger":{"isMarket":true,"triggerPx":"110","tpsl":"tp"}},"c":"0x00000000000000000000000000000001"}),
+                27,
+            ),
+        ] {
+            for count in [accepted, accepted + 1] {
+                let action =
+                    json!({"type":"order","orders":vec![item.clone(); count],"grouping":"na"});
+                let result = rebuild(
+                    "mainnet",
+                    action.clone(),
+                    123,
+                    None,
+                    None,
+                    super::super::MAX_FIELDS,
+                );
+                assert_eq!(result.is_ok(), count == accepted);
+                assert!(rebuild("mainnet", action, 123, None, None, 4096).is_ok());
+            }
+        }
+        for fast in [false, true] {
+            for count in [125, 126] {
+                let mut action =
+                    json!({"type":"cancel","cancels":vec![json!({"a":0,"o":42}); count]});
+                if fast {
+                    action["f"] = json!(true);
+                }
+                let result = rebuild("mainnet", action, 123, None, None, super::super::MAX_FIELDS);
+                assert_eq!(result.is_ok(), count == 125);
+                if fast && count == 125 {
+                    assert_eq!(result.unwrap().1.len(), 256);
+                }
+            }
+        }
+    }
+    #[test]
     fn cancellations_label_identifiers_without_claiming_market_identity() {
         for (action, label, value) in [
             (
