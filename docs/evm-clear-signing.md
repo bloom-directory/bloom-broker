@@ -169,6 +169,28 @@ against the current catalog and policy: a withdrawal, a changed entry
 verifier source digest invalidates an unsigned review. A newer catalog never
 extends an approval, and a signature already produced cannot be recalled.
 
+## Safe approval permissions
+
+Safe approval freezes its chain opt-in and opaque review permission when prepared.
+Signing rechecks the approval's policy binding, but does not separately re-evaluate
+those Safe-specific permissions through the clear-signing catalog recheck. Retire
+pending approvals when changing those permissions.
+
+Safe inner contract calls use the same accepted catalog, observation-age limits,
+and clear-signing policy as native calls. A familiar selector alone does not
+establish readability. Readable calls cannot request an opaque review. A Safe
+approval whose inner calls were read from the catalog freezes those entries as
+clear-signing evidence, so the expiry cap and the activation and signing
+rechecks above apply to it exactly as they do to a native call.
+
+Known limit: a wallet with clear signing enabled cannot deploy a Safe or send
+its `execTransaction` through the Safe Petal. Those outer calls go to the Safe
+proxy factory or the Safe itself, which no catalog describes, and Petal signing
+and outbox staging never request `opaque_exact`, so Broker refuses them with
+`UNSUPPORTED_CALL` even when `opaque_exact_allowed` is set. Such a wallet can
+still sign the Safe transaction as an owner; an account without clear signing
+has to deploy the Safe and execute its transactions.
+
 ## Unlimited allowances
 
 Denied by default. A maximum-U256 request explains the denial and names one
