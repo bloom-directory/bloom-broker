@@ -34,7 +34,8 @@ RPC = {
     100: "https://gnosis-rpc.publicnode.com",
     137: "https://polygon-bor-rpc.publicnode.com",
     8453: "https://base-rpc.publicnode.com",
-    42161: "https://arbitrum-one-rpc.publicnode.com",
+    # publicnode serves only ~100 Arbitrum blocks (~25 s) of state.
+    42161: "https://arb1.arbitrum.io/rpc",
     4663: "https://rpc.mainnet.chain.robinhood.com",
     56: "https://bsc-rpc.publicnode.com",
     43114: "https://avalanche-c-chain-rpc.publicnode.com",
@@ -117,13 +118,18 @@ PROXY_SLOTS = [
 DECIMALS, SYMBOL, NAME = "0x313ce567", "0x95d89b41", "0x06fdde03"
 # Tokens per RPC request (six calls each). Robinhood's endpoint rate-limits
 # large batches; HyperEVM's accepts at most 20 calls.
-BATCH = {4663: 2, 999: 3}
+# Arbitrum's endpoint answers 429 to 60 calls in one request.
+BATCH = {4663: 2, 999: 3, 42161: 5}
 
 
 def get(url):
     request = urllib.request.Request(url, headers={"User-Agent": "bloom-tokens"})
     with urllib.request.urlopen(request, timeout=60) as response:
         return json.load(response)
+
+
+class BlockExpired(Exception):
+    """The RPC no longer serves state at the pinned block."""
 
 
 def rpc(chain, calls):
@@ -143,9 +149,15 @@ def rpc(chain, calls):
             time.sleep(0.5)
             return [replies.get(i) for i in range(len(calls))]
         except urllib.error.HTTPError as error:
+            # Public nodes answer 403 once the pinned block counts as archive.
+            if error.code == 403:
+                raise BlockExpired(chain) from error
             if error.code != 429 or attempt == 9:
                 raise RuntimeError(f"chain {chain}: {error}") from error
-            time.sleep(2**attempt)
+        except OSError as error:
+            if attempt == 9:
+                raise RuntimeError(f"chain {chain}: {error}") from error
+        time.sleep(2**attempt)
 
 
 def text(result):
@@ -269,6 +281,39 @@ def canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
 
 
+def capture_chain(chain, tokens):
+    """One chain's observations, all at one pinned block."""
+    observed_chain = rpc(chain, [("eth_chainId", [])])[0]
+    if int(observed_chain, 16) != chain:
+        raise ValueError(f"chain {chain}: RPC chain ID mismatch ({observed_chain})")
+    block = rpc(chain, [("eth_getBlockByNumber", ["latest", False])])[0]
+    number, block_hash = block["number"], block["hash"]
+    if not number.startswith("0x") or len(block_hash) != 66:
+        raise ValueError("RPC returned an invalid block identity")
+    observations = []
+    size = BATCH.get(chain, 20)
+    for start in range(0, len(tokens), size):
+        batch = tokens[start:start + size]
+        calls = []
+        for token in batch:
+            address = token["address"].lower()
+            calls.append(("eth_getCode", [address, number]))
+            for selector in (DECIMALS, SYMBOL, NAME):
+                calls.append(("eth_call", [{"to": address, "data": selector}, number]))
+            for slot in PROXY_SLOTS:
+                calls.append(("eth_getStorageAt", [address, slot, number]))
+        results = rpc(chain, calls)
+        width = 4 + len(PROXY_SLOTS)
+        for index, token in enumerate(batch):
+            observations.append({"chain_id": chain, "address": token["address"].lower(),
+                "token": token, "proxy_slots": PROXY_SLOTS,
+                "results": results[index * width:(index + 1) * width]})
+    checked = rpc(chain, [("eth_getBlockByNumber", [number, False])])[0]
+    if not checked or checked["hash"] != block_hash:
+        raise ValueError(f"chain {chain}: block changed during capture")
+    return {"number": number, "hash": block_hash}, observations
+
+
 def capture(only=()):
     sources = {}
     def acquire(url):
@@ -283,34 +328,14 @@ def capture(only=()):
     observations = []
     blocks = {}
     for chain, tokens in sorted(by_chain.items()):
-        observed_chain = rpc(chain, [("eth_chainId", [])])[0]
-        if int(observed_chain, 16) != chain:
-            raise ValueError(f"chain {chain}: RPC chain ID mismatch ({observed_chain})")
-        block = rpc(chain, [("eth_getBlockByNumber", ["latest", False])])[0]
-        number, block_hash = block["number"], block["hash"]
-        if not number.startswith("0x") or len(block_hash) != 66:
-            raise ValueError("RPC returned an invalid block identity")
-        blocks[str(chain)] = {"number": number, "hash": block_hash}
-        size = BATCH.get(chain, 20)
-        for start in range(0, len(tokens), size):
-            batch = tokens[start:start + size]
-            calls = []
-            for token in batch:
-                address = token["address"].lower()
-                calls.append(("eth_getCode", [address, number]))
-                for selector in (DECIMALS, SYMBOL, NAME):
-                    calls.append(("eth_call", [{"to": address, "data": selector}, number]))
-                for slot in PROXY_SLOTS:
-                    calls.append(("eth_getStorageAt", [address, slot, number]))
-            results = rpc(chain, calls)
-            width = 4 + len(PROXY_SLOTS)
-            for index, token in enumerate(batch):
-                observations.append({"chain_id": chain, "address": token["address"].lower(),
-                    "token": token, "proxy_slots": PROXY_SLOTS,
-                    "results": results[index * width:(index + 1) * width]})
-        checked = rpc(chain, [("eth_getBlockByNumber", [number, False])])[0]
-        if not checked or checked["hash"] != block_hash:
-            raise ValueError(f"chain {chain}: block changed during capture")
+        for attempt in range(3):
+            try:
+                blocks[str(chain)], chain_observations = capture_chain(chain, tokens)
+                break
+            except BlockExpired:
+                if attempt == 2:
+                    raise
+        observations += chain_observations
     if only and len(observations) != len(set(only)):
         raise ValueError("requested identity absent from recorded candidates")
     return {"schema": 1, "scope": sorted(only), "sources": sources, "blocks": blocks, "observations": observations}

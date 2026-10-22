@@ -29,7 +29,7 @@ jobs:
           python3 scripts/bundle-token-artwork.py --check
           python3 scripts/test_token_artwork.py
           python3 -B scripts/test_token_derivation.py
-          python3 -B crates/bloom-broker-api/tokens/tokens.py --offline crates/bloom-broker-api/tokens/fixtures/pusd-inputs-2026-10-20.json.gz --check crates/bloom-broker-api/tokens/fixtures/pusd-derived-2026-10-20.json
+          python3 -B crates/bloom-broker-api/tokens/tokens.py --offline crates/bloom-broker-api/tokens/fixtures/inputs-2026-10-22.json.gz --check crates/bloom-broker-api/tokens/tokens.json > /dev/null
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run tests

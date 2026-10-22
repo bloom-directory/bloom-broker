@@ -1,17 +1,18 @@
-# Offline catalog update evidence
+# Token catalog evidence
 
-The 2026-10-20 pUSD fixture captures public curated-source documents and their
-SHA-256 digests, the exact selected identity, pinned block number/hash, raw
-code, decimals/name/symbol results and both checked proxy slots. Capture
-verifies the block hash again after reading. The gzip uses deterministic mtime 0.
+`inputs-2026-10-22.json.gz` is a full capture of every candidate token:
+the curated source documents with their SHA-256 digests, one pinned block
+number and hash per chain, and each token's raw code, decimals/name/symbol
+results and proxy slots at that block. Capture verifies each block hash again
+after reading. The gzip uses mtime 0.
 
-Regenerate the row offline with the CI command in .github/workflows/ci.yml.
-The capture command was:
+CI derives the catalog from this capture offline and requires it to equal
+`tokens.json` row for row. When the catalog changes, recapture and replace
+this file:
 
 ```sh
-python3 -B crates/bloom-broker-api/tokens/tokens.py --capture inputs.json --only 137:0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb
+python3 -I -B crates/bloom-broker-api/tokens/tokens.py --capture inputs.json > crates/bloom-broker-api/tokens/tokens.json
 ```
 
-This is a new observation, not invented provenance for older catalog rows.
-It supplements the existing pusd-observation.json and preserves its limitations.
-Two proxy slots do not prove that another contract cannot upgrade.
+then gzip `inputs.json` with mtime 0. Two proxy slots do not prove that a
+contract cannot be upgraded another way.
