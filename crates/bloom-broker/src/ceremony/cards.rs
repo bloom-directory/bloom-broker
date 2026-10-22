@@ -6,6 +6,7 @@ use bloom_signer_api::{
 };
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Default)]
 pub(super) struct CardChannels {
@@ -69,43 +70,92 @@ mod tests {
         assert!(check("Quantity", "123"));
         assert!(check("Security note", "front desk"));
     }
+
+    #[test]
+    fn order_fields_reject_disguised_card_numbers_and_foreign_cvc_labels() {
+        for value in [
+            "4111.1111.1111.1111",
+            "4111111111111111\n",
+            "４１１１１１１１１１１１１１１１",
+            "4111/1111/1111/1111",
+        ] {
+            assert!(!check("Reference", value), "{value:?}");
+        }
+        for label in [
+            "Sicherheitscode",
+            "Código de seguridad",
+            "CID",
+            "Prüfnummer",
+        ] {
+            assert!(!check(label, "123"), "{label}");
+            assert!(!check(label, " １２３４ "), "{label}");
+        }
+        assert!(check("Phone", "+54 9 11 4111 1111 1111"));
+        assert!(!check("Booking", "Ref 4111111111111111 seat"));
+        assert!(check("Booking", "Ref 4111111111111112 seat"));
+        assert!(check("Passengers", "2"));
+    }
+}
+
+fn luhn(digits: &[u32]) -> bool {
+    digits
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(i, &d)| {
+            if i % 2 == 1 && d > 0 {
+                (d * 2 - 1) % 9 + 1
+            } else {
+                d
+            }
+        })
+        .sum::<u32>()
+        % 10
+        == 0
+}
+
+/// Any 13–19 digit run (spaces, dots, dashes or slashes allowed between
+/// digits) that passes Luhn, unless it is a `+` phone number.
+fn contains_card_number(value: &str) -> bool {
+    value
+        .split(|c: char| !(c.is_ascii_digit() || c == '+' || " .-/\t\n\r".contains(c)))
+        .filter(|run| !run.trim_start().starts_with('+'))
+        .any(|run| {
+            let digits: Vec<u32> = run.chars().filter_map(|c| c.to_digit(10)).collect();
+            (13..=19).contains(&digits.len()) && luhn(&digits)
+        })
+}
+
+/// Short codes match the start of a word; the rest match anywhere.
+const SECURITY_CODE_WORDS: [&str; 4] = ["cvc", "cvv", "cid", "csc"];
+const SECURITY_CODE_LABELS: [&str; 6] = [
+    "security",
+    "sicherheit",
+    "prüf",
+    "segur",
+    "sécurité",
+    "cryptogram",
+];
+
+fn security_code_label(label: &str) -> bool {
+    label
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| SECURITY_CODE_WORDS.iter().any(|c| w.starts_with(c)))
+        || SECURITY_CODE_LABELS.iter().any(|word| label.contains(word))
 }
 
 fn checked_order_fields(fields: Vec<OrderField>) -> Result<Vec<OrderField>, ProtocolError> {
     if fields.len() > MAX_ORDER_FIELDS
         || fields.iter().any(|f| {
-            let digits: Vec<u8> = f
-                .value
-                .bytes()
-                .filter(u8::is_ascii_digit)
-                .map(|b| b - b'0')
-                .collect();
-            let numeric = f
-                .value
-                .bytes()
-                .all(|b| b.is_ascii_digit() || b == b' ' || b == b'-');
-            let card_number = numeric
-                && (13..=19).contains(&digits.len())
-                && digits
-                    .iter()
-                    .rev()
-                    .enumerate()
-                    .map(|(i, &d)| {
-                        let d = if i % 2 == 1 { d * 2 } else { d };
-                        u32::from(if d > 9 { d - 9 } else { d })
-                    })
-                    .sum::<u32>()
-                    % 10
-                    == 0;
-            let label = f.label.to_lowercase();
-            let security_code = (3..=4).contains(&f.value.len())
-                && f.value.bytes().all(|b| b.is_ascii_digit())
-                && ["cvc", "cvv", "security"]
-                    .iter()
-                    .any(|word| label.contains(word));
+            let value: String = f.value.nfkc().collect();
+            let label = f.label.nfkc().collect::<String>().to_lowercase();
+            let code = value.trim();
+            let security_code = (3..=4).contains(&code.len())
+                && code.bytes().all(|b| b.is_ascii_digit())
+                && security_code_label(&label);
             f.label.chars().count() > 120
                 || f.value.chars().count() > 200
-                || card_number
+                || contains_card_number(&value)
                 || security_code
         })
     {

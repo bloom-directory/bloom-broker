@@ -1115,6 +1115,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "url",
  "uuid",
  "x509-parser",
