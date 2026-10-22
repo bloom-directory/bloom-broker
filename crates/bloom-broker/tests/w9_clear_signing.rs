@@ -275,6 +275,7 @@ impl Harness {
             expires_at_ms: DecimalU64::new(NOW_MS + 50_000),
             not_before_ms: DecimalU64::new(NOW_MS - 10),
             renewal_of: None,
+            session_budget: None,
         }
     }
 
@@ -331,6 +332,7 @@ impl Harness {
         let mut input = AuthorizationInput {
             expected_signer_public_key: None,
             request: MachineSignRequest {
+                session_use: None,
                 operation_id: operation_id.clone(),
                 operation_digest: Digest32::from_bytes([0; 32]),
                 approval_id: terms.approval_id().unwrap(),

@@ -209,6 +209,8 @@ pub struct ApprovalLimitState {
     pub committed_signatures: DecimalU64,
     pub reserved_signatures: DecimalU64,
     pub quarantined_signatures: DecimalU64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_budget_state: Option<crate::SessionBudgetState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

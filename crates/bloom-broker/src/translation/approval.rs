@@ -45,6 +45,11 @@ fn assurance_to_signer(value: north::ClaimAssuranceLevel) -> south::ClaimAssuran
 
 fn selector_to_signer(value: north::ApprovalSelector) -> south::ApprovalSelector {
     match value {
+        north::ApprovalSelector::SystemSession { scope } => {
+            south::ApprovalSelector::SystemSession {
+                scope: mirror(scope),
+            }
+        }
         north::ApprovalSelector::Exact {
             ordered_payload_digests,
             ordered_hashes,
@@ -156,7 +161,13 @@ pub(crate) fn validated_terms_to_signer(
         not_before_ms: value.not_before_ms,
         expires_at_ms: value.expires_at_ms,
         renewal_of: value.renewal_of,
+        session_budget: value.session_budget.map(mirror),
     }
+}
+
+pub(crate) fn mirror<T: serde::Serialize, U: serde::de::DeserializeOwned>(value: T) -> U {
+    serde_json::from_value(serde_json::to_value(value).expect("closed API type serializes"))
+        .expect("session API mirrors have identical wire fields")
 }
 
 #[cfg(test)]
@@ -224,6 +235,7 @@ mod tests {
             not_before_ms: north::DecimalU64::new(29),
             expires_at_ms: north::DecimalU64::new(30),
             renewal_of: Some(digest(31)),
+            session_budget: None,
         };
         terms.validate().unwrap();
         let mapped = validated_terms_to_signer(terms);
@@ -323,6 +335,7 @@ mod tests {
                 not_before_ms: north::DecimalU64::new(10),
                 expires_at_ms: north::DecimalU64::new(20),
                 renewal_of: None,
+                session_budget: None,
             };
             value.limits.max_signatures = north::DecimalU64::new(2);
             value

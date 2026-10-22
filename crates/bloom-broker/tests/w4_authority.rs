@@ -2135,6 +2135,7 @@ fn exact_terms(harness: &Harness, payload: &[u8]) -> SealedApprovalTerms {
         not_before_ms: DecimalU64::new(1_000),
         expires_at_ms: DecimalU64::new(2_000),
         renewal_of: None,
+        session_budget: None,
     }
 }
 
@@ -2273,6 +2274,7 @@ fn solana_terms(
         not_before_ms: DecimalU64::new(1_000),
         expires_at_ms: DecimalU64::new(2_000),
         renewal_of: None,
+        session_budget: None,
     }
 }
 
@@ -2288,6 +2290,7 @@ fn solana_input(
     let mut input = AuthorizationInput {
         expected_signer_public_key,
         request: MachineSignRequest {
+            session_use: None,
             operation_id,
             operation_digest: digest(5),
             approval_id: terms.approval_id().unwrap(),
@@ -2360,6 +2363,7 @@ fn petal_terms(harness: &Harness, provenance: &ProvenanceRecord) -> SealedApprov
         not_before_ms: DecimalU64::new(1_000),
         expires_at_ms: DecimalU64::new(2_000),
         renewal_of: None,
+        session_budget: None,
     }
 }
 
@@ -2372,6 +2376,7 @@ fn exact_input(
     let mut input = AuthorizationInput {
         expected_signer_public_key: None,
         request: MachineSignRequest {
+            session_use: None,
             operation_id,
             operation_digest: digest(5),
             approval_id: terms.approval_id().unwrap(),
@@ -2403,6 +2408,7 @@ fn exact_batch_input(
     let mut input = AuthorizationInput {
         expected_signer_public_key: None,
         request: MachineSignRequest {
+            session_use: None,
             operation_id,
             operation_digest: digest(5),
             approval_id: terms.approval_id().unwrap(),
@@ -2460,6 +2466,7 @@ fn petal_input(
     let mut input = AuthorizationInput {
         expected_signer_public_key: None,
         request: MachineSignRequest {
+            session_use: None,
             operation_id,
             operation_digest: digest(5),
             approval_id: terms.approval_id().unwrap(),
