@@ -7835,6 +7835,28 @@ async fn local_cross_surface_enrollment_uses_the_configured_ceremony_port() {
     );
 }
 
+/// Design previews exist only in developer-harness builds. A build without
+/// the harness serves no preview path at all.
+#[cfg(not(feature = "triad-dev-harness"))]
+#[tokio::test]
+async fn previews_are_absent_without_the_developer_harness() {
+    let broker = CeremonyBroker::new(Arc::new(MockSigner::new()));
+    for path in ["/preview", "/preview/enso-swap", "/preview/tokens.json"] {
+        let response = broker
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(header::HOST, "localhost:18734")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
 #[tokio::test]
 async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
     let signer = Arc::new(MockSigner::new());
@@ -9822,7 +9844,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
                 .uri(format!("/api/session/{ceremony_id}/complete"))
                 .header(header::HOST, "localhost:18734")
                 .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", token)
+                .header("x-bloom-ceremony-token", &token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("sec-fetch-site", "same-origin")
                 .body(Body::from(body))
@@ -9831,6 +9853,30 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         .await
         .unwrap();
     assert_eq!(completed.status(), StatusCode::OK);
+    // Registration capabilities are spent at completion: the link can no
+    // longer read, acknowledge or replay the result.
+    for (method, path, body) in [
+        ("GET", format!("/api/session/{ceremony_id}/result"), ""),
+        ("POST", format!("/api/session/{ceremony_id}/ack"), "{}"),
+    ] {
+        let spent = broker
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::HOST, "localhost:18734")
+                    .header(header::ORIGIN, "http://localhost:18734")
+                    .header("x-bloom-ceremony-token", &token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(spent.status(), StatusCode::FORBIDDEN, "{method}");
+    }
 
     let app = broker.router();
     let denied = app

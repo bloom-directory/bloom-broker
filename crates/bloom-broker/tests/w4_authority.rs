@@ -2248,6 +2248,39 @@ fn legacy_restrictions_block_activation_and_authorization_of_existing_approvals(
         error_code(harness.authority.authorize(&input).unwrap_err())
             .contains("POLICY_MIGRATION_REQUIRED")
     );
+
+    // The Signer-receipt activation path applies the same gate.
+    let mut receipt: bloom_signer_api::SignerActivationReceipt =
+        serde_json::from_value(serde_json::json!({
+            "activation_operation_id": operation(4),
+            "ceremony_id": digest(8),
+            "approval_id": grant.approval_id,
+            "approval_digest": grant.approval_id,
+            "review_manifest_digest": digest(7),
+            "key_ref": pending.key_ref,
+            "allowed_crypto_suites": pending.allowed_crypto_suites,
+            "activation_mode": pending.activation_mode,
+            "wallet_revocation_epoch": pending.wallet_revocation_epoch,
+            "replaced_approval_id": pending.renewal_of,
+            "activated_at_ms": "1000",
+            "expires_at_ms": "2000",
+            "signer_key_id": "ceremony-key",
+            "signer_signature": "",
+        }))
+        .unwrap();
+    let mut message = SIGNER_RECEIPT_DOMAIN.to_vec();
+    message.extend_from_slice(&receipt.unsigned_canonical_bytes().unwrap());
+    receipt.signer_signature =
+        Base64UrlBytes::from_bytes(&harness.ceremony_key.sign(&message).to_bytes());
+    assert!(
+        error_code(
+            harness
+                .authority
+                .activate_signer_receipt(&receipt, 1_500)
+                .unwrap_err()
+        )
+        .contains("POLICY_MIGRATION_REQUIRED")
+    );
 }
 
 #[test]

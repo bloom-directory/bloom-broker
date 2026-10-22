@@ -32,6 +32,8 @@ jobs:
           python3 -B crates/bloom-broker-api/tokens/tokens.py --offline crates/bloom-broker-api/tokens/fixtures/inputs-2026-10-22.json.gz --check crates/bloom-broker-api/tokens/tokens.json > /dev/null
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Check the developer-harness build
+        run: cargo clippy --locked -p bloom-broker --features triad-dev-harness --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --workspace --locked
       - name: Check shared Weiroll encoder vectors
