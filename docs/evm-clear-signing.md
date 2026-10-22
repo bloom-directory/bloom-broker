@@ -22,9 +22,11 @@ for every Petal. Artwork is bundled into Broker; the browser never contacts an
 image provider. The small static browser mapping retains issuer-reviewed
 SVGs bound to exact chain/address identities. Reviewed neutral bindings
 prevent pegged copies and pUSD from borrowing Circle's mark. CI checks this
-mapping and browser identity boundaries offline. Long-tail artwork and its
-acquisition pipeline remain preserved at Broker commit `2b7033a39163513a39b387a83abbaca80fcd0268`
-for separate review. A logo is decorative and never establishes identity, token
+mapping and browser identity boundaries offline. Every other catalog token's
+image is bundled too: `scripts/bundle-token-artwork.py` fetches each image from
+the curated lists for an exact chain/address already in `tokens.json`, bounds
+and re-encodes it as PNG, and records its source URL and hash in
+`artwork.json`; `--check` verifies the bundle offline in CI. A logo is decorative and never establishes identity, token
 behavior or decimals; a missing image uses the neutral icon.
 
 ## Released policy migration
@@ -213,7 +215,8 @@ call's fields labelled under it (`Safe transaction · Amount`). The inner
 call's warnings are prefixed the same way.
 
 Empty inner calldata is a plain value transfer, shown as `Send <amount> to
-<callee>`, or `No call` when the amount is zero. Calls nest at most two deep.
+<callee>`. With no amount it is still a call, shown as `Call <callee> with no
+data`, because the callee's code runs. Calls nest at most two deep.
 
 ## Instance and standard descriptions
 

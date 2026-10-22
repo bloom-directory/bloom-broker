@@ -843,7 +843,7 @@ fn render_embedded(
     let callee = checksum(&format!("0x{:x}", inner.to));
     if inner.calldata.is_empty() {
         let value = if inner.value.is_zero() {
-            format!("No call (empty calldata to {callee})")
+            format!("Call {callee} with no data; its code, if any, still runs")
         } else {
             let native = inner.native.as_ref().ok_or_else(|| {
                 unsupported("Bloom has no authenticated native units for this chain")

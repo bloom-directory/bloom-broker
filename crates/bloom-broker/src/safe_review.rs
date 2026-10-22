@@ -196,6 +196,17 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
             "Safe review owner differs from the Bloom signing key",
         ));
     }
+    // A refund pays a receiver from the Safe, and the review cannot show one.
+    // These are EIP-712 members, so the signed hash binds them.
+    let tx = &envelope.safe_tx;
+    if [&tx.safe_tx_gas, &tx.base_gas, &tx.gas_price]
+        .iter()
+        .any(|v| *v != "0")
+        || address(&tx.gas_token, "safe_tx.gas_token")? != Address::ZERO
+        || address(&tx.refund_receiver, "safe_tx.refund_receiver")? != Address::ZERO
+    {
+        return Err(invalid("Safe gas reimbursement fields must all be zero"));
+    }
     Ok(())
 }
 
@@ -679,6 +690,48 @@ mod tests {
         let mut request = request;
         request.safe_review_payloads[0] = Base64UrlBytes::from_bytes(&changed);
         assert!(review(&request, &policy(), from).is_err());
+    }
+
+    #[test]
+    fn refuses_any_gas_reimbursement() {
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+        for (field, value) in [
+            ("safe_tx_gas", "1"),
+            ("base_gas", "1"),
+            ("gas_price", "1"),
+            ("gas_token", "0x9999999999999999999999999999999999999999"),
+            (
+                "refund_receiver",
+                "0x9999999999999999999999999999999999999999",
+            ),
+        ] {
+            let mut changed: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+            changed["safe_tx"][field] = serde_json::json!(value);
+            let changed = serde_jcs::to_vec(&changed).unwrap();
+            assert!(
+                review(&request(changed), &policy(), from).is_err(),
+                "{field} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_zero_value_call_is_still_a_call() {
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        value["safe_tx"]["to"] = serde_json::json!("0x2222222222222222222222222222222222222222");
+        value["safe_tx"]["value"] = serde_json::json!("0");
+        let plan = review(
+            &request(serde_jcs::to_vec(&value).unwrap()),
+            &policy(),
+            from,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            plan.action[0],
+            "Action: Call 0x2222222222222222222222222222222222222222 with no data; its code, if any, still runs"
+        );
     }
 
     #[test]
