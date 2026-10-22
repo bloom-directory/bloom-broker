@@ -5754,6 +5754,52 @@ mod remote_storage_tests {
         transaction.commit().unwrap();
     }
 
+    /// A fresh install creates `ceremony_sessions` without the old UNIQUE
+    /// constraint on `operation_id`, so it takes the branch that only adds
+    /// the partial index, never the rebuild above. On every fresh install
+    /// that index is all that keeps one primary session per operation.
+    #[test]
+    fn a_fresh_ceremony_table_still_allows_one_primary_session_per_operation() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ceremony_sessions (
+                    ceremony_id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL,
+                    session_jcs TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(
+            !migrate_pairing_session_index(&transaction).unwrap(),
+            "a fresh table has nothing to rebuild"
+        );
+        transaction.commit().unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO ceremony_sessions VALUES ('destination', 'operation', '{}')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO ceremony_sessions VALUES ('source', 'operation', ?1)",
+                [r#"{"auxiliary":true}"#],
+            )
+            .expect("an auxiliary session may share the primary's operation");
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO ceremony_sessions VALUES ('duplicate', 'operation', '{}')",
+                    [],
+                )
+                .is_err(),
+            "a second primary session for one operation must be refused"
+        );
+    }
+
     #[test]
     fn precommit_cookie_expires_even_while_browser_cookie_remains_present() {
         let auth = RemoteBrowserAuth {
