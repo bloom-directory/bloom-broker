@@ -210,6 +210,47 @@ fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolErro
     Ok(())
 }
 
+/// Whether the Safe transaction can change the Safe's owners, modules or
+/// code: a call to the Safe itself, a delegatecall to anything but Safe's own
+/// batch and deployment libraries, or a batch with a call to the Safe.
+fn can_reconfigure_safe(
+    envelope: &Envelope,
+    catalog: &bloom_evm_clear_signing::Catalog,
+    chain_id: u64,
+) -> Result<bool, ProtocolError> {
+    let safe = address(&envelope.safe_address, "safe_address")?;
+    let to = address(&envelope.safe_tx.to, "safe_tx.to")?;
+    if to == safe {
+        return Ok(true);
+    }
+    if envelope.safe_tx.operation == 0 {
+        return Ok(false);
+    }
+    if !catalog.is_safe_library(chain_id, &format!("{to:#x}")) {
+        return Ok(true);
+    }
+    // MultiSend packs (operation, to, value, length, data) entries.
+    let data = bytes(&envelope.safe_tx.data, "safe_tx.data")?;
+    let packed = match data
+        .get(4..)
+        .map(|args| alloy_dyn_abi::DynSolType::Bytes.abi_decode(args))
+    {
+        Some(Ok(alloy_dyn_abi::DynSolValue::Bytes(packed))) => packed,
+        _ => return Ok(false),
+    };
+    let mut rest = packed.as_slice();
+    while rest.len() >= 85 {
+        if Address::from_slice(&rest[1..21]) == safe {
+            return Ok(true);
+        }
+        let length = usize::try_from(U256::from_be_slice(&rest[53..85])).unwrap_or(usize::MAX);
+        rest = rest
+            .get(85usize.saturating_add(length)..)
+            .unwrap_or_default();
+    }
+    Ok(false)
+}
+
 /// The heading of a Safe transaction Bloom could not read.
 pub(crate) const OPAQUE_ACTION: &str = "Action: Contract call Bloom cannot read";
 
@@ -358,6 +399,14 @@ pub(crate) fn review(
                     call.structural,
                 )),
             )
+        }
+        // A delegatecall or a call to the Safe itself can change its owners,
+        // modules or code. Unreadable, those are refused rather than shown.
+        Err(error) if can_reconfigure_safe(&envelope, catalog, chain_id)? => {
+            return Err(invalid(format!(
+                "Safe delegatecalls and self-calls Bloom cannot read are refused: {}",
+                error.detail
+            )));
         }
         Err(error) => (
             vec![
@@ -712,6 +761,49 @@ mod tests {
                 review(&request(changed), &policy(), from).is_err(),
                 "{field} was accepted"
             );
+        }
+    }
+
+    #[test]
+    fn refuses_unreadable_delegatecalls_and_self_calls() {
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+        let mut delegate: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        delegate["safe_tx"]["value"] = serde_json::json!("0");
+        delegate["safe_tx"]["operation"] = serde_json::json!(1);
+        delegate["safe_tx"]["data"] = serde_json::json!("0xdeadbeef");
+        let mut self_call: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        self_call["safe_tx"]["to"] =
+            serde_json::json!("0x1000000000000000000000000000000000000000");
+        self_call["safe_tx"]["value"] = serde_json::json!("0");
+        self_call["safe_tx"]["data"] = serde_json::json!("0xdeadbeef");
+        let mut batch: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        batch["chain_id"] = serde_json::json!("8453");
+        batch["safe_tx"]["to"] = serde_json::json!("0xa83c336b20401af773b6219ba5027174338d1836");
+        batch["safe_tx"]["operation"] = serde_json::json!(1);
+        batch["safe_tx"]["value"] = serde_json::json!("0");
+        batch["safe_tx"]["data"] = serde_json::json!(format!(
+            "0x{}",
+            hex::encode(multisend_calldata(&multisend_entry(
+                "0x1000000000000000000000000000000000000000",
+                0,
+                &[0xde, 0xad, 0xbe, 0xef],
+            )))
+        ));
+        let mut base = policy();
+        base.allowed_destinations[0].chain = token("evm-8453");
+        assert!(
+            super::review(
+                &request(serde_jcs::to_vec(&batch).unwrap()),
+                &base,
+                from,
+                &catalog_on(8453),
+            )
+            .is_err(),
+            "a batch call to the Safe itself was not refused"
+        );
+        for changed in [delegate, self_call] {
+            let changed = serde_jcs::to_vec(&changed).unwrap();
+            assert!(review(&request(changed), &policy(), from).is_err());
         }
     }
 

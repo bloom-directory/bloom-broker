@@ -569,8 +569,13 @@ fn review_at(
                                 (Some(bytes), Some(value)) => {
                                     let inner = CallContext { to: step.target, value, calldata: bytes, ..context.clone() };
                                     match review_at(catalog, &inner, depth + 1) {
-                                        Ok((reading, entries)) => {
+                                        Ok((mut reading, entries)) => {
                                             for entry in entries { if !used.contains(&entry) { used.push(entry); } }
+                                            // The Enso executor makes this call with its own
+                                            // balance, not the owner's account.
+                                            for warning in &mut reading.warnings {
+                                                *warning = warning.replace("your ", "the Enso executor's ");
+                                            }
                                             step.reading = Some(reading);
                                         }
                                         Err(error) => step.unread_reason = Some(error.to_string()),

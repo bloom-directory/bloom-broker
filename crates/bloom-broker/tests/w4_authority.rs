@@ -2194,6 +2194,62 @@ fn policy_update_rejects_a_machine_claimed_diff_that_broker_did_not_derive() {
     );
 }
 
+fn legacy_policy(harness: &Harness) -> CanonicalWalletPolicy {
+    let mut legacy: CanonicalWalletPolicy =
+        serde_json::from_slice(&harness.policy_snapshot(1).canonical_policy.decode()).unwrap();
+    legacy.clear_signing = Some(bloom_broker_api::LegacyClearSigningPolicy {
+        catalog_id: token("bloom-tokens"),
+        trusted_keys: vec![bloom_broker_api::LegacyCatalogTrustedKey {
+            key_id: token("publisher"),
+            verifying_key: Base64UrlBytes::from_bytes(&[7; 32]),
+        }],
+        signature_threshold: 1,
+        maximum_observation_age_ms: 86_400_000,
+        opaque_exact_allowed: false,
+        unlimited_allowance_allowed: false,
+        verifier: bloom_broker_api::RequiredVerifier {
+            verifier_id: token("evm-clear-signing-v1"),
+            verifier_digest: digest(42),
+        },
+    });
+    legacy.required_verifiers = vec![legacy.clear_signing.as_ref().unwrap().verifier.clone()];
+    legacy
+}
+
+/// An approval made before an upgrade cannot be activated or used while the
+/// wallet still carries the retired restrictions.
+#[test]
+fn legacy_restrictions_block_activation_and_authorization_of_existing_approvals() {
+    let harness = Harness::new();
+    let provenance = harness.system_provenance();
+    harness.authority.install_provenance(&provenance).unwrap();
+    let pending = exact_terms(&harness, b"pending");
+    let approval_id = harness
+        .authority
+        .prepare_approval(&pending, &digest(7))
+        .unwrap();
+    let grant = harness.signed_grant(&pending, approval_id, operation(3));
+    let active = exact_terms(&harness, b"active");
+    harness.activate(&active, Some(&provenance));
+
+    let snapshot = signed_policy_snapshot(&harness, 2, &legacy_policy(&harness));
+    harness.authority.install_policy(&snapshot).unwrap();
+    assert!(
+        error_code(
+            harness
+                .authority
+                .activate_approval(&grant, 1_500)
+                .unwrap_err()
+        )
+        .contains("POLICY_MIGRATION_REQUIRED")
+    );
+    let input = exact_input(&harness, &active, operation(10), b"active");
+    assert!(
+        error_code(harness.authority.authorize(&input).unwrap_err())
+            .contains("POLICY_MIGRATION_REQUIRED")
+    );
+}
+
 #[test]
 fn legacy_restrictions_survive_reload_and_block_grants_until_explicit_policy_replacement() {
     let directory = tempfile::tempdir().unwrap();

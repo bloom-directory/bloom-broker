@@ -4167,7 +4167,21 @@ async fn prepare_wallet_backup(
                 && session.expires_at_ms > now
         })
         .cloned();
-    if let Some(session) = pending {
+    // A page that already bound its output key holds that session; any other
+    // caller, such as another local process, gets a fresh one rather than
+    // being able to park the owner's backup on a key it controls.
+    let bound = |session: &BrowserSession| {
+        session
+            .projection
+            .signer_contribution
+            .get("browser_output_recipient_key")
+            .is_some_and(|key| !key.is_null())
+    };
+    if let Some(session) = pending.as_ref().filter(|session| bound(session)) {
+        if broker.cancel(&session.operation_id, now).is_err() {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    } else if let Some(session) = pending {
         if let Some(response) =
             broker.stable_custody_response(&session.operation_id, &session.request_digest)
         {

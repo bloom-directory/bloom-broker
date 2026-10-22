@@ -227,10 +227,10 @@ pub(crate) fn review(
     Ok(Some(review))
 }
 
-/// Show an unlisted token's amount with the symbol and decimals the token
-/// reports, read by Machine. Only the display changes, and it says so: the
-/// exact raw amount stays in the fields. A report for any other contract, or
-/// one whose symbol is not a plain label, is ignored.
+/// Add what an unlisted token reports about itself, read by Machine, as a
+/// marked claim. The headline keeps raw units: a token can call itself USDC
+/// with any decimals. A report for any other contract, or one whose symbol is
+/// not a plain label, is ignored.
 fn show_reported_token(review: &mut EvmReview, reported: &bloom_broker_api::EvmReportedToken) {
     let symbol = &reported.symbol;
     if symbol.is_empty()
@@ -256,14 +256,12 @@ fn show_reported_token(review: &mut EvmReview, reported: &bloom_broker_api::EvmR
         else {
             continue;
         };
-        intent.amount_display = format!(
-            "{} {symbol}",
-            bloom_evm_clear_signing::format_base_units(&intent.amount, reported.decimals)
-        );
         call.warnings.push(format!(
-            "{symbol} and its {} decimals are what the token contract reports about itself; \
-             Bloom has not verified them. The exact amount is {} raw units.",
-            reported.decimals, intent.amount
+            "The token calls itself {symbol} with {} decimals, which would make this {} {symbol}. \
+             Bloom has not verified this; the amount signed is {} raw units.",
+            reported.decimals,
+            bloom_evm_clear_signing::format_base_units(&intent.amount, reported.decimals),
+            intent.amount
         ));
     }
 }
@@ -1368,8 +1366,9 @@ pub(crate) mod mode_tests {
         assert!(decoded.clear_signing.is_none());
     }
 
-    /// The token's own symbol and decimals shape the display, marked as
-    /// unverified; a report naming another contract or carrying markup does not.
+    /// The token's own symbol and decimals appear only as a marked claim; the
+    /// headline stays in raw units. A report naming another contract or
+    /// carrying markup is ignored.
     #[test]
     fn an_unlisted_token_shows_the_amount_it_reports_about_itself() {
         let read = |address: &str, symbol: &str| {
@@ -1385,26 +1384,18 @@ pub(crate) mod mode_tests {
                 .unwrap();
             review.payloads[0].contract_call.clone().unwrap()
         };
-        let shown = read(&RECIPIENT.to_lowercase(), "BRETT");
+        let shown = read(&RECIPIENT.to_lowercase(), "USDC");
         let summary = shown.intent_summary.as_ref().unwrap();
-        assert_eq!(summary.amount_display, "2.5 BRETT");
+        assert!(summary.amount_display.contains("raw units"));
+        assert!(!summary.amount_display.contains("USDC"));
         assert_eq!(summary.amount, "2500000");
         assert!(summary.token.is_none() && shown.structural);
-        assert!(
-            shown
-                .warnings
-                .iter()
-                .any(|w| w.contains("has not verified them"))
-        );
+        assert!(shown.warnings.iter().any(|w| w.contains(
+            "The token calls itself USDC with 6 decimals, which would make this 2.5 USDC"
+        )));
         for (address, symbol) in [(TOKEN_ADDRESS, "BRETT"), (RECIPIENT, "<b>X</b>")] {
             let ignored = read(address, symbol);
-            assert!(
-                ignored
-                    .intent_summary
-                    .unwrap()
-                    .amount_display
-                    .contains("raw units")
-            );
+            assert!(!ignored.warnings.iter().any(|w| w.contains("calls itself")));
         }
     }
 

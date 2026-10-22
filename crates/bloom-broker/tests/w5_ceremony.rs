@@ -1434,6 +1434,36 @@ const unknownPrimary = nodes.review.children.filter(node => node.tagName !== "DE
 if (!unknownPrimary.includes("7 raw units") || !unknownPrimary.includes("Token identity and decimals are unverified") || unknownPrimary.includes("7 USDC")) {{
   throw new Error("Unknown Enso output was hidden or borrowed an identified token's units");
 }}
+if (!unknownPrimary.includes("No output protection")) {{
+  throw new Error("A minimum in an unrecognised output token was presented as protection");
+}}
+// Every output needs a positive minimum, not just one of them.
+const multiMinimum = structuredClone(PREVIEW_PM80_READINGS["enso-output"]);
+const firstMinimum = multiMinimum.fields.find(field => field.label.startsWith("Requested minimum balance increase"));
+multiMinimum.fields.push({{...firstMinimum, label: "Requested minimum balance increase 2", raw: "0x" + "0".repeat(128)}});
+if (ensoHasMinimum(multiMinimum)) throw new Error("A zero minimum on a second output was treated as protection");
+// Output sent to another address is called out beside the decision.
+const stranger = previewSession("enso-output");
+const strangerPlan = JSON.parse(stranger.review_manifest.canonical_plan);
+strangerPlan.evm_review.payloads[0].contract_call.fields.find(field => field.label === "Output receiver").value =
+  "0x000000000000000000000000000000000000dEaD";
+stranger.review_manifest.canonical_plan = JSON.stringify(strangerPlan);
+renderReview(stranger);
+if (!nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ").includes("Output goes to another address")) {{
+  throw new Error("An Enso swap paying a stranger was not flagged");
+}}
+// An Enso call in a batch does not hide the other transactions' warnings.
+const mixed = previewSession("enso-output");
+const mixedBatch = JSON.parse(mixed.review_manifest.canonical_plan);
+const allowance = JSON.parse(previewSession("enso-allowance").review_manifest.canonical_plan).evm_review.payloads[0];
+const allowanceWarning = "Distinct batch warning that only the banner shows.";
+allowance.contract_call.warnings = [allowanceWarning];
+mixedBatch.evm_review.payloads.unshift(allowance);
+mixed.review_manifest.canonical_plan = JSON.stringify(mixedBatch);
+renderReview(mixed);
+if (!nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ").includes(allowanceWarning)) {{
+  throw new Error("An Enso call in a batch hid another transaction's warning");
+}}
 renderReview(previewSession("safe-token-transfer"));
 const safeFlow = nodes.review.children.find(node => String(node.className).includes("ceremony-transfer-path"));
 if (!safeFlow || !allText(safeFlow).includes("−25 USDC") || !allText(safeFlow).includes("+25 USDC")) {{
@@ -10081,6 +10111,101 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         .await
         .unwrap();
     assert_eq!(replay_after_ack.status(), StatusCode::FORBIDDEN);
+
+    // The wallet API refuses requests that are not from the page itself.
+    for (host, site, content_type) in [
+        ("evil.invalid", "same-origin", "application/json"),
+        ("localhost:18734", "", "application/json"),
+        ("localhost:18734", "same-origin", "text/plain"),
+    ] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/wallet/quiet-lilac/backup")
+            .header(header::HOST, host)
+            .header(header::ORIGIN, "http://localhost:18734")
+            .header(header::CONTENT_TYPE, content_type);
+        if !site.is_empty() {
+            request = request.header("sec-fetch-site", site);
+        }
+        let status = app
+            .clone()
+            .oneshot(request.body(Body::from("{}")).unwrap())
+            .await
+            .unwrap()
+            .status();
+        assert!(
+            status.is_client_error(),
+            "{host} / {site:?} / {content_type} was accepted: {status}"
+        );
+    }
+
+    // A backup whose output key another caller already bound is not handed
+    // back: the next request gets a fresh backup instead of a stuck one.
+    let first: bloom_broker_api::CustodyPrepareResponse = serde_json::from_slice(
+        &app.clone()
+            .oneshot(backup_request("http://localhost:18734", "{}"))
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    let first_operation = OperationId::new(first.custody_operation_id.as_str()).unwrap();
+    let first_id = broker
+        .public_status(&first_operation)
+        .unwrap()
+        .ceremony_id
+        .to_string();
+    let parked = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/session/{first_id}/output-key"))
+                .header(header::HOST, "localhost:18734")
+                .header(header::ORIGIN, "http://localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&first.ceremony_url))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "recipient_key": HpkeRecipient::generate().public_key()
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(parked.status(), StatusCode::OK);
+    // Replacing it cancels the parked session; the wallet's short cancellation
+    // backoff then applies before the fresh one.
+    let replaced = app
+        .clone()
+        .oneshot(backup_request("http://localhost:18734", "{}"))
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), StatusCode::CONFLICT);
+    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+    let fresh = app
+        .clone()
+        .oneshot(backup_request("http://localhost:18734", "{}"))
+        .await
+        .unwrap();
+    let status = fresh.status();
+    let fresh_bytes = fresh.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&fresh_bytes)
+    );
+    let fresh: bloom_broker_api::CustodyPrepareResponse =
+        serde_json::from_slice(&fresh_bytes).unwrap();
+    assert_ne!(fresh.custody_operation_id, first.custody_operation_id);
 }
 
 /// Bundled token artwork is chosen by chain id and full contract address, and

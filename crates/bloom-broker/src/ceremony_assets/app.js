@@ -368,10 +368,17 @@ function reviewCallFields(call) {
 function shapeOnly(call) {
   return Boolean(call?.intent_summary && !call.intent_summary.token);
 }
+function ensoMinimums(call) {
+  return (call.fields || []).filter(field => /^Requested minimum balance increase(?: \d+)?$/.test(field.label));
+}
+// Protection needs every output to have a positive minimum in a token Bloom
+// recognises: the router checks the token's own balanceOf, so an unknown
+// token's minimum protects nothing.
 function ensoHasMinimum(call) {
-  return call.function_signature.startsWith("safeRoute") && (call.fields || []).some(field =>
-    /^Requested minimum balance increase(?: \d+)?$/.test(field.label) &&
-    /^0x(?:[a-f0-9]{64}){1,2}$/i.test(field.raw) && BigInt("0x" + field.raw.slice(-64)) > 0n);
+  const minimums = ensoMinimums(call);
+  return call.function_signature.startsWith("safeRoute") && minimums.length > 0 && minimums.every(field =>
+    /^0x(?:[a-f0-9]{64}){1,2}$/i.test(field.raw) && BigInt("0x" + field.raw.slice(-64)) > 0n &&
+    (field.asset?.token || field.format === "nativeAmount"));
 }
 // Headings describe the requested call. None of them promise an outcome:
 // Bloom has not executed anything, and a passkey response is an approval,
@@ -1541,9 +1548,11 @@ function renderReview(session) {
         if (!ensoHasMinimum(call)) {
           outputWarning = el("aside", {class: "ceremony-warning", "aria-label": "No output protection"},
             el("strong", {}, "No output protection"),
-            el("p", {}, call.function_signature.startsWith("safeRoute")
-              ? "This request sets no positive output minimum. You may spend the input without receiving the expected output."
-              : "This request sets no output token, receiver or minimum return. You may spend the input without receiving the expected output."));
+            el("p", {}, !call.function_signature.startsWith("safeRoute")
+              ? "This request sets no output token, receiver or minimum return. You may spend the input without receiving the expected output."
+              : ensoMinimums(call).some(field => !field.asset?.token && field.format !== "nativeAmount")
+                ? "Bloom does not recognise an output token, and the router's minimum check trusts that token's own balance. You may spend the input without receiving anything of value."
+                : "An output has no positive minimum. You may spend the input without receiving the expected output."));
         }
         evidence.push(el("p", {}, call.warnings?.join(" ") || call.assurance));
       }
@@ -1584,13 +1593,17 @@ function renderReview(session) {
           if (!reading || step.target.toLowerCase() !== reading.contract.toLowerCase()) {
             section.append(partyRow({role: "contract", label: "Called contract", value: step.target, chainId: payload.chain_id}));
           }
-          if (step.call_type !== "CALL") {
+          if (!["CALL", "CALL with native value", "STATICCALL"].includes(step.call_type)) {
             section.append(el("p", {}, `Execution mode: ${step.call_type}`));
             decision.push(el("aside", {class: "ceremony-warning"}, `Route includes ${step.call_type} execution.`));
           }
           if (step.native_value !== "0 raw native units") {
             section.append(el("p", {}, `Native value: ${step.native_value}`));
-            decision.push(el("p", {}, `Additional instruction value: ${step.native_value}`));
+            // Forwarding the ETH the owner pays is not an extra charge.
+            const units = step.native_value.match(/^(\d+) raw native units$/)?.[1];
+            if (!units || BigInt(units) > BigInt(payload.value || "0")) {
+              decision.push(el("p", {}, `Additional instruction value: ${step.native_value}`));
+            }
           }
           execution.push(section);
           evidence.push(el("p", {}, `${field.label}: ${field.value}. Execution mode: ${step.call_type}. Native value: ${step.native_value}`));
@@ -1621,6 +1634,9 @@ function renderReview(session) {
         }
         if (enso && field.label === "Output receiver") {
           const self = field.value.toLowerCase() === String(payload.sender).toLowerCase();
+          if (!self) decision.push(el("aside", {class: "ceremony-warning"},
+            el("strong", {}, "Output goes to another address"),
+            el("p", {}, `The swap output is sent to ${field.value}, not to the signing account.`)));
           decision.push(partyRow({role: "recipient", label: self ? "Receiver · Signing account" : "Receiver",
             name: self ? accountName : null, value: field.value, chainId: payload.chain_id}));
           continue;
@@ -1650,8 +1666,12 @@ function renderReview(session) {
         argumentsList));
     }
     if (transfer.warnings?.length) {
-      const enso = transfer.payloads?.some(payload => payload.contract_call?.contract_name === "Enso Router V2");
-      if (!enso) primaryWarnings.push(...transfer.warnings);
+      // The Enso section shows the router call's own warnings; every other
+      // payload's warnings still lead the page.
+      const ensoOwn = new Set((transfer.payloads || [])
+        .filter(payload => payload.contract_call?.contract_name === "Enso Router V2")
+        .flatMap(payload => reviewedContractCall(payload)?.warnings || []));
+      primaryWarnings.push(...transfer.warnings.filter(warning => !ensoOwn.has(warning)));
     }
     for (const card of transfer.intent.cards || []) {
       const unlimited = card.magnitude === "unlimited";
