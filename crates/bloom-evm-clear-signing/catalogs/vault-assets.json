@@ -1,0 +1,28 @@
+{
+  "schema": "bloom.vault-asset-bindings.v1",
+  "bindings": [
+    {
+      "chain_id": 8453,
+      "vault": "0xc1256ae5ff1cf2719d4937adb3bbccab2e00a2ca",
+      "asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+      "observation": {
+        "date": "2026-10-18",
+        "block_number": 52786455,
+        "block_hash": "0x59cab3b8241e248706841c2657209399d3978a2283b5dce43ab4c97478a50da3",
+        "runtime_code_keccak": "0xca56bf34ea3b781d633c62274f5ad1bb2e987d82eb0c6fc038febde1f0e7cfb1",
+        "rpc_sources": [
+          "https://mainnet.base.org",
+          "https://base-rpc.publicnode.com"
+        ],
+        "asset_decimals": 6,
+        "sourcify_url": "https://sourcify.dev/server/v2/contract/8453/0xc1256ae5ff1cf2719d4937adb3bbccab2e00a2ca",
+        "sourcify_match_id": "96333",
+        "sourcify_runtime_match": "exact_match",
+        "verified_contract": "src/MetaMorpho.sol:MetaMorpho",
+        "source_bundle_sha256": "0b40bc0b062b11ea66c25a9aca94cf208ff1947a865889f16da015a8ba45e222",
+        "asset_binding": "ERC4626 private immutable _asset; inherited getter is not overridden in MetaMorpho",
+        "limits": "Release-time trusted catalog binding; Broker does not fetch chain state or certify current bytecode, balances, share price or settlement."
+      }
+    }
+  ]
+}

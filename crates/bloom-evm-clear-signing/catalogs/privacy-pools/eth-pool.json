@@ -1,0 +1,120 @@
+{
+  "$schema": "https://eips.ethereum.org/assets/eip-7730/erc7730-v2.schema.json",
+  "$comment": "Source: 0xbow-io/privacy-pools-core d494b63e79f33bb2b0c8ece6cdacdca465c3b884, packages/contracts/src/contracts. Mainnet addresses: bloom-petal-privacy-pools protocol.rs; listed bindings do not attest runtime code or proof validity.",
+  "context": {
+    "contract": {
+      "deployments": [
+        {
+          "chainId": 1,
+          "address": "0xf241d57c6debae225c0f2e6ea1529373c9a9c9fb"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "contractName": "Privacy Pools ETH pool"
+  },
+  "display": {
+    "formats": {
+      "withdraw((address processooor,bytes data) withdrawal,(uint256[2] pA,uint256[2][2] pB,uint256[2] pC,uint256[8] pubSignals) proof)": {
+        "intent": "Direct ETH withdrawal; proof validity and settlement are not verified by this reading",
+        "fields": [
+          {
+            "path": "withdrawal.processooor",
+            "label": "Recipient / required caller",
+            "format": "addressName"
+          },
+          {
+            "path": "withdrawal.data",
+            "label": "Direct withdrawal data",
+            "visible": {
+              "mustMatch": [
+                "0x"
+              ]
+            }
+          },
+          {
+            "path": "proof.pubSignals.[2]",
+            "label": "Withdrawal",
+            "format": "amount"
+          },
+          {
+            "path": "proof.pA.[0]",
+            "label": "Proof pA 1",
+            "format": "raw"
+          },
+          {
+            "path": "proof.pA.[1]",
+            "label": "Proof pA 2",
+            "format": "raw"
+          },
+          {
+            "path": "proof.pB.[0].[0]",
+            "label": "Proof B 1 1",
+            "format": "raw"
+          },
+          {
+            "path": "proof.pB.[0].[1]",
+            "label": "Proof B 1 2",
+            "format": "raw"
+          },
+          {
+            "path": "proof.pB.[1].[0]",
+            "label": "Proof B 2 1",
+            "format": "raw"
+          },
+          {
+            "path": "proof.pB.[1].[1]",
+            "label": "Proof B 2 2",
+            "format": "raw"
+          },
+          {
+            "path": "proof.pC.[0]",
+            "label": "Proof pC 1",
+            "format": "raw"
+          },
+          {
+            "path": "proof.pC.[1]",
+            "label": "Proof pC 2",
+            "format": "raw"
+          },
+          {
+            "path": "proof.pubSignals.[0]",
+            "label": "Replacement commitment",
+            "format": "raw"
+          },
+          {
+            "path": "proof.pubSignals.[1]",
+            "label": "Spent nullifier",
+            "format": "raw"
+          },
+          {
+            "path": "proof.pubSignals.[3]",
+            "label": "State root",
+            "format": "raw"
+          },
+          {
+            "path": "proof.pubSignals.[4]",
+            "label": "State tree depth",
+            "format": "raw"
+          },
+          {
+            "path": "proof.pubSignals.[5]",
+            "label": "ASP root",
+            "format": "raw"
+          },
+          {
+            "path": "proof.pubSignals.[6]",
+            "label": "ASP tree depth",
+            "format": "raw"
+          },
+          {
+            "path": "proof.pubSignals.[7]",
+            "label": "Context",
+            "format": "raw"
+          }
+        ]
+      }
+    }
+  }
+}
