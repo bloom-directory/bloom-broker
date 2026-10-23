@@ -9,6 +9,69 @@ use crate::{
 
 const APPROVAL_DOMAIN: &[u8] = b"bloom-sealed-approval-terms/v1";
 
+/// Petal operation class whose owner signature is an opaque EIP-712 preimage,
+/// reviewable only through the Safe envelope Broker rebuilds it from. Broker
+/// refuses an exact approval from a package declaring this class without one.
+///
+/// The gate is keyed on this name, and the name comes from the package's
+/// installer-signed provenance record, so it constrains a package that
+/// declares it and not one that does not. A Safe petal packaged under
+/// `transaction.confirm` — the generic class this repository's own provenance
+/// examples use — signs the same preimage with no envelope, no safeTxHash
+/// rebuild and no Safe facts on screen. Nothing here can detect that: an
+/// exact approval carries 32-byte hashes, and a `safeTxHash` is not
+/// distinguishable from any other keccak.
+///
+/// Closing it properly means Broker owning the mapping from package to class
+/// rather than reading it from the package. Inverting the default instead —
+/// requiring some review envelope for every Petal-subject exact approval —
+/// would refuse every petal that legitimately signs an exact payload today,
+/// which is why `subject_is_native_evm_transaction` excludes Petal subjects.
+/// That is a Petal-contract decision, not a local one. Neither Machine nor
+/// Broker identifies a Safe preimage registered under another class. Registering
+/// the Safe Petal under this class is a release-trust requirement.
+pub const SAFE_CONFIRM_OPERATION_CLASS: &str = "safe.transaction.confirm";
+
+/// Released Petal operation classes whose exact signatures require a full
+/// message preimage review. Reusable grants cannot review future messages.
+pub const MESSAGE_REVIEW_OPERATION_CLASSES: &[&str] = &[
+    "gasless.relay",
+    "venice-x402.topup",
+    "venice-x402.chat",
+    "venice-x402.balance",
+    "hyperliquid.approve_agent",
+    "hyperliquid.usd_send",
+    "hyperliquid.usd_class_transfer",
+    "hyperliquid.withdraw",
+    "hyperliquid.order",
+    "hyperliquid.cancel",
+    "hyperliquid.cancel_by_cloid",
+    "hyperliquid.schedule_cancel",
+    "hyperliquid.update_leverage",
+];
+
+/// These callers use the batch host API with one exact prepared signature.
+/// Onboarding also has a separate reusable, single-use login grant; it is
+/// intentionally not converted into an exact timestamp-bound login approval.
+pub const POLYMARKET_REVIEW_OPERATION_CLASSES: &[&str] = &[
+    "polymarket.order.poly1271",
+    "polymarket.relayer_batch",
+    "polymarket.onboard",
+];
+
+/// Immutable v1 profile: Polygon ClobAuth, nonce 0, one signature, selected
+/// owner, fixed attestation and a timestamp within 300 seconds at use. A wider
+/// profile must have a new class so existing grants cannot silently widen.
+pub const POLYMARKET_CLOB_AUTH_CLASS: &str = "polymarket.clob_auth.v1";
+
+pub fn message_review_requires_exact(class: &str) -> bool {
+    MESSAGE_REVIEW_OPERATION_CLASSES.contains(&class)
+        || matches!(
+            class,
+            "polymarket.order.poly1271" | "polymarket.relayer_batch" | "polymarket.onboard"
+        )
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApprovalSubject {

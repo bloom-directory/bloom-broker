@@ -1,0 +1,29 @@
+{
+  "metadata": {
+    "contractName": "ERC-721/ERC-1155 operator interface"
+  },
+  "context": {
+    "contract": {}
+  },
+  "display": {
+    "formats": {
+      "setApprovalForAll(address operator, bool approved)": {
+        "intent": "Set operator permission for every token ID; contract behavior is unverified for unlisted addresses",
+        "fields": [
+          {
+            "path": "operator",
+            "label": "Operator",
+            "format": "addressName"
+          },
+          {
+            "path": "approved",
+            "label": "Approved",
+            "format": "raw"
+          }
+        ]
+      }
+    }
+  },
+  "$schema": "https://eips.ethereum.org/assets/eip-7730/erc7730-v2.schema.json",
+  "$comment": "ERC-721 / ERC-1155 common operator method; unlisted addresses are structural readings. Source: eips.ethereum.org/EIPS/eip-1155."
+}

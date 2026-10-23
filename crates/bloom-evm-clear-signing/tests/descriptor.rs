@@ -27,14 +27,8 @@ fn six_format_descriptor() -> Value {
     })
 }
 
-fn six_catalog(descriptor: Value) -> Result<AcceptedCatalog, ReviewError> {
-    let functions = vec![AdmittedFunction {
-        signature: SIX.into(),
-        action_class: ActionClass::Other,
-    }];
-    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    accept(&catalog)
+fn six_catalog(descriptor: Value) -> Result<Catalog, ReviewError> {
+    build(vec![descriptor], vec![token(TOKEN, 6)])
 }
 
 fn six_calldata(mode: u64, deadline: u64) -> Vec<u8> {
@@ -55,7 +49,7 @@ fn six_calldata(mode: u64, deadline: u64) -> Vec<u8> {
 fn all_six_formats_render_from_authenticated_data() {
     let catalog = six_catalog(six_format_descriptor()).unwrap();
     let bytes = six_calldata(1, 1_760_000_000);
-    let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
 
     assert_eq!(field(&call, "Operator").value, checksum(RECIPIENT));
     assert_eq!(field(&call, "Fee").value, "1.5 EXA");
@@ -80,7 +74,7 @@ fn each_format_has_an_invalid_input_that_fails_review() {
     // enum: a value the signed map does not label.
     let unknown_mode = six_calldata(2, 1_760_000_000);
     assert_eq!(
-        review_call(&accepted, &context(&unknown_mode, false))
+        review_call(&accepted, &context(&unknown_mode))
             .unwrap_err()
             .reason,
         ReviewReason::UnsupportedCall
@@ -89,7 +83,7 @@ fn each_format_has_an_invalid_input_that_fails_review() {
     // date: beyond the representable range.
     let far_future = six_calldata(1, 253_402_300_800);
     assert_eq!(
-        review_call(&accepted, &context(&far_future, false))
+        review_call(&accepted, &context(&far_future))
             .unwrap_err()
             .reason,
         ReviewReason::UnsupportedCall
@@ -97,30 +91,17 @@ fn each_format_has_an_invalid_input_that_fails_review() {
 
     // amount: no authenticated native units for this chain.
     let bytes = six_calldata(1, 1_760_000_000);
-    let mut without_native = context(&bytes, false);
+    let mut without_native = context(&bytes);
     without_native.native = None;
     assert_eq!(
         review_call(&accepted, &without_native).unwrap_err().reason,
         ReviewReason::UnsupportedCall
     );
 
-    // tokenAmount: no signed decimals for the token.
-    let mut entry = entry(
-        six_format_descriptor(),
-        vec![AdmittedFunction {
-            signature: SIX.into(),
-            action_class: ActionClass::Other,
-        }],
-        6,
-    );
-    entry.token_metadata = None;
-    let mut catalog = catalog(vec![entry]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+    // tokenAmount: no listed decimals for the token.
+    let catalog = build(vec![six_format_descriptor()], Vec::new()).unwrap();
     assert_eq!(
-        review_call(&catalog, &context(&bytes, false))
-            .unwrap_err()
-            .reason,
+        review_call(&catalog, &context(&bytes)).unwrap_err().reason,
         ReviewReason::UnsupportedCall
     );
 }
@@ -135,18 +116,6 @@ fn unsupported_instructions_make_a_descriptor_unusable() {
             "unresolved include",
             Box::new(|value: &mut Value| {
                 value["includes"] = json!("https://example.invalid/base.json");
-            }),
-        ),
-        (
-            "wrong chain binding",
-            Box::new(|value: &mut Value| {
-                value["context"]["contract"]["deployments"][0]["chainId"] = json!(8453);
-            }),
-        ),
-        (
-            "wrong address binding",
-            Box::new(|value: &mut Value| {
-                value["context"]["contract"]["deployments"][0]["address"] = json!(RECIPIENT);
             }),
         ),
         (
@@ -289,29 +258,129 @@ fn unsupported_instructions_make_a_descriptor_unusable() {
     }
 }
 
+fn admit_one(signature: &str, fields: Value) -> Result<Catalog, ReviewError> {
+    let descriptor = json!({
+        "context": {"contract": {"deployments": [{"chainId": CHAIN_ID, "address": TOKEN}]}},
+        "display": {"formats": {signature: {"fields": fields}}}
+    });
+    build(vec![descriptor], vec![token(TOKEN, 6)])
+}
+
 #[test]
-fn dynamic_and_signed_argument_types_are_outside_the_subset() {
-    for signature in [
-        "note(string text)",
-        "blob(bytes data)",
-        "many(uint256[] amounts)",
-        "pair(uint256[2] amounts)",
-        "signed(int256 delta)",
-        "alias(uint value)",
+fn strings_signed_integers_and_dynamic_nested_arrays_are_outside_the_subset() {
+    for (signature, path) in [
+        ("note(string text)", "text"),
+        ("grid(uint256[][] cells)", "cells.[]"),
+        ("signed(int256 delta)", "delta"),
     ] {
-        let descriptor = json!({
-            "context": {"contract": {"deployments": [{"chainId": CHAIN_ID, "address": TOKEN}]}},
-            "display": {"formats": {signature: {
-                "fields": [{"path": "x", "label": "X", "format": "raw"}]
-            }}}
-        });
-        let functions = vec![AdmittedFunction {
-            signature: signature.into(),
-            action_class: ActionClass::Other,
-        }];
-        let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-        sign(&mut catalog, &[(1, "publisher-1")]);
-        assert!(accept(&catalog).is_err(), "{signature} must be refused");
+        let error = admit_one(
+            signature,
+            json!([{"path": path, "label": "X", "format": "raw"}]),
+        )
+        .expect_err(signature);
+        assert!(
+            error.detail.contains("outside the supported"),
+            "{signature}: {error}"
+        );
+    }
+}
+
+#[test]
+fn bytes_arrays_and_must_match_rules_are_admitted_in_their_one_shape() {
+    const SIGNATURE: &str = "f(address[] owners, bytes blob, uint8 mode)";
+    let fields = |owners: Value, blob: Value, mode: Value| json!([owners, blob, mode]);
+    let owners = json!({"path": "owners.[]", "label": "Owner", "format": "addressName"});
+    let blob = json!({"path": "blob", "label": "Blob", "format": "raw"});
+    let mode = json!({"path": "mode", "label": "Mode", "visible": {"mustMatch": [0]}});
+    admit_one(
+        SIGNATURE,
+        fields(owners.clone(), blob.clone(), mode.clone()),
+    )
+    .unwrap();
+
+    let refused = [
+        (
+            "an array without .[]",
+            json!({"path": "owners", "label": "Owner", "format": "addressName"}),
+            blob.clone(),
+            mode.clone(),
+        ),
+        (
+            "a token amount per element",
+            json!({"path": "owners.[]", "label": "Owner", "format": "tokenAmount", "params": {"tokenPath": "@.to"}}),
+            blob.clone(),
+            mode.clone(),
+        ),
+        (
+            "a mustMatch on an array",
+            json!({"path": "owners.[]", "label": "Owner", "visible": {"mustMatch": []}}),
+            blob.clone(),
+            mode.clone(),
+        ),
+        (
+            "calldata on a non-bytes argument",
+            owners.clone(),
+            blob.clone(),
+            json!({"path": "mode", "label": "Mode", "format": "calldata", "params": {"calleePath": "@.to"}}),
+        ),
+        (
+            "calldata without a callee",
+            owners.clone(),
+            json!({"path": "blob", "label": "Blob", "format": "calldata"}),
+            mode.clone(),
+        ),
+        (
+            "calldata with a redirected selector",
+            owners.clone(),
+            json!({"path": "blob", "label": "Blob", "format": "calldata", "params": {"calleePath": "@.to", "selector": "0x12345678"}}),
+            mode.clone(),
+        ),
+        (
+            "calldata naming a non-address callee",
+            owners.clone(),
+            json!({"path": "blob", "label": "Blob", "format": "calldata", "params": {"calleePath": "mode"}}),
+            mode.clone(),
+        ),
+        (
+            "a scalar addressed with .[]",
+            owners.clone(),
+            blob.clone(),
+            json!({"path": "mode.[]", "label": "Mode", "format": "raw"}),
+        ),
+        (
+            "a mustMatch that also formats",
+            owners.clone(),
+            blob.clone(),
+            json!({"path": "mode", "label": "Mode", "format": "raw", "visible": {"mustMatch": [0]}}),
+        ),
+        (
+            "a mustMatch value of the wrong type",
+            owners.clone(),
+            blob.clone(),
+            json!({"path": "mode", "label": "Mode", "visible": {"mustMatch": ["zero"]}}),
+        ),
+        (
+            "an empty mustMatch",
+            owners.clone(),
+            blob.clone(),
+            json!({"path": "mode", "label": "Mode", "visible": {"mustMatch": []}}),
+        ),
+        (
+            "a conditional rule beside mustMatch",
+            owners,
+            blob,
+            json!({"path": "mode", "label": "Mode", "visible": {"mustMatch": [0], "ifNotIn": [1]}}),
+        ),
+    ];
+    for (name, owners, blob, mode) in refused {
+        let error = admit_one(SIGNATURE, fields(owners, blob, mode))
+            .err()
+            .unwrap_or_else(|| panic!("{name} must be refused"));
+        assert_eq!(
+            error.reason,
+            ReviewReason::CatalogRejected,
+            "{name}: {error}"
+        );
     }
 }
 
@@ -328,21 +397,16 @@ fn a_renamed_or_reclassified_erc20_call_cannot_bypass_allowance_policy() {
             ]
         }}}
     });
-    for class in [ActionClass::Other, ActionClass::Transfer] {
-        let functions = vec![AdmittedFunction {
-            signature: "approve(address _spender, uint256 _value)".into(),
-            action_class: class,
-        }];
-        let mut catalog = catalog(vec![entry(descriptor.clone(), functions, 6)]);
-        sign(&mut catalog, &[(1, "publisher-1")]);
-        let catalog = accept(&catalog).unwrap();
-        let bytes = calldata(
-            "approve(address _spender, uint256 _value)",
-            &[address_word(RECIPIENT), U256::MAX],
-        );
-        let error = review_call(&catalog, &context(&bytes, false)).unwrap_err();
-        assert_eq!(error.reason, ReviewReason::CatalogRejected, "{error}");
-    }
+    // The class comes from the signature, not the descriptor, so the
+    // allowance rules still run: Bloom's heading and unlimited warning.
+    let catalog = build(vec![descriptor], vec![token(TOKEN, 6)]).unwrap();
+    let bytes = calldata(
+        "approve(address _spender, uint256 _value)",
+        &[address_word(RECIPIENT), U256::MAX],
+    );
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
+    assert_eq!(call.action, "allowance");
+    assert_eq!(call.intent_summary.unwrap().magnitude, "unlimited");
 }
 
 #[test]
@@ -357,23 +421,14 @@ fn an_unrelated_call_cannot_borrow_the_transfer_screen() {
             ]
         }}}
     });
-    let functions = vec![AdmittedFunction {
-        signature: "donate(address _to, uint256 _value, uint256 _tip)".into(),
-        action_class: ActionClass::Transfer,
-    }];
-    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+    let catalog = build(vec![descriptor], vec![token(TOKEN, 6)]).unwrap();
     let bytes = calldata(
         "donate(address _to, uint256 _value, uint256 _tip)",
         &[address_word(RECIPIENT), U256::from(1u8), U256::from(2u8)],
     );
-    assert_eq!(
-        review_call(&catalog, &context(&bytes, false))
-            .unwrap_err()
-            .reason,
-        ReviewReason::CatalogRejected
-    );
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
+    assert_eq!(call.action, "other");
+    assert!(call.intent_summary.is_none());
 }
 
 #[test]
@@ -395,33 +450,11 @@ fn two_format_keys_selecting_the_same_function_are_ambiguous() {
             }
         }}
     });
-    let functions = vec![AdmittedFunction {
-        signature: "transfer(address _to, uint256 _value)".into(),
-        action_class: ActionClass::Transfer,
-    }];
-    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    assert!(accept(&catalog).is_err());
+    assert!(build(vec![descriptor], Vec::new()).is_err());
 }
 
 #[test]
-fn a_descriptor_whose_content_changed_after_signing_is_refused() {
-    let mut entry = erc20_entry();
-    // The digest still names the reviewed document; the content does not.
-    entry.flattened_descriptor.as_mut().unwrap()["metadata"]["contractName"] = json!("Other Token");
-    let mut catalog = catalog(vec![entry]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    assert_eq!(
-        accept(&catalog).unwrap_err().reason,
-        ReviewReason::CatalogRejected
-    );
-}
-
-#[test]
-fn a_tuple_argument_is_refused_because_no_path_can_reach_it() {
-    // Uniswap's `exactInputSingle` is shaped like this. The signature parser
-    // that format keys are written for drops the component names, so the
-    // router slice needs a second signed input before tuples can be read.
+fn unnamed_tuple_components_cannot_be_hidden_behind_a_raw_tuple() {
     let signature = "settle((address,uint256) terms, bool finalize)";
     let descriptor = json!({
         "context": {"contract": {"deployments": [{"chainId": CHAIN_ID, "address": TOKEN}]}},
@@ -432,15 +465,69 @@ fn a_tuple_argument_is_refused_because_no_path_can_reach_it() {
             ]
         }}}
     });
-    let functions = vec![AdmittedFunction {
-        signature: signature.into(),
-        action_class: ActionClass::Other,
-    }];
-    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let error = accept(&catalog).unwrap_err();
+    let error = build(vec![descriptor], Vec::new()).unwrap_err();
     assert_eq!(error.reason, ReviewReason::CatalogRejected);
-    assert!(error.detail.contains("tuple"), "{error}");
+    assert!(error.detail.contains("named"), "{error}");
+}
+
+#[test]
+fn nested_named_tuples_and_fixed_arrays_display_every_leaf() {
+    let signature = "settle((address recipient,uint256[2][2] amounts) terms, bool finalize)";
+    let mut fields =
+        vec![json!({"path":"terms.recipient","label":"Recipient","format":"addressName"})];
+    for row in 0..2 {
+        for column in 0..2 {
+            fields.push(json!({"path":format!("terms.amounts.[{row}].[{column}]"),"label":format!("Amount {row} {column}"),"format":"raw"}));
+        }
+    }
+    fields.push(json!({"path":"finalize","label":"Final","format":"raw"}));
+    let catalog = admit_one(signature, json!(fields)).unwrap();
+    let mut bytes = parse_function(signature).unwrap().selector().to_vec();
+    for word in [
+        address_word(RECIPIENT),
+        U256::from(11),
+        U256::from(12),
+        U256::from(21),
+        U256::from(22),
+        U256::from(1),
+    ] {
+        bytes.extend_from_slice(&word.to_be_bytes::<32>());
+    }
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
+    assert_eq!(field(&call, "Recipient").value, checksum(RECIPIENT));
+    assert_eq!(field(&call, "Amount 1 0").raw, "21");
+    fields.remove(2);
+    assert!(admit_one(signature, json!(fields)).is_err());
+    bytes.extend_from_slice(&[0; 32]);
+    assert!(review_call(&catalog, &context(&bytes)).is_err());
+    for signature in ["f(uint256[33] a)", "f(uint256[32][32] a)"] {
+        assert!(admit_one(signature, json!([])).is_err());
+    }
+}
+
+#[test]
+fn payable_calls_must_display_exact_native_value_and_cannot_hide_it() {
+    let signature = "deposit(uint256 commitment)";
+    let fields = json!([
+        {"path":"commitment","label":"Commitment","format":"raw"},
+        {"path":"@.value","label":"Deposit","format":"amount"}
+    ]);
+    let catalog = admit_one(signature, fields.clone()).unwrap();
+    let bytes = calldata(signature, &[U256::from(42)]);
+    let mut ctx = context(&bytes);
+    ctx.value = U256::from(2_000_000_000_000_000_000u64);
+    let (call, _) = review_call(&catalog, &ctx).unwrap();
+    assert_eq!(field(&call, "Deposit").value, "2 ETH");
+    let ordinary = admit_one(signature, json!([fields[0].clone()])).unwrap();
+    assert!(review_call(&ordinary, &ctx).is_err());
+    let mut hidden = fields.clone();
+    hidden[1]["visible"] = json!({"mustMatch":[0]});
+    assert!(admit_one(signature, hidden).is_err());
+    let mut raw = fields;
+    raw[1]["format"] = json!("raw");
+    assert!(admit_one(signature, raw).is_err());
+    ctx.native = None;
+    assert!(review_call(&catalog, &ctx).is_err());
 }
 
 #[test]
@@ -452,18 +539,135 @@ fn a_noncanonical_boolean_word_does_not_survive_the_round_trip() {
             "fields": [{"path": "on", "label": "On", "format": "raw"}]
         }}}
     });
-    let functions = vec![AdmittedFunction {
-        signature: signature.into(),
-        action_class: ActionClass::Other,
-    }];
-    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+    let catalog = build(vec![descriptor], vec![token(TOKEN, 6)]).unwrap();
     let bytes = calldata(signature, &[U256::from(2u8)]);
     assert_eq!(
-        review_call(&catalog, &context(&bytes, false))
-            .unwrap_err()
-            .reason,
+        review_call(&catalog, &context(&bytes)).unwrap_err().reason,
         ReviewReason::InvalidPayload
     );
+}
+
+const MULTICALL: &str = "multicall((address to, bytes data, uint256 value, bool skipRevert, bytes32 callbackHash)[] bundle)";
+
+fn multicall_fields() -> Value {
+    json!([
+        {"path": "bundle.[].data", "label": "Call", "format": "calldata",
+         "params": {"calleePath": "bundle.[].to", "amountPath": "bundle.[].value"}},
+        {"path": "bundle.[].to", "label": "Target", "format": "addressName"},
+        {"path": "bundle.[].value", "label": "Value", "format": "amount"},
+        {"path": "bundle.[].skipRevert", "label": "Skip revert", "visible": {"mustMatch": [false]}},
+        {"path": "bundle.[].callbackHash", "label": "Callback",
+         "visible": {"mustMatch": ["0x0000000000000000000000000000000000000000000000000000000000000000"]}}
+    ])
+}
+
+#[test]
+fn a_named_tuple_key_parses_to_the_canonical_selector() {
+    let named = parse_function(MULTICALL).unwrap();
+    let bare = parse_function("multicall((address,bytes,uint256,bool,bytes32)[] bundle)").unwrap();
+    assert_eq!(named.selector(), bare.selector());
+    let names: Vec<_> = named.inputs[0]
+        .components
+        .iter()
+        .map(|component| component.name.as_str())
+        .collect();
+    assert_eq!(names, ["to", "data", "value", "skipRevert", "callbackHash"]);
+    assert!(parse_function("f((address a, uint256 b) x").is_err());
+}
+
+fn multicall_input(calls: &[(&str, Vec<u8>, u64, bool, u8)]) -> Vec<u8> {
+    use alloy_dyn_abi::{DynSolValue, JsonAbiExt as _};
+    let calls = calls
+        .iter()
+        .map(|(to, data, value, skip, hash)| {
+            DynSolValue::Tuple(vec![
+                DynSolValue::Address(to.parse().unwrap()),
+                DynSolValue::Bytes(data.clone()),
+                DynSolValue::Uint(U256::from(*value), 256),
+                DynSolValue::Bool(*skip),
+                DynSolValue::FixedBytes([*hash; 32].into(), 32),
+            ])
+        })
+        .collect();
+    parse_function(MULTICALL)
+        .unwrap()
+        .abi_encode_input(&[DynSolValue::Array(calls)])
+        .unwrap()
+}
+
+/// A list of calls reads call by call: each element's embedded call is
+/// reviewed against the catalog with its own callee and value.
+#[test]
+fn a_list_of_calls_is_read_call_by_call() {
+    let bundler = "0x4444444444444444444444444444444444444444";
+    let descriptor = json!({
+        "context": {"contract": {"deployments": [{"chainId": CHAIN_ID, "address": bundler}]}},
+        "metadata": {"contractName": "Bundler"},
+        "display": {"formats": {MULTICALL: {"fields": multicall_fields()}}}
+    });
+    let catalog = build(vec![descriptor], vec![token(TOKEN, 6)]).unwrap();
+    let transfer = calldata(
+        "transfer(address,uint256)",
+        &[address_word(RECIPIENT), U256::from(2_500_000u64)],
+    );
+    let unlisted = "0x5555555555555555555555555555555555555555";
+    let input = multicall_input(&[
+        (TOKEN, transfer.clone(), 0, false, 0),
+        (unlisted, transfer, 0, false, 0),
+    ]);
+    let mut ctx = context(&input);
+    ctx.to = bundler.parse().unwrap();
+    let (call, used) = review_call(&catalog, &ctx).unwrap();
+    assert_eq!(
+        field(&call, "Call 1").value,
+        format!("transfer on Example Token {}", checksum(TOKEN))
+    );
+    assert_eq!(field(&call, "Call 1 · Amount").value, "2.5 EXA");
+    assert_eq!(field(&call, "Target 1").value, checksum(TOKEN));
+    assert_eq!(field(&call, "Call 2 · Raw token amount").value, "2500000");
+    assert!(call.structural);
+    assert_eq!(used.len(), 2);
+
+    // The fixed components are enforced on every element.
+    let callback = multicall_input(&[(TOKEN, Vec::new(), 0, false, 1)]);
+    let mut ctx = context(&callback);
+    ctx.to = bundler.parse().unwrap();
+    let error = review_call(&catalog, &ctx).unwrap_err();
+    assert_eq!(error.reason, ReviewReason::UnsupportedCall, "{error}");
+    assert!(error.detail.contains("callbackHash"), "{error}");
+}
+
+#[test]
+fn a_list_of_calls_must_show_every_component_from_its_own_element() {
+    // Leaving a component off the screen.
+    let mut missing = multicall_fields();
+    missing.as_array_mut().unwrap().remove(1);
+    let error = admit_one(MULTICALL, missing).unwrap_err();
+    assert!(error.detail.contains("bundle.[].to"), "{error}");
+
+    // A callee taken from outside the element.
+    let signature = "run((address to, bytes data)[] calls, address other)";
+    let error = admit_one(
+        signature,
+        json!([
+            {"path": "calls.[].data", "label": "Call", "format": "calldata",
+             "params": {"calleePath": "other"}},
+            {"path": "calls.[].to", "label": "To", "format": "addressName"},
+            {"path": "other", "label": "Other", "format": "addressName"}
+        ]),
+    )
+    .unwrap_err();
+    assert!(error.detail.contains("calleePath"), "{error}");
+
+    // A token amount per element would need a token per element.
+    let error = admit_one(
+        "pay((address to, uint256 amount)[] payments)",
+        json!([
+            {"path": "payments.[].to", "label": "To", "format": "addressName"},
+            {"path": "payments.[].amount", "label": "Amount", "format": "tokenAmount",
+             "params": {"tokenPath": "@.to"}}
+        ]),
+    )
+    .unwrap_err();
+    assert!(error.detail.contains("token amount"), "{error}");
 }
