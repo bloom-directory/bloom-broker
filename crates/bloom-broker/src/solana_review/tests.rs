@@ -24,6 +24,7 @@ fn request(bytes: &[u8], class: &str) -> ApprovalPrepareRequest {
         claim_assurance: ClaimAssurance::MachineAsserted,
     };
     ApprovalPrepareRequest {
+        attributed_advisory: None,
         operation_id: OperationId::from_bytes([2; 32]),
         surface_selection: CeremonySurfaceSelection::Default,
         canonical_plan_facts_digest: digest.clone(),

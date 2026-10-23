@@ -2,6 +2,13 @@
 
 Bloom's approval, policy, declared-usage accounting, and ceremony boundary.
 
+Petals can send a bounded `bloom.petal.review.v1` description in an approval's
+`attributed_advisory` field. Broker rejects malformed reviews and displays valid
+lines under “Bloom has not checked these statements.” The description does not
+change policy, declared-value limits or payload authorization. A reusable
+approval continues to authorize its approved operation class and limits; its
+description does not bind it to a particular mint or exact transaction bytes.
+
 ## The Broker configuration file
 
 Broker reads one JSON file at startup. It defaults to `/etc/bloom/broker.json`;

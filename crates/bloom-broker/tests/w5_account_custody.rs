@@ -1981,6 +1981,7 @@ async fn activate_signing_approval(
             safe_review_payloads: Vec::new(),
             petal_use_claim: claim.cloned(),
             system_use_claim: None,
+            attributed_advisory: None,
         }),
     )
     .await

@@ -921,6 +921,7 @@ mod tests {
         let digest = Digest32::from_bytes([1; 32]);
         let token = |name: &str| Token::new(name).unwrap();
         ApprovalPrepareRequest {
+            attributed_advisory: None,
             operation_id: OperationId::from_bytes([2; 32]),
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             canonical_plan_facts_digest: digest.clone(),

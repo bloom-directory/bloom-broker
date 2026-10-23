@@ -275,3 +275,5 @@ button.wallet-copy{width:100%;min-height:40px;border-radius:9px;font-size:13px;b
   .action-buttons button{flex:1 1 auto}
 }
 @media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+
+.advisory{margin:16px 0 0;padding:12px 14px;border:1px solid var(--rule);border-radius:9px;background:#fffdf9;color:var(--ink-2);font-size:13px}.advisory-note{margin:0 0 9px;color:var(--muted);font-size:12px}.advisory ul{margin:0;padding-left:18px}.advisory li{margin:3px 0;overflow-wrap:anywhere}

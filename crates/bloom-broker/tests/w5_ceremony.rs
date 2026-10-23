@@ -461,6 +461,7 @@ async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
             operation_id: approval_operation.clone(),
+            attributed_advisory: None,
             terms: approval_terms.clone(),
             canonical_plan_facts_digest: approval_terms.approval_digest().unwrap(),
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
@@ -850,6 +851,38 @@ fn the_shipped_page_handles_every_custody_ceremony_kind() {
             "the ceremony page does not mention the {kind} ceremony"
         );
     }
+}
+
+/// A description of what a transaction does is not a warning, and the page
+/// must not render it as one. This is a source assertion because the review
+/// block has no behaviour to drive: a real browser run is the only thing that
+/// confirms the layout, and it is not something this suite can do.
+#[test]
+fn the_shipped_page_renders_an_attributed_advisory_as_its_own_block() {
+    let asset = include_str!("../src/ceremony_assets/app.js");
+    let style = include_str!("../src/ceremony_assets/style.css");
+    assert!(
+        asset.contains("attributed_advisory_items"),
+        "the page must read the advisory the manifest carries"
+    );
+    assert!(
+        !asset.contains("attributed_advisory_items || []) warns.push"),
+        "advisory items must not be pushed into the warning list"
+    );
+    assert!(
+        asset.contains(r#"el("div", {class: "advisory"}"#),
+        "the advisory needs its own block"
+    );
+    assert!(
+        style.contains(".advisory{"),
+        "the advisory block needs a style, or it renders as unstyled text"
+    );
+    // A Petal's declared destinations are the addresses its transaction may
+    // reach, not recipients. Only a system claim's destination is a "To".
+    assert!(
+        asset.contains(r#"manifest?.system_use_claim ? "To" : "Declared destinations""#),
+        "a Petal claim's destinations must not be labelled as recipients"
+    );
 }
 
 #[test]
@@ -3515,6 +3548,15 @@ async fn prepare_scoped_approval(
     terms: &SealedApprovalTerms,
     operation_id: OperationId,
 ) -> Result<bloom_broker_api::SealedApprovalPrepareResponse, ProtocolError> {
+    prepare_scoped_approval_with_advisory(broker, terms, operation_id, None).await
+}
+
+async fn prepare_scoped_approval_with_advisory(
+    broker: &BrokerRpcService,
+    terms: &SealedApprovalTerms,
+    operation_id: OperationId,
+    attributed_advisory: Option<bloom_broker_api::AttributedAdvisory>,
+) -> Result<bloom_broker_api::SealedApprovalPrepareResponse, ProtocolError> {
     match MachineBrokerService::dispatch(
         broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
@@ -3526,6 +3568,7 @@ async fn prepare_scoped_approval(
             petal_use_claim: None,
             system_use_claim: None,
             evm_review_payloads: Vec::new(),
+            attributed_advisory,
             message_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
         }),
@@ -4477,6 +4520,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let stale_policy_error = MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            attributed_advisory: None,
             evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: vec![Base64UrlBytes::from_bytes(&creation)],
@@ -4568,6 +4612,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                 canonical_plan_facts_digest: digest("d4"),
                 petal_use_claim: None,
                 system_use_claim: None,
+                attributed_advisory: None,
             }),
         )
     };
@@ -4834,6 +4879,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             canonical_plan_facts_digest: digest("d4"),
             petal_use_claim: None,
             system_use_claim: None,
+            attributed_advisory: None,
         }),
     )
     .await
@@ -4971,6 +5017,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             petal_use_claim: None,
             system_use_claim: None,
             evm_review_payloads: Vec::new(),
+            attributed_advisory: None,
         }),
     )
     .await
@@ -5206,6 +5253,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                     canonical_plan_facts_digest: digest("c9"),
                     petal_use_claim: None,
                     system_use_claim: None,
+                    attributed_advisory: None,
                 }),
             )
             .await
@@ -5811,10 +5859,85 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let sweep_payload = b"fixture-recovery-sweep";
     let sweep = recovery_terms(sweep_payload, 0xe6);
     let sweep_operation = operation("e6");
-    let sweep_prepared =
-        prepare_scoped_approval(&restarted_scoped_broker, &sweep, sweep_operation.clone())
-            .await
-            .unwrap();
+
+    // An advisory Broker cannot render honestly fails the preparation. It is
+    // never dropped: an owner asked to approve an operation whose description
+    // was silently discarded is worse off than one who is not asked at all.
+    let malformed = prepare_scoped_approval_with_advisory(
+        &restarted_scoped_broker,
+        &sweep,
+        sweep_operation.clone(),
+        Some(bloom_broker_api::AttributedAdvisory {
+            schema: Token::new(bloom_broker_api::AttributedAdvisory::SCHEMA).unwrap(),
+            items: vec!["forged\nline structure".into()],
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(malformed.code, ProtocolErrorCode::MalformedFrame);
+    assert!(
+        malformed.message.contains("attributed advisory"),
+        "{malformed:?}"
+    );
+    cancellation_backoff().await;
+
+    let sweep_prepared = prepare_scoped_approval_with_advisory(
+        &restarted_scoped_broker,
+        &sweep,
+        sweep_operation.clone(),
+        Some(bloom_broker_api::AttributedAdvisory {
+            schema: Token::new(bloom_broker_api::AttributedAdvisory::SCHEMA).unwrap(),
+            items: vec![
+                "Sell on Pump.fun".into(),
+                "Guaranteed minimum received: 0.5 SOL".into(),
+            ],
+        }),
+    )
+    .await
+    .unwrap();
+
+    // The advisory reaches the page the owner actually reads, attributed to
+    // the app rather than presented as something Broker established.
+    {
+        let session: serde_json::Value = serde_json::from_slice(
+            &restarted_scoped_broker
+                .ceremony()
+                .router()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/session")
+                        .header(header::HOST, "localhost:18734")
+                        .header(
+                            "x-bloom-ceremony-token",
+                            url_token(&sweep_prepared.ceremony_url),
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        let items = session["review_manifest"]["attributed_advisory_items"]
+            .as_array()
+            .expect("the advisory reaches the review manifest");
+        assert!(
+            items[0]
+                .as_str()
+                .is_some_and(|line| line.contains("Bloom has not checked")),
+            "the app's own text must be attributed: {items:?}"
+        );
+        assert_eq!(items[1], serde_json::json!("Sell on Pump.fun"));
+        assert_eq!(
+            items[2],
+            serde_json::json!("Guaranteed minimum received: 0.5 SOL")
+        );
+    }
     let (sweep_status, sweep_body) = complete_scoped_ceremony(
         &restarted_scoped_broker,
         &authenticator,
@@ -6009,6 +6132,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let expired = MachineBrokerService::dispatch(
         &restarted_scoped_broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            attributed_advisory: None,
             evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: Vec::new(),
@@ -6363,6 +6487,133 @@ async fn legacy_passkey_prepare_renders_only_digest_bound_public_migration_terms
             .get("raw_private_key")
             .is_none()
     );
+}
+
+/// The session projection a browser would fetch for a Pump.fun trade,
+/// produced by the real Broker from a real Petal claim and a real advisory,
+/// and written out when `BLOOM_CEREMONY_PROJECTION_OUT` names a path.
+///
+/// The page render itself is not a Rust test; `scripts/ceremony-review-render.mjs`
+/// loads these bytes in Chromium and asserts what the owner actually sees.
+#[tokio::test]
+async fn a_pumpfun_trade_projection_carries_its_review_to_the_page() {
+    let signer = Arc::new(MockSigner::new());
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        signer,
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[37; 32]),
+    );
+
+    let mut request = approval_request();
+    request.terms.wallet_id = Token::new("main").unwrap();
+    // A Solana trade signs with an Ed25519 account key, not the secp256k1
+    // root the generic fixture carries. The page derives what it shows from
+    // this, so an unrepresentative key makes unrepresentative evidence.
+    request.terms.key_ref = bloom_signer_api::KeyRef {
+        backend: Token::new("local").unwrap(),
+        backend_instance: Token::new("main").unwrap(),
+        key_spec: bloom_signer_api::KeySpec::Ed25519,
+        locator: "wallet/main/solana/0".into(),
+        derivation: Some(bloom_signer_api::DerivationRef::Bip39Multicurve {
+            wallet_seed_ref: Token::new("main").unwrap(),
+            profile: bloom_signer_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            path: "m/44'/501'/0'/0'".into(),
+        }),
+        public_key_fingerprint: digest("2b"),
+    };
+    request.terms.allowed_crypto_suites = vec![bloom_signer_api::CryptoSuite::Ed25519Message];
+    let claim = PetalUseClaim {
+        package_hash: digest("bb"),
+        route: "r000004".into(),
+        operation_class: Token::new("pumpfun.buy").unwrap(),
+        crypto_suite: bloom_broker_api::CryptoSuite::Ed25519Message,
+        payload_digest: digest("12"),
+        ordered_hashes: vec![digest("13")],
+        // 0.001 SOL of trade plus the associated-token rent allowance.
+        declared_debits: vec![bloom_broker_api::DeclaredDebit {
+            asset: bloom_broker_api::AssetId {
+                chain: Token::new("solana").unwrap(),
+                asset: "native".into(),
+            },
+            amount: bloom_broker_api::DecimalU256::parse("3100000").unwrap(),
+        }],
+        declared_destinations: vec![bloom_broker_api::DeclaredDestination {
+            chain: Token::new("solana").unwrap(),
+            destination: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P".into(),
+        }],
+        declared_fee: bloom_broker_api::DeclaredFee::Fee {
+            chain: Token::new("solana").unwrap(),
+            asset: "native".into(),
+            amount: bloom_broker_api::DecimalU256::parse("5000").unwrap(),
+        },
+        nonce: RequestNonce::new("2a".repeat(16)).unwrap(),
+        claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+    };
+    let items = vec![
+        "Buy on Pump.fun".to_owned(),
+        "Trading account: FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF".to_owned(),
+        "Token: C8CMvu8FXZruHrNjFaixaDJjiveG6gKmUvT5BrK5pump".to_owned(),
+        "Maximum spent on the trade: 0.00102 SOL".to_owned(),
+        "Guaranteed minimum received: 41900000 raw units of C8CMvu8FXZruHrNjFaixaDJjiveG6gKmUvT5BrK5pump".to_owned(),
+        "Estimated network fee: 0.000005 SOL (a cap, charged as used)".to_owned(),
+        "Rent for 1 new token account(s), up to 0.0021 SOL; recoverable by closing them while empty".to_owned(),
+        "Most this can cost in total: 0.003125 SOL".to_owned(),
+    ];
+    let attribution =
+        "The app describes this operation as follows. Bloom has not checked these statements."
+            .to_owned();
+    let response = broker
+        .prepare_approval(
+            request,
+            ReviewManifestContext {
+                petal_use_claim: Some(claim.clone()),
+                claim_assurance: Some(claim.claim_assurance.clone()),
+                attributed_advisory_items: std::iter::once(attribution.clone())
+                    .chain(items.clone())
+                    .collect(),
+                ..ReviewManifestContext::default()
+            },
+            now_ms,
+        )
+        .unwrap();
+
+    let token = url_token(&response.ceremony_url);
+    let session = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = session.into_body().collect().await.unwrap().to_bytes();
+    let projection: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    let carried = projection["review_manifest"]["attributed_advisory_items"]
+        .as_array()
+        .expect("advisory items");
+    assert_eq!(carried[0], serde_json::json!(attribution));
+    assert_eq!(carried.len(), items.len() + 1);
+    assert!(
+        carried.iter().any(|item| item
+            .as_str()
+            .is_some_and(|item| item.starts_with("Guaranteed minimum received:"))),
+        "the floor must survive to the projection: {carried:?}"
+    );
+
+    if let Ok(path) = std::env::var("BLOOM_CEREMONY_PROJECTION_OUT") {
+        std::fs::write(&path, &bytes).unwrap();
+    }
 }
 
 #[tokio::test]

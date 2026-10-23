@@ -1142,7 +1142,7 @@ function describeTransfer(manifest) {
   const to = dests.map(d => d.destination);
   const network = chainLabel(chain, ctx);
   let sentence;
-  if (amounts.length && to.length) {
+  if (amounts.length && to.length && manifest?.system_use_claim) {
     sentence = `Send <strong>${escapeHtml(amounts.join(" + "))}</strong> on ${escapeHtml(network)} to the address below.`;
   } else if (amounts.length) {
     sentence = `Spend up to <strong>${escapeHtml(amounts.join(" + "))}</strong> on ${escapeHtml(network)}.`;
@@ -1150,7 +1150,18 @@ function describeTransfer(manifest) {
     sentence = `Sign one operation on ${escapeHtml(network)}.`;
   }
   const facts = [];
-  if (to.length) facts.push(["To", to.join(", "), true]);
+  // A system claim's destination is a recipient: value leaves for it. A
+  // Petal's declared destinations are the addresses its transaction is
+  // permitted to reach, which for a swap is the protocol program it routes
+  // through — the assets come back to the signer. Labelling those "To" reads
+  // as "your money goes here", which is false.
+  if (to.length) {
+    facts.push([
+      manifest?.system_use_claim ? "To" : "Declared destinations",
+      to.join(", "),
+      true,
+    ]);
+  }
   if (amounts.length) facts.push(["Amount", amounts.join(" + ")]);
   if (fee && fee.amount) {
     const reviewedFee = reviewed.find(a => a.kind === "declared_fee");
@@ -1428,8 +1439,17 @@ function renderReview(session) {
   const expiryHost = document.getElementById("action-expiry");
   if (expiryHost) expiryHost.replaceChildren(expiry);
   else facts.append(el("dt", {}, "Expires"), el("dd", {}, expiry));
+  let advisory = [];
   if (kind === "sealed_approval") {
-    for (const item of session.review_manifest?.attributed_advisory_items || []) primaryWarnings.push(item);
+    advisory = session.review_manifest?.attributed_advisory_items || [];
+    // A claim's declared destination is not necessarily a recipient: a swap
+    // declares the protocol program it routes through, and the assets come
+    // back to the signer. When the app has described the operation itself,
+    // stop asserting a transfer shape the claim does not establish, and let
+    // its description say what happens. The facts below are unchanged.
+    if (advisory.length && transfer) {
+      summaryHtml = `Approve one operation on ${escapeHtml(transfer.facts.find(([label]) => label === "Network")?.[1] || "this network")}, as described below.`;
+    }
     // Proof verification occurs during authorization, after this review.
     // Never suppress the plan's present-tense disclosure merely because the
     // Machine requested proof verification for the later signing step.
@@ -1747,6 +1767,11 @@ function renderReview(session) {
       : el("span", {}, "Not available in this review");
     decision.push(el("div", {class: "ceremony-fee", "aria-label": "Execution gas only; other network charges may apply"},
       el("span", {class: "ceremony-fee-label"}, label), amount));
+  }
+  if (advisory.length) {
+    decision.push(el("div", {class: "advisory"},
+      el("p", {class: "advisory-note"}, advisory[0]),
+      el("ul", {}, ...advisory.slice(1).map(item => el("li", {}, item)))));
   }
   if (meta.warn) primaryWarnings.unshift(meta.warn);
   for (const note of detailNotes) evidence.push(el("p", {class: "ceremony-assurance"}, note));

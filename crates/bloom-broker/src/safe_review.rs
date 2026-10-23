@@ -535,6 +535,7 @@ mod tests {
             safe_review_payloads: vec![Base64UrlBytes::from_bytes(&review)],
             petal_use_claim: None,
             system_use_claim: None,
+            attributed_advisory: None,
             terms: SealedApprovalTerms {
                 subject: ApprovalSubject::Petal {
                     package_hash: digest.clone(),
