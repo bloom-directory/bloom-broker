@@ -5,6 +5,7 @@ members = [
   "crates/bloom-evm-clear-signing",
   "crates/bloom-broker-debug-driver",
   "crates/bloom-solana-verify",
+  "crates/bloom-solana-clear-signing",
 ]
 resolver = "2"
 
@@ -19,6 +20,7 @@ bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runti
 bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "45b04a0f0964e0c3863ca7692167c66fcff5ed79" }
 bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "45b04a0f0964e0c3863ca7692167c66fcff5ed79" }
 bloom-solana-verify = { path = "crates/bloom-solana-verify" }
+bloom-solana-clear-signing = { path = "crates/bloom-solana-clear-signing" }
 bloom-relay-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "8464a60bad159d1336e3c2df303d4a5f7114eec2" }
 bloom-relay-protocol = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "8464a60bad159d1336e3c2df303d4a5f7114eec2" }
 bloom-relay-admin-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "8464a60bad159d1336e3c2df303d4a5f7114eec2" }

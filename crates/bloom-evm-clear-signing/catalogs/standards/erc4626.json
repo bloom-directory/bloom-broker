@@ -1,0 +1,86 @@
+{
+  "$schema": "https://eips.ethereum.org/assets/eip-7730/erc7730-v2.schema.json",
+  "$comment": "The ERC-4626 vault standard, read for any address no entry lists. Derived from LedgerHQ/clear-signing-erc7730-registry ercs/calldata-erc4626-vaults.json. Bloom's vaultAssetAmount extension uses exact compiled vault-to-underlying bindings; unknown vault assets and share amounts remain raw.",
+  "context": {
+    "contract": {}
+  },
+  "metadata": {
+    "contractName": "ERC-4626 vault"
+  },
+  "display": {
+    "formats": {
+      "deposit(uint256 assets, address receiver)": {
+        "intent": "Deposit",
+        "fields": [
+          {
+            "path": "assets",
+            "label": "Assets",
+            "format": "vaultAssetAmount",
+            "params": {"vaultPath": "@.to"}
+          },
+          {
+            "path": "receiver",
+            "label": "Shares go to",
+            "format": "addressName"
+          }
+        ]
+      },
+      "mint(uint256 shares, address receiver)": {
+        "intent": "Mint",
+        "fields": [
+          {
+            "path": "shares",
+            "label": "Shares (raw units)",
+            "format": "raw"
+          },
+          {
+            "path": "receiver",
+            "label": "Shares go to",
+            "format": "addressName"
+          }
+        ]
+      },
+      "withdraw(uint256 assets, address receiver, address owner)": {
+        "intent": "Withdraw",
+        "fields": [
+          {
+            "path": "assets",
+            "label": "Assets",
+            "format": "vaultAssetAmount",
+            "params": {"vaultPath": "@.to"}
+          },
+          {
+            "path": "receiver",
+            "label": "Assets go to",
+            "format": "addressName"
+          },
+          {
+            "path": "owner",
+            "label": "From the shares of",
+            "format": "addressName"
+          }
+        ]
+      },
+      "redeem(uint256 shares, address receiver, address owner)": {
+        "intent": "Redeem",
+        "fields": [
+          {
+            "path": "shares",
+            "label": "Shares (raw units)",
+            "format": "raw"
+          },
+          {
+            "path": "receiver",
+            "label": "Assets go to",
+            "format": "addressName"
+          },
+          {
+            "path": "owner",
+            "label": "From the shares of",
+            "format": "addressName"
+          }
+        ]
+      }
+    }
+  }
+}

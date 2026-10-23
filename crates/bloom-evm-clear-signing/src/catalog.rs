@@ -1,38 +1,124 @@
-//! The signed local catalog: the only thing Broker trusts about a deployment.
+//! The catalog: which contracts Broker can describe, and how.
 //!
-//! ERC-7730 supplies *descriptions*. It supplies neither trust nor token
-//! decimals, and a wallet cannot read the chain from inside a review. So a
-//! publisher signs one snapshot that binds each contract address to the
-//! flattened descriptor admitted for it, the action class of each admitted
-//! function, and the token metadata amounts are formatted with. Broker
-//! verifies that signature offline and never fetches anything.
+//! It is compiled into Broker from `catalogs/`, so it is trusted exactly as
+//! far as the Broker release is, and it is covered by the verifier digest. A
+//! new contract is a descriptor file and one line in [`DESCRIPTORS`]; a new
+//! token is a row in `bloom-broker-api/tokens/tokens.json`, the list Machine
+//! also compiles in. Broker never fetches anything.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 
-use bloom_broker_api::{Base64UrlBytes, DecimalU64, Digest32, Token};
-use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+pub use bloom_broker_api::KnownToken;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
+use serde_json::Value;
 
-use crate::{AdmittedDescriptor, ReviewError, ReviewReason, admit, descriptor_digest};
+use crate::{
+    AdmittedCall, AdmittedDescriptor, AdmittedField, AdmittedFormat, LeafType, ReviewError,
+    ReviewReason, admit, admit_document, deployments, erc20_profile, parse_function,
+};
 
-pub const CATALOG_SCHEMA: &str = "bloom.clear-signing-catalog.1";
-/// Versioned domain for the one catalog signature. This is a Bloom content
-/// signature over the admitted snapshot, not an ERC-8176 attestation.
-pub const CATALOG_SIGNATURE_DOMAIN: &[u8] = b"bloom-clear-signing-catalog/v1";
-
-pub const CATALOG_MAX_BYTES: usize = 1024 * 1024;
-pub const CATALOG_MAX_ENTRIES: usize = 1024;
-pub const CATALOG_MAX_SIGNATURES: usize = 8;
 pub const TOKEN_SYMBOL_MAX_BYTES: usize = 16;
 pub const TOKEN_NAME_MAX_SCALARS: usize = 64;
 pub const TOKEN_NAME_MAX_BYTES: usize = 256;
-pub const DEFAULT_MAXIMUM_OBSERVATION_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// What a reviewed function is permitted to mean. The class is signed, and
-/// Broker checks it against the canonical ERC-20 signature in both
-/// directions: renaming `approve` cannot escape allowance policy, and
-/// labelling an unrelated call `allowance` cannot borrow its screen.
+/// How a compiled-in description applies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Binding {
+    /// To the deployments it lists.
+    Listed,
+    /// Listed deployments whose implementation can change.
+    ListedUpgradeable,
+    /// Also, by selector, to addresses no entry lists, on the chains where it
+    /// lists this deployment: per-user proxies such as Safes, which all run
+    /// one singleton.
+    Instances(&'static str),
+    /// By selector, to addresses no entry lists, on every chain: a contract
+    /// standard such as ERC-4626, whose deployments cannot all be listed.
+    Standard,
+}
+
+/// The compiled-in descriptor files: path, contents and binding.
+pub const DESCRIPTORS: [(&str, &str, Binding); 11] = [
+    (
+        "safe/safe.json",
+        include_str!("../catalogs/safe/safe.json"),
+        Binding::Instances("0x41675c099f32341bf84bfc5382af534df5c7461a"),
+    ),
+    (
+        "safe/safe-proxy-factory.json",
+        include_str!("../catalogs/safe/safe-proxy-factory.json"),
+        Binding::Listed,
+    ),
+    (
+        "safe/create-call.json",
+        include_str!("../catalogs/safe/create-call.json"),
+        Binding::Listed,
+    ),
+    (
+        "morpho/bundler3.json",
+        include_str!("../catalogs/morpho/bundler3.json"),
+        Binding::Listed,
+    ),
+    (
+        "morpho/general-adapter1.json",
+        include_str!("../catalogs/morpho/general-adapter1.json"),
+        Binding::Listed,
+    ),
+    (
+        "standards/erc4626.json",
+        include_str!("../catalogs/standards/erc4626.json"),
+        Binding::Standard,
+    ),
+    (
+        "privacy-pools/entrypoint.json",
+        include_str!("../catalogs/privacy-pools/entrypoint.json"),
+        Binding::ListedUpgradeable,
+    ),
+    (
+        "privacy-pools/eth-pool.json",
+        include_str!("../catalogs/privacy-pools/eth-pool.json"),
+        Binding::Listed,
+    ),
+    (
+        "enso/router-v2.json",
+        include_str!("../catalogs/enso/router-v2.json"),
+        Binding::Listed,
+    ),
+    (
+        "standards/erc721-erc1155-operator.json",
+        include_str!("../catalogs/standards/erc721-erc1155-operator.json"),
+        Binding::Standard,
+    ),
+    (
+        "standards/conditional-tokens.json",
+        include_str!("../catalogs/standards/conditional-tokens.json"),
+        Binding::Standard,
+    ),
+];
+
+/// Safe's MultiSendCallOnly (1.3.0 twice, 1.4.1, 1.5.0): the only contract a
+/// Safe may delegatecall, and only to run a batch of plain calls. Its packed
+/// format is not ERC-7730, so it is described in code. The runtime code at
+/// each address was checked on each chain listed.
+pub const SAFE_BATCH: [&str; 4] = [
+    "0x40a2accbd92bca938b02010e17a5b8929b49130d",
+    "0xa1dabef33b3b82c7814b6d82a79e50f4ac44102b",
+    "0x9641d764fc13c8b624c04430c7356c1c7c8102e2",
+    "0xa83c336b20401af773b6219ba5027174338d1836",
+];
+pub const SAFE_BATCH_CHAINS: [u64; 6] = [1, 10, 100, 137, 8453, 42161];
+/// Safe's CreateCall, described in `catalogs/safe/create-call.json`.
+const SAFE_CREATE_CALL: [&str; 4] = [
+    "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4",
+    "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d",
+    "0x9b35af71d77eaf8d7e40252370304687390a1a52",
+    "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4",
+];
+
+/// What a reviewed function is permitted to mean. It is derived from the
+/// signature: only the canonical ERC-20 `transfer` and `approve` get the
+/// transfer and allowance rules, and nothing can rename its way out of them.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionClass {
@@ -49,13 +135,21 @@ impl ActionClass {
             Self::Other => "other",
         }
     }
+
+    pub fn of(signature: &str) -> Result<Self, ReviewError> {
+        Ok(match parse_function(signature)?.signature().as_str() {
+            crate::TRANSFER_SIGNATURE => Self::Transfer,
+            crate::APPROVE_SIGNATURE => Self::Allowance,
+            _ => Self::Other,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdmittedFunction {
-    /// The reviewed ERC-7730 display format key: a full function signature
-    /// with parameter names. The selector is derived from it, never supplied.
+    /// A descriptor format key: a full function signature with parameter
+    /// names. The selector is derived from it, never supplied.
     pub signature: String,
     pub action_class: ActionClass,
 }
@@ -68,296 +162,305 @@ pub struct TokenMetadata {
     pub name: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+/// One describable deployment.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogEntry {
-    pub chain_id: DecimalU64,
-    /// Lowercase `0x`-prefixed 20-byte address. The lookup key, and the only
-    /// address form compared against the transaction destination.
+    pub chain_id: u64,
+    /// Lowercase `0x`-prefixed 20-byte address.
     pub contract_address: String,
-    pub admitted_functions: Vec<AdmittedFunction>,
-    /// The flattened ERC-7730 document. Absent for a token-only entry that
-    /// exists to supply decimals for another contract's `tokenAmount`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub flattened_descriptor: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub descriptor_digest: Option<Digest32>,
-    /// Publisher assertions retained for comparison and provenance. Broker
-    /// does not measure them against a chain and cannot certify them.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_code_hash: Option<Digest32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_metadata: Option<TokenMetadata>,
     pub upgradeable: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub implementation_hash: Option<Digest32>,
-    /// When the publisher observed this deployment. Freshness is measured
-    /// from here, so republishing an old observation does not renew it.
-    pub observed_at_ms: DecimalU64,
+    /// Calls to an address with no entry of its own are also read by this
+    /// entry's functions, and Broker says it did not verify the address runs
+    /// this contract.
+    pub applies_to_instances: bool,
+    descriptor: usize,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CatalogSignature {
-    pub key_id: Token,
-    pub signature: Base64UrlBytes,
+/// The admitted catalog.
+#[derive(Debug)]
+pub struct Catalog {
+    descriptors: Vec<AdmittedDescriptor>,
+    entries: BTreeMap<(u64, String), CatalogEntry>,
+    /// One entry per standard description, at the zero address on chain 0:
+    /// it describes no deployment.
+    standards: Vec<CatalogEntry>,
+    vault_assets: BTreeMap<(u64, String), String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClearSigningCatalog {
-    pub schema: String,
-    pub catalog_id: Token,
-    pub sequence: DecimalU64,
-    pub issued_at_ms: DecimalU64,
-    pub expires_at_ms: DecimalU64,
-    pub entries: Vec<CatalogEntry>,
-    pub signatures: Vec<CatalogSignature>,
-}
-
-/// One trusted signing key, as wallet policy pins it.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TrustedCatalogKey {
-    pub key_id: Token,
-    pub verifying_key: VerifyingKey,
-}
-
-impl ClearSigningCatalog {
-    /// Signed content: everything except the signatures themselves.
-    pub fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, ReviewError> {
-        #[derive(Serialize)]
-        struct Unsigned<'a> {
-            schema: &'a str,
-            catalog_id: &'a Token,
-            sequence: &'a DecimalU64,
-            issued_at_ms: &'a DecimalU64,
-            expires_at_ms: &'a DecimalU64,
-            entries: &'a [CatalogEntry],
-        }
-        serde_jcs::to_vec(&Unsigned {
-            schema: &self.schema,
-            catalog_id: &self.catalog_id,
-            sequence: &self.sequence,
-            issued_at_ms: &self.issued_at_ms,
-            expires_at_ms: &self.expires_at_ms,
-            entries: &self.entries,
-        })
-        .map_err(|error| {
-            ReviewError::new(
-                ReviewReason::CatalogRejected,
-                format!("catalog canonicalization failed: {error}"),
-            )
-        })
-    }
-
-    /// The stored content identity. Two catalogs at the same sequence are the
-    /// same catalog only if this matches.
-    pub fn content_digest(&self) -> Result<Digest32, ReviewError> {
-        Ok(Digest32::from_bytes(
-            Sha256::digest(self.unsigned_canonical_bytes()?).into(),
-        ))
-    }
-
-    fn validate_shape(&self) -> Result<(), ReviewError> {
-        if self.schema != CATALOG_SCHEMA {
-            return Err(ReviewError::new(
-                ReviewReason::CatalogRejected,
-                "catalog schema is unsupported",
-            ));
-        }
-        if self.entries.len() > CATALOG_MAX_ENTRIES {
-            return Err(ReviewError::new(
-                ReviewReason::LimitExceeded,
-                format!("catalog holds more than {CATALOG_MAX_ENTRIES} entries"),
-            ));
-        }
-        if self.signatures.is_empty() || self.signatures.len() > CATALOG_MAX_SIGNATURES {
-            return Err(ReviewError::new(
-                ReviewReason::LimitExceeded,
-                format!("catalog must carry 1-{CATALOG_MAX_SIGNATURES} signatures"),
-            ));
-        }
-        if self.issued_at_ms.get() >= self.expires_at_ms.get() {
-            return Err(ReviewError::new(
-                ReviewReason::CatalogRejected,
-                "catalog validity interval is empty",
-            ));
-        }
-        let mut key_ids = BTreeSet::new();
-        for signature in &self.signatures {
-            if !key_ids.insert(signature.key_id.as_str()) {
-                return Err(ReviewError::new(
-                    ReviewReason::CatalogRejected,
-                    "catalog repeats a signing key identity",
-                ));
-            }
-        }
-        let mut keys: Vec<(u64, &str)> = Vec::with_capacity(self.entries.len());
-        for entry in &self.entries {
-            entry.validate_shape()?;
-            keys.push((entry.chain_id.get(), entry.contract_address.as_str()));
-        }
-        // Sorted and unique: the signed snapshot has one deterministic order,
-        // so a duplicate entry cannot shadow an earlier one during lookup.
-        if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(ReviewError::new(
-                ReviewReason::CatalogRejected,
-                "catalog entries must be sorted and unique by chain and address",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Verify shape, bounds and signature threshold offline. `trusted` and
-    /// `threshold` come from the wallet's authenticated policy; nothing here
-    /// consults the network, the filesystem or the clock.
-    pub fn accept(
-        &self,
-        encoded_bytes: usize,
-        trusted: &[TrustedCatalogKey],
-        threshold: usize,
-    ) -> Result<AcceptedCatalog, ReviewError> {
-        if encoded_bytes > CATALOG_MAX_BYTES {
-            return Err(ReviewError::new(
-                ReviewReason::LimitExceeded,
-                format!("catalog exceeds {CATALOG_MAX_BYTES} bytes"),
-            ));
-        }
-        self.validate_shape()?;
-        if threshold == 0 || threshold > trusted.len() {
-            return Err(ReviewError::new(
-                ReviewReason::CatalogRejected,
-                "policy signature threshold exceeds the number of trusted keys",
-            ));
-        }
-        let mut message = CATALOG_SIGNATURE_DOMAIN.to_vec();
-        message.extend_from_slice(&self.unsigned_canonical_bytes()?);
-        // Count each *verifying key* once, not each signature or key id: a
-        // publisher that repeats one key, under one id or several, cannot
-        // reach a threshold of two.
-        let mut satisfied = BTreeSet::new();
-        for candidate in &self.signatures {
-            let Some(key) = trusted
-                .iter()
-                .find(|trusted| trusted.key_id == candidate.key_id)
-            else {
-                continue;
-            };
-            let bytes: [u8; 64] = candidate.signature.decode().try_into().map_err(|_| {
-                ReviewError::new(
-                    ReviewReason::CatalogRejected,
-                    "catalog signature must contain exactly 64 bytes",
-                )
+static BUILT_IN: LazyLock<Result<Catalog, ReviewError>> = LazyLock::new(|| {
+    let descriptors = DESCRIPTORS
+        .iter()
+        .map(|(path, text, binding)| {
+            let value = serde_json::from_str(text).map_err(|error| {
+                ReviewError::new(ReviewReason::CatalogRejected, format!("{path}: {error}"))
             })?;
-            if key
-                .verifying_key
-                .verify(&message, &Signature::from_bytes(&bytes))
-                .is_ok()
-            {
-                satisfied.insert(key.verifying_key.to_bytes());
-            }
-        }
-        if satisfied.len() < threshold {
-            return Err(ReviewError::new(
-                ReviewReason::CatalogRejected,
-                format!(
-                    "catalog carries {} trusted signatures, below the required {threshold}",
-                    satisfied.len()
-                ),
-            ));
-        }
-        // Admit every descriptor now, at import, rather than at review. An
-        // entry Broker cannot read is an operator's problem to fix before a
-        // ceremony, not a surprise while the owner is looking at one. A
-        // digest match does not make an instruction supported, so both the
-        // content identity and the full subset check run here.
-        let mut admitted = Vec::with_capacity(self.entries.len());
-        for entry in &self.entries {
-            let Some(descriptor) = &entry.flattened_descriptor else {
-                continue;
-            };
-            let expected = entry
-                .descriptor_digest
-                .as_ref()
-                .expect("shape validation pairs descriptor and digest");
-            if &descriptor_digest(descriptor)? != expected {
-                return Err(ReviewError::new(
-                    ReviewReason::CatalogRejected,
-                    format!(
-                        "descriptor content for {} differs from the digest the catalog signed",
-                        entry.contract_address
-                    ),
-                ));
-            }
-            admitted.push((
-                (entry.chain_id.get(), entry.contract_address.clone()),
-                admit(
-                    descriptor,
-                    entry.chain_id.get(),
-                    &entry.contract_address,
-                    &entry.admitted_functions,
-                )?,
-            ));
-        }
-        Ok(AcceptedCatalog {
-            content_digest: self.content_digest()?,
-            catalog: self.clone(),
-            admitted,
+            Ok((value, *binding))
         })
-    }
-}
+        .collect::<Result<Vec<_>, ReviewError>>()?;
+    let mut catalog = Catalog::build(&descriptors, bloom_broker_api::known_tokens().to_vec())?;
+    catalog.admit_vault_assets(include_str!("../catalogs/vault-assets.json"))?;
+    Ok(catalog)
+});
 
-impl CatalogEntry {
-    fn validate_shape(&self) -> Result<(), ReviewError> {
-        if !is_canonical_address(&self.contract_address) {
-            return Err(ReviewError::new(
-                ReviewReason::CatalogRejected,
-                "entry address must be lowercase 0x-prefixed 20 bytes",
-            ));
+impl Catalog {
+    fn admit_vault_assets(&mut self, document: &str) -> Result<(), ReviewError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Bindings {
+            schema: String,
+            bindings: Vec<BindingRow>,
         }
-        if self.chain_id.get() == 0 {
-            return Err(ReviewError::new(
-                ReviewReason::CatalogRejected,
-                "entry chain ID must be nonzero",
-            ));
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct BindingRow {
+            chain_id: u64,
+            vault: String,
+            asset: String,
+            #[serde(rename = "observation")]
+            _observation: Value,
         }
-        if self.upgradeable != self.implementation_hash.is_some() {
-            return Err(ReviewError::new(
-                ReviewReason::CatalogRejected,
-                "an upgradeable entry requires an implementation hash, a direct one forbids it",
-            ));
+        let document: Bindings = serde_json::from_str(document)
+            .map_err(|error| rejected(format!("vault asset bindings: {error}")))?;
+        if document.schema != "bloom.vault-asset-bindings.v1" || document.bindings.len() > 256 {
+            return Err(rejected("unsupported or oversized vault asset bindings"));
         }
-        if self.flattened_descriptor.is_some() != self.descriptor_digest.is_some() {
-            return Err(ReviewError::new(
-                ReviewReason::CatalogRejected,
-                "a descriptor and its digest are present together or not at all",
-            ));
-        }
-        if self.admitted_functions.is_empty() != self.flattened_descriptor.is_none() {
-            return Err(ReviewError::new(
-                ReviewReason::CatalogRejected,
-                "admitted functions require a descriptor, and a descriptor requires them",
-            ));
-        }
-        let mut signatures = BTreeSet::new();
-        for admitted in &self.admitted_functions {
-            if !signatures.insert(admitted.signature.as_str()) {
-                return Err(ReviewError::new(
-                    ReviewReason::CatalogRejected,
-                    "entry admits the same function signature twice",
+        for binding in document.bindings {
+            if binding.chain_id == 0
+                || !crate::is_canonical_address(&binding.vault)
+                || !crate::is_canonical_address(&binding.asset)
+                || binding.vault == format!("0x{}", "0".repeat(40))
+                || !self
+                    .entry(binding.chain_id, &binding.asset)
+                    .is_some_and(|entry| entry.token_metadata.is_some())
+            {
+                return Err(rejected(
+                    "vault binding requires a canonical vault and catalogued underlying token",
                 ));
             }
-        }
-        if let Some(metadata) = &self.token_metadata {
-            metadata.validate_shape()?;
+            if self
+                .vault_assets
+                .insert((binding.chain_id, binding.vault), binding.asset)
+                .is_some()
+            {
+                return Err(rejected("duplicate vault asset binding"));
+            }
         }
         Ok(())
     }
 
-    pub fn admitted(&self, signature: &str) -> Option<&AdmittedFunction> {
-        self.admitted_functions
-            .iter()
-            .find(|admitted| admitted.signature == signature)
+    pub fn vault_asset(&self, chain_id: u64, vault: &str) -> Option<&CatalogEntry> {
+        self.vault_assets
+            .get(&(chain_id, vault.to_owned()))
+            .and_then(|asset| self.entry(chain_id, asset))
+    }
+    /// The catalog compiled into this build. A test proves it admits, so the
+    /// error is reachable only through a broken build.
+    pub fn built_in() -> Result<&'static Catalog, ReviewError> {
+        BUILT_IN.as_ref().map_err(Clone::clone)
+    }
+
+    /// Admit descriptors and token rows. Every function a descriptor formats
+    /// is admitted. A token without a descriptor of its own is read by the
+    /// built-in ERC-20 profile.
+    pub fn build(
+        descriptors: &[(Value, Binding)],
+        tokens: Vec<KnownToken>,
+    ) -> Result<Self, ReviewError> {
+        let (profile, functions) = erc20_profile();
+        let mut catalog = Catalog {
+            descriptors: vec![
+                admit_document(&profile, None, &functions)?,
+                safe_batch_description(),
+            ],
+            entries: BTreeMap::new(),
+            standards: Vec::new(),
+            vault_assets: BTreeMap::new(),
+        };
+        for chain_id in SAFE_BATCH_CHAINS {
+            for address in SAFE_BATCH {
+                catalog.insert(CatalogEntry {
+                    chain_id,
+                    contract_address: address.to_owned(),
+                    token_metadata: None,
+                    upgradeable: false,
+                    applies_to_instances: false,
+                    descriptor: SAFE_BATCH_DESCRIPTOR,
+                })?;
+            }
+        }
+        let mut instance_selectors = BTreeSet::new();
+        for (descriptor, binding) in descriptors {
+            let functions = descriptor
+                .pointer("/display/formats")
+                .and_then(Value::as_object)
+                .ok_or_else(|| rejected("display has no formats"))?
+                .keys()
+                .map(|signature| {
+                    Ok(AdmittedFunction {
+                        signature: signature.clone(),
+                        action_class: ActionClass::of(signature)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ReviewError>>()?;
+            let index = catalog.descriptors.len();
+            if *binding == Binding::Standard {
+                let admitted = admit_document(descriptor, None, &functions)?;
+                check_unlisted_reading(&admitted)?;
+                for call in &admitted.calls {
+                    if !instance_selectors.insert((0, call.selector)) {
+                        return Err(rejected(format!(
+                            "two standard descriptions admit the selector of `{}`",
+                            call.signature
+                        )));
+                    }
+                }
+                catalog.standards.push(CatalogEntry {
+                    chain_id: 0,
+                    contract_address: format!("0x{}", "0".repeat(40)),
+                    token_metadata: None,
+                    upgradeable: false,
+                    applies_to_instances: true,
+                    descriptor: index,
+                });
+                catalog.descriptors.push(admitted);
+                continue;
+            }
+            let bound = deployments(descriptor)?;
+            let (chain_id, address) = bound
+                .first()
+                .ok_or_else(|| rejected("a descriptor lists no deployments"))?;
+            let admitted = admit(descriptor, *chain_id, address, &functions)?;
+            let instance = match binding {
+                Binding::Instances(address) => {
+                    check_unlisted_reading(&admitted)?;
+                    Some(*address)
+                }
+                _ => None,
+            };
+            for (chain_id, address) in bound {
+                let applies_to_instances = instance == Some(address.as_str());
+                if applies_to_instances {
+                    for call in &admitted.calls {
+                        if !instance_selectors.insert((chain_id, call.selector)) {
+                            return Err(rejected(format!(
+                                "two instance descriptions on chain {chain_id} admit the selector of `{}`, so an unlisted address would be ambiguous",
+                                call.signature
+                            )));
+                        }
+                    }
+                }
+                catalog.insert(CatalogEntry {
+                    chain_id,
+                    contract_address: address,
+                    token_metadata: None,
+                    upgradeable: *binding == Binding::ListedUpgradeable,
+                    applies_to_instances,
+                    descriptor: index,
+                })?;
+            }
+            catalog.descriptors.push(admitted);
+        }
+        for token in tokens {
+            let metadata = TokenMetadata {
+                decimals: token.decimals,
+                symbol: token.symbol,
+                name: token.name,
+            };
+            metadata.validate_shape()?;
+            // A described deployment that is also a token (one with `permit`,
+            // say) is read by its own descriptor, with these units.
+            if let Some(described) = catalog
+                .entries
+                .get_mut(&(token.chain_id, token.address.clone()))
+            {
+                if described.applies_to_instances || described.token_metadata.is_some() {
+                    return Err(rejected(format!(
+                        "token {} on chain {} is listed twice or is an instance description",
+                        token.address, token.chain_id
+                    )));
+                }
+                described.token_metadata = Some(metadata);
+                described.upgradeable |= token.upgradeable;
+                continue;
+            }
+            catalog.insert(CatalogEntry {
+                chain_id: token.chain_id,
+                contract_address: token.address,
+                token_metadata: Some(metadata),
+                upgradeable: token.upgradeable,
+                applies_to_instances: false,
+                descriptor: 0,
+            })?;
+        }
+        Ok(catalog)
+    }
+
+    fn insert(&mut self, entry: CatalogEntry) -> Result<(), ReviewError> {
+        if !is_canonical_address(&entry.contract_address) || entry.chain_id == 0 {
+            return Err(rejected(format!(
+                "`{}` on chain {} is not a lowercase 0x-prefixed address on a nonzero chain",
+                entry.contract_address, entry.chain_id
+            )));
+        }
+        let key = (entry.chain_id, entry.contract_address.clone());
+        if self.entries.insert(key, entry).is_some() {
+            return Err(rejected("the catalog lists one deployment twice"));
+        }
+        Ok(())
+    }
+
+    /// Whether a Safe may delegatecall this address: one of Safe's own
+    /// libraries, MultiSendCallOnly or CreateCall, which act only as the
+    /// Safe's batch or deployment.
+    pub fn is_safe_library(&self, chain_id: u64, address: &str) -> bool {
+        self.entry(chain_id, address).is_some_and(|entry| {
+            entry.descriptor == SAFE_BATCH_DESCRIPTOR || SAFE_CREATE_CALL.contains(&address)
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn entry(&self, chain_id: u64, address: &str) -> Option<&CatalogEntry> {
+        self.entries.get(&(chain_id, address.to_owned()))
+    }
+
+    pub fn descriptor(&self, chain_id: u64, address: &str) -> Option<&AdmittedDescriptor> {
+        self.entry(chain_id, address)
+            .map(|entry| &self.descriptors[entry.descriptor])
+    }
+
+    /// The entry that describes a call to `address` with `selector`, and
+    /// whether it was matched as an unverified instance.
+    ///
+    /// An address with its own entry is read by that entry alone: a listed
+    /// token is never read as a Safe because it lacks the selector. Only an
+    /// unlisted address falls through to the instance entries.
+    pub fn resolve(
+        &self,
+        chain_id: u64,
+        address: &str,
+        selector: &[u8],
+    ) -> Option<(&CatalogEntry, &AdmittedDescriptor, bool)> {
+        if let Some(entry) = self.entry(chain_id, address) {
+            return Some((entry, &self.descriptors[entry.descriptor], false));
+        }
+        self.entries
+            .range((chain_id, String::new())..)
+            .take_while(|((entry_chain, _), _)| *entry_chain == chain_id)
+            .map(|(_, entry)| entry)
+            .filter(|entry| entry.applies_to_instances)
+            .chain(&self.standards)
+            .find_map(|entry| {
+                let descriptor = &self.descriptors[entry.descriptor];
+                descriptor.call(selector).map(|_| (entry, descriptor, true))
+            })
     }
 }
 
@@ -375,59 +478,64 @@ impl TokenMetadata {
             && self.name.len() <= TOKEN_NAME_MAX_BYTES
             && !self.name.chars().any(is_control_or_bidi);
         if !symbol_ok || !name_ok {
-            return Err(ReviewError::new(
-                ReviewReason::CatalogRejected,
-                "token symbol or name is empty, oversized, or carries unsafe characters",
-            ));
+            return Err(rejected(format!(
+                "token `{}` has an empty, oversized or unsafe symbol or name",
+                self.symbol
+            )));
         }
         Ok(())
     }
 }
 
-/// A catalog that passed shape, bounds and signature checks. Freshness is
-/// deliberately *not* checked here: the accepted snapshot is durable, and the
-/// clock is consulted per review.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AcceptedCatalog {
-    pub catalog: ClearSigningCatalog,
-    pub content_digest: Digest32,
-    admitted: Vec<((u64, String), AdmittedDescriptor)>,
+const SAFE_BATCH_DESCRIPTOR: usize = 1;
+
+/// A description read for addresses nobody listed may not admit ERC-20
+/// calls: token units or the transfer class there would lend one token's
+/// identity to every such address.
+fn check_unlisted_reading(admitted: &AdmittedDescriptor) -> Result<(), ReviewError> {
+    if admitted.calls.iter().any(|call| call.native_value) {
+        return Err(rejected(
+            "native value requires a listed deployment, not an instance or standard binding",
+        ));
+    }
+    if admitted
+        .calls
+        .iter()
+        .any(|call| call.action_class != ActionClass::Other)
+    {
+        return Err(rejected(
+            "an instance or standard description may not admit ERC-20 calls",
+        ));
+    }
+    Ok(())
 }
 
-impl AcceptedCatalog {
-    pub fn entry(&self, chain_id: u64, address: &str) -> Option<&CatalogEntry> {
-        self.catalog
-            .entries
-            .iter()
-            .find(|entry| entry.chain_id.get() == chain_id && entry.contract_address == address)
+fn safe_batch_description() -> AdmittedDescriptor {
+    let signature = "multiSend(bytes transactions)";
+    AdmittedDescriptor {
+        contract_name: Some("Safe batch".to_owned()),
+        calls: vec![AdmittedCall {
+            signature: signature.to_owned(),
+            selector: parse_function(signature)
+                .expect("the batch signature parses")
+                .selector()
+                .0,
+            action_class: ActionClass::Other,
+            intent: None,
+            fields: vec![AdmittedField {
+                path: "transactions".to_owned(),
+                label: "Transaction".to_owned(),
+                format: AdmittedFormat::SafeBatch,
+            }],
+            native_value: false,
+            leaves: vec![("transactions".to_owned(), LeafType::Bytes)],
+            constraints: Vec::new(),
+        }],
     }
+}
 
-    pub fn descriptor(&self, chain_id: u64, address: &str) -> Option<&AdmittedDescriptor> {
-        self.admitted
-            .iter()
-            .find(|((entry_chain, entry_address), _)| {
-                *entry_chain == chain_id && entry_address == address
-            })
-            .map(|(_, descriptor)| descriptor)
-    }
-
-    /// Reject a snapshot that is not yet issued or already expired. Both ends
-    /// are checked, so a catalog dated in the future cannot pre-authorize.
-    pub fn check_validity(&self, now_ms: u64) -> Result<(), ReviewError> {
-        if now_ms < self.catalog.issued_at_ms.get() {
-            return Err(ReviewError::new(
-                ReviewReason::CatalogRejected,
-                "catalog is not yet valid",
-            ));
-        }
-        if now_ms >= self.catalog.expires_at_ms.get() {
-            return Err(ReviewError::new(
-                ReviewReason::EvidenceExpired,
-                "catalog has expired; import a newer signed snapshot",
-            ));
-        }
-        Ok(())
-    }
+fn rejected(message: impl Into<String>) -> ReviewError {
+    ReviewError::new(ReviewReason::CatalogRejected, message)
 }
 
 pub fn is_canonical_address(value: &str) -> bool {
