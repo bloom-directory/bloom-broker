@@ -219,7 +219,13 @@ identity — never parse the message, and never invent a replacement operation.
 The field is refused if it appears on any other code or carries values outside
 its own window.
 
-Concurrency exhaustion is a different class: it returns `QUOTA_EXCEEDED` with
+Each wallet permits one live ceremony. Petals and agents must finish or cancel
+an approval ceremony before requesting the next route ceremony. An overlapping
+request returns `CEREMONY_RATE_LIMITED`; its `retry_after_ms` is the remaining
+lifetime of the live ceremony. Completion can free the slot earlier. Preserve
+the operation identity when retrying and do not busy-loop on this error.
+
+Global concurrency exhaustion is a different class: it returns `QUOTA_EXCEEDED` with
 **no** retry hint, because nothing ages out on a schedule — only when a live
 ceremony ends.
 

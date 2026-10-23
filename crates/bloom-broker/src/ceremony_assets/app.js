@@ -813,8 +813,11 @@ function describeTransfer(manifest) {
     // Every mandatory warning, in the order the verifier produced it, kept
     // visible rather than folded into the fact list or the details section.
     const warnings = [];
+    const bannerWarnings = [];
     for (const payload of calls) {
-      for (const warning of reviewedContractCall(payload).warnings || []) warnings.push(warning);
+      const call = reviewedContractCall(payload);
+      warnings.push(...(call.warnings || []));
+      if (call.contract_name !== "Enso Router V2") bannerWarnings.push(...(call.warnings || []));
     }
     const interpretation = [];
     // Upgradeability belongs to a contract, so it is stated once per affected
@@ -825,9 +828,11 @@ function describeTransfer(manifest) {
     // page, and when it touches more than one the address distinguishes them.
     const upgradeable = clear ? (clear.entries || []).filter(entry => entry.upgradeable) : [];
     for (const entry of upgradeable) {
-      warnings.push(upgradeable.length > 1
+      const warning = upgradeable.length > 1
         ? `Upgradeable contract ${shortAddress(entry.contract_address)} — its behavior can change.`
-        : "Upgradeable contract — its behavior can change.");
+        : "Upgradeable contract — its behavior can change.";
+      warnings.push(warning);
+      bannerWarnings.push(warning);
       interpretation.push(["Upgradeable contract",
         `${entry.contract_address} — its code may have changed since this Bloom release described it.`]);
     }
@@ -949,7 +954,7 @@ function describeTransfer(manifest) {
     const sentence = intent.action === "batch"
       ? `One approval covers all ${evmPayloads.length} transactions on <strong>${escapeHtml(network)}</strong>, in the order below.`
       : "";
-    return {intent, sentence, payloads: evmPayloads, parties: parties.map(party => ({...party, chainId: first.chain_id})), assurance, interpretation, mixedAssurance: Boolean(clear && structuralCalls.length), facts, technical, warnings, networkIdentity,
+    return {intent, sentence, payloads: evmPayloads, parties: parties.map(party => ({...party, chainId: first.chain_id})), assurance, interpretation, mixedAssurance: Boolean(clear && structuralCalls.length), facts, technical, warnings, bannerWarnings, networkIdentity,
             chainId: evmPayloads.length === 1 ? first.chain_id : null,
             assetSummary: evmPayloads.length === 1 ? summary : null,
             networkIcon: oneNetwork ? chainIcon(first.chain_id) : "unknown",
@@ -1561,6 +1566,19 @@ function renderReview(session) {
       if (call.contract_name === "Enso Router V2") {
         try { shortcut = JSON.parse(call.fields.find(field => field.format === "ensoShortcut")?.value); } catch (_) {}
       }
+      if (enso && shortcut?.steps?.length) {
+        let total = 0n;
+        let unknown = false;
+        for (const step of shortcut.steps) {
+          const units = step.native_value.match(/^(\d+) raw native units$/)?.[1];
+          if (units) total += BigInt(units);
+          else unknown = true;
+        }
+        if (total > BigInt(payload.value || "0")) {
+          decision.push(el("p", {}, `Total instruction value: ${total} raw native units, exceeding the transaction value. This may include value returned by earlier calls; it is not necessarily an additional debit from your wallet.`));
+        }
+        if (unknown) decision.push(el("p", {}, "Some instruction values depend on execution; the total native value forwarded cannot be determined."));
+      }
       for (const field of reviewCallFields(call)) {
         if (technicalCallField(call, field)) continue;
         if (enso && field.label === "Native value") {
@@ -1599,11 +1617,6 @@ function renderReview(session) {
           }
           if (step.native_value !== "0 raw native units") {
             section.append(el("p", {}, `Native value: ${step.native_value}`));
-            // Forwarding the ETH the owner pays is not an extra charge.
-            const units = step.native_value.match(/^(\d+) raw native units$/)?.[1];
-            if (!units || BigInt(units) > BigInt(payload.value || "0")) {
-              decision.push(el("p", {}, `Additional instruction value: ${step.native_value}`));
-            }
           }
           execution.push(section);
           evidence.push(el("p", {}, `${field.label}: ${field.value}. Execution mode: ${step.call_type}. Native value: ${step.native_value}`));
@@ -1665,14 +1678,7 @@ function renderReview(session) {
         protocolDetails ? null : el("code", {class: "ceremony-function"}, call.function_signature),
         argumentsList));
     }
-    if (transfer.warnings?.length) {
-      // The Enso section shows the router call's own warnings; every other
-      // payload's warnings still lead the page.
-      const ensoOwn = new Set((transfer.payloads || [])
-        .filter(payload => payload.contract_call?.contract_name === "Enso Router V2")
-        .flatMap(payload => reviewedContractCall(payload)?.warnings || []));
-      primaryWarnings.push(...transfer.warnings.filter(warning => !ensoOwn.has(warning)));
-    }
+    primaryWarnings.push(...(transfer.bannerWarnings || transfer.warnings || []));
     for (const card of transfer.intent.cards || []) {
       const unlimited = card.magnitude === "unlimited";
       const wrapper = el("section", {class: "ceremony-card"},
@@ -2836,7 +2842,7 @@ const PREVIEW_PM80_READINGS = {
         "raw": "0x"
       }
     ],
-    "assurance": "Interpreted using Bloom's contract descriptions, but this call reaches a contract Bloom has not identified. Bloom has not verified what that contract is or what it does.",
+    "assurance": "Interpreted using Bloom's description of this catalogued Enso router. Shortcut targets, contract behavior and execution effects are not verified.",
     "structural": true,
     "warnings": [
       "Shortcut program not independently decoded: unknown shortcut entry-point selector. Exact bytes are retained.",
@@ -2914,7 +2920,7 @@ const PREVIEW_PM80_READINGS = {
         "raw": "0x01020304"
       }
     ],
-    "assurance": "Interpreted using Bloom's contract descriptions, but this call reaches a contract Bloom has not identified. Bloom has not verified what that contract is or what it does.",
+    "assurance": "Interpreted using Bloom's description of this catalogued Enso router. Shortcut targets, contract behavior and execution effects are not verified.",
     "structural": true,
     "warnings": [
       "Shortcut program not independently decoded: unknown shortcut entry-point selector. Exact bytes are retained.",
@@ -2976,7 +2982,7 @@ const PREVIEW_PM80_READINGS = {
         "raw": "0x95352c9f00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000e00000000000000000000000000000000000000000000000000000000000000002a9059cbb010001ffffffff01833589fcd6edb6e08f4c7c32d4f71b54bda02913a9059cbb010001ffffffff01833589fcd6edb6e08f4c7c32d4f71b54bda0291300000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000200000000000000000000000002222222222222222222222222222222222222222000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000002625a0"
       }
     ],
-    "assurance": "Interpreted using Bloom's contract descriptions, but this call reaches a contract Bloom has not identified. Bloom has not verified what that contract is or what it does.",
+    "assurance": "Interpreted using Bloom's description of this catalogued Enso router. Shortcut targets, contract behavior and execution effects are not verified.",
     "structural": true,
     "warnings": [
       "Enso input amounts and supported shortcut commands are decoded. Ordinary route envelopes do not constrain output token, recipient or minimum output. Runtime values, fees and destination settlement are not verified; route quotes are not signed guarantees."
@@ -3025,7 +3031,7 @@ const PREVIEW_PM80_READINGS = {
         "raw": "0x01020304"
       }
     ],
-    "assurance": "Interpreted using Bloom's contract descriptions, but this call reaches a contract Bloom has not identified. Bloom has not verified what that contract is or what it does.",
+    "assurance": "Interpreted using Bloom's description of this catalogued Enso router. Shortcut targets, contract behavior and execution effects are not verified.",
     "structural": true,
     "warnings": [
       "Shortcut program not independently decoded: unknown shortcut entry-point selector. Exact bytes are retained.",

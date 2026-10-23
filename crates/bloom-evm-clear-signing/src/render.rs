@@ -573,8 +573,15 @@ fn review_at(
                                             for entry in entries { if !used.contains(&entry) { used.push(entry); } }
                                             // The Enso executor makes this call with its own
                                             // balance, not the owner's account.
-                                            for warning in &mut reading.warnings {
-                                                *warning = warning.replace("your ", "the Enso executor's ");
+                                            if let Some(token) = &reading.token {
+                                                for unlimited in [false, true] {
+                                                    let owner_warning = allowance_warning(&token.symbol, unlimited, "your");
+                                                    for warning in &mut reading.warnings {
+                                                        if *warning == owner_warning {
+                                                            *warning = allowance_warning(&token.symbol, unlimited, "the Enso executor's");
+                                                        }
+                                                    }
+                                                }
                                             }
                                             step.reading = Some(reading);
                                         }
@@ -782,7 +789,9 @@ fn review_at(
             fields,
             token: SelectedEntry::of(entry).token,
             intent_summary,
-            assurance: if structural {
+            assurance: if enso_inputs > 0 {
+                "Interpreted using Bloom's description of this catalogued Enso router. Shortcut targets, contract behavior and execution effects are not verified.".into()
+            } else if structural {
                 structural_assurance()
             } else {
                 standing_assurance()
@@ -1186,16 +1195,10 @@ fn apply_safety_rules(
         warnings.push("This sets the spender's allowance to zero, clearing it.".to_owned());
         "zero"
     } else if *amount == U256::MAX {
-        warnings.push(format!(
-            "If executed, this spender can use all your current and future {} without asking again. This permission has no expiry; changing it requires another transaction.",
-            identity.symbol
-        ));
+        warnings.push(allowance_warning(&identity.symbol, true, "your"));
         "unlimited"
     } else {
-        warnings.push(
-            "This spender can move your tokens later without another approval. The permission does not expire with this review."
-                .to_owned(),
-        );
+        warnings.push(allowance_warning(&identity.symbol, false, "your"));
         warnings.push(
             "This sets the spender's total allowance to the amount shown. It is not added to any existing allowance."
                 .to_owned(),
@@ -1207,6 +1210,18 @@ fn apply_safety_rules(
         ActionClass::Allowance,
         Some(summary("allowance", "spender", magnitude)),
     ))
+}
+
+fn allowance_warning(symbol: &str, unlimited: bool, owner: &str) -> String {
+    if unlimited {
+        format!(
+            "If executed, this spender can use all {owner} current and future {symbol} without asking again. This permission has no expiry; changing it requires another transaction."
+        )
+    } else {
+        format!(
+            "This spender can move {owner} tokens later without another approval. The permission does not expire with this review."
+        )
+    }
 }
 
 fn render_field(

@@ -45,6 +45,8 @@ fn petal_protected_swap_is_independently_decoded() {
     assert_eq!(tx["to"].as_str().unwrap().to_lowercase(), ROUTER);
     let bytes = hex::decode(tx["data_hex"].as_str().unwrap().trim_start_matches("0x")).unwrap();
     let call = review(&bytes, tx["value_wei"].as_str().unwrap().parse().unwrap()).unwrap();
+    assert!(call.assurance.contains("catalogued Enso router"));
+    assert!(!call.assurance.contains("contract Bloom has not identified"));
     assert_eq!(
         field(&call, "Source asset / amount").value,
         "0.001 ETH (transaction value)"
@@ -431,6 +433,40 @@ fn shortcut_constants_receive_catalog_readings_and_runtime_slots_stay_explicit()
             .contains("2.5 USDC")
     );
     export_ui_fixture("enso-shortcut", &call);
+}
+
+#[test]
+fn shortcut_allowances_name_the_executor_for_finite_and_unlimited_amounts() {
+    for amount in [U256::from(10), U256::MAX] {
+        let mut command = [0xffu8; 32];
+        command[..4].copy_from_slice(&[0x09, 0x5e, 0xa7, 0xb3]);
+        command[4] = 1;
+        command[5] = 0;
+        command[6] = 1;
+        command[12..].copy_from_slice(&USDC.parse::<alloy_primitives::Address>().unwrap()[..]);
+        let shortcut = parse_function("executeShortcut(bytes32,bytes32,bytes32[],bytes[])")
+            .unwrap()
+            .abi_encode_input(&[
+                DynSolValue::FixedBytes(Default::default(), 32),
+                DynSolValue::FixedBytes(Default::default(), 32),
+                DynSolValue::Array(vec![DynSolValue::FixedBytes(command.into(), 32)]),
+                DynSolValue::Array(vec![
+                    DynSolValue::Bytes(address_word(RECIPIENT).to_be_bytes::<32>().to_vec()),
+                    DynSolValue::Bytes(amount.to_be_bytes::<32>().to_vec()),
+                ]),
+            ])
+            .unwrap();
+        let outer = parse_function(SINGLE)
+            .unwrap()
+            .abi_encode_input(&[input(USDC, 10), DynSolValue::Bytes(shortcut)])
+            .unwrap();
+        let call = review(&outer, 0).unwrap();
+        let program: serde_json::Value =
+            serde_json::from_str(&field(&call, "Shortcut program").value).unwrap();
+        let warnings = program["steps"][0]["reading"]["warnings"].to_string();
+        assert!(warnings.contains("the Enso executor's"), "{warnings}");
+        assert!(!warnings.contains("your "), "{warnings}");
+    }
 }
 
 #[test]

@@ -4167,9 +4167,11 @@ async fn prepare_wallet_backup(
                 && session.expires_at_ms > now
         })
         .cloned();
-    // A page that already bound its output key holds that session; any other
-    // caller, such as another local process, gets a fresh one rather than
-    // being able to park the owner's backup on a key it controls.
+    // Replace a bound session so a local caller cannot park the owner's backup
+    // on its own output key. This also lets one forged-header request from a
+    // local process cancel the owner's session, even at the passkey prompt.
+    // These browser headers do not authenticate local processes. Replacement
+    // prevents persistent parking, not interruption; no secret is exposed.
     let bound = |session: &BrowserSession| {
         session
             .projection

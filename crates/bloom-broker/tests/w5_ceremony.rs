@@ -1458,6 +1458,7 @@ const mixedBatch = JSON.parse(mixed.review_manifest.canonical_plan);
 const allowance = JSON.parse(previewSession("enso-allowance").review_manifest.canonical_plan).evm_review.payloads[0];
 const allowanceWarning = "Distinct batch warning that only the banner shows.";
 allowance.contract_call.warnings = [allowanceWarning];
+mixedBatch.evm_review.payloads[0].contract_call.warnings.push(allowanceWarning);
 mixedBatch.evm_review.payloads.unshift(allowance);
 mixed.review_manifest.canonical_plan = JSON.stringify(mixedBatch);
 renderReview(mixed);
@@ -1501,6 +1502,22 @@ renderReview(riskyShortcut);
 const unreadPrimary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
 if (!unreadPrimary.includes("Bloom cannot interpret every call") || unreadPrimary.includes("cannot be determined before execution")) {{
   throw new Error("An undecodable static call was falsely labelled runtime-dependent");
+}}
+// Neither step individually exceeds the payment, but together they do.
+riskyPlan.evm_review.payloads[0].value = "10";
+for (const step of program.steps) step.native_value = "6 raw native units";
+programField.value = JSON.stringify(program);
+riskyShortcut.review_manifest.canonical_plan = JSON.stringify(riskyPlan);
+renderReview(riskyShortcut);
+if (!nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ").includes("12 raw native units")) {{
+  throw new Error("Native instruction values were not summed across the route");
+}}
+for (const step of program.steps) step.native_value = "5 raw native units";
+programField.value = JSON.stringify(program);
+riskyShortcut.review_manifest.canonical_plan = JSON.stringify(riskyPlan);
+renderReview(riskyShortcut);
+if (nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ").includes("Total instruction value")) {{
+  throw new Error("Forwarding the transaction value was shown as excess value");
 }}
 for (const token of {tokens}) {{
   const preview = previewCatalogToken(token);
