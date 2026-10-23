@@ -1253,6 +1253,30 @@ impl BrokerRpcService {
                 bloom_broker_api::pumpfun_review_required(c.operation_class.as_str())
             });
         crate::message_review::validate_selector(&terms, request.petal_use_claim.as_ref())?;
+        // A retry of an operation Broker already signed returns its recorded
+        // result. Authorizing it again would charge the approval a second
+        // time, so a caller that lost the first response to an approval with
+        // one operation could never learn the signature that exists. The
+        // retry must describe exactly that operation: its digest is recomputed
+        // from the request's own approval, key, payloads, claim and provenance,
+        // never taken from the request.
+        if let Some(snapshot) = self
+            .journal
+            .operation(&request.operation_id)
+            .map_err(journal_error)?
+            && snapshot.kind == crate::journal::OPERATION_KIND
+            && snapshot.is_batch == is_batch
+            && let Some(result) = snapshot.result
+            && result.operation_digest == snapshot.operation_digest
+            && self
+                .authority
+                .request_operation_digest(&request)
+                .map_err(authority_error)?
+                .as_ref()
+                == Some(&snapshot.operation_digest)
+        {
+            return Ok(result);
+        }
         let trusted_time_required = clob_auth
             || !terms.limits.operation_rate_limits.is_empty()
             || !terms.limits.signature_rate_limits.is_empty()
