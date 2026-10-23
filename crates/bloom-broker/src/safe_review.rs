@@ -2,16 +2,15 @@
 
 use std::str::FromStr;
 
-use alloy::primitives::{Address, B256, U256, keccak256};
+use alloy::primitives::{Address, U256, keccak256};
 use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalSelector, CanonicalWalletPolicy, CryptoSuite, DeclaredFee,
-    Digest32, ProtocolError, ProtocolErrorCode, ReviewMode,
+    Digest32, ProtocolError, ProtocolErrorCode,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-/// Facts Broker rebuilt from the exact Safe signing bytes, plus what the
-/// Petal reported about the Safe and Broker could not check.
+/// Facts Broker rebuilt from the exact Safe signing bytes.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SafeReview {
@@ -26,33 +25,13 @@ pub struct SafeReview {
     pub value_display: String,
     pub action: Vec<String>,
     pub safe_tx_hash: String,
-    pub reported: SafeReported,
-    /// The catalog entries that read the inner calls, frozen with the
-    /// approval so signing re-checks them exactly as it does a native call.
+    /// The catalog entries that read the inner calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clear_signing: Option<bloom_evm_clear_signing::ClearSigningEvidence>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SafeReported {
-    pub version: String,
-    pub singleton: String,
-    pub singleton_code_hash: String,
-    pub owners: Vec<String>,
-    pub threshold: String,
-    pub guard: String,
-    pub modules: Vec<String>,
-    pub fallback_handler: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub library_code_hash: Option<String>,
-}
-
 const MAX_REVIEW_BYTES: usize = 256 * 1024;
 const MAX_CALLDATA_BYTES: usize = 128 * 1024;
-const MAX_OWNERS: usize = 64;
-const MAX_MODULES: usize = 64;
-const ZERO: &str = "0x0000000000000000000000000000000000000000";
 const SAFE_TX_TYPE: &str = "SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)";
 const DOMAIN_TYPE: &str = "EIP712Domain(uint256 chainId,address verifyingContract)";
 
@@ -109,57 +88,6 @@ fn uint(value: &str, field: &str) -> Result<U256, ProtocolError> {
         )));
     }
     U256::from_str(value).map_err(|_| invalid(format!("{field} is too large")))
-}
-
-/// A 32-byte hash as a Petal reports it.
-///
-/// Broker cannot verify these against a chain, but a hash has a shape, and a
-/// field with a checkable shape is checked: the value is rendered into the
-/// ceremony, so accepting arbitrary text here means accepting whatever a
-/// Petal puts on the approval screen.
-fn code_hash(value: &str, field: &str) -> Result<(), ProtocolError> {
-    let digits = value
-        .strip_prefix("0x")
-        .ok_or_else(|| invalid(format!("{field} must be 0x-prefixed hex")))?;
-    if digits.len() != 64 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(invalid(format!(
-            "{field} must be a 0x-prefixed 32-byte hash"
-        )));
-    }
-    Ok(())
-}
-
-/// A Safe version as a Petal reports it: `major.minor.patch`, optionally with
-/// a short alphanumeric suffix such as `1.3.0+L2`. Short and printable, for
-/// the same reason as `code_hash`.
-fn safe_version(value: &str) -> Result<(), ProtocolError> {
-    let invalid_version = || invalid("safe_version must look like 1.4.1, with an optional +suffix");
-    if value.is_empty() || value.len() > 16 {
-        return Err(invalid_version());
-    }
-    let (core, suffix) = match value.split_once('+') {
-        Some((core, suffix)) => (core, Some(suffix)),
-        None => (value, None),
-    };
-    if let Some(suffix) = suffix
-        && (suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()))
-    {
-        return Err(invalid_version());
-    }
-    let parts: Vec<&str> = core.split('.').collect();
-    if parts.len() != 3 {
-        return Err(invalid_version());
-    }
-    for part in parts {
-        if part.is_empty()
-            || part.len() > 3
-            || (part.len() > 1 && part.starts_with('0'))
-            || !part.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err(invalid_version());
-        }
-    }
-    Ok(())
 }
 
 fn bytes(value: &str, field: &str) -> Result<Vec<u8>, ProtocolError> {
@@ -255,364 +183,110 @@ fn exact_bytes(
     Ok((ordered_payload_digests, ordered_hashes))
 }
 
+/// The Safe's version, singleton, owners, threshold, guard, modules and
+/// fallback handler are the Petal's report and outside the signed bytes, so
+/// Broker neither checks nor shows them. It checks the one thing it can: the
+/// signing owner is this wallet's key.
 fn validate_state(envelope: &Envelope, from: Address) -> Result<(), ProtocolError> {
     if envelope.schema != "bloom.safe.review.v1" {
         return Err(invalid("unsupported Safe review schema"));
     }
-    // Petal-reported fields outside the EIP-712 preimage are bounded for
-    // display only: a pinned table could refuse an honest Petal and not a
-    // dishonest one. A pre-1.3.0 domain separator fails the selector check.
-    // Bounded still means checked, though -- every one of these is rendered
-    // into the ceremony, so each is held to the shape its own type has.
-    address(&envelope.singleton, "singleton")?;
-    address(&envelope.guard, "guard")?;
-    address(&envelope.fallback_handler, "fallback_handler")?;
-    safe_version(&envelope.safe_version)?;
-    code_hash(&envelope.singleton_code_hash, "singleton_code_hash")?;
-    if let Some(hash) = &envelope.library_code_hash {
-        code_hash(hash, "library_code_hash")?;
-    }
-    if envelope.owners.len() > MAX_OWNERS || envelope.modules.len() > MAX_MODULES {
-        return Err(invalid(
-            "Safe owner or module count is outside supported bounds",
-        ));
-    }
-    for value in &envelope.owners {
-        address(value, "owners[]")?;
-    }
-    for value in &envelope.modules {
-        address(value, "modules[]")?;
-    }
-    let threshold = uint(&envelope.threshold, "threshold")?;
-    let owners = envelope
-        .owners
-        .iter()
-        .map(|value| address(value, "owners[]"))
-        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
-    if threshold == U256::ZERO
-        || threshold > U256::from(owners.len())
-        || owners.len() != envelope.owners.len()
-    {
-        return Err(invalid(
-            "reported Safe owners must be distinct and threshold must be between one and owner count",
-        ));
-    }
-
-    // `from` comes from the Signer-held key, so this is the one configuration
-    // fact Broker can establish itself.
     if address(&envelope.owner, "owner")? != from {
         return Err(invalid(
             "Safe review owner differs from the Bloom signing key",
         ));
     }
-
-    // These five are EIP-712 members, so the selector comparison binds them.
-    if envelope.safe_tx.safe_tx_gas != "0"
-        || envelope.safe_tx.base_gas != "0"
-        || envelope.safe_tx.gas_price != "0"
-        || !envelope.safe_tx.gas_token.eq_ignore_ascii_case(ZERO)
-        || !envelope.safe_tx.refund_receiver.eq_ignore_ascii_case(ZERO)
+    // A refund pays a receiver from the Safe, and the review cannot show one.
+    // These are EIP-712 members, so the signed hash binds them.
+    let tx = &envelope.safe_tx;
+    if [&tx.safe_tx_gas, &tx.base_gas, &tx.gas_price]
+        .iter()
+        .any(|v| *v != "0")
+        || address(&tx.gas_token, "safe_tx.gas_token")? != Address::ZERO
+        || address(&tx.refund_receiver, "safe_tx.refund_receiver")? != Address::ZERO
     {
-        return Err(invalid(
-            "Safe gas reimbursement fields must all be zero in this release",
-        ));
+        return Err(invalid("Safe gas reimbursement fields must all be zero"));
     }
     Ok(())
 }
 
-/// Chains where every library below was read from the chain and found to hold
-/// the canonical Safe runtime code. The chain ID is an EIP-712 domain member,
-/// so the signature cannot be replayed on a chain outside this list, where the
-/// same address could hold other code.
-const LIBRARY_CHAINS: &[u64] = &[1, 10, 100, 137, 8453, 42161];
-
-/// Official Safe libraries a delegatecall may enter. `safe_tx.to` is bound by
-/// the selector, so this is a real constraint. Addresses are pinned per chain
-/// in `LIBRARY_CHAINS`; a Petal-reported code hash is not trusted.
-struct Library {
-    kind: &'static str,
-    address: &'static str,
-}
-
-const LIBRARIES: &[Library] = &[
-    // MultiSendCallOnly, Safe 1.3.0 (two deployments), 1.4.1, and 1.5.0.
-    Library {
-        kind: "MultiSendCallOnly",
-        address: "0x40a2accbd92bca938b02010e17a5b8929b49130d",
-    },
-    Library {
-        kind: "MultiSendCallOnly",
-        address: "0xa1dabef33b3b82c7814b6d82a79e50f4ac44102b",
-    },
-    Library {
-        kind: "MultiSendCallOnly",
-        address: "0x9641d764fc13c8b624c04430c7356c1c7c8102e2",
-    },
-    Library {
-        kind: "MultiSendCallOnly",
-        address: "0xa83c336b20401af773b6219ba5027174338d1836",
-    },
-    // CreateCall, Safe 1.3.0 (two deployments), 1.4.1, and 1.5.0.
-    Library {
-        kind: "CreateCall",
-        address: "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4",
-    },
-    Library {
-        kind: "CreateCall",
-        address: "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d",
-    },
-    Library {
-        kind: "CreateCall",
-        address: "0x9b35af71d77eaf8d7e40252370304687390a1a52",
-    },
-    Library {
-        kind: "CreateCall",
-        address: "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4",
-    },
-];
-
-fn dynamic_bytes(
-    data: &[u8],
-    head_words: usize,
-    offset_word: usize,
-) -> Result<&[u8], ProtocolError> {
-    if data.len() < head_words * 32 {
-        return Err(invalid("delegatecall ABI data is truncated"));
-    }
-    let offset = U256::from_be_slice(&data[offset_word * 32..offset_word * 32 + 32])
-        .try_into()
-        .map_err(|_| invalid("delegatecall ABI offset is too large"))?;
-    if offset != head_words * 32 || offset + 32 > data.len() {
-        return Err(invalid("delegatecall ABI offset is invalid"));
-    }
-    let length: usize = U256::from_be_slice(&data[offset..offset + 32])
-        .try_into()
-        .map_err(|_| invalid("delegatecall ABI length is too large"))?;
-    let end = offset
-        .checked_add(32)
-        .and_then(|start| start.checked_add(length))
-        .ok_or_else(|| invalid("delegatecall ABI length overflow"))?;
-    let padded_end = end
-        .checked_add(31)
-        .map(|value| value / 32 * 32)
-        .ok_or_else(|| invalid("delegatecall ABI padding overflow"))?;
-    if padded_end != data.len() || data[end..].iter().any(|byte| *byte != 0) {
-        return Err(invalid(
-            "delegatecall ABI bytes are truncated or noncanonical",
-        ));
-    }
-    Ok(&data[offset + 32..end])
-}
-
-/// One disclosed line per call-only batch entry, decoded the same way a
-/// top-level call is.
-fn entry_summary(index: usize, to: Address, value: U256, data: &[u8]) -> String {
-    if data.len() == 68 && data[..4] == [0xa9, 0x05, 0x9c, 0xbb] {
-        format!(
-            "  {index}. ERC-20 transfer token={to} recipient={} amount (base units)={} native value (wei)={value}",
-            Address::from_slice(&data[16..36]),
-            U256::from_be_slice(&data[36..68])
-        )
-    } else if data.is_empty() {
-        format!("  {index}. Native transfer recipient={to} value (wei)={value}")
-    } else {
-        format!(
-            "  {index}. {OPAQUE_ENTRY}{to} value (wei)={value} selector=0x{} calldata keccak256={:#x}",
-            hex::encode(&data[..data.len().min(4)]),
-            keccak256(data)
-        )
-    }
-}
-
-/// The heading `classify` uses when it could read nothing about the inner
-/// call beyond its selector and hash. Named rather than spelled out at each
-/// use so the wallet-policy gate can ask whether the reading was opaque
-/// instead of re-deriving the question from the rendered text.
-pub(crate) const OPAQUE_ACTION: &str = "Action: Contract call";
-
-/// What follows the index of a batch entry Bloom could not read.
-const OPAQUE_ENTRY: &str = "Contract call to=";
-
-/// Whether a rendered line is a call Bloom read no further than its selector
-/// and hash: the whole transaction, or any one entry of a call-only batch.
-/// Both gates ask this one question, so a batch cannot hide what a direct
-/// call would have to disclose.
-fn is_opaque_line(line: &str) -> bool {
-    let line = line.trim_start();
-    line.starts_with(OPAQUE_ACTION)
-        || line.split_once(". ").is_some_and(|(index, rest)| {
-            !index.is_empty()
-                && index.bytes().all(|byte| byte.is_ascii_digit())
-                && (rest.starts_with(OPAQUE_ENTRY) || rest.starts_with(OPAQUE_ACTION))
-        })
-}
-
-fn classify_calls(
+/// Whether the Safe transaction can change the Safe's owners, modules or
+/// code: a call to the Safe itself, a delegatecall to anything but Safe's own
+/// batch and deployment libraries, or a batch with a call to the Safe.
+fn can_reconfigure_safe(
     envelope: &Envelope,
-    mut read_call: impl FnMut(Address, U256, &[u8]) -> Result<Option<String>, ProtocolError>,
-) -> Result<String, ProtocolError> {
+    catalog: &bloom_evm_clear_signing::Catalog,
+    chain_id: u64,
+) -> Result<bool, ProtocolError> {
     let safe = address(&envelope.safe_address, "safe_address")?;
     let to = address(&envelope.safe_tx.to, "safe_tx.to")?;
-    let value = uint(&envelope.safe_tx.value, "safe_tx.value")?;
-    let data = bytes(&envelope.safe_tx.data, "safe_tx.data")?;
-    match envelope.safe_tx.operation {
-        0 => {
-            if to == safe {
-                if value.is_zero() && data.is_empty() {
-                    return Ok("Action: Reject competing Safe transaction\nValue: 0".into());
-                }
-                return Err(invalid(
-                    "Safe self-calls and configuration changes are not supported",
-                ));
-            }
-            if !data.is_empty()
-                && let Some(reading) = read_call(to, value, &data)?
-            {
-                return Ok(reading);
-            }
-            if data.len() == 68 && data[..4] == [0xa9, 0x05, 0x9c, 0xbb] {
-                let recipient = Address::from_slice(&data[16..36]);
-                let amount = U256::from_be_slice(&data[36..68]);
-                Ok(format!(
-                    "Action: ERC-20 transfer\nToken: {to}\nRecipient: {recipient}\nToken amount (base units): {amount}"
-                ))
-            } else if data.is_empty() {
-                Ok(format!("Action: Native transfer\nRecipient: {to}"))
-            } else {
-                Ok(format!(
-                    "{OPAQUE_ACTION}\nCalldata selector: 0x{}\nCalldata keccak256: {:#x}",
-                    hex::encode(&data[..data.len().min(4)]),
-                    keccak256(&data)
-                ))
-            }
-        }
-        1 => {
-            if value != U256::ZERO {
-                return Err(invalid("Safe delegatecall transaction value must be zero"));
-            }
-            let chain = uint(&envelope.chain_id, "chain_id")?;
-            if !LIBRARY_CHAINS.iter().any(|id| U256::from(*id) == chain) {
-                return Err(invalid(
-                    "Safe delegatecalls are refused on this chain because Broker has no verified Safe library deployment for it",
-                ));
-            }
-            let target = format!("{to:#x}");
-            let library = LIBRARIES
-                .iter()
-                .find(|entry| entry.address == target)
-                .ok_or_else(|| invalid("delegatecall target is not an official Safe library"))?;
-            if data.len() < 4 {
-                return Err(invalid("Safe library calldata is truncated"));
-            }
-            if library.kind == "MultiSendCallOnly" {
-                if data[..4] != keccak256("multiSend(bytes)").as_slice()[..4] {
-                    return Err(invalid("unexpected MultiSendCallOnly selector"));
-                }
-                let packed = dynamic_bytes(&data[4..], 1, 0)?;
-                let mut cursor = 0;
-                let mut calls = 0usize;
-                let mut total = U256::ZERO;
-                let mut entries = Vec::new();
-                while cursor < packed.len() {
-                    if calls == 32 || packed.len() - cursor < 85 {
-                        return Err(invalid("MultiSendCallOnly batch is malformed or too large"));
-                    }
-                    if packed[cursor] != 0 {
-                        return Err(invalid("MultiSendCallOnly contains a delegatecall"));
-                    }
-                    let destination = Address::from_slice(&packed[cursor + 1..cursor + 21]);
-                    if destination == safe || destination == Address::ZERO {
-                        return Err(invalid("MultiSendCallOnly contains a Safe self-call"));
-                    }
-                    let call_value = U256::from_be_slice(&packed[cursor + 21..cursor + 53]);
-                    let length: usize = U256::from_be_slice(&packed[cursor + 53..cursor + 85])
-                        .try_into()
-                        .map_err(|_| invalid("MultiSend call data length is too large"))?;
-                    let data_start = cursor
-                        .checked_add(85)
-                        .ok_or_else(|| invalid("MultiSend call data length overflow"))?;
-                    let next = data_start
-                        .checked_add(length)
-                        .ok_or_else(|| invalid("MultiSend call data length overflow"))?;
-                    if next > packed.len() {
-                        return Err(invalid("MultiSend call data is truncated"));
-                    }
-                    total = total.checked_add(call_value).ok_or_else(|| {
-                        invalid(format!(
-                            "MultiSend native value overflow at entry {}",
-                            calls + 1
-                        ))
-                    })?;
-                    calls += 1;
-                    // Every entry is disclosed; a batch must not hide a call.
-                    let call_data = &packed[data_start..next];
-                    if !call_data.is_empty()
-                        && let Some(reading) = read_call(destination, call_value, call_data)?
-                    {
-                        entries.push(format!("  {calls}. {}", reading.replace('\n', "\n     ")));
-                    } else {
-                        entries.push(entry_summary(calls, destination, call_value, call_data));
-                    }
-                    cursor = next;
-                }
-                if calls == 0 {
-                    return Err(invalid("MultiSendCallOnly batch is empty"));
-                }
-                Ok(format!(
-                    "Action: Call-only batch\nCalls: {calls}\nTotal native value (wei): {total}\n{}\nPacked calls keccak256: {:#x}",
-                    entries.join("\n"),
-                    keccak256(packed)
-                ))
-            } else {
-                let create = keccak256("performCreate(uint256,bytes)");
-                let create2 = keccak256("performCreate2(uint256,bytes,bytes32)");
-                let deployment_value = if data.len() >= 36 {
-                    U256::from_be_slice(&data[4..36])
-                } else {
-                    return Err(invalid("CreateCall calldata is truncated"));
-                };
-                let (kind, initcode, salt) = if data[..4] == create.as_slice()[..4] {
-                    if data.len() < 68 {
-                        return Err(invalid("CreateCall calldata is truncated"));
-                    }
-                    ("CREATE", dynamic_bytes(&data[4..], 2, 1)?, None)
-                } else if data[..4] == create2.as_slice()[..4] {
-                    if data.len() < 100 {
-                        return Err(invalid("CreateCall CREATE2 calldata is truncated"));
-                    }
-                    (
-                        "CREATE2",
-                        dynamic_bytes(&data[4..], 3, 1)?,
-                        Some(B256::from_slice(&data[68..100])),
-                    )
-                } else {
-                    return Err(invalid("unexpected CreateCall selector"));
-                };
-                if initcode.is_empty() {
-                    return Err(invalid("contract deployment initcode is empty"));
-                }
-                let mut result = format!(
-                    "Action: Deploy contract ({kind})\nDeployment value (wei): {deployment_value}\nInitcode keccak256: {:#x}",
-                    keccak256(initcode)
-                );
-                if let Some(salt) = salt {
-                    result.push_str(&format!(
-                        "\nSalt: {salt:#x}\nPredicted address: {}",
-                        safe.create2(salt, keccak256(initcode))
-                    ));
-                }
-                Ok(result)
-            }
-        }
-        _ => Err(invalid("unsupported Safe operation")),
+    if to == safe {
+        return Ok(true);
     }
+    if envelope.safe_tx.operation == 0 {
+        return Ok(false);
+    }
+    if !catalog.is_safe_library(chain_id, &format!("{to:#x}")) {
+        return Ok(true);
+    }
+    // MultiSend packs (operation, to, value, length, data) entries.
+    let data = bytes(&envelope.safe_tx.data, "safe_tx.data")?;
+    let packed = match data
+        .get(4..)
+        .map(|args| alloy_dyn_abi::DynSolType::Bytes.abi_decode(args))
+    {
+        Some(Ok(alloy_dyn_abi::DynSolValue::Bytes(packed))) => packed,
+        _ => return Ok(false),
+    };
+    let mut rest = packed.as_slice();
+    while rest.len() >= 85 {
+        if Address::from_slice(&rest[1..21]) == safe {
+            return Ok(true);
+        }
+        let length = usize::try_from(U256::from_be_slice(&rest[53..85])).unwrap_or(usize::MAX);
+        rest = rest
+            .get(85usize.saturating_add(length)..)
+            .unwrap_or_default();
+    }
+    Ok(false)
+}
+
+/// The heading of a Safe transaction Bloom could not read.
+pub(crate) const OPAQUE_ACTION: &str = "Action: Contract call Bloom cannot read";
+
+const EXEC_TRANSACTION: &str =
+    "execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)";
+
+/// The Safe transaction as the `execTransaction` call that runs it, so it is
+/// read with the same catalog and rules as a Safe execution: inner calls,
+/// owner changes, batches and deployments. Signatures are not part of it.
+fn exec_calldata(envelope: &Envelope) -> Result<Vec<u8>, ProtocolError> {
+    use alloy_dyn_abi::{DynSolValue, JsonAbiExt as _};
+    let tx = &envelope.safe_tx;
+    let address = |value: &str, field| address(value, field).map(DynSolValue::Address);
+    let uint = |value: &str, field| uint(value, field).map(|value| DynSolValue::Uint(value, 256));
+    bloom_evm_clear_signing::parse_function(EXEC_TRANSACTION)
+        .map_err(|error| invalid(error.to_string()))?
+        .abi_encode_input(&[
+            address(&tx.to, "safe_tx.to")?,
+            uint(&tx.value, "safe_tx.value")?,
+            DynSolValue::Bytes(bytes(&tx.data, "safe_tx.data")?),
+            DynSolValue::Uint(U256::from(tx.operation), 8),
+            uint(&tx.safe_tx_gas, "safe_tx.safe_tx_gas")?,
+            uint(&tx.base_gas, "safe_tx.base_gas")?,
+            uint(&tx.gas_price, "safe_tx.gas_price")?,
+            address(&tx.gas_token, "safe_tx.gas_token")?,
+            address(&tx.refund_receiver, "safe_tx.refund_receiver")?,
+            DynSolValue::Bytes(Vec::new()),
+        ])
+        .map_err(|error| invalid(error.to_string()))
 }
 
 pub(crate) fn review(
     request: &ApprovalPrepareRequest,
     policy: &CanonicalWalletPolicy,
     from: Address,
-    clear_signing: &crate::evm_review::ClearSigningContext,
+    catalog: &bloom_evm_clear_signing::Catalog,
 ) -> Result<Option<SafeReview>, ProtocolError> {
     if request.safe_review_payloads.is_empty() {
         return Ok(None);
@@ -664,91 +338,84 @@ pub(crate) fn review(
             "wallet policy must allow destination exact on {chain_policy} for Safe signing"
         )));
     }
-    let mut entries = Vec::new();
-    let rendered = classify_calls(&envelope, |to, value, calldata| {
-        if policy.clear_signing.is_none() {
-            return Ok(None);
-        }
-        let chain_id = u64::try_from(chain)
-            .map_err(|_| invalid("Safe chain ID is too large for catalog review"))?;
-        let (reading, selected) = crate::evm_review::review_contract_call(
-            &crate::evm_review::DecodedCall {
-                chain_id,
-                to,
-                value,
-                calldata: calldata.to_vec(),
-            },
-            policy,
-            request.requested_review_mode,
-            clear_signing,
-        )?;
-        for entry in selected {
-            if !entries.contains(&entry) {
-                entries.push(entry);
-            }
-        }
-        let Some(reading) = reading else {
-            return Ok(Some(format!(
-                "{OPAQUE_ACTION}\nContract: {to}\nNative value (wei): {value}\nCalldata selector: 0x{}\nCalldata keccak256: {:#x}",
-                hex::encode(&calldata[..calldata.len().min(4)]),
-                keccak256(calldata),
-            )));
-        };
-        let mut lines = vec![
-            format!("Action: {}", reading.action),
-            format!("Contract: {}", reading.contract),
-        ];
-        if let Some(summary) = reading.intent_summary {
-            lines.push(format!(
-                "Token: {} — {} ({})",
-                summary.token.symbol, summary.token.name, summary.token.address
-            ));
-            let role = if summary.counterparty_role == "recipient" {
-                "Recipient"
-            } else {
-                "Spender"
-            };
-            lines.push(format!("{role}: {}", summary.counterparty));
-            lines.push(format!(
-                "Token amount: {} (base units: {})",
-                summary.amount_display, summary.amount
-            ));
-        } else {
-            for field in reading.fields {
-                lines.push(format!(
-                    "{}: {} (signed: {})",
-                    field.label, field.value, field.raw
-                ));
-            }
-        }
-        lines.push(format!("Native value (wei): {value}"));
-        lines.push(reading.assurance);
-        lines.extend(
-            reading
-                .warnings
-                .into_iter()
-                .map(|warning| format!("Warning: {warning}")),
-        );
-        Ok(Some(lines.join("\n")))
-    })?;
-    // The wallet's clear-signing settings are authority over what the owner
-    // can be asked to approve, and they are not about how the bytes reach the
-    // chain. A payload Bloom cannot explain is refused when it is sent
-    // directly, so wrapping it in a SafeTx must not be a way around that.
-    apply_clear_signing_policy(policy, request.requested_review_mode, &rendered)?;
-    let evidence = match &clear_signing.catalog {
-        Some(catalog) if !entries.is_empty() => {
-            let evidence = bloom_evm_clear_signing::ClearSigningEvidence::new(
-                catalog,
-                &clear_signing.verifier_digest,
-                entries,
+    let chain_id = u64::try_from(chain)
+        .map_err(|_| invalid("Safe chain ID is too large for catalog review"))?;
+    let reading = bloom_evm_clear_signing::review_call(
+        catalog,
+        &bloom_evm_clear_signing::CallContext {
+            chain_id,
+            to: address(&envelope.safe_address, "safe_address")?,
+            value: U256::ZERO,
+            calldata: &exec_calldata(&envelope)?,
+            native: crate::evm_review::native_units(&crate::evm_review::chain_name(chain_id)),
+        },
+    );
+    let (action, evidence) = match reading {
+        Ok((call, entries)) => {
+            // The inner call's heading first, then what it adds. The page
+            // shows the destination, value and operation separately, the
+            // signatures are not part of what the owner signs, and zero gas
+            // settings say nothing.
+            let heading = call
+                .fields
+                .iter()
+                .find(|field| field.label == "Safe transaction")
+                .map_or(call.function_signature.clone(), |field| field.value.clone());
+            let mut lines = vec![format!("Action: {heading}")];
+            lines.extend(
+                call.fields
+                    .iter()
+                    .filter(|field| {
+                        !matches!(
+                            field.label.as_str(),
+                            "Safe transaction" | "Safe calls" | "Safe sends" | "Operation"
+                        ) && !field.label.starts_with("Owner signatures")
+                            && !(field.raw == "0"
+                                && matches!(field.label.as_str(), "Safe gas limit" | "Base gas"))
+                    })
+                    .flat_map(|field| {
+                        let label = field.label.trim_start_matches("Safe transaction · ");
+                        let mut rows = vec![format!("{label}: {}", field.value)];
+                        if let Some(asset) = &field.asset {
+                            rows.push(format!("{label} asset: {}", asset.token.address));
+                            if !field.raw.is_empty()
+                                && field.raw.bytes().all(|byte| byte.is_ascii_digit())
+                            {
+                                rows.push(format!("{label} (raw units): {}", field.raw));
+                            }
+                        }
+                        rows
+                    }),
             );
-            crate::evm_review::cap_approval_expiry(&evidence, policy, request)?;
-            Some(evidence)
+            lines.extend(
+                call.warnings
+                    .iter()
+                    .map(|warning| format!("Warning: {warning}")),
+            );
+            (
+                lines,
+                Some(bloom_evm_clear_signing::ClearSigningEvidence::new(
+                    entries,
+                    call.structural,
+                )),
+            )
         }
-        _ => None,
+        // A delegatecall or a call to the Safe itself can change its owners,
+        // modules or code. Unreadable, those are refused rather than shown.
+        Err(error) if can_reconfigure_safe(&envelope, catalog, chain_id)? => {
+            return Err(invalid(format!(
+                "Safe delegatecalls and self-calls Bloom cannot read are refused: {}",
+                error.detail
+            )));
+        }
+        Err(error) => (
+            vec![
+                OPAQUE_ACTION.to_owned(),
+                format!("Reason: {}", error.detail),
+            ],
+            None,
+        ),
     };
-    let action = rendered.lines().map(str::to_owned).collect();
     let chain_name = u64::try_from(chain)
         .map(crate::evm_review::chain_name)
         .unwrap_or(chain_policy);
@@ -771,84 +438,16 @@ pub(crate) fn review(
         value: envelope.safe_tx.value,
         action,
         safe_tx_hash: format!("{:#x}", keccak256(&preimage)),
-        reported: SafeReported {
-            version: envelope.safe_version,
-            singleton: address(&envelope.singleton, "singleton")?.to_string(),
-            singleton_code_hash: envelope.singleton_code_hash,
-            owners: envelope
-                .owners
-                .iter()
-                .map(|value| address(value, "owners[]").map(|address| address.to_string()))
-                .collect::<Result<_, _>>()?,
-            threshold: envelope.threshold,
-            guard: address(&envelope.guard, "guard")?.to_string(),
-            modules: envelope
-                .modules
-                .iter()
-                .map(|value| address(value, "modules[]").map(|address| address.to_string()))
-                .collect::<Result<_, _>>()?,
-            fallback_handler: address(&envelope.fallback_handler, "fallback_handler")?.to_string(),
-            library_code_hash: envelope.library_code_hash,
-        },
         clear_signing: evidence,
     }))
 }
 
-/// The Safe equivalent of `evm_review::apply_review_mode`.
-///
-/// The native path decides three things from `policy.clear_signing`: that an
-/// unreadable call needs an explicit `OpaqueExact` request, that the request
-/// is only honored when the wallet allows it, and that a mode a wallet cannot
-/// serve is refused rather than dropped. A Safe transaction is the same
-/// decision about the same calldata, so it gets the same three.
-fn apply_clear_signing_policy(
-    policy: &CanonicalWalletPolicy,
-    requested: Option<ReviewMode>,
-    rendered: &str,
-) -> Result<(), ProtocolError> {
-    let opaque = rendered.lines().any(is_opaque_line);
-    let Some(settings) = policy.clear_signing.as_ref() else {
-        // An incapable wallet refuses a required mode rather than ignoring it,
-        // exactly as the native path does.
-        if requested.is_some() {
-            return Err(invalid("clear signing is not enabled for this wallet"));
-        }
-        return Ok(());
-    };
-    settings.validate()?;
-    match requested {
-        Some(ReviewMode::OpaqueExact) => {
-            if !settings.opaque_exact_allowed {
-                return Err(invalid(
-                    "wallet policy does not allow approving payloads Bloom cannot explain",
-                ));
-            }
-            if !opaque {
-                return Err(invalid(
-                    "Bloom can read this call, so it cannot be approved unread; request a clear-signed review",
-                ));
-            }
-            Ok(())
-        }
-        // A clear review cannot contain an unreadable inner call.
-        Some(ReviewMode::Clear) if opaque => Err(invalid(concat!(
-            "Bloom cannot read this Safe transaction's inner call, so it cannot be ",
-            "clear-signed; approve it as an exact payload if wallet policy allows that",
-        ))),
-        Some(ReviewMode::Clear) | None => {
-            if opaque {
-                return Err(invalid(
-                    "Bloom cannot explain this Safe call; request an explicit opaque_exact review",
-                ));
-            }
-            Ok(())
-        }
-    }
-}
-
-/// Whether a prepared Safe review read its inner call, for the frozen record.
+/// Whether Bloom could not read the Safe transaction.
 pub(crate) fn is_opaque(review: &SafeReview) -> bool {
-    review.action.iter().any(|line| is_opaque_line(line))
+    review
+        .action
+        .first()
+        .is_some_and(|line| line == OPAQUE_ACTION)
 }
 
 #[cfg(test)]
@@ -856,12 +455,28 @@ mod tests {
     use super::*;
     use bloom_broker_api::*;
 
-    fn no_catalog() -> crate::evm_review::ClearSigningContext {
-        crate::evm_review::ClearSigningContext {
-            catalog: None,
-            verifier_digest: Digest32::from_bytes(EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES),
-            now_ms: 1_750_000_000_000,
-        }
+    const SINGLETON: &str = "0x41675c099f32341bf84bfc5382af534df5c7461a";
+
+    /// The Safe description on `chain_id`, and an example token there.
+    fn catalog_on(chain_id: u64) -> bloom_evm_clear_signing::Catalog {
+        use bloom_broker_api::KnownToken;
+        use bloom_evm_clear_signing::{Binding, DESCRIPTORS};
+        let mut safe: serde_json::Value = serde_json::from_str(DESCRIPTORS[0].1).unwrap();
+        safe["context"]["contract"]["deployments"] =
+            serde_json::json!([{"chainId": chain_id, "address": SINGLETON}]);
+        let token = KnownToken {
+            chain_id,
+            address: "0x1111111111111111111111111111111111111111".into(),
+            symbol: "EXA".into(),
+            name: "Example Token".into(),
+            decimals: 6,
+            upgradeable: false,
+        };
+        bloom_evm_clear_signing::Catalog::build(
+            &[(safe, Binding::Instances(SINGLETON))],
+            vec![token],
+        )
+        .unwrap()
     }
 
     fn review(
@@ -869,11 +484,7 @@ mod tests {
         policy: &CanonicalWalletPolicy,
         from: Address,
     ) -> Result<Option<SafeReview>, ProtocolError> {
-        super::review(request, policy, from, &no_catalog())
-    }
-
-    fn classify(envelope: &Envelope) -> Result<String, ProtocolError> {
-        classify_calls(envelope, |_, _, _| Ok(None))
+        super::review(request, policy, from, &catalog_on(31337))
     }
 
     fn token(value: &str) -> Token {
@@ -915,11 +526,12 @@ mod tests {
         let preimage = safe_preimage(&parsed).unwrap();
         let digest = Digest32::from_bytes([1; 32]);
         ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: OperationId::from_bytes([2; 32]),
             canonical_plan_facts_digest: digest.clone(),
-            requested_review_mode: None,
             evm_review_payloads: vec![],
+            message_review_payloads: Vec::new(),
             safe_review_payloads: vec![Base64UrlBytes::from_bytes(&review)],
             petal_use_claim: None,
             system_use_claim: None,
@@ -1117,11 +729,8 @@ mod tests {
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
         let plan = review(&request, &policy(), from).unwrap().unwrap();
         assert_eq!(
-            plan.action,
-            [
-                "Action: Native transfer",
-                "Recipient: 0x4000000000000000000000000000000000000000"
-            ]
+            plan.action[0],
+            "Action: Send 0.000000000000000007 ETH to 0x4000000000000000000000000000000000000000"
         );
         assert_eq!(plan.nonce, "4");
         assert_eq!(plan.value_display, "0.000000000000000007 ETH");
@@ -1133,30 +742,94 @@ mod tests {
         assert!(review(&request, &policy(), from).is_err());
     }
 
-    fn clear_signing_policy(opaque_exact_allowed: bool) -> CanonicalWalletPolicy {
-        CanonicalWalletPolicy {
-            clear_signing: Some(ClearSigningPolicy {
-                catalog_id: token("bloom-tokens"),
-                trusted_keys: vec![CatalogTrustedKey {
-                    key_id: token("publisher-1"),
-                    verifying_key: Base64UrlBytes::from_bytes(&[7; 32]),
-                }],
-                signature_threshold: 1,
-                maximum_observation_age_ms: 86_400_000,
-                opaque_exact_allowed,
-                unlimited_allowance_allowed: false,
-                verifier: RequiredVerifier {
-                    verifier_id: token(EVM_CLEAR_SIGNING_VERIFIER_ID),
-                    verifier_digest: Digest32::from_bytes(EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES),
-                },
-            }),
-            ..policy()
+    #[test]
+    fn refuses_any_gas_reimbursement() {
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+        for (field, value) in [
+            ("safe_tx_gas", "1"),
+            ("base_gas", "1"),
+            ("gas_price", "1"),
+            ("gas_token", "0x9999999999999999999999999999999999999999"),
+            (
+                "refund_receiver",
+                "0x9999999999999999999999999999999999999999",
+            ),
+        ] {
+            let mut changed: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+            changed["safe_tx"][field] = serde_json::json!(value);
+            let changed = serde_jcs::to_vec(&changed).unwrap();
+            assert!(
+                review(&request(changed), &policy(), from).is_err(),
+                "{field} was accepted"
+            );
         }
     }
 
     #[test]
-    fn safe_transfers_use_catalog_identity_and_reject_readable_as_opaque() {
-        let context = crate::evm_review::mode_tests::enabled_context();
+    fn refuses_unreadable_delegatecalls_and_self_calls() {
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+        let mut delegate: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        delegate["safe_tx"]["value"] = serde_json::json!("0");
+        delegate["safe_tx"]["operation"] = serde_json::json!(1);
+        delegate["safe_tx"]["data"] = serde_json::json!("0xdeadbeef");
+        let mut self_call: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        self_call["safe_tx"]["to"] =
+            serde_json::json!("0x1000000000000000000000000000000000000000");
+        self_call["safe_tx"]["value"] = serde_json::json!("0");
+        self_call["safe_tx"]["data"] = serde_json::json!("0xdeadbeef");
+        let mut batch: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        batch["chain_id"] = serde_json::json!("8453");
+        batch["safe_tx"]["to"] = serde_json::json!("0xa83c336b20401af773b6219ba5027174338d1836");
+        batch["safe_tx"]["operation"] = serde_json::json!(1);
+        batch["safe_tx"]["value"] = serde_json::json!("0");
+        batch["safe_tx"]["data"] = serde_json::json!(format!(
+            "0x{}",
+            hex::encode(multisend_calldata(&multisend_entry(
+                "0x1000000000000000000000000000000000000000",
+                0,
+                &[0xde, 0xad, 0xbe, 0xef],
+            )))
+        ));
+        let mut base = policy();
+        base.allowed_destinations[0].chain = token("evm-8453");
+        assert!(
+            super::review(
+                &request(serde_jcs::to_vec(&batch).unwrap()),
+                &base,
+                from,
+                &catalog_on(8453),
+            )
+            .is_err(),
+            "a batch call to the Safe itself was not refused"
+        );
+        for changed in [delegate, self_call] {
+            let changed = serde_jcs::to_vec(&changed).unwrap();
+            assert!(review(&request(changed), &policy(), from).is_err());
+        }
+    }
+
+    #[test]
+    fn empty_zero_value_call_is_still_a_call() {
+        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
+        value["safe_tx"]["to"] = serde_json::json!("0x2222222222222222222222222222222222222222");
+        value["safe_tx"]["value"] = serde_json::json!("0");
+        let plan = review(
+            &request(serde_jcs::to_vec(&value).unwrap()),
+            &policy(),
+            from,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            plan.action[0],
+            "Action: Call 0x2222222222222222222222222222222222222222 with no data; its code, if any, still runs"
+        );
+    }
+
+    #[test]
+    fn safe_inner_calls_are_read_with_the_catalog() {
+        let catalog = catalog_on(31337);
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
         let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
         value["safe_tx"]["to"] = serde_json::json!("0x1111111111111111111111111111111111111111");
@@ -1166,226 +839,34 @@ mod tests {
             "0".repeat(24) + &"2".repeat(40),
             format!("{:064x}", 1_000_000),
         ));
-        let mut asked = request(serde_jcs::to_vec(&value).unwrap());
-        for mode in [None, Some(ReviewMode::Clear)] {
-            asked.requested_review_mode = mode;
-            let plan = super::review(&asked, &clear_signing_policy(false), from, &context)
-                .unwrap()
-                .unwrap();
-            assert!(!is_opaque(&plan));
-            assert!(
-                plan.action.iter().any(|line| line.contains("EXA")),
-                "{:?}",
-                plan.action
-            );
-            // The approval cannot outlive the catalog entries that read it.
-            let settings = clear_signing_policy(false).clear_signing.unwrap();
-            let permitted = plan
-                .clear_signing
-                .expect("a catalog reading carries its evidence")
-                .permitted_expiry_ms(settings.maximum_observation_age_ms);
-            let mut late = asked.clone();
-            late.terms.expires_at_ms = DecimalU64::new(permitted + 1);
-            let error =
-                super::review(&late, &clear_signing_policy(false), from, &context).unwrap_err();
-            assert!(
-                error.message.contains(&format!("only until {permitted}")),
-                "{error}"
-            );
-        }
-        asked.requested_review_mode = Some(ReviewMode::OpaqueExact);
-        let error = super::review(&asked, &clear_signing_policy(true), from, &context).unwrap_err();
+        let plan = super::review(
+            &request(serde_jcs::to_vec(&value).unwrap()),
+            &policy(),
+            from,
+            &catalog,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!is_opaque(&plan));
         assert!(
-            error.to_string().contains("cannot be approved unread"),
-            "{error}"
+            plan.action.iter().any(|line| line.contains("EXA")),
+            "{:?}",
+            plan.action
         );
+        assert!(plan.clear_signing.is_some());
 
-        // The same selector on a contract outside the catalog is not readable.
+        // A call Bloom cannot read is shown as its bytes, not refused.
         value["safe_tx"]["to"] = serde_json::json!("0x4000000000000000000000000000000000000000");
-        let mut asked = request(serde_jcs::to_vec(&value).unwrap());
-        for mode in [None, Some(ReviewMode::Clear), Some(ReviewMode::OpaqueExact)] {
-            asked.requested_review_mode = mode;
-            assert!(super::review(&asked, &clear_signing_policy(false), from, &context).is_err());
-        }
-        asked.requested_review_mode = Some(ReviewMode::OpaqueExact);
-        let plan = super::review(&asked, &clear_signing_policy(true), from, &context)
-            .unwrap()
-            .unwrap();
+        value["safe_tx"]["data"] = serde_json::json!("0xdeadbeef");
+        let plan = super::review(
+            &request(serde_jcs::to_vec(&value).unwrap()),
+            &policy(),
+            from,
+            &catalog,
+        )
+        .unwrap()
+        .unwrap();
         assert!(is_opaque(&plan));
-        assert!(!plan.action.iter().any(|line| line.contains("ERC-20")));
-
-        value["safe_tx"]["to"] = serde_json::json!("0x1111111111111111111111111111111111111111");
-        let asked = request(serde_jcs::to_vec(&value).unwrap());
-        let mut stale = crate::evm_review::mode_tests::enabled_context();
-        stale.catalog = Some(crate::evm_review::mode_tests::accepted_catalog_at(
-            stale.now_ms - 1000,
-        ));
-        let mut policy = clear_signing_policy(false);
-        policy
-            .clear_signing
-            .as_mut()
-            .unwrap()
-            .maximum_observation_age_ms = 500;
-        assert!(
-            super::review(&asked, &policy, from, &stale)
-                .unwrap_err()
-                .to_string()
-                .contains("EXPIRED")
-        );
-    }
-
-    /// An owner who set `opaque_exact_allowed: false` said "do not ask me to
-    /// approve payloads Bloom cannot explain". The native path enforced that
-    /// and the Safe path did not, so the same undescribable calldata that is
-    /// refused when sent directly was approvable wrapped in a SafeTx, with
-    /// the owner shown a selector and a keccak.
-    #[test]
-    fn an_unreadable_safe_call_obeys_the_wallets_opaque_payload_setting() {
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["data"] = serde_json::json!("0xdeadbeef00112233");
-        let opaque = serde_jcs::to_vec(&value).unwrap();
-        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-
-        // No clear-signing policy: unchanged, the envelope review stands.
-        let plan = review(&request(opaque.clone()), &policy(), from)
-            .unwrap()
-            .unwrap();
-        assert!(is_opaque(&plan), "{:?}", plan.action);
-
-        // Clear signing on, opaque payloads refused: this must not prepare.
-        let error = review(&request(opaque.clone()), &clear_signing_policy(false), from)
-            .expect_err("an unreadable Safe call must obey the wallet's setting");
-        assert!(
-            error.to_string().contains("CATALOG_UNAVAILABLE"),
-            "{}",
-            error
-        );
-
-        // Clear signing on, opaque payloads permitted: prepares, and the
-        // frozen record has to be able to say it was not read.
-        let mut opaque_request = request(opaque);
-        assert!(review(&opaque_request, &clear_signing_policy(true), from).is_err());
-        opaque_request.requested_review_mode = Some(ReviewMode::OpaqueExact);
-        let plan = review(&opaque_request, &clear_signing_policy(true), from)
-            .unwrap()
-            .unwrap();
-        assert!(is_opaque(&plan));
-
-        // A call Bloom *can* read is unaffected by the setting.
-        let readable = review(&request(envelope()), &clear_signing_policy(false), from)
-            .unwrap()
-            .unwrap();
-        assert!(!is_opaque(&readable), "{:?}", readable.action);
-    }
-
-    /// A requested mode the Safe path cannot serve was dropped rather than
-    /// refused, so a Machine asking for a clear reading got an unread one
-    /// under that name.
-    #[test]
-    fn a_review_mode_the_safe_path_cannot_serve_is_refused_not_dropped() {
-        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["data"] = serde_json::json!("0xdeadbeef00112233");
-        let opaque = serde_jcs::to_vec(&value).unwrap();
-
-        // A wallet with no clear-signing policy cannot honor any mode.
-        let mut asked = request(envelope());
-        asked.requested_review_mode = Some(ReviewMode::Clear);
-        let error = review(&asked, &policy(), from).expect_err("an incapable wallet refuses");
-        assert!(error.to_string().contains("not enabled"), "{error}");
-
-        // Clear was asked for and the inner call cannot be read.
-        let mut asked = request(opaque.clone());
-        asked.requested_review_mode = Some(ReviewMode::Clear);
-        let error = review(&asked, &clear_signing_policy(true), from)
-            .expect_err("an unreadable call cannot be clear-signed");
-        assert!(error.to_string().contains("CATALOG_UNAVAILABLE"), "{error}");
-
-        // OpaqueExact is honored only where the wallet allows it.
-        let mut asked = request(opaque);
-        asked.requested_review_mode = Some(ReviewMode::OpaqueExact);
-        assert!(review(&asked, &clear_signing_policy(false), from).is_err());
-        assert!(review(&asked, &clear_signing_policy(true), from).is_ok());
-    }
-
-    /// Three envelope fields are rendered into the ceremony and none of them
-    /// had a shape check, so a Petal could put arbitrary text on the approval
-    /// screen. Broker cannot verify them against a chain; it can still
-    /// require a hash to be a hash.
-    #[test]
-    fn petal_reported_version_and_code_hashes_must_have_their_own_shape() {
-        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-        for (field, bad) in [
-            ("safe_version", serde_json::json!("1.4.1; see attached")),
-            ("safe_version", serde_json::json!("")),
-            ("safe_version", serde_json::json!("1.4")),
-            ("safe_version", serde_json::json!("01.4.1")),
-            ("singleton_code_hash", serde_json::json!("not a hash")),
-            ("singleton_code_hash", serde_json::json!("0xabcd")),
-            ("library_code_hash", serde_json::json!("0xzz")),
-        ] {
-            let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-            value[field] = bad.clone();
-            let bytes = serde_jcs::to_vec(&value).unwrap();
-            assert!(
-                review(&request(bytes), &policy(), from).is_err(),
-                "{field} = {bad} must be refused"
-            );
-        }
-
-        // The shapes an honest Petal reports are all still accepted.
-        for version in ["1.3.0", "1.4.1", "1.5.0", "1.3.0+L2"] {
-            let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-            value["safe_version"] = serde_json::json!(version);
-            let bytes = serde_jcs::to_vec(&value).unwrap();
-            review(&request(bytes), &policy(), from)
-                .unwrap_or_else(|error| panic!("{version} must be accepted: {error}"));
-        }
-    }
-
-    #[test]
-    fn permits_only_the_canonical_same_nonce_rejection_self_call() {
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["safe_tx"]["to"] = value["safe_address"].clone();
-        value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["data"] = serde_json::json!("0x");
-        let envelope: Envelope = serde_json::from_value(value.clone()).unwrap();
-        assert!(classify(&envelope).unwrap().contains("Reject competing"));
-
-        value["safe_tx"]["data"] = serde_json::json!("0x01");
-        let envelope: Envelope = serde_json::from_value(value).unwrap();
-        assert!(classify(&envelope).is_err());
-    }
-
-    #[test]
-    fn create_review_discloses_endowment_and_requires_canonical_abi() {
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        let mut calldata = keccak256("performCreate(uint256,bytes)").as_slice()[..4].to_vec();
-        calldata.extend_from_slice(&U256::from(9).to_be_bytes::<32>());
-        calldata.extend_from_slice(&U256::from(64).to_be_bytes::<32>());
-        calldata.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
-        calldata.push(0);
-        calldata.extend_from_slice(&[0; 31]);
-        value["safe_tx"]["to"] = serde_json::json!("0x9b35af71d77eaf8d7e40252370304687390a1a52");
-        value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["operation"] = serde_json::json!(1);
-        value["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(&calldata)));
-        value["library_code_hash"] =
-            serde_json::json!("0x2b3060c55fcb8275653e99ad511a71f67ba76934ed66a7d74d6e68b52afff889");
-        value["chain_id"] = serde_json::json!("8453");
-        let parsed: Envelope = serde_json::from_value(value.clone()).unwrap();
-        assert!(
-            classify(&parsed)
-                .unwrap()
-                .contains("Deployment value (wei): 9")
-        );
-
-        calldata.extend_from_slice(&[0; 32]);
-        value["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(calldata)));
-        let parsed: Envelope = serde_json::from_value(value).unwrap();
-        assert!(classify(&parsed).is_err());
     }
 
     fn multisend_entry(to: &str, value: u64, data: &[u8]) -> Vec<u8> {
@@ -1407,14 +888,10 @@ mod tests {
     }
 
     #[test]
-    fn safe_batch_transfers_cannot_bypass_catalog_policy() {
-        let mut context = crate::evm_review::mode_tests::enabled_context();
-        context.catalog = Some(crate::evm_review::mode_tests::accepted_catalog_on_chain(
-            8453,
-            context.now_ms - 500,
-        ));
+    fn safe_batch_calls_are_read_with_the_catalog() {
+        let catalog = catalog_on(8453);
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-        let mut policy = clear_signing_policy(false);
+        let mut policy = policy();
         policy.allowed_destinations[0].chain = token("evm-8453");
         let mut parsed: Envelope = serde_json::from_slice(&envelope()).unwrap();
         parsed.chain_id = "8453".into();
@@ -1425,84 +902,26 @@ mod tests {
         transfer.extend_from_slice(&[0; 12]);
         transfer.extend_from_slice(&[0x22; 20]);
         transfer.extend_from_slice(&U256::from(1_000_000).to_be_bytes::<32>());
-        for (target, known) in [
-            ("0x1111111111111111111111111111111111111111", true),
-            ("0x4000000000000000000000000000000000000000", false),
+        for (target, data, known) in [
+            ("0x1111111111111111111111111111111111111111", transfer, true),
+            (
+                "0x4000000000000000000000000000000000000000",
+                vec![0xde, 0xad, 0xbe, 0xef],
+                false,
+            ),
         ] {
-            let packed = multisend_entry(target, 0, &transfer);
+            let packed = multisend_entry(target, 0, &data);
             parsed.safe_tx.data = format!("0x{}", hex::encode(multisend_calldata(&packed)));
-            let mut asked = request(serde_jcs::to_vec(&parsed).unwrap());
-            let result = super::review(&asked, &policy, from, &context);
-            if known {
-                let plan = result.unwrap().unwrap();
-                assert!(!is_opaque(&plan));
-                assert!(plan.action.iter().any(|line| line.contains("EXA")));
-            } else {
-                assert!(result.is_err());
-            }
-            asked.requested_review_mode = Some(ReviewMode::OpaqueExact);
-            let mut allowing = policy.clone();
-            allowing
-                .clear_signing
-                .as_mut()
-                .unwrap()
-                .opaque_exact_allowed = true;
-            let result = super::review(&asked, &allowing, from, &context);
-            if known {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .to_string()
-                        .contains("cannot be approved unread")
-                );
-            } else {
-                assert!(is_opaque(&result.unwrap().unwrap()));
-            }
-        }
-    }
-
-    #[test]
-    fn batch_value_overflow_names_the_offending_entry() {
-        let target = "0x4000000000000000000000000000000000000000";
-        let mut packed = multisend_entry(target, 0, &[]);
-        packed[21..53].copy_from_slice(&U256::MAX.to_be_bytes::<32>());
-        packed.extend(multisend_entry(target, 1, &[]));
-        let mut parsed: Envelope = serde_json::from_slice(&envelope()).unwrap();
-        parsed.chain_id = "8453".into();
-        parsed.safe_tx.to = "0xa83c336b20401af773b6219ba5027174338d1836".into();
-        parsed.safe_tx.operation = 1;
-        parsed.safe_tx.value = "0".into();
-        parsed.safe_tx.data = format!("0x{}", hex::encode(multisend_calldata(&packed)));
-        assert!(
-            classify(&parsed)
-                .unwrap_err()
-                .message
-                .contains("overflow at entry 2")
-        );
-    }
-
-    #[test]
-    fn version_150_batch_rejects_zero_and_explicit_safe_self_calls() {
-        for target in [ZERO, "0x1000000000000000000000000000000000000000"] {
-            let mut parsed: Envelope = serde_json::from_slice(&envelope()).unwrap();
-            parsed.chain_id = "8453".into();
-            parsed.safe_tx.to = "0xa83c336b20401af773b6219ba5027174338d1836".into();
-            parsed.safe_tx.operation = 1;
-            parsed.safe_tx.value = "0".into();
-            parsed.safe_tx.data = format!(
-                "0x{}",
-                hex::encode(multisend_calldata(&multisend_entry(
-                    target,
-                    0,
-                    &[0x61, 0x0b, 0x59, 0x25]
-                )))
-            );
-            assert!(
-                classify(&parsed)
-                    .unwrap_err()
-                    .message
-                    .contains("Safe self-call")
-            );
+            let plan = super::review(
+                &request(serde_jcs::to_vec(&parsed).unwrap()),
+                &policy,
+                from,
+                &catalog,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(is_opaque(&plan), !known, "{:?}", plan.action);
+            assert_eq!(plan.action.iter().any(|line| line.contains("EXA")), known);
         }
     }
 
@@ -1540,221 +959,6 @@ mod tests {
                 .message
                 .contains("cannot be mixed")
         );
-        let mut delegate: Envelope = serde_json::from_slice(&envelope()).unwrap();
-        delegate.safe_tx.operation = 1;
-        assert!(
-            classify(&delegate)
-                .unwrap_err()
-                .message
-                .contains("value must be zero")
-        );
-    }
-
-    #[test]
-    fn impossible_reported_owner_sets_and_thresholds_are_refused() {
-        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-        for threshold in ["0", "2"] {
-            let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-            value["threshold"] = serde_json::json!(threshold);
-            let request = request(serde_jcs::to_vec(&value).unwrap());
-            assert!(
-                review(&request, &policy(), from)
-                    .unwrap_err()
-                    .message
-                    .contains("threshold must be between")
-            );
-        }
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["owners"] = serde_json::json!([from.to_string(), from.to_string()]);
-        let request = request(serde_jcs::to_vec(&value).unwrap());
-        assert!(
-            review(&request, &policy(), from)
-                .unwrap_err()
-                .message
-                .contains("owners must be distinct")
-        );
-    }
-
-    #[test]
-    fn call_only_batches_disclose_every_entry() {
-        let mut erc20 = vec![0xa9, 0x05, 0x9c, 0xbb];
-        erc20.extend_from_slice(&[0; 12]);
-        erc20.extend_from_slice(
-            address("0x4000000000000000000000000000000000000000", "to")
-                .unwrap()
-                .as_slice(),
-        );
-        erc20.extend_from_slice(&U256::from(7).to_be_bytes::<32>());
-
-        let mut packed = multisend_entry("0x5000000000000000000000000000000000000000", 2, &erc20);
-        packed.extend(multisend_entry(
-            "0x6000000000000000000000000000000000000000",
-            3,
-            &[],
-        ));
-
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["safe_tx"]["to"] = serde_json::json!("0x9641d764fc13c8b624c04430c7356c1c7c8102e2");
-        value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["operation"] = serde_json::json!(1);
-        value["safe_tx"]["data"] =
-            serde_json::json!(format!("0x{}", hex::encode(multisend_calldata(&packed))));
-        value["library_code_hash"] =
-            serde_json::json!("0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939");
-
-        // The same address on a chain Broker has not verified may hold other
-        // code, and the Petal's code hash cannot vouch for it.
-        let unverified: Envelope = serde_json::from_value(value.clone()).unwrap();
-        assert!(
-            classify(&unverified)
-                .unwrap_err()
-                .message
-                .contains("no verified Safe library deployment")
-        );
-
-        value["chain_id"] = serde_json::json!("8453");
-        let parsed: Envelope = serde_json::from_value(value).unwrap();
-        let action = classify(&parsed).unwrap();
-
-        // A batch must not be a cheaper way to hide a call than sending it
-        // directly: every destination and amount is disclosed.
-        assert!(action.contains("Calls: 2"));
-        assert!(action.contains("Total native value (wei): 5"));
-        assert!(action.contains(
-            "1. ERC-20 transfer token=0x5000000000000000000000000000000000000000 recipient=0x4000000000000000000000000000000000000000 amount (base units)=7"
-        ));
-        assert!(action.contains(
-            "2. Native transfer recipient=0x6000000000000000000000000000000000000000 value (wei)=3"
-        ));
-    }
-
-    /// Wrapping an unreadable call in a MultiSendCallOnly batch rendered it as
-    /// a numbered entry, which the opacity gates did not recognise: a wallet
-    /// that refuses payloads Bloom cannot explain prepared it anyway, and the
-    /// journal recorded it as read.
-    #[test]
-    fn an_unreadable_batch_entry_obeys_the_wallets_opaque_payload_setting() {
-        let mut packed = multisend_entry(
-            "0x6000000000000000000000000000000000000000",
-            0,
-            &[0xde, 0xad, 0xbe, 0xef, 0x00, 0x11],
-        );
-        packed.extend(multisend_entry(
-            "0x6000000000000000000000000000000000000000",
-            3,
-            &[],
-        ));
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["chain_id"] = serde_json::json!("8453");
-        value["safe_tx"]["to"] = serde_json::json!("0x9641d764fc13c8b624c04430c7356c1c7c8102e2");
-        value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["operation"] = serde_json::json!(1);
-        value["safe_tx"]["data"] =
-            serde_json::json!(format!("0x{}", hex::encode(multisend_calldata(&packed))));
-        value["library_code_hash"] =
-            serde_json::json!("0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939");
-        let batch = serde_jcs::to_vec(&value).unwrap();
-        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-
-        let on_base = |allowed| {
-            let mut policy = clear_signing_policy(allowed);
-            policy.allowed_destinations[0].chain = token("evm-8453");
-            policy
-        };
-        let error = review(&request(batch.clone()), &on_base(false), from)
-            .expect_err("an unreadable batch entry must obey the wallet's setting");
-        assert!(
-            error.to_string().contains("CATALOG_UNAVAILABLE"),
-            "{}",
-            error
-        );
-
-        let mut opaque_request = request(batch);
-        opaque_request.requested_review_mode = Some(ReviewMode::OpaqueExact);
-        let plan = review(&opaque_request, &on_base(true), from)
-            .unwrap()
-            .unwrap();
-        assert!(is_opaque(&plan), "{:?}", plan.action);
-    }
-
-    #[test]
-    fn unverifiable_safe_state_is_reported_separately_from_the_rebuilt_transaction() {
-        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        // `threshold` is not an EIP-712 member, so the digest cannot constrain
-        // it and Broker has no chain client to check it against. It must not be
-        // presented as something Broker established.
-        value["threshold"] = serde_json::json!("3");
-        value["owners"] = serde_json::json!([
-            "0x3000000000000000000000000000000000000000",
-            "0xaaaa000000000000000000000000000000000000",
-            "0xbbbb000000000000000000000000000000000000"
-        ]);
-        let canonical = serde_jcs::to_vec(&value).unwrap();
-        let plan = review(&request(canonical), &policy(), from)
-            .unwrap()
-            .unwrap();
-        assert_eq!(plan.reported.threshold, "3");
-        assert_eq!(plan.reported.owners.len(), 3);
-        assert!(
-            !serde_json::to_string(&plan)
-                .unwrap()
-                .contains("Broker-verified")
-        );
-    }
-
-    #[test]
-    fn rejects_refunds_and_delegatecalls_outside_the_official_safe_libraries() {
-        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-
-        // Refund fields are EIP-712 members, so the digest binds them and this
-        // is a real constraint on what the owner is signing.
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["safe_tx"]["gas_price"] = serde_json::json!("1");
-        let canonical = serde_jcs::to_vec(&value).unwrap();
-        assert!(review(&request(canonical), &policy(), from).is_err());
-
-        // `safe_tx.to` is an EIP-712 member too, so restricting a delegatecall
-        // to the official libraries constrains the transaction rather than the
-        // Petal's description of it.
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["safe_tx"]["operation"] = serde_json::json!(1);
-        value["safe_tx"]["value"] = serde_json::json!("0");
-        value["safe_tx"]["data"] = serde_json::json!("0xdeadbeef");
-        value["safe_tx"]["to"] = serde_json::json!("0x4000000000000000000000000000000000000000");
-        let canonical = serde_jcs::to_vec(&value).unwrap();
-        assert!(review(&request(canonical), &policy(), from).is_err());
-
-        // Reaching an official library is not enough; the call into it must
-        // still decode.
-        value["safe_tx"]["to"] = serde_json::json!("0x9641d764fc13c8b624c04430c7356c1c7c8102e2");
-        let canonical = serde_jcs::to_vec(&value).unwrap();
-        assert!(review(&request(canonical), &policy(), from).is_err());
-    }
-
-    #[test]
-    fn an_unrecognized_safe_deployment_is_disclosed_rather_than_refused() {
-        // Deployment fields are outside the preimage: a pinned table could only
-        // refuse an honest Petal, so they are disclosed as unverified instead.
-        let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
-        let mut value: serde_json::Value = serde_json::from_slice(&envelope()).unwrap();
-        value["singleton"] = serde_json::json!("0x4000000000000000000000000000000000000000");
-        value["singleton_code_hash"] = serde_json::json!("0x".to_owned() + &"ab".repeat(32));
-        value["safe_version"] = serde_json::json!("1.4.2");
-        let canonical = serde_jcs::to_vec(&value).unwrap();
-
-        let plan = review(&request(canonical), &policy(), from)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            plan.reported.singleton,
-            "0x4000000000000000000000000000000000000000"
-        );
-        assert_eq!(
-            plan.reported.singleton_code_hash,
-            "0x".to_owned() + &"ab".repeat(32)
-        );
-        assert_eq!(plan.reported.version, "1.4.2");
     }
 
     #[test]

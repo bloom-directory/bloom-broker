@@ -102,7 +102,6 @@ fn capabilities() -> ServiceCapabilities {
             verifier_id: token("webauthn"),
             verifier_digest: digest(13),
         }],
-        clear_signing: Vec::new(),
         frame_max_bytes: DecimalU64::new(FRAME_MAX_BYTES as u64),
     }
 }
@@ -274,8 +273,9 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
         MachineBrokerRequest::CeremonySurfaceStatus(Empty {}),
         MachineBrokerRequest::ActionValidate(digest(58)),
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
-            requested_review_mode: None,
+            evm_reported_token: None,
             evm_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
             operation_id: operation(54),
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
@@ -586,19 +586,19 @@ where
 
 #[test]
 fn every_machine_broker_variant_matches_frozen_v1_frames() {
-    // The unreleased 1.7 fixture combines the remote-ceremony methods and
+    // The signing release's 1.8 fixture combines the remote-ceremony methods and
     // surface selection with native and Safe review fields. Empty review
     // vectors remain omitted from pre-existing approval request frames.
     assert_eq!(MachineBrokerMethod::ALL.len(), 45);
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "fad0c8cf62391a1000b1c771b4e482e353efebc9056f263a68670f8abba946a8",
+        "57dbc41a057c754038ae207becae0536d365c37dc2466c1e3611a0d8940b6204",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "7889a9d1f237553511ddcf311543652f4c199aec2a8069950217e5a5feda9128",
+        "32bd9b02398991399b065111e6cacfa8c98667f5454babca2873dab05d314276",
     );
 }
 

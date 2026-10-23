@@ -1,0 +1,87 @@
+{
+  "$schema": "https://eips.ethereum.org/assets/eip-7730/erc7730-v2.schema.json",
+  "$comment": "Morpho GeneralAdapter1, as the Morpho Petal calls it through Bundler3.",
+  "context": {
+    "contract": {
+      "deployments": [
+        {
+          "chainId": 1,
+          "address": "0x4A6c312ec70E8747a587EE860a0353cd42Be0aE0"
+        },
+        {
+          "chainId": 10,
+          "address": "0x79481C87f24A3C4332442A2E9faaf675e5F141f0"
+        },
+        {
+          "chainId": 137,
+          "address": "0xB261B51938A9767406ef83bbFbaAFE16691b7047"
+        },
+        {
+          "chainId": 8453,
+          "address": "0xb98c948CFA24072e58935BC004a8A7b376AE746A"
+        },
+        {
+          "chainId": 42161,
+          "address": "0x9954aFB60BB5A222714c478ac86990F221788B88"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "owner": "Morpho DAO",
+    "contractName": "Morpho GeneralAdapter1"
+  },
+  "display": {
+    "formats": {
+      "erc20TransferFrom(address token, address receiver, uint256 amount)": {
+        "intent": "Pull tokens from you",
+        "fields": [
+          {
+            "path": "amount",
+            "label": "Amount",
+            "format": "tokenAmount",
+            "params": {
+              "tokenPath": "token"
+            }
+          },
+          {
+            "path": "token",
+            "label": "Token",
+            "format": "addressName"
+          },
+          {
+            "path": "receiver",
+            "label": "Sent to",
+            "format": "addressName"
+          }
+        ]
+      },
+      "erc4626Deposit(address vault, uint256 assets, uint256 maxSharePriceE27, address receiver)": {
+        "intent": "Deposit into a vault",
+        "fields": [
+          {
+            "path": "vault",
+            "label": "Vault",
+            "format": "addressName"
+          },
+          {
+            "path": "assets",
+            "label": "Assets",
+            "format": "vaultAssetAmount",
+            "params": {"vaultPath": "vault"}
+          },
+          {
+            "path": "maxSharePriceE27",
+            "label": "Highest share price (1e27 scale)",
+            "format": "raw"
+          },
+          {
+            "path": "receiver",
+            "label": "Shares go to",
+            "format": "addressName"
+          }
+        ]
+      }
+    }
+  }
+}

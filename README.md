@@ -226,7 +226,13 @@ identity — never parse the message, and never invent a replacement operation.
 The field is refused if it appears on any other code or carries values outside
 its own window.
 
-Concurrency exhaustion is a different class: it returns `QUOTA_EXCEEDED` with
+Each wallet permits one live ceremony. Petals and agents must finish or cancel
+an approval ceremony before requesting the next route ceremony. An overlapping
+request returns `CEREMONY_RATE_LIMITED`; its `retry_after_ms` is the remaining
+lifetime of the live ceremony. Completion can free the slot earlier. Preserve
+the operation identity when retrying and do not busy-loop on this error.
+
+Global concurrency exhaustion is a different class: it returns `QUOTA_EXCEEDED` with
 **no** retry hint, because nothing ages out on a schedule — only when a live
 ceremony ends.
 
@@ -284,6 +290,37 @@ URI and issuer and never installs those roots into a system or application trust
 store. Abrupt process termination can prevent immediate retirement; DNS leases
 remain bounded by Relay expiry. Before concluding an interrupted run, the operator
 must verify signed retirement, DNS cleanup, and the permanent hostname tombstone.
+
+## Local wallet onboarding
+
+After registration, the local browser shows the wallet name, initial EVM and
+Solana account addresses, copy controls and a separate **Back up wallet** action.
+**Later** returns to the persistent `/wallet/<wallet-id>` page without claiming
+a backup was made. Bookmark that page to revisit addresses and backup after the
+registration capability has been consumed. It also works for already-created
+BIP-39 wallets on this host.
+
+The local wallet API exposes public account projections for an exact wallet ID;
+it does not list wallets or return secret material. It requires the configured
+localhost Host and same-origin Fetch Metadata. Preparing backup additionally
+requires the exact Origin and JSON content type. Hosted listeners reject these
+owner-page routes; a persistent authenticated hosted-wallet UI remains outside
+this local flow. Ceremony capabilities and terminal invalidation are unchanged.
+
+**Back up wallet** prepares the existing wallet-export ceremony. Signer requires
+a fresh passkey proof; registration approval cannot export a phrase. Pending
+backup requests resume on repeat clicks; cancellation allows a new request after
+the existing cooldown. The recovery phrase restores the wallet in compatible
+wallet software, while the passkey authorizes operations in Bloom. Neither
+viewing a phrase nor returning to the wallet establishes that a backup was saved.
+
+`scripts/test-wallet-onboarding.mjs` runs create → addresses → Later/refresh →
+backup/cancel → fresh backup approval → return against a running isolated Triad
+with a Chromium virtual passkey. It captures only address and pre-export review
+screens. It never records video/traces, reads phrase text, logs it or screenshots
+it. Required environment inputs are listed at the top of the script; do not run
+against custody or a production wallet. The service test independently covers
+the real Signer registration/export path and local-origin/body boundaries.
 
 ## Durable-clock recovery and repair
 

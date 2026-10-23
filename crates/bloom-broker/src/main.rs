@@ -85,11 +85,6 @@ struct BrokerConfig {
     signer_revocation_key_id: String,
     signer_revocation_public_key_hex: String,
     provenance_catalog_path: PathBuf,
-    /// Optional path to a signed clear-signing catalog. Replacing this file
-    /// and restarting Broker is the whole import surface: there is no
-    /// network fetch, no refresh command and no second audit family.
-    #[serde(default)]
-    clear_signing_catalog_path: Option<PathBuf>,
     /// Optional path to an owner-installed ceremony stylesheet. It is read
     /// once here and served at `/assets/theme.css` after the default sheet;
     /// no other file is reachable through that route. It is trusted UI code:
@@ -684,9 +679,6 @@ async fn run_with_paths(
         let provenance_catalog = load_provenance_catalog(&config.provenance_catalog_path)?;
         if !journal.audit_degraded() {
             authority.synchronize_provenance_catalog(&provenance_catalog)?;
-            if let Some(path) = &config.clear_signing_catalog_path {
-                install_clear_signing_catalog(&authority, path)?;
-            }
         }
         if let Some(path) = &config.ceremony_theme_css_path {
             bloom_broker::ceremony::install_owner_theme_css(load_theme_css(
@@ -2122,76 +2114,6 @@ fn load_config(path: &Path) -> Result<BrokerConfig, ProtocolError> {
     });
     bytes.zeroize();
     decoded
-}
-
-/// Read and install the operator's signed clear-signing catalog.
-///
-/// A snapshot no enrolled wallet trusts is a configuration mistake worth
-/// naming, not a reason to refuse to start: wallets that never enabled clear
-/// signing keep working, and the log says why nothing was installed.
-fn install_clear_signing_catalog(
-    authority: &BrokerAuthority,
-    path: &Path,
-) -> Result<(), ProtocolError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| {
-            ProtocolError::new(
-                ProtocolErrorCode::UnauthenticatedPeer,
-                format!("open {}: {error}", path.display()),
-            )
-        })?;
-    let metadata = file.metadata().map_err(|error| {
-        ProtocolError::new(
-            ProtocolErrorCode::UnauthenticatedPeer,
-            format!("inspect {}: {error}", path.display()),
-        )
-    })?;
-    if !metadata.file_type().is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.mode() & 0o022 != 0
-    {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::UnauthenticatedPeer,
-            "clear-signing catalog must be a non-symlink regular file not writable by group or other",
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.take((bloom_evm_clear_signing::CATALOG_MAX_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            ProtocolError::new(
-                ProtocolErrorCode::UnauthenticatedPeer,
-                format!("read {}: {error}", path.display()),
-            )
-        })?;
-    if bytes.len() > bloom_evm_clear_signing::CATALOG_MAX_BYTES {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::LimitExceededFrame,
-            "clear-signing catalog exceeds 1 MiB",
-        ));
-    }
-    let catalog: bloom_evm_clear_signing::ClearSigningCatalog = serde_json::from_slice(&bytes)
-        .map_err(|error| {
-            ProtocolError::new(
-                ProtocolErrorCode::MalformedFrame,
-                format!("parse clear-signing catalog: {error}"),
-            )
-        })?;
-    let outcome = authority
-        .install_clear_signing_catalog_for_enrolled_wallets(&catalog, bytes.len())
-        .map_err(|error| ProtocolError::new(ProtocolErrorCode::ClaimInvalid, error.to_string()))?;
-    tracing::info!(
-        event = "broker.clear_signing_catalog",
-        catalog_id = catalog.catalog_id.as_str(),
-        sequence = catalog.sequence.as_str(),
-        entries = catalog.entries.len(),
-        outcome = ?outcome,
-        "Broker read the operator's clear-signing catalog"
-    );
-    Ok(())
 }
 
 /// The theme can restyle the approval page, including hiding a warning, so

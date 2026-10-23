@@ -3,7 +3,6 @@
 mod support;
 
 use alloy_primitives::U256;
-use bloom_broker_api::Digest32;
 use bloom_evm_clear_signing::*;
 use support::*;
 
@@ -25,7 +24,7 @@ fn approve_bytes(spender: &str, amount: U256) -> Vec<u8> {
 fn a_transfer_shows_the_actual_recipient_and_exact_amount() {
     let catalog = accepted_erc20();
     let bytes = transfer_bytes(RECIPIENT, U256::from(100_000_000u64));
-    let (call, used) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, used) = review_call(&catalog, &context(&bytes)).unwrap();
 
     assert_eq!(call.action, "transfer");
     assert_eq!(
@@ -48,7 +47,7 @@ fn a_transfer_shows_the_actual_recipient_and_exact_amount() {
 fn an_allowance_shows_the_spender_and_the_total_it_sets() {
     let catalog = accepted_erc20();
     let bytes = approve_bytes(RECIPIENT, U256::from(250u64));
-    let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
 
     assert_eq!(call.action, "allowance");
     assert_eq!(field(&call, "Spender").value, checksum(RECIPIENT));
@@ -76,15 +75,12 @@ fn an_allowance_shows_the_spender_and_the_total_it_sets() {
 /// every single-entry review.
 #[test]
 fn an_upgradeable_contract_is_typed_evidence_and_not_a_call_warning() {
-    let mut upgradeable = erc20_entry();
+    let mut upgradeable = token(TOKEN, 6);
     upgradeable.upgradeable = true;
-    upgradeable.implementation_hash = Some(Digest32::from_bytes([7; 32]));
-    let mut catalog = catalog(vec![upgradeable]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+    let catalog = build(vec![erc20_descriptor()], vec![upgradeable]).unwrap();
 
     let bytes = transfer_bytes(RECIPIENT, U256::from(100_000_000u64));
-    let (call, used) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, used) = review_call(&catalog, &context(&bytes)).unwrap();
 
     // The property survives, on the entry, where a page can state it once per
     // contract however many calls referenced that contract.
@@ -105,7 +101,7 @@ fn an_upgradeable_contract_is_typed_evidence_and_not_a_call_warning() {
     }
 
     // A direct deployment differs only in the flag, never in the warnings.
-    let (direct, _) = review_call(&accepted_erc20(), &context(&bytes, false)).unwrap();
+    let (direct, _) = review_call(&accepted_erc20(), &context(&bytes)).unwrap();
     assert_eq!(call.warnings, direct.warnings);
 }
 
@@ -113,7 +109,7 @@ fn an_upgradeable_contract_is_typed_evidence_and_not_a_call_warning() {
 fn a_zero_allowance_is_shown_as_clearing_it() {
     let catalog = accepted_erc20();
     let bytes = approve_bytes(RECIPIENT, U256::ZERO);
-    let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
     assert_eq!(field(&call, "Amount").value, "0 EXA");
     assert!(
         call.warnings
@@ -123,16 +119,10 @@ fn a_zero_allowance_is_shown_as_clearing_it() {
 }
 
 #[test]
-fn a_maximum_allowance_is_denied_until_policy_enables_it() {
+fn a_maximum_allowance_carries_one_complete_warning() {
     let catalog = accepted_erc20();
     let bytes = approve_bytes(RECIPIENT, U256::MAX);
-
-    let denied = review_call(&catalog, &context(&bytes, false)).unwrap_err();
-    assert_eq!(denied.reason, ReviewReason::PolicyDenied);
-
-    // Enabling the policy does not approve the transaction: it only makes the
-    // request reviewable, and the exact amount stays visible.
-    let (call, _) = review_call(&catalog, &context(&bytes, true)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
     assert!(
         call.warnings
             .iter()
@@ -157,7 +147,7 @@ fn a_large_finite_allowance_is_never_relabelled_unlimited() {
     let catalog = accepted_erc20();
     let large = U256::from(2u8).pow(U256::from(255u8));
     let bytes = approve_bytes(RECIPIENT, large);
-    let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
     assert_eq!(field(&call, "Amount").raw, large.to_string());
     assert!(
         !call
@@ -171,7 +161,7 @@ fn a_large_finite_allowance_is_never_relabelled_unlimited() {
 fn trailing_dirty_and_truncated_calldata_are_all_refused() {
     let catalog = accepted_erc20();
     let valid = transfer_bytes(RECIPIENT, U256::from(1u8));
-    review_call(&catalog, &context(&valid, false)).unwrap();
+    review_call(&catalog, &context(&valid)).unwrap();
 
     let mut trailing = valid.clone();
     trailing.extend_from_slice(&[0; 32]);
@@ -187,12 +177,12 @@ fn trailing_dirty_and_truncated_calldata_are_all_refused() {
         ("dirty padding", dirty.as_slice()),
         ("truncated", truncated),
     ] {
-        let error = review_call(&catalog, &context(bytes, false)).unwrap_err();
+        let error = review_call(&catalog, &context(bytes)).unwrap_err();
         assert_eq!(error.reason, ReviewReason::InvalidPayload, "{name}");
     }
     // An unknown selector is not malformed, it is undescribed.
     assert_eq!(
-        review_call(&catalog, &context(&wrong_selector, false))
+        review_call(&catalog, &context(&wrong_selector))
             .unwrap_err()
             .reason,
         ReviewReason::UnsupportedCall
@@ -209,23 +199,17 @@ fn a_narrow_integer_with_high_bits_set_is_refused() {
             "fields": [{"path": "limit", "label": "Limit", "format": "raw", "visible": "always"}]
         }}}
     });
-    let functions = vec![AdmittedFunction {
-        signature: "cap(uint64 limit)".into(),
-        action_class: ActionClass::Other,
-    }];
-    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+    let catalog = build(vec![descriptor], vec![token(TOKEN, 6)]).unwrap();
 
     let ok = calldata("cap(uint64 limit)", &[U256::from(u64::MAX)]);
-    review_call(&catalog, &context(&ok, false)).unwrap();
+    review_call(&catalog, &context(&ok)).unwrap();
 
     let overflowing = calldata(
         "cap(uint64 limit)",
         &[U256::from(u64::MAX) + U256::from(1u8)],
     );
     assert_eq!(
-        review_call(&catalog, &context(&overflowing, false))
+        review_call(&catalog, &context(&overflowing))
             .unwrap_err()
             .reason,
         ReviewReason::InvalidPayload
@@ -236,7 +220,7 @@ fn a_narrow_integer_with_high_bits_set_is_refused() {
 fn a_contract_call_carrying_native_value_is_refused() {
     let catalog = accepted_erc20();
     let bytes = transfer_bytes(RECIPIENT, U256::from(1u8));
-    let mut context = context(&bytes, false);
+    let mut context = context(&bytes);
     context.value = U256::from(1u8);
     assert_eq!(
         review_call(&catalog, &context).unwrap_err().reason,
@@ -259,9 +243,7 @@ fn the_token_contract_is_not_a_valid_recipient_and_zero_never_is() {
         ),
     ] {
         assert_eq!(
-            review_call(&catalog, &context(&bytes, false))
-                .unwrap_err()
-                .reason,
+            review_call(&catalog, &context(&bytes)).unwrap_err().reason,
             ReviewReason::InvalidPayload
         );
     }
@@ -271,7 +253,7 @@ fn the_token_contract_is_not_a_valid_recipient_and_zero_never_is() {
 fn a_zero_amount_transfer_is_shown_honestly_rather_than_hidden() {
     let catalog = accepted_erc20();
     let bytes = transfer_bytes(RECIPIENT, U256::ZERO);
-    let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
     assert_eq!(field(&call, "Amount").value, "0 EXA");
 }
 
@@ -284,11 +266,9 @@ fn decimals_zero_six_eighteen_and_255_all_format_exactly() {
         (18, "1000000000000000000", "1 EXA"),
         (18, "1", "0.000000000000000001 EXA"),
     ] {
-        let mut catalog = catalog(vec![entry(erc20_descriptor(), erc20_functions(), decimals)]);
-        sign(&mut catalog, &[(1, "publisher-1")]);
-        let catalog = accept(&catalog).unwrap();
+        let catalog = build(vec![erc20_descriptor()], vec![token(TOKEN, decimals)]).unwrap();
         let bytes = transfer_bytes(RECIPIENT, amount.parse::<U256>().unwrap());
-        let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+        let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
         assert_eq!(
             field(&call, "Amount").value,
             expected,
@@ -296,11 +276,9 @@ fn decimals_zero_six_eighteen_and_255_all_format_exactly() {
         );
     }
     // 255 decimals is representable and is not rounded to zero.
-    let mut catalog = catalog(vec![entry(erc20_descriptor(), erc20_functions(), 255)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+    let catalog = build(vec![erc20_descriptor()], vec![token(TOKEN, 255)]).unwrap();
     let bytes = transfer_bytes(RECIPIENT, U256::from(1u8));
-    let (call, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&bytes)).unwrap();
     let value = &field(&call, "Amount").value;
     assert!(
         value.starts_with("0.") && value.ends_with("1 EXA"),
@@ -310,33 +288,16 @@ fn decimals_zero_six_eighteen_and_255_all_format_exactly() {
 
 #[test]
 fn two_tokens_sharing_a_symbol_stay_distinct_by_contract() {
-    let mut second = erc20_entry();
-    second.contract_address = "0x3333333333333333333333333333333333333333".into();
-    let descriptor = serde_json::json!({
-        "context": {"contract": {"deployments": [
-            {"chainId": CHAIN_ID, "address": "0x3333333333333333333333333333333333333333"}]}},
-        "display": {"formats": {"transfer(address _to, uint256 _value)": {
-            "fields": [
-                {"path": "_to", "label": "To", "format": "addressName", "visible": "always"},
-                {"path": "_value", "label": "Amount", "format": "tokenAmount",
-                 "params": {"tokenPath": "@.to"}, "visible": "always"}
-            ]
-        }}}
-    });
-    second.descriptor_digest = Some(descriptor_digest(&descriptor).unwrap());
-    second.flattened_descriptor = Some(descriptor);
-    second.admitted_functions = vec![AdmittedFunction {
-        signature: "transfer(address _to, uint256 _value)".into(),
-        action_class: ActionClass::Transfer,
-    }];
-
-    let mut catalog = catalog(vec![erc20_entry(), second]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+    let second = "0x3333333333333333333333333333333333333333";
+    let catalog = build(
+        vec![erc20_descriptor()],
+        vec![token(TOKEN, 6), token(second, 6)],
+    )
+    .unwrap();
 
     let bytes = transfer_bytes(RECIPIENT, U256::from(1u8));
-    let (first, _) = review_call(&catalog, &context(&bytes, false)).unwrap();
-    let mut other = context(&bytes, false);
+    let (first, _) = review_call(&catalog, &context(&bytes)).unwrap();
+    let mut other = context(&bytes);
     other.to = "0x3333333333333333333333333333333333333333"
         .parse()
         .unwrap();
@@ -349,20 +310,26 @@ fn two_tokens_sharing_a_symbol_stay_distinct_by_contract() {
     assert_ne!(first.token.unwrap().address, second.token.unwrap().address);
 }
 
+/// Off the catalog, only the exact ERC-20 shape is read, structurally and
+/// in raw units; anything else is unsupported rather than guessed at.
 #[test]
-fn a_call_to_an_undescribed_contract_is_unsupported_not_guessed() {
+fn a_call_to_an_undescribed_contract_is_read_by_shape_or_not_at_all() {
     let catalog = accepted_erc20();
     let bytes = transfer_bytes(RECIPIENT, U256::from(1u8));
-    let mut elsewhere = context(&bytes, false);
+    let mut elsewhere = context(&bytes);
     elsewhere.to = "0x9999999999999999999999999999999999999999"
         .parse()
         .unwrap();
-    assert_eq!(
-        review_call(&catalog, &elsewhere).unwrap_err().reason,
-        ReviewReason::UnsupportedCall
-    );
+    let (call, used) = review_call(&catalog, &elsewhere).unwrap();
+    assert!(call.structural);
+    assert!(call.intent_summary.unwrap().token.is_none());
+    assert!(used.is_empty());
 
-    let mut wrong_chain = context(&bytes, false);
+    let other = calldata(
+        "mint(address,uint256)",
+        &[address_word(RECIPIENT), U256::from(1u8)],
+    );
+    let mut wrong_chain = context(&other);
     wrong_chain.chain_id = 8453;
     assert_eq!(
         review_call(&catalog, &wrong_chain).unwrap_err().reason,
@@ -371,17 +338,11 @@ fn a_call_to_an_undescribed_contract_is_unsupported_not_guessed() {
 }
 
 #[test]
-fn a_token_without_signed_decimals_cannot_display_an_amount() {
-    let mut entry = erc20_entry();
-    entry.token_metadata = None;
-    let mut catalog = catalog(vec![entry]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+fn a_token_without_listed_decimals_cannot_display_an_amount() {
+    let catalog = build(vec![erc20_descriptor()], Vec::new()).unwrap();
     let bytes = transfer_bytes(RECIPIENT, U256::from(1u8));
     assert_eq!(
-        review_call(&catalog, &context(&bytes, false))
-            .unwrap_err()
-            .reason,
+        review_call(&catalog, &context(&bytes)).unwrap_err().reason,
         ReviewReason::UnsupportedCall
     );
 }
@@ -390,7 +351,7 @@ fn a_token_without_signed_decimals_cannot_display_an_amount() {
 /// contract being called. The same generic decoder handles it, and the
 /// decimals come from the catalog entry the decoded address names.
 #[test]
-fn a_token_named_by_an_argument_is_resolved_from_the_signed_catalog() {
+fn a_token_named_by_an_argument_is_resolved_from_the_catalog() {
     let catalog = accepted_vault();
     let bytes = calldata(
         VAULT_DEPOSIT,
@@ -414,8 +375,10 @@ fn a_token_named_by_an_argument_is_resolved_from_the_signed_catalog() {
     assert_eq!(used[1].contract_address, TOKEN);
 }
 
+/// An unlisted token's amount is shown in its raw units, never with decimals
+/// borrowed from somewhere else, and the reading is structural.
 #[test]
-fn a_token_the_catalog_does_not_describe_cannot_be_shown() {
+fn a_token_the_catalog_does_not_list_is_shown_in_raw_units() {
     let catalog = accepted_vault();
     let bytes = calldata(
         VAULT_DEPOSIT,
@@ -425,55 +388,13 @@ fn a_token_the_catalog_does_not_describe_cannot_be_shown() {
             address_word(RECIPIENT),
         ],
     );
-    let error = review_call(&catalog, &vault_context(&bytes)).unwrap_err();
-    assert_eq!(error.reason, ReviewReason::UnsupportedCall);
-    assert!(
-        error.detail.contains("no signed description of the token"),
-        "{error}"
+    let (call, used) = review_call(&catalog, &vault_context(&bytes)).unwrap();
+    assert_eq!(
+        field(&call, "Amount").value,
+        format!("1 raw units of {}", checksum(RECIPIENT))
     );
-}
-
-#[test]
-fn withdrawing_or_changing_the_named_token_invalidates_the_frozen_review() {
-    let accepted = accepted_vault();
-    let bytes = calldata(
-        VAULT_DEPOSIT,
-        &[
-            address_word(TOKEN),
-            U256::from(2_500_000u64),
-            address_word(RECIPIENT),
-        ],
-    );
-    let (_, used) = review_call(&accepted, &vault_context(&bytes)).unwrap();
-    let verifier = bloom_broker_api::Digest32::from_bytes([7; 32]);
-    let evidence = ClearSigningEvidence::new(&accepted, &verifier, used);
-    evidence
-        .recheck(Some(&accepted), &verifier, NOW_MS, 86_400_000)
-        .expect("nothing has changed yet");
-
-    // Withdrawing the token entry leaves the vault entry intact, and the
-    // review is still invalid: the amount was denominated in that token.
-    let mut without_token = catalog(vec![vault_entry()]);
-    sign(&mut without_token, &[(1, "publisher-1")]);
-    let without_token = accept(&without_token).unwrap();
-    let error = evidence
-        .recheck(Some(&without_token), &verifier, NOW_MS, 86_400_000)
-        .unwrap_err();
-    assert_eq!(error.reason, ReviewReason::ReviewChanged);
-    assert!(error.detail.contains(TOKEN), "{error}");
-
-    // So does changing its decimals, which would change what "2.5 EXA" means.
-    let mut redenominated = catalog(vec![
-        entry(erc20_descriptor(), erc20_functions(), 8),
-        vault_entry(),
-    ]);
-    sign(&mut redenominated, &[(1, "publisher-1")]);
-    let redenominated = accept(&redenominated).unwrap();
-    let error = evidence
-        .recheck(Some(&redenominated), &verifier, NOW_MS, 86_400_000)
-        .unwrap_err();
-    assert_eq!(error.reason, ReviewReason::ReviewChanged);
-    assert!(error.detail.contains(TOKEN), "{error}");
+    assert!(call.structural);
+    assert_eq!(used.len(), 1);
 }
 
 #[test]
@@ -489,18 +410,12 @@ fn a_fixed_bytes_word_with_nonzero_trailing_bytes_is_refused() {
             "fields": [{"path": "tag", "label": "Tag", "format": "raw", "visible": "always"}]
         }}}
     });
-    let functions = vec![AdmittedFunction {
-        signature: "settle(bytes4 tag)".into(),
-        action_class: ActionClass::Other,
-    }];
-    let mut catalog = catalog(vec![entry(descriptor, functions, 6)]);
-    sign(&mut catalog, &[(1, "publisher-1")]);
-    let catalog = accept(&catalog).unwrap();
+    let catalog = build(vec![descriptor], vec![token(TOKEN, 6)]).unwrap();
 
     let mut clean = [0u8; 32];
     clean[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
     let ok = calldata("settle(bytes4 tag)", &[U256::from_be_bytes(clean)]);
-    let (call, _) = review_call(&catalog, &context(&ok, false)).unwrap();
+    let (call, _) = review_call(&catalog, &context(&ok)).unwrap();
     assert_eq!(field(&call, "Tag").value, "0xdeadbeef");
 
     let mut dirty = [0xaau8; 32];
@@ -508,9 +423,7 @@ fn a_fixed_bytes_word_with_nonzero_trailing_bytes_is_refused() {
     let hidden = calldata("settle(bytes4 tag)", &[U256::from_be_bytes(dirty)]);
     // The bytes still round-trip, so only the explicit tail check refuses them.
     assert_eq!(
-        review_call(&catalog, &context(&hidden, false))
-            .unwrap_err()
-            .reason,
+        review_call(&catalog, &context(&hidden)).unwrap_err().reason,
         ReviewReason::InvalidPayload
     );
 }

@@ -3,7 +3,6 @@
 mod approval;
 mod ceremony;
 mod claims;
-mod clear_signing;
 mod codec;
 mod crypto;
 mod error;
@@ -14,14 +13,15 @@ mod provenance;
 mod revocation;
 mod service;
 mod signing;
+mod solana_review;
 pub mod solana_vectors;
+mod tokens;
 mod validation;
 mod wallet_account;
 
 pub use approval::*;
 pub use ceremony::*;
 pub use claims::*;
-pub use clear_signing::*;
 pub use codec::*;
 pub use crypto::*;
 pub use error::*;
@@ -32,6 +32,8 @@ pub use provenance::*;
 pub use revocation::*;
 pub use service::*;
 pub use signing::*;
+pub use solana_review::*;
+pub use tokens::*;
 pub use wallet_account::*;
 
 pub use bloom_rpc_wire::{
@@ -53,8 +55,10 @@ pub const RATE_LIMIT_DETAILS_MINOR: u16 = 4;
 /// The negotiated range moves as a unit, so there is no accepted minor that
 /// predates any field the Broker may emit. Older peers are refused at the
 /// hello before a response can carry a field their strict decoder rejects.
-pub const BROKER_API_MINOR_MIN: u16 = 7;
-pub const BROKER_API_MINOR_MAX: u16 = 7;
+// Released 1.7 used strict catalog-policy and hash-only caller shapes.
+// The signing release negotiates its incompatible contract once, as 1.8.
+pub const BROKER_API_MINOR_MIN: u16 = 8;
+pub const BROKER_API_MINOR_MAX: u16 = 8;
 pub const BROKER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(BROKER_API_MAJOR, BROKER_API_MINOR_MAX);
 pub const BROKER_API_RANGE: ProtocolVersionRange =
@@ -72,6 +76,7 @@ mod version_tests {
 
     #[test]
     fn broker_api_range_rejects_incompatible_versions() {
+        assert!(!BROKER_API_RANGE.contains(ProtocolVersion::new(1, 7)));
         assert!(!BROKER_API_RANGE.contains(ProtocolVersion::new(
             BROKER_API_MAJOR + 1,
             BROKER_API_MINOR_MIN,

@@ -1,0 +1,80 @@
+{
+  "$schema": "https://eips.ethereum.org/assets/eip-7730/erc7730-v2.schema.json",
+  "$comment": "Derived from LedgerHQ/clear-signing-erc7730-registry registry/morpho/calldata-MorphoBundlerV3.json. Every call component is shown or fixed: no callbacks and no skipped reverts.",
+  "context": {
+    "contract": {
+      "deployments": [
+        {
+          "chainId": 1,
+          "address": "0x6566194141eefa99Af43Bb5Aa71460Ca2Dc90245"
+        },
+        {
+          "chainId": 10,
+          "address": "0xFBCd3C258feB131D8E038F2A3a670A7bE0507C05"
+        },
+        {
+          "chainId": 137,
+          "address": "0x2d9C3A9E67c966C711208cc78b34fB9E9f8db589"
+        },
+        {
+          "chainId": 8453,
+          "address": "0x6BFd8137e702540E7A42B74178A4a49Ba43920C4"
+        },
+        {
+          "chainId": 42161,
+          "address": "0x1FA4431bC113D308beE1d46B0e98Cb805FB48C13"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "owner": "Morpho DAO",
+    "contractName": "Morpho Bundler3"
+  },
+  "display": {
+    "formats": {
+      "multicall((address to, bytes data, uint256 value, bool skipRevert, bytes32 callbackHash)[] bundle)": {
+        "intent": "Run a Morpho bundle",
+        "fields": [
+          {
+            "path": "#.bundle.[].data",
+            "label": "Action",
+            "format": "calldata",
+            "params": {
+              "calleePath": "#.bundle.[].to",
+              "amountPath": "#.bundle.[].value"
+            }
+          },
+          {
+            "path": "#.bundle.[].to",
+            "label": "Action contract",
+            "format": "addressName"
+          },
+          {
+            "path": "#.bundle.[].value",
+            "label": "Action sends",
+            "format": "amount"
+          },
+          {
+            "path": "#.bundle.[].skipRevert",
+            "label": "Skip on failure",
+            "visible": {
+              "mustMatch": [
+                false
+              ]
+            }
+          },
+          {
+            "path": "#.bundle.[].callbackHash",
+            "label": "Callback",
+            "visible": {
+              "mustMatch": [
+                "0x0000000000000000000000000000000000000000000000000000000000000000"
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}
