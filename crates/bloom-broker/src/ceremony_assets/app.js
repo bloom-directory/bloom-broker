@@ -10,6 +10,10 @@ const exportFields = document.getElementById("export-fields");
 const importFields = document.getElementById("import-fields");
 const mnemonicInput = document.getElementById("mnemonic-input");
 const rawKeyInput = document.getElementById("raw-key-input");
+const cardFields = document.getElementById("card-fields");
+const travelerFields = document.getElementById("traveler-fields");
+const cardCvcFields = document.getElementById("card-cvc-fields");
+const formError = document.getElementById("form-error");
 const panelTitle = document.getElementById("panel-title");
 const panelKicker = document.getElementById("panel-kicker");
 
@@ -21,6 +25,9 @@ const MNEMONIC_WORD_COUNTS = [12, 15, 18, 21, 24];
 // is signed or bound; the exact signed material stays available under
 // "Signed details" and is what the passkey attests to.
 const KINDS = {
+  card_add: {title: "Save a card", summary: "Save this card encrypted in Signer. It replaces any saved card with the same ID. CVC is never saved.", button: "Save with passkey"},
+  card_delete: {title: "Delete a card", summary: "Remove the saved card. Your card container remains enrolled.", button: "Delete with passkey"},
+  card_checkout: {title: "Approve a purchase", summary: "Fill and submit this checkout once. Bloom cannot cap the merchant's actual charge.", button: "Approve purchase with passkey"},
   wallet_registration: {
     title: "Create a new wallet",
     summary: "A new wallet will be created on your Bloom host. You will set up a <strong>new passkey</strong> for it now — that passkey is what approves anything this wallet does.",
@@ -204,6 +211,7 @@ let expiryTimer = null;
 let approvalTerminal = false;
 function startExpiry(session, node) {
   clearInterval(expiryTimer);
+  expiryTimer = null;
   const expiresAt = Number(session.expires_at_ms ||
     session.signer_contribution?.expires_at_ms ||
     session.review_manifest?.expires_at_ms);
@@ -236,6 +244,14 @@ function startExpiry(session, node) {
       approve.disabled = true;
       statusNode.textContent = session.is_preview ? "Preview only — nothing can be approved."
         : "This ceremony has expired. Nothing was changed.";
+      const page = document.getElementById("ceremony-page");
+      if (page?.classList?.contains("browser-handoff")) {
+        page.classList.add("request-expired");
+        panelTitle.textContent = "This request expired";
+        statusNode.textContent = "Nothing happened. Ask your agent for a fresh link.";
+        approve.textContent = "Request expired";
+        reviewNode.querySelector("details.agent-instructions")?.removeAttribute("open");
+      }
       clearInterval(expiryTimer);
     }
   };
@@ -1313,6 +1329,111 @@ function planDisclosures(manifest) {
   } catch (_) { return []; }
 }
 
+function renderCardReview(session) {
+  const meta = KINDS[session.ceremony_kind];
+  document.getElementById("page-title").textContent = meta.title;
+  document.getElementById("page-lede").textContent = meta.summary;
+  panelTitle.textContent = "Check this request";
+  approve.textContent = meta.button;
+  const manifest = session.review_manifest;
+  const effect = manifest.card_effect;
+  if (["save_traveler", "delete_traveler", "fill_traveler"].includes(effect.kind)) {
+    const saving = effect.kind === "save_traveler", filling = effect.kind === "fill_traveler";
+    document.getElementById("page-title").textContent = saving ? "Save a traveler" : filling ? "Autofill traveler details" : "Delete a traveler";
+    document.getElementById("page-lede").textContent = saving
+      ? "Enter details once, privately. Agents can see the label and which fields are saved, but not their values."
+      : filling ? "Share only these saved fields with this booking site. This does not authorize payment."
+      : "Remove this person's saved details from Bloom. Existing airline bookings are unaffected.";
+    approve.textContent = saving ? "Save with passkey" : filling ? "Autofill with passkey" : "Delete with passkey";
+    const facts = el("dl", {class:"facts"});
+    facts.append(el("dt",{},"Traveler"),el("dd",{},saving ? effect.label : (manifest.traveler?.label || effect.traveler_id)));
+    if (filling) {
+      facts.append(el("dt",{},"Website"),el("dd",{},effect.scope.origin),
+        el("dt",{},"Receiving frames"),el("dd",{},effect.scope.frame_origins.join(", ")),
+        el("dt",{},"Fields"),el("dd",{},effect.scope.fields.map(field=>field.replaceAll("_"," ")).join(", ")));
+    }
+    reviewNode.replaceChildren(facts);
+    const expiry=el("p",{class:"expiry"});reviewNode.append(expiry);startExpiry(session,expiry);
+    return;
+  }
+  const handoff = effect.kind === "manual_checkout" && !effect.card_id;
+  const page = document.getElementById("ceremony-page");
+  page?.classList?.toggle("browser-handoff", handoff);
+  page?.classList?.remove("request-expired");
+  panelKicker.textContent = "Step 1 of 2 · Check";
+  const facts = el("dl", {class: "facts"});
+  const fact = (name, value) => facts.append(el("dt", {}, name), el("dd", {}, value));
+  if (manifest.card) fact("Card", `${manifest.card.brand} ending ${manifest.card.last4} (“${manifest.card.label}”)`);
+  if (effect.kind === "add") fact("Label", effect.label);
+  if (effect.kind === "checkout" || effect.kind === "site_checkout") {
+    const payment = effect.facts;
+    const website = el("span");
+    const domain = manifest.host;
+    const index = domain ? payment.origin.lastIndexOf(domain) : -1;
+    if (index >= 0) website.append(payment.origin.slice(0, index), el("strong", {}, domain), payment.origin.slice(index + domain.length));
+    else website.textContent = payment.origin;
+    fact("Website", website);
+    if (effect.kind === "site_checkout") {
+      document.getElementById("page-lede").textContent = "Bloom clicks this shop's pay button once. The shop charges the payment method saved in your account there; no Bloom card is used. Bloom cannot cap the shop's actual charge.";
+      fact("Payment", "Your saved payment method at this shop");
+    } else fact("Payment frames", payment.payment_frame_origins.join(", ") || "Main document");
+    const scale = new Intl.NumberFormat("en", {style: "currency", currency: payment.currency}).resolvedOptions().maximumFractionDigits;
+    const amount = payment.total_minor / (10 ** scale);
+    const money = value => new Intl.NumberFormat("en", {style: "currency", currency: payment.currency}).format(value);
+    fact("Total", `${money(amount)} (${payment.currency})`);
+    fact("Installments", payment.total_minor % payment.installments === 0
+      ? `${payment.installments} × ${money(amount / payment.installments)} = ${money(amount)}`
+      : `${payment.installments} payments totaling ${money(amount)}; individual installment amounts were not verified`);
+    fact("Recurring charge", payment.recurring ? "Yes" : "No");
+    // The merchant's page as checkout saw it, so items, quantity and delivery
+    // details can be checked. Only the total above is bound to the approval.
+    const image = el("img", {alt: "Merchant checkout page"});
+    const preview = el("figure", {class: "order-preview", hidden: ""},
+      el("figcaption", {}, "Merchant's page as Bloom saw it. Check the items, quantity and delivery details."),
+      el("div", {class: "order-preview-frame"}, image));
+    fetch(`/api/session/${session.ceremony_id}/order-preview`, {headers: authHeaders, credentials: "same-origin"})
+      .then(response => response.ok ? response.blob() : null)
+      .then(blob => { if (blob?.type === "image/jpeg") { image.src = URL.createObjectURL(blob); preview.hidden = false; } })
+      .catch(() => {});
+    // Every field filled on the merchant's page, read just before this
+    // review, so passenger, contact and card-holder details can be checked.
+    const entered = el("section", {class: "order-fields", hidden: ""},
+      el("h3", {}, "Details entered on the merchant's page"));
+    fetch(`/api/session/${session.ceremony_id}/order-fields`, {headers: authHeaders, credentials: "same-origin"})
+      .then(response => response.ok ? response.json() : [])
+      .then(fields => {
+        if (!Array.isArray(fields) || !fields.length) return;
+        const table = el("table", {});
+        for (const field of fields) table.append(el("tr", {}, el("th", {scope: "row"}, field.label || "(no label)"), el("td", {}, field.value)));
+        entered.append(table, el("p", {class: "order-fields-note"}, "Read from the page as it will be submitted. Card number and security code are not shown."));
+        entered.hidden = false;
+      })
+      .catch(() => {});
+    reviewNode.replaceChildren(facts, entered, preview, el("h3", {}, "Described by agent — not verified"), el("p", {}, effect.agent_description), el("p", {}, "Bloom reports the merchant's confirmation; it does not verify your bank charge."));
+  } else if (effect.kind === "manual_checkout" && !effect.card_id) {
+    document.getElementById("page-title").textContent = "Open Bloom's browser";
+    panelKicker.textContent = "Review this request";
+    panelTitle.textContent = "Your task";
+    approve.textContent = "Open browser with passkey";
+    document.getElementById("page-lede").textContent = "Continue where your agent stopped. No payment is approved and no saved card is shared.";
+    statusNode.textContent = "";
+    const steps = effect.agent_description.split(/(?<=[.!?])\s+(?=[A-Z])|\n+/u).filter(Boolean);
+    const instructions = el("details", {class: "agent-instructions", open: ""},
+      el("summary", {}, "Agent instructions · not verified by Bloom"),
+      el("ul", {}, ...steps.map(step => el("li", {}, step))));
+    reviewNode.replaceChildren(facts, instructions,
+      el("p", {class: "handoff-return"}, "When finished, click Done to return control to your agent."));
+  } else if (effect.kind === "manual_checkout") {
+    approve.textContent = "Open private view with passkey";
+    document.getElementById("page-lede").textContent = "Payment facts could not be verified. Open the private view to finish yourself. No saved card will be released and no automated payment is approved.";
+    reviewNode.replaceChildren(facts, el("h3", {}, "Described by agent — not verified"), el("p", {}, effect.agent_description));
+  } else reviewNode.replaceChildren(facts);
+  const expiry = el("p", {class: "expiry"});
+  if (handoff) reviewNode.prepend(expiry);
+  else reviewNode.append(expiry);
+  startExpiry(session, expiry);
+}
+
 const explorerAnchor = (explorer, value, label) =>
   el("a", {href: explorer.url, class: "ceremony-address-link", target: "_blank",
     rel: "noopener noreferrer", referrerpolicy: "no-referrer",
@@ -1321,6 +1442,7 @@ const explorerAnchor = (explorer, value, label) =>
     el("code", {}, value));
 
 function renderReview(session) {
+  if (session.ceremony_kind.startsWith("card_")) return renderCardReview(session);
   const kind = session.ceremony_kind;
   const meta = KINDS[kind] || {title: kind.replace(/_/g, " "), summary: "", button: "Continue with passkey"};
   const manifest = session.review_manifest;
@@ -2004,13 +2126,154 @@ function reportCeremonyError(error, fallback = "Ceremony failed") {
   statusNode.textContent = fallback;
 }
 
+// Raised before any passkey prompt, so the link stays usable.
+class CardFieldError extends Error {}
+
+const CARD_BRANDS = [
+  {name: "Amex", pattern: /^3[47]/, lengths: [15], cvc: 4},
+  {name: "Visa", pattern: /^4/, lengths: [13, 16, 19], cvc: 3},
+  {name: "Mastercard", pattern: /^(5[1-5]|222[1-9]|22[3-9]|2[3-6]|27[01]|2720)/, lengths: [16], cvc: 3},
+  {name: "Discover", pattern: /^(6011|64[4-9]|65)/, lengths: [16, 17, 18, 19], cvc: 3},
+  {name: "Diners Club", pattern: /^(36|38|30[0-5])/, lengths: [14, 15, 16, 17, 18, 19], cvc: 3},
+  {name: "JCB", pattern: /^35(2[89]|[3-8])/, lengths: [16, 17, 18, 19], cvc: 3}
+];
+
+function luhnValid(number) {
+  let sum = 0;
+  [...number].reverse().forEach((digit, i) => {
+    const n = Number(digit) * (i % 2 ? 2 : 1);
+    sum += n > 9 ? n - 9 : n;
+  });
+  return sum % 10 === 0;
+}
+
+// Returns {value} or {error} per field; checked before any passkey prompt.
+const CARD_CHECKS = {
+  "card-number": raw => {
+    const number = raw.replace(/\D/g, "");
+    if (!number) return {error: "Enter the card number."};
+    const brand = CARD_BRANDS.find(b => b.pattern.test(number));
+    const lengths = brand ? brand.lengths : [12, 13, 14, 15, 16, 17, 18, 19];
+    if (!lengths.includes(number.length)) {
+      return {error: `${brand ? brand.name : "Card"} numbers are ${lengths.length > 1 ? `${lengths[0]} to ${lengths.at(-1)}` : lengths[0]} digits.`};
+    }
+    if (!luhnValid(number)) return {error: "This card number has a typo. Check the digits."};
+    return {value: number};
+  },
+  "card-expiry": raw => {
+    const match = /^(\d{2})\/(\d{2})$/.exec(raw);
+    if (!match) return {error: "Enter the expiry as MM/YY, for example 08/29."};
+    const month = Number(match[1]), year = 2000 + Number(match[2]);
+    if (month < 1 || month > 12) return {error: "The month must be 01 to 12."};
+    const now = new Date();
+    if (year * 12 + month < now.getFullYear() * 12 + now.getMonth() + 1) return {error: "This card has expired."};
+    if (year > now.getFullYear() + 20) return {error: "Check the year. It is too far ahead."};
+    return {value: {month, year}};
+  },
+  "card-name": raw => raw ? {value: raw} : {error: "Enter the name as printed on the card."},
+  "card-cvc": raw => /^\d{3,4}$/.test(raw) ? {value: raw} : {error: "Enter the 3 or 4 digit security code."}
+};
+
+function checkCardField(id) {
+  const input = document.getElementById(id);
+  const result = CARD_CHECKS[id](input.value.trim());
+  input.setAttribute("aria-invalid", result.error ? "true" : "false");
+  document.getElementById(`${id}-error`).textContent = result.error || "";
+  return result;
+}
+
+function setupCardFields() {
+  const number = document.getElementById("card-number");
+  const expiry = document.getElementById("card-expiry");
+  number.addEventListener("input", () => {
+    const digits = number.value.replace(/\D/g, "").slice(0, 19);
+    const groups = /^3[47]/.test(digits) ? [4, 6, 5] : [4, 4, 4, 4, 3];
+    const parts = [];
+    let rest = digits;
+    for (const size of groups) if (rest) { parts.push(rest.slice(0, size)); rest = rest.slice(size); }
+    number.value = parts.join(" ");
+  });
+  expiry.addEventListener("input", event => {
+    let digits = expiry.value.replace(/\D/g, "").slice(0, 4);
+    if (digits.length === 1 && digits > "1") digits = `0${digits}`;
+    const deleting = event.inputType?.startsWith("delete");
+    expiry.value = digits.length > 2 || (digits.length === 2 && !deleting) ? `${digits.slice(0, 2)}/${digits.slice(2)}` : digits;
+  });
+  for (const id of Object.keys(CARD_CHECKS)) {
+    const input = document.getElementById(id);
+    input.addEventListener("blur", () => { if (input.value) checkCardField(id); });
+    input.addEventListener("input", () => {
+      if (input.getAttribute("aria-invalid") === "true") checkCardField(id);
+      formError.hidden = true;
+    });
+  }
+}
+
+function cardFieldsInput(session) {
+  if (session.review_manifest.card_effect.kind === "save_traveler") {
+    const traveler = {};
+    for (const field of travelerFields.querySelectorAll("input,select")) {
+      if (!field.checkValidity()) { field.reportValidity(); throw new CardFieldError("Check the traveler details."); }
+      let value = field.value.trim();
+      if (field.required && !value) {field.focus();throw new CardFieldError("Enter the name as on the travel document.");}
+      const key = field.id.slice("traveler-".length);
+      if (key === "nationality" || key === "document_country") value = value.toUpperCase();
+      if (value) traveler[key] = value;
+    }
+    return {traveler};
+  }
+  const ids = session.review_manifest.card_effect.kind === "add" ? ["card-number", "card-expiry", "card-name"]
+    : session.review_manifest.card_effect.kind === "checkout" ? ["card-cvc"] : [];
+  const results = Object.fromEntries(ids.map(id => [id, checkCardField(id)]));
+  const invalid = ids.find(id => results[id].error);
+  if (invalid) {
+    document.getElementById(invalid).focus();
+    throw new CardFieldError("Fix the highlighted field to continue.");
+  }
+  if (session.review_manifest.card_effect.kind === "add") {
+    const {month, year} = results["card-expiry"].value;
+    return {card: {number: results["card-number"].value, expiry_month: month, expiry_year: year, name: results["card-name"].value}};
+  }
+  return ids.length ? {cvc: results["card-cvc"].value} : {};
+}
+
+// After the passkey approves a card request, Signer has consumed the link.
+function reportCardFailure(session, error) {
+  console.error("Bloom card ceremony failed", error);
+  const effect = session.review_manifest?.card_effect?.kind;
+  const action = effect === "save_traveler" ? "Traveler not saved"
+    : effect === "delete_traveler" ? "Traveler not deleted"
+    : effect === "fill_traveler" ? "Autofill not approved"
+    : session.ceremony_kind === "card_add" ? "Card not saved"
+    : session.ceremony_kind === "card_delete" ? "Card not deleted" : "Not approved";
+  const reason = error?.message === "invalid card details"
+    ? "Signer rejected the card details." : (error?.message || "Signer refused the request.");
+  statusNode.textContent = `${action}.`;
+  formError.textContent = `${action}. ${reason} This link is used up; ask your agent for a new one.`;
+  formError.hidden = false;
+  clearInterval(expiryTimer);
+  for (const node of [approve, cancel, cardFields, cardCvcFields, travelerFields]) node.hidden = true;
+}
+
 function reportApprovalFailure(error) {
   if (approvalTerminal) return;
+  if (error instanceof CardFieldError) {
+    formError.textContent = error.message;
+    formError.hidden = false;
+    statusNode.textContent = "Not sent. Nothing was saved or charged.";
+    approve.disabled = false;
+    return;
+  }
   const missingPrf = error?.name === "NotSupportedError" ||
     (typeof error?.message === "string" && error.message.includes("required PRF output"));
-  reportCeremonyError(error, missingPrf
+  const message = missingPrf
     ? "This browser or passkey does not support the required PRF extension. Use a supported browser and passkey."
-    : "Passkey verification failed. Please try again.");
+    : error?.name === "NotAllowedError"
+      ? "The passkey prompt was cancelled or timed out. Nothing was sent. Try again."
+      : "Passkey verification failed. Please try again.";
+  reportCeremonyError(error, message);
+  formError.textContent = message;
+  formError.hidden = false;
   approve.disabled = false;
 }
 
@@ -3649,6 +3912,10 @@ async function load() {
   // Rendering applies the deadline and must have the final say on whether
   // approval is enabled, including a page first opened after its deadline.
   approve.disabled = false;
+  setupCardFields();
+  cardFields.hidden = session.review_manifest?.card_effect?.kind !== "add";
+  travelerFields.hidden = session.review_manifest?.card_effect?.kind !== "save_traveler";
+  cardCvcFields.hidden = session.review_manifest?.card_effect?.kind !== "checkout";
   renderReview(session);
   recoveryFields.hidden = session.ceremony_kind !== "wallet_recovery";
   exportFields.hidden = session.ceremony_kind !== "wallet_export";
@@ -3761,7 +4028,28 @@ async function run(session) {
   let secret = null;
   let credentialId = null;
 
-  if (kind === "wallet_registration" || (kind === "wallet_import" && !legacyPasskeyImport)) {
+  if (kind.startsWith("card_")) {
+    const cardInput = cardFieldsInput(session);
+    let prf;
+    if (session.webauthn_options.registration_user_handle) {
+      const created = await createCredential(session, 0);
+      // Signer requires the second assertion, even when creation returns PRF.
+      const confirmed = await ensureNewCredentialPrf(session, created, 1, true);
+      credentialId = encodeUrl(created.rawId);
+      prf = confirmed.prf;
+      proof = {kind: "registration", attestation: attestationJson(created), prf_assertion: confirmed.assertion};
+    } else {
+      const assertion = await getCredential(session, 0);
+      credentialId = encodeUrl(assertion.rawId);
+      prf = prfResult(assertion);
+      if (!prf) throw new Error("This passkey did not return required PRF output");
+      proof = {kind: "assertion", assertion: assertionJson(assertion)};
+    }
+    const input = {credential_prf: encodeUrl(prf), ...cardInput};
+    secret = te.encode(canonicalJson(input));
+    prf.fill(0);
+    for (const field of [...cardFields.querySelectorAll("input"), ...cardCvcFields.querySelectorAll("input"), ...travelerFields.querySelectorAll("input,select")]) field.value = "";
+  } else if (kind === "wallet_registration" || (kind === "wallet_import" && !legacyPasskeyImport)) {
     const created = await createCredential(session, 0);
     const prf = await ensureNewCredentialPrf(session, created, 1);
     credentialId = encodeUrl(created.rawId);
@@ -3892,7 +4180,10 @@ async function run(session) {
     const recovered = await fetch(`/api/session/${ceremonyId}/result`, {
       headers: authHeaders
     });
-    if (!recovered.ok) throw error;
+    if (!recovered.ok) {
+      if (kind.startsWith("card_")) return reportCardFailure(session, error);
+      throw error;
+    }
     result = await recovered.json();
   }
   try {
@@ -3920,6 +4211,26 @@ function browserResultAad(session, contribution) {
 async function finishBrowserResult(session, result) {
   approvalTerminal = true;
   approve.disabled = true;
+  if (session.ceremony_kind.startsWith("card_")) {
+    const effect = session.review_manifest.card_effect;
+    statusNode.textContent = effect.kind === "manual_checkout" ? (effect.card_id ? "Private view authorized. No saved card was released." : "Bloom's browser is yours. Click Done there to hand it back.") : effect.kind === "site_checkout" ? "Approved. Bloom is placing the order with your saved payment method; the outcome is reported by the shop." : session.ceremony_kind === "card_checkout" ? "Approved. Checkout is continuing; the outcome is reported by the merchant." : session.ceremony_kind === "card_add" ? "Card saved. You can close this page." : "Card deleted. You can close this page.";
+    clearInterval(expiryTimer);
+    if (effect.kind === "save_traveler") statusNode.textContent = "Traveler saved privately. You can close this page.";
+    if (effect.kind === "delete_traveler") statusNode.textContent = "Traveler deleted. You can close this page.";
+    if (effect.kind === "fill_traveler") statusNode.textContent = "Approved. Bloom is filling these traveler fields privately. No payment was approved.";
+    cardFields.hidden = true;
+    travelerFields.hidden = true;
+    cardCvcFields.hidden = true;
+    approve.hidden = true;
+    cancel.hidden = true;
+    if (result.challenge_url) {
+      const link = el("a", {href: result.challenge_url, target: "_blank", rel: "noopener noreferrer"}, effect.kind === "manual_checkout" && !effect.card_id ? "Open Bloom's browser" : "Open private checkout view");
+      reviewNode.append(el("p", {}, link));
+      window.open(result.challenge_url, "_blank", "noopener,noreferrer");
+    }
+    await clearBrowserState(ceremonyId);
+    return;
+  }
   const contribution = session.signer_contribution;
   statusNode.textContent = "Completed.";
   clearInterval(expiryTimer);

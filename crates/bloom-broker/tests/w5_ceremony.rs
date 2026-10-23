@@ -683,6 +683,806 @@ use tower::ServiceExt as _;
 
 static EPHEMERAL_PORT_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+fn card_test_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+async fn card_session_json(
+    broker: &CeremonyBroker,
+    prepared: &CustodyPrepareResponse,
+) -> serde_json::Value {
+    let response = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&prepared.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+}
+
+async fn card_approve(
+    broker: &CeremonyBroker,
+    prepared: &CustodyPrepareResponse,
+    auth: &VirtualAuthenticator,
+    input: serde_json::Value,
+    count: u32,
+) -> (StatusCode, serde_json::Value) {
+    let session = card_session_json(broker, prepared).await;
+    let contribution: CustodySignerContribution =
+        serde_json::from_value(session["signer_contribution"].clone()).unwrap();
+    let challenges: Vec<CeremonyChallenge> = session["challenges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| serde_json::from_value(v["binding"].clone()).unwrap())
+        .collect();
+    let proof = if challenges.len() == 2 {
+        WebAuthnCeremonyProof::Registration {
+            attestation: auth.attestation(&challenges[0].canonical_bytes().unwrap()),
+            prf_assertion: Some(auth.assertion(&challenges[1].canonical_bytes().unwrap(), count)),
+        }
+    } else {
+        WebAuthnCeremonyProof::Assertion {
+            assertion: auth.assertion(&challenges[0].canonical_bytes().unwrap(), count),
+        }
+    };
+    let aad = CustodyHpkeAad {
+        surface: contribution.surface.clone(),
+        ceremony_id: contribution.ceremony_id.clone(),
+        ceremony_kind: contribution.ceremony_kind,
+        custody_operation_id: contribution.custody_operation_id.clone(),
+        signer_nonce: contribution.signer_nonce.clone(),
+        signer_contribution_digest: contribution.digest().unwrap(),
+        wallet_id: None,
+        key_ref: None,
+        credential_id: Some(auth.credential_id().clone()),
+        expected_input_class: contribution.expected_input_class.clone(),
+    };
+    let envelope = seal_hpke(
+        &contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad.canonical_bytes().unwrap(),
+        &serde_json::to_vec(&input).unwrap(),
+    )
+    .unwrap();
+    let response = broker.router().oneshot(Request::builder().method("POST").uri(format!("/api/session/{}/complete",contribution.ceremony_id))
+        .header(header::HOST,"localhost:18734").header(header::ORIGIN,"http://localhost:18734").header("sec-fetch-site","same-origin")
+        .header("x-bloom-ceremony-token",url_token(&prepared.ceremony_url)).header(header::CONTENT_TYPE,"application/json")
+        .body(Body::from(serde_json::to_vec(&serde_json::json!({"proof":proof,"encrypted_input":envelope,"public_binding_digest":contribution.review_manifest_digest})).unwrap())).unwrap()).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn private_traveler_save_and_release_use_real_signer_and_hide_values() {
+    use bloom_broker::ceremony::{
+        CheckoutIntakeRequest, CheckoutIntakeResponse, bind_checkout_intake,
+        serve_checkout_listener,
+    };
+    use bloom_signer_api::{CardEffect, TravelerField, TravelerFillScope};
+    use std::os::unix::fs::PermissionsExt;
+    let broker = CeremonyBroker::new(real_ceremony_signer());
+    let first = broker
+        .prepare_card(
+            operation("b1"),
+            CardEffect::SaveTraveler {
+                traveler_id: Token::new("wife").unwrap(),
+                label: "Wife".into(),
+            },
+            card_test_now(),
+        )
+        .unwrap();
+    let session = card_session_json(&broker, &first).await;
+    let auth = VirtualAuthenticator::generate_for_registration(
+        serde_json::from_value(session["webauthn_options"]["registration_user_handle"].clone())
+            .unwrap(),
+        "http://localhost:18734",
+    );
+    let prf = Base64UrlBytes::from_bytes(&auth.deterministic_prf());
+    for (prepared, given, count) in [(&first, "SyntheticWife", 1)] {
+        let input = serde_json::json!({"credential_prf":prf,"traveler":{"given_name":given,"family_name":"SyntheticFamily","born_on":"1992-02-29","nationality":"CA"}});
+        assert_eq!(
+            card_approve(&broker, prepared, &auth, input, count).await.0,
+            StatusCode::OK
+        );
+    }
+    let second = broker
+        .prepare_card(
+            operation("b2"),
+            CardEffect::SaveTraveler {
+                traveler_id: Token::new("self").unwrap(),
+                label: "Me".into(),
+            },
+            card_test_now(),
+        )
+        .unwrap();
+    assert_eq!(
+        card_approve(
+            &broker,
+            &second,
+            &auth,
+            serde_json::json!({"credential_prf":prf,
+        "traveler":{"given_name":"SyntheticSelf","family_name":"SyntheticFamily"}}),
+            2
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let public = serde_json::to_string(&broker.traveler_list().unwrap()).unwrap();
+    for secret in [
+        "SyntheticWife",
+        "SyntheticSelf",
+        "SyntheticFamily",
+        "1992-02-29",
+    ] {
+        assert!(!public.contains(secret));
+    }
+    assert!(broker.card_list().unwrap().is_empty());
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o710)).unwrap();
+    let socket = dir.path().join("traveler.sock");
+    let listener = bind_checkout_intake(&socket).unwrap();
+    let service = tokio::spawn(serve_checkout_listener(
+        broker.clone(),
+        listener,
+        fs::metadata(dir.path()).unwrap().uid(),
+    ));
+    let recipient = HpkeRecipient::generate();
+    let prepared = match card_intake(
+        &socket,
+        CheckoutIntakeRequest::Traveler {
+            operation_id: operation("b3"),
+            traveler_id: Token::new("wife").unwrap(),
+            scope: TravelerFillScope {
+                origin: "https://airline.example".into(),
+                frame_origins: vec!["https://airline.example".into()],
+                document_binding: Digest32::from_bytes([3; 32]),
+                fields: vec![TravelerField::GivenName, TravelerField::FamilyName],
+            },
+            recipient_key: recipient.public_key().clone(),
+            challenge_url: "http://localhost:28740/private?token=synthetic".into(),
+        },
+    )
+    .await
+    {
+        CheckoutIntakeResponse::Prepared(prepared) => prepared,
+        _ => panic!("private traveler prepare failed"),
+    };
+    let session = card_session_json(&broker, &prepared).await;
+    assert_eq!(session["review_manifest"]["traveler"]["label"], "Wife");
+    assert!(!session.to_string().contains("SyntheticWife"));
+    assert_eq!(
+        card_approve(
+            &broker,
+            &prepared,
+            &auth,
+            serde_json::json!({"credential_prf":prf}),
+            3
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (receipt, aad) = match card_intake(
+        &socket,
+        CheckoutIntakeRequest::Result {
+            operation_id: operation("b3"),
+        },
+    )
+    .await
+    {
+        CheckoutIntakeResponse::Result {
+            receipt: Some(receipt),
+            output_aad: Some(aad),
+            ..
+        } => (receipt, aad),
+        _ => panic!("missing private traveler output"),
+    };
+    let plaintext = recipient
+        .open(
+            receipt.encrypted_browser_result.as_ref().unwrap(),
+            CUSTODY_OUTPUT_INFO,
+            &aad.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(plaintext.expose_to_backend()).unwrap(),
+        serde_json::json!({"given_name":"SyntheticWife","family_name":"SyntheticFamily"})
+    );
+    service.abort();
+}
+
+#[tokio::test]
+async fn card_checkout_private_delivery_is_single_use_and_manual_has_no_release() {
+    use bloom_broker::ceremony::{
+        CheckoutIntakeRequest, CheckoutIntakeResponse, bind_checkout_intake,
+        serve_checkout_listener,
+    };
+    use bloom_signer_api::{CardEffect, CheckoutFacts};
+    use std::os::unix::fs::PermissionsExt;
+    let broker = CeremonyBroker::new(real_ceremony_signer());
+    let card_id = Token::new("private-card").unwrap();
+    let added = broker
+        .prepare_card(
+            operation("a1"),
+            CardEffect::Add {
+                card_id: card_id.clone(),
+                label: "Test card".into(),
+            },
+            card_test_now(),
+        )
+        .unwrap();
+    let session = card_session_json(&broker, &added).await;
+    let auth = VirtualAuthenticator::generate_for_registration(
+        serde_json::from_value(session["webauthn_options"]["registration_user_handle"].clone())
+            .unwrap(),
+        "http://localhost:18734",
+    );
+    let prf = Base64UrlBytes::from_bytes(&auth.deterministic_prf());
+    assert_eq!(
+        card_approve(
+            &broker,
+            &added,
+            &auth,
+            serde_json::json!({
+                "credential_prf":prf,"card":{"number":"4242424242424242",
+                "expiry_month":12,"expiry_year":2034,"name":"Synthetic Card"}
+            }),
+            1
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("facts.sock");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o710)).unwrap();
+    let listener = bind_checkout_intake(&socket).unwrap();
+    let uid = fs::metadata(dir.path()).unwrap().uid();
+    let service = tokio::spawn(serve_checkout_listener(broker.clone(), listener, uid));
+    let key = HpkeRecipient::generate();
+    let challenge = "http://localhost:28740/private?token=test-capability";
+    let not_jpeg = card_intake(
+        &socket,
+        CheckoutIntakeRequest::Prepare {
+            operation_id: operation("a9"),
+            card_id: card_id.clone(),
+            facts: CheckoutFacts {
+                origin: "https://merchant.example".into(),
+                payment_frame_origins: vec!["https://js.stripe.com".into()],
+                total_minor: 399,
+                currency: "USD".into(),
+                installments: 1,
+                recurring: false,
+            },
+            recipient_key: key.public_key().clone(),
+            agent_description: "Unverified description".into(),
+            challenge_url: challenge.into(),
+            order_preview: Some(Base64UrlBytes::from_bytes(b"<svg/>")),
+            order_fields: vec![],
+        },
+    )
+    .await;
+    assert!(matches!(not_jpeg, CheckoutIntakeResponse::Error { .. }));
+    // A realistic full-page JPEG is far larger than the other intake fields.
+    let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe0];
+    jpeg.resize(900_000, 7);
+    let prepared = match card_intake(
+        &socket,
+        CheckoutIntakeRequest::Prepare {
+            operation_id: operation("a2"),
+            card_id: card_id.clone(),
+            facts: CheckoutFacts {
+                origin: "https://merchant.example".into(),
+                payment_frame_origins: vec!["https://js.stripe.com".into()],
+                total_minor: 399,
+                currency: "USD".into(),
+                installments: 1,
+                recurring: false,
+            },
+            recipient_key: key.public_key().clone(),
+            agent_description: "Unverified description".into(),
+            challenge_url: challenge.into(),
+            order_preview: Some(Base64UrlBytes::from_bytes(&jpeg)),
+            order_fields: vec![bloom_broker::ceremony::OrderField {
+                label: "Nombres *".into(),
+                value: "Synthetic Traveler".into(),
+            }],
+        },
+    )
+    .await
+    {
+        CheckoutIntakeResponse::Prepared(p) => p,
+        _ => panic!("prepare rejected"),
+    };
+    let session = card_session_json(&broker, &prepared).await;
+    let preview_uri = format!(
+        "/api/session/{}/order-preview",
+        session["ceremony_id"].as_str().unwrap()
+    );
+    let preview = |token: Option<String>| {
+        let mut request = Request::builder()
+            .uri(&preview_uri)
+            .header(header::HOST, "localhost:18734");
+        if let Some(token) = token {
+            request = request.header("x-bloom-ceremony-token", token);
+        }
+        broker
+            .router()
+            .oneshot(request.body(Body::empty()).unwrap())
+    };
+    let shown = preview(Some(url_token(&prepared.ceremony_url)))
+        .await
+        .unwrap();
+    assert_eq!(shown.status(), StatusCode::OK);
+    assert_eq!(shown.headers()[header::CONTENT_TYPE], "image/jpeg");
+    let shown = axum::body::to_bytes(shown.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(shown.as_ref(), jpeg.as_slice());
+    assert_eq!(preview(None).await.unwrap().status(), StatusCode::FORBIDDEN);
+    // Entered details reach the review page only, never the session projection.
+    let fields = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri(preview_uri.replace("order-preview", "order-fields"))
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&prepared.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fields.status(), StatusCode::OK);
+    let fields: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(fields.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        fields,
+        serde_json::json!([{"label":"Nombres *","value":"Synthetic Traveler"}])
+    );
+    assert!(!session.to_string().contains("Synthetic Traveler"));
+    assert!(
+        !session
+            .to_string()
+            .contains(&Base64UrlBytes::from_bytes(&jpeg).encoded()[..64])
+    );
+    let contribution: CustodySignerContribution =
+        serde_json::from_value(session["signer_contribution"].clone()).unwrap();
+    assert!(!session.to_string().contains("test-capability"));
+    let (status, private_response) = card_approve(
+        &broker,
+        &prepared,
+        &auth,
+        serde_json::json!({"credential_prf":prf,"cvc":"937"}),
+        2,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(private_response["challenge_url"], challenge);
+    let public = serde_json::to_string(&broker.public_status(&operation("a2")).unwrap()).unwrap();
+    assert!(!public.contains("test-capability"));
+    assert!(!public.contains("encrypted_browser_result"));
+    let receipt = match card_intake(
+        &socket,
+        CheckoutIntakeRequest::Result {
+            operation_id: operation("a2"),
+        },
+    )
+    .await
+    {
+        CheckoutIntakeResponse::Result {
+            receipt: Some(r), ..
+        } => r,
+        _ => panic!("missing private receipt"),
+    };
+    let contribution_digest = contribution.digest().unwrap();
+    let public_binding_digest = contribution.review_manifest_digest.clone();
+    let aad = CustodyOutputHpkeAad {
+        surface: contribution.surface,
+        ceremony_id: contribution.ceremony_id,
+        ceremony_kind: contribution.ceremony_kind,
+        custody_operation_id: operation("a2"),
+        signer_contribution_digest: contribution_digest,
+        public_binding_digest,
+    };
+    let plaintext = key
+        .open(
+            receipt.encrypted_browser_result.as_ref().unwrap(),
+            CUSTODY_OUTPUT_INFO,
+            &aad.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(plaintext.expose_to_backend()).unwrap();
+    assert!(value["number"] == "4242424242424242" && value["cvc"] == "937");
+    assert!(matches!(
+        card_intake(
+            &socket,
+            CheckoutIntakeRequest::Result {
+                operation_id: operation("a2")
+            }
+        )
+        .await,
+        CheckoutIntakeResponse::Result { receipt: None, .. }
+    ));
+    let completed_session = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&prepared.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed_session.status(), StatusCode::FORBIDDEN);
+    let manual = match card_intake(
+        &socket,
+        CheckoutIntakeRequest::Manual {
+            operation_id: operation("a3"),
+            card_id: Some(card_id),
+            agent_description: "Manual review".into(),
+            challenge_url: challenge.into(),
+        },
+    )
+    .await
+    {
+        CheckoutIntakeResponse::Prepared(p) => p,
+        _ => panic!("manual rejected"),
+    };
+    assert_eq!(
+        card_approve(
+            &broker,
+            &manual,
+            &auth,
+            serde_json::json!({"credential_prf":prf}),
+            4
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let manual_receipt = card_intake(
+        &socket,
+        CheckoutIntakeRequest::Result {
+            operation_id: operation("a3"),
+        },
+    )
+    .await;
+    assert!(matches!(manual_receipt, CheckoutIntakeResponse::Result {
+        receipt:Some(ref receipt),..
+    } if receipt.encrypted_browser_result.is_none()));
+    service.abort();
+    let denied_socket = dir.path().join("denied.sock");
+    let listener = bind_checkout_intake(&denied_socket).unwrap();
+    let denied = tokio::spawn(serve_checkout_listener(broker, listener, uid + 1));
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::UnixStream::connect(&denied_socket)
+        .await
+        .unwrap();
+    let _ = stream
+        .write_all(b"{\"method\":\"result\",\"operation_id\":\"a2\"}\n")
+        .await;
+    let mut output = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stream.read_to_end(&mut output),
+    )
+    .await
+    .unwrap();
+    assert!(output.is_empty());
+    denied.abort();
+}
+
+/// Take-over and the merchant's saved payment method release no card.
+#[tokio::test]
+async fn card_takeover_and_site_checkout_release_no_card() {
+    use bloom_broker::ceremony::{
+        CheckoutIntakeRequest, CheckoutIntakeResponse, bind_checkout_intake,
+        serve_checkout_listener,
+    };
+    use bloom_signer_api::{CardEffect, CheckoutFacts};
+    use std::os::unix::fs::PermissionsExt;
+    let broker = CeremonyBroker::new(real_ceremony_signer());
+    let added = broker
+        .prepare_card(
+            operation("b1"),
+            CardEffect::Add {
+                card_id: Token::new("private-card").unwrap(),
+                label: "Test card".into(),
+            },
+            card_test_now(),
+        )
+        .unwrap();
+    let session = card_session_json(&broker, &added).await;
+    let auth = VirtualAuthenticator::generate_for_registration(
+        serde_json::from_value(session["webauthn_options"]["registration_user_handle"].clone())
+            .unwrap(),
+        "http://localhost:18734",
+    );
+    let prf = Base64UrlBytes::from_bytes(&auth.deterministic_prf());
+    let card = serde_json::json!({"credential_prf":prf,"card":{"number":"4242424242424242",
+        "expiry_month":12,"expiry_year":2034,"name":"Synthetic Card"}});
+    assert_eq!(
+        card_approve(&broker, &added, &auth, card, 1).await.0,
+        StatusCode::OK
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("facts.sock");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o710)).unwrap();
+    let listener = bind_checkout_intake(&socket).unwrap();
+    let uid = fs::metadata(dir.path()).unwrap().uid();
+    let service = tokio::spawn(serve_checkout_listener(broker.clone(), listener, uid));
+    let challenge = "http://localhost:28740/private?token=test-capability";
+    let requests = [
+        CheckoutIntakeRequest::Manual {
+            operation_id: operation("b4"),
+            card_id: None,
+            agent_description: "Log in to the shop".into(),
+            challenge_url: challenge.into(),
+        },
+        CheckoutIntakeRequest::Site {
+            operation_id: operation("b5"),
+            facts: CheckoutFacts {
+                origin: "https://merchant.example".into(),
+                payment_frame_origins: vec![],
+                total_minor: 4990,
+                currency: "CHF".into(),
+                installments: 1,
+                recurring: false,
+            },
+            agent_description: "Shop's saved card".into(),
+            challenge_url: challenge.into(),
+            order_preview: None,
+            order_fields: vec![],
+        },
+    ];
+    for (count, (id, request)) in (2..).zip(["b4", "b5"].into_iter().zip(requests)) {
+        let prepared = match card_intake(&socket, request).await {
+            CheckoutIntakeResponse::Prepared(prepared) => prepared,
+            CheckoutIntakeResponse::Error { message } => panic!("{id} rejected: {message}"),
+            _ => panic!("{id} rejected"),
+        };
+        let approved = card_approve(
+            &broker,
+            &prepared,
+            &auth,
+            serde_json::json!({"credential_prf":prf}),
+            count,
+        )
+        .await;
+        assert_eq!(approved.0, StatusCode::OK);
+        assert_eq!(approved.1["challenge_url"], challenge);
+        assert!(
+            matches!(card_intake(&socket, CheckoutIntakeRequest::Result {
+            operation_id: operation(id),
+        }).await, CheckoutIntakeResponse::Result {
+            receipt: Some(ref receipt), ..
+        } if receipt.encrypted_browser_result.is_none())
+        );
+    }
+    service.abort();
+}
+
+#[tokio::test]
+async fn card_intake_reclaims_only_owned_stale_sockets() {
+    use bloom_broker::ceremony::bind_checkout_intake;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o710)).unwrap();
+    let socket = dir.path().join("facts.sock");
+    let listener = bind_checkout_intake(&socket).unwrap();
+    assert!(bind_checkout_intake(&socket).is_err());
+    // Close the descriptor synchronously before probing a stale endpoint;
+    // Tokio can otherwise retain its I/O resource until the reactor runs.
+    drop(listener.into_std().unwrap());
+    let replacement = bind_checkout_intake(&socket).unwrap();
+    drop(replacement.into_std().unwrap());
+    fs::remove_file(&socket).unwrap();
+    fs::write(&socket, "preserved fixture file").unwrap();
+    assert!(bind_checkout_intake(&socket).is_err());
+    assert_eq!(
+        fs::read_to_string(&socket).unwrap(),
+        "preserved fixture file"
+    );
+}
+
+async fn card_intake(
+    path: &std::path::Path,
+    request: bloom_broker::ceremony::CheckoutIntakeRequest,
+) -> bloom_broker::ceremony::CheckoutIntakeResponse {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
+    let mut bytes = serde_json::to_vec(&request).unwrap();
+    bytes.push(b'\n');
+    stream.write_all(&bytes).await.unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).await.unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+#[tokio::test]
+async fn card_add_delete_and_expiry_use_real_signer_proofs() {
+    use bloom_signer_api::CardEffect;
+    let signer = real_ceremony_signer();
+    let broker = CeremonyBroker::new(signer.clone());
+    let prepared_at = card_test_now();
+    let prepared = broker
+        .prepare_card(
+            operation("91"),
+            CardEffect::Add {
+                card_id: Token::new("card-one").unwrap(),
+                label: "Synthetic card".into(),
+            },
+            prepared_at,
+        )
+        .unwrap();
+    let session = card_session_json(&broker, &prepared).await;
+    assert_eq!(
+        session["expires_at_ms"].as_u64().unwrap(),
+        prepared.ceremony_expires_at_ms.get()
+    );
+    let handle: Base64UrlBytes =
+        serde_json::from_value(session["webauthn_options"]["registration_user_handle"].clone())
+            .unwrap();
+    let auth = VirtualAuthenticator::generate_for_registration(handle, "http://localhost:18734");
+    let input = serde_json::json!({"credential_prf":Base64UrlBytes::from_bytes(&auth.deterministic_prf()),"card":{"number":"4242424242424242","expiry_month":12,"expiry_year":2034,"name":"Synthetic Card"}});
+    assert_eq!(
+        card_approve(&broker, &prepared, &auth, input, 1).await.0,
+        StatusCode::OK
+    );
+    let cards = broker.card_list().unwrap();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0].last4, "4242");
+    assert!(
+        !serde_json::to_string(&broker.public_status(&operation("91")).unwrap())
+            .unwrap()
+            .contains("4242424242424242")
+    );
+    let expired = broker
+        .prepare_card(
+            operation("92"),
+            CardEffect::Delete {
+                card_id: Token::new("card-one").unwrap(),
+            },
+            card_test_now(),
+        )
+        .unwrap();
+    broker
+        .expire_sessions(expired.ceremony_expires_at_ms.get() + 1)
+        .unwrap();
+    assert_eq!(broker.card_list().unwrap().len(), 1);
+    let deletion = broker
+        .prepare_card(
+            operation("93"),
+            CardEffect::Delete {
+                card_id: Token::new("card-one").unwrap(),
+            },
+            card_test_now(),
+        )
+        .unwrap();
+    assert_eq!(card_approve(&broker,&deletion,&auth,serde_json::json!({"credential_prf":Base64UrlBytes::from_bytes(&auth.deterministic_prf())}),2).await.0,StatusCode::OK);
+    assert!(broker.card_list().unwrap().is_empty());
+    let again = broker
+        .prepare_card(
+            operation("94"),
+            CardEffect::Add {
+                card_id: Token::new("card-two").unwrap(),
+                label: "Second card".into(),
+            },
+            card_test_now(),
+        )
+        .unwrap();
+    let session = card_session_json(&broker, &again).await;
+    assert!(session["webauthn_options"]["registration_user_handle"].is_null());
+}
+
+#[tokio::test]
+async fn cancelling_a_card_operation_the_signer_already_closed_succeeds() {
+    use bloom_signer_api::CardEffect;
+    let signer = real_ceremony_signer();
+    let broker = CeremonyBroker::new(signer.clone());
+    let operation_id = operation("95");
+    let now = card_test_now();
+    broker
+        .prepare_card(
+            operation_id.clone(),
+            CardEffect::Add {
+                card_id: Token::new("released-card").unwrap(),
+                label: "Synthetic card".into(),
+            },
+            now,
+        )
+        .unwrap();
+    signer.card_cancel(&operation_id).unwrap();
+    broker.cancel(&operation_id, now + 1).unwrap();
+    assert_eq!(broker.status(&operation_id), Some(CeremonyState::Cancelled));
+}
+
+/// The released Broker (v0.3.2, 85e9a999) has no card ceremony kinds and
+/// refuses to start on a non-terminal row it cannot decode. Pending card
+/// sessions must stay out of the table it reads; terminal ones go there so it
+/// keeps their replay protection.
+#[tokio::test]
+async fn released_broker_never_reads_a_pending_card_session() {
+    use bloom_signer_api::CardEffect;
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("journal.sqlite");
+    let journal =
+        Arc::new(BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let signer = real_ceremony_signer();
+    let open = || {
+        CeremonyBroker::open(
+            directory.path().join("ceremony.sqlite"),
+            signer.clone(),
+            journal.clone(),
+        )
+        .unwrap()
+    };
+    let broker = open();
+    let (pending, cancelled) = (operation("96"), operation("97"));
+    for id in [&pending, &cancelled] {
+        let card_id = Token::new(format!("card-{}", &id.as_str()[..4])).unwrap();
+        broker
+            .prepare_card(
+                id.clone(),
+                CardEffect::Add {
+                    card_id,
+                    label: "Synthetic card".into(),
+                },
+                card_test_now(),
+            )
+            .unwrap();
+    }
+    broker.cancel(&cancelled, card_test_now()).unwrap();
+    let released_rows = || -> Vec<(String, String)> {
+        let db = rusqlite::Connection::open(&journal_path).unwrap();
+        let mut statement = db
+            .prepare(
+                "SELECT json_extract(session_jcs, '$.operation_id'),
+                        json_extract(session_jcs, '$.state')
+                 FROM ceremony_sessions",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let rows = released_rows();
+    assert_eq!(
+        rows,
+        vec![(cancelled.as_str().to_string(), "CANCELLED".to_string())]
+    );
+    drop(broker);
+    let restarted = open();
+    assert_eq!(restarted.status(&pending), Some(CeremonyState::Expired));
+    assert_eq!(restarted.status(&cancelled), Some(CeremonyState::Cancelled));
+    assert_eq!(released_rows().len(), 2);
+}
+
 /// Bind IPv4 on port 0, hold it, bind IPv6 on the same selected port, and
 /// return the held pair plus its explicit nonzero endpoint. Retries selection
 /// if the second bind collides. Test setup only, never 18734.
@@ -882,6 +1682,25 @@ cryptoSelfTest().then(
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "browser-crypto-ok");
+}
+
+#[test]
+fn browser_handoff_preserves_instructions_and_disables_expired_requests() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = std::process::Command::new("node")
+        .arg(root.join("tests/browser_handoff.cjs"))
+        .arg(root.join("src/ceremony_assets/app.js"))
+        .output()
+        .expect("Node.js is required to validate the shipped ceremony asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "browser-handoff-ok"
+    );
 }
 
 #[test]
@@ -2571,6 +3390,9 @@ fn custody_result_to_machine(value: &CustodyResult) -> bloom_broker_api::Custody
             CeremonyKind::AccountAllocate => bloom_broker_api::CeremonyKind::AccountAllocate,
             CeremonyKind::AccountRetire => bloom_broker_api::CeremonyKind::AccountRetire,
             CeremonyKind::PolicyUpdate => bloom_broker_api::CeremonyKind::PolicyUpdate,
+            CeremonyKind::CardAdd => bloom_broker_api::CeremonyKind::CardAdd,
+            CeremonyKind::CardDelete => bloom_broker_api::CeremonyKind::CardDelete,
+            CeremonyKind::CardCheckout => bloom_broker_api::CeremonyKind::CardCheckout,
         }
     }
     fn state(value: bloom_signer_api::CeremonyState) -> CeremonyState {
@@ -2821,6 +3643,44 @@ impl CeremonyCompletionObserver for FailOnceAdoptionObserver {
 }
 
 impl CeremonySigner for RealSigner {
+    fn traveler_list(
+        &self,
+    ) -> Result<Vec<bloom_signer_api::TravelerPublic>, bloom_signer_api::ProtocolError> {
+        self.service.traveler_list()
+    }
+    fn card_list(
+        &self,
+    ) -> Result<Vec<bloom_signer_api::CardPublic>, bloom_signer_api::ProtocolError> {
+        self.service.card_list()
+    }
+    fn prepare_card(
+        &self,
+        request: bloom_signer_api::CardPrepareRequest,
+        now_ms: u64,
+    ) -> Result<SignerPreparedCustody, bloom_signer_api::ProtocolError> {
+        // Real RPC samples Signer's clock after transport. Exercise that skew.
+        self.service
+            .prepare_card(request, now_ms.saturating_add(250))
+    }
+    fn complete_card(
+        &self,
+        request: CustodyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
+        self.service.complete_card(request, now_ms)
+    }
+    fn card_status(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<bloom_signer_api::CardOperationStatus, bloom_signer_api::ProtocolError> {
+        self.service.card_status(operation_id, card_test_now())
+    }
+    fn card_cancel(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<bloom_signer_api::CardOperationStatus, bloom_signer_api::ProtocolError> {
+        self.service.card_cancel(operation_id, card_test_now())
+    }
     fn derived_accounts_public(
         &self,
         request: bloom_signer_api::WalletRequest,
@@ -3673,7 +4533,7 @@ fn peer_acl(identity: &LocalIdentity, effective_uid: u32) -> PeerAcl {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn policy_service_requires_completion_then_commits_and_replays_over_authenticated_rpc() {
+async fn card_and_policy_services_complete_over_authenticated_rpc() {
     let authenticator = VirtualAuthenticator::generate();
     let directory = tempfile::tempdir().unwrap();
     let signer_database = directory.path().join("signer.sqlite");
@@ -3769,6 +4629,52 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         Arc::new(AcceptingCheckpointSink),
     )
     .unwrap();
+    // Exercise the card-specific BrokerSignerClient methods against the real
+    // Signer service over the authenticated Unix socket, including completion.
+    let card_broker = CeremonyBroker::new(Arc::new(signer_client.clone()));
+    let card_id = Token::new("socket-test-card").unwrap();
+    let card_add = card_broker
+        .prepare_card(
+            operation("c1"),
+            bloom_signer_api::CardEffect::Add {
+                card_id: card_id.clone(),
+                label: "Synthetic socket card".into(),
+            },
+            now_ms,
+        )
+        .unwrap();
+    let session = card_session_json(&card_broker, &card_add).await;
+    let card_auth = VirtualAuthenticator::generate_for_registration(
+        serde_json::from_value(session["webauthn_options"]["registration_user_handle"].clone())
+            .unwrap(),
+        "http://localhost:18734",
+    );
+    assert_eq!(card_approve(&card_broker, &card_add, &card_auth, serde_json::json!({
+        "credential_prf":Base64UrlBytes::from_bytes(&card_auth.deterministic_prf()),
+        "card":{"number":"4242424242424242","expiry_month":12,"expiry_year":2034,"name":"Synthetic Test"}
+    }), 1).await.0, StatusCode::OK);
+    assert_eq!(signer_client.card_list().unwrap()[0].card_id, card_id);
+    assert_eq!(
+        signer_client.card_status(&operation("c1")).unwrap().state,
+        bloom_signer_api::CardOperationState::Succeeded
+    );
+    let delete = signer_client
+        .prepare_card(
+            bloom_signer_api::CardPrepareRequest {
+                operation_id: operation("c2"),
+                surface: bloom_signer_api::legacy_local_surface(),
+                effect: bloom_signer_api::CardEffect::Delete { card_id },
+            },
+            now_ms,
+        )
+        .unwrap();
+    assert_eq!(delete.contribution.ceremony_kind, CeremonyKind::CardDelete);
+    assert_eq!(
+        signer_client.card_cancel(&operation("c2")).unwrap().state,
+        bloom_signer_api::CardOperationState::Cancelled
+    );
+    assert_eq!(signer_client.card_list().unwrap().len(), 1);
+    drop(card_broker);
     let authority = Arc::new(
         BrokerAuthority::open(
             &broker_authority_path,
@@ -4245,11 +5151,11 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
 
     let parent_key = machine_registration_result.public_key_refs[0].clone();
     let derive_operation = operation("d2");
-    // This scenario exercises many real ceremonies. Its active-authority
-    // assertions must not race a 30-second deadline on a loaded CI host.
-    // Expiry is exercised separately below with an already-expired request.
-    let scope_lifetime_ms = 300_000;
-    let approval_lifetime_ms = 120_000;
+    // This real-service fixture now includes Safe review and multiple restarts.
+    // Keep its authorization live while testing replay and revocation; the
+    // expired-term case below must not mask those separate rejection checks.
+    let scope_lifetime_ms = 10 * 60_000;
+    let approval_lifetime_ms = 5 * 60_000;
     let scope = PetalKeyScope {
         wallet_id: wallet_id.clone(),
         parent_key_ref: parent_key.clone(),
@@ -5273,15 +6179,16 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         petal_route,
         b"changed-replay",
     );
+    let replay_error = MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::SigningSign(changed_replay.clone()),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(
-        MachineBrokerService::dispatch(
-            &broker,
-            MachineBrokerRequest::SigningSign(changed_replay.clone()),
-        )
-        .await
-        .unwrap_err()
-        .code,
-        ProtocolErrorCode::OperationIdConflict
+        replay_error.code,
+        ProtocolErrorCode::OperationIdConflict,
+        "{replay_error:?}"
     );
     changed_replay.operation_id = operation("d6");
     changed_replay.operation_digest = petal_sign_request(
@@ -5795,8 +6702,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         terms.limits.max_signatures = DecimalU64::new(1);
         terms.request_nonce = RequestNonce::from_bytes([nonce; 16]);
         terms.wallet_revocation_epoch = current_epoch.clone();
-        // Issued now, for most of the scope's maximum lifetime: the
-        // ceremony's own validity window must fit inside the approval's.
+        // The fresh recovery window remains inside the scope's maximum lifetime;
+        // the ceremony's own validity must fit inside this approval's window.
         let now_ms: u64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -5994,7 +6901,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .is_err()
     );
 
-    let now_after_scope_ms: u64 = std::time::SystemTime::now()
+    let expired_at_ms: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis()
@@ -6002,9 +6909,9 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .unwrap();
     let mut expired_terms = approval_terms.clone();
     expired_terms.request_nonce = RequestNonce::from_bytes([0xdc; 16]);
-    expired_terms.issued_at_ms = DecimalU64::new(now_after_scope_ms - 30_000);
+    expired_terms.issued_at_ms = DecimalU64::new(expired_at_ms - 30_000);
     expired_terms.not_before_ms = expired_terms.issued_at_ms.clone();
-    expired_terms.expires_at_ms = DecimalU64::new(now_after_scope_ms - 1);
+    expired_terms.expires_at_ms = DecimalU64::new(expired_at_ms - 1);
     expired_terms.validate().unwrap();
     let expired = MachineBrokerService::dispatch(
         &restarted_scoped_broker,

@@ -34,10 +34,10 @@ use crate::{
     journal::{BrokerJournal, JournalError, ReservationState},
     signer_client::BrokerSignerClient,
     translation::{
-        approval as translate_approval, custody as translate_custody, error as translate_error,
-        key as translate_key, policy as translate_policy, revocation as translate_revocation,
-        service as translate_service, signing as translate_signing,
-        wallet_account as translate_wallet_account,
+        approval as translate_approval, cards as translate_cards, custody as translate_custody,
+        error as translate_error, key as translate_key, policy as translate_policy,
+        revocation as translate_revocation, service as translate_service,
+        signing as translate_signing, wallet_account as translate_wallet_account,
     },
 };
 
@@ -212,6 +212,61 @@ impl BrokerRpcService {
             self.require_network_containment()?;
         }
         match request {
+            Request::TravelerList(_) => Ok(Response::TravelerList(
+                self.ceremony
+                    .traveler_list()?
+                    .into_iter()
+                    .map(translate_cards::traveler)
+                    .collect(),
+            )),
+            Request::TravelerSave(request) => {
+                Ok(Response::TravelerSave(self.ceremony.prepare_card(
+                    request.operation_id,
+                    bloom_signer_api::CardEffect::SaveTraveler {
+                        traveler_id: request.traveler_id,
+                        label: request.label,
+                    },
+                    self.clock.now_ms(false)?,
+                )?))
+            }
+            Request::TravelerDelete(request) => {
+                Ok(Response::TravelerDelete(self.ceremony.prepare_card(
+                    request.operation_id,
+                    bloom_signer_api::CardEffect::DeleteTraveler {
+                        traveler_id: request.traveler_id,
+                    },
+                    self.clock.now_ms(false)?,
+                )?))
+            }
+            Request::CardList(_) => Ok(Response::CardList(
+                self.ceremony
+                    .card_list()?
+                    .into_iter()
+                    .map(translate_cards::card)
+                    .collect(),
+            )),
+            Request::CardAdd(request) => Ok(Response::CardAdd(self.ceremony.prepare_card(
+                request.operation_id,
+                bloom_signer_api::CardEffect::Add {
+                    card_id: request.card_id,
+                    label: request.label,
+                },
+                self.clock.now_ms(false)?,
+            )?)),
+            Request::CardDelete(request) => Ok(Response::CardDelete(self.ceremony.prepare_card(
+                request.operation_id,
+                bloom_signer_api::CardEffect::Delete {
+                    card_id: request.card_id,
+                },
+                self.clock.now_ms(false)?,
+            )?)),
+            Request::CardStatus(request) => Ok(Response::CardStatus(translate_cards::status(
+                self.ceremony.card_status(&request.operation_id)?,
+            ))),
+            Request::CardCancel(request) => Ok(Response::CardCancel(translate_cards::status(
+                self.ceremony
+                    .card_cancel(&request.operation_id, self.clock.now_ms(false)?)?,
+            ))),
             Request::SystemHello(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::UnknownMethod,
                 "system.hello is consumed by the authenticated transport",
@@ -2364,6 +2419,10 @@ fn machine_request_requires_containment(request: &MachineBrokerRequest) -> bool 
     matches!(
         request,
         Request::SealedApprovalPrepare(_)
+            | Request::TravelerSave(_)
+            | Request::TravelerDelete(_)
+            | Request::CardAdd(_)
+            | Request::CardDelete(_)
             | Request::SealedApprovalRenew(_)
             | Request::SigningSign(_)
             | Request::SigningSignBatch(_)
@@ -2384,6 +2443,25 @@ fn machine_request_requires_containment(request: &MachineBrokerRequest) -> bool 
             | Request::CredentialRemovePrepare(_)
             | Request::RecoveryPrepare(_)
     )
+}
+
+#[test]
+fn card_mutations_require_containment() {
+    let operation_id = bloom_broker_api::OperationId::from_bytes([1; 32]);
+    let card_id = bloom_broker_api::Token::new("test-card").unwrap();
+    assert!(machine_request_requires_containment(
+        &MachineBrokerRequest::CardAdd(bloom_broker_api::CardAddRequest {
+            operation_id: operation_id.clone(),
+            card_id: card_id.clone(),
+            label: "Test".into(),
+        })
+    ));
+    assert!(machine_request_requires_containment(
+        &MachineBrokerRequest::CardDelete(bloom_broker_api::CardDeleteRequest {
+            operation_id,
+            card_id,
+        })
+    ));
 }
 
 fn validate_signer_readiness(broker: &Readiness, signer: &Readiness) -> Result<(), ProtocolError> {

@@ -268,6 +268,32 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
     };
     vec![
         MachineBrokerRequest::SystemHello(hello()),
+        MachineBrokerRequest::CardList(Empty {}),
+        MachineBrokerRequest::TravelerList(Empty {}),
+        MachineBrokerRequest::TravelerSave(TravelerSaveRequest {
+            operation_id: operation(90),
+            traveler_id: token("wife"),
+            label: "Wife".into(),
+        }),
+        MachineBrokerRequest::TravelerDelete(TravelerDeleteRequest {
+            operation_id: operation(91),
+            traveler_id: token("wife"),
+        }),
+        MachineBrokerRequest::CardAdd(CardAddRequest {
+            operation_id: operation(1),
+            card_id: token("card-one"),
+            label: "Synthetic card".into(),
+        }),
+        MachineBrokerRequest::CardDelete(CardDeleteRequest {
+            operation_id: operation(2),
+            card_id: token("card-one"),
+        }),
+        MachineBrokerRequest::CardStatus(OperationRequest {
+            operation_id: operation(3),
+        }),
+        MachineBrokerRequest::CardCancel(OperationRequest {
+            operation_id: operation(4),
+        }),
         MachineBrokerRequest::BrokerReadiness(Empty {}),
         MachineBrokerRequest::BrokerCapabilities(Empty {}),
         MachineBrokerRequest::CeremonySurfaceStatus(Empty {}),
@@ -560,8 +586,44 @@ fn machine_responses() -> Vec<MachineBrokerResponse> {
         }),
         MachineBrokerResponse::CredentialReplacePrepare(custody_prepared.clone()),
         MachineBrokerResponse::CredentialRemovePrepare(custody_prepared.clone()),
+        MachineBrokerResponse::TravelerList(vec![TravelerPublic {
+            traveler_id: token("wife"),
+            label: "Wife".into(),
+            fields: vec![TravelerField::GivenName, TravelerField::FamilyName],
+        }]),
+        MachineBrokerResponse::TravelerSave(custody_prepared.clone()),
+        MachineBrokerResponse::TravelerDelete(custody_prepared.clone()),
+        MachineBrokerResponse::CardList(vec![CardPublic {
+            card_id: token("card-one"),
+            label: "Synthetic card".into(),
+            brand: "Card".into(),
+            last4: "4242".into(),
+        }]),
+        MachineBrokerResponse::CardAdd({
+            let mut p = custody_prepared.clone();
+            p.ceremony_kind = CeremonyKind::CardAdd;
+            p
+        }),
+        MachineBrokerResponse::CardDelete({
+            let mut p = custody_prepared.clone();
+            p.ceremony_kind = CeremonyKind::CardDelete;
+            p
+        }),
+        MachineBrokerResponse::CardStatus(CardOperationStatus {
+            operation_id: operation(3),
+            state: CardOperationState::Prepared,
+        }),
+        MachineBrokerResponse::CardCancel(CardOperationStatus {
+            operation_id: operation(4),
+            state: CardOperationState::Cancelled,
+        }),
         MachineBrokerResponse::RecoveryPrepare(custody_prepared),
         MachineBrokerResponse::CeremonyStatus(ceremony_status()),
+        MachineBrokerResponse::CeremonyStatus({
+            let mut s = ceremony_status();
+            s.ceremony_kind = CeremonyKind::CardCheckout;
+            s
+        }),
         MachineBrokerResponse::CeremonyCancel(ceremony_status()),
         MachineBrokerResponse::CustodyResult(custody_result()),
     ]
@@ -582,19 +644,19 @@ where
 
 #[test]
 fn every_machine_broker_variant_matches_frozen_v1_frames() {
-    // The signing release's 1.8 fixture combines the remote-ceremony methods and
-    // surface selection with native and Safe review fields. Empty review
-    // vectors remain omitted from pre-existing approval request frames.
-    assert_eq!(MachineBrokerMethod::ALL.len(), 45);
+    // The unreleased 1.8 fixture combines the remote-ceremony methods and
+    // surface selection with native and Safe review fields, cards and private
+    // travelers. Empty review vectors remain omitted from pre-existing frames.
+    assert_eq!(MachineBrokerMethod::ALL.len(), 53);
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "1749dae9a684ec9a1be412c4a94d584485cc1f0fb28a468afb3f1dcf405e62a4",
+        "4b5a2875560d09b08c808e2a401748df8e5aaf9fbbc4e09f51bbe4768df8326f",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "32bd9b02398991399b065111e6cacfa8c98667f5454babca2873dab05d314276",
+        "04ae64aff58bdc186cc97c92ed82de8414cec4ce06c46a4e6905d305024bd6ba",
     );
 }
 

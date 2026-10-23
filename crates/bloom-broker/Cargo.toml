@@ -44,12 +44,14 @@ rusqlite.workspace = true
 serde.workspace = true
 serde_jcs.workspace = true
 serde_json.workspace = true
+unicode-normalization = "0.1.25"
 sha2.workspace = true
 sha3.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 bloom-broker-debug-driver = { path = "../bloom-broker-debug-driver" }
@@ -57,7 +59,7 @@ bloom-relay-admin-client.workspace = true
 # The socket-activation regression hands a real descriptor to a child process
 # between fork and exec, which needs dup2/fcntl directly.
 libc = "0.2"
-bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "bc88ad690757165ebf1978410ea5c7ec652215d3" }
+bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "45b04a0f0964e0c3863ca7692167c66fcff5ed79" }
 bloom-signer-vectors.workspace = true
 futures = "0.3"
 http-body-util = "0.1"
