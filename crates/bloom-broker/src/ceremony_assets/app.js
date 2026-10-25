@@ -936,9 +936,14 @@ function renderCardReview(session) {
       document.getElementById("page-lede").textContent = "Bloom clicks this shop's pay button once. The shop charges the payment method saved in your account there; no Bloom card is used. Bloom cannot cap the shop's actual charge.";
       fact("Payment", "Your saved payment method at this shop");
     } else fact("Payment frames", payment.payment_frame_origins.join(", ") || "Main document");
-    const scale = new Intl.NumberFormat("en", {style: "currency", currency: payment.currency}).resolvedOptions().maximumFractionDigits;
+    // ISO 4217 minor units (SIX list, 2026-09-17), not CLDR display digits.
+    const scale = ({
+      BIF:0,CLP:0,DJF:0,GNF:0,ISK:0,JPY:0,KMF:0,KRW:0,PYG:0,RWF:0,UGX:0,UYI:0,VND:0,VUV:0,XAF:0,XOF:0,XPF:0,
+      BHD:3,IQD:3,JOD:3,KWD:3,LYD:3,OMR:3,TND:3,
+      CLF:4,UYW:4,
+    })[payment.currency] ?? 2;
     const amount = payment.total_minor / (10 ** scale);
-    const money = value => new Intl.NumberFormat("en", {style: "currency", currency: payment.currency}).format(value);
+    const money = value => new Intl.NumberFormat("en", {style: "currency", currency: payment.currency, minimumFractionDigits: scale, maximumFractionDigits: scale}).format(value);
     fact("Total", `${money(amount)} (${payment.currency})`);
     fact("Installments", payment.total_minor % payment.installments === 0
       ? `${payment.installments} × ${money(amount / payment.installments)} = ${money(amount)}`

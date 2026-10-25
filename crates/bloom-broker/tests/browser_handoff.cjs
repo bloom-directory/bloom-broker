@@ -69,4 +69,23 @@ renderCardReview({...session, expires_at_ms: now + 120000,
   review_manifest: {card_effect: {kind: "manual_checkout", card_id: "saved",
     agent_description: "Finish this purchase yourself."}}});
 assert(!nodes["ceremony-page"].classList.contains("browser-handoff"));
+// Review ISO minor units rather than the browser's display precision. CLDR
+// omits fractions for HUF/COP/IQD, but those currencies retain minor units.
+globalThis.fetch = async () => ({ok: false});
+for (const [currency, total_minor, installments, total, installment] of [
+  ["HUF", 2882650, 2, "28,826.50", "14,413.25"],
+  ["COP", 12345678, 2, "123,456.78", "61,728.39"],
+  ["IQD", 1250125, 1, "1,250.125", "1,250.125"],
+  ["VND", 18062176, 2, "18,062,176", "9,031,088"],
+]) {
+  renderCardReview({...session, expires_at_ms: now + 120000,
+    review_manifest: {host: "example.com", card_effect: {kind: "checkout",
+      facts: {origin: "https://example.com", payment_frame_origins: [],
+        currency, total_minor, installments, recurring: false},
+      agent_description: "Synthetic amount review"}}});
+  const fields = nodes.review.children[0].children;
+  const value = name => fields[fields.findIndex(field => field.children[0] === name) + 1].children.join("");
+  assert(value("Total").includes(total), `${currency}: ${value("Total")}`);
+  assert(value("Installments").includes(installment), `${currency}: ${value("Installments")}`);
+}
 console.log("browser-handoff-ok");
