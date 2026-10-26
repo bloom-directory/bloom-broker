@@ -238,15 +238,9 @@ impl BrokerRpcService {
             Request::SealedApprovalRenew(request) => Ok(Response::SealedApprovalRenew(
                 self.renew_approval(request).await?,
             )),
-            Request::SealedApprovalStatus(request) => {
-                // Ceremonies expire only when something sweeps them. A
-                // status read is such a moment, so an overdue ceremony
-                // never reads as still awaiting the owner.
-                self.ceremony.expire_sessions(self.clock.now_ms(false)?)?;
-                Ok(Response::SealedApprovalStatus(
-                    self.approval_public_status(&request.id)?,
-                ))
-            }
+            Request::SealedApprovalStatus(request) => Ok(Response::SealedApprovalStatus(
+                self.approval_public_status(&request.id)?,
+            )),
             Request::SealedApprovalList(request) => {
                 let mut statuses = self
                     .authority
@@ -755,13 +749,10 @@ impl BrokerRpcService {
             }
             Request::CeremonyStatus(request) => {
                 let operation_id = OperationId::new(request.id.as_str().to_owned())?;
-                // The durable clock refuses while the audit journal is latched;
-                // status must stay readable then, just without the sweep.
-                let status = match self.clock.now_ms(false) {
-                    Ok(now_ms) => self.ceremony.current_public_status(&operation_id, now_ms)?,
-                    Err(_) => self.ceremony.public_status(&operation_id)?,
-                };
-                Ok(Response::CeremonyStatus(status))
+                self.sweep_overdue_ceremonies();
+                Ok(Response::CeremonyStatus(
+                    self.ceremony.public_status(&operation_id)?,
+                ))
             }
             Request::CeremonyCancel(request) => {
                 let operation_id = OperationId::new(request.id.as_str().to_owned())?;
@@ -1071,13 +1062,31 @@ impl BrokerRpcService {
         Ok(status)
     }
 
+    /// Ceremonies expire only when something sweeps them, so status reads
+    /// sweep first: an overdue ceremony must not read as awaiting the owner.
+    /// Best-effort, because status must stay readable (AC-18) while the
+    /// clock or the audit journal is latched.
+    fn sweep_overdue_ceremonies(&self) {
+        if let Err(error) = self
+            .clock
+            .now_ms(false)
+            .and_then(|now_ms| self.ceremony.expire_sessions(now_ms))
+        {
+            tracing::warn!(
+                event = "ceremony.status_sweep_failed",
+                protocol_error_code = error.code.as_str(),
+                "Broker answered a status read without sweeping overdue ceremonies"
+            );
+        }
+    }
+
     fn attach_pending_approval_ceremony(
         &self,
         status: &mut bloom_broker_api::ApprovalPublicStatus,
     ) -> Result<(), ProtocolError> {
-        if let Some((url, expires_at_ms)) = self
-            .ceremony
-            .pending_approval_ceremony(&status.approval_id, self.clock.now_ms(false)?)?
+        self.sweep_overdue_ceremonies();
+        if let Some((url, expires_at_ms)) =
+            self.ceremony.pending_approval_ceremony(&status.approval_id)
         {
             status.ceremony_url = Some(url);
             status.ceremony_expires_at_ms = Some(expires_at_ms);

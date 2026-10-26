@@ -2243,27 +2243,6 @@ impl CeremonyBroker {
             .map(|session| state_to_machine(session.state))
     }
 
-    /// The ceremony's status as of `now_ms`. Ceremonies expire only when
-    /// something sweeps them, so this sweeps first: an overdue ceremony
-    /// reads as expired rather than as still awaiting the owner, and a
-    /// Machine polling it can retire it and prepare a fresh one.
-    pub fn current_public_status(
-        &self,
-        operation_id: &OperationId,
-        now_ms: u64,
-    ) -> Result<BrokerCeremonyPublicStatus, ProtocolError> {
-        // The sweep is best-effort: a status read stays live (AC-18) even when
-        // the journal is latched or some other overdue session cannot be swept.
-        if let Err(error) = self.expire_sessions(now_ms) {
-            tracing::warn!(
-                event = "ceremony.status_sweep_failed",
-                protocol_error_code = error.code.as_str(),
-                "Broker answered ceremony status without sweeping overdue sessions"
-            );
-        }
-        self.public_status(operation_id)
-    }
-
     pub fn public_status(
         &self,
         operation_id: &OperationId,
@@ -2364,13 +2343,8 @@ impl CeremonyBroker {
     pub fn pending_approval_ceremony(
         &self,
         approval_id: &Digest32,
-        now_ms: u64,
-    ) -> Result<Option<(String, DecimalU64)>, ProtocolError> {
-        // Status/list requests are a lifecycle boundary just like opening the
-        // browser. Sweep first so an owner who never opened the page cannot
-        // leave an expired AwaitingUser row masquerading as a live URL.
-        self.expire_sessions(now_ms)?;
-        Ok(self.inner.sessions.lock().values().find_map(|session| {
+    ) -> Option<(String, DecimalU64)> {
+        self.inner.sessions.lock().values().find_map(|session| {
             if session.ceremony_kind != CeremonyKind::SealedApproval
                 || session.state != CeremonyState::AwaitingUser
             {
@@ -2388,7 +2362,7 @@ impl CeremonyBroker {
             session.token.as_ref().and_then(|_| {
                 session_url(session).map(|url| (url, DecimalU64::new(session.expires_at_ms)))
             })
-        }))
+        })
     }
 
     /// True when every owner ceremony minted for this approval died without

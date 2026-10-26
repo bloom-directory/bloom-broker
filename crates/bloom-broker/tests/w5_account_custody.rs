@@ -2729,50 +2729,46 @@ async fn restored_wallet_signs_from_restored_derived_account_over_real_transport
     assert_eq!(descriptor.canonical_public_key.decode(), spki.as_bytes());
 }
 
-/// A ceremony nobody completes reads as expired once it is overdue, on the
-/// status read itself. Nothing else sweeps it until the next prepare, cancel,
-/// page load or restart, and a Machine that keeps reading it as awaiting the
-/// owner never retires it to prepare a fresh one.
+/// Status reads sweep overdue ceremonies first, but a sweep that cannot run
+/// must not take status down with it: with the audit journal latched the
+/// trusted clock refuses, and the owner's pending ceremony still answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_overdue_ceremony_reads_as_expired_on_status() {
+async fn ceremony_status_answers_when_the_expiry_sweep_cannot_run() {
     let directory = tempfile::tempdir().unwrap();
     let mut stack = account_stack(directory.path(), "e1").await;
     let authenticator = VirtualAuthenticator::generate();
     let wallet_id = Token::new("quiet-fern").unwrap();
     register_bip39_wallet(&mut stack, &wallet_id, &authenticator, None).await;
     let public = wallet_public(&stack, &wallet_id).await;
-
     let operation = stack.next_operation();
     let terms = allocation_terms(&public, solana_derivation_request(), operation.clone());
-    let prepared = match MachineBrokerService::dispatch(
+    MachineBrokerService::dispatch(
         stack.broker.as_ref(),
         MachineBrokerRequest::AccountAllocatePrepare(allocate_request(&wallet_id, terms)),
     )
     .await
-    .unwrap()
-    {
-        MachineBrokerResponse::AccountAllocatePrepare(prepared) => prepared,
-        response => panic!("unexpected prepare response: {response:?}"),
+    .unwrap();
+
+    // An out-of-band write breaks the audit chain; the next clock read
+    // verifies it and latches the journal.
+    rusqlite::Connection::open(directory.path().join("broker-journal.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE audit_chain SET payload_jcs='{}' WHERE sequence=0",
+            [],
+        )
+        .unwrap();
+    let status = MachineBrokerService::dispatch(
+        stack.broker.as_ref(),
+        MachineBrokerRequest::CeremonyStatus(IdRequest {
+            id: Digest32::new(operation.as_str().to_owned()).unwrap(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(stack.broker.journal_is_audit_degraded());
+    let MachineBrokerResponse::CeremonyStatus(status) = status else {
+        panic!("unexpected status response: {status:?}");
     };
-    let ceremony = stack.broker.ceremony();
-    let expiry = prepared.ceremony_expires_at_ms.get();
-    assert_eq!(
-        ceremony
-            .current_public_status(&operation, expiry - 1)
-            .unwrap()
-            .state,
-        CeremonyState::AwaitingUser
-    );
-    assert_eq!(
-        ceremony.public_status(&operation).unwrap().state,
-        CeremonyState::AwaitingUser,
-        "without a sweep an overdue ceremony would keep reading as awaiting"
-    );
-    assert_eq!(
-        ceremony
-            .current_public_status(&operation, expiry + 1)
-            .unwrap()
-            .state,
-        CeremonyState::Expired
-    );
+    assert_eq!(status.state, CeremonyState::AwaitingUser);
 }
