@@ -1,0 +1,39 @@
+{
+  "metadata": {
+    "contractName": "Conditional-token redemption interface"
+  },
+  "context": {
+    "contract": {}
+  },
+  "display": {
+    "formats": {
+      "redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)": {
+        "intent": "Request conditional-position redemption; outcome resolution, payouts and contract behavior are not verified",
+        "fields": [
+          {
+            "path": "collateralToken",
+            "label": "Collateral token",
+            "format": "addressName"
+          },
+          {
+            "path": "parentCollectionId",
+            "label": "Parent collection ID",
+            "format": "raw"
+          },
+          {
+            "path": "conditionId",
+            "label": "Condition ID",
+            "format": "raw"
+          },
+          {
+            "path": "indexSets.[]",
+            "label": "Outcome index set",
+            "format": "raw"
+          }
+        ]
+      }
+    }
+  },
+  "$schema": "https://eips.ethereum.org/assets/eip-7730/erc7730-v2.schema.json",
+  "$comment": "Gnosis ConditionalTokens redeemPositions ABI, also used by Polymarket collateral adapters. Unlisted addresses are structural readings; no market, collateral units or payout are inferred. Source: bloom-petal-polymarket a0177ae4e68f4a043df4db727fb3212e23ab7395 route/src/polymarket/wallet.rs."
+}

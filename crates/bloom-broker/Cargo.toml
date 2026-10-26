@@ -12,10 +12,12 @@ triad-dev-harness = ["bloom-triad-local-transport/triad-dev-harness"]
 axum.workspace = true
 axum-server.workspace = true
 alloy = { version = "2.0.5", default-features = false, features = ["std", "consensus", "rlp"] }
+alloy-dyn-abi = { workspace = true, features = ["eip712"] }
 bloom-broker-api = { path = "../bloom-broker-api" }
 bloom-evm-clear-signing.workspace = true
 bloom-signer-api.workspace = true
 bloom-solana-verify.workspace = true
+bloom-solana-clear-signing.workspace = true
 bloom-relay-client.workspace = true
 bloom-relay-protocol.workspace = true
 bloom-platform-containment.workspace = true
@@ -31,6 +33,7 @@ hex.workspace = true
 num-bigint.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
+rmp-serde = "1"
 rustls.workspace = true
 uuid.workspace = true
 instant-acme.workspace = true
@@ -54,7 +57,7 @@ bloom-relay-admin-client.workspace = true
 # The socket-activation regression hands a real descriptor to a child process
 # between fork and exec, which needs dup2/fcntl directly.
 libc = "0.2"
-bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "27c3fef2f5b9225d55f1ad542223c824128c8e9e" }
+bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "8e40390b9cd350d178a90878b478eeb1189b5f62" }
 bloom-signer-vectors.workspace = true
 futures = "0.3"
 http-body-util = "0.1"

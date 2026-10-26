@@ -11,6 +11,8 @@ fn browser_script(body: &str) -> String {
     format!(
         r#"
 globalThis.crypto = require("node:crypto").webcrypto;
+globalThis.window = globalThis;
+window.parent = window;
 globalThis.document = {{getElementById: () => ({{}})}};
 globalThis.location = {{pathname: "/", protocol: "https:", hostname: "abcdefghijklmnopqrstuvwxyz.relay.bloom.directory", origin: "https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory", hash: ""}};
 globalThis.history = {{replaceState: () => {{}}}};

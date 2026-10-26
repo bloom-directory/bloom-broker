@@ -10,8 +10,8 @@ num-bigint = "0.4"
 bloom-rpc-wire.workspace = true
 serde.workspace = true
 serde_jcs.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
-serde_json.workspace = true

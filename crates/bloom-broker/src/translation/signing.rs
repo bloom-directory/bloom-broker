@@ -5,12 +5,19 @@ use bloom_signer_api as south;
 
 use super::key;
 
-pub(crate) fn selector_to_signer(value: &north::ApprovalSelector) -> south::SelectorKind {
-    match value {
+pub(crate) fn selector_to_signer(
+    value: &north::ApprovalSelector,
+) -> Result<south::SelectorKind, north::ProtocolError> {
+    Ok(match value {
         north::ApprovalSelector::Exact { .. } => south::SelectorKind::Exact,
         north::ApprovalSelector::Petal { .. } => south::SelectorKind::Petal,
-        north::ApprovalSelector::SystemSession { .. } => south::SelectorKind::SystemSession,
-    }
+        north::ApprovalSelector::SystemSession { .. } => {
+            return Err(north::ProtocolError::new(
+                north::ProtocolErrorCode::SelectorMismatch,
+                "native sessions require exact approval",
+            ));
+        }
+    })
 }
 
 pub(crate) fn assurance_to_signer(value: north::ClaimAssurance) -> south::SignerClaimAssurance {
@@ -69,8 +76,14 @@ mod tests {
             route_grants: Vec::new(),
             required_claim_assurance: north::ClaimAssuranceLevel::MachineAsserted,
         };
-        assert_eq!(selector_to_signer(&exact), south::SelectorKind::Exact);
-        assert_eq!(selector_to_signer(&petal), south::SelectorKind::Petal);
+        assert_eq!(
+            selector_to_signer(&exact).unwrap(),
+            south::SelectorKind::Exact
+        );
+        assert_eq!(
+            selector_to_signer(&petal).unwrap(),
+            south::SelectorKind::Petal
+        );
     }
 
     #[test]

@@ -4,8 +4,8 @@ use bloom_audit_checkpoint::{
 };
 use bloom_broker::journal::{
     AuditSigner, BrokerJournal, BudgetLimits, ClockCondition, DurablePoint, FaultHook,
-    FrozenReview, JournalError, NewApprovalRecord, ReservationRequest, ReservationState,
-    SlidingBudgetLimit, SlidingValueLimit, TimeReading, derive_batch_child_operation_id,
+    JournalError, NewApprovalRecord, ReservationRequest, ReservationState, SlidingBudgetLimit,
+    SlidingValueLimit, TimeReading, derive_batch_child_operation_id,
 };
 use bloom_broker_api::{
     ApprovalLifecycleState, Base64UrlBytes, BootEpoch, CryptoSuite, DecimalU64, DecimalU256,
@@ -222,7 +222,6 @@ fn install_reservation_approval(journal: &BrokerJournal) {
                 approved_claim_digest: None,
                 provenance_jcs: None,
                 renewal_of: None,
-                review: &FrozenReview::legacy(),
             },
         )
         .unwrap();
@@ -253,7 +252,6 @@ fn request(value: u8) -> UnsignedSignRequest {
         }),
     };
     let identity = SignOperationIdentity {
-        session_accounting_digest: None,
         operation_id: operation_id.clone(),
         approval_id: digest("22"),
         key_ref: key_ref.clone(),
@@ -266,7 +264,6 @@ fn request(value: u8) -> UnsignedSignRequest {
         policy_digest: digest("66"),
     };
     let mut request = UnsignedSignRequest {
-        session_accounting: None,
         schema: Token::new("bloom.sign-request/1").unwrap(),
         attempt_id: Digest32::new(format!("{value:02x}").repeat(32)).unwrap(),
         operation_id,

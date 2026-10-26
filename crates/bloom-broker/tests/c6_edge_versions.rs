@@ -129,6 +129,33 @@ async fn machine_broker_downgrade_fails_before_durable_broker_work() {
 }
 
 #[tokio::test]
+async fn released_1_7_and_signing_1_8_refuse_each_other_before_state_work() {
+    let released = ProtocolVersion::new(1, 7);
+    let released_range = ProtocolVersionRange::new(1, 7, 7);
+    for (server, server_range, client, client_range, id) in [
+        (
+            BROKER_API_CURRENT,
+            BROKER_API_RANGE,
+            released,
+            released_range,
+            0x60,
+        ),
+        (
+            released,
+            released_range,
+            BROKER_API_CURRENT,
+            BROKER_API_RANGE,
+            0x70,
+        ),
+    ] {
+        let result = authenticate_edge(server, server_range, client, client_range, id).await;
+        assert!(result.server.is_err());
+        assert!(result.client.is_err());
+        assert_eq!(result.durable_work, 0);
+    }
+}
+
+#[tokio::test]
 async fn machine_predating_the_rate_limit_minor_is_refused_at_the_hello() {
     // A Machine built against the previous minor: it would decode
     // CEREMONY_RATE_LIMITED, but its strict error decoder has no field for

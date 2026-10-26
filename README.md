@@ -219,7 +219,13 @@ identity — never parse the message, and never invent a replacement operation.
 The field is refused if it appears on any other code or carries values outside
 its own window.
 
-Concurrency exhaustion is a different class: it returns `QUOTA_EXCEEDED` with
+Each wallet permits one live ceremony. Petals and agents must finish or cancel
+an approval ceremony before requesting the next route ceremony. An overlapping
+request returns `CEREMONY_RATE_LIMITED`; its `retry_after_ms` is the remaining
+lifetime of the live ceremony. Completion can free the slot earlier. Preserve
+the operation identity when retrying and do not busy-loop on this error.
+
+Global concurrency exhaustion is a different class: it returns `QUOTA_EXCEEDED` with
 **no** retry hint, because nothing ages out on a schedule — only when a live
 ceremony ends.
 
@@ -278,6 +284,37 @@ store. Abrupt process termination can prevent immediate retirement; DNS leases
 remain bounded by Relay expiry. Before concluding an interrupted run, the operator
 must verify signed retirement, DNS cleanup, and the permanent hostname tombstone.
 
+## Local wallet onboarding
+
+After registration, the local browser shows the wallet name, initial EVM and
+Solana account addresses, copy controls and a separate **Back up wallet** action.
+**Later** returns to the persistent `/wallet/<wallet-id>` page without claiming
+a backup was made. Bookmark that page to revisit addresses and backup after the
+registration capability has been consumed. It also works for already-created
+BIP-39 wallets on this host.
+
+The local wallet API exposes public account projections for an exact wallet ID;
+it does not list wallets or return secret material. It requires the configured
+localhost Host and same-origin Fetch Metadata. Preparing backup additionally
+requires the exact Origin and JSON content type. Hosted listeners reject these
+owner-page routes; a persistent authenticated hosted-wallet UI remains outside
+this local flow. Ceremony capabilities and terminal invalidation are unchanged.
+
+**Back up wallet** prepares the existing wallet-export ceremony. Signer requires
+a fresh passkey proof; registration approval cannot export a phrase. Pending
+backup requests resume on repeat clicks; cancellation allows a new request after
+the existing cooldown. The recovery phrase restores the wallet in compatible
+wallet software, while the passkey authorizes operations in Bloom. Neither
+viewing a phrase nor returning to the wallet establishes that a backup was saved.
+
+`scripts/test-wallet-onboarding.mjs` runs create → addresses → Later/refresh →
+backup/cancel → fresh backup approval → return against a running isolated Triad
+with a Chromium virtual passkey. It captures only address and pre-export review
+screens. It never records video/traces, reads phrase text, logs it or screenshots
+it. Required environment inputs are listed at the top of the script; do not run
+against custody or a production wallet. The service test independently covers
+the real Signer registration/export path and local-origin/body boundaries.
+
 ## Durable-clock recovery and repair
 
 Broker's approval and ceremony lifetimes are measured against a durable clock,
@@ -331,65 +368,51 @@ rollback, same-boot jump, or unknown-domain jump, that affected service must be
 repaired independently; repairing only one does not clear the other's fault.
 
 
-## Owner-reviewed session authority
+## Owner-reviewed Petal sessions
 
-The session extension uses Machine–Broker protocol 1.8 and Broker–Signer
-protocol 1.7. It reuses Sealed Approval activation and the existing custody
-backend. An onboarding label or local `under_policy` choice creates no signing
-authority. Every member grant requires an owner passkey activation.
+Persona onboarding reuses Petal Sealed Approvals. The first automatic scope is
+fee-free Polymarket BUY orders on Polygon with positive `polygon:pusd` debits.
+SELLs, allowances, funding, withdrawals, native transfers and other classes do
+not inherit that session. Native `SystemSession` draft terms are refused.
 
-A typed System session currently supports canonical legacy/EIP-1559 EVM
-native transfers and ERC-20 `transfer(address,uint256)` only. Broker decodes the
-complete unsigned preimage at signing, binds numeric chain ID (`evm-N`), token,
-recipient, amount and maximum gas fee, and refuses arbitrary calldata,
-approvals and contract creation. Token contract effects are not proved by an
-ABI decoder. Reusable native Solana authority is refused until trusted cluster
-and freshness observations are available; the existing exact Solana path is
-unchanged.
+Machine–Broker uses protocol 1.9 for Broker-owned session descriptors. The
+Broker–Signer edge remains production protocol 1.6. No session-budget API,
+asset conversion, economic ledger or new selector is added to Signer.
 
-A signed `session_budget` descriptor binds wallet, policy snapshot, epoch,
-member keys, asset conversion scales, per-action/lifetime/rolling/count/rate
-caps and validity. Its ID is the SHA-256 domain-separated canonical descriptor,
-not a caller-selected alias. Every child approval shares its ledger. Broker
-and Signer reserve within their existing SQLite write transactions; pending,
-committed and ambiguous uses consume capacity, and only definitively released
-uses stop counting. Per-action split quantities are coalesced before checking.
+Broker owns per-action, lifetime, rolling and shared economic accounting. It
+reconstructs the order from the full prepared witness, compares it to the actual
+signing preimage and checks the declared debit against the signed gross BUY
+maker amount before reserving capacity. Missing evidence, SELLs, changed
+amounts, unexpected assets and fees fail closed. This proves the signed order
+terms, not venue execution, deposit-wallet ownership or settlement.
 
-Nominal stablecoin collateral units use owner-reviewed integer conversion
-scales, conservatively rounded upward to micro-units. These are not mutable
-Machine price hints, current USD prices or a guarantee against depegging.
-Unknown assets are refused. Native fees or transfers require separately stated
-raw-unit caps and are not silently converted into nominal dollars. Existing
-Petal selectors can join a group, but their claim assurance remains explicit:
-`machine_asserted` trusts the installed Petal/Machine economic projection and
-does not independently decode arbitrary payload effects. Grouped monetary
-Petal actions with no positive debit are refused.
+The immutable `session_budget` stays on the north edge and in Broker's durable
+approval metadata and signed review. Its canonical digest and original request
+nonce derive the existing 128-bit Signer request nonce under the
+`bloom-broker-session-nonce/v1` domain. The approval ID hashes the ordinary
+Signer enforcement projection. Changing or removing economics changes that
+identity; both edges still agree on the approval ID. Budgetless approvals keep
+their existing canonical identities. The complete descriptor is shown in the
+signed Broker review, whose digest Signer binds opaquely to owner activation.
+Signer continues to enforce its existing key/selector/suite, operation and
+signature counts, rates, expiry, revocation and replay checks. It does not
+independently guarantee economic containment of a compromised Broker.
 
-The existing limit-state RPC exposes group usage, including reservations and
-ambiguous outcomes, at a trusted observation time. If the clock cannot supply
-that observation, group usage is unavailable; clients must not invent remaining
-capacity. Policy changes, expiry and revocation continue to invalidate new use.
-An identical completed session operation can retrieve its original result
-without a new reservation or signature; altered bytes, keys, claims or
-provenance cannot retrieve that result.
+Broker reserves shared capacity in the same SQLite transaction as the signing
+operation. Reserved, committed and ambiguous operations continue to count;
+only definitively released operations stop counting. Replays retrieve their
+original result without another reservation. Different member approvals share
+one Broker ledger; their Signer counters remain approval-local. Shared
+signature-count enforcement in Signer is not claimed.
 
-Boot-bound grants stop signing after Signer logout/restart. The current persona
-workflow does not rearm an orphaned grant: end it and review a new session with
-its separately reviewed budget. Retaining old accounting records is not an
-automatic rearm or a global cap across newly owner-approved budgets.
+Nominal units are owner-reviewed collateral conventions, not live USD prices.
+Keep the Broker journal and its accounting history intact. Restoring or losing
+that history must never be treated as unused allowance. Signer archive recovery
+does not restore Broker budgets, and this feature makes no new cross-service
+restore guarantee. Existing startup/audit/recovery fences remain in force.
 
-Adoption requires the matching Signer commit first, then Broker's API, test
-fixture and locked dependency pins, then Machine's Broker/Signer/runtime pins.
-The new accounted Polymarket package must also be built, reviewed and registered
-with its immutable hash; older zero-debit packages remain exact-approval-only.
-Local sibling patches used for verification are not release pins. No release
-or service deployment is implied by this work.
-
-Selective Signer backup recovery does not restore a complete shared session spending
-ledger. Restore therefore deactivates grouped approvals and durably blocks their
-canonical budget descriptors from activation or new reservations. A nonce-only
-renewal cannot recreate their lifetime capacity. Recovery requires newly reviewed
-terms with a fresh budget descriptor; cached completed results remain recoverable.
-Reusable native EVM sessions currently support Ethereum (1), Polygon (137), and
-local development (31337) only. Other chains, including OP Stack networks whose
-L1 fees are absent from the typed fee projection, require exact approval.
+The candidate uses the production Signer rather than the experimental #68.
+Land the reviewed Broker, repin Machine to its landed commit, and publish/adopt
+the combined Polymarket review/accounting package with immutable archive hashes
+and installer provenance before enabling the default flow. Local source tests
+do not establish installed-release compatibility.
