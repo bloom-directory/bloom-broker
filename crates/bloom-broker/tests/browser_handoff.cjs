@@ -88,4 +88,24 @@ for (const [currency, total_minor, installments, total, installment] of [
   assert(value("Total").includes(total), `${currency}: ${value("Total")}`);
   assert(value("Installments").includes(installment), `${currency}: ${value("Installments")}`);
 }
+// A trial price is not the price: the review states the ongoing charge, how
+// often it recurs and the day it starts, and says so plainly when the page
+// did not give one.
+for (const [facts, expected] of [
+  [{currency: "USD", total_minor: 100, installments: 1, recurring: true,
+    renewal_minor: 1299, renewal_period: "month", renewal_starts_on: "2026-11-25"},
+   "$12.99 every month, from 2026-11-25"],
+  [{currency: "USD", total_minor: 1799, installments: 1, recurring: true,
+    renewal_minor: 1799, renewal_period: "month"}, "$17.99 every month"],
+  [{currency: "USD", total_minor: 100, installments: 1, recurring: true}, "could not read"],
+  [{currency: "USD", total_minor: 100, installments: 1, recurring: false}, "No"],
+]) {
+  renderCardReview({...session, expires_at_ms: now + 120000,
+    review_manifest: {host: "example.com", card_effect: {kind: "checkout",
+      facts: {origin: "https://example.com", payment_frame_origins: [], ...facts},
+      agent_description: "Synthetic subscription review"}}});
+  const fields = nodes.review.children[0].children;
+  const value = name => fields[fields.findIndex(field => field.children[0] === name) + 1].children.join("");
+  assert(value("Recurring charge").includes(expected), `${JSON.stringify(facts)}: ${value("Recurring charge")}`);
+}
 console.log("browser-handoff-ok");

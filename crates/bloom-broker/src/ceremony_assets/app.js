@@ -1389,7 +1389,17 @@ function renderCardReview(session) {
     fact("Installments", payment.total_minor % payment.installments === 0
       ? `${payment.installments} × ${money(amount / payment.installments)} = ${money(amount)}`
       : `${payment.installments} payments totaling ${money(amount)}; individual installment amounts were not verified`);
-    fact("Recurring charge", payment.recurring ? "Yes" : "No");
+    // What the subscription costs later is the part a trial price hides, so
+    // it goes next to the charge rather than behind the word "recurring".
+    const every = {day: "day", week: "week", month: "month", year: "year"}[payment.renewal_period];
+    if (payment.renewal_minor && every) {
+      const renewal = money(payment.renewal_minor / (10 ** scale));
+      fact("Recurring charge", payment.renewal_starts_on
+        ? `${renewal} every ${every}, from ${payment.renewal_starts_on}`
+        : `${renewal} every ${every}`);
+    } else if (payment.recurring) {
+      fact("Recurring charge", "Yes. Bloom could not read what each later charge costs; check the merchant's page below.");
+    } else fact("Recurring charge", "No");
     // The merchant's page as checkout saw it, so items, quantity and delivery
     // details can be checked. Only the total above is bound to the approval.
     const image = el("img", {alt: "Merchant checkout page"});
