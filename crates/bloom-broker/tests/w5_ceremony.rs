@@ -424,6 +424,7 @@ async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
         publisher: Token::new("fixture-publisher").unwrap(),
         petal_lineage: None,
         operation_classes: vec![ProvenanceOperationClass {
+            economic_effects_schema: None,
             operation_class: Token::new("wallet-sign").unwrap(),
             fee_asset: None,
         }],
@@ -2397,6 +2398,7 @@ fn petal_sign_request(
     claim_payload_digest.update((payload.len() as u64).to_be_bytes());
     claim_payload_digest.update(payload);
     let claim = PetalUseClaim {
+        economic_effects: None,
         package_hash: package_hash.clone(),
         route: route.into(),
         operation_class: Token::new("exchange-order").unwrap(),
@@ -4276,6 +4278,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             active: true,
         }),
         operation_classes: vec![ProvenanceOperationClass {
+            economic_effects_schema: None,
             operation_class: Token::new("exchange-order").unwrap(),
             fee_asset: None,
         }],
@@ -4567,6 +4570,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         route: safe_route.into(),
     };
     safe_provenance.operation_classes = vec![ProvenanceOperationClass {
+        economic_effects_schema: None,
         operation_class: Token::new(bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS).unwrap(),
         fee_asset: None,
     }];
@@ -6069,6 +6073,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             }],
         };
         let budget = SessionBudget {
+            usd_policy: None,
             wallet_id: wallet_id.clone(),
             policy_version: committed.committed.version.clone(),
             policy_digest: committed.committed.policy_digest.clone(),
@@ -6101,6 +6106,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             route: group_route.into(),
         };
         group_provenance.operation_classes = vec![ProvenanceOperationClass {
+            economic_effects_schema: None,
             operation_class: Token::new("polymarket.order.poly1271").unwrap(),
             fee_asset: None,
         }];
@@ -6974,6 +6980,7 @@ async fn review_plan_formats_known_asset_base_units_without_hiding_raw_authority
         SigningKey::from_bytes(&[32; 32]),
     );
     let claim = PetalUseClaim {
+        economic_effects: None,
         package_hash: digest("91"),
         route: "/mainnet/exchange/wallet/usd_send.json".into(),
         operation_class: Token::new("hyperliquid.usd_send").unwrap(),
@@ -11923,6 +11930,20 @@ const terms={{subject:{{package_hash:"abc"}},selector:{{kind:"petal",package_has
 const session=describePetalApproval({{canonical_plan:JSON.stringify({{terms,session_budget_id:"budget-identity",asset_amounts:[]}})}});
 const facts=JSON.stringify(session.facts);
 for (const needle of ["budget-identity","Per action","Rolling cap","Covered assets","pusd","Expires","Activation","nominal"]) {{if (!facts.includes(needle))throw new Error("session review omitted "+needle);}}
+// USD members can intentionally omit raw-unit value limits while authorizing
+// spending. Owner review must show that authority and every reviewed scope.
+const petalMember={{...terms,subject:{{kind:"petal",package_hash:"usd-package",route:"usd-trade"}},key_ref:{{public_key_fingerprint:"petal-key"}},provenance_digest:"petal-provenance",allowed_crypto_suites:["secp256k1_keccak256_recoverable"],selector:{{kind:"petal",allowed_operation_classes:["generic.swap"],route_grants:[{{route:"reviewed-route"}}]}},limits:{{max_operations:"4",value_limits:[]}}}};
+const nativeMember={{...terms,subject:{{kind:"system",operation_class:"native.transfer"}},key_ref:{{public_key_fingerprint:"native-key"}},provenance_digest:"native-provenance",allowed_crypto_suites:["ed25519_message"],selector:{{kind:"system_session",scope:{{actions:["native_transfer"],chains:[{{chain:"solana-mainnet",genesis_hash:"reviewed-genesis"}}],destinations:[{{chain:"solana-mainnet",destination:"reviewed-recipient"}}],per_action_value_limits:[{{asset:{{chain:"solana-mainnet",asset:"native"}},maximum:"123456789"}}]}}}}}};
+const usdBudget={{...budget,limits:{{max_operations:"9",max_signatures:"12",value_limits:[],operation_rate_limits:[{{duration_ms:"60000",maximum:"3"}}],signature_rate_limits:[{{duration_ms:"60000",maximum:"6"}}]}},per_action_value_limits:[{{asset:{{chain:"solana-mainnet",asset:"native"}},maximum:"123456789"}}],usd_policy:{{schema_version:2,assets:[{{asset:{{chain:"solana-mainnet",asset:"native"}},decimals:9}}],member_templates:[petalMember,nativeMember],member_backstop_allocations:[{{scope_digest:"petal-scope",limits:petalMember.limits}},{{scope_digest:"native-scope",limits:{{max_operations:"5"}}}}]}}}};
+const usdReview=describePetalApproval({{canonical_plan:JSON.stringify({{terms:{{...petalMember,session_budget:usdBudget}},session_budget_id:"usd-budget",asset_amounts:[]}})}});
+const usdFacts=JSON.stringify(usdReview.facts);
+const spendingFact=usdReview.facts.find(f=>f[0]==="Shared spending authority");
+if (!spendingFact || !spendingFact[1].includes("shared USD caps") || spendingFact[1].includes("None")) throw new Error("USD review falsely claims no spending authority");
+for (const needle of ["$2.000000 USD","$10.000000 USD","9 operations; 12 signatures","60000","petal-scope","native-scope","usd-package","petal-provenance","native-provenance","reviewed-route","ed25519_message","solana-mainnet","reviewed-recipient","123456789"]) {{if (!usdFacts.includes(needle)) throw new Error("USD review omitted "+needle);}}
+// The ceremony canonical plan restores the current native member's exact
+// scope before JavaScript renders the reviewed descriptor.
+const nativeReview=describePetalApproval({{canonical_plan:JSON.stringify({{terms:{{...nativeMember,session_budget:usdBudget}},session_budget_id:"usd-budget"}})}});
+for (const [label,needle] of [["Actions","native_transfer"],["Chains","reviewed-genesis"],["Recipients","reviewed-recipient"],["Per-action asset ceilings","123456789"]]) {{const fact=nativeReview.facts.find(f=>f[0]===label);if (!fact || !fact[1].includes(needle)) throw new Error("native USD review omitted "+label);}}
 process.stdout.write("session-review-ok");
 "#
     );

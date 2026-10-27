@@ -15,6 +15,8 @@ const SCHEMA: &str = "bloom.message.review.v1";
 const MAX_FIELDS: usize = 256;
 const MAX_DEPTH: usize = 12;
 
+#[cfg(test)]
+mod generic_session_tests;
 mod hyperliquid;
 mod polymarket;
 pub(crate) mod polymarket_auth;
@@ -141,8 +143,17 @@ fn validate_order_debit(
         _ => return Err(invalid("Unsupported signed order side")),
     };
     let debit = &claim.declared_debits[0];
-    if debit.asset.chain.as_str() != "polygon"
-        || debit.asset.asset != asset
+    let canonical = debit.asset.chain.as_str() == "evm-137"
+        && debit.asset.asset
+            == if side == "0" {
+                "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb".to_owned()
+            } else {
+                asset.clone()
+            };
+    let legacy = debit.asset.chain.as_str() == "polygon"
+        && debit.asset.asset == asset
+        && claim.economic_effects.is_none();
+    if !(canonical || legacy)
         || debit.amount.as_str() != amount
         || !claim.declared_destinations.is_empty()
         || claim.declared_fee != bloom_broker_api::DeclaredFee::None
@@ -160,7 +171,11 @@ pub(crate) fn validate_selector(
     terms: &bloom_broker_api::SealedApprovalTerms,
     claim: Option<&bloom_broker_api::PetalUseClaim>,
 ) -> Result<(), ProtocolError> {
-    if terms.session_budget.is_some() {
+    if terms
+        .session_budget
+        .as_ref()
+        .is_some_and(|b| b.usd_policy.is_none())
+    {
         let ApprovalSelector::Petal {
             allowed_operation_classes,
             route_grants,
@@ -1135,6 +1150,7 @@ mod tests {
             rolling_windows: vec![],
         }];
         request.petal_use_claim = Some(PetalUseClaim {
+            economic_effects: None,
             package_hash: Digest32::from_bytes([1; 32]),
             route: "payment/a/0/confirm".into(),
             operation_class: Token::new("venice-x402.topup").unwrap(),
@@ -1221,6 +1237,7 @@ mod tests {
                     payload: Base64UrlBytes::from_bytes(&raw),
                 },
                 petal_use_claim: Some(PetalUseClaim {
+                    economic_effects: None,
                     package_hash: Digest32::from_bytes([1; 32]),
                     route: "agent/cancel".into(),
                     operation_class: Token::new("hyperliquid.agent_action").unwrap(),
@@ -1319,6 +1336,7 @@ mod tests {
                 payload: Base64UrlBytes::from_bytes(&raw),
             },
             petal_use_claim: Some(PetalUseClaim {
+                economic_effects: None,
                 package_hash: Digest32::from_bytes([1; 32]),
                 route: "agent/cancel".into(),
                 operation_class: Token::new("hyperliquid.agent_action").unwrap(),

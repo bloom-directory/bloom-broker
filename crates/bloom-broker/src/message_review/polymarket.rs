@@ -318,6 +318,7 @@ mod tests {
         let digest = Digest32::from_bytes([1; 32]);
         let payload = hex::decode(&prepared.signing_preimage_hex).unwrap();
         let mut claim = PetalUseClaim {
+            economic_effects: None,
             package_hash: digest.clone(),
             route: "trade/alice/0/new".into(),
             operation_class: token("polymarket.order.poly1271"),
@@ -489,6 +490,7 @@ mod tests {
             &serde_json::to_vec(&vec![&prepared]).unwrap(),
         )];
         request.petal_use_claim = Some(PetalUseClaim {
+            economic_effects: None,
             package_hash: Digest32::from_bytes([1; 32]),
             route: "payment/a/0/confirm".into(),
             operation_class: Token::new(&prepared.intent).unwrap(),

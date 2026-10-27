@@ -11,6 +11,7 @@ fn request(bytes: &[u8], class: &str) -> ApprovalPrepareRequest {
     batch.update((bytes.len() as u64).to_be_bytes());
     batch.update(bytes);
     let claim = PetalUseClaim {
+        economic_effects: None,
         package_hash: digest.clone(),
         route: "trade/alice/0/buy.json".into(),
         operation_class: token(class),

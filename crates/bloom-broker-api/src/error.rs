@@ -28,6 +28,11 @@ pub enum DurableEffect {
 /// Closed v1 error-code registry from architecture section 18.1.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ProtocolErrorCode {
+    PriceUnavailable,
+    PriceStale,
+    AssetUnsupported,
+    EffectsUnsupported,
+    PoolInactive,
     UnauthenticatedPeer,
     UnsupportedVersion,
     MalformedFrame,
@@ -65,7 +70,12 @@ pub enum ProtocolErrorCode {
 }
 
 impl ProtocolErrorCode {
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 39] = [
+        Self::PriceUnavailable,
+        Self::PriceStale,
+        Self::AssetUnsupported,
+        Self::EffectsUnsupported,
+        Self::PoolInactive,
         Self::UnauthenticatedPeer,
         Self::UnsupportedVersion,
         Self::MalformedFrame,
@@ -141,6 +151,11 @@ impl ProtocolErrorCode {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::PriceUnavailable => "PRICE_UNAVAILABLE",
+            Self::PriceStale => "PRICE_STALE",
+            Self::AssetUnsupported => "ASSET_UNSUPPORTED",
+            Self::EffectsUnsupported => "EFFECTS_UNSUPPORTED",
+            Self::PoolInactive => "POOL_INACTIVE",
             Self::UnauthenticatedPeer => "UNAUTHENTICATED_PEER",
             Self::UnsupportedVersion => "UNSUPPORTED_VERSION",
             Self::MalformedFrame => "MALFORMED_FRAME",

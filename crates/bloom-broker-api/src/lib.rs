@@ -6,6 +6,7 @@ mod claims;
 mod codec;
 mod crypto;
 mod error;
+mod generic_session;
 mod methods;
 mod petal_key;
 mod policy;
@@ -26,6 +27,7 @@ pub use claims::*;
 pub use codec::*;
 pub use crypto::*;
 pub use error::*;
+pub use generic_session::*;
 pub use methods::*;
 pub use petal_key::*;
 pub use policy::*;
@@ -60,8 +62,8 @@ pub const RATE_LIMIT_DETAILS_MINOR: u16 = 4;
 // Released 1.7 used strict catalog-policy and hash-only caller shapes.
 // Broker-owned session terms extend the strict Machine edge to 1.9.
 // The Broker–Signer edge remains at production 1.6.
-pub const BROKER_API_MINOR_MIN: u16 = 9;
-pub const BROKER_API_MINOR_MAX: u16 = 9;
+pub const BROKER_API_MINOR_MIN: u16 = 10;
+pub const BROKER_API_MINOR_MAX: u16 = 10;
 pub const BROKER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(BROKER_API_MAJOR, BROKER_API_MINOR_MAX);
 pub const BROKER_API_RANGE: ProtocolVersionRange =

@@ -219,6 +219,76 @@ impl BrokerRpcService {
             Request::BrokerReadiness(_) => {
                 Ok(Response::BrokerReadiness(self.triad_readiness().await?))
             }
+            Request::SessionPrices(request) => {
+                let (assets, quotes) =
+                    crate::session_pricing::prices(&request.assets, self.clock.now_ms(false)?)
+                        .await?;
+                Ok(Response::SessionPrices(
+                    bloom_broker_api::SessionPricesResponse { assets, quotes },
+                ))
+            }
+            Request::SessionStop(request) => {
+                let ids = self
+                    .journal
+                    .stop_session_pool(
+                        &request.budget_id,
+                        &request.operation_id,
+                        &request.reason,
+                        self.clock.now_ms(false)?,
+                    )
+                    .map_err(journal_error)?;
+                let mut revoked = Vec::new();
+                let mut pending = Vec::new();
+                for (id, wallet_id) in ids {
+                    let revoke_id = OperationId::new(format!(
+                        "session-stop-{}",
+                        Digest32::from_bytes(
+                            Sha256::digest(format!(
+                                "{}:{}",
+                                request.operation_id.as_str(),
+                                id.as_str()
+                            ))
+                            .into()
+                        )
+                        .as_str()
+                    ))?;
+                    if let Some(record) =
+                        self.journal.approval_record(&id).map_err(journal_error)?
+                    {
+                        if let Some(activation) = record.activation_operation_id {
+                            let _ = self
+                                .ceremony
+                                .cancel(&OperationId::new(activation)?, self.clock.now_ms(false)?);
+                        }
+                    }
+                    self.authority
+                        .revoke_local_approval(&id)
+                        .map_err(authority_error)?;
+                    match self
+                        .signer
+                        .request_for_machine(BrokerSignerRequest::SealedApprovalRevoke(
+                            bloom_signer_api::RevokeRequest {
+                                operation_id: revoke_id,
+                                wallet_id,
+                                approval_id: id.clone(),
+                                reason: request.reason.clone(),
+                            },
+                        ))
+                        .await
+                    {
+                        Ok(BrokerSignerResponse::SealedApprovalRevoke(_)) => revoked.push(id),
+                        Ok(_) => pending.push(id),
+                        Err(_) => pending.push(id),
+                    }
+                }
+                Ok(Response::SessionStop(
+                    bloom_broker_api::SessionStopResponse {
+                        budget_id: request.budget_id,
+                        revoked,
+                        pending,
+                    },
+                ))
+            }
             Request::BrokerCapabilities(_) => {
                 Ok(Response::BrokerCapabilities(self.capabilities()?))
             }
@@ -789,25 +859,53 @@ impl BrokerRpcService {
         }
     }
 
+    fn validate_generic_session_profile(
+        &self,
+        terms: &bloom_broker_api::SealedApprovalTerms,
+    ) -> Result<(), ProtocolError> {
+        if terms
+            .session_budget
+            .as_ref()
+            .is_none_or(|b| b.usd_policy.is_none())
+            || !matches!(terms.subject, ApprovalSubject::Petal { .. })
+        {
+            return Ok(());
+        }
+        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
+            .iter()
+            .copied()
+            .chain([bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS])
+            .chain(
+                bloom_broker_api::PUMPFUN_REVIEW_OPERATION_CLASSES
+                    .iter()
+                    .copied(),
+            )
+        {
+            if self
+                .authority
+                .subject_declares_operation_class(&terms.subject, class)
+                .map_err(authority_error)?
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::EffectsUnsupported,
+                    "This installed Petal retains its existing stronger approval profile; generic USD sessions cannot bypass it",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn prepare_approval(
         &self,
         request: ApprovalPrepareRequest,
     ) -> Result<SealedApprovalPrepareResponse, ProtocolError> {
-        if matches!(
-            request.terms.selector,
-            ApprovalSelector::SystemSession { .. }
-        ) {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::SelectorMismatch,
-                "native sessions require exact approval",
-            ));
-        }
         if request.petal_use_claim.is_some() && request.system_use_claim.is_some() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
                 "an approval cannot bind both Petal and system claims",
             ));
         }
+        self.validate_generic_session_profile(&request.terms)?;
         self.reconcile_wallet(&request.terms.wallet_id).await?;
         let mut context = ReviewManifestContext::default();
         let native_evm =
@@ -845,11 +943,21 @@ impl BrokerRpcService {
             }
         }
         match &request.terms.selector {
-            ApprovalSelector::SystemSession { .. } => {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::SelectorMismatch,
-                    "native sessions require exact approval",
-                ));
+            ApprovalSelector::SystemSession { scope } => {
+                scope.validate()?;
+                crate::system_session::validate_solana_scope_live(scope).await?;
+                if request
+                    .terms
+                    .session_budget
+                    .as_ref()
+                    .and_then(|b| b.usd_policy.as_ref())
+                    .is_none()
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "native sessions require a reviewed USD pool",
+                    ));
+                }
             }
             ApprovalSelector::Exact { .. } => {
                 if message_petal && request.message_review_payloads.is_empty() {
@@ -1278,6 +1386,7 @@ impl BrokerRpcService {
                 ProtocolError::new(ProtocolErrorCode::ApprovalNotFound, "approval not found")
             })?;
         terms.validate()?;
+        self.validate_generic_session_profile(&terms)?;
         if terms.session_budget.is_some()
             || matches!(terms.selector, ApprovalSelector::SystemSession { .. })
         {
@@ -1334,7 +1443,12 @@ impl BrokerRpcService {
         // the only layer that can: authority is synchronous and journal-
         // backed, while the account projection comes from the Signer.
         let expected_signer_public_key = self.resolve_terms_signer_public_key(&terms).await?;
-        let polymarket_session = terms.session_budget.is_some();
+        let polymarket_session = terms.session_budget.is_some()
+            && matches!(terms.subject, ApprovalSubject::Petal { .. })
+            && self
+                .authority
+                .subject_declares_operation_class(&terms.subject, "polymarket.order.poly1271")
+                .map_err(authority_error)?;
         if clob_auth || hyperliquid_agent || pump_review || polymarket_session {
             let response = self
                 .signer
@@ -1394,10 +1508,111 @@ impl BrokerRpcService {
                 }
             }
         }
+        let solana_observation = if let Some(use_) = request
+            .session_use
+            .as_ref()
+            .filter(|u| matches!(u.chain, bloom_broker_api::SystemSessionChain::Solana { .. }))
+        {
+            let payload = match &request.payloads {
+                SigningPayloads::Single { payload } => payload.decode(),
+                SigningPayloads::Batch { children } if children.len() == 1 => children[0].decode(),
+                _ => {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "Native SOL requires one payload",
+                    ));
+                }
+            };
+            Some(
+                crate::system_session::verify_solana_live(
+                    &payload,
+                    request.crypto_suite,
+                    use_,
+                    request.system_use_claim.as_ref().ok_or_else(|| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::ClaimInvalid,
+                            "Native SOL requires system claim",
+                        )
+                    })?,
+                    &expected_signer_public_key.ok_or_else(|| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::KeyrefMismatch,
+                            "Native SOL requires exact signer public key",
+                        )
+                    })?,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let mut newly_priced = false;
+        let mut session_valuation = if let Some(budget) = terms
+            .session_budget
+            .as_ref()
+            .filter(|b| b.usd_policy.is_some())
+        {
+            let values = if let Some(use_) = &request.session_use {
+                use_.accounting(Some(budget))?.values
+            } else {
+                bloom_broker_api::SessionAccounting::from_petal_claim(
+                    request.petal_use_claim.as_ref().ok_or_else(|| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::EffectsUnsupported,
+                            "USD session needs economic effects",
+                        )
+                    })?,
+                    Some(budget),
+                )?
+                .values
+            };
+            Some(
+                if let Some(stored) = self
+                    .journal
+                    .session_valuation(&request.approval_id, &request.operation_id)
+                    .map_err(journal_error)?
+                {
+                    stored
+                } else {
+                    if self
+                        .journal
+                        .operation(&request.operation_id)
+                        .map_err(journal_error)?
+                        .is_some()
+                    {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::ServiceUnavailable,
+                            "Existing session operation needs reconciliation",
+                        ));
+                    }
+                    newly_priced = true;
+                    crate::session_pricing::valuation(budget, &values, reserved_at_ms).await?
+                },
+            )
+        } else {
+            None
+        };
+        let clock = self.clock.observe(trusted_time_required)?;
+        let reserved_at_ms = clock.effective_now_ms;
+        if newly_priced {
+            if let Some(valuation) = session_valuation.as_mut() {
+                valuation.accepted_at_ms = DecimalU64::new(reserved_at_ms);
+            }
+        }
+        if let Some(observation) = &solana_observation {
+            observation.ensure_fresh()?;
+            tracing::debug!(
+                event = "session.solana_observed",
+                fee_lamports = observation.fee_lamports,
+                context_slot = observation.context_slot,
+                "Native SOL facts verified before reservation"
+            );
+        }
         let decision = self
             .authority
             .authorize_for_clock_profile(
                 &AuthorizationInput {
+                    session_valuation,
                     request: request.clone(),
                     expected_signer_public_key,
                     reserved_at_ms,
@@ -1421,7 +1636,19 @@ impl BrokerRpcService {
                 .system_use_claim
                 .as_ref()
                 .map(jcs_digest)
-                .transpose()?);
+                .transpose()?)
+            .or(
+                if request.petal_use_claim.is_none() && request.system_use_claim.is_none() {
+                    request
+                        .session_use
+                        .as_ref()
+                        .map(bloom_broker_api::session_native_claim_digests)
+                        .transpose()?
+                        .map(|pair| pair.0)
+                } else {
+                    None
+                },
+            );
         let assurance_digest = request
             .petal_use_claim
             .as_ref()
@@ -1431,7 +1658,19 @@ impl BrokerRpcService {
                 .system_use_claim
                 .as_ref()
                 .map(|claim| jcs_digest(&claim.claim_assurance))
-                .transpose()?);
+                .transpose()?)
+            .or(
+                if request.petal_use_claim.is_none() && request.system_use_claim.is_none() {
+                    request
+                        .session_use
+                        .as_ref()
+                        .map(bloom_broker_api::session_native_claim_digests)
+                        .transpose()?
+                        .map(|pair| pair.1)
+                } else {
+                    None
+                },
+            );
         let mut validation_receipt = BrokerValidationReceipt {
             approval_id: request.approval_id.clone(),
             approval_digest: terms.approval_digest()?,
@@ -1472,10 +1711,10 @@ impl BrokerRpcService {
             issuer_boot_epoch: self.boot_epoch.clone(),
             broker_signing_key_id: self.signing_key_id.clone(),
             approval_id: request.approval_id.clone(),
-            wallet_id: terms.wallet_id,
+            wallet_id: terms.wallet_id.clone(),
             key_ref: translate_key::key_ref_to_signer(request.key_ref),
             crypto_suite: translate_key::crypto_suite_to_signer(request.crypto_suite),
-            selector_kind: translate_signing::selector_to_signer(&terms.selector)?,
+            selector_kind: translate_signing::selector_to_signer(&terms.selector, Some(&terms))?,
             ordered_payload_digests: decision.ordered_payload_digests,
             ordered_hashes: decision.ordered_hashes,
             ordered_messages,
@@ -2395,7 +2634,13 @@ impl BrokerRpcService {
                 .iter()
                 .map(|method| Token::new(method.as_str()))
                 .collect::<Result<_, _>>()?,
-            schemas: vec![Token::new(RPC_ENVELOPE_SCHEMA_V1)?],
+            schemas: vec![
+                Token::new(RPC_ENVELOPE_SCHEMA_V1)?,
+                Token::new("bloom.session-usd/2")?,
+                Token::new("bloom.economic-effects/1")?,
+                Token::new("bloom.keyless-pricing/1")?,
+                Token::new("bloom.native-transfer/1")?,
+            ],
             backends: Vec::new(),
             assurance_verifiers: self
                 .authority
@@ -2720,7 +2965,11 @@ fn authority_error(error: AuthorityError) -> ProtocolError {
                 "REVOCATION_EPOCH_UNRECONCILED" => ProtocolErrorCode::RevocationEpochUnreconciled,
                 "KEYREF_MISMATCH" => ProtocolErrorCode::KeyrefMismatch,
                 "SUITE_NOT_ALLOWED" => ProtocolErrorCode::SuiteNotAllowed,
-                "SELECTOR_MISMATCH" => ProtocolErrorCode::SelectorMismatch,
+                "EFFECTS_UNSUPPORTED" => ProtocolErrorCode::EffectsUnsupported,
+                "POOL_INACTIVE" => ProtocolErrorCode::PoolInactive,
+                "SESSION_SCOPE_MISMATCH" | "SELECTOR_MISMATCH" => {
+                    ProtocolErrorCode::SelectorMismatch
+                }
                 "PROVENANCE_MISMATCH" | "PROVENANCE_REQUIRED" => {
                     ProtocolErrorCode::ProvenanceMismatch
                 }
@@ -3032,7 +3281,7 @@ mod tests {
         assert_ne!(previous_broker.build_digest, current_broker.build_digest);
         assert_eq!(
             bloom_signer_api::SIGNER_API_CURRENT,
-            bloom_broker_api::ProtocolVersion::new(1, 6)
+            bloom_broker_api::ProtocolVersion::new(1, 8)
         );
         validate_signer_readiness(&previous_broker, &previous_signer).unwrap();
         validate_signer_readiness(&current_broker, &current_signer).unwrap();

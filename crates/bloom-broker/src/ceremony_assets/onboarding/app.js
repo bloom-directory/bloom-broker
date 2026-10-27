@@ -200,7 +200,14 @@
     if (!['policy', 'activate', 'stop', 'refresh'].includes(action)) throw new Error('Unknown setup action.');
     if (action === 'stop') { closeReview(); sessionReady = false; }
     notice('Working with your local Bloom…');
-    const result = await api('action', {action});
+    let selection;
+    const file=$('session-selection')?.files?.[0];
+    if(action==='activate' && file){
+      if(file.size>256*1024) throw new Error('Session selection file is too large.');
+      selection=JSON.parse(await file.text());
+      if(!selection || typeof selection!=='object' || Array.isArray(selection)) throw new Error('Invalid session selection file.');
+    }
+    const result = await api('action', {action,...(selection ? {selection} : {})});
     activity(result.stdout || display(result.data ?? result));
     if (action === 'policy') policyApplied = result.data?.state === 'applied' || (result.data?.state === 'nothing_to_allow' && !(state?.config?.petals?.length));
     await refresh();

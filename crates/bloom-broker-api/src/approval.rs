@@ -220,6 +220,9 @@ impl SealedApprovalTerms {
 
         if let Some(budget) = &self.session_budget {
             budget.validate()?;
+            if let Some(usd) = &budget.usd_policy {
+                usd.validate_member(self)?;
+            }
             if matches!(self.selector, ApprovalSelector::Exact { .. })
                 || budget.wallet_id != self.wallet_id
                 || budget.policy_version != self.policy_version
@@ -240,11 +243,17 @@ impl SealedApprovalTerms {
                 ApprovalSubject::System { component_id, .. },
                 ApprovalSelector::SystemSession { scope },
             ) if component_id == &scope.component_id => {
-                let _ = scope;
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::SelectorMismatch,
-                    "native sessions are not supported; use exact approval",
-                ));
+                scope.validate()?;
+                if self
+                    .session_budget
+                    .as_ref()
+                    .is_none_or(|b| b.usd_policy.is_none())
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "native sessions require a reviewed USD policy",
+                    ));
+                }
             }
             (
                 ApprovalSubject::Petal {
@@ -323,6 +332,15 @@ impl SealedApprovalTerms {
             .as_object_mut()
             .expect("approval terms serialize as an object");
         object.remove("session_budget");
+        if let ApprovalSelector::SystemSession { scope } = &self.selector {
+            let operation_class = match &self.subject {
+                ApprovalSubject::System {
+                    operation_class, ..
+                } => operation_class,
+                _ => unreachable!("validated system subject"),
+            };
+            object.insert("selector".into(),serde_json::json!({"kind":"system","component_id":scope.component_id,"allowed_operation_classes":[operation_class]}));
+        }
         object.insert(
             "request_nonce".into(),
             serde_json::to_value(self.signer_request_nonce()?).map_err(|e| {

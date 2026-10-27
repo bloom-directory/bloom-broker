@@ -1,0 +1,15 @@
+# Generic reusable USD sessions
+
+Machine–Broker API 1.10 adds a Broker-owned USD policy to existing Sealed Approvals. Signer API 1.8 adds structural System selectors; it does not receive prices, quantities, or the shared ledger. The dependency includes the post-signature ambiguity fix from Signer #62.
+
+`SealedApprovalTerms.session_budget.usd_policy` identifies the version 2 profile. Existing `nominal_limits`, `nominal_used` and `nominal_remaining` wire names represent integer microdollars for this profile; legacy budgets retain their original nominal accounting. Every reviewed member template, exact account, structural scope and fixed backstop allocation is bound into the descriptor. All members must be active before admission. A stopped pool cannot admit new actions.
+
+Petals opt into economic effects schema 1 in installer-signed operation-class metadata. Claims retain debits, fees and destinations and add complete per-payload network/account contexts plus the continuing-permission classification. Broker trusts those declarations, preserving existing stricter profiles. Polymarket BUY additionally requires its complete independently checked signed-order witness; SELL remains separately approved. Safe, Pump and Hyperliquid packages retain their existing stronger approval profiles rather than entering opaque USD admission.
+
+Pricing is keyless CoinGecko first and DefiLlama fallback, using approved identities and metadata. Quotes are cached/coalesced, bounded to a ten-second aggregate lookup and rejected above fifteen minutes from the provider timestamp. Exact decimal arithmetic rounds gross outgoing principal and maximum wallet costs upward to microdollars. Historical reservations retain their original valuation. Missing pricing requires the existing owner-approval path; stablecoins have no implicit peg.
+
+`session.prices` supplies trusted metadata and review quotes. `sealed_approval.limit_state.session_budget_state` reports shared usage and pool lifecycle. `session.stop` durably fences the pool before revoking members and canceling ceremonies. Reservations and ambiguous signatures remain charged until authoritative no-sign evidence permits release. Authenticated existing audit events bind valuation, quantities, reservation time and lifecycle state.
+
+Initial mappings cover catalogued EVM tokens on Ethereum, Polygon, Base, Arbitrum, Optimism, BSC, Gnosis, Avalanche and Linea, plus pUSD and mainnet SOL/USDC/wSOL. Unknown identities require exact approval. Native verified sessions cover supported Ethereum/Polygon single native/ERC-20 transfers and mainnet SOL transfers. Native SOL independently checks fixed-cluster genesis, signer, recipient, amount, recent blockhash and fees against a release-owned keyless RPC endpoint. Native SPL, L2 fee formats and automatic position-token valuation are deferred.
+
+The onboarding browser accepts an optional session selection file for generic accounts, Petals, assets and native recipients; the default remains the Polymarket reference integration. Review shows dollar limits, fixed raw ceilings, all member scopes and the trusted-claim boundary.

@@ -7,15 +7,32 @@ use super::key;
 
 pub(crate) fn selector_to_signer(
     value: &north::ApprovalSelector,
+    terms: Option<&north::SealedApprovalTerms>,
 ) -> Result<south::SelectorKind, north::ProtocolError> {
     Ok(match value {
         north::ApprovalSelector::Exact { .. } => south::SelectorKind::Exact,
         north::ApprovalSelector::Petal { .. } => south::SelectorKind::Petal,
-        north::ApprovalSelector::SystemSession { .. } => {
-            return Err(north::ProtocolError::new(
-                north::ProtocolErrorCode::SelectorMismatch,
-                "native sessions require exact approval",
-            ));
+        north::ApprovalSelector::SystemSession { scope } => {
+            let terms = terms.ok_or_else(|| {
+                north::ProtocolError::new(
+                    north::ProtocolErrorCode::SelectorMismatch,
+                    "System selector requires terms",
+                )
+            })?;
+            let north::ApprovalSubject::System {
+                operation_class, ..
+            } = &terms.subject
+            else {
+                return Err(north::ProtocolError::new(
+                    north::ProtocolErrorCode::SelectorMismatch,
+                    "System subject required",
+                ));
+            };
+            south::SelectorKind::System {
+                component_id: scope.component_id.clone(),
+                operation_class: operation_class.clone(),
+                provenance_digest: terms.provenance_digest.clone(),
+            }
         }
     })
 }
@@ -77,11 +94,11 @@ mod tests {
             required_claim_assurance: north::ClaimAssuranceLevel::MachineAsserted,
         };
         assert_eq!(
-            selector_to_signer(&exact).unwrap(),
+            selector_to_signer(&exact, None).unwrap(),
             south::SelectorKind::Exact
         );
         assert_eq!(
-            selector_to_signer(&petal).unwrap(),
+            selector_to_signer(&petal, None).unwrap(),
             south::SelectorKind::Petal
         );
     }

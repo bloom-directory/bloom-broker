@@ -62,6 +62,8 @@ pub struct PetalLineageMembership {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceOperationClass {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub economic_effects_schema: Option<u16>,
     pub operation_class: Token,
     pub fee_asset: Option<ProvenanceFeeAsset>,
 }
@@ -192,6 +194,7 @@ mod tests {
             publisher: Token::new("bloom-installer").unwrap(),
             petal_lineage: None,
             operation_classes: vec![ProvenanceOperationClass {
+                economic_effects_schema: None,
                 operation_class: Token::new("transaction.confirm").unwrap(),
                 fee_asset: None,
             }],

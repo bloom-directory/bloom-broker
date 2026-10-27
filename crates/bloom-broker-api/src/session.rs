@@ -46,16 +46,6 @@ pub struct SystemSessionScope {
 }
 impl SystemSessionScope {
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self
-            .chains
-            .iter()
-            .any(|c| matches!(c, SystemSessionChain::Solana { .. }))
-        {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::SelectorMismatch,
-                "reusable Solana sessions require a trusted cluster/freshness gate; use exact approval",
-            ));
-        }
         if self.component_id.as_str() != "bloom-machine"
             || self.actions.is_empty()
             || self.actions.len() > 2
@@ -75,14 +65,53 @@ impl SystemSessionScope {
                     !matches!(chain_id.get(), 1 | 137 | 31337)
                         || chain.as_str() != format!("evm-{}", chain_id.get())
                 }
-                SystemSessionChain::Solana { genesis_hash, .. } => {
-                    genesis_hash.is_empty() || genesis_hash.len() > 64
+                SystemSessionChain::Solana {
+                    chain,
+                    genesis_hash,
+                } => {
+                    chain.as_str() != "solana-mainnet"
+                        || genesis_hash != "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+                        || self.actions != [SystemSessionAction::NativeTransfer]
+                        || self.tokens.iter().any(|t| t.chain == *chain)
                 }
             })
             || self
                 .destinations
                 .iter()
                 .any(|d| !self.chains.iter().any(|c| c.chain() == &d.chain))
+            || self
+                .chains
+                .iter()
+                .enumerate()
+                .any(|(i, c)| self.chains[..i].contains(c))
+            || self
+                .tokens
+                .iter()
+                .enumerate()
+                .any(|(i, t)| self.tokens[..i].contains(t))
+            || self
+                .per_action_value_limits
+                .iter()
+                .enumerate()
+                .any(|(i, c)| {
+                    self.per_action_value_limits[..i]
+                        .iter()
+                        .any(|p| p.asset == c.asset)
+                })
+            || self.chains.iter().any(|chain| {
+                !self
+                    .per_action_value_limits
+                    .iter()
+                    .any(|cap| cap.asset.chain == *chain.chain() && cap.asset.asset == "native")
+            })
+            || self.tokens.iter().any(|token| {
+                !self
+                    .per_action_value_limits
+                    .iter()
+                    .any(|cap| cap.asset == *token)
+            })
+            || (self.actions.contains(&SystemSessionAction::Erc20Transfer)
+                && self.tokens.is_empty())
             || self
                 .per_action_value_limits
                 .iter()
@@ -134,6 +163,8 @@ pub struct SessionNominalLimits {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionBudget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd_policy: Option<crate::SessionUsdPolicy>,
     pub wallet_id: Token,
     pub policy_version: DecimalU64,
     pub policy_digest: Digest32,
@@ -168,7 +199,7 @@ impl SessionBudget {
             || self.nominal_limits.per_action.as_str() == "0"
             || self.nominal_limits.lifetime.as_str() == "0"
             || self.nominal_asset_scales.len() > 128
-            || self.per_action_value_limits.is_empty()
+            || (self.per_action_value_limits.is_empty() && self.usd_policy.is_none())
             || self.per_action_value_limits.len() > 128
             || self
                 .nominal_asset_scales
@@ -198,6 +229,9 @@ impl SessionBudget {
             return Err(invalid("invalid immutable session budget"));
         }
         crate::approval::validate_limits(&self.limits)?;
+        if let Some(usd) = &self.usd_policy {
+            usd.validate(&self.limits)?;
+        }
         if self
             .member_keys
             .iter()
@@ -328,6 +362,8 @@ impl SessionBudget {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionRecordedUse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valuation: Option<crate::SessionValuation>,
     pub accepted_at_ms: u64,
     pub signature_count: u64,
     pub values: Vec<SessionAssetAmount>,
@@ -368,10 +404,41 @@ impl SessionBudget {
         let number = |s: &DecimalU256| {
             BigUint::from_str(s.as_str()).map_err(|_| invalid("invalid budget quantity"))
         };
-        let current_nominal = number(&self.action_nominal_quantity(&current.values)?)?;
+        let current_nominal = number(&self.recorded_quantity(current)?)?;
+        if current_nominal > number(&self.nominal_limits.per_action)? {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::LimitExceededValue,
+                "session USD per-action ceiling exceeded",
+            ));
+        }
+        if self.usd_policy.is_some() {
+            let v = current
+                .valuation
+                .as_ref()
+                .ok_or_else(|| invalid("missing valuation"))?;
+            if v.accepted_at_ms.get() > current.accepted_at_ms
+                || current.accepted_at_ms - v.accepted_at_ms.get() > 10_000
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::PriceStale,
+                    "quote acceptance expired before reservation",
+                ));
+            }
+            for q in &v.quotes {
+                if q.timestamp_ms.get() > current.accepted_at_ms.saturating_add(5000)
+                    || current.accepted_at_ms.saturating_sub(q.timestamp_ms.get())
+                        > crate::SESSION_QUOTE_MAX_AGE_MS
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::PriceStale,
+                        "price expired before reservation",
+                    ));
+                }
+            }
+        }
         let mut nominal = current_nominal.clone();
         for p in previous {
-            nominal += number(&self.action_nominal_quantity(&p.values)?)?;
+            nominal += number(&self.recorded_quantity(p)?)?;
         }
         if nominal > number(&self.nominal_limits.lifetime)? {
             return Err(ProtocolError::new(
@@ -383,7 +450,7 @@ impl SessionBudget {
             let start = current.accepted_at_ms.saturating_sub(w.duration_ms.get());
             let mut total = current_nominal.clone();
             for p in previous.iter().filter(|p| p.accepted_at_ms > start) {
-                total += number(&self.action_nominal_quantity(&p.values)?)?;
+                total += number(&self.recorded_quantity(p)?)?;
             }
             if total > number(&w.maximum)? {
                 return Err(ProtocolError::new(
@@ -591,6 +658,7 @@ mod tests {
     }
     fn budget() -> SessionBudget {
         SessionBudget {
+            usd_policy: None,
             wallet_id: token("main"),
             policy_version: DecimalU64::new(1),
             policy_digest: Digest32::from_bytes([1; 32]),
@@ -652,6 +720,7 @@ mod tests {
     }
     fn use_(name: &str, quantity: &str, time: u64) -> SessionRecordedUse {
         SessionRecordedUse {
+            valuation: None,
             accepted_at_ms: time,
             signature_count: 1,
             values: vec![SessionAssetAmount {
@@ -753,6 +822,8 @@ pub struct SessionWindowState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionBudgetState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_state: Option<crate::SessionPoolState>,
     pub budget_id: Digest32,
     pub observed_at_ms: DecimalU64,
     pub operations: DecimalU64,
@@ -782,7 +853,7 @@ impl SessionBudget {
         let mut signatures = 0u64;
         let mut values = Vec::new();
         for p in previous {
-            total += n(&self.action_nominal_quantity(&p.values)?)?;
+            total += n(&self.recorded_quantity(p)?)?;
             signatures = signatures
                 .checked_add(p.signature_count)
                 .ok_or_else(|| invalid("session signature usage overflow"))?;
@@ -802,7 +873,7 @@ impl SessionBudget {
                 .iter()
                 .filter(|p| p.accepted_at_ms > now.saturating_sub(w.duration_ms.get()))
             {
-                used += n(&self.action_nominal_quantity(&p.values)?)?;
+                used += n(&self.recorded_quantity(p)?)?;
             }
             windows.push(SessionWindowState {
                 duration_ms: w.duration_ms.clone(),
@@ -812,6 +883,7 @@ impl SessionBudget {
             });
         }
         Ok(SessionBudgetState {
+            pool_state: None,
             budget_id: self.budget_id()?,
             observed_at_ms: DecimalU64::new(now),
             operations: DecimalU64::new(previous.len() as u64),
@@ -874,5 +946,20 @@ fn native_session_scope_refuses_unpriced_layer_two_fees_and_sol_freshness() {
         chain: Token::new("solana").unwrap(),
         genesis_hash: "genesis".into(),
     }];
-    assert!(scope.validate().unwrap_err().message.contains("freshness"));
+    assert!(scope.validate().is_err());
+    scope.chains = vec![SystemSessionChain::Solana {
+        chain: Token::new("solana-mainnet").unwrap(),
+        genesis_hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d".into(),
+    }];
+    scope.destinations[0].chain = Token::new("solana-mainnet").unwrap();
+    scope.per_action_value_limits[0].asset.chain = Token::new("solana-mainnet").unwrap();
+    scope.validate().unwrap();
+    scope.actions.push(SystemSessionAction::Erc20Transfer);
+    assert!(scope.validate().is_err());
+    scope.actions.pop();
+    scope.tokens.push(AssetId {
+        chain: Token::new("solana-mainnet").unwrap(),
+        asset: "mint".into(),
+    });
+    assert!(scope.validate().is_err());
 }

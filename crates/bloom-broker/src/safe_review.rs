@@ -966,6 +966,7 @@ mod tests {
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
         let mut request = request(envelope());
         let claim = PetalUseClaim {
+            economic_effects: None,
             package_hash: Digest32::from_bytes([1; 32]),
             route: "transactions/a/b/confirm.json".into(),
             operation_class: token(SAFE_CONFIRM_OPERATION_CLASS),
@@ -981,6 +982,7 @@ mod tests {
         request.petal_use_claim = Some(claim.clone());
         assert!(review(&request, &policy(), from).unwrap().is_some());
         request.petal_use_claim = Some(PetalUseClaim {
+            economic_effects: None,
             declared_destinations: vec![DeclaredDestination {
                 chain: token("evm-31337"),
                 destination: "0x4000000000000000000000000000000000000000".into(),

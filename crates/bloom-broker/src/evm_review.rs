@@ -1039,6 +1039,7 @@ pub(crate) mod tests {
         };
         let mut req = request(&tx.encoded_for_signing());
         req.petal_use_claim = Some(PetalUseClaim {
+            economic_effects: None,
             package_hash: Digest32::from_bytes([9; 32]),
             route: "orders/place".into(),
             operation_class: Token::new("transaction.confirm").unwrap(),

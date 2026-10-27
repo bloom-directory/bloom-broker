@@ -5484,6 +5484,35 @@ fn canonical_review_plan(
             let mut terms = serde_json::to_value(&request.terms).map_err(malformed)?;
             if let Some(budget) = session_budget {
                 terms["session_budget"] = serde_json::to_value(budget).map_err(malformed)?;
+                if matches!(
+                    request.terms.selector,
+                    bloom_signer_api::ApprovalSelector::System { .. }
+                ) {
+                    let policy = budget.usd_policy.as_ref().ok_or_else(|| {
+                        protocol(
+                            ProtocolErrorCode::SelectorMismatch,
+                            "System review requires USD member templates",
+                        )
+                    })?;
+                    let template = policy
+                        .member_templates
+                        .iter()
+                        .find(|template| {
+                            let mut projected = (*template).clone();
+                            projected.session_budget = Some(budget.clone());
+                            projected
+                                .signer_request_nonce()
+                                .is_ok_and(|nonce| nonce == request.terms.request_nonce)
+                        })
+                        .ok_or_else(|| {
+                            protocol(
+                                ProtocolErrorCode::SelectorMismatch,
+                                "System review cannot locate exact bound member scope",
+                            )
+                        })?;
+                    terms["selector"] =
+                        serde_json::to_value(&template.selector).map_err(malformed)?;
+                }
             }
             terms
         },
@@ -5515,7 +5544,12 @@ fn review_disclosures(
 ) -> Vec<String> {
     let mut disclosures = Vec::new();
     if let Some(budget) = session_budget {
-        disclosures.push(format!("Shared session budget {}: per action {} nominal micro-units, lifetime {} nominal micro-units. Every approved member shares the same counters. Conversion scales are owner-reviewed collateral conventions, not independently verified USD prices.", budget.budget_id().map(|id|id.to_string()).unwrap_or_else(|_|"invalid".into()),budget.nominal_limits.per_action.as_str(),budget.nominal_limits.lifetime.as_str()));
+        if budget.usd_policy.is_some() {
+            disclosures.push(format!("Shared USD authorization budget {}: per action {} microdollars; lifetime {} microdollars. Gross outgoing assets and maximum wallet costs consume capacity; incoming funds do not replenish it. Keyless CoinGecko first, DefiLlama fallback, provider quotes at most 15 minutes old. Prices may lag market moves. Unpriced actions require separate approval.",budget.budget_id().map(|id|id.to_string()).unwrap_or_default(),budget.nominal_limits.per_action.as_str(),budget.nominal_limits.lifetime.as_str()));
+            disclosures.push("Trusted Petal/Machine claims are not independent verification of spending. A dishonest Petal or compromised Broker can misreport economic effects. Signer limits signature volume and duration, not dollars. Existing external permissions and spending are not contained by this budget.".into());
+        } else {
+            disclosures.push(format!("Shared nominal session budget {}: per action {}; lifetime {}. Owner-reviewed conversion conventions are not USD prices.",budget.budget_id().map(|id|id.to_string()).unwrap_or_default(),budget.nominal_limits.per_action.as_str(),budget.nominal_limits.lifetime.as_str()));
+        }
         for scale in &budget.nominal_asset_scales {
             disclosures.push(format!(
                 "Covered collateral: {} on {}, {} raw units per nominal unit.",
@@ -5526,7 +5560,7 @@ fn review_disclosures(
         }
         for window in &budget.nominal_limits.rolling_windows {
             disclosures.push(format!(
-                "Shared rolling ceiling: {} nominal micro-units per {} milliseconds.",
+                "Shared rolling accounting ceiling: {} micro-units per {} milliseconds.",
                 window.maximum.as_str(),
                 window.duration_ms.get()
             ));

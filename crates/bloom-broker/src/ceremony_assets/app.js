@@ -1226,8 +1226,9 @@ function describePetalApproval(manifest) {
   try { plan = JSON.parse(manifest?.canonical_plan || "{}"); } catch (_) { return null; }
   const terms = plan?.terms;
   const selector = terms?.selector;
-  if (selector?.kind !== "petal" && selector?.kind !== "system_session") return null;
+  if (selector?.kind !== "petal" && selector?.kind !== "system_session" && selector?.kind !== "system") return null;
   const budget = terms?.session_budget;
+  const usd = Boolean(budget?.usd_policy);
   const nominal = value => {
     const digits = String(value || "0").padStart(7,"0");
     return `${digits.slice(0,-6)}.${digits.slice(-6)}`;
@@ -1235,13 +1236,15 @@ function describePetalApproval(manifest) {
   const budgetFacts = budget ? [
     ["Budget identity", plan.session_budget_id, true],
     ["Shared budget", "These caps are shared by every approved grant and account in this budget, not granted again to each app"],
-    ["Per action", `${nominal(budget.nominal_limits?.per_action)} nominal stablecoin collateral units`],
-    ["Total", `${nominal(budget.nominal_limits?.lifetime)} nominal stablecoin collateral units`],
-    ...(budget.nominal_limits?.rolling_windows || []).map(w => ["Rolling cap", `${nominal(w.maximum)} nominal units per ${w.duration_ms} ms`]),
-    ["Covered assets", (budget.nominal_asset_scales || []).map(v => `${v.asset?.asset} on ${v.asset?.chain}: ${v.units_per_nominal_unit} base units per nominal unit`).join("; ")],
+    ["Per action", usd ? `$${nominal(budget.nominal_limits?.per_action)} USD` : `${nominal(budget.nominal_limits?.per_action)} nominal stablecoin collateral units`],
+    ["Total", usd ? `$${nominal(budget.nominal_limits?.lifetime)} USD` : `${nominal(budget.nominal_limits?.lifetime)} nominal stablecoin collateral units`],
+    ...(budget.nominal_limits?.rolling_windows || []).map(w => ["Rolling cap", `${usd ? "$" : ""}${nominal(w.maximum)} ${usd ? "USD" : "nominal units"} per ${w.duration_ms} ms`]),
+    ["Covered assets", usd ? (budget.usd_policy.assets || []).map(v=>`${v.asset?.asset} on ${v.asset?.chain} (${v.decimals} decimals)`).join("; ") : (budget.nominal_asset_scales || []).map(v => `${v.asset?.asset} on ${v.asset?.chain}: ${v.units_per_nominal_unit} base units per nominal unit`).join("; ")],
     ["Separate asset caps", (budget.limits?.value_limits || []).map(v => `${v.lifetime} raw units of ${v.asset?.asset} on ${v.asset?.chain}`).join("; ")],
     ["Member keys", (budget.member_keys || []).map(k => k.public_key_fingerprint).join(", "), true],
-    ["Accounting", "Owner-reviewed nominal collateral conversion, not a current USD price or guarantee against depegging. Unknown assets require a separate exact approval."]
+    ...(usd ? [["Pool operation/signature backstops", `${budget.limits?.max_operations} operations; ${budget.limits?.max_signatures} signatures; operation rates ${canonicalJson(budget.limits?.operation_rate_limits || [])}; signature rates ${canonicalJson(budget.limits?.signature_rate_limits || [])}`], ["Fixed member backstop allocations", canonicalJson(budget.usd_policy.member_backstop_allocations), true]] : []),
+    ["Accounting", usd ? "Gross authorized outflows plus maximum wallet-paid costs. Incoming funds do not replenish capacity. CoinGecko first, DefiLlama fallback; provider quotes at most 15 minutes old. Unknown or unpriced assets require separate approval." : "Owner-reviewed nominal collateral conversion, not a current USD price or guarantee against depegging. Unknown assets require a separate exact approval."],
+    ...(usd ? [["All reviewed member scopes", (budget.usd_policy.member_templates || []).map(t=>{const s=t.selector || {}; const scope=s.scope || {}; return `${t.key_ref?.derivation?.path || t.key_ref?.public_key_fingerprint}: ${t.subject?.kind} ${t.subject?.route || t.subject?.operation_class || ""}; package ${t.subject?.package_hash || "native System"}; provenance ${t.provenance_digest}; suites ${(t.allowed_crypto_suites || []).join(", ")}; route grants ${canonicalJson(s.route_grants || [])}; actions ${(s.allowed_operation_classes || scope.actions || []).join(", ")}; networks ${(scope.chains || []).map(c=>c.chain).join(", ") || "declared priced assets"}; recipients ${(scope.destinations || []).map(d=>d.destination+" on "+d.chain).join(", ") || "Petal declared destinations"}; member raw caps ${canonicalJson(scope.per_action_value_limits || [])}`;}).join("\n"), true], ["Fixed raw per-action caps",canonicalJson(budget.per_action_value_limits),true], ["Trust boundary","Broker trusts the pinned Petal and Machine to declare all spending and continuing authority. Signer bounds signature volume and duration, not dollars."]] : [])
   ] : [];
   const wallTime = value => Number.isFinite(Number(value)) && Number(value)>0 ? new Date(Number(value)).toISOString() : "See signed approval terms";
   const lifetimeFacts = [
@@ -1249,13 +1252,13 @@ function describePetalApproval(manifest) {
     ["Expires", wallTime(terms.expires_at_ms)],
     ["Activation", terms.activation_mode?.kind === "boot_bound" ? "Bound to the active Signer process. Signing stops after logout or service restart. This screen does not rearm it; end the old session and review a new session with its separately reviewed budget. Old accounting records remain stored." : canonicalJson(terms.activation_mode)]
   ];
-  if (selector?.kind === "system_session") {
-    const scope=selector.scope || {};
+  if (selector?.kind === "system_session" || selector?.kind === "system") {
+    const scope=selector.scope || budget?.usd_policy?.member_templates?.find(t=>t.subject?.kind==="system" && t.key_ref?.public_key_fingerprint===terms.key_ref?.public_key_fingerprint && t.subject?.operation_class===terms.subject?.operation_class)?.selector?.scope || {};
     return {
       title: "Activate bounded transfer session", button: "Activate session",
       sentence: "Allow repeated transfers within the exact accounts, assets, recipients, time and budget shown below. Matching transfers will not ask for another passkey approval.",
       facts: [["Actions",(scope.actions || []).join(", ")],["Chains",(scope.chains || []).map(c=>`${c.chain} (${c.chain_id || c.genesis_hash})`).join("; ")],["Recipients",(scope.destinations || []).map(d=>`${d.destination} on ${d.chain}`).join("; "),true],["Per-action asset ceilings",(scope.per_action_value_limits || []).map(v=>`${v.maximum} raw units of ${v.asset?.asset} on ${v.asset?.chain}`).join("; ")],["Operation limit",terms?.limits?.max_operations],...budgetFacts,...lifetimeFacts],
-      warning: "Bloom decodes supported transfer bytes at signing. Token contract effects and nominal dollar value are not independently guaranteed. Anything outside this scope requires a new approval."
+      warning: "Bloom decodes supported transfer bytes at signing. Token contract effects and market prices are not independently guaranteed. Anything outside this scope requires a new approval."
     };
   }
   const classes = Array.isArray(selector.allowed_operation_classes)
@@ -1269,12 +1272,14 @@ function describePetalApproval(manifest) {
   const operations = Number(terms?.limits?.max_operations);
   const operationLimit = Number.isSafeInteger(operations) && operations > 0
     ? `Up to ${operations} signed actions` : "Limited by the session rules";
-  // The Broker sums every debit and fee per asset against these ceilings and
-  // refuses any asset without one, so "none" means nothing can be spent.
+  // Legacy raw-unit ceilings and the versioned shared USD policy have
+  // different display semantics; an absent optional raw cap is not zero USD authority.
   const ceilings = (Array.isArray(plan.asset_amounts) ? plan.asset_amounts : [])
     .filter(amount => amount.kind === "value_limit")
     .map(amount => amount.display);
-  const spending = ceilings.length
+  const spending = usd
+    ? "Gross spending up to the shared USD caps below, including maximum wallet-paid costs, with fixed raw-token caps where present"
+    : ceilings.length
     ? `Up to ${naturalList(ceilings)} in total across the whole session, counting fees and any funds sent back to your wallet`
     : "None — Bloom will refuse any action that spends funds or pays a fee";
   return {
@@ -1286,7 +1291,7 @@ function describePetalApproval(manifest) {
       ["Package", packageHash, true],
       ["Can", naturalList(actions)],
       ["Limit", operationLimit],
-      ["Spending ceiling", spending],
+      [usd ? "Shared spending authority" : "Spending ceiling", spending],
       ["Main wallet key", "Stays inside Bloom"],
       ...budgetFacts,
       ...lifetimeFacts

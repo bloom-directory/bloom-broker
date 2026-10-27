@@ -269,6 +269,17 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
         operation_id: operation(30),
     };
     vec![
+        MachineBrokerRequest::SessionPrices(SessionPricesRequest {
+            assets: vec![AssetId {
+                chain: token("evm-1"),
+                asset: "native".into(),
+            }],
+        }),
+        MachineBrokerRequest::SessionStop(SessionStopRequest {
+            budget_id: digest(76),
+            operation_id: operation(77),
+            reason: "owner stopped".into(),
+        }),
         MachineBrokerRequest::SystemHello(historical_hello()),
         MachineBrokerRequest::BrokerReadiness(Empty {}),
         MachineBrokerRequest::BrokerCapabilities(Empty {}),
@@ -478,6 +489,15 @@ fn machine_responses() -> Vec<MachineBrokerResponse> {
         signer_contribution_digest: digest(55),
     };
     vec![
+        MachineBrokerResponse::SessionPrices(SessionPricesResponse {
+            assets: vec![],
+            quotes: vec![],
+        }),
+        MachineBrokerResponse::SessionStop(SessionStopResponse {
+            budget_id: digest(76),
+            revoked: vec![],
+            pending: vec![],
+        }),
         MachineBrokerResponse::SystemHello(historical_hello()),
         MachineBrokerResponse::BrokerReadiness(readiness()),
         MachineBrokerResponse::BrokerCapabilities(historical_capabilities()),
@@ -585,21 +605,21 @@ where
 
 #[test]
 fn every_machine_broker_variant_matches_frozen_v1_frames() {
-    // The persona release's 1.9 fixture updates the negotiated version from 1.8.
+    // The generic session release's 1.10 fixture includes keyless pricing and pool stop.
     // Existing optional session fields are omitted from these baseline frames.
     // The signing fixture combines the remote-ceremony methods and
     // surface selection with native and Safe review fields. Empty review
     // vectors remain omitted from pre-existing approval request frames.
-    assert_eq!(MachineBrokerMethod::ALL.len(), 45);
+    assert_eq!(MachineBrokerMethod::ALL.len(), 47);
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "950b2fc2235205a19fa41058e6c14fb00eba4730415e0545830322cf8d6780cb",
+        "da34b01c1f50b172b5a24b58449debb5bbbd6b4bd6188586feba0ffd0a178840",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "7889a9d1f237553511ddcf311543652f4c199aec2a8069950217e5a5feda9128",
+        "8058384af13748202f0beaa2f425d97d82623a9a470db4b1d0d77a7286695a2b",
     );
 }
 

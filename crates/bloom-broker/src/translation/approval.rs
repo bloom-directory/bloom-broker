@@ -45,13 +45,23 @@ fn assurance_to_signer(value: north::ClaimAssuranceLevel) -> south::ClaimAssuran
 
 fn selector_to_signer(
     value: north::ApprovalSelector,
+    subject: &north::ApprovalSubject,
 ) -> Result<south::ApprovalSelector, north::ProtocolError> {
     Ok(match value {
-        north::ApprovalSelector::SystemSession { .. } => {
-            return Err(north::ProtocolError::new(
-                north::ProtocolErrorCode::SelectorMismatch,
-                "native sessions require exact approval",
-            ));
+        north::ApprovalSelector::SystemSession { scope } => {
+            let north::ApprovalSubject::System {
+                operation_class, ..
+            } = subject
+            else {
+                return Err(north::ProtocolError::new(
+                    north::ProtocolErrorCode::SelectorMismatch,
+                    "native selector requires System subject",
+                ));
+            };
+            south::ApprovalSelector::System {
+                component_id: scope.component_id,
+                allowed_operation_classes: vec![operation_class.clone()],
+            }
         }
         north::ApprovalSelector::Exact {
             ordered_payload_digests,
@@ -144,6 +154,7 @@ pub(crate) fn validated_terms_to_signer(
     value: north::SealedApprovalTerms,
 ) -> Result<south::SealedApprovalTerms, north::ProtocolError> {
     let request_nonce = value.signer_request_nonce()?;
+    let selector = selector_to_signer(value.selector.clone(), &value.subject)?;
     Ok(south::SealedApprovalTerms {
         subject: subject_to_signer(value.subject),
         wallet_id: value.wallet_id,
@@ -153,7 +164,7 @@ pub(crate) fn validated_terms_to_signer(
             .into_iter()
             .map(crypto_suite_to_signer)
             .collect(),
-        selector: selector_to_signer(value.selector)?,
+        selector,
         limits: limits_to_signer(value.limits),
         activation_mode: activation_to_signer(value.activation_mode),
         wallet_revocation_epoch: value.wallet_revocation_epoch,
@@ -203,6 +214,7 @@ mod tests {
             }],
         };
         let budget = north::SessionBudget {
+            usd_policy: None,
             wallet_id: token("alice"),
             policy_version: north::DecimalU64::new(1),
             policy_digest: digest(2),

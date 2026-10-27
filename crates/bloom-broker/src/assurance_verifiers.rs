@@ -84,8 +84,8 @@ impl AssuranceVerifier for SolanaSystemTransferVerifier {
         let [debit] = claim.declared_debits.as_slice() else {
             return Err("expected exactly one declared debit".to_owned());
         };
-        if destination.chain.as_str() != "solana"
-            || debit.asset.chain.as_str() != "solana"
+        if !matches!(destination.chain.as_str(), "solana" | "solana-mainnet")
+            || !matches!(debit.asset.chain.as_str(), "solana" | "solana-mainnet")
             || debit.asset.asset != "native"
         {
             return Err(
@@ -144,6 +144,7 @@ mod tests {
 
     fn solana_claim(destination: &str, lamports: u64, digest: [u8; 32]) -> PetalUseClaim {
         PetalUseClaim {
+            economic_effects: None,
             package_hash: Digest32::from_bytes([0x11; 32]),
             route: "transfer.stage.json".to_string(),
             operation_class: Token::new("solana.native-transfer").unwrap(),

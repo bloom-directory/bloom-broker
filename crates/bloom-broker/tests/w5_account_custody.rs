@@ -1875,6 +1875,7 @@ fn system_provenance() -> ProvenanceRecord {
         publisher: Token::new("installer").unwrap(),
         petal_lineage: None,
         operation_classes: vec![ProvenanceOperationClass {
+            economic_effects_schema: None,
             operation_class: Token::new("sign").unwrap(),
             fee_asset: None,
         }],
@@ -2303,6 +2304,7 @@ async fn pump_review_binds_real_signer_to_the_reviewed_transaction() {
         hash.update((payload.len() as u64).to_be_bytes());
         hash.update(payload);
         PetalUseClaim {
+            economic_effects: None,
             package_hash: package.clone(),
             route: route.into(),
             operation_class: class.clone(),
@@ -2488,6 +2490,7 @@ async fn delegated_hyperliquid_witness_is_enforced_over_real_signer_transport() 
         hash.update((bytes.len() as u64).to_be_bytes());
         hash.update(bytes);
         PetalUseClaim {
+            economic_effects: None,
             package_hash: package.clone(),
             route: route.into(),
             operation_class: class.clone(),

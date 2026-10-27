@@ -353,6 +353,7 @@ impl Harness {
             }),
             operation_classes: vec![
                 ProvenanceOperationClass {
+                    economic_effects_schema: None,
                     operation_class: token("transfer"),
                     fee_asset: Some(PolicyAsset {
                         chain: token("ethereum"),
@@ -360,6 +361,7 @@ impl Harness {
                     }),
                 },
                 ProvenanceOperationClass {
+                    economic_effects_schema: None,
                     operation_class: token("authenticate"),
                     fee_asset: None,
                 },
@@ -385,6 +387,7 @@ impl Harness {
             publisher: token("publisher"),
             petal_lineage: None,
             operation_classes: vec![ProvenanceOperationClass {
+                economic_effects_schema: None,
                 operation_class: token("sign"),
                 fee_asset: None,
             }],
@@ -409,6 +412,7 @@ impl Harness {
             publisher: token("bloom-installer"),
             petal_lineage: None,
             operation_classes: vec![ProvenanceOperationClass {
+                economic_effects_schema: None,
                 operation_class: token("solana.native-transfer"),
                 fee_asset: Some(PolicyAsset {
                     chain: token("solana"),
@@ -1071,6 +1075,7 @@ fn petal_scoped_key_is_frozen_to_installer_provenance_and_petal_approvals() {
         route: "/other".into(),
     };
     secondary.operation_classes = vec![ProvenanceOperationClass {
+        economic_effects_schema: None,
         operation_class: token("transfer"),
         fee_asset: None,
     }];
@@ -2568,6 +2573,7 @@ fn solana_input(
     expected_signer_public_key: Option<[u8; 32]>,
 ) -> AuthorizationInput {
     let mut input = AuthorizationInput {
+        session_valuation: None,
         expected_signer_public_key,
         request: MachineSignRequest {
             session_use: None,
@@ -2654,6 +2660,7 @@ fn exact_input(
     payload: &[u8],
 ) -> AuthorizationInput {
     let mut input = AuthorizationInput {
+        session_valuation: None,
         expected_signer_public_key: None,
         request: MachineSignRequest {
             session_use: None,
@@ -2686,6 +2693,7 @@ fn exact_batch_input(
     payloads: &[&[u8]],
 ) -> AuthorizationInput {
     let mut input = AuthorizationInput {
+        session_valuation: None,
         expected_signer_public_key: None,
         request: MachineSignRequest {
             session_use: None,
@@ -2744,6 +2752,7 @@ fn petal_input(
     };
     let claim_nonce = nonce(operation_id.to_bytes()[31]);
     let mut input = AuthorizationInput {
+        session_valuation: None,
         expected_signer_public_key: None,
         request: MachineSignRequest {
             session_use: None,
@@ -2756,6 +2765,7 @@ fn petal_input(
                 payload: Base64UrlBytes::from_bytes(payload),
             },
             petal_use_claim: Some(PetalUseClaim {
+                economic_effects: None,
                 package_hash,
                 route,
                 operation_class: token("transfer"),
@@ -2849,6 +2859,12 @@ fn bind_operation_digest(input: &mut AuthorizationInput, terms: &SealedApprovalT
         .map(|assurance| {
             Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(assurance).unwrap()).into())
         });
+    let (claim_digest, assurance_digest) = if let Some(use_) = &input.request.session_use {
+        let (claim, assurance) = bloom_broker_api::session_native_claim_digests(use_).unwrap();
+        (Some(claim), Some(assurance))
+    } else {
+        (claim_digest, assurance_digest)
+    };
     input.request.operation_digest = TestSignOperationIdentity {
         operation_id: input.request.operation_id.clone(),
         approval_id: input.request.approval_id.clone(),
@@ -3812,4 +3828,434 @@ fn key_stop_admission_rolls_back_and_replay_preserves_fresh_exact() {
         reopened.journal.approval_state(&fresh_id).unwrap(),
         Some(bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony)
     );
+}
+
+#[test]
+fn generic_usd_authority_shares_priced_evm_svm_spending_with_certified_effects() {
+    use bloom_broker_api::{
+        EconomicEffectsV1, SessionBudget, SessionMemberAllocation, SessionNominalLimits,
+        SessionPayloadContext, SessionPermissionEffect, SessionPriceQuote, SessionUsdPolicy,
+        SessionValuation, approved_session_asset, session_member_scope_digest,
+        session_pricing_policy_digest,
+    };
+    let harness = Harness::new();
+    let policy = CanonicalWalletPolicy {
+        wallet_id: harness.wallet.clone(),
+        maximum_approval_lifetime_ms: 100_000,
+        allowed_petal_packages: vec![digest(8), digest(9)],
+        allowed_destinations: vec![],
+        required_verifiers: vec![],
+        clear_signing: None,
+    };
+    let snapshot = signed_policy_snapshot(&harness, 2, &policy);
+    harness.authority.install_policy(&snapshot).unwrap();
+    let pusd = AssetId {
+        chain: token("evm-137"),
+        asset: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb".into(),
+    };
+    let pol = AssetId {
+        chain: token("evm-137"),
+        asset: "native".into(),
+    };
+    let sol = AssetId {
+        chain: token("solana-mainnet"),
+        asset: "native".into(),
+    };
+    let svm_token = AssetId {
+        chain: token("solana-mainnet"),
+        asset: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+    };
+    let mut provenances = vec![];
+    let mut templates = vec![];
+    for svm in [false, true] {
+        let mut provenance = harness.provenance();
+        provenance.subject = ProvenanceSubject::Petal {
+            package_hash: digest(if svm { 8 } else { 9 }),
+            route: "/sign".into(),
+        };
+        provenance.petal_lineage = None;
+        provenance.operation_classes = vec![ProvenanceOperationClass {
+            economic_effects_schema: Some(1),
+            operation_class: token(if svm { "svm.swap" } else { "evm.swap" }),
+            fee_asset: Some(PolicyAsset {
+                chain: if svm {
+                    sol.chain.clone()
+                } else {
+                    pol.chain.clone()
+                },
+                asset: "native".into(),
+            }),
+        }];
+        sign_zeroed(
+            &mut provenance,
+            |p| &mut p.installer_signature,
+            PROVENANCE_DOMAIN,
+            &harness.installer_key,
+        );
+        let mut terms = petal_terms(&harness, &provenance);
+        terms.policy_version = snapshot.version.clone();
+        terms.policy_digest = snapshot.policy_digest.clone();
+        terms.limits.value_limits.clear();
+        if svm {
+            terms.key_ref.key_spec = KeySpec::Ed25519;
+            terms.key_ref.locator = "svm-key".into();
+            terms.key_ref.public_key_fingerprint = digest(88);
+        }
+        terms.allowed_crypto_suites = vec![if svm {
+            CryptoSuite::Ed25519Message
+        } else {
+            CryptoSuite::Secp256k1Sha256Recoverable
+        }];
+        if let ApprovalSelector::Petal {
+            allowed_operation_classes,
+            ..
+        } = &mut terms.selector
+        {
+            *allowed_operation_classes =
+                vec![provenance.operation_classes[0].operation_class.clone()];
+        }
+        provenances.push(provenance);
+        templates.push(terms);
+    }
+    let mut paired = templates
+        .iter()
+        .cloned()
+        .map(|t| (session_member_scope_digest(&t).unwrap(), t))
+        .collect::<Vec<_>>();
+    paired.sort_by_key(|(d, _)| d.as_str().to_owned());
+    let budget = SessionBudget {
+        usd_policy: Some(SessionUsdPolicy {
+            schema_version: 2,
+            budget_nonce: nonce(90),
+            member_scope_digests: paired.iter().map(|(d, _)| d.clone()).collect(),
+            member_templates: paired.iter().map(|(_, t)| t.clone()).collect(),
+            member_backstop_allocations: paired
+                .iter()
+                .map(|(d, t)| SessionMemberAllocation {
+                    scope_digest: d.clone(),
+                    limits: t.limits.clone(),
+                })
+                .collect(),
+            assets: vec![
+                approved_session_asset(&pusd).unwrap(),
+                approved_session_asset(&pol).unwrap(),
+                approved_session_asset(&sol).unwrap(),
+                approved_session_asset(&svm_token).unwrap(),
+            ],
+            pricing_policy_digest: session_pricing_policy_digest(),
+        }),
+        wallet_id: harness.wallet.clone(),
+        policy_version: snapshot.version.clone(),
+        policy_digest: snapshot.policy_digest.clone(),
+        wallet_revocation_epoch: DecimalU64::new(0),
+        member_keys: templates.iter().map(|t| t.key_ref.clone()).collect(),
+        limits: ApprovalLimits {
+            max_operations: DecimalU64::new(8),
+            max_signatures: DecimalU64::new(8),
+            operation_rate_limits: vec![],
+            signature_rate_limits: vec![],
+            value_limits: vec![],
+        },
+        nominal_asset_scales: vec![],
+        nominal_limits: SessionNominalLimits {
+            per_action: DecimalU256::parse("2000000").unwrap(),
+            lifetime: DecimalU256::parse("1150000").unwrap(),
+            rolling_windows: vec![],
+        },
+        per_action_value_limits: vec![],
+        not_before_ms: DecimalU64::new(1000),
+        expires_at_ms: DecimalU64::new(2000),
+    };
+    for terms in &mut templates {
+        terms.session_budget = Some(budget.clone());
+    }
+    for (i, terms) in templates.iter().enumerate() {
+        let id = harness
+            .authority
+            .prepare_approval(terms, &digest(7))
+            .unwrap();
+        let grant = harness.signed_grant(terms, id, operation(80 + i as u8));
+        harness.authority.activate_approval(&grant, 1500).unwrap();
+    }
+    let make_input = |index: usize, op: u8| {
+        let terms = &templates[index];
+        let svm = index == 1;
+        let suite = terms.allowed_crypto_suites[0];
+        let mut input = petal_input(terms, &provenances[index], operation(op), suite);
+        let claim = input.request.petal_use_claim.as_mut().unwrap();
+        claim.operation_class = provenances[index].operation_classes[0]
+            .operation_class
+            .clone();
+        claim.declared_destinations.clear();
+        claim.declared_debits = vec![DeclaredDebit {
+            asset: if svm { svm_token.clone() } else { pusd.clone() },
+            amount: DecimalU256::parse(if svm { "100000" } else { "1000000" }).unwrap(),
+        }];
+        claim.declared_fee = DeclaredFee::Fee {
+            chain: if svm {
+                sol.chain.clone()
+            } else {
+                pol.chain.clone()
+            },
+            asset: "native".into(),
+            amount: DecimalU256::parse(if svm { "5000" } else { "10000000000000000" }).unwrap(),
+        };
+        claim.economic_effects = Some(EconomicEffectsV1 {
+            schema_version: 1,
+            payload_contexts: vec![SessionPayloadContext {
+                payload_index: 0,
+                network: if svm {
+                    sol.chain.clone()
+                } else {
+                    pusd.chain.clone()
+                },
+                spending_accounts: vec![terms.key_ref.clone()],
+            }],
+            permission_effect: SessionPermissionEffect::None,
+        });
+        let quote = |asset: AssetId, price: &str| SessionPriceQuote {
+            asset,
+            price_usd: price.into(),
+            provider: token("coingecko"),
+            timestamp_ms: DecimalU64::new(1500),
+        };
+        input.session_valuation = Some(SessionValuation {
+            accepted_at_ms: DecimalU64::new(1500),
+            quotes: if svm {
+                vec![quote(svm_token.clone(), "1"), quote(sol.clone(), "100")]
+            } else {
+                vec![quote(pusd.clone(), "1"), quote(pol.clone(), "0.1")]
+            },
+            usd_microdollars: DecimalU256::parse(if svm { "100500" } else { "1001000" }).unwrap(),
+        });
+        bind_operation_digest(&mut input, terms);
+        input
+    };
+    let first = make_input(0, 91);
+    for permission in [false, true] {
+        let mut changed = first.clone();
+        let effects = changed
+            .request
+            .petal_use_claim
+            .as_mut()
+            .unwrap()
+            .economic_effects
+            .as_mut()
+            .unwrap();
+        if permission {
+            effects.permission_effect = SessionPermissionEffect::RequiresSeparateApproval;
+        } else {
+            effects.payload_contexts.clear();
+        }
+        bind_operation_digest(&mut changed, &templates[0]);
+        assert!(harness.authority.authorize(&changed).is_err());
+    }
+    let decision = harness.authority.authorize(&first).unwrap();
+    assert_eq!(
+        decision.reserved_values[&format!("{}:{}", pusd.chain.as_str(), pusd.asset)].as_str(),
+        "1000000"
+    );
+    let second = make_input(1, 92);
+    harness.authority.authorize(&second).unwrap();
+    assert_eq!(
+        harness
+            .journal
+            .session_valuation(&first.request.approval_id, &first.request.operation_id)
+            .unwrap(),
+        first.session_valuation
+    );
+    assert_eq!(
+        harness
+            .journal
+            .session_valuation(&second.request.approval_id, &second.request.operation_id)
+            .unwrap(),
+        second.session_valuation
+    );
+    // Both unrelated Petals share gross costs: $1.001 + $0.1005 leaves $0.0485.
+    assert!(harness.authority.authorize(&make_input(1, 93)).is_err());
+    let mut uncertified = provenances[0].clone();
+    uncertified.operation_classes[0].economic_effects_schema = None;
+    sign_zeroed(
+        &mut uncertified,
+        |p| &mut p.installer_signature,
+        PROVENANCE_DOMAIN,
+        &harness.installer_key,
+    );
+    harness.authority.install_provenance(&uncertified).unwrap();
+    assert!(harness.authority.authorize(&make_input(0, 94)).is_err());
+    harness.journal.verify_audit_chain().unwrap();
+}
+
+#[test]
+fn native_evm_usd_authority_binds_structural_scope_bytes_and_operation_identity() {
+    use alloy::{
+        consensus::{SignableTransaction, TxLegacy},
+        primitives::{Address, TxKind, U256},
+    };
+    use bloom_broker_api::{
+        SessionBudget, SessionMemberAllocation, SessionNominalLimits, SessionPriceQuote,
+        SessionUsdPolicy, SessionValuation, SessionValueCeiling, SystemSessionAction,
+        SystemSessionChain, SystemSessionScope, SystemSessionUse, approved_session_asset,
+        session_member_scope_digest, session_pricing_policy_digest,
+    };
+    let harness = Harness::new();
+    let recipient = Address::repeat_byte(0x11);
+    let native = AssetId {
+        chain: token("evm-1"),
+        asset: "native".into(),
+    };
+    let policy = CanonicalWalletPolicy {
+        wallet_id: harness.wallet.clone(),
+        maximum_approval_lifetime_ms: 100_000,
+        allowed_petal_packages: vec![],
+        allowed_destinations: vec![PolicyDestination {
+            chain: native.chain.clone(),
+            destination: format!("{recipient:#x}"),
+        }],
+        required_verifiers: vec![],
+        clear_signing: None,
+    };
+    let snapshot = signed_policy_snapshot(&harness, 2, &policy);
+    harness.authority.install_policy(&snapshot).unwrap();
+    let tx = TxLegacy {
+        chain_id: Some(1),
+        nonce: 0,
+        gas_price: 2,
+        gas_limit: 21000,
+        to: TxKind::Call(recipient),
+        value: U256::from(1_000_000_000_000_000_000u64),
+        input: Default::default(),
+    };
+    let bytes = tx.encoded_for_signing();
+    let chain = SystemSessionChain::Evm {
+        chain: native.chain.clone(),
+        chain_id: DecimalU64::new(1),
+    };
+    let mut provenance = harness.system_provenance();
+    provenance.subject = ProvenanceSubject::System {
+        component_id: token("bloom-machine"),
+        operation_class: token("evm.native-transfer"),
+    };
+    provenance.operation_classes = vec![ProvenanceOperationClass {
+        economic_effects_schema: None,
+        operation_class: token("evm.native-transfer"),
+        fee_asset: Some(PolicyAsset {
+            chain: native.chain.clone(),
+            asset: "native".into(),
+        }),
+    }];
+    sign_zeroed(
+        &mut provenance,
+        |p| &mut p.installer_signature,
+        PROVENANCE_DOMAIN,
+        &harness.installer_key,
+    );
+    let mut terms = exact_terms(&harness, &bytes);
+    terms.subject = ApprovalSubject::System {
+        component_id: token("bloom-machine"),
+        operation_class: token("evm.native-transfer"),
+    };
+    terms.policy_version = snapshot.version.clone();
+    terms.policy_digest = snapshot.policy_digest.clone();
+    terms.provenance_digest = provenance.digest().unwrap();
+    terms.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Keccak256Recoverable];
+    terms.limits.value_limits.clear();
+    terms.selector = ApprovalSelector::SystemSession {
+        scope: SystemSessionScope {
+            component_id: token("bloom-machine"),
+            actions: vec![SystemSessionAction::NativeTransfer],
+            chains: vec![chain.clone()],
+            destinations: vec![bloom_broker_api::PolicyDestination {
+                chain: native.chain.clone(),
+                destination: format!("{recipient:#x}"),
+            }],
+            tokens: vec![],
+            per_action_value_limits: vec![SessionValueCeiling {
+                asset: native.clone(),
+                maximum: DecimalU256::parse("2000000000000000000").unwrap(),
+            }],
+        },
+    };
+    let scope = session_member_scope_digest(&terms).unwrap();
+    let template = terms.clone();
+    terms.session_budget = Some(SessionBudget {
+        usd_policy: Some(SessionUsdPolicy {
+            schema_version: 2,
+            budget_nonce: nonce(95),
+            member_scope_digests: vec![scope.clone()],
+            member_templates: vec![template],
+            member_backstop_allocations: vec![SessionMemberAllocation {
+                scope_digest: scope,
+                limits: terms.limits.clone(),
+            }],
+            assets: vec![approved_session_asset(&native).unwrap()],
+            pricing_policy_digest: session_pricing_policy_digest(),
+        }),
+        wallet_id: terms.wallet_id.clone(),
+        policy_version: terms.policy_version.clone(),
+        policy_digest: terms.policy_digest.clone(),
+        wallet_revocation_epoch: terms.wallet_revocation_epoch.clone(),
+        member_keys: vec![terms.key_ref.clone()],
+        limits: terms.limits.clone(),
+        nominal_asset_scales: vec![],
+        nominal_limits: SessionNominalLimits {
+            per_action: DecimalU256::parse("3000000000").unwrap(),
+            lifetime: DecimalU256::parse("5000000000").unwrap(),
+            rolling_windows: vec![],
+        },
+        per_action_value_limits: vec![],
+        not_before_ms: terms.not_before_ms.clone(),
+        expires_at_ms: terms.expires_at_ms.clone(),
+    });
+    let south_bytes = terms.signer_canonical_bytes().unwrap();
+    let south: bloom_signer_api::SealedApprovalTerms =
+        serde_json::from_slice(&south_bytes).unwrap();
+    south.validate().unwrap();
+    assert_eq!(south.approval_id().unwrap(), terms.approval_id().unwrap());
+    let projected: serde_json::Value = serde_json::from_slice(&south_bytes).unwrap();
+    assert_eq!(
+        projected["selector"],
+        serde_json::json!({"kind":"system","component_id":"bloom-machine","allowed_operation_classes":["evm.native-transfer"]})
+    );
+    assert!(projected.get("session_budget").is_none());
+    harness.activate(&terms, Some(&provenance));
+    let mut input = exact_input(&harness, &terms, operation(96), &bytes);
+    input.request.crypto_suite = CryptoSuite::Secp256k1Keccak256Recoverable;
+    input.request.provenance = provenance.subject.clone();
+    input.request.session_use = Some(SystemSessionUse {
+        action: SystemSessionAction::NativeTransfer,
+        chain,
+        token: None,
+        recipient: format!("{recipient:#x}"),
+        amount: DecimalU256::parse("1000000000000000000").unwrap(),
+        maximum_fee: DecimalU256::parse("42000").unwrap(),
+    });
+    input.session_valuation = Some(SessionValuation {
+        accepted_at_ms: DecimalU64::new(1500),
+        quotes: vec![SessionPriceQuote {
+            asset: native.clone(),
+            price_usd: "2000".into(),
+            provider: token("coingecko"),
+            timestamp_ms: DecimalU64::new(1500),
+        }],
+        usd_microdollars: DecimalU256::parse("2000000001").unwrap(),
+    });
+    bind_operation_digest(&mut input, &terms);
+    assert_eq!(
+        harness
+            .authority
+            .request_operation_digest(&input.request)
+            .unwrap(),
+        input.request.operation_digest
+    );
+    let mut changed = input.clone();
+    changed.request.session_use.as_mut().unwrap().amount = DecimalU256::parse("1").unwrap();
+    bind_operation_digest(&mut changed, &terms);
+    assert!(harness.authority.authorize(&changed).is_err());
+    let decision = harness.authority.authorize(&input).unwrap();
+    assert_eq!(
+        decision.reserved_values["evm-1:native"].as_str(),
+        "1000000000000042000"
+    );
+    harness.journal.verify_audit_chain().unwrap();
 }
