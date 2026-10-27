@@ -215,7 +215,7 @@
     if (action === 'policy' && policyApplied) { showStep(3); notice('Wallet policy applied. Continue with your session permissions.'); }
     if (action === 'activate') {
       const scopes = result.data;
-      if (Array.isArray(scopes) && scopes.length && scopes.every(scope => !scope.locally_disabled && !scope.preparation_pending && scope.authority?.state === 'active')) {
+      if (Array.isArray(scopes) && scopes.length && scopes.every(scope => !scope.locally_disabled && !scope.preparation_pending && scope.authority?.state === 'ACTIVE')) {
         sessionReady = true; controls(); notice('Your persona permissions are active. Setup is complete.');
       } else notice('No active automatic session was confirmed. Check the session details below before continuing.', true);
     }

@@ -45,6 +45,29 @@ const BROKER_SIGN_REQUEST_SCHEMA: &str = "bloom.sign-request/1";
 const POLICY_REVIEW_DOMAIN: &[u8] = b"bloom-policy-update-review/v1";
 const POLICY_VALIDATION_DOMAIN: &[u8] = b"bloom-policy-validation-receipt/v1";
 
+fn session_member_revoke_operation_id(stop: &OperationId, approval: &Digest32) -> OperationId {
+    let mut digest = Sha256::new();
+    digest.update(b"bloom.session.member-revoke/v1\0");
+    digest.update(stop.as_str().as_bytes());
+    digest.update(approval.as_str().as_bytes());
+    OperationId::from_bytes(digest.finalize().into())
+}
+
+fn closed_unactivated_approval(
+    state: Option<ApprovalLifecycleState>,
+    has_grant: Option<bool>,
+) -> bool {
+    has_grant == Some(false)
+        && matches!(
+            state,
+            Some(
+                ApprovalLifecycleState::Failed
+                    | ApprovalLifecycleState::Cancelled
+                    | ApprovalLifecycleState::Expired
+            )
+        )
+}
+
 pub struct BrokerRpcService {
     authority: Arc<BrokerAuthority>,
     journal: Arc<BrokerJournal>,
@@ -240,18 +263,7 @@ impl BrokerRpcService {
                 let mut revoked = Vec::new();
                 let mut pending = Vec::new();
                 for (id, wallet_id) in ids {
-                    let revoke_id = OperationId::new(format!(
-                        "session-stop-{}",
-                        Digest32::from_bytes(
-                            Sha256::digest(format!(
-                                "{}:{}",
-                                request.operation_id.as_str(),
-                                id.as_str()
-                            ))
-                            .into()
-                        )
-                        .as_str()
-                    ))?;
+                    let revoke_id = session_member_revoke_operation_id(&request.operation_id, &id);
                     if let Some(record) =
                         self.journal.approval_record(&id).map_err(journal_error)?
                     {
@@ -277,6 +289,12 @@ impl BrokerRpcService {
                         .await
                     {
                         Ok(BrokerSignerResponse::SealedApprovalRevoke(_)) => revoked.push(id),
+                        Err(error)
+                            if error.code == ProtocolErrorCode::ApprovalNotFound
+                                && self.unactivated_approval_is_closed(&id)? =>
+                        {
+                            revoked.push(id)
+                        }
                         Ok(_) => pending.push(id),
                         Err(_) => pending.push(id),
                     }
@@ -338,11 +356,19 @@ impl BrokerRpcService {
                 self.authority
                     .revoke_local_approval(&request.approval_id)
                     .map_err(authority_error)?;
-                self.signer
+                let result = self
+                    .signer
                     .request_for_machine(BrokerSignerRequest::SealedApprovalRevoke(
                         translate_revocation::revoke_request_to_signer(request.clone()),
                     ))
-                    .await?;
+                    .await;
+                if let Err(error) = result {
+                    if error.code != ProtocolErrorCode::ApprovalNotFound
+                        || !self.unactivated_approval_is_closed(&request.approval_id)?
+                    {
+                        return Err(error);
+                    }
+                }
                 Ok(Response::SealedApprovalRevoke(
                     self.approval_public_status(&request.approval_id)?,
                 ))
@@ -857,6 +883,20 @@ impl BrokerRpcService {
                 }
             }
         }
+    }
+
+    /// A canceled/failed preparation may never have installed a Signer grant.
+    /// Only an authoritative not-found response plus this closed local state
+    /// can complete its stop; unavailable or possibly active grants stay pending.
+    fn unactivated_approval_is_closed(&self, id: &Digest32) -> Result<bool, ProtocolError> {
+        let state = self.journal.approval_state(id).map_err(journal_error)?;
+        let record = self.journal.approval_record(id).map_err(journal_error)?;
+        Ok(closed_unactivated_approval(
+            state,
+            record
+                .as_ref()
+                .map(|record| record.ceremony_grant_jcs.is_some()),
+        ))
     }
 
     fn validate_generic_session_profile(
@@ -3007,6 +3047,47 @@ fn malformed(error: impl std::fmt::Display) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_signer_grants_only_complete_stops_for_closed_unactivated_approvals() {
+        use ApprovalLifecycleState::*;
+        for state in [Failed, Cancelled, Expired] {
+            assert!(closed_unactivated_approval(Some(state), Some(false)));
+            assert!(!closed_unactivated_approval(Some(state), Some(true)));
+            assert!(!closed_unactivated_approval(Some(state), None));
+        }
+        for state in [
+            Prepared,
+            AwaitingCeremony,
+            Active,
+            Orphaned,
+            Exhausted,
+            Revoked,
+        ] {
+            assert!(!closed_unactivated_approval(Some(state), Some(false)));
+        }
+        assert!(!closed_unactivated_approval(None, Some(false)));
+    }
+
+    #[test]
+    fn session_stop_member_revocations_have_canonical_stable_operation_ids() {
+        let stop = OperationId::from_bytes([1; 32]);
+        let approval = Digest32::from_bytes([2; 32]);
+        let revoke = session_member_revoke_operation_id(&stop, &approval);
+        assert_eq!(
+            OperationId::new(revoke.as_str().to_owned()).unwrap(),
+            revoke
+        );
+        assert_eq!(session_member_revoke_operation_id(&stop, &approval), revoke);
+        assert_ne!(
+            session_member_revoke_operation_id(&OperationId::from_bytes([3; 32]), &approval),
+            revoke
+        );
+        assert_ne!(
+            session_member_revoke_operation_id(&stop, &Digest32::from_bytes([3; 32])),
+            revoke
+        );
+    }
 
     #[test]
     fn evm_review_accepts_the_signers_spki_public_key() {

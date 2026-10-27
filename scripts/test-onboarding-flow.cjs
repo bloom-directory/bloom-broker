@@ -8,6 +8,7 @@ const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../crates/bloom-broker/src/ceremony_assets/onboarding/app.js'), 'utf8');
 const baseState = {selected_wallet:'alice',wallet_choices:[{id:'alice'}],machine:{available:true},config:{exists:true,setup_complete:true,persona:{preset:'trader'},persona_limits:{per_action_usd:'100',daily_usd:'1000',session_duration_secs:'86400'},petals:['polymarket']},catalog:[]};
 function harness(actions, options = {}) {
+  const expectedAction = options.action ?? 'policy';
   const elements = new Map(), listeners = {}, calls = [];
   function element() { return {hidden:false,value:'',options:[],style:{},dataset:{},classList:{toggle(){}},contentWindow:{},querySelectorAll:()=>[],addEventListener(){},append(){},replaceChildren(){},removeAttribute(name){delete this[name];},add(option){this.options.push(option);}}; }
   const get = id => {if (!elements.has(id)) elements.set(id,element()); return elements.get(id);};
@@ -21,7 +22,7 @@ function harness(actions, options = {}) {
   const sandbox = {URL,URLSearchParams,Date,Number,JSON,Option:function(text,value){this.value=value;},location,history:{replaceState(){location.hash='';}},document:{getElementById:get,querySelectorAll:()=>[],createElement:element},window:{sessionStorage,addEventListener:(name,fn)=>{listeners[name]=fn;}},setTimeout:()=>1,clearTimeout(){},ResizeObserver:function(){},fetch:async(raw,options={})=>{
     const url = new URL(raw,location); calls.push({url:url.href,body:options.body});
     if (url.pathname.endsWith('/api/state')) return response(JSON.parse(JSON.stringify(baseState)));
-    if (url.pathname.endsWith('/api/action')) {assert.equal(JSON.parse(options.body).action,'policy'); assert.ok(actions.length,'unexpected reconciliation'); return response(actions.shift());}
+    if (url.pathname.endsWith('/api/action')) {assert.equal(JSON.parse(options.body).action,expectedAction); assert.ok(actions.length,'unexpected reconciliation'); return response(actions.shift());}
     if (url.pathname === '/api/session') return response({ceremony_id:String(++sessionCount).repeat(64),expires_at_ms:Date.now()+60000});
     throw new Error('unexpected fetch '+url);
   }};
@@ -51,6 +52,16 @@ const pending = token => ({ceremony_url:'http://localhost:18734/ceremony/'+token
 
   // DefaultPolicyStatus uses #[serde(tag = "state")]; use the real wire shape.
   const resumed = harness([{data:{state:'applied',petals:['polymarket']}}]); await resumed.settle(); resumed.hooks.showStep(2); await resumed.hooks.runAction('policy'); assert.equal(resumed.hooks.step,3); assert.equal(resumed.get('activate').disabled,false); assert.equal(resumed.hooks.pending,null);
+  // ApprovalLifecycleState is serialized in SCREAMING_SNAKE_CASE by the API.
+  const activeScope = {authority:{state:'ACTIVE'},locally_disabled:false,preparation_pending:false};
+  const activated = harness([{data:[activeScope,activeScope]}],{action:'activate'});await activated.settle();await activated.hooks.runAction('activate');
+  assert.equal(activated.get('activate').hidden,true,'confirmed active sessions must hide the activation button');
+  assert.equal(activated.get('finish').hidden,false);
+  assert.match(activated.get('status').textContent,/permissions are active/);
+  for (const scopes of [[],[activeScope,{...activeScope,authority:{state:'AWAITING_CEREMONY'}}],[{...activeScope,locally_disabled:true}],[{...activeScope,preparation_pending:true}]]) {
+    const inactive=harness([{data:scopes}],{action:'activate'});await inactive.settle();await inactive.hooks.runAction('activate');
+    assert.equal(inactive.get('activate').hidden,false);assert.equal(inactive.get('finish').hidden,true);
+  }
   const h = harness([pending('b'),{data:{state:'applied',petals:['polymarket']}}]); await h.settle(); h.hooks.showStep(2); await h.hooks.runAction('policy');
   const before=h.calls.length;
   h.message({origin:'https://attacker.example'}); h.message({source:{}}); h.message({data:{type:'bloom.onboarding.ceremony',ceremony_id:'f'.repeat(64),state:'completed'}}); await h.settle();
