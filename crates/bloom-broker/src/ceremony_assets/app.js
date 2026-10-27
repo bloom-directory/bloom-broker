@@ -1929,26 +1929,40 @@ function createdWalletView(accounts, created = true) {
   reviewNode.replaceChildren(el("div", {class: "wallet-home"}, ...parts));
 }
 
-async function showCreatedWallet(session, recovery = null) {
+// The code is in the output the page just decrypted, so it is offered
+// whatever any later read of the wallet does. It is the one thing here that
+// cannot be obtained again.
+function showRecoveryCode(recovery) {
+  if (!recovery?.recovery_id || !recovery?.recovery_secret) return;
+  const download = el("button", {type: "button", class: "secondary"}, "Download Bloom recovery code");
+  download.onclick = () => {
+    const url = URL.createObjectURL(new Blob([JSON.stringify(recovery)], {type: "application/json"}));
+    const link = el("a", {href: url, download: "bloom-recovery-code.json"});
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  reviewNode.append(el("details", {class: "ceremony-details"},
+    el("summary", {}, "Bloom recovery code"),
+    el("p", {}, "This code restores access on this Bloom host. It is different from your portable recovery phrase. Keep it private and offline."),
+    download));
+}
+
+// An account is created before its address can be read back, so a refused
+// read right after a registration means "not yet", not "no wallet", and the
+// caller there waits. On the load path one read answers a different question,
+// whether a wallet is already there, and must not stall the form.
+async function showCreatedWallet(session, attempts = 1) {
   const wallet = session.signer_contribution?.wallet_id;
   if (!wallet || remoteCeremony) return false;
-  const response = await fetch(`/api/wallet/${encodeURIComponent(wallet)}`, {credentials: "same-origin", cache: "no-store"});
-  if (!response.ok) return false;
-  createdWalletView(await response.json());
-  if (recovery?.recovery_id && recovery?.recovery_secret) {
-    const download = el("button", {type: "button", class: "secondary"}, "Download Bloom recovery code");
-    download.onclick = () => {
-      const url = URL.createObjectURL(new Blob([JSON.stringify(recovery)], {type: "application/json"}));
-      const link = el("a", {href: url, download: "bloom-recovery-code.json"});
-      link.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-    };
-    reviewNode.append(el("details", {class: "ceremony-details"},
-      el("summary", {}, "Bloom recovery code"),
-      el("p", {}, "This code restores access on this Bloom host. It is different from your portable recovery phrase. Keep it private and offline."),
-      download));
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt) await new Promise(resolve => setTimeout(resolve, 300));
+    const response = await fetch(`/api/wallet/${encodeURIComponent(wallet)}`, {credentials: "same-origin", cache: "no-store"});
+    if (response.ok) {
+      createdWalletView(await response.json());
+      return true;
+    }
   }
-  return true;
+  return false;
 }
 
 function renderDone(session, result) {
@@ -3935,12 +3949,18 @@ async function finishBrowserResult(session, result) {
       te.encode(outputAad),
       result.encrypted_browser_result
     );
+    // Opening the output is what the acknowledgement attests, so send it
+    // before drawing anything. Custody has already committed; a registration
+    // must not lapse to failed because a view would not render.
+    await mutate(`/api/session/${ceremonyId}/ack`, {});
     if (session.ceremony_kind === "wallet_registration") {
       let recovery;
       try { recovery = JSON.parse(new TextDecoder().decode(plaintext)); } catch (_) {}
-      if (!await showCreatedWallet(session, recovery)) throw new Error("Could not load the created wallet; keep this tab open");
+      showRecoveryCode(recovery);
+      if (!await showCreatedWallet(session, 10)) {
+        statusNode.textContent = "Wallet created. Its addresses are not readable here yet; open Bloom to see them.";
+      }
     } else renderResult(session, plaintext);
-    await mutate(`/api/session/${ceremonyId}/ack`, {});
   } else {
     if (session.ceremony_kind !== "wallet_registration" || !await showCreatedWallet(session)) renderDone(session, result);
   }
