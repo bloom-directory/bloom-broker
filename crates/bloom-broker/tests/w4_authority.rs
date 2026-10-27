@@ -247,6 +247,11 @@ impl Harness {
         let ceremony_key = SigningKey::from_bytes(&[3; 32]);
         let revocation_key = SigningKey::from_bytes(&[4; 32]);
         let wallet = token("wallet-1");
+        // Authority state lives in the journal, so a home is new exactly when
+        // its journal does not exist yet. The legacy `authority.sqlite` is
+        // only a migration source and is never created, so it cannot say.
+        let first_open =
+            directory.is_none_or(|directory| !directory.join("journal.sqlite").exists());
         let journal = Arc::new(match directory {
             None => BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).expect("journal"),
             Some(directory) => {
@@ -260,42 +265,32 @@ impl Harness {
             (token("policy-key"), policy_key.verifying_key()),
         );
         let registry = AssuranceRegistry::compiled(verifiers).unwrap();
-        let (authority, first_open) = match directory {
-            None => (
-                BrokerAuthority::open_in_memory(
-                    journal.clone(),
-                    policy_keys,
-                    token("installer-key"),
-                    installer_key.verifying_key(),
-                    token("ceremony-key"),
-                    ceremony_key.verifying_key(),
-                    token("revocation-key"),
-                    revocation_key.verifying_key(),
-                    registry,
-                )
-                .unwrap(),
-                true,
-            ),
-            Some(directory) => {
-                let path = directory.join("authority.sqlite");
-                let first_open = !path.exists();
-                (
-                    BrokerAuthority::open(
-                        &path,
-                        journal.clone(),
-                        policy_keys,
-                        token("installer-key"),
-                        installer_key.verifying_key(),
-                        token("ceremony-key"),
-                        ceremony_key.verifying_key(),
-                        token("revocation-key"),
-                        revocation_key.verifying_key(),
-                        registry,
-                    )
-                    .unwrap(),
-                    first_open,
-                )
-            }
+        let authority = match directory {
+            None => BrokerAuthority::open_in_memory(
+                journal.clone(),
+                policy_keys,
+                token("installer-key"),
+                installer_key.verifying_key(),
+                token("ceremony-key"),
+                ceremony_key.verifying_key(),
+                token("revocation-key"),
+                revocation_key.verifying_key(),
+                registry,
+            )
+            .unwrap(),
+            Some(directory) => BrokerAuthority::open(
+                directory.join("authority.sqlite"),
+                journal.clone(),
+                policy_keys,
+                token("installer-key"),
+                installer_key.verifying_key(),
+                token("ceremony-key"),
+                ceremony_key.verifying_key(),
+                token("revocation-key"),
+                revocation_key.verifying_key(),
+                registry,
+            )
+            .unwrap(),
         };
         let harness = Self {
             authority,
