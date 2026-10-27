@@ -22,9 +22,7 @@
 //! `ProofVerified` identity wallets pin, so its file set is deliberately
 //! frozen. The two look alike today and are free to diverge.
 
-use std::fmt;
-
-use bech32::{Bech32, Hrp, primitives::decode::CheckedHrpstring};
+use bech32::{Bech32, primitives::decode::CheckedHrpstring};
 use bloom_rpc_wire::Token;
 use thiserror::Error;
 
@@ -93,29 +91,6 @@ pub enum PolicyTarget {
     /// would let a policy signed yesterday authorize a class it never named,
     /// with no ceremony, no review manifest and no new signature.
     PetalClass(String),
-}
-
-impl fmt::Display for PolicyTarget {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PetalClass(name) => write!(f, "petal:{name}"),
-            Self::Address(ChainAddress::Evm(bytes)) => write!(f, "0x{}", hex::encode(bytes)),
-            Self::Address(ChainAddress::Solana(bytes)) => {
-                f.write_str(&bs58::encode(bytes).into_string())
-            }
-            Self::Address(ChainAddress::Cosmos { hrp, payload }) => {
-                let hrp = Hrp::parse(hrp).map_err(|_| fmt::Error)?;
-                f.write_str(&bech32::encode::<Bech32>(hrp, payload).map_err(|_| fmt::Error)?)
-            }
-            // Deliberately not re-encoded as an address. The script *is* the
-            // decoded identity, and a reverse mapping would be a second
-            // implementation of the forward one, free to drift from it, for
-            // the sake of a diagnostic string.
-            Self::Address(ChainAddress::Bitcoin { script_pubkey }) => {
-                write!(f, "script:{}", hex::encode(script_pubkey))
-            }
-        }
-    }
 }
 
 /// The prefix marking a Petal-chosen destination rather than a fixed account.
@@ -788,28 +763,5 @@ mod tests {
             parse_destination(&chain("bsae"), "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
             Err(DestinationError::UnknownChain(_))
         ));
-    }
-
-    #[test]
-    fn display_round_trips_each_decodable_spelling() {
-        for (chain_name, text) in [
-            ("base", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
-            ("solana", "11111111111111111111111111111111"),
-            ("cosmos", "cosmos1w508d6qejxtdg4y5r3zarvary0c5xw7k6ah60c"),
-            ("base", "petal:near-intents"),
-        ] {
-            assert_eq!(parse(chain_name, text).to_string(), text);
-        }
-    }
-
-    /// Bitcoin is the exception: the decoded identity is a script, and showing
-    /// it is more use in a diagnostic than echoing back whichever of the four
-    /// address forms happened to be written.
-    #[test]
-    fn display_shows_the_bitcoin_script() {
-        assert_eq!(
-            parse("bitcoin", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").to_string(),
-            format!("script:0014{HASH160}"),
-        );
     }
 }
