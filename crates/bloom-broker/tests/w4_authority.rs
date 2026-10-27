@@ -591,6 +591,82 @@ fn a_home_with_nothing_to_migrate_grows_no_legacy_authority_file() {
     drop(authority);
 }
 
+/// Legacy authority files with nothing to migrate open, and are left exactly
+/// as they were, with no migration recorded. Every release before this one
+/// created the file on every start and never wrote to it, so an empty file is
+/// the shape most upgraded homes have; only the `policies` check keeps them
+/// starting. An empty database, or one with other tables only, has nothing to
+/// migrate either.
+#[test]
+fn a_legacy_authority_file_without_policies_is_left_untouched() {
+    let directory = tempfile::tempdir().unwrap();
+    fn older_release(path: &std::path::Path) {
+        std::fs::write(path, b"").unwrap();
+    }
+    fn empty_database(path: &std::path::Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 1;")
+            .unwrap();
+    }
+    fn other_tables(path: &std::path::Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch("CREATE TABLE ceremony_sessions(ceremony_id TEXT PRIMARY KEY);")
+            .unwrap();
+    }
+    let shapes = [
+        (
+            "an older release's empty file",
+            older_release as fn(&std::path::Path),
+        ),
+        ("an empty database", empty_database),
+        ("a file with other tables only", other_tables),
+    ];
+
+    for (index, (shape, write)) in shapes.into_iter().enumerate() {
+        let legacy_path = directory.path().join(format!("authority-{index}.sqlite"));
+        write(&legacy_path);
+        let before = std::fs::read(&legacy_path).unwrap();
+        let journal = Arc::new(
+            BrokerJournal::open(
+                directory.path().join(format!("journal-{index}.sqlite")),
+                Arc::new(TestAuditSigner),
+            )
+            .unwrap(),
+        );
+
+        let authority = BrokerAuthority::open(
+            &legacy_path,
+            journal.clone(),
+            BTreeMap::new(),
+            token("installer-key"),
+            SigningKey::from_bytes(&[2; 32]).verifying_key(),
+            token("ceremony-key"),
+            SigningKey::from_bytes(&[3; 32]).verifying_key(),
+            token("revocation-key"),
+            SigningKey::from_bytes(&[4; 32]).verifying_key(),
+            AssuranceRegistry::compiled(vec![]).unwrap(),
+        )
+        .unwrap_or_else(|error| panic!("{shape} means nothing to migrate: {error}"));
+        drop(authority);
+
+        assert_eq!(
+            std::fs::read(&legacy_path).unwrap(),
+            before,
+            "{shape} must not be written to"
+        );
+        assert!(
+            !journal
+                .audit_entries()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.event_type == "storage.authority_migrated"),
+            "{shape} must not record a migration"
+        );
+    }
+}
+
 #[cfg(unix)]
 fn open_authority_at(
     legacy_path: &std::path::Path,
