@@ -1,0 +1,36 @@
+{
+  "$schema": "https://eips.ethereum.org/assets/eip-7730/erc7730-v2.schema.json",
+  "$comment": "Source: 0xbow-io/privacy-pools-core d494b63e79f33bb2b0c8ece6cdacdca465c3b884, packages/contracts/src/contracts. Mainnet addresses: bloom-petal-privacy-pools protocol.rs; listed bindings do not attest runtime code or proof validity.",
+  "context": {
+    "contract": {
+      "deployments": [
+        {
+          "chainId": 1,
+          "address": "0x6818809eefce719e480a7526d76bd3e561526b46"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "contractName": "Privacy Pools Entrypoint"
+  },
+  "display": {
+    "formats": {
+      "deposit(uint256 precommitment)": {
+        "intent": "Deposit native ETH; credited amount depends on the current pool fee",
+        "fields": [
+          {
+            "path": "@.value",
+            "label": "Deposit",
+            "format": "amount"
+          },
+          {
+            "path": "precommitment",
+            "label": "Note precommitment",
+            "format": "raw"
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,10 +1,35 @@
+#[test]
+fn legacy_removal_diff_matches_machine_vector_without_other_authority_changes() {
+    let vector: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/legacy-policy-removal.json")).unwrap();
+    let current: bloom_broker_api::CanonicalWalletPolicy =
+        serde_json::from_value(vector["current"].clone()).unwrap();
+    let proposed: bloom_broker_api::CanonicalWalletPolicy =
+        serde_json::from_value(vector["proposed"].clone()).unwrap();
+    let diff = canonical_policy_authority_diff(&current, &proposed);
+    assert_eq!(
+        serde_json::to_value(&diff).unwrap(),
+        vector["authority_diff"]
+    );
+    assert_eq!(
+        diff.digest().unwrap().as_str(),
+        "65f348e08a8ded736ad13843456a1afbaacf16bf5518147b1d7d900f703e7401"
+    );
+    assert_eq!(proposed.allowed_destinations, current.allowed_destinations);
+    assert_eq!(
+        proposed.allowed_petal_packages,
+        current.allowed_petal_packages
+    );
+    assert_eq!(proposed.required_verifiers.len(), 1);
+}
+
 use bloom_broker::{
     assurance_verifiers::SolanaSystemTransferVerifier,
     authority::{
         AssuranceRegistry, AssuranceVerifier, AuthorizationInput, BrokerAuthority,
-        CanonicalWalletPolicy, CeremonyApprovalGrant, EpochReconciliation, FrozenReview,
-        PolicyAsset, PolicyDestination, ProvenanceOperationClass, ProvenanceRecord,
-        ProvenanceSubject, VerifierCapability, canonical_policy_authority_diff,
+        CanonicalWalletPolicy, CeremonyApprovalGrant, EpochReconciliation, PolicyAsset,
+        PolicyDestination, ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject,
+        VerifierCapability, canonical_policy_authority_diff,
     },
     journal::{AuditSigner, BrokerJournal},
 };
@@ -292,7 +317,6 @@ impl Harness {
 
     fn policy_snapshot(&self, version: u64) -> SignedPolicySnapshot {
         let policy = CanonicalWalletPolicy {
-            clear_signing: None,
             wallet_id: self.wallet.clone(),
             maximum_approval_lifetime_ms: 100_000,
             allowed_petal_packages: vec![digest(9)],
@@ -307,6 +331,7 @@ impl Harness {
                 },
             ],
             required_verifiers: vec![],
+            clear_signing: None,
         };
         signed_policy_snapshot(self, version, &policy)
     }
@@ -425,12 +450,7 @@ impl Harness {
             Digest32::from_bytes(Sha256::digest(serde_jcs::to_vec(claim).unwrap()).into());
         let approval_id = self
             .authority
-            .prepare_approval_with_claim(
-                terms,
-                &review,
-                Some(&claim_digest),
-                &FrozenReview::legacy(),
-            )
+            .prepare_approval_with_claim(terms, &review, Some(&claim_digest))
             .unwrap();
         let grant = self.signed_grant(terms, approval_id, operation(3));
         self.authority.activate_approval(&grant, 1_500).unwrap();
@@ -1530,6 +1550,82 @@ fn ac08_exact_selector_rejects_payload_hash_order_count_key_and_suite_changes() 
 }
 
 #[test]
+fn catalog_upgrade_retains_predecessor_but_refuses_its_existing_grant() {
+    let (harness, predecessor, _scope, child) = scoped_petal_child();
+    let terms = scoped_petal_terms(&harness, &predecessor, &child);
+    harness.activate(&terms, Some(&predecessor));
+    let mut retired = predecessor.clone();
+    retired.petal_lineage.as_mut().unwrap().active = false;
+    sign_zeroed(
+        &mut retired,
+        |value| &mut value.installer_signature,
+        PROVENANCE_DOMAIN,
+        &harness.installer_key,
+    );
+    let mut successor = predecessor.clone();
+    successor.subject = ProvenanceSubject::Petal {
+        package_hash: digest(10),
+        route: "/sign".into(),
+    };
+    let lineage = successor.petal_lineage.as_mut().unwrap();
+    lineage.release_sequence = DecimalU64::new(2);
+    lineage.predecessor_package_hashes = vec![digest(9)];
+    sign_zeroed(
+        &mut successor,
+        |value| &mut value.installer_signature,
+        PROVENANCE_DOMAIN,
+        &harness.installer_key,
+    );
+    harness
+        .authority
+        .synchronize_provenance_catalog(&ProvenanceCatalog {
+            schema: PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![retired, successor],
+        })
+        .unwrap();
+    let request = petal_input(
+        &terms,
+        &predecessor,
+        operation(121),
+        CryptoSuite::Secp256k1Sha256Recoverable,
+    );
+    assert!(error_code(harness.authority.authorize(&request).unwrap_err()).contains("PROVENANCE"));
+    assert!(
+        error_code(
+            harness
+                .authority
+                .prepare_approval(&terms, &digest(7))
+                .unwrap_err()
+        )
+        .contains("PROVENANCE")
+    );
+}
+
+#[test]
+fn expired_petal_authority_cannot_reserve_a_signature() {
+    let harness = Harness::new();
+    let provenance = harness.provenance();
+    let terms = petal_terms(&harness, &provenance);
+    harness.activate(&terms, Some(&provenance));
+    let mut input = petal_input(
+        &terms,
+        &provenance,
+        operation(20),
+        CryptoSuite::Secp256k1Sha256Recoverable,
+    );
+    input.reserved_at_ms = terms.expires_at_ms.get() + 1;
+    input.observed_utc_ms = Some(input.reserved_at_ms);
+    assert!(
+        error_code(harness.authority.authorize(&input).unwrap_err())
+            .contains("APPROVAL_OUTSIDE_VALIDITY")
+    );
+    // A failed expired use cannot consume the grant or claim nonce.
+    input.reserved_at_ms = terms.expires_at_ms.get();
+    input.observed_utc_ms = Some(input.reserved_at_ms);
+    harness.authority.authorize(&input).unwrap();
+}
+
+#[test]
 fn authorization_rechecks_broker_owned_current_provenance_catalog() {
     let harness = Harness::new();
     let provenance = harness.provenance();
@@ -1987,7 +2083,7 @@ fn native_solana_destination_refusal_names_the_conflicting_policy_chain() {
         },
     );
     let mut terms = solana_terms(&harness, &provenance, &message, 85);
-    terms.policy_version = snapshot.version;
+    terms.policy_version = snapshot.version.clone();
     terms.policy_digest = snapshot.policy_digest;
     harness.activate_with_system_claim(&terms, &provenance, &claim);
     let input = solana_input(
@@ -2617,6 +2713,190 @@ fn policy_update_rejects_a_machine_claimed_diff_that_broker_did_not_derive() {
         harness.authority.validate_policy_update(&request).unwrap(),
         exact_diff
     );
+}
+
+fn legacy_policy(harness: &Harness) -> CanonicalWalletPolicy {
+    let mut legacy: CanonicalWalletPolicy =
+        serde_json::from_slice(&harness.policy_snapshot(1).canonical_policy.decode()).unwrap();
+    legacy.clear_signing = Some(bloom_broker_api::LegacyClearSigningPolicy {
+        catalog_id: token("bloom-tokens"),
+        trusted_keys: vec![bloom_broker_api::LegacyCatalogTrustedKey {
+            key_id: token("publisher"),
+            verifying_key: Base64UrlBytes::from_bytes(&[7; 32]),
+        }],
+        signature_threshold: 1,
+        maximum_observation_age_ms: 86_400_000,
+        opaque_exact_allowed: false,
+        unlimited_allowance_allowed: false,
+        verifier: bloom_broker_api::RequiredVerifier {
+            verifier_id: token("evm-clear-signing-v1"),
+            verifier_digest: digest(42),
+        },
+    });
+    legacy.required_verifiers = vec![legacy.clear_signing.as_ref().unwrap().verifier.clone()];
+    legacy
+}
+
+/// An approval made before an upgrade cannot be activated or used while the
+/// wallet still carries the retired restrictions.
+#[test]
+fn legacy_restrictions_block_activation_and_authorization_of_existing_approvals() {
+    let harness = Harness::new();
+    let provenance = harness.system_provenance();
+    harness.authority.install_provenance(&provenance).unwrap();
+    let pending = exact_terms(&harness, b"pending");
+    let approval_id = harness
+        .authority
+        .prepare_approval(&pending, &digest(7))
+        .unwrap();
+    let grant = harness.signed_grant(&pending, approval_id, operation(3));
+    let active = exact_terms(&harness, b"active");
+    harness.activate(&active, Some(&provenance));
+
+    let snapshot = signed_policy_snapshot(&harness, 2, &legacy_policy(&harness));
+    harness.authority.install_policy(&snapshot).unwrap();
+    assert!(
+        error_code(
+            harness
+                .authority
+                .activate_approval(&grant, 1_500)
+                .unwrap_err()
+        )
+        .contains("POLICY_MIGRATION_REQUIRED")
+    );
+    let input = exact_input(&harness, &active, operation(10), b"active");
+    assert!(
+        error_code(harness.authority.authorize(&input).unwrap_err())
+            .contains("POLICY_MIGRATION_REQUIRED")
+    );
+
+    // The Signer-receipt activation path applies the same gate.
+    let mut receipt: bloom_signer_api::SignerActivationReceipt =
+        serde_json::from_value(serde_json::json!({
+            "activation_operation_id": operation(4),
+            "ceremony_id": digest(8),
+            "approval_id": grant.approval_id,
+            "approval_digest": grant.approval_id,
+            "review_manifest_digest": digest(7),
+            "key_ref": pending.key_ref,
+            "allowed_crypto_suites": pending.allowed_crypto_suites,
+            "activation_mode": pending.activation_mode,
+            "wallet_revocation_epoch": pending.wallet_revocation_epoch,
+            "replaced_approval_id": pending.renewal_of,
+            "activated_at_ms": "1000",
+            "expires_at_ms": "2000",
+            "signer_key_id": "ceremony-key",
+            "signer_signature": "",
+        }))
+        .unwrap();
+    let mut message = SIGNER_RECEIPT_DOMAIN.to_vec();
+    message.extend_from_slice(&receipt.unsigned_canonical_bytes().unwrap());
+    receipt.signer_signature =
+        Base64UrlBytes::from_bytes(&harness.ceremony_key.sign(&message).to_bytes());
+    assert!(
+        error_code(
+            harness
+                .authority
+                .activate_signer_receipt(&receipt, 1_500)
+                .unwrap_err()
+        )
+        .contains("POLICY_MIGRATION_REQUIRED")
+    );
+}
+
+#[test]
+fn legacy_restrictions_survive_reload_and_block_grants_until_explicit_policy_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let harness = Harness::open_at(directory.path());
+    let baseline = harness.policy_snapshot(1);
+    let mut legacy: CanonicalWalletPolicy =
+        serde_json::from_slice(&baseline.canonical_policy.decode()).unwrap();
+    legacy.clear_signing = Some(bloom_broker_api::LegacyClearSigningPolicy {
+        catalog_id: token("bloom-tokens"),
+        trusted_keys: vec![bloom_broker_api::LegacyCatalogTrustedKey {
+            key_id: token("publisher"),
+            verifying_key: Base64UrlBytes::from_bytes(&[7; 32]),
+        }],
+        signature_threshold: 1,
+        maximum_observation_age_ms: 86_400_000,
+        opaque_exact_allowed: false,
+        unlimited_allowance_allowed: false,
+        verifier: bloom_broker_api::RequiredVerifier {
+            verifier_id: token("evm-clear-signing-v1"),
+            verifier_digest: digest(42),
+        },
+    });
+    legacy.required_verifiers = vec![legacy.clear_signing.as_ref().unwrap().verifier.clone()];
+    let snapshot = signed_policy_snapshot(&harness, 2, &legacy);
+    harness.authority.install_policy(&snapshot).unwrap();
+    let mut terms = exact_terms(&harness, b"legacy");
+    terms.policy_version = snapshot.version.clone();
+    terms.policy_digest = snapshot.policy_digest.clone();
+    assert!(
+        error_code(
+            harness
+                .authority
+                .prepare_approval(&terms, &digest(7))
+                .unwrap_err()
+        )
+        .contains("POLICY_MIGRATION_REQUIRED")
+    );
+    let mut proposed = legacy.clone();
+    proposed.clear_signing = None;
+    proposed.required_verifiers.clear();
+    let bytes = serde_jcs::to_vec(&proposed).unwrap();
+    let diff = canonical_policy_authority_diff(&legacy, &proposed);
+    assert_eq!(diff.removed_legacy_clear_signing, legacy.clear_signing);
+    assert_eq!(diff.removed_required_verifiers.len(), 1);
+    let request = PolicyUpdateRequest {
+        operation_id: operation(90),
+        wallet_id: harness.wallet.clone(),
+        baseline_version: snapshot.version.clone(),
+        baseline_digest: snapshot.policy_digest.clone(),
+        proposed_canonical_policy: Base64UrlBytes::from_bytes(&bytes),
+        proposed_policy_digest: Digest32::from_bytes(Sha256::digest(&bytes).into()),
+        authority_diff_digest: diff.digest().unwrap(),
+        assurance_level: token("user_verified"),
+    };
+    assert_eq!(
+        harness.authority.validate_policy_update(&request).unwrap(),
+        diff
+    );
+    // Preparing/cancelling the migration must not mutate the stored policy.
+    assert_eq!(
+        harness.authority.policy_snapshot(&harness.wallet).unwrap(),
+        snapshot
+    );
+    drop(harness);
+    let reopened = Harness::open_at(directory.path());
+    assert_eq!(
+        reopened
+            .authority
+            .policy_snapshot(&reopened.wallet)
+            .unwrap(),
+        snapshot
+    );
+    assert!(
+        reopened
+            .authority
+            .prepare_approval(&terms, &digest(7))
+            .is_err()
+    );
+    let committed = signed_policy_snapshot(&reopened, 3, &proposed);
+    reopened.authority.install_policy(&committed).unwrap();
+    assert!(
+        reopened
+            .authority
+            .prepare_approval(&terms, &digest(7))
+            .is_err(),
+        "old policy-bound grants stay invalid"
+    );
+    terms.policy_version = committed.version;
+    terms.policy_digest = committed.policy_digest;
+    reopened
+        .authority
+        .prepare_approval(&terms, &digest(7))
+        .unwrap();
 }
 
 fn exact_terms(harness: &Harness, payload: &[u8]) -> SealedApprovalTerms {

@@ -1,0 +1,19 @@
+[package]
+name = "bloom-solana-clear-signing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bounded Solana transaction readings, separate from the policy-pinned native transfer verifier"
+
+[dependencies]
+bloom-solana-verify.workspace = true
+bloom-broker-api = { path = "../bloom-broker-api" }
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bs58.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+solana-message = { version = "4.5.0", features = ["wincode"] }

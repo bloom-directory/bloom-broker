@@ -781,58 +781,6 @@ impl BrokerRpcService {
         }
     }
 
-    /// Resolve what this wallet's authenticated policy says about clear
-    /// signing, and load the catalog under exactly that trust. A stored
-    /// snapshot the policy no longer trusts reads as no catalog at all.
-    fn clear_signing_context(
-        &self,
-        policy: &bloom_broker_api::CanonicalWalletPolicy,
-    ) -> Result<crate::evm_review::ClearSigningContext, ProtocolError> {
-        let verifier_digest =
-            Digest32::from_bytes(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES);
-        // The same authority clock the rest of preparation uses. This read is
-        // not a mutation, so it does not consume the caller's mutation
-        // allowance a second time; `prepare_approval` already takes one.
-        let now_ms = self.clock.now_ms(false)?;
-        // The wallet pins the verifier by digest, and this is where that pin
-        // is spent. A build whose verifier sources hash to something else
-        // cannot describe calls for this wallet: refusing here is what stops
-        // an upgraded Broker quietly substituting its own reading for the one
-        // the owner approved.
-        if let Some(settings) = &policy.clear_signing
-            && (settings.verifier.verifier_id.as_str()
-                != bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_ID
-                || settings.verifier.verifier_digest != verifier_digest)
-        {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::ClaimInvalid,
-                "wallet policy pins a clear-signing verifier absent from this build; \
-                 approve a policy update naming this build's verifier",
-            ));
-        }
-        let Some(settings) = &policy.clear_signing else {
-            return Ok(crate::evm_review::ClearSigningContext {
-                catalog: None,
-                verifier_digest,
-                now_ms,
-            });
-        };
-        let trusted = crate::authority::trusted_catalog_keys(settings).map_err(authority_error)?;
-        let catalog = self
-            .authority
-            .clear_signing_catalog(
-                &settings.catalog_id,
-                &trusted,
-                usize::from(settings.signature_threshold),
-            )
-            .map_err(authority_error)?;
-        Ok(crate::evm_review::ClearSigningContext {
-            catalog,
-            verifier_digest,
-            now_ms,
-        })
-    }
-
     async fn prepare_approval(
         &self,
         request: ApprovalPrepareRequest,
@@ -861,8 +809,26 @@ impl BrokerRpcService {
                 .authority
                 .subject_declares_operation_class(&request.terms.subject, safe_class)
                 .map_err(authority_error)?;
+        let mut message_petal = false;
+        if matches!(request.terms.subject, ApprovalSubject::Petal { .. }) {
+            for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
+                .iter()
+                .chain(bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES)
+            {
+                message_petal |= self
+                    .authority
+                    .subject_declares_operation_class(&request.terms.subject, class)
+                    .map_err(authority_error)?;
+            }
+        }
         match &request.terms.selector {
             ApprovalSelector::Exact { .. } => {
+                if message_petal && request.message_review_payloads.is_empty() {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "This message operation requires a review envelope; upgrade Bloom Machine and the Petal",
+                    ));
+                }
                 if safe_petal && request.safe_review_payloads.is_empty() {
                     return Err(ProtocolError::new(
                         ProtocolErrorCode::SelectorMismatch,
@@ -882,11 +848,14 @@ impl BrokerRpcService {
                             .iter()
                             .flat_map(|grant| &grant.allowed_operation_classes),
                     )
-                    .any(|class| class.as_str() == safe_class)
+                    .any(|class| {
+                        class.as_str() == safe_class
+                            || bloom_broker_api::message_review_requires_exact(class.as_str())
+                    })
                 {
                     return Err(ProtocolError::new(
                         ProtocolErrorCode::SelectorMismatch,
-                        "Safe transactions require exact approval",
+                        "Reviewed Petal transactions and messages require exact approval",
                     ));
                 }
             }
@@ -897,10 +866,64 @@ impl BrokerRpcService {
                 "Safe review payloads require a Safe Petal subject",
             ));
         }
-        // The policy the review was produced against, kept so the frozen
-        // review kind is read from the same document the reading used.
-        let mut review_policy: Option<bloom_broker_api::CanonicalWalletPolicy> = None;
-        if !request.evm_review_payloads.is_empty() || !request.safe_review_payloads.is_empty() {
+        if message_petal && !request.message_review_payloads.is_empty() {
+            let claim = request.petal_use_claim.as_ref().ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::ClaimInvalid,
+                    "Reviewed message operation requires its Petal claim",
+                )
+            })?;
+            if !self
+                .authority
+                .subject_declares_operation_class(
+                    &request.terms.subject,
+                    claim.operation_class.as_str(),
+                )
+                .map_err(authority_error)?
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::ClaimInvalid,
+                    "Message claim operation class differs from installer provenance",
+                ));
+            }
+        }
+        let clob_auth = crate::message_review::polymarket_auth::is_scope(&request.terms);
+        let pump_review = crate::solana_review::is_scope(&request.terms)
+            || request.petal_use_claim.as_ref().is_some_and(|c| {
+                bloom_broker_api::pumpfun_review_required(c.operation_class.as_str())
+            });
+        crate::message_review::validate_selector(&request.terms, request.petal_use_claim.as_ref())?;
+        if clob_auth {
+            let claim = request.petal_use_claim.as_ref().ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::ClaimInvalid,
+                    "CLOB authentication requires its versioned claim",
+                )
+            })?;
+            crate::message_review::polymarket_auth::validate_claim(claim)?;
+            if !request.evm_review_payloads.is_empty()
+                || !request.safe_review_payloads.is_empty()
+                || !request.message_review_payloads.is_empty()
+                || !self
+                    .authority
+                    .subject_declares_operation_class(
+                        &request.terms.subject,
+                        bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS,
+                    )
+                    .map_err(authority_error)?
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::ClaimInvalid,
+                    "CLOB authentication must match installer provenance and cannot mix exact reviews",
+                ));
+            }
+        }
+        if !request.evm_review_payloads.is_empty()
+            || !request.safe_review_payloads.is_empty()
+            || !request.message_review_payloads.is_empty()
+            || clob_auth
+            || pump_review
+        {
             let response = self
                 .signer
                 .request_for_machine(BrokerSignerRequest::KeyGetPublic(
@@ -916,36 +939,54 @@ impl BrokerRpcService {
             if key.key_ref != request.terms.key_ref {
                 return Err(response_mismatch("EVM review key identity"));
             }
-            let from = evm_address_from_public_key(&key.canonical_public_key.decode())?;
-            let snapshot = self
-                .authority
-                .policy_snapshot(&request.terms.wallet_id)
-                .map_err(authority_error)?;
-            // Review against the policy these terms are bound to, so the
-            // creation opt-in is never read from a different version.
-            if snapshot.version != request.terms.policy_version
-                || snapshot.policy_digest != request.terms.policy_digest
-            {
-                return Err(authority_error(AuthorityError::Denied {
-                    code: "POLICY_SNAPSHOT_MISMATCH",
-                    message: "approval is not bound to Broker's verified current policy".into(),
-                }));
-            }
-            let policy =
-                serde_json::from_slice(&snapshot.canonical_policy.decode()).map_err(|_| {
-                    ProtocolError::new(
-                        ProtocolErrorCode::SelectorMismatch,
-                        "invalid canonical policy",
-                    )
+            if pump_review {
+                let signer = crate::translation::wallet_account::ed25519_raw_key(
+                    &key.canonical_public_key.decode(),
+                )?;
+                context.message_review = Some(crate::solana_review::prepare(
+                    &request,
+                    bloom_solana_verify::Pubkey::from_bytes(signer),
+                )?);
+            } else {
+                let from = evm_address_from_public_key(&key.canonical_public_key.decode())?;
+                let snapshot = self
+                    .authority
+                    .policy_snapshot(&request.terms.wallet_id)
+                    .map_err(authority_error)?;
+                // Review against the policy these terms are bound to, so the
+                // creation opt-in is never read from a different version.
+                if snapshot.version != request.terms.policy_version
+                    || snapshot.policy_digest != request.terms.policy_digest
+                {
+                    return Err(authority_error(AuthorityError::Denied {
+                        code: "POLICY_SNAPSHOT_MISMATCH",
+                        message: "approval is not bound to Broker's verified current policy".into(),
+                    }));
+                }
+                let policy: bloom_broker_api::CanonicalWalletPolicy =
+                    serde_json::from_slice(&snapshot.canonical_policy.decode()).map_err(|_| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::SelectorMismatch,
+                            "invalid canonical policy",
+                        )
+                    })?;
+                let catalog = bloom_evm_clear_signing::Catalog::built_in().map_err(|error| {
+                    ProtocolError::new(ProtocolErrorCode::AssuranceUnavailable, error.to_string())
                 })?;
-            let clear_signing = self.clear_signing_context(&policy)?;
-            if !request.evm_review_payloads.is_empty() {
-                context.evm_review =
-                    crate::evm_review::review(&request, &policy, from, &clear_signing)?;
+                if !request.evm_review_payloads.is_empty() {
+                    context.evm_review =
+                        crate::evm_review::review(&request, &policy, from, catalog)?;
+                }
+                context.safe_review = crate::safe_review::review(&request, &policy, from, catalog)?;
+                context.message_review = if clob_auth {
+                    Some(crate::message_review::polymarket_auth::review(
+                        &request.terms,
+                        from,
+                    )?)
+                } else {
+                    crate::message_review::review(&request, from)?
+                };
             }
-            context.safe_review =
-                crate::safe_review::review(&request, &policy, from, &clear_signing)?;
-            review_policy = Some(policy.clone());
         }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
             ApprovalSelector::Exact {
@@ -989,46 +1030,6 @@ impl BrokerRpcService {
         context.petal_use_claim = request.petal_use_claim;
         context.system_use_claim = request.system_use_claim;
         context.claim_assurance = claim_assurance;
-        // Freeze what Broker itself concluded, alongside the record that
-        // authorizes signing. There is no second write to lose: an approval
-        // record either exists with its review, or does not exist at all.
-        let review_kind =
-            review_policy
-                .as_ref()
-                .map_or(crate::journal::ReviewKind::Legacy, |policy| {
-                    match (&context.safe_review, &policy.clear_signing) {
-                        // A Safe review whose inner calls were read from the
-                        // catalog is `Clear`, with the same evidence and signing
-                        // recheck as a native call. Otherwise it still has to
-                        // record whether the inner call was read, or nothing
-                        // downstream can tell an opaque Safe approval from a
-                        // fully read one.
-                        (Some(review), Some(_)) => {
-                            if review.clear_signing.is_some() {
-                                crate::journal::ReviewKind::Clear
-                            } else if crate::safe_review::is_opaque(review) {
-                                crate::journal::ReviewKind::OpaqueExact
-                            } else {
-                                crate::journal::ReviewKind::Native
-                            }
-                        }
-                        _ => crate::evm_review::review_kind(context.evm_review.as_ref(), policy),
-                    }
-                });
-        let frozen_review = match context
-            .evm_review
-            .as_ref()
-            .and_then(|review| review.clear_signing.as_ref())
-            .or_else(|| {
-                context
-                    .safe_review
-                    .as_ref()
-                    .and_then(|review| review.clear_signing.as_ref())
-            }) {
-            Some(evidence) => crate::authority::FrozenReview::with_evidence(review_kind, evidence),
-            None => crate::authority::FrozenReview::without_evidence(review_kind),
-        }
-        .map_err(|error| ProtocolError::new(ProtocolErrorCode::ClaimInvalid, error))?;
         let response =
             self.ceremony
                 .prepare_approval(ceremony_request, context, self.clock.now_ms(true)?)?;
@@ -1038,7 +1039,6 @@ impl BrokerRpcService {
                 &request.terms,
                 &response.review_manifest_digest,
                 approved_claim_digest.as_ref(),
-                &frozen_review,
             )
             .map_err(authority_error)
         {
@@ -1196,8 +1196,9 @@ impl BrokerRpcService {
             return Err(error);
         }
         self.prepare_approval(ApprovalPrepareRequest {
-            requested_review_mode: None,
+            evm_reported_token: None,
             evm_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
             operation_id: request.operation_id,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
@@ -1242,7 +1243,18 @@ impl BrokerRpcService {
             .ok_or_else(|| {
                 ProtocolError::new(ProtocolErrorCode::ApprovalNotFound, "approval not found")
             })?;
-        let trusted_time_required = !terms.limits.operation_rate_limits.is_empty()
+        let clob_auth = crate::message_review::polymarket_auth::is_scope(&terms);
+        let hyperliquid_agent = request
+            .petal_use_claim
+            .as_ref()
+            .is_some_and(|claim| claim.operation_class.as_str() == "hyperliquid.agent_action");
+        let pump_review = crate::solana_review::is_scope(&terms)
+            || request.petal_use_claim.as_ref().is_some_and(|c| {
+                bloom_broker_api::pumpfun_review_required(c.operation_class.as_str())
+            });
+        crate::message_review::validate_selector(&terms, request.petal_use_claim.as_ref())?;
+        let trusted_time_required = clob_auth
+            || !terms.limits.operation_rate_limits.is_empty()
             || !terms.limits.signature_rate_limits.is_empty()
             || terms
                 .limits
@@ -1257,6 +1269,62 @@ impl BrokerRpcService {
         // the only layer that can: authority is synchronous and journal-
         // backed, while the account projection comes from the Signer.
         let expected_signer_public_key = self.resolve_terms_signer_public_key(&terms).await?;
+        if clob_auth || hyperliquid_agent || pump_review {
+            let response = self
+                .signer
+                .request_for_machine(BrokerSignerRequest::KeyGetPublic(
+                    translate_service::key_request_to_signer(bloom_broker_api::KeyRequest {
+                        key_ref: terms.key_ref.clone(),
+                    }),
+                ))
+                .await?;
+            let BrokerSignerResponse::KeyGetPublic(key) = response else {
+                return Err(response_mismatch("message profile public key"));
+            };
+            let key = translate_service::key_to_machine(key);
+            if key.key_ref != terms.key_ref {
+                return Err(response_mismatch("message profile key identity"));
+            }
+            if pump_review {
+                let record = self
+                    .journal
+                    .approval_record(&request.approval_id)
+                    .map_err(journal_error)?
+                    .ok_or_else(|| response_mismatch("Solana approval record"))?;
+                let activation = record
+                    .activation_operation_id
+                    .ok_or_else(|| response_mismatch("Solana approval activation"))?;
+                let activation =
+                    OperationId::new(activation).map_err(|e| response_mismatch(&e.to_string()))?;
+                let approved = self.ceremony.bound_message_review(
+                    &activation,
+                    &request.approval_id,
+                    &record.review_manifest_digest,
+                )?;
+                let signer = crate::translation::wallet_account::ed25519_raw_key(
+                    &key.canonical_public_key.decode(),
+                )?;
+                crate::solana_review::verify_use(
+                    &terms,
+                    &request,
+                    bloom_solana_verify::Pubkey::from_bytes(signer),
+                    &approved,
+                )?;
+            } else {
+                let owner = evm_address_from_public_key(&key.canonical_public_key.decode())?;
+                if hyperliquid_agent {
+                    crate::message_review::verify_hyperliquid_agent_use(&request, owner)?;
+                }
+                if clob_auth {
+                    crate::message_review::polymarket_auth::verify_use(
+                        &terms,
+                        &request,
+                        owner,
+                        reserved_at_ms,
+                    )?;
+                }
+            }
+        }
         let decision = self
             .authority
             .authorize_for_clock_profile(
@@ -2269,10 +2337,6 @@ impl BrokerRpcService {
                     verifier_digest: capability.artifact_digest,
                 })
                 .collect(),
-            clear_signing: self
-                .authority
-                .clear_signing_status()
-                .map_err(authority_error)?,
             frame_max_bytes: DecimalU64::new(bloom_broker_api::FRAME_MAX_BYTES as u64),
         })
     }

@@ -24,10 +24,48 @@ jobs:
           fi
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Verify bundled token artwork and source boundaries
+        run: |
+          python3 scripts/bundle-token-artwork.py --check
+          python3 scripts/test_token_artwork.py
+          python3 -B scripts/test_token_derivation.py
+          python3 -B crates/bloom-broker-api/tokens/tokens.py --offline crates/bloom-broker-api/tokens/fixtures/inputs-2026-10-22.json.gz --check crates/bloom-broker-api/tokens/tokens.json > /dev/null
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Check the developer-harness build
+        run: cargo clippy --locked -p bloom-broker --features triad-dev-harness --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --workspace --locked
+      - name: Check shared Weiroll encoder vectors
+        run: python3 -B scripts/weiroll_vectors.py --check
+
+  weiroll-encoder:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09
+        with:
+          version: v1.4.4
+      - name: Check pinned encoder against shared reader vectors
+        run: |
+          python3 -B scripts/weiroll_vectors.py --check
+          forge test --root crates/bloom-evm-clear-signing/tests/fixtures/weiroll
+
+  released-policy-upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          ref: 4885a77f7741f63aa04b131d091039716b14dffc
+          path: released-policy-fixture
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Verify plain and legacy released stores through signing and rollback
+        env:
+          BLOOM_RELEASED_BROKER_FIXTURE_ROOT: ${{ github.workspace }}/released-policy-fixture
+        run: bash scripts/test-released-policy-upgrade.sh
 
   privileged-w0:
     name: privileged W0 listener ownership

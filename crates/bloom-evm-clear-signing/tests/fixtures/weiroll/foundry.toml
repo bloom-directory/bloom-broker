@@ -1,0 +1,6 @@
+[profile.default]
+src = "."
+test = "."
+solc = "0.8.28"
+optimizer = true
+via_ir = true
