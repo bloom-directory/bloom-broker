@@ -10,7 +10,7 @@ const baseState = {selected_wallet:'alice',wallet_choices:[{id:'alice'}],machine
 function harness(actions, options = {}) {
   const expectedAction = options.action ?? 'policy';
   const elements = new Map(), listeners = {}, calls = [];
-  function element() { return {hidden:false,value:'',options:[],style:{},dataset:{},classList:{toggle(){}},contentWindow:{},querySelectorAll:()=>[],addEventListener(){},append(){},replaceChildren(){},removeAttribute(name){delete this[name];},add(option){this.options.push(option);}}; }
+  function element() { return {hidden:false,value:'',options:[],style:{},dataset:{},handlers:{},classList:{toggle(){}},contentWindow:{},querySelectorAll:()=>[],addEventListener(name,fn){this.handlers[name]=fn;},append(){},replaceChildren(){},removeAttribute(name){delete this[name];},add(option){this.options.push(option);}}; }
   const get = id => {if (!elements.has(id)) elements.set(id,element()); return elements.get(id);};
   get('setup-form').elements = {persona:{value:'trader'}};
   const location = new URL('http://localhost:18734/onboarding/');
@@ -22,7 +22,7 @@ function harness(actions, options = {}) {
   const sandbox = {URL,URLSearchParams,Date,Number,JSON,Option:function(text,value){this.value=value;},location,history:{replaceState(){location.hash='';}},document:{getElementById:get,querySelectorAll:()=>[],createElement:element},window:{sessionStorage,addEventListener:(name,fn)=>{listeners[name]=fn;}},setTimeout:()=>1,clearTimeout(){},ResizeObserver:function(){},fetch:async(raw,options={})=>{
     const url = new URL(raw,location); calls.push({url:url.href,body:options.body});
     if (url.pathname.endsWith('/api/state')) return response(JSON.parse(JSON.stringify(baseState)));
-    if (url.pathname.endsWith('/api/action')) {assert.equal(JSON.parse(options.body).action,expectedAction); assert.ok(actions.length,'unexpected reconciliation'); return response(actions.shift());}
+    if (url.pathname.endsWith('/api/action')) {assert.equal(JSON.parse(options.body).action,Array.isArray(expectedAction)?expectedAction.shift():expectedAction); assert.ok(actions.length,'unexpected reconciliation'); return response(actions.shift());}
     if (url.pathname === '/api/session') return response({ceremony_id:String(++sessionCount).repeat(64),expires_at_ms:Date.now()+60000});
     throw new Error('unexpected fetch '+url);
   }};
@@ -58,6 +58,22 @@ const pending = token => ({ceremony_url:'http://localhost:18734/ceremony/'+token
   assert.equal(activated.get('activate').hidden,true,'confirmed active sessions must hide the activation button');
   assert.equal(activated.get('finish').hidden,false);
   assert.match(activated.get('status').textContent,/permissions are active/);
+  // Finish must visibly leave the wizard and must not create another approval.
+  activated.get('finish').handlers.click();
+  assert.equal(activated.hooks.step,0,'session confirmation alone cannot bypass the wallet-policy gate');
+  const finished=harness([{data:{state:'applied',petals:['polymarket']}}]);await finished.settle();await finished.hooks.runAction('policy');
+  finished.get('setup-form').elements.persona.value='custodian';
+  const callsBeforeFinish=finished.calls.length;finished.get('finish').handlers.click();
+  assert.equal(finished.hooks.step,4);assert.equal(finished.get('panel-title').textContent,'Setup complete');
+  assert.equal(finished.get('setup-navigation').hidden,true);assert.equal(finished.get('setup-diagnostics').hidden,true);
+  assert.equal(finished.calls.length,callsBeforeFinish,'finishing cannot request more authority');
+  const degenFinished=harness([{data:{state:'applied',petals:['polymarket']}},{data:[activeScope]}],{action:['policy','activate']});
+  await degenFinished.settle();await degenFinished.hooks.runAction('policy');await degenFinished.hooks.runAction('activate');
+  const degenCalls=degenFinished.calls.length;degenFinished.get('finish').handlers.click();
+  assert.equal(degenFinished.hooks.step,4);assert.equal(degenFinished.calls.length,degenCalls);
+  const html=fs.readFileSync(path.join(__dirname,'../crates/bloom-broker/src/ceremony_assets/onboarding/index.html'),'utf8');
+  assert.ok(!html.includes('session-selection'),'normal onboarding must not require developer selection files');
+
   for (const scopes of [[],[activeScope,{...activeScope,authority:{state:'AWAITING_CEREMONY'}}],[{...activeScope,locally_disabled:true}],[{...activeScope,preparation_pending:true}]]) {
     const inactive=harness([{data:scopes}],{action:'activate'});await inactive.settle();await inactive.hooks.runAction('activate');
     assert.equal(inactive.get('activate').hidden,false);assert.equal(inactive.get('finish').hidden,true);

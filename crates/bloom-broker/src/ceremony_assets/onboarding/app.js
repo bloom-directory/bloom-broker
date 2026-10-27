@@ -4,7 +4,7 @@
   let bridge = null, activeReview = null, reviewTimer = null;
   const bridgeFragment = location.hash;
   const form = $('setup-form');
-  const titles = ['How would you like to use Bloom?', 'Choose your limits and Petals', 'Review your wallet policy', 'Review session permissions'];
+  const titles = ['How would you like to use Bloom?', 'Choose your limits and Petals', 'Review your wallet policy', 'Review session permissions', 'Setup complete'];
   const presets = {trader: ['100', '1000', '86400'], degen: ['1000', '10000', '604800']};
   let state = null, busy = false, hydrated = false, dirty = false, step = 0;
   let explicitPersona = false, policyApplied = false, sessionReady = false;
@@ -36,7 +36,9 @@
     $('finish').disabled = busy || !available || !policyApplied;
     $('activate').disabled = busy || custodian || !available || !policyApplied;
     for (const button of document.querySelectorAll('[data-action="policy"], [data-action="stop"]')) button.disabled = busy || !available;
-    $('next').hidden = step === 3;
+    $('setup-navigation').hidden = step === 4;
+    $('setup-diagnostics').hidden = step === 4;
+    $('next').hidden = step >= 3;
     $('next').disabled = busy || !available || (step === 2 && !policyApplied);
     $('next').textContent = step === 1 ? 'Save and continue' : 'Next';
     $('back').hidden = step === 0;
@@ -46,7 +48,7 @@
     step = next;
     for (const section of document.querySelectorAll('[data-step]')) section.hidden = Number(section.dataset.step) !== step;
     $('panel-title').textContent = titles[step]; $('page-title').textContent = step < 2 ? (step === 0 ? 'Your preferences' : 'Limits and integrations') : `Wallet ${state?.selected_wallet ?? 'not selected'} · account 0`;
-    $('step-label').textContent = `Step ${step + 1} of 4`;
+    $('step-label').textContent = step === 4 ? 'Complete' : `Step ${step + 1} of 4`;
     controls();
   }
   function closeReview() {
@@ -200,14 +202,7 @@
     if (!['policy', 'activate', 'stop', 'refresh'].includes(action)) throw new Error('Unknown setup action.');
     if (action === 'stop') { closeReview(); sessionReady = false; }
     notice('Working with your local Bloom…');
-    let selection;
-    const file=$('session-selection')?.files?.[0];
-    if(action==='activate' && file){
-      if(file.size>256*1024) throw new Error('Session selection file is too large.');
-      selection=JSON.parse(await file.text());
-      if(!selection || typeof selection!=='object' || Array.isArray(selection)) throw new Error('Invalid session selection file.');
-    }
-    const result = await api('action', {action,...(selection ? {selection} : {})});
+    const result = await api('action', {action});
     activity(result.stdout || display(result.data ?? result));
     if (action === 'policy') policyApplied = result.data?.state === 'applied' || (result.data?.state === 'nothing_to_allow' && !(state?.config?.petals?.length));
     await refresh();
@@ -221,7 +216,11 @@
     }
   }
   for (const button of document.querySelectorAll('[data-action]')) button.addEventListener('click', () => perform(() => runAction(button.dataset.action)));
-  $('finish').addEventListener('click', () => notice(selected() === 'custodian' ? 'Setup is complete. Each action remains under your review.' : 'Setup is complete. Your persona permissions are active.'));
+  $('finish').addEventListener('click', () => {
+    if (busy || !policyApplied || (!sessionReady && selected() !== 'custodian') || !state?.machine?.available || !state?.selected_wallet) return;
+    showStep(4);
+    notice(selected() === 'custodian' ? 'Each action remains under your review.' : 'Your persona permissions are active.');
+  });
   showStep(0);
   try {
     const storageKey = 'bloom.onboarding.bridge.v1';
