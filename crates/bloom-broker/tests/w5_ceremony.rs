@@ -884,6 +884,48 @@ cryptoSelfTest().then(
     assert_eq!(String::from_utf8_lossy(&output.stdout), "browser-crypto-ok");
 }
 
+/// A Petal's declared destination is where its transaction may reach (a swap
+/// names the program it routes through), so the page must not call it a
+/// recipient. A system transfer's destination is a recipient.
+#[test]
+fn petal_destinations_are_not_shown_as_recipients() {
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+globalThis.document = {{getElementById: () => ({{}})}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+{executable}
+const claim = {{
+  declared_debits: [{{amount: "1", asset: {{chain: "solana", asset: "SOL"}}}}],
+  declared_destinations: [{{chain: "solana", destination: "PumpProgram111"}}],
+}};
+const petal = describeTransfer({{petal_use_claim: claim}});
+const system = describeTransfer({{system_use_claim: claim}});
+const label = view => view.facts.find(([, value]) => value === "PumpProgram111")[0];
+if (petal.sentence.includes("address below")) throw new Error(petal.sentence);
+if (label(petal) !== "Declared destinations") throw new Error(label(petal));
+if (!system.sentence.includes("address below")) throw new Error(system.sentence);
+if (label(system) !== "To") throw new Error(label(system));
+process.stdout.write("ok");
+"#
+    );
+    let output = run_node(&script);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "ok");
+}
+
 #[test]
 fn custody_manifest_is_rendered_on_the_primary_review_surface() {
     let asset = concat!(
