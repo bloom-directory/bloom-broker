@@ -1814,13 +1814,30 @@ impl BrokerJournal {
                 .into());
             }
         }
+        self.finalize_reservation_in_transaction(&transaction, approval_id, operation_id, next)?;
+        transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
+        self.after_durable(DurablePoint::ReservationFinalized)
+    }
+
+    /// Keep the state change and its authenticated evidence in the same
+    /// transaction, including when successful signing publishes its result.
+    /// Callers validate the transition (or require a RESERVED row) first.
+    fn finalize_reservation_in_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        approval_id: &Digest32,
+        operation_id: &OperationId,
+        next: ReservationState,
+    ) -> Result<(), JournalError> {
         transaction.execute(
             "UPDATE reservations SET state = ?3
              WHERE approval_id = ?1 AND operation_id = ?2",
             params![approval_id.as_str(), operation_id.as_str(), next.as_str()],
         )?;
         self.append_audit_transaction(
-            &transaction,
+            transaction,
             "reservation.finalized",
             &serde_json::json!({
                 "approval_id": approval_id,
@@ -1829,10 +1846,7 @@ impl BrokerJournal {
             }),
             self.audit_signer.as_ref(),
         )?;
-        transaction.commit()?;
-        drop(connection);
-        self.checkpoint_committed_head()?;
-        self.after_durable(DurablePoint::ReservationFinalized)
+        Ok(())
     }
 
     pub fn reservation_status(
@@ -1927,10 +1941,11 @@ impl BrokerJournal {
              WHERE operation_id = ?1",
             params![result.operation_id.as_str(), result_jcs],
         )?;
-        transaction.execute(
-            "UPDATE reservations SET state = 'COMMITTED'
-             WHERE approval_id = ?1 AND operation_id = ?2",
-            params![approval_id.as_str(), result.operation_id.as_str()],
+        self.finalize_reservation_in_transaction(
+            &transaction,
+            approval_id,
+            &result.operation_id,
+            ReservationState::Committed,
         )?;
         self.append_audit_transaction(
             &transaction,
@@ -2070,10 +2085,11 @@ impl BrokerJournal {
              WHERE operation_id = ?1",
             params![parent_result.operation_id.as_str(), parent_jcs],
         )?;
-        transaction.execute(
-            "UPDATE reservations SET state = 'COMMITTED'
-             WHERE approval_id = ?1 AND operation_id = ?2",
-            params![approval_id.as_str(), parent_result.operation_id.as_str()],
+        self.finalize_reservation_in_transaction(
+            &transaction,
+            approval_id,
+            &parent_result.operation_id,
+            ReservationState::Committed,
         )?;
         self.append_audit_transaction(
             &transaction,

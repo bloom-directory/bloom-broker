@@ -515,3 +515,155 @@ fn authenticated_release_frees_usd_capacity_and_survives_restart() {
         .unwrap();
     reopened.verify_audit_chain().unwrap();
 }
+
+/// Exercise the publication paths used by service::commit_signer_result rather
+/// than calling finalize_reservation directly: the next admission must accept
+/// their authenticated COMMITTED state, including after restart.
+#[test]
+fn usd_publication_preserves_audit_recovery_and_shared_capacity() {
+    for (batch, signature_count) in [(false, 1usize), (true, 1), (true, 2)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("published.sqlite");
+        let m = members();
+        let mut reservation = request(&m[0], 1, 70);
+        reservation.signature_count = signature_count as u64;
+        let mut unsigned = UnsignedSignRequest {
+            schema: token("bloom.sign-request/1"),
+            attempt_id: digest(70),
+            operation_id: reservation.operation_id.clone(),
+            operation_digest: digest(0),
+            attempt_digest: digest(0),
+            audience: token("bloom-signer"),
+            issuer_service_id: token("bloom-broker"),
+            issuer_boot_epoch: BootEpoch::from_bytes([1; 16]),
+            broker_signing_key_id: token("broker-test"),
+            approval_id: reservation.approval_id.clone(),
+            wallet_id: m[0].wallet_id.clone(),
+            key_ref: serde_json::from_value(serde_json::to_value(&m[0].key_ref).unwrap()).unwrap(),
+            crypto_suite: serde_json::from_value(
+                serde_json::to_value(m[0].allowed_crypto_suites[0]).unwrap(),
+            )
+            .unwrap(),
+            selector_kind: bloom_signer_api::SelectorKind::Petal,
+            ordered_payload_digests: vec![digest(71); signature_count],
+            ordered_hashes: vec![digest(72); signature_count],
+            ordered_messages: vec![],
+            signature_count: DecimalU64::new(signature_count as u64),
+            petal_use_claim_digest: Some(digest(73)),
+            claim_assurance_digest: Some(digest(74)),
+            policy_version: m[0].policy_version.clone(),
+            policy_digest: m[0].policy_digest.clone(),
+            validation_receipt_digest: digest(0),
+            issued_at_ms: DecimalU64::new(1_000_000),
+            not_before_ms: DecimalU64::new(1_000_000),
+            expires_at_ms: DecimalU64::new(1_030_000),
+        };
+        unsigned.operation_digest = unsigned.operation_identity().digest().unwrap();
+        reservation.operation_digest = unsigned.operation_digest.clone();
+        let receipt = BrokerValidationReceipt {
+            approval_id: unsigned.approval_id.clone(),
+            approval_digest: m[0].approval_digest().unwrap(),
+            operation_digest: unsigned.operation_digest.clone(),
+            policy_version: unsigned.policy_version.clone(),
+            policy_digest: unsigned.policy_digest.clone(),
+            claim_digest: unsigned.petal_use_claim_digest.clone(),
+            assurance_digest: unsigned.claim_assurance_digest.clone(),
+            reservation_ids: vec![digest(75)],
+            effective_claim_assurance: None,
+            broker_key_id: unsigned.broker_signing_key_id.clone(),
+            broker_signature: Base64UrlBytes::from_bytes(&[7; 64]),
+        };
+        unsigned.validation_receipt_digest = receipt.digest().unwrap();
+        unsigned.attempt_digest = unsigned.computed_attempt_digest().unwrap();
+        let result = SigningResult {
+            operation_id: unsigned.operation_id.clone(),
+            operation_digest: unsigned.operation_digest.clone(),
+            signatures: vec![
+                NormalizedSignature {
+                    crypto_suite: m[0].allowed_crypto_suites[0],
+                    bytes: Base64UrlBytes::from_bytes(&[8; 65]),
+                };
+                signature_count
+            ],
+            signer_receipt_digest: digest(76),
+            broker_receipt_digest: digest(77),
+        };
+        let children: Vec<_> = result
+            .signatures
+            .iter()
+            .enumerate()
+            .map(|(i, signature)| SigningResult {
+                operation_id: derive_batch_child_operation_id(&result.operation_id, i).unwrap(),
+                signatures: vec![signature.clone()],
+                ..result.clone()
+            })
+            .collect();
+        let publish = |j: &BrokerJournal| {
+            if batch {
+                j.publish_batch(&reservation.approval_id, &result, &children)
+            } else {
+                j.publish_result(&reservation.approval_id, &result)
+            }
+        };
+        {
+            let j = BrokerJournal::open(&path, audit()).unwrap();
+            prepare(&j, &m[0], 1, true);
+            prepare(&j, &m[1], 2, true);
+            j.reserve_for_clock_profile(&reservation, &limits(), false)
+                .unwrap();
+            j.begin_sign_attempt(&unsigned, batch, &receipt).unwrap();
+            for state in [
+                OperationState::Validated,
+                OperationState::Reserved,
+                OperationState::Dispatched,
+                OperationState::DownstreamAccepted,
+                OperationState::Committed,
+            ] {
+                j.transition_operation(&result.operation_id, state).unwrap();
+            }
+            publish(&j).unwrap();
+            j.verify_audit_chain().unwrap();
+            publish(&j).unwrap(); // Idempotent publication cannot duplicate the event.
+            assert_eq!(
+                j.audit_entries()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.event_type == "reservation.finalized")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                j.session_valuation(&reservation.approval_id, &result.operation_id)
+                    .unwrap(),
+                reservation.session_valuation
+            );
+            assert!(
+                j.session_budget_state(&reservation.approval_id, 1_000_001)
+                    .is_ok()
+            );
+        }
+        let j = BrokerJournal::open(&path, audit()).unwrap();
+        j.verify_audit_chain().unwrap();
+        assert_eq!(
+            j.operation(&result.operation_id).unwrap().unwrap().result,
+            Some(result.clone())
+        );
+        publish(&j).unwrap();
+        let mut next = request(&m[1], 2, 80);
+        next.values.values_mut().for_each(|amount| {
+            *amount = n(if m[1].key_ref.key_spec == KeySpec::Ed25519 {
+                "30000000"
+            } else {
+                "3000000"
+            });
+        });
+        next.session_valuation.as_mut().unwrap().usd_microdollars = n("3000000");
+        j.reserve_for_clock_profile(&next, &limits(), false)
+            .unwrap();
+        assert!(
+            j.reserve_for_clock_profile(&request(&m[1], 2, 81), &limits(), false)
+                .is_err()
+        );
+        j.verify_audit_chain().unwrap();
+    }
+}
