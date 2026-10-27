@@ -749,9 +749,9 @@ impl BrokerRpcService {
             }
             Request::CeremonyStatus(request) => {
                 let operation_id = OperationId::new(request.id.as_str().to_owned())?;
+                self.sweep_overdue_ceremonies();
                 Ok(Response::CeremonyStatus(
-                    self.ceremony
-                        .current_public_status(&operation_id, self.clock.now_ms(false)?)?,
+                    self.ceremony.public_status(&operation_id)?,
                 ))
             }
             Request::CeremonyCancel(request) => {
@@ -1062,13 +1062,31 @@ impl BrokerRpcService {
         Ok(status)
     }
 
+    /// Ceremonies expire only when something sweeps them, so status reads
+    /// sweep first: an overdue ceremony must not read as awaiting the owner.
+    /// Best-effort, because status must stay readable (AC-18) while the
+    /// clock or the audit journal is latched.
+    fn sweep_overdue_ceremonies(&self) {
+        if let Err(error) = self
+            .clock
+            .now_ms(false)
+            .and_then(|now_ms| self.ceremony.expire_sessions(now_ms))
+        {
+            tracing::warn!(
+                event = "ceremony.status_sweep_failed",
+                protocol_error_code = error.code.as_str(),
+                "Broker answered a status read without sweeping overdue ceremonies"
+            );
+        }
+    }
+
     fn attach_pending_approval_ceremony(
         &self,
         status: &mut bloom_broker_api::ApprovalPublicStatus,
     ) -> Result<(), ProtocolError> {
-        if let Some((url, expires_at_ms)) = self
-            .ceremony
-            .pending_approval_ceremony(&status.approval_id, self.clock.now_ms(false)?)?
+        self.sweep_overdue_ceremonies();
+        if let Some((url, expires_at_ms)) =
+            self.ceremony.pending_approval_ceremony(&status.approval_id)
         {
             status.ceremony_url = Some(url);
             status.ceremony_expires_at_ms = Some(expires_at_ms);
@@ -2629,14 +2647,18 @@ fn jcs_digest(value: &impl serde::Serialize) -> Result<Digest32, ProtocolError> 
 }
 
 fn authority_error(error: AuthorityError) -> ProtocolError {
-    let error_kind = match &error {
-        AuthorityError::Journal(_) => "journal",
-        AuthorityError::Storage(_) => "storage",
-        AuthorityError::Denied { .. } => "denied",
+    let (error_kind, denial_code, reason) = match &error {
+        AuthorityError::Journal(_) => ("journal", "", ""),
+        AuthorityError::Storage(_) => ("storage", "", ""),
+        AuthorityError::Denied { code, message } => ("denied", *code, message.as_str()),
     };
+    // Several denial codes reach the Machine as CLAIM_INVALID, so the code
+    // and its reason are logged here, where an operator can find them.
     tracing::warn!(
         event = "broker.authority_rejected",
         error_kind,
+        denial_code,
+        reason,
         "Broker authority rejected an operation"
     );
     match error {
