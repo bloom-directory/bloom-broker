@@ -1908,6 +1908,24 @@ function renderResult(session, plaintext) {
 }
 
 function walletPageUrl(wallet) { return "/wallet/" + encodeURIComponent(wallet); }
+// The Machine supplies a temporary loopback connection in the launch fragment.
+// Keep it in this tab only; never infer a connection from a public wallet ID.
+function walletSetupContinuation(wallet) {
+  const key = "bloom.wallet.setup." + wallet;
+  let storage;
+  try { storage = globalThis.sessionStorage; } catch (_) {}
+  try {
+    const params = new URLSearchParams(walletSetupFragment.slice(1));
+    const fresh = [...params.keys()].length === 1 ? params.get("setup") : null;
+    const saved = fresh ? {url:fresh, expires_at:Date.now() + 30*60*1000} : JSON.parse(storage?.getItem(key) ?? "null");
+    if (!saved || !Number.isFinite(saved.expires_at) || saved.expires_at <= Date.now()) return null;
+    const bridge = new URL(saved.url);
+    if (bridge.href !== saved.url || bridge.protocol !== "http:" || bridge.hostname !== "127.0.0.1" || !bridge.port || bridge.username || bridge.password || bridge.search || bridge.hash || !/^\/onboarding\/[0-9a-f]{64}\/$/.test(bridge.pathname)) return null;
+    try { storage?.setItem(key, JSON.stringify(saved)); } catch (_) {}
+    return "/onboarding/#bridge=" + encodeURIComponent(bridge.href);
+  } catch (_) { return null; }
+}
+
 function createdWalletView(accounts, created = true) {
   markDone(created ? "Wallet created" : accounts.wallet_id);
   document.getElementById("review-deadline").textContent = "";
@@ -1921,6 +1939,15 @@ function createdWalletView(accounts, created = true) {
     el("section", {class: "wallet-receive"},
       el("div", {class: "wallet-section-heading"}, el("h2", {}, "Your addresses"), el("span", {}, "Receive assets")),
       addressGrid)];
+  const continueUrl = walletSetupContinuation(accounts.wallet_id);
+  if (continueUrl) {
+    const next = el("button", {type:"button"}, "Continue setup");
+    next.onclick = () => location.assign(continueUrl);
+    parts.splice(1, 0, el("section", {class:"wallet-setup"},
+      el("h2", {}, "Make Bloom yours"),
+      el("p", {}, "Choose Custodian, Trader or Degen, then review your wallet permissions."),
+      el("div", {class:"result-actions"}, next)));
+  }
   const sortedAccounts = [...(accounts.accounts || [])].sort((a, b) =>
     Number(b.chain_projections?.[0]?.chain_family === "evm") - Number(a.chain_projections?.[0]?.chain_family === "evm"));
   for (const account of sortedAccounts) {
@@ -2014,6 +2041,7 @@ const tokenFromPath = location.pathname.startsWith("/ceremony/")
 const remoteCeremony = location.protocol === "https:";
 const remoteFragment = remoteCeremony && location.hash.startsWith("#cap=")
   ? location.hash.slice("#cap=".length) : "";
+const walletSetupFragment = !remoteCeremony ? location.hash : "";
 const sessionTokenKey = "bloom.ceremony.token.v1";
 let token = remoteCeremony ? remoteFragment : (tokenFromPath || readSessionToken());
 let ceremonyId = null;

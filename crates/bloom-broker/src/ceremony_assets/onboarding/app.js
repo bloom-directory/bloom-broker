@@ -218,6 +218,7 @@
   for (const button of document.querySelectorAll('[data-action]')) button.addEventListener('click', () => perform(() => runAction(button.dataset.action)));
   $('finish').addEventListener('click', () => {
     if (busy || !policyApplied || (!sessionReady && selected() !== 'custodian') || !state?.machine?.available || !state?.selected_wallet) return;
+    try { window.sessionStorage.removeItem("bloom.wallet.setup." + state.selected_wallet); } catch (_) {}
     showStep(4);
     notice(selected() === 'custodian' ? 'Each action remains under your review.' : 'Your persona permissions are active.');
   });
