@@ -1377,6 +1377,9 @@ function renderCardReview(session) {
       document.getElementById("page-lede").textContent = "Bloom clicks this shop's pay button once. The shop charges the payment method saved in your account there; no Bloom card is used. Bloom cannot cap the shop's actual charge.";
       fact("Payment", "Your saved payment method at this shop");
     } else fact("Payment frames", payment.payment_frame_origins.join(", ") || "Main document");
+    if (payment.total_minor === 0 && payment.renewal_minor) {
+      document.getElementById("page-lede").textContent = "This charges nothing today. You are giving this merchant your card for the charges below; Bloom cannot cap what it takes later, and cancelling is done with the merchant.";
+    }
     // ISO 4217 minor units (SIX list, 2026-09-17), not CLDR display digits.
     const scale = ({
       BIF:0,CLP:0,DJF:0,GNF:0,ISK:0,JPY:0,KMF:0,KRW:0,PYG:0,RWF:0,UGX:0,UYI:0,VND:0,VUV:0,XAF:0,XOF:0,XPF:0,
@@ -1385,13 +1388,18 @@ function renderCardReview(session) {
     })[payment.currency] ?? 2;
     const amount = payment.total_minor / (10 ** scale);
     const money = value => new Intl.NumberFormat("en", {style: "currency", currency: payment.currency, minimumFractionDigits: scale, maximumFractionDigits: scale}).format(value);
-    fact("Total", `${money(amount)} (${payment.currency})`);
+    // A trial charges nothing today, so the figure that matters is the one
+    // below it. Saying "$0.00" invites reading this as a free transaction
+    // rather than as putting a card on file.
+    const every = {day: "day", week: "week", month: "month", year: "year"}[payment.renewal_period];
+    fact("Total", payment.total_minor === 0 && payment.renewal_minor && every
+      ? `Nothing today (${payment.currency})`
+      : `${money(amount)} (${payment.currency})`);
     fact("Installments", payment.total_minor % payment.installments === 0
       ? `${payment.installments} × ${money(amount / payment.installments)} = ${money(amount)}`
       : `${payment.installments} payments totaling ${money(amount)}; individual installment amounts were not verified`);
     // What the subscription costs later is the part a trial price hides, so
     // it goes next to the charge rather than behind the word "recurring".
-    const every = {day: "day", week: "week", month: "month", year: "year"}[payment.renewal_period];
     if (payment.renewal_minor && every) {
       const renewal = money(payment.renewal_minor / (10 ** scale));
       fact("Recurring charge", payment.renewal_starts_on
