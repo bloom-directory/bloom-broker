@@ -1,0 +1,149 @@
+{
+  "$schema": "https://eips.ethereum.org/assets/eip-7730/erc7730-v2.schema.json",
+  "$comment": "Bloom derivative of LedgerHQ/clear-signing-erc7730-registry registry/safe/common-SafeProxyFactory.json. The singleton is fixed to official Safe implementations by mustMatch.",
+  "context": {
+    "$id": "SafeProxyFactory",
+    "contract": {
+      "deployments": [
+        {
+          "chainId": 1,
+          "address": "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2"
+        },
+        {
+          "chainId": 1,
+          "address": "0xc22834581ebc8527d974f8a1c97e1bea4ef910bc"
+        },
+        {
+          "chainId": 1,
+          "address": "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67"
+        },
+        {
+          "chainId": 1,
+          "address": "0x14f2982d601c9458f93bd70b218933a6f8165e7b"
+        },
+        {
+          "chainId": 10,
+          "address": "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2"
+        },
+        {
+          "chainId": 10,
+          "address": "0xc22834581ebc8527d974f8a1c97e1bea4ef910bc"
+        },
+        {
+          "chainId": 10,
+          "address": "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67"
+        },
+        {
+          "chainId": 10,
+          "address": "0x14f2982d601c9458f93bd70b218933a6f8165e7b"
+        },
+        {
+          "chainId": 100,
+          "address": "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2"
+        },
+        {
+          "chainId": 100,
+          "address": "0xc22834581ebc8527d974f8a1c97e1bea4ef910bc"
+        },
+        {
+          "chainId": 100,
+          "address": "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67"
+        },
+        {
+          "chainId": 100,
+          "address": "0x14f2982d601c9458f93bd70b218933a6f8165e7b"
+        },
+        {
+          "chainId": 137,
+          "address": "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2"
+        },
+        {
+          "chainId": 137,
+          "address": "0xc22834581ebc8527d974f8a1c97e1bea4ef910bc"
+        },
+        {
+          "chainId": 137,
+          "address": "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67"
+        },
+        {
+          "chainId": 137,
+          "address": "0x14f2982d601c9458f93bd70b218933a6f8165e7b"
+        },
+        {
+          "chainId": 8453,
+          "address": "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2"
+        },
+        {
+          "chainId": 8453,
+          "address": "0xc22834581ebc8527d974f8a1c97e1bea4ef910bc"
+        },
+        {
+          "chainId": 8453,
+          "address": "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67"
+        },
+        {
+          "chainId": 8453,
+          "address": "0x14f2982d601c9458f93bd70b218933a6f8165e7b"
+        },
+        {
+          "chainId": 42161,
+          "address": "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2"
+        },
+        {
+          "chainId": 42161,
+          "address": "0xc22834581ebc8527d974f8a1c97e1bea4ef910bc"
+        },
+        {
+          "chainId": 42161,
+          "address": "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67"
+        },
+        {
+          "chainId": 42161,
+          "address": "0x14f2982d601c9458f93bd70b218933a6f8165e7b"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "owner": "Safe{Wallet}",
+    "contractName": "Safe proxy factory"
+  },
+  "display": {
+    "formats": {
+      "createProxyWithNonce(address _singleton, bytes initializer, uint256 saltNonce)": {
+        "intent": "Create Safe",
+        "fields": [
+          {
+            "path": "_singleton",
+            "label": "Safe implementation",
+            "visible": {
+              "mustMatch": [
+                "0xd9db270c1b5e3bd161e8c8503c55ceabee709552",
+                "0x69f4d1788e39c87893c980c06edf4b7f686e2938",
+                "0x3e5c63644e683549055b9be8653de26e0b4cd36e",
+                "0xfb1bffc9d739b8d520daf37df666da4c687191ea",
+                "0x41675c099f32341bf84bfc5382af534df5c7461a",
+                "0x29fcb43b46531bca003ddc8fcb67ffe91900c762",
+                "0xff51a5898e281db6dfc7855790607438df2ca44b",
+                "0xedd160febbd92e350d4d398fb636302fccd67c7e"
+              ]
+            }
+          },
+          {
+            "path": "initializer",
+            "label": "New Safe",
+            "format": "calldata",
+            "params": {
+              "calleePath": "_singleton"
+            }
+          },
+          {
+            "path": "saltNonce",
+            "label": "Salt nonce",
+            "format": "raw"
+          }
+        ]
+      }
+    }
+  }
+}

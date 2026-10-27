@@ -1,0 +1,213 @@
+{
+  "$schema": "https://eips.ethereum.org/assets/eip-7730/erc7730-v2.schema.json",
+  "$comment": "Enso Router V2 input envelopes and safe-route output balance-increase checks; Bloom ensoToken/ensoTokenOutput extensions. Source: EnsoBuild/shortcuts-client-contracts 483408a3219451858abcd92c2f7b19a9783c14cc src/interfaces/IEnsoRouter.sol, src/router/EnsoRouter.sol and broadcast/EnsoRouterDeployer.s.sol/<chain>/run-latest.json; Tempo 4217 and Robinhood 4663 deployments: https://docs.enso.build/pages/build/reference/deployments.md retrieved 2026-10-19. Covers all 12 networks accepted by the Enso Petal's chain parser. No runtime code or shortcut program attestation.",
+  "context": {
+    "contract": {
+      "deployments": [
+        {
+          "chainId": 1,
+          "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+        },
+        {
+          "chainId": 10,
+          "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+        },
+        {
+          "chainId": 56,
+          "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+        },
+        {
+          "chainId": 100,
+          "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+        },
+        {
+          "chainId": 137,
+          "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+        },
+        {
+          "chainId": 8453,
+          "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+        },
+        {
+          "chainId": 42161,
+          "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+        },
+        {
+          "chainId": 43114,
+          "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+        },
+        {
+          "chainId": 999,
+          "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+        },
+        {
+          "chainId": 59144,
+          "address": "0xa146d46823f3f594b785200102be5385cafce9b5"
+        },
+        {
+          "chainId": 4217,
+          "address": "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"
+        },
+        {
+          "chainId": 4663,
+          "address": "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "contractName": "Enso Router V2"
+  },
+  "display": {
+    "formats": {
+      "routeSingle((uint8 tokenType,bytes data) tokenIn,bytes data)": {
+        "intent": "Route inputs through Enso; shortcut effects and quoted outputs remain unverified",
+        "fields": [
+          {
+            "path": "@.value",
+            "label": "Native value",
+            "format": "amount"
+          },
+          {
+            "path": "tokenIn.tokenType",
+            "label": "Input token type",
+            "format": "raw"
+          },
+          {
+            "path": "tokenIn.data",
+            "label": "Source asset / amount",
+            "format": "ensoToken",
+            "params": {
+              "typePath": "tokenIn.tokenType"
+            }
+          },
+          {
+            "path": "data",
+            "label": "Shortcut program",
+            "format": "ensoShortcut"
+          }
+        ]
+      },
+      "routeMulti((uint8 tokenType,bytes data)[] tokensIn,bytes data)": {
+        "intent": "Route inputs through Enso; shortcut effects and quoted outputs remain unverified",
+        "fields": [
+          {
+            "path": "@.value",
+            "label": "Native value",
+            "format": "amount"
+          },
+          {
+            "path": "tokensIn.[].tokenType",
+            "label": "Input token type",
+            "format": "raw"
+          },
+          {
+            "path": "tokensIn.[].data",
+            "label": "Source asset / amount",
+            "format": "ensoToken",
+            "params": {
+              "typePath": "tokensIn.[].tokenType"
+            }
+          },
+          {
+            "path": "data",
+            "label": "Shortcut program",
+            "format": "ensoShortcut"
+          }
+        ]
+      },
+      "safeRouteSingle((uint8 tokenType,bytes data) tokenIn,(uint8 tokenType,bytes data) tokenOut,address receiver,bytes data)": {
+        "intent": "Route through Enso with requested output balance-increase checks; shortcut effects remain unverified",
+        "fields": [
+          {
+            "path": "@.value",
+            "label": "Native value",
+            "format": "amount"
+          },
+          {
+            "path": "tokenIn.tokenType",
+            "label": "Input token type",
+            "format": "raw"
+          },
+          {
+            "path": "tokenIn.data",
+            "label": "Source asset / amount",
+            "format": "ensoToken",
+            "params": {
+              "typePath": "tokenIn.tokenType"
+            }
+          },
+          {
+            "path": "tokenOut.tokenType",
+            "label": "Output token type",
+            "format": "raw"
+          },
+          {
+            "path": "tokenOut.data",
+            "label": "Requested minimum balance increase",
+            "format": "ensoTokenOutput",
+            "params": {
+              "typePath": "tokenOut.tokenType"
+            }
+          },
+          {
+            "path": "receiver",
+            "label": "Output receiver",
+            "format": "addressName"
+          },
+          {
+            "path": "data",
+            "label": "Shortcut program",
+            "format": "ensoShortcut"
+          }
+        ]
+      },
+      "safeRouteMulti((uint8 tokenType,bytes data)[] tokensIn,(uint8 tokenType,bytes data)[] tokensOut,address receiver,bytes data)": {
+        "intent": "Route through Enso with requested output balance-increase checks; shortcut effects remain unverified",
+        "fields": [
+          {
+            "path": "@.value",
+            "label": "Native value",
+            "format": "amount"
+          },
+          {
+            "path": "tokensIn.[].tokenType",
+            "label": "Input token type",
+            "format": "raw"
+          },
+          {
+            "path": "tokensIn.[].data",
+            "label": "Source asset / amount",
+            "format": "ensoToken",
+            "params": {
+              "typePath": "tokensIn.[].tokenType"
+            }
+          },
+          {
+            "path": "tokensOut.[].tokenType",
+            "label": "Output token type",
+            "format": "raw"
+          },
+          {
+            "path": "tokensOut.[].data",
+            "label": "Requested minimum balance increase",
+            "format": "ensoTokenOutput",
+            "params": {
+              "typePath": "tokensOut.[].tokenType"
+            }
+          },
+          {
+            "path": "receiver",
+            "label": "Output receiver",
+            "format": "addressName"
+          },
+          {
+            "path": "data",
+            "label": "Shortcut program",
+            "format": "ensoShortcut"
+          }
+        ]
+      }
+    }
+  }
+}

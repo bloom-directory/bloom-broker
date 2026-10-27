@@ -1,3 +1,623 @@
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires disposable store produced by the released Broker/Signer fixture binary"]
+async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
+    let authenticator = VirtualAuthenticator::from_seed(b"pm80-disposable-policy-owner");
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = std::path::PathBuf::from(
+        std::env::var_os("BLOOM_PM80_RELEASED_STORE").expect("set released fixture path"),
+    );
+    for entry in std::fs::read_dir(&fixture).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), directory.path().join(entry.file_name())).unwrap();
+        }
+    }
+    let signer_database = directory.path().join("signer.sqlite");
+    let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
+    let signer_engine = Arc::new(
+        SignerEngine::open(
+            &signer_database,
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
+            SigningKey::from_bytes(&[6; 32]).verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            signer_audit_keys(),
+            registry,
+        )
+        .unwrap(),
+    );
+    let signer_ceremony = Arc::new(
+        SignerCeremonyService::new(
+            signer_engine.clone(),
+            Token::new("signer-ceremony-key").unwrap(),
+            SigningKey::from_bytes(&[9; 32]),
+        )
+        .unwrap(),
+    );
+    let socket_path = directory.path().join("signer.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+    let effective_uid = fs::metadata(directory.path()).unwrap().uid();
+    let broker_identity = local_identity("bloom-broker", [0x31; 32], "31");
+    let signer_identity = local_identity("bloom-signer", [0x32; 32], "32");
+    let signer_acl = peer_acl(&signer_identity, effective_uid);
+    let broker_acl = peer_acl(&broker_identity, effective_uid);
+    let broker_journal_path = directory.path().join("broker-journal.sqlite");
+    let broker_authority_path = directory.path().join("broker-authority.sqlite");
+    let journal = Arc::new(
+        BrokerJournal::open(&broker_journal_path, Arc::new(ServiceTestAuditSigner)).unwrap(),
+    );
+    let signer_rpc = Arc::new(SignerRpcService::new(
+        signer_engine.clone(),
+        signer_ceremony.clone(),
+        Arc::new(
+            SignerClock::new(
+                signer_engine.clone(),
+                test_time_source(),
+                signer_identity.boot_epoch.clone(),
+            )
+            .unwrap(),
+        ),
+        signer_identity.boot_epoch.clone(),
+        digest("e2"),
+        "test",
+    ));
+    let signer_server = tokio::spawn({
+        let signer_identity = signer_identity.clone();
+        let signer_rpc = signer_rpc.clone();
+        let signer_journals = TestSignerJournalExchange(signer_engine.clone());
+        async move {
+            let quota = EndpointQuota::new(16, 1_000, 60_000, 1_000, 60_000).unwrap();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                bloom_triad_local_transport::dispatch_connection_with_journal_heads::<
+                    BrokerSignerRequest,
+                    BrokerSignerResponse,
+                    bloom_signer_api::ProtocolError,
+                    _,
+                    _,
+                >(
+                    &mut stream,
+                    &signer_identity,
+                    &broker_acl,
+                    bloom_signer_api::SIGNER_API_CURRENT,
+                    bloom_signer_api::SIGNER_API_RANGE,
+                    &quota,
+                    &signer_journals,
+                    |request| BrokerSignerService::dispatch(signer_rpc.as_ref(), request),
+                )
+                .await
+                .unwrap();
+            }
+        }
+    });
+    let signer_client = BrokerSignerClient::connect_unix(
+        &socket_path,
+        broker_identity.clone(),
+        signer_acl.clone(),
+        journal.clone(),
+        Arc::new(AcceptingCheckpointSink),
+    )
+    .unwrap();
+    let authority = Arc::new(
+        BrokerAuthority::open(
+            &broker_authority_path,
+            journal.clone(),
+            BTreeMap::new(),
+            Token::new("installer-key").unwrap(),
+            SigningKey::from_bytes(&[5; 32]).verifying_key(),
+            Token::new("signer-ceremony-key").unwrap(),
+            SigningKey::from_bytes(&[9; 32]).verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]).verifying_key(),
+            AssuranceRegistry::compiled(Vec::new()).unwrap(),
+        )
+        .unwrap(),
+    );
+    let ceremony = CeremonyBroker::open_with_manifest_signer(
+        directory.path().join("ceremony.sqlite"),
+        Arc::new(signer_client.clone()),
+        Token::new("broker-app-1").unwrap(),
+        SigningKey::from_bytes(&[7; 32]),
+        journal.clone(),
+    )
+    .unwrap();
+    let broker = BrokerRpcService::new(
+        authority.clone(),
+        journal.clone(),
+        Arc::new(
+            BrokerClock::new(
+                journal.clone(),
+                test_time_source(),
+                broker_identity.boot_epoch.clone(),
+            )
+            .unwrap(),
+        ),
+        ceremony,
+        signer_client.clone(),
+        Token::new("broker-app-1").unwrap(),
+        SigningKey::from_bytes(&[7; 32]),
+        broker_identity.boot_epoch.clone(),
+        digest("e3"),
+        "test",
+    )
+    .unwrap();
+
+    let wallet_id = Token::new("quiet-lilac").unwrap();
+    let original: SignedPolicySnapshot =
+        serde_json::from_slice(&std::fs::read(fixture.join("policy-snapshot.json")).unwrap())
+            .unwrap();
+    let baseline = authority.policy_snapshot(&wallet_id).unwrap();
+    assert_eq!(
+        baseline, original,
+        "upgrade must preserve signed canonical policy bytes"
+    );
+    let old: CanonicalWalletPolicy =
+        serde_json::from_slice(&baseline.canonical_policy.decode()).unwrap();
+    let mut terms: SealedApprovalTerms =
+        serde_json::from_value(serde_json::to_value(approval_request().terms).unwrap()).unwrap();
+    terms.wallet_id = wallet_id.clone();
+    terms.policy_version = baseline.version.clone();
+    terms.policy_digest = baseline.policy_digest.clone();
+    let current = if old.clear_signing.is_none() {
+        let observed = MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::PolicyRead(WalletRequest {
+                wallet_id: wallet_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(observed, MachineBrokerResponse::PolicyRead(snapshot) if snapshot == original)
+        );
+        // A plain released policy requires no owner migration. Continue through
+        // the same real approval/signing path as the migrated policy below.
+        baseline.clone()
+    } else {
+        let denied = authority
+            .prepare_approval(&terms, &digest("a1"))
+            .unwrap_err();
+        assert!(
+            denied.to_string().contains("POLICY_MIGRATION_REQUIRED"),
+            "{denied}"
+        );
+        let mut proposed = old.clone();
+        proposed.clear_signing = None;
+        let authority_diff = canonical_policy_authority_diff(&old, &proposed);
+        assert_eq!(
+            authority_diff.removed_legacy_clear_signing,
+            old.clear_signing
+        );
+        let bytes = serde_jcs::to_vec(&proposed).unwrap();
+        let mut update = PolicyUpdateRequest {
+            operation_id: operation("f1"),
+            wallet_id: wallet_id.clone(),
+            baseline_version: baseline.version.clone(),
+            baseline_digest: baseline.policy_digest.clone(),
+            proposed_canonical_policy: Base64UrlBytes::from_bytes(&bytes),
+            proposed_policy_digest: Digest32::from_bytes(sha2::Sha256::digest(&bytes).into()),
+            authority_diff_digest: authority_diff.digest().unwrap(),
+            assurance_level: Token::new("user_verified").unwrap(),
+        };
+        // Cancelling a real owner migration must leave the signed policy intact.
+        MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::PolicyValidateUpdate(update.clone()),
+        )
+        .await
+        .unwrap();
+        MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::CeremonyCancel(bloom_broker_api::IdRequest {
+                id: Digest32::from_bytes(update.operation_id.to_bytes()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(authority.policy_snapshot(&wallet_id).unwrap(), original);
+        update.operation_id = operation("f2");
+        tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+        let prepared = match MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::PolicyValidateUpdate(update.clone()),
+        )
+        .await
+        .unwrap()
+        {
+            MachineBrokerResponse::PolicyValidateUpdate(prepared) => prepared,
+            other => panic!("unexpected prepare: {other:?}"),
+        };
+        assert_eq!(authority.policy_snapshot(&wallet_id).unwrap(), original);
+        let token = url_token(&prepared.ceremony_url);
+        let session_response = broker
+            .ceremony()
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session")
+                    .header(header::HOST, "localhost:18734")
+                    .header("x-bloom-ceremony-token", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let session: serde_json::Value = serde_json::from_slice(
+            &session_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            session["review_manifest"]["authority_diff"],
+            serde_json::to_value(&authority_diff).unwrap()
+        );
+        let challenge: CeremonyChallenge =
+            serde_json::from_value(session["challenges"][0]["binding"].clone()).unwrap();
+        let contribution: CustodySignerContribution =
+            serde_json::from_value(session["signer_contribution"].clone()).unwrap();
+        let assertion = authenticator.assertion(&challenge.canonical_bytes().unwrap(), 3);
+        let aad = CustodyHpkeAad {
+            surface: bloom_signer_api::legacy_local_surface(),
+            ceremony_id: contribution.ceremony_id.clone(),
+            ceremony_kind: CeremonyKind::PolicyUpdate,
+            custody_operation_id: update.operation_id.clone(),
+            signer_nonce: contribution.signer_nonce.clone(),
+            signer_contribution_digest: contribution.digest().unwrap(),
+            wallet_id: Some(wallet_id.clone()),
+            key_ref: None,
+            credential_id: Some(assertion.credential_id.clone()),
+            expected_input_class: Token::new("policy_update_credential_prf").unwrap(),
+        }
+        .canonical_bytes()
+        .unwrap();
+        let plaintext = serde_jcs::to_vec(&serde_json::json!({
+            "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+            "effect": {"kind": "policy_update"},
+        }))
+        .unwrap();
+        let encrypted_input = seal_hpke(
+            &contribution.hpke_recipient_key,
+            b"bloom-custody-input/v1",
+            &aad,
+            &plaintext,
+        )
+        .unwrap();
+        let completed = signer_ceremony
+            .complete_policy_update(
+                PolicyUpdateCeremonyCompleteRequest {
+                    custody: CustodyCompleteRequest {
+                        ceremony_kind: CeremonyKind::PolicyUpdate,
+                        custody_operation_id: update.operation_id.clone(),
+                        ceremony_id: contribution.ceremony_id,
+                        proof: WebAuthnCeremonyProof::Assertion { assertion },
+                        encrypted_input: Some(encrypted_input),
+                        public_binding_digest: update.terms_digest().unwrap(),
+                    },
+                },
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        broker
+            .ceremony()
+            .expire_sessions(contribution.expires_at_ms.get() + 1)
+            .unwrap();
+        let _recovered = broker_custody_result(&broker, update.operation_id.clone()).await;
+        let committed = match MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::PolicyCommitUpdate(PolicyCommitUpdateRequest {
+                operation_id: update.operation_id.clone(),
+                ceremony_receipt: custody_result_to_machine(&completed),
+            }),
+        )
+        .await
+        .unwrap()
+        {
+            MachineBrokerResponse::PolicyCommitUpdate(receipt) => receipt,
+            other => panic!("unexpected commit: {other:?}"),
+        };
+        assert_eq!(
+            committed.committed.version.get(),
+            original.version.get() + 1
+        );
+        let migrated: CanonicalWalletPolicy =
+            serde_json::from_slice(&committed.committed.canonical_policy.decode()).unwrap();
+        assert_eq!(migrated, proposed);
+        assert!(
+            authority.prepare_approval(&terms, &digest("a1")).is_err(),
+            "old policy-bound grants remain invalid"
+        );
+        assert_eq!(
+            rusqlite::Connection::open(&broker_journal_path)
+                .unwrap()
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            3
+        );
+        committed.committed
+    };
+    let reopened = BrokerAuthority::open(
+        &broker_authority_path,
+        journal.clone(),
+        BTreeMap::new(),
+        Token::new("installer-key").unwrap(),
+        SigningKey::from_bytes(&[5; 32]).verifying_key(),
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]).verifying_key(),
+        Token::new("signer-revocation-key").unwrap(),
+        SigningKey::from_bytes(&[4; 32]).verifying_key(),
+        AssuranceRegistry::compiled(Vec::new()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reopened.policy_snapshot(&wallet_id).unwrap(), current);
+    let authority = Arc::new(reopened);
+    let broker = BrokerRpcService::new(
+        authority.clone(),
+        journal.clone(),
+        Arc::new(
+            BrokerClock::new(
+                journal.clone(),
+                test_time_source(),
+                broker_identity.boot_epoch.clone(),
+            )
+            .unwrap(),
+        ),
+        broker.ceremony().clone(),
+        signer_client.clone(),
+        Token::new("broker-app-1").unwrap(),
+        SigningKey::from_bytes(&[7; 32]),
+        broker_identity.boot_epoch.clone(),
+        digest("e3"),
+        "test",
+    )
+    .unwrap();
+    let public = match MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::WalletGetPublic(WalletRequest {
+            wallet_id: wallet_id.clone(),
+        }),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::WalletGetPublic(public) => public,
+        other => panic!("unexpected wallet projection: {other:?}"),
+    };
+    let accounts = match MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::WalletAccounts(WalletRequest {
+            wallet_id: wallet_id.clone(),
+        }),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::WalletAccounts(accounts) => accounts,
+        other => panic!("unexpected accounts: {other:?}"),
+    };
+    let account_key = accounts
+        .accounts
+        .iter()
+        .find(|account| {
+            account.path == "m/44'/60'/0'/0/0"
+                && account.derivation_profile
+                    == bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1
+        })
+        .expect("registered EVM account zero")
+        .key_ref
+        .clone();
+    let mut provenance = ProvenanceRecord {
+        subject: ProvenanceSubject::Cli {
+            client_id: Token::new("bloom-cli").unwrap(),
+            command_class: Token::new("wallet-sign").unwrap(),
+        },
+        publisher: Token::new("fixture-publisher").unwrap(),
+        petal_lineage: None,
+        operation_classes: vec![ProvenanceOperationClass {
+            operation_class: Token::new("wallet-sign").unwrap(),
+            fee_asset: None,
+        }],
+        installer_key_id: Token::new("installer-key").unwrap(),
+        installer_signature: Base64UrlBytes::from_bytes(&[]),
+    };
+    sign_provenance(&mut provenance, &SigningKey::from_bytes(&[5; 32]));
+    authority.install_provenance(&provenance).unwrap();
+    let payload = b"disposable software-owner migration proof";
+    let payload_digest = Digest32::from_bytes(sha2::Sha256::digest(payload).into());
+    let current_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let mut approval_terms = terms.clone();
+    approval_terms.key_ref = account_key;
+    approval_terms.policy_version = current.version.clone();
+    approval_terms.policy_digest = current.policy_digest.clone();
+    approval_terms.wallet_revocation_epoch = public.wallet_revocation_epoch;
+    approval_terms.provenance_digest =
+        Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&provenance).unwrap()).into());
+    approval_terms.activation_mode = ActivationMode::BootBound;
+    approval_terms.issued_at_ms = DecimalU64::new(current_ms);
+    approval_terms.not_before_ms = DecimalU64::new(current_ms);
+    approval_terms.expires_at_ms = DecimalU64::new(current_ms + 60_000);
+    approval_terms.request_nonce = RequestNonce::from_bytes([0x77; 16]);
+    approval_terms.selector = ApprovalSelector::Exact {
+        ordered_payload_digests: vec![payload_digest.clone()],
+        ordered_hashes: vec![payload_digest],
+    };
+    let approval_operation = operation("f3");
+    let approval_prepared = match MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            operation_id: approval_operation.clone(),
+            terms: approval_terms.clone(),
+            canonical_plan_facts_digest: approval_terms.approval_digest().unwrap(),
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            evm_reported_token: None,
+            evm_review_payloads: vec![],
+            message_review_payloads: vec![],
+            safe_review_payloads: vec![],
+            petal_use_claim: None,
+            system_use_claim: None,
+        }),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::SealedApprovalPrepare(prepared) => prepared,
+        other => panic!("unexpected approval: {other:?}"),
+    };
+    let child_key = key_to_signer(&approval_terms.key_ref);
+    let approval_token = url_token(&approval_prepared.ceremony_url);
+    let approval_status = broker
+        .ceremony()
+        .public_status(&approval_operation)
+        .unwrap();
+    let approval_id = approval_status.ceremony_id.to_string();
+    let approval_app = broker.ceremony().router();
+    let approval_session_response = approval_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", &approval_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let approval_session: serde_json::Value = serde_json::from_slice(
+        &approval_session_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    let approval_challenge: CeremonyChallenge =
+        serde_json::from_value(approval_session["challenges"][0]["binding"].clone()).unwrap();
+    let approval_contribution: SignerCeremonyContribution =
+        serde_json::from_value(approval_session["signer_contribution"].clone()).unwrap();
+    let approval_assertion =
+        authenticator.assertion(&approval_challenge.canonical_bytes().unwrap(), 4);
+    let approval_aad = LocalPrfHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
+        ceremony_id: approval_contribution.ceremony_id.clone(),
+        signer_nonce: approval_contribution.signer_nonce.clone(),
+        approval_id: approval_terms.approval_id().unwrap(),
+        approval_digest: approval_terms.approval_digest().unwrap(),
+        review_manifest_digest: approval_prepared.review_manifest_digest.clone(),
+        key_ref: child_key.clone(),
+        allowed_crypto_suites: approval_terms
+            .allowed_crypto_suites
+            .iter()
+            .cloned()
+            .map(crypto_suite_to_signer)
+            .collect(),
+        credential_id: approval_assertion.credential_id.clone(),
+        activation_mode: activation_mode_to_signer(approval_terms.activation_mode.clone()),
+        wallet_revocation_epoch: approval_terms.wallet_revocation_epoch.clone(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let approval_encrypted = seal_hpke(
+        approval_contribution
+            .ephemeral_encryption_public_key
+            .as_ref()
+            .unwrap(),
+        b"bloom-local-prf/v1",
+        &approval_aad,
+        &authenticator.deterministic_prf(),
+    )
+    .unwrap();
+    let approval_complete_response = approval_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/session/{approval_id}/complete"))
+                .header(header::HOST, "localhost:18734")
+                .header(header::ORIGIN, "http://localhost:18734")
+                .header("x-bloom-ceremony-token", &approval_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "proof": {"kind": "assertion", "assertion": approval_assertion},
+                        "encrypted_input": approval_encrypted,
+                        "public_binding_digest": approval_terms.approval_digest().unwrap()
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approval_complete_response.status(), StatusCode::OK);
+    let approval_receipt: SignerActivationReceipt = serde_json::from_slice(
+        &approval_complete_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        approval_receipt.approval_id,
+        approval_terms.approval_id().unwrap()
+    );
+
+    let mut signing = exact_petal_sign_request(
+        &approval_terms,
+        operation("f4"),
+        digest("d1"),
+        "/unused",
+        payload,
+    );
+    signing.provenance = provenance.subject;
+    let result =
+        MachineBrokerService::dispatch(&broker, MachineBrokerRequest::SigningSign(signing))
+            .await
+            .unwrap();
+    match result {
+        MachineBrokerResponse::SigningSign(result) => assert_eq!(result.signatures.len(), 1),
+        other => panic!("unexpected signing result: {other:?}"),
+    }
+    if let Some(output) = std::env::var_os("BLOOM_PM80_UPGRADED_STORE_OUT") {
+        let output = std::path::PathBuf::from(output);
+        std::fs::create_dir_all(&output).unwrap();
+        for entry in std::fs::read_dir(directory.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file()
+                && entry.file_name().to_string_lossy().ends_with(".sqlite")
+            {
+                let destination = output
+                    .join(entry.file_name())
+                    .to_string_lossy()
+                    .replace('\'', "''");
+                rusqlite::Connection::open(entry.path())
+                    .unwrap()
+                    .execute_batch(&format!("VACUUM INTO '{destination}'"))
+                    .unwrap();
+            }
+        }
+    }
+    signer_server.abort();
+}
+
 use axum::{
     body::Body,
     http::{Request, StatusCode, Version, header},
@@ -11,7 +631,7 @@ use bloom_broker::{
         ReviewManifestContext,
     },
     clock::BrokerClock,
-    journal::{AuditSigner, BrokerJournal, FrozenReview, NewApprovalRecord},
+    journal::{AuditSigner, BrokerJournal, NewApprovalRecord},
     service::BrokerRpcService,
     signer_client::BrokerSignerClient,
 };
@@ -194,7 +814,10 @@ impl AuditSigner for SwitchableAuditSigner {
 /// completed these ceremonies through the API rather than the page.
 #[test]
 fn the_shipped_page_handles_every_custody_ceremony_kind() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
 
     // Kinds whose completion is PRF plus a typed effect, with no operator
     // input. The page must list them, or it sends nothing at all.
@@ -231,7 +854,10 @@ fn the_shipped_page_handles_every_custody_ceremony_kind() {
 
 #[test]
 fn browser_crypto_self_test_executes_the_shipped_asset() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -260,7 +886,10 @@ cryptoSelfTest().then(
 
 #[test]
 fn custody_manifest_is_rendered_on_the_primary_review_surface() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -319,16 +948,23 @@ if (nodes["page-title"].textContent !== "Remove a passkey from a wallet" ||
 
 #[test]
 fn evm_manifest_is_rendered_as_primary_review_facts() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        "const REVIEWED_ENSO_ROUTER = ",
+        include_str!("../../bloom-evm-clear-signing/catalogs/enso/router-v2.json"),
+        ";\n",
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
         .0;
+    let tokens = serde_json::to_string(bloom_broker_api::known_tokens()).unwrap();
     let script = format!(
         r#"
 class Node {{
   constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
-  setAttribute() {{}}
+  setAttribute(name, value) {{ this[name] = value; }}
   append(...children) {{ this.children.push(...children); }}
   replaceChildren(...children) {{ this.children = children; }}
 }}
@@ -436,6 +1072,463 @@ for (const expected of ["Deploy a contract", "Initcode", "5 bytes", "0xcafe"]) {
   if (!rendered.includes(expected)) throw new Error(`creation not disclosed ${{expected}}: ${{rendered}}`);
 }}
 
+// A Safe review is the headline.
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "wallet-primary"}},
+  review_manifest: {{
+    schema: "bloom.review-manifest.v1",
+    canonical_plan: JSON.stringify({{safe_review: {{
+      chain_id: "1", chain: "ethereum",
+      safe: "0x1000000000000000000000000000000000000000",
+      owner: "0x3000000000000000000000000000000000000000",
+      nonce: "4", operation: "call",
+      destination: "0x5000000000000000000000000000000000000000",
+      value: "0", value_display: "0 ETH",
+      action: ["Action: ERC-20 transfer", "Token: 0x5000000000000000000000000000000000000000",
+        "Recipient: 0x6000000000000000000000000000000000000000", "Token amount (base units): 123",
+        "Warning: this removes this Bloom wallet from the Safe's owners"],
+      safe_tx_hash: "0x9565"
+    }}, security_disclosures: ["Safe transaction rebuilt from the exact signing bytes."]}}),
+    attributed_advisory_items: []
+  }}
+}});
+rendered = [nodes["panel-title"], nodes.review].map(allText).join(" ");
+for (const expected of ["Send 123 base units", "ERC-20 transfer",
+  "0x6000000000000000000000000000000000000000", "Token amount (base units)", "123",
+  "Nonce", "0x9565", "rebuilt from the exact signing bytes"]) {{
+  if (!rendered.includes(expected)) throw new Error(`Safe review not disclosed ${{expected}}: ${{rendered}}`);
+}}
+const safeFactText = (nodes.review.children.find(node => node.tagName === "DETAILS")?.children || [])
+  .filter(node => node && node.tagName === "DL" && node.className === "facts")
+  .map(allText).join(" ");
+if (safeFactText.includes("Token amount (base units): 123") || safeFactText.includes("What changes") || safeFactText.includes("; ")) {{
+  throw new Error(`Safe review still dumps action lines: ${{safeFactText}}`);
+}}
+const openTags = nodes.review.children.map(node => node.tagName);
+if (openTags.join(",") !== "P,SECTION,DIV,ASIDE,DETAILS") {{
+  throw new Error(`Safe open view is not summary, decision, warning, details: ${{openTags}}`);
+}}
+const banners = node => !node || typeof node === "string" ? [] : [
+  ...(node.className === "ceremony-warning" ? [node] : []),
+  ...(node.children || []).flatMap(banners)
+];
+if (!banners(nodes.review).some(node => allText(node).includes("removes this Bloom wallet"))) {{
+  throw new Error("Safe owner removal warning missing from the warning banner");
+}}
+
+// Safe self-calls use the change itself as the heading, not a Solidity
+// function name or the generic "Requested action" placeholder.
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "wallet-primary"}},
+  review_manifest: {{
+    schema: "bloom.review-manifest.v1",
+    canonical_plan: JSON.stringify({{safe_review: {{
+      chain_id: "8453", chain: "base",
+      safe: "0x1000000000000000000000000000000000000000",
+      owner: "0x3000000000000000000000000000000000000000",
+      nonce: "2", operation: "call",
+      destination: "0x1000000000000000000000000000000000000000",
+      value: "0", value_display: "0 ETH",
+      action: ["Action: addOwnerWithThreshold on Safe 0x1000000000000000000000000000000000000000",
+        "New owner: 0x7000000000000000000000000000000000000007",
+        "Signatures required: 1"],
+      safe_tx_hash: "0x9566"
+    }}}}),
+    attributed_advisory_items: []
+  }}
+}});
+if (nodes["panel-title"].textContent !==
+    "Add owner 0x7000…0007; 1 signature still required") {{
+  throw new Error(`Safe owner heading stayed technical: ${{nodes["panel-title"].textContent}}`);
+}}
+if (allText(nodes.review).includes("Calls   0x1000000000000000000000000000000000000000")) {{
+  throw new Error("Safe self-call repeated the Safe as a Calls row");
+}}
+
+// Safe deployment helpers are implementation details, not approval language.
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "wallet-primary"}},
+  review_manifest: {{
+    schema: "bloom.review-manifest.v1",
+    canonical_plan: JSON.stringify({{safe_review: {{
+      chain_id: "8453", chain: "base",
+      safe: "0x1000000000000000000000000000000000000000",
+      owner: "0x3000000000000000000000000000000000000000",
+      nonce: "3", operation: "delegatecall",
+      destination: "0x9b35af71d77eaf8d7e40252370304687390a1a52",
+      value: "0", value_display: "0 ETH",
+      action: ["Action: performCreate on Safe CreateCall 0x9b35Af71d77eaf8d7e40252370304687390A1A52",
+        "Value: 0 ETH", "Initcode: 5 bytes"],
+      safe_tx_hash: "0x9567"
+    }}}}),
+    attributed_advisory_items: []
+  }}
+}});
+if (nodes["panel-title"].textContent !== "Create a contract") {{
+  throw new Error(`Safe deployment heading stayed technical: ${{nodes["panel-title"].textContent}}`);
+}}
+
+// A Morpho deposit has to show the amount, vault, and shares recipient
+// before details are opened, and details are rows rather than one dump.
+// The fixture is the non-authorizing /preview/morpho session.
+const morphoPreview = previewSession("morpho");
+if (!morphoPreview.is_preview || morphoPreview.ceremony_id) {{
+  throw new Error("morpho preview is a ceremony");
+}}
+renderReview(morphoPreview);
+if (nodes["panel-title"].textContent !== "Deposit 2.5 USDC into a Morpho vault") {{
+  throw new Error(`Morpho heading hid the amount: ${{nodes["panel-title"].textContent}}`);
+}}
+const morphoSummary = allText(nodes.review.children[0]);
+for (const expected of ["2.5 USDC", "0xc125…A2Ca", "0x86dB…5864", "Base"]) {{
+  if (!morphoSummary.includes(expected)) throw new Error(`Morpho summary hid ${{expected}}: ${{morphoSummary}}`);
+}}
+if (morphoSummary.includes("0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca") ||
+    morphoSummary.includes("erc4626Deposit") || morphoSummary.includes("; ")) {{
+  throw new Error(`Morpho summary dumped technical detail: ${{morphoSummary}}`);
+}}
+function walk(node, out = []) {{
+  if (!node || typeof node === "string") return out;
+  out.push(node);
+  for (const child of node.children || []) walk(child, out);
+  return out;
+}}
+function pairs(list) {{
+  const out = [];
+  const children = (list?.children || []).filter(child => child && typeof child !== "string");
+  for (let i = 0; i + 1 < children.length; i += 2) out.push([allText(children[i]).trim(), allText(children[i + 1]).trim()]);
+  return out;
+}}
+const morphoLists = walk(nodes.review).filter(node => node.tagName === "DL");
+const morphoFacts = pairs(morphoLists.find(node => node.className === "facts"));
+const morphoTechnical = pairs(morphoLists.find(node => String(node.className).includes("technical")));
+const factValue = label => morphoFacts.find(([name]) => name === label)?.[1] || "";
+for (const [label, expected] of [
+  ["Amount", "2.5 USDC"],
+  ["Token", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"],
+  ["Vault", "0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca"],
+  ["Shares recipient", "0x86dB2acbF74856fd3286Cb5B755A5a05Ba445864"],
+  ["Safe", "0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61"],
+  ["Network", "Base"],
+  ["Nonce", "2"]
+]) {{
+  if (!factValue(label).includes(expected)) {{
+    throw new Error(`Morpho detail ${{label}} was ${{JSON.stringify(factValue(label))}}`);
+  }}
+}}
+if (!factValue("Share bound").includes("share decimals") || factValue("Share bound") === "1097016817869820") {{
+  throw new Error(`Morpho share bound stayed raw: ${{factValue("Share bound")}}`);
+}}
+const factText = morphoFacts.map(pair => pair.join(" ")).join(" | ");
+if (factText.includes("erc4626Deposit") || factText.includes("erc20TransferFrom") ||
+    factText.includes("2500000") || factText.includes("; ")) {{
+  throw new Error(`Morpho decision rows include technical dump: ${{factText}}`);
+}}
+const technicalText = morphoTechnical.map(pair => pair.join(" ")).join(" | ");
+for (const expected of ["erc4626Deposit", "erc20TransferFrom", "2500000",
+  "0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+  "0x5160acd8c69384337afae5de65027a3fef41f5ba421060d78f9d0c87fa1b3d17",
+  "cannot check that"]) {{
+  if (!technicalText.includes(expected)) throw new Error(`Morpho technical detail hid ${{expected}}: ${{technicalText}}`);
+}}
+const morphoBanner = banners(nodes.review).map(allText).join(" ");
+if (!morphoBanner.includes("different contract") || morphoBanner.includes("cannot check that")) {{
+  throw new Error(`Morpho warning did not state the Safe-identity risk: ${{morphoBanner}}`);
+}}
+
+// Calling Bundler3 alone does not establish a deposit. Do not invent one
+// when the bundle only pulls tokens or reaches more than one vault.
+for (const extraVault of [false, true]) {{
+  const variant = previewSession("morpho");
+  const plan = JSON.parse(variant.review_manifest.canonical_plan);
+  if (extraVault) {{
+    plan.safe_review.action.push("Action 3: erc4626Deposit on Morpho GeneralAdapter1 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+      "Action 3 · Vault: 0x4000000000000000000000000000000000000000");
+  }} else {{
+    plan.safe_review.action = plan.safe_review.action.filter(line => !line.startsWith("Action 2"));
+  }}
+  variant.review_manifest.canonical_plan = JSON.stringify(plan);
+  renderReview(variant);
+  if (nodes["panel-title"].textContent !== "Review calls through Morpho") {{
+    throw new Error("Morpho bundle was mislabeled as a single deposit");
+  }}
+}}
+
+// A pull's ticker/amount cannot establish the vault's underlying identity.
+for (const mismatch of ["amount", "asset", "missing"]) {{
+  const variant = previewSession("morpho");
+  const plan = JSON.parse(variant.review_manifest.canonical_plan);
+  plan.safe_review.action = plan.safe_review.action.flatMap(line => {{
+    if (mismatch === "amount" && line.startsWith("Action 2 · Assets: ")) return ["Action 2 · Assets: 3 USDC"];
+    if (line.startsWith("Action 2 · Assets asset: ")) {{
+      return mismatch === "missing" ? [] : mismatch === "asset"
+        ? ["Action 2 · Assets asset: 0x4000000000000000000000000000000000000000"] : [line];
+    }}
+    return [line];
+  }});
+  variant.review_manifest.canonical_plan = JSON.stringify(plan);
+  renderReview(variant);
+  if (nodes["panel-title"].textContent !== "Review calls through Morpho") {{
+    throw new Error(`Morpho deposit borrowed an unbound amount/asset: ${{mismatch}}`);
+  }}
+}}
+
+// A Safe batch states each movement in the heading and keeps one row per fact.
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "wallet-primary"}},
+  review_manifest: {{
+    schema: "bloom.review-manifest.v1",
+    canonical_plan: JSON.stringify({{safe_review: {{
+      chain_id: "8453", chain: "base",
+      safe: "0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61",
+      owner: "0x86dB2acbF74856fd3286Cb5B755A5a05Ba445864",
+      nonce: "3", operation: "delegatecall",
+      destination: "0x9641d764fc13c8B624c04430C7356C1C7C8102e2",
+      value: "0", value_display: "0 ETH",
+      action: [
+        "Action: multiSend on Safe batch 0x9641d764fc13c8B624c04430C7356C1C7C8102e2",
+        "Safe transaction · Transaction 1: transfer on USD Coin 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "Safe transaction · Transaction 1 · To: 0x4000000000000000000000000000000000000000",
+        "Safe transaction · Transaction 1 · Amount: 5 USDC",
+        "Safe transaction · Transaction 2: Send 0.0001 ETH to 0x6000000000000000000000000000000000000000",
+        "Warning: Bloom cannot check that 0x032649E1cb74393A8cC9dA390Af43a5D1eebDF61 is a Safe; it reads it as one."
+      ],
+      safe_tx_hash: "0xaaaa"
+    }}}}),
+    attributed_advisory_items: []
+  }}
+}});
+if (nodes["panel-title"].textContent !== "Send 5 USDC and 0.0001 ETH") {{
+  throw new Error(`Safe batch heading hid the amounts: ${{nodes["panel-title"].textContent}}`);
+}}
+const batchSummary = allText(nodes.review.children[0]);
+if (!batchSummary.includes("5 USDC to 0x4000…0000") || !batchSummary.includes("0.0001 ETH to 0x6000…0000")) {{
+  throw new Error(`Safe batch summary hid a movement: ${{batchSummary}}`);
+}}
+
+// An approval in a Safe batch is a permission, not a second payment. A
+// mixed approval/Morpho bundle must not be headed as two USDC sends.
+const mixedSafe = previewSession("morpho");
+const mixedPlan = JSON.parse(mixedSafe.review_manifest.canonical_plan);
+mixedPlan.safe_review.action = [
+  "Action: multiSend on Safe batch 0x9641d764fc13c8B624c04430C7356C1C7C8102e2",
+  "Transaction 1: approve on USD Coin 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  "Transaction 1 · Spender: 0xb98c948CFA24072e58935BC004a8A7b376AE746A",
+  "Transaction 1 · Amount: 2.5 USDC",
+  "Transaction 2: multicall on Morpho Bundler3 0x6BFd8137e702540E7A42B74178A4a49Ba43920C4",
+  "Transaction 2 · Action 1 · Amount: 2.5 USDC",
+  "Transaction 2 · Action 2 · Vault: 0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca"
+];
+mixedSafe.review_manifest.canonical_plan = JSON.stringify(mixedPlan);
+renderReview(mixedSafe);
+if (nodes["panel-title"].textContent !== "Review 2 Safe actions") {{
+  throw new Error("a spending permission was mislabeled as a payment");
+}}
+renderReview(previewSession("safe-morpho-batch"));
+const mixedPrimary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+for (const expected of ["Token spending permission", "Spending limit", "2.5 USDC", "Calls through Morpho", "Tokens supplied", "Vault", "Shares recipient"]) {{
+  if (!mixedPrimary.includes(expected)) throw new Error(`Safe action hidden before disclosure: ${{expected}}`);
+}}
+const mixedCards = nodes.review.children.filter(node => node.className === "ceremony-card");
+if (mixedCards.length !== 2 || mixedCards.some(card =>
+    !walk(card).some(node => node.tagName === "IMG" && node.src === "/assets/tokens/usdc.svg"))) {{
+  throw new Error("Safe approval/deposit cards lost their USDC artwork");
+}}
+
+// Safe's real ERC-20 reader puts the token contract in the action heading,
+// not in a separate Token field. Its artwork and permission still belong
+// beside the decision, including zero and maximum allowances.
+for (const amount of ["25 USDC", "0 USDC", "115792089237316195423570985008687907853269984665640564039457584007913129.639935 USDC"]) {{
+  const variant = previewSession("morpho");
+  const plan = JSON.parse(variant.review_manifest.canonical_plan);
+  plan.safe_review.action = [
+    "Action: approve on USD Coin 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "Spender: 0xb98c948CFA24072e58935BC004a8A7b376AE746A", `Amount: ${{amount}}`
+  ];
+  variant.review_manifest.canonical_plan = JSON.stringify(plan);
+  renderReview(variant);
+  const primary = nodes.review.children.filter(node => node.tagName !== "DETAILS");
+  const text = primary.map(allText).join(" ");
+  if (!primary.some(node => walk(node).some(child => child.tagName === "IMG" && child.src === "/assets/tokens/usdc.svg")) ||
+      !text.includes("Spending limit") || !text.includes("Spender")) {{
+    throw new Error("Safe allowance identity or spending limit is hidden");
+  }}
+  if (amount.startsWith("115792") && (!text.includes("Unlimited") || text.includes("115792"))) {{
+    throw new Error("Safe maximum allowance is not shown as Unlimited");
+  }}
+  if (amount === "0 USDC" && !nodes["panel-title"].textContent.includes("Clear spending permission")) {{
+    throw new Error("Safe zero allowance did not explain revocation");
+  }}
+}}
+
+// Decoder-backed PM80 examples must retain the scope that the owner reviews.
+for (const [name, expected] of [
+  ["enso-swap", ["0.001 ETH", "2.985 USDC", "Receiver"]],
+  ["enso-output", ["2.5 USDC", "1.25 USDC", "Output receiver"]],
+  ["enso-shortcut", ["Encoded command 1", "Encoded command 2", "runtime"]],
+  ["enso-allowance", ["Spending limit", "2.5 USDC", "Spender"]],
+  ["polymarket-auth", ["Polymarket", "One signature"]],
+  ["polymarket-order", ["prediction-market buy order", "11.7824 pUSD"]]
+]) {{
+  const preview = previewSession(name);
+  if (!preview.is_preview || preview.ceremony_id) throw new Error("PM80 fixture gained ceremony authority");
+  renderReview(preview);
+  const text = [nodes["panel-title"], nodes.review].map(allText).join(" ");
+  for (const field of expected) if (!text.includes(field)) throw new Error(`${{name}} omitted ${{field}}`);
+  const primary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+  if (!primary.includes("Signing account") || !primary.includes("EVM account 1")) {{
+    throw new Error(`${{name}} hides the numbered signing account inside technical details`);
+  }}
+}}
+
+// Roles and identities must be visible without expanding technical details.
+for (const [name, expected] of [
+  ["safe-token-transfer", ["Sender · Safe address", "Signing owner · EOA", "Recipient", "25 USDC"]],
+  ["safe-allowance-unlimited", ["Token holder · Safe address", "Signing owner · EOA", "Spender · allowed to use these tokens"]],
+  ["transfer-dai", ["Dai Stablecoin", "12.5 DAI", "Sender"]],
+  ["native-send", ["Ether", "0.01 ETH", "Sender"]],
+  ["structural-transfer", ["Token identity and decimals are unverified", "250000000 raw units"]],
+  ["polymarket-order", ["Market / outcome", "Unverified", "11.7824 pUSD"]]
+]) {{
+  renderReview(previewSession(name));
+  const primary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+  for (const field of expected) if (![nodes["panel-title"].textContent, primary].join(" ").includes(field)) throw new Error(`${{name}} hides ${{field}}`);
+  if (name === "polymarket-order" && primary.includes("11782400")) throw new Error("Raw collateral competes with the readable amount");
+}}
+renderReview(previewSession("safe-token-transfer"));
+if (!walk(nodes.review).some(node => node.href === "https://basescan.org/token/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")) {{
+  throw new Error("Token card does not link to the token explorer page");
+}}
+renderReview(previewSession("enso-output"));
+for (const empty of [false, true]) {{
+  const noMinimum = structuredClone(PREVIEW_PM80_READINGS["enso-output"]);
+  noMinimum.fields = noMinimum.fields.filter(field => !empty || !field.label.startsWith("Requested minimum balance increase"));
+  if (!empty) noMinimum.fields.find(field => field.label.startsWith("Requested minimum balance increase")).raw = "0x" + "0".repeat(128);
+  if (ensoHasMinimum(noMinimum) || callIntent(noMinimum).heading.includes("swap")) throw new Error("Empty or zero output checks falsely protected");
+}}
+const outputCard = nodes.review.children.find(node => allText(node).includes("1.25 USDC"));
+if (!outputCard || !allText(outputCard).includes("Minimum output") || !allText(outputCard).includes("+1.25 USDC") ||
+    !walk(outputCard).some(node => String(node.className).includes("incoming")) ||
+    !allText(nodes.review).includes("reverts if it is not met") || !allText(nodes.review).includes("not a quote or proof of receipt") ||
+    walk(outputCard).some(node => String(node.className).includes("outgoing"))) {{
+  throw new Error("Enso requested output is presented as money leaving or guaranteed receipt");
+}}
+createdWalletView({{wallet_id:"new-wallet", accounts:[{{key_ref:{{derivation:{{path:"m/44'/60'/0'/0/0"}}}},chain_projections:[{{chain_family:"evm",address:"0x1111111111111111111111111111111111111111"}}]}}]}});
+if (!allText(nodes.review).includes("Back up wallet") || !allText(nodes.review).includes("EVM account 0") || !allText(nodes.review).includes("Later")) throw new Error("Wallet onboarding omitted identity or next steps");
+const unknownOutput = previewSession("enso-output");
+const unknownPlan = JSON.parse(unknownOutput.review_manifest.canonical_plan);
+const unknownMinimum = unknownPlan.evm_review.payloads[0].contract_call.fields.find(field => field.label === "Requested minimum balance increase");
+delete unknownMinimum.asset;
+unknownMinimum.value = "7 raw units of an unverified token";
+unknownOutput.review_manifest.canonical_plan = JSON.stringify(unknownPlan);
+renderReview(unknownOutput);
+const unknownPrimary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+if (!unknownPrimary.includes("7 raw units") || !unknownPrimary.includes("Token identity and decimals are unverified") || unknownPrimary.includes("7 USDC")) {{
+  throw new Error("Unknown Enso output was hidden or borrowed an identified token's units");
+}}
+if (!unknownPrimary.includes("No output protection")) {{
+  throw new Error("A minimum in an unrecognised output token was presented as protection");
+}}
+// Every output needs a positive minimum, not just one of them.
+const multiMinimum = structuredClone(PREVIEW_PM80_READINGS["enso-output"]);
+const firstMinimum = multiMinimum.fields.find(field => field.label.startsWith("Requested minimum balance increase"));
+multiMinimum.fields.push({{...firstMinimum, label: "Requested minimum balance increase 2", raw: "0x" + "0".repeat(128)}});
+if (ensoHasMinimum(multiMinimum)) throw new Error("A zero minimum on a second output was treated as protection");
+// Output sent to another address is called out beside the decision.
+const stranger = previewSession("enso-output");
+const strangerPlan = JSON.parse(stranger.review_manifest.canonical_plan);
+strangerPlan.evm_review.payloads[0].contract_call.fields.find(field => field.label === "Output receiver").value =
+  "0x000000000000000000000000000000000000dEaD";
+stranger.review_manifest.canonical_plan = JSON.stringify(strangerPlan);
+renderReview(stranger);
+if (!nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ").includes("Output goes to another address")) {{
+  throw new Error("An Enso swap paying a stranger was not flagged");
+}}
+// An Enso call in a batch does not hide the other transactions' warnings.
+const mixed = previewSession("enso-output");
+const mixedBatch = JSON.parse(mixed.review_manifest.canonical_plan);
+const allowance = JSON.parse(previewSession("enso-allowance").review_manifest.canonical_plan).evm_review.payloads[0];
+const allowanceWarning = "Distinct batch warning that only the banner shows.";
+allowance.contract_call.warnings = [allowanceWarning];
+mixedBatch.evm_review.payloads[0].contract_call.warnings.push(allowanceWarning);
+mixedBatch.evm_review.payloads.unshift(allowance);
+mixed.review_manifest.canonical_plan = JSON.stringify(mixedBatch);
+renderReview(mixed);
+if (!nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ").includes(allowanceWarning)) {{
+  throw new Error("An Enso call in a batch hid another transaction's warning");
+}}
+renderReview(previewSession("safe-token-transfer"));
+const safeFlow = nodes.review.children.find(node => String(node.className).includes("ceremony-transfer-path"));
+if (!safeFlow || !allText(safeFlow).includes("−25 USDC") || !allText(safeFlow).includes("+25 USDC")) {{
+  throw new Error("Safe transfer omitted requested sender and recipient deltas");
+}}
+renderReview(previewSession("enso-allowance"));
+if (!nodes["panel-title"].textContent.includes("Enso Router V2") || !allText(nodes.review).includes("Enso Router V2")) {{
+  throw new Error("Enso allowance hides the catalogued spender name");
+}}
+if (catalogPartyName("123456", PREVIEW_PM80_READINGS["enso-output"].contract)) throw new Error("Enso label leaked onto an unlisted chain");
+renderReview(previewSession("enso-shortcut"));
+const shortcutPrimary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+if (!shortcutPrimary.includes("No output protection") || !shortcutPrimary.includes("cannot be determined before execution") || shortcutPrimary.includes("selector 0xa9059cbb") ||
+    shortcutPrimary.includes("Send 2.5 USDC") || shortcutPrimary.includes("Called contract") ||
+    shortcutPrimary.includes("0 raw native units") || shortcutPrimary.includes("Execution mode") || shortcutPrimary.includes("Call details")) {{
+  throw new Error("Enso shortcut still dumps encoded commands instead of their bounded reading");
+}}
+const riskyShortcut = previewSession("enso-shortcut");
+const riskyPlan = JSON.parse(riskyShortcut.review_manifest.canonical_plan);
+const programField = riskyPlan.evm_review.payloads[0].contract_call.fields.find(field => field.format === "ensoShortcut");
+const program = JSON.parse(programField.value);
+program.steps[1].native_value = "17 raw native units";
+program.steps[1].call_type = "DELEGATECALL";
+programField.value = JSON.stringify(program);
+riskyShortcut.review_manifest.canonical_plan = JSON.stringify(riskyPlan);
+renderReview(riskyShortcut);
+const riskyPrimary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+if (!riskyPrimary.includes("17 raw native units") || !riskyPrimary.includes("DELEGATECALL")) {{
+  throw new Error("Simplified Enso view hid nonzero native value or privileged execution");
+}}
+program.steps[1].reconstructed_calldata = "0xabcdef01";
+programField.value = JSON.stringify(program);
+riskyShortcut.review_manifest.canonical_plan = JSON.stringify(riskyPlan);
+renderReview(riskyShortcut);
+const unreadPrimary = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+if (!unreadPrimary.includes("Bloom cannot interpret every call") || unreadPrimary.includes("cannot be determined before execution")) {{
+  throw new Error("An undecodable static call was falsely labelled runtime-dependent");
+}}
+// Neither step individually exceeds the payment, but together they do.
+riskyPlan.evm_review.payloads[0].value = "10";
+for (const step of program.steps) step.native_value = "6 raw native units";
+programField.value = JSON.stringify(program);
+riskyShortcut.review_manifest.canonical_plan = JSON.stringify(riskyPlan);
+renderReview(riskyShortcut);
+if (!nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ").includes("12 raw native units")) {{
+  throw new Error("Native instruction values were not summed across the route");
+}}
+for (const step of program.steps) step.native_value = "5 raw native units";
+programField.value = JSON.stringify(program);
+riskyShortcut.review_manifest.canonical_plan = JSON.stringify(riskyPlan);
+renderReview(riskyShortcut);
+if (nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ").includes("Total instruction value")) {{
+  throw new Error("Forwarding the transaction value was shown as excess value");
+}}
+for (const token of {tokens}) {{
+  const preview = previewCatalogToken(token);
+  if (!preview.is_preview || preview.ceremony_id) throw new Error("Catalog preview gained authority");
+  renderReview(preview);
+  const text = allText(nodes.review);
+  if (!text.includes(token.symbol) || !text.includes(token.name) || !nodes["panel-title"].textContent.includes(`1 ${{token.symbol}}`)) {{
+    throw new Error(`Catalog renderer omitted ${{token.chain_id}}:${{token.address}}`);
+  }}
+}}
+
 // A batch member Bloom could not read is never shown as a plain send, and a
 // batch spanning two networks is not headed with the first one alone.
 const unread = (chain_id, chain) => ({{
@@ -458,6 +1551,20 @@ if (!rendered.includes("Approve a call Bloom cannot read") || rendered.includes(
     !rendered.includes("Approve 2 transactions on more than one network")) {{
   throw new Error(`unread batch misdescribed: ${{rendered}}`);
 }}
+(async () => {{
+  globalThis.fetch = async () => ({{ok: true, json: async () => {tokens}}});
+  document.querySelector = () => null;
+  await renderTokenCatalog();
+  if (!walk(nodes.review).some(node => node.tagName === "IMG" && node.src === "/assets/tokens/usdc.svg") ||
+      !allText(nodes.review).includes("Neutral icon · no bundled logo")) throw new Error("Catalog omitted bundled logos or misrepresented neutral icons");
+  const input = walk(nodes.review).find(node => node.tagName === "INPUT");
+  input.value = "WBTC";
+  input.oninput();
+  const text = allText(nodes.review);
+  if (!text.includes("WBTC") || text.includes("USD Coin")) throw new Error("Token catalog search did not filter symbols");
+  walk(nodes.review).find(node => node.tagName === "BUTTON").onclick();
+  if (!nodes["panel-title"].textContent.includes("1 WBTC") || !approve.hidden || !cancel.hidden) throw new Error("Catalog selection is not a non-authorizing transfer preview");
+}})().catch(error => {{ console.error(error); process.exitCode = 1; }});
 "#
     );
     let output = run_node(&script);
@@ -470,7 +1577,10 @@ if (!rendered.includes("Approve a call Bloom cannot read") || rendered.includes(
 
 #[test]
 fn policy_page_states_the_numeric_chain_exact_opt_in_scope() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -531,36 +1641,20 @@ for (const expected of [
 for (const stale of ["Allow deploying contracts on", "Stop allowing contract deployment on"]) {{
   if (rendered.includes(stale)) throw new Error(`stale policy wording ${{stale}}: ${{rendered}}`);
 }}
-
-// Without clear signing nothing is refused for being unreadable or
-// unlimited, so switching it off loosens the wallet and switching it on
-// tightens it. Each direction must say so.
-const strict = {{
-  catalog_id: "bloom-evm", signature_threshold: 2, maximum_observation_age_ms: 3600000,
-  unlimited_allowance_allowed: false, opaque_exact_allowed: false,
-  verifier: {{verifier_digest: "ab".repeat(32)}},
-  trusted_keys: [{{key_id: "publisher-1", verifying_key: "cd".repeat(32)}}]
-}};
-function renderClearSigning(before, after) {{
-  renderReview({{
-    ceremony_kind: "policy_update",
-    expires_at_ms: Date.now() + 60000,
-    signer_contribution: {{wallet_id: "wallet-primary"}},
-    review_manifest: {{schema: "bloom.review-manifest.v1",
-      authority_diff: {{clear_signing: {{before, after}}}}}}
-  }});
-  return [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
-}}
-const off = renderClearSigning(strict, null);
-if (!off.includes("on → off") || !off.includes("no longer refused") ||
-    off.includes("→ blocked") || off.includes("refused rather than approved unread")) {{
-  throw new Error(`disabling clear signing misdescribed: ${{off}}`);
-}}
-const on = renderClearSigning(null, strict);
-for (const expected of ["off → on", "Unlimited-allowance requests", "allowed → blocked",
-  "Descriptions come from catalog", "none → bloom-evm", "Publisher signatures required",
-  "none → 2", "Oldest usable observation", "none → 3600000", "publisher-1"]) {{
-  if (!on.includes(expected)) throw new Error(`enabling clear signing missing ${{expected}}: ${{on}}`);
+const migration = describePolicy({{authority_diff: {{
+  removed_legacy_clear_signing: {{
+    catalog_id: "old-catalog", signature_threshold: 1,
+    trusted_keys: [{{key_id: "publisher-one"}}],
+    maximum_observation_age_ms: 86400000,
+    verifier: {{verifier_id: "old-reader", verifier_digest: "old-digest"}},
+    opaque_exact_allowed: false, unlimited_allowance_allowed: false
+  }}
+}}}});
+const migrationText = migration.facts.flat().join(" ");
+for (const expected of ["old-catalog", "publisher-one", "observation limit",
+  "old-reader", "old-digest", "Allow opaque exact review", "Allow unlimited allowance review",
+  "do not enforce the removed rules"]) {{
+  if (!migrationText.includes(expected)) throw new Error(`missing migration explanation ${{expected}}`);
 }}
 "#
     );
@@ -574,7 +1668,10 @@ for (const expected of ["off → on", "Unlimited-allowance requests", "allowed �
 
 #[test]
 fn browser_cancel_disables_approve_before_awaiting_and_reports_the_outcome() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     // The approval page's handler; paired enrollment installs its own, which
     // disables both buttons synchronously through `terminate` instead.
     let start = asset
@@ -611,7 +1708,10 @@ fn browser_cancel_disables_approve_before_awaiting_and_reports_the_outcome() {
 
 #[test]
 fn key_derive_primary_review_explains_the_session_without_internal_scope_json() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -666,12 +1766,15 @@ renderReview({{
 const primary = allText({{textContent: "", innerHTML: "", children:
   nodes.review.children.filter(child => child?.name !== "details")}});
 const technical = allText(nodes.review.children.find(child => child?.name === "details"));
-for (const phrase of ["this Petal", scope.package_hash, "No funds move", "buy tokens", "sell tokens",
-                      "return unused SOL", "main wallet key stays inside Bloom", "Up to 1h 0m"]) {{
+for (const phrase of ["this Petal", "no funds move", "main wallet key stays inside Bloom", "1h 0m"]) {{
   if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
 }}
 for (const internal of ["allowed_routes", "custody_operation_id", "package_hash", "r000010"]) {{
   if (primary.includes(internal)) throw new Error(`primary review exposed ${{internal}}: ${{primary}}`);
+}}
+for (const phrase of [scope.package_hash, "allowed_routes", "buy tokens", "sell tokens",
+                      "return unused SOL", "Up to 1h 0m"]) {{
+  if (!technical.includes(phrase)) throw new Error(`technical details omitted ${{phrase}}: ${{technical}}`);
 }}
 if (!technical.includes(scope.package_hash) || !technical.includes("allowed_routes")) {{
   throw new Error(`technical details omitted the exact signed scope: ${{technical}}`);
@@ -691,7 +1794,10 @@ if (nodes.approve.textContent !== "Create temporary key") {{
 
 #[test]
 fn reusable_pumpfun_approval_is_plain_language_with_raw_grants_collapsed() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -754,18 +1860,17 @@ renderReview({{
 const primary = allText({{textContent: "", innerHTML: "", children:
   nodes.review.children.filter(child => child?.name !== "details")}});
 const technical = allText(nodes.review.children.find(child => child?.name === "details"));
-for (const phrase of ["Finish setting up", "this Petal", packageHash, "buy tokens", "sell tokens",
-                      "return unused SOL", "Up to 256 signed actions",
-                      "Up to 0.5 SOL in total across the whole session",
-                      "main wallet key stays inside Bloom"]) {{
+for (const phrase of ["Finish setting up", "this Petal", "main wallet key stays inside Bloom"]) {{
   if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
 }}
 for (const internal of ["route_grants", "machine_asserted", "r000010",
                         "limits are asserted by the named Petal"]) {{
   if (primary.includes(internal)) throw new Error(`primary review exposed ${{internal}}: ${{primary}}`);
 }}
-if (!technical.includes(packageHash) || !technical.includes("route_grants")) {{
-  throw new Error(`technical details omitted the exact signed plan: ${{technical}}`);
+for (const phrase of [packageHash, "route_grants", "buy tokens", "sell tokens",
+                      "return unused SOL", "Up to 256 signed actions",
+                      "Up to 0.5 SOL in total across the whole session"]) {{
+  if (!technical.includes(phrase)) throw new Error(`technical details omitted ${{phrase}}: ${{technical}}`);
 }}
 if (nodes["page-title"].textContent !== "Finish temporary session setup" ||
     nodes.approve.textContent !== "Finish session setup") {{
@@ -785,10 +1890,9 @@ renderReview({{
     approval_id: "internal-approval-id"
   }}
 }});
-const unbudgeted = allText({{textContent: "", innerHTML: "", children:
-  nodes.review.children.filter(child => child?.name !== "details")}});
+const unbudgeted = allText(nodes.review.children.find(child => child?.name === "details"));
 if (!unbudgeted.includes("refuse any action that spends funds") || unbudgeted.includes("0.5 SOL")) {{
-  throw new Error(`an empty spending ceiling was not stated: ${{unbudgeted}}`);
+  throw new Error(`an empty spending ceiling was not stated in details: ${{unbudgeted}}`);
 }}
 "#
     );
@@ -807,7 +1911,10 @@ if (!unbudgeted.includes("refuse any action that spends funds") || unbudgeted.in
 /// `MALFORMED_FRAME: Invalid last symbol` from deep inside Signer).
 #[test]
 fn browser_page_accepts_hex_private_keys_and_converts_them_to_base64url() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -858,7 +1965,10 @@ process.stdout.write("hex-normalization-ok");
 
 #[test]
 fn browser_ceremony_state_survives_reload_and_reuses_one_output_key() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     for required in [
         "tokenFromPath || readSessionToken()",
         "writeSessionToken(tokenFromPath)",
@@ -889,7 +1999,10 @@ fn browser_ceremony_state_survives_reload_and_reuses_one_output_key() {
 
 #[test]
 fn browser_reload_recovers_the_ceremony_token_from_tab_storage() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -927,7 +2040,10 @@ process.stdout.write("browser-reload-ok");
 
 #[test]
 fn browser_approval_failure_is_logged_displayed_and_retryable() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -985,7 +2101,10 @@ process.stdout.write("browser-error-feedback-ok");
 
 #[test]
 fn transfer_review_promises_later_verification_without_claiming_it_already_happened() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     assert!(asset.contains("Estimated network fee"));
     assert!(asset.contains("Required before signing"));
     assert!(asset.contains("Bloom will decode the transaction"));
@@ -1069,7 +2188,10 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
 
 #[test]
 fn scoped_petal_key_browser_flow_never_collects_a_namespace_grant() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     assert!(asset.contains("session.signer_contribution?.petal_key_scope"));
     assert!(asset.contains("&& !scopedPetalKey"));
     assert!(asset.contains("Boolean(scopedPetalKey)"));
@@ -1092,7 +2214,10 @@ fn scoped_petal_key_browser_flow_never_collects_a_namespace_grant() {
 
 #[test]
 fn legacy_passkey_browser_flow_uses_assertion_prf_and_hides_raw_key_input() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     assert!(asset.contains("legacy_passkey_v1_prf"));
     assert!(asset.contains("const assertion = await getCredential(session, 0)"));
     assert!(asset.contains("credential_prf: encodeUrl(credentialPrf)"));
@@ -1104,7 +2229,10 @@ fn legacy_passkey_browser_flow_uses_assertion_prf_and_hides_raw_key_input() {
 
 #[test]
 fn bip39_browser_import_uses_profile_to_control_serialization() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let html = include_str!("../src/ceremony_assets/index.html");
     let css = include_str!("../src/ceremony_assets/style.css");
     let load = asset
@@ -1390,6 +2518,7 @@ struct MockSigner {
 
 struct RealSigner {
     service: Arc<SignerCeremonyService>,
+    engine: Option<Arc<SignerEngine>>,
 }
 
 fn real_ceremony_signer() -> Arc<RealSigner> {
@@ -1408,13 +2537,16 @@ fn real_ceremony_signer() -> Arc<RealSigner> {
     );
     let service = Arc::new(
         SignerCeremonyService::new(
-            engine,
+            engine.clone(),
             Token::new("signer-ceremony-key").unwrap(),
             SigningKey::from_bytes(&[9; 32]),
         )
         .unwrap(),
     );
-    Arc::new(RealSigner { service })
+    Arc::new(RealSigner {
+        service,
+        engine: Some(engine),
+    })
 }
 
 struct FailOnceAdoptionObserver {
@@ -1689,6 +2821,16 @@ impl CeremonyCompletionObserver for FailOnceAdoptionObserver {
 }
 
 impl CeremonySigner for RealSigner {
+    fn derived_accounts_public(
+        &self,
+        request: bloom_signer_api::WalletRequest,
+    ) -> Result<Vec<bloom_signer_api::DerivedAccountDescriptor>, bloom_signer_api::ProtocolError>
+    {
+        self.engine
+            .as_ref()
+            .expect("account-capable test signer")
+            .derived_account_descriptors(&request.wallet_id)
+    }
     fn surface_status(
         &self,
     ) -> Result<bloom_signer_api::SurfaceStatus, bloom_signer_api::ProtocolError> {
@@ -2376,14 +3518,16 @@ async fn prepare_scoped_approval(
     match MachineBrokerService::dispatch(
         broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            requested_review_mode: None,
             operation_id,
             terms: terms.clone(),
             canonical_plan_facts_digest: digest("e7"),
             petal_use_claim: None,
             system_use_claim: None,
             evm_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
         }),
     )
     .await?
@@ -2861,6 +4005,13 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     proposed_policy
         .allowed_petal_packages
         .push(petal_package.clone());
+    proposed_policy.allowed_petal_packages.push(digest("d5"));
+    proposed_policy
+        .allowed_destinations
+        .push(PolicyDestination {
+            chain: Token::new("evm-31337").unwrap(),
+            destination: "exact".into(),
+        });
     proposed_policy
         .allowed_destinations
         .push(PolicyDestination {
@@ -3094,8 +4245,11 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
 
     let parent_key = machine_registration_result.public_key_refs[0].clone();
     let derive_operation = operation("d2");
-    let scope_lifetime_ms = 60_000;
-    let approval_lifetime_ms = 30_000;
+    // This scenario exercises many real ceremonies. Its active-authority
+    // assertions must not race a 30-second deadline on a loaded CI host.
+    // Expiry is exercised separately below with an already-expired request.
+    let scope_lifetime_ms = 300_000;
+    let approval_lifetime_ms = 120_000;
     let scope = PetalKeyScope {
         wallet_id: wallet_id.clone(),
         parent_key_ref: parent_key.clone(),
@@ -3323,9 +4477,11 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let stale_policy_error = MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            requested_review_mode: None,
             evm_review_payloads: vec![Base64UrlBytes::from_bytes(&creation)],
+            message_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
             operation_id: operation("d9"),
             terms: SealedApprovalTerms {
                 subject: ApprovalSubject::Cli {
@@ -3358,13 +4514,321 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             .contains("not bound to Broker's verified current policy"),
         "{stale_policy_error:?}"
     );
+    // A package declaring the Safe class signs opaque preimages: Broker refuses
+    // its exact approvals without an envelope and its reusable approvals.
+    let safe_package = digest("d5");
+    let safe_route = "/petals/safe/confirm";
+    let mut safe_provenance = petal_provenance.clone();
+    safe_provenance.subject = ProvenanceSubject::Petal {
+        package_hash: safe_package.clone(),
+        route: safe_route.into(),
+    };
+    safe_provenance.operation_classes = vec![ProvenanceOperationClass {
+        operation_class: Token::new(bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS).unwrap(),
+        fee_asset: None,
+    }];
+    sign_provenance(&mut safe_provenance, &installer_key);
+    authority.install_provenance(&safe_provenance).unwrap();
+    let safe_terms = SealedApprovalTerms {
+        key_ref: parent_key.clone(),
+        provenance_digest: safe_provenance.digest().unwrap(),
+        limits: ApprovalLimits {
+            max_operations: DecimalU64::new(1),
+            max_signatures: DecimalU64::new(1),
+            operation_rate_limits: Vec::new(),
+            signature_rate_limits: Vec::new(),
+            value_limits: Vec::new(),
+        },
+        subject: ApprovalSubject::Petal {
+            package_hash: safe_package.clone(),
+            route: safe_route.into(),
+            agent_id: None,
+        },
+        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+        selector: ApprovalSelector::Exact {
+            ordered_payload_digests: vec![digest("d6")],
+            ordered_hashes: vec![digest("d7")],
+        },
+        request_nonce: RequestNonce::from_bytes([0xd8; 16]),
+        ..approval_terms.clone()
+    };
+    let safe_prepare = |terms: SealedApprovalTerms, envelope: Option<Vec<u8>>| {
+        MachineBrokerService::dispatch(
+            &broker,
+            MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                evm_reported_token: None,
+                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+                evm_review_payloads: Vec::new(),
+                message_review_payloads: Vec::new(),
+                safe_review_payloads: envelope
+                    .map(|bytes| vec![Base64UrlBytes::from_bytes(&bytes)])
+                    .unwrap_or_default(),
+                operation_id: operation("da"),
+                terms,
+                canonical_plan_facts_digest: digest("d4"),
+                petal_use_claim: None,
+                system_use_claim: None,
+            }),
+        )
+    };
+    let blind = safe_prepare(safe_terms.clone(), None).await.unwrap_err();
+    assert!(
+        blind.message.contains("requires the review envelope"),
+        "{blind:?}"
+    );
+    for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
+        let mut provenance = safe_provenance.clone();
+        provenance.operation_classes[0].operation_class = Token::new(*class).unwrap();
+        sign_provenance(&mut provenance, &installer_key);
+        authority.install_provenance(&provenance).unwrap();
+        let terms = SealedApprovalTerms {
+            provenance_digest: provenance.digest().unwrap(),
+            ..safe_terms.clone()
+        };
+        let blind = safe_prepare(terms.clone(), None).await.unwrap_err();
+        assert!(
+            blind.message.contains("requires a review envelope"),
+            "{class}: {blind:?}"
+        );
+        let reusable = safe_prepare(
+            SealedApprovalTerms {
+                selector: ApprovalSelector::Petal {
+                    package_hash: safe_package.clone(),
+                    route: safe_route.into(),
+                    allowed_operation_classes: vec![Token::new(*class).unwrap()],
+                    route_grants: Vec::new(),
+                    required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+                },
+                ..terms
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            reusable.message.contains("require exact approval"),
+            "{class}: {reusable:?}"
+        );
+    }
+    authority.install_provenance(&safe_provenance).unwrap();
+    let reusable = safe_prepare(
+        SealedApprovalTerms {
+            selector: ApprovalSelector::Petal {
+                package_hash: safe_package.clone(),
+                route: safe_route.into(),
+                allowed_operation_classes: vec![
+                    Token::new(bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS).unwrap(),
+                ],
+                route_grants: Vec::new(),
+                required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+            },
+            ..safe_terms.clone()
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        reusable.message.contains("require exact approval"),
+        "{reusable:?}"
+    );
+    let route_grant = safe_prepare(
+        SealedApprovalTerms {
+            selector: ApprovalSelector::Petal {
+                package_hash: safe_package.clone(),
+                route: safe_route.into(),
+                allowed_operation_classes: vec![Token::new("exchange-order").unwrap()],
+                route_grants: vec![bloom_broker_api::PetalRouteGrant {
+                    route: "/petals/safe/other-confirm".into(),
+                    allowed_operation_classes: vec![
+                        Token::new(bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS).unwrap(),
+                    ],
+                    provenance_digest: safe_provenance.digest().unwrap(),
+                }],
+                required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+            },
+            ..safe_terms.clone()
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        route_grant.message.contains("require exact approval"),
+        "{route_grant:?}"
+    );
+    let envelope = serde_jcs::to_vec(&serde_json::json!({
+        "schema": "bloom.safe.review.v1", "chain_id": "31337",
+        "safe_address": "0x1000000000000000000000000000000000000000", "safe_version": "1.4.1",
+        "singleton": "0x41675c099f32341bf84bfc5382af534df5c7461a",
+        "singleton_code_hash": "0x1fe2df852ba3299d6534ef416eefa406e56ced995bca886ab7a553e6d0c5e1c4",
+        "owner": "0x3000000000000000000000000000000000000000",
+        "owners": ["0x3000000000000000000000000000000000000000"], "threshold": "1",
+        "guard": "0x0000000000000000000000000000000000000000", "modules": [],
+        "fallback_handler": "0x0000000000000000000000000000000000000000",
+        "safe_tx": {"to": "0x4000000000000000000000000000000000000000", "value": "7", "data": "0x",
+            "operation": 0, "safe_tx_gas": "0", "base_gas": "0", "gas_price": "0",
+            "gas_token": "0x0000000000000000000000000000000000000000",
+            "refund_receiver": "0x0000000000000000000000000000000000000000", "nonce": "4"}
+    }))
+    .unwrap();
+    let wrong_subject = safe_prepare(
+        SealedApprovalTerms {
+            subject: approval_terms.subject.clone(),
+            ..safe_terms.clone()
+        },
+        Some(envelope.clone()),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        wrong_subject.message.contains("Safe Petal subject"),
+        "{wrong_subject:?}"
+    );
+    // The envelope names another owner than the Signer-held key.
+    let wrong_owner = safe_prepare(safe_terms.clone(), Some(envelope.clone()))
+        .await
+        .unwrap_err();
+    assert!(
+        wrong_owner.message.contains("owner differs"),
+        "{wrong_owner:?}"
+    );
+    // A valid review goes through the real Broker/Signer boundary and its
+    // decoded facts and disclosure survive into the signed review manifest.
+    let public = match MachineBrokerService::dispatch(
+        &broker,
+        MachineBrokerRequest::KeyGetPublic(bloom_broker_api::KeyRequest {
+            key_ref: parent_key.clone(),
+        }),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::KeyGetPublic(public) => public,
+        other => panic!("unexpected public key response: {other:?}"),
+    };
+    let public = public.canonical_public_key.decode();
+    use k256::elliptic_curve::sec1::ToEncodedPoint as _;
+    use k256::pkcs8::DecodePublicKey as _;
+    let public = k256::PublicKey::from_public_key_der(&public)
+        .unwrap()
+        .to_encoded_point(false);
+    let owner = alloy::primitives::Address::from_raw_public_key(&public.as_bytes()[1..]);
+    let mut valid: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+    valid["owner"] = serde_json::json!(owner.to_string());
+    valid["owners"] = serde_json::json!([owner.to_string()]);
+    let token_contract = "0x1111111111111111111111111111111111111111";
+    let mut calldata = vec![0xa9, 0x05, 0x9c, 0xbb];
+    calldata.extend_from_slice(&[0; 12]);
+    calldata.extend_from_slice(&[0x22; 20]);
+    calldata.extend_from_slice(&alloy::primitives::U256::from(1_000_000).to_be_bytes::<32>());
+    valid["safe_tx"]["to"] = serde_json::json!(token_contract);
+    valid["safe_tx"]["value"] = serde_json::json!("0");
+    valid["safe_tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(&calldata)));
+    let word = |n: u64| alloy::primitives::U256::from(n).to_be_bytes::<32>();
+    let address_word = |address: &str| {
+        let mut result = [0u8; 32];
+        result[12..].copy_from_slice(
+            address
+                .parse::<alloy::primitives::Address>()
+                .unwrap()
+                .as_slice(),
+        );
+        result
+    };
+    let mut domain =
+        alloy::primitives::keccak256("EIP712Domain(uint256 chainId,address verifyingContract)")
+            .to_vec();
+    domain.extend_from_slice(&word(31337));
+    domain.extend_from_slice(&address_word(valid["safe_address"].as_str().unwrap()));
+    let mut transaction = alloy::primitives::keccak256("SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)").to_vec();
+    transaction.extend_from_slice(&address_word(valid["safe_tx"]["to"].as_str().unwrap()));
+    transaction.extend_from_slice(&word(0));
+    transaction.extend_from_slice(alloy::primitives::keccak256(&calldata).as_slice());
+    for _ in 0..6 {
+        transaction.extend_from_slice(&word(0));
+    }
+    transaction.extend_from_slice(&word(4));
+    let mut preimage = vec![0x19, 0x01];
+    preimage.extend_from_slice(alloy::primitives::keccak256(domain).as_slice());
+    preimage.extend_from_slice(alloy::primitives::keccak256(transaction).as_slice());
+    let catalog_terms = SealedApprovalTerms {
+        selector: ApprovalSelector::Exact {
+            ordered_payload_digests: vec![Digest32::from_bytes(
+                sha2::Sha256::digest(&preimage).into(),
+            )],
+            ordered_hashes: vec![Digest32::from_bytes(
+                alloy::primitives::keccak256(&preimage).0,
+            )],
+        },
+        ..safe_terms
+    };
+    let response = safe_prepare(
+        catalog_terms.clone(),
+        Some(serde_jcs::to_vec(&valid).unwrap()),
+    )
+    .await
+    .unwrap();
+    let response = match response {
+        MachineBrokerResponse::SealedApprovalPrepare(response) => response,
+        other => panic!("unexpected approval response: {other:?}"),
+    };
+    let session = broker
+        .ceremony()
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let projection: serde_json::Value =
+        serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let manifest = &projection["review_manifest"];
+    let plan: serde_json::Value =
+        serde_json::from_str(manifest["canonical_plan"].as_str().unwrap()).unwrap();
+    assert_eq!(plan["safe_review"]["owner"], owner.to_string());
+    assert_eq!(manifest["safe_review"], plan["safe_review"]);
+    // Broker's catalog describes Safes on the chains Safe deploys to, not
+    // this test chain, so the transaction is shown as bytes Bloom cannot
+    // read, with the reason.
+    let action = plan["safe_review"]["action"].to_string();
+    assert!(
+        action.contains("Bloom cannot read") && action.contains("no description"),
+        "{action}"
+    );
+    assert!(
+        plan["security_disclosures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| {
+                value
+                    .as_str()
+                    .unwrap()
+                    .contains("rebuilt the Safe transaction")
+            })
+    );
+    broker
+        .ceremony()
+        .cancel(&operation("da"), approval_now_ms)
+        .unwrap();
+    // Cancellation intentionally backs this wallet off for two seconds.
+    // Fast hosts must observe that guard before preparing its next ceremony.
+    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
     let approval_operation = operation("d3");
     let approval_prepared = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            requested_review_mode: None,
             evm_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
             operation_id: approval_operation.clone(),
             terms: approval_terms.clone(),
             canonical_plan_facts_digest: digest("d4"),
@@ -3497,8 +4961,10 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let exact_prepared = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            requested_review_mode: None,
+            message_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
             operation_id: exact_approval_operation.clone(),
             terms: exact_terms.clone(),
             canonical_plan_facts_digest: digest("e7"),
@@ -3730,9 +5196,11 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             MachineBrokerService::dispatch(
                 &broker,
                 MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                    evm_reported_token: None,
                     surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-                    requested_review_mode: None,
                     evm_review_payloads: Vec::new(),
+                    message_review_payloads: Vec::new(),
+                    safe_review_payloads: Vec::new(),
                     operation_id: operation(&format!("{:02x}", 0xc0 + index)),
                     terms: denied_terms,
                     canonical_plan_facts_digest: digest("c9"),
@@ -4107,7 +5575,6 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                 approved_claim_digest: None,
                 provenance_jcs: None,
                 renewal_of: None,
-                review: &FrozenReview::legacy(),
             },
         )
         .unwrap();
@@ -4533,31 +6000,32 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .as_millis()
         .try_into()
         .unwrap();
-    if now_after_scope_ms <= approval_expires_at_ms {
-        tokio::time::sleep(std::time::Duration::from_millis(
-            approval_expires_at_ms - now_after_scope_ms + 25,
-        ))
-        .await;
-    }
     let mut expired_terms = approval_terms.clone();
     expired_terms.request_nonce = RequestNonce::from_bytes([0xdc; 16]);
-    assert!(
-        MachineBrokerService::dispatch(
-            &restarted_scoped_broker,
-            MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
-                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-                requested_review_mode: None,
-                evm_review_payloads: Vec::new(),
-                operation_id: operation("dc"),
-                terms: expired_terms,
-                canonical_plan_facts_digest: digest("dd"),
-                petal_use_claim: None,
-                system_use_claim: None,
-            }),
-        )
-        .await
-        .is_err()
-    );
+    expired_terms.issued_at_ms = DecimalU64::new(now_after_scope_ms - 30_000);
+    expired_terms.not_before_ms = expired_terms.issued_at_ms.clone();
+    expired_terms.expires_at_ms = DecimalU64::new(now_after_scope_ms - 1);
+    expired_terms.validate().unwrap();
+    let expired = MachineBrokerService::dispatch(
+        &restarted_scoped_broker,
+        MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+            evm_reported_token: None,
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            evm_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
+            operation_id: operation("dc"),
+            terms: expired_terms,
+            canonical_plan_facts_digest: digest("dd"),
+            petal_use_claim: None,
+            system_use_claim: None,
+        }),
+    )
+    .await
+    .unwrap_err();
+    // The terms are well formed, but a current review manifest cannot fit
+    // inside their already-ended lifetime.
+    assert_eq!(expired.code, ProtocolErrorCode::SelectorMismatch);
 
     // Stop Broker before panic-revoking through Signer's independently
     // authenticated control socket. Recreate Broker afterwards and prove its
@@ -4957,6 +6425,71 @@ async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
 }
 
 #[tokio::test]
+async fn independently_read_message_fields_are_bound_into_the_signed_manifest() {
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        Arc::new(MockSigner::new()),
+        Token::new("message-review-key").unwrap(),
+        SigningKey::from_bytes(&[31; 32]),
+    );
+    let message = serde_json::json!({
+        "kind":"personal", "title":"Sign a personal message",
+        "signer":"0x0000000000000000000000000000000000000007",
+        "payload_keccak":format!("0x{}", "11".repeat(32)),
+        "domain":[], "fields":[{"path":"message","value":"Exact signed text"}],
+        "warnings":["Execution effects remain unverified."]
+    });
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let response = broker
+        .prepare_approval(
+            approval_request(),
+            ReviewManifestContext {
+                message_review: Some(serde_json::from_value(message.clone()).unwrap()),
+                ..ReviewManifestContext::default()
+            },
+            now_ms,
+        )
+        .unwrap();
+    let session = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let projection: serde_json::Value =
+        serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let mut manifest = projection["review_manifest"].clone();
+    assert_eq!(manifest["message_review"], message);
+    let plan: serde_json::Value =
+        serde_json::from_str(manifest["canonical_plan"].as_str().unwrap()).unwrap();
+    assert_eq!(plan["message_review"], message);
+    assert!(
+        plan["security_disclosures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str().unwrap().contains("exact signing hash"))
+    );
+    assert_eq!(
+        Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&manifest).unwrap()).into()),
+        response.review_manifest_digest
+    );
+    manifest["message_review"]["fields"][0]["value"] = serde_json::json!("Changed text");
+    assert_ne!(
+        Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&manifest).unwrap()).into()),
+        response.review_manifest_digest
+    );
+}
+
+#[tokio::test]
 async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
     let signer = Arc::new(MockSigner::new());
     let now_ms: u64 = 1_700_000_000_000;
@@ -5214,6 +6747,88 @@ async fn review_plan_formats_known_asset_base_units_without_hiding_raw_authority
     assert_eq!(plan["asset_amounts"][0]["display"], "0.01 USDC");
     assert_eq!(plan["asset_amounts"][0]["base_units"], "10000");
     assert_eq!(plan["asset_amounts"][0]["decimals"], 6);
+}
+
+#[tokio::test]
+async fn unreadable_safe_call_carries_a_signed_inability_to_explain_disclosure() {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        Arc::new(MockSigner::new()),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[32; 32]),
+    );
+    let safe = serde_json::from_value(serde_json::json!({
+        "chain_id":"1", "chain":"ethereum", "safe":"0x1000000000000000000000000000000000000000",
+        "owner":"0x3000000000000000000000000000000000000000", "nonce":"4", "operation":"call",
+        "destination":"0x4000000000000000000000000000000000000000", "value":"0", "value_display":"0 ETH",
+        "action":["Action: Contract call Bloom cannot read", "Reason: no description of 0x4000000000000000000000000000000000000000 on chain 1"], "safe_tx_hash":"0x1234"
+    })).unwrap();
+    let prepared = broker
+        .prepare_approval(
+            approval_request(),
+            ReviewManifestContext {
+                safe_review: Some(safe),
+                ..ReviewManifestContext::default()
+            },
+            now_ms,
+        )
+        .unwrap();
+    let session = broker
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header(header::HOST, "localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&prepared.ceremony_url))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let projection: serde_json::Value =
+        serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let plan: serde_json::Value = serde_json::from_str(
+        projection["review_manifest"]["canonical_plan"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        plan["security_disclosures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str().unwrap().contains("Bloom cannot explain"))
+    );
+    assert!(
+        projection["review_manifest"]["broker_signature"]
+            .as_str()
+            .is_some_and(|signature| !signature.is_empty())
+    );
+    let mut unsigned = projection["review_manifest"].clone();
+    let signature: Base64UrlBytes = serde_json::from_value(
+        unsigned
+            .as_object_mut()
+            .unwrap()
+            .remove("broker_signature")
+            .unwrap(),
+    )
+    .unwrap();
+    let signature = ed25519_dalek::Signature::from_slice(&signature.decode()).unwrap();
+    SigningKey::from_bytes(&[32; 32])
+        .verifying_key()
+        .verify(
+            &[
+                b"bloom-broker-review-manifest/v1".as_slice(),
+                serde_jcs::to_vec(&unsigned).unwrap().as_slice(),
+            ]
+            .concat(),
+            &signature,
+        )
+        .unwrap();
 }
 
 #[tokio::test]
@@ -6237,6 +7852,28 @@ async fn local_cross_surface_enrollment_uses_the_configured_ceremony_port() {
     );
 }
 
+/// Design previews exist only in developer-harness builds. A build without
+/// the harness serves no preview path at all.
+#[cfg(not(feature = "triad-dev-harness"))]
+#[tokio::test]
+async fn previews_are_absent_without_the_developer_harness() {
+    let broker = CeremonyBroker::new(Arc::new(MockSigner::new()));
+    for path in ["/preview", "/preview/enso-swap", "/preview/tokens.json"] {
+        let response = broker
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(header::HOST, "localhost:18734")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
 #[tokio::test]
 async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
     let signer = Arc::new(MockSigner::new());
@@ -6363,6 +8000,7 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
     }
     for name in [
         "unknown.svg",
+        "0000000000000000000000000000000000000000000000000000000000000000.png",
         "usdc.svg.bak",
         "style.css",
         "..%2Fstyle.css",
@@ -6383,6 +8021,45 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
             refused.status(),
             StatusCode::NOT_FOUND,
             "{name} must not resolve through the token artwork route"
+        );
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../src/ceremony_assets/tokens/artwork.json")).unwrap();
+    let pngs: std::collections::BTreeSet<_> = manifest["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["file"].as_str().filter(|name| name.ends_with(".png")))
+        .collect();
+    for name in pngs {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assets/tokens/{name}"))
+                    .header(header::HOST, "localhost:18734")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "missing bundled PNG {name}"
+        );
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let expected = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/ceremony_assets/tokens/generated")
+                .join(name),
+        )
+        .unwrap();
+        assert_eq!(
+            bytes.as_ref(),
+            expected.as_slice(),
+            "wrong bundled PNG {name}"
         );
     }
     let wrong_host_artwork = app
@@ -7075,7 +8752,7 @@ fn schema1_release_state_migrates_pending_and_preserves_completed_receipt() {
         migrated_store
             .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
             .unwrap(),
-        2
+        3
     );
     let completed_jcs_after: String = migrated_store
         .query_row(
@@ -7952,7 +9629,10 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
         )
         .unwrap(),
     );
-    let broker = CeremonyBroker::new(Arc::new(RealSigner { service }));
+    let broker = CeremonyBroker::new(Arc::new(RealSigner {
+        service,
+        engine: None,
+    }));
     for index in 0..4_u8 {
         let operation_id = operation(&format!("d{index}"));
         broker
@@ -8181,7 +9861,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
                 .uri(format!("/api/session/{ceremony_id}/complete"))
                 .header(header::HOST, "localhost:18734")
                 .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", token)
+                .header("x-bloom-ceremony-token", &token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("sec-fetch-site", "same-origin")
                 .body(Body::from(body))
@@ -8190,27 +9870,139 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         .await
         .unwrap();
     assert_eq!(completed.status(), StatusCode::OK);
+    // Registration capabilities are spent at completion: the link can no
+    // longer read, acknowledge or replay the result.
+    for (method, path, body) in [
+        ("GET", format!("/api/session/{ceremony_id}/result"), ""),
+        ("POST", format!("/api/session/{ceremony_id}/ack"), "{}"),
+    ] {
+        let spent = broker
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::HOST, "localhost:18734")
+                    .header(header::ORIGIN, "http://localhost:18734")
+                    .header("x-bloom-ceremony-token", &token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(spent.status(), StatusCode::FORBIDDEN, "{method}");
+    }
 
-    let export_operation = operation("42");
-    let export = broker
-        .prepare_custody(
-            CustodyPrepareRequest {
-                surface: bloom_signer_api::legacy_local_surface(),
-                ceremony_kind: CeremonyKind::WalletExport,
-                custody_operation_id: export_operation.clone(),
-                wallet_id: contribution.wallet_id.clone(),
-                key_ref: None,
-                exact_terms_digest: digest("52"),
-                expected_input_class: Token::new("generic-custody-v1").unwrap(),
-                browser_output_recipient_key: None,
-                petal_key_scope: None,
-                legacy_passkey_migration: None,
-                wallet_seed_profile: None,
-                derivation_requests: Vec::new(),
-            },
-            now_ms + 1_000,
+    let app = broker.router();
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/wallet/quiet-lilac")
+                .header(header::HOST, "localhost:18734")
+                .header("sec-fetch-site", "cross-site")
+                .body(Body::empty())
+                .unwrap(),
         )
+        .await
         .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let remote = broker
+        .for_remote_origin("https://abcdefghijklmnopqrstuv2345.relay.bloom.directory")
+        .unwrap()
+        .router();
+    let denied = remote
+        .oneshot(
+            Request::builder()
+                .uri("/api/wallet/quiet-lilac")
+                .header(
+                    header::HOST,
+                    "abcdefghijklmnopqrstuv2345.relay.bloom.directory",
+                )
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let token = url_token(&prepared.ceremony_url);
+    let summary = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/wallet/quiet-lilac")
+                .header(header::HOST, "localhost:18734")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let summary: serde_json::Value =
+        serde_json::from_slice(&summary.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(summary["wallet_id"], "quiet-lilac");
+    assert_eq!(summary["accounts"].as_array().unwrap().len(), 2);
+    assert!(
+        summary["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|account| account["chain_projections"][0]["address"]
+                .as_str()
+                .is_some_and(|address| !address.is_empty()))
+    );
+    let backup_request = |origin: &str, body: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/wallet/quiet-lilac/backup")
+            .header(header::HOST, "localhost:18734")
+            .header(header::ORIGIN, origin)
+            .header("x-bloom-ceremony-token", &token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("sec-fetch-site", "same-origin")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone()
+            .oneshot(backup_request("https://other.invalid", "{}"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(backup_request(
+                "http://localhost:18734",
+                r#"{"wallet_id":"other"}"#
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let exported = app
+        .clone()
+        .oneshot(backup_request("http://localhost:18734", "{}"))
+        .await
+        .unwrap();
+    assert_eq!(exported.status(), StatusCode::OK);
+    let export: bloom_broker_api::CustodyPrepareResponse =
+        serde_json::from_slice(&exported.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let repeated = app
+        .clone()
+        .oneshot(backup_request("http://localhost:18734", "{}"))
+        .await
+        .unwrap();
+    let repeated: bloom_broker_api::CustodyPrepareResponse =
+        serde_json::from_slice(&repeated.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(export, repeated);
+    let export_operation = OperationId::new(export.custody_operation_id.as_str()).unwrap();
     let export_id = broker
         .public_status(&export_operation)
         .unwrap()
@@ -8251,6 +10043,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
     );
     let export_challenge: CeremonyChallenge =
         serde_json::from_value(projection["challenges"][0]["binding"].clone()).unwrap();
+    let export_terms = export_challenge.exact_terms_digest.clone();
     let export_assertion = authenticator.assertion(&export_challenge.canonical_bytes().unwrap(), 2);
     let export_aad = CustodyHpkeAad {
         surface: bloom_signer_api::legacy_local_surface(),
@@ -8304,7 +10097,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
                             "assertion": export_assertion
                         },
                         "encrypted_input": export_envelope,
-                        "public_binding_digest": digest("52")
+                        "public_binding_digest": export_terms
                     }))
                     .unwrap(),
                 ))
@@ -8338,7 +10131,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         ceremony_kind: CeremonyKind::WalletExport,
         custody_operation_id: export_operation,
         signer_contribution_digest: export_contribution_digest,
-        public_binding_digest: digest("52"),
+        public_binding_digest: export_terms,
     }
     .canonical_bytes()
     .unwrap();
@@ -8381,6 +10174,101 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         .await
         .unwrap();
     assert_eq!(replay_after_ack.status(), StatusCode::FORBIDDEN);
+
+    // The wallet API refuses requests that are not from the page itself.
+    for (host, site, content_type) in [
+        ("evil.invalid", "same-origin", "application/json"),
+        ("localhost:18734", "", "application/json"),
+        ("localhost:18734", "same-origin", "text/plain"),
+    ] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/wallet/quiet-lilac/backup")
+            .header(header::HOST, host)
+            .header(header::ORIGIN, "http://localhost:18734")
+            .header(header::CONTENT_TYPE, content_type);
+        if !site.is_empty() {
+            request = request.header("sec-fetch-site", site);
+        }
+        let status = app
+            .clone()
+            .oneshot(request.body(Body::from("{}")).unwrap())
+            .await
+            .unwrap()
+            .status();
+        assert!(
+            status.is_client_error(),
+            "{host} / {site:?} / {content_type} was accepted: {status}"
+        );
+    }
+
+    // A backup whose output key another caller already bound is not handed
+    // back: the next request gets a fresh backup instead of a stuck one.
+    let first: bloom_broker_api::CustodyPrepareResponse = serde_json::from_slice(
+        &app.clone()
+            .oneshot(backup_request("http://localhost:18734", "{}"))
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    let first_operation = OperationId::new(first.custody_operation_id.as_str()).unwrap();
+    let first_id = broker
+        .public_status(&first_operation)
+        .unwrap()
+        .ceremony_id
+        .to_string();
+    let parked = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/session/{first_id}/output-key"))
+                .header(header::HOST, "localhost:18734")
+                .header(header::ORIGIN, "http://localhost:18734")
+                .header("x-bloom-ceremony-token", url_token(&first.ceremony_url))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "recipient_key": HpkeRecipient::generate().public_key()
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(parked.status(), StatusCode::OK);
+    // Replacing it cancels the parked session; the wallet's short cancellation
+    // backoff then applies before the fresh one.
+    let replaced = app
+        .clone()
+        .oneshot(backup_request("http://localhost:18734", "{}"))
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), StatusCode::CONFLICT);
+    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+    let fresh = app
+        .clone()
+        .oneshot(backup_request("http://localhost:18734", "{}"))
+        .await
+        .unwrap();
+    let status = fresh.status();
+    let fresh_bytes = fresh.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&fresh_bytes)
+    );
+    let fresh: bloom_broker_api::CustodyPrepareResponse =
+        serde_json::from_slice(&fresh_bytes).unwrap();
+    assert_ne!(fresh.custody_operation_id, first.custody_operation_id);
 }
 
 /// Bundled token artwork is chosen by chain id and full contract address, and
@@ -8391,7 +10279,10 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
 /// earned. The logo is decorative; the address stays the identity.
 #[test]
 fn token_artwork_is_selected_by_chain_and_contract_and_nothing_else() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -8470,6 +10361,14 @@ if (!isGeneric(tokenReviewIcon("constructor", "prototype"))) {{
   throw new Error("prototype chain leaked into artwork selection");
 }}
 
+// Circle's USDC on Base gets the artwork; Binance-pegged "USDC" does not.
+if (src(tokenReviewIcon("8453", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")) !== "/assets/tokens/usdc.svg") {{
+  throw new Error("Base USDC lost its artwork");
+}}
+if (!isGeneric(tokenReviewIcon("56", "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"))) {{
+  throw new Error("a pegged copy took Circle's artwork");
+}}
+
 // Artwork is decorative: it carries no alternative text that could be read
 // as an identity, and the wrapper is hidden from assistive technology.
 const usdcIcon = tokenReviewIcon("1", USDC);
@@ -8511,12 +10410,15 @@ if (!usdcIcon.replacedWith || !isGeneric(usdcIcon.replacedWith)) {{
 /// Upgradeability is one fact about one contract. It used to arrive twice —
 /// once from the verifier's per-call `warnings` and once from the page's walk
 /// over the selected catalog entries — so a single-entry review printed the
-/// same sentence and the same timestamp in two consecutive paragraphs. The
-/// catalog entries are now the only source, and the observation moves into
-/// the details section where the rest of the provenance already lives.
+/// same sentence in two consecutive paragraphs. The catalog entries are now
+/// the only source, and the caveat lives in the details section with the rest
+/// of the provenance.
 #[test]
-fn the_upgradeable_warning_is_stated_once_per_contract_and_keeps_its_timestamp_in_details() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+fn the_upgradeable_warning_is_stated_once_per_contract_and_keeps_its_caveat_in_details() {
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -8592,12 +10494,12 @@ for (const stale of ["can be upgraded", "The publisher observed it at"]) {{
     throw new Error(`the superseded wording survived: ${{stale}}`);
   }}
 }}
-// The decision does not carry a timestamp; the details section does, once.
+// The decision carries no timestamp; the details section has the caveat, once.
 if (/\d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}} UTC/.test(view.primary)) {{
   throw new Error(`an observation timestamp is still beside the decision: ${{view.primary}}`);
 }}
-if (count(view.details, "the publisher observed this deployment at") !== 1) {{
-  throw new Error(`the observation is not stated exactly once in details: ${{view.details}}`);
+if (count(view.details, "its code may have changed since this Bloom release described it") !== 1) {{
+  throw new Error(`the upgrade caveat is not stated exactly once in details: ${{view.details}}`);
 }}
 if (!view.details.includes(TOKEN)) {{
   throw new Error("details do not say which contract is upgradeable");
@@ -8667,7 +10569,10 @@ if (!view.primary.includes("can move your tokens later without another approval"
 /// heading, the roles and the classification must not move.
 #[test]
 fn the_clear_signed_review_reads_its_meaning_only_from_the_typed_intent() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
     let executable = asset
         .split_once("\nload().catch")
         .expect("asset must invoke load")
@@ -8734,20 +10639,22 @@ function show(name) {{
 // A transfer names the amount and the recipient, and the recipient is a
 // recipient — never the contract, never a generic "To".
 let view = show("transfer");
-if (view.heading !== "Requested transfer") throw new Error(`transfer heading: ${{view.heading}}`);
+if (view.heading !== "Send 250 USDC") throw new Error(`transfer heading: ${{view.heading}}`);
 if (view.primary.includes(view.heading)) throw new Error("action title was printed twice");
-if (!view.primary.includes("−250 BDT") || !view.primary.includes("+250 BDT")) {{
+if (!view.primary.includes("−250 USDC") || !view.primary.includes("+250 USDC")) {{
   throw new Error("requested sender/recipient movements are missing");
 }}
 if (!view.technical.includes("Contract behavior has not been verified")) {{
   throw new Error("the interpretation limitation disappeared from details");
 }}
-if (!allText(nodes["page-title"]).includes("Chain ID 31337")) {{
+if (!allText(nodes["page-title"]).includes("Chain ID 8453")) {{
   throw new Error("the exact EVM chain is missing from the primary context");
 }}
-if (!view.primary.includes("BDT — Bloom Demo Token")) {{
-  throw new Error("the token's full name is missing from the primary review");
+if (!view.primary.includes("USD Coin") || !view.primary.includes("USDC")) {{
+  throw new Error("the token's full name is missing from the decision");
 }}
+const tokenImage = find(nodes.review, n => n.tagName === "IMG" && n.attrs.src === "/assets/tokens/usdc.svg");
+if (!tokenImage) throw new Error("Base USDC artwork is missing from the decision");
 if (view.action !== "transfer") throw new Error(`transfer action: ${{view.action}}`);
 if (!view.roles.includes("recipient")) throw new Error(`transfer roles: ${{view.roles}}`);
 if (view.roles.includes("spender")) throw new Error("a transfer must not name a spender");
@@ -8756,7 +10663,7 @@ if (view.button !== "Approve transfer") throw new Error(`transfer button: ${{vie
 if (!view.primary.includes("0x9fE46736679d2d9a65F0992F2272dE9f3c7fa6e0")) {{
   throw new Error("the recipient address is not on the page");
 }}
-if (!view.primary.includes("0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512")) {{
+if (!view.primary.includes("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")) {{
   throw new Error("the token contract address is not on the page");
 }}
 // The envelope's zero native value must not read as the thing being sent.
@@ -8764,7 +10671,7 @@ if (view.primary.includes("  0 ETH")) throw new Error(`primary showed the native
 // The potential cost stays with the decision, labelled as a ceiling.
 if (!view.primary.includes("Gas fee") ||
     !view.primary.includes("Up to 0.000199 ETH")) {{
-  throw new Error(`the execution gas ceiling is not visible: ${{view.primary}}`);
+  throw new Error(`the execution gas ceiling is not in details: ${{view.technical}}`);
 }}
 if (!view.technical.includes("0.000198510751634520 ETH")) {{
   throw new Error("the exact execution cap disappeared");
@@ -8784,8 +10691,8 @@ const unitless = JSON.parse(noUnits.review_manifest.canonical_plan);
 delete unitless.evm_review.payloads[0].maximum_execution_gas_fee_display;
 noUnits.review_manifest.canonical_plan = JSON.stringify(unitless);
 renderReview(noUnits);
-const shown = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
-if (!shown.includes("Cannot be shown")) {{
+const shown = nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allText).join(" ");
+if (!shown.includes("Gas fee") || !shown.includes("Not available in this review")) {{
   throw new Error(`an unpriceable fee vanished instead of saying so: ${{shown}}`);
 }}
 renderReview(previewSession("transfer"));
@@ -8799,7 +10706,7 @@ for (const detail of ["5f2a1c6b8d4e0937ab55c1e8d0f34721aa9c6b5e4d3f2a1908b7c6d5e
 // A finite allowance states the cap and that it is a total, and the
 // counterparty is a spender.
 view = show("allowance-finite");
-if (!view.heading.includes("to spend up to 100 BDT")) throw new Error(`finite heading: ${{view.heading}}`);
+if (!view.heading.includes("to spend up to 100 USDC")) throw new Error(`finite heading: ${{view.heading}}`);
 if (view.magnitude !== "finite") throw new Error(`finite magnitude: ${{view.magnitude}}`);
 if (!view.roles.includes("spender")) throw new Error(`finite roles: ${{view.roles}}`);
 if (view.button !== "Approve allowance") throw new Error(`finite button: ${{view.button}}`);
@@ -8815,13 +10722,13 @@ if (view.heading.includes("spend up to")) throw new Error("zero read as a spendi
 
 // Unlimited says so in the heading, and does not lead with the U256 maximum.
 view = show("allowance-unlimited");
-if (view.heading !== "Allow unlimited BDT spending") throw new Error(`unlimited heading: ${{view.heading}}`);
+if (view.heading !== "Allow unlimited USDC spending") throw new Error(`unlimited heading: ${{view.heading}}`);
 if (view.magnitude !== "unlimited") throw new Error(`unlimited magnitude: ${{view.magnitude}}`);
 if (view.heading.includes("115792089")) throw new Error("the U256 maximum led the heading");
 // Deciding must never require reading the raw integer.
 if (view.primary.includes("115792089")) throw new Error("the U256 maximum is still a primary fact");
 if (!view.technical.includes("115792089")) throw new Error("the exact maximum left technical details");
-if (!view.primary.includes("all your current and future BDT")) throw new Error("the unlimited warning is not visible");
+if (!view.primary.includes("all your current and future USDC")) throw new Error("the unlimited warning is not visible");
 const unfamiliar = previewSession("allowance-unlimited");
 const unfamiliarPlan = JSON.parse(unfamiliar.review_manifest.canonical_plan);
 unfamiliarPlan.evm_review.payloads[0].contract_call.warnings.push("A new warning the renderer does not recognise");
@@ -8836,9 +10743,40 @@ if (!view.all.includes("11579208923731619542357098500868790785326998466564056403
   throw new Error("the exact maximum lost precision");
 }}
 
+// A structural transfer is useful without borrowing a token identity or
+// decimals from the selector. Raw units and the unverified-contract warning
+// stay beside the decision.
+view = show("structural-transfer");
+if (view.heading !== "Review transfer-shaped call for 250000000 raw units") throw new Error(`structural heading: ${{view.heading}}`);
+if (view.primary.includes("−250000000 raw units") || view.primary.includes("+250000000 raw units")) {{
+  throw new Error(`a structural reading claimed token balance changes: ${{view.primary}}`);
+}}
+if (!view.primary.includes("has not verified that this contract is a token")) {{
+  throw new Error("the structural assurance warning is not visible");
+}}
+if (view.primary.includes("Bloom Demo Token") || view.primary.includes(" USDC")) {{
+  throw new Error("a structural reading borrowed catalog token identity");
+}}
+if (!view.technical.includes("Decoded from the standard ERC-20 calldata shape")) {{
+  throw new Error("the structural assurance explanation disappeared");
+}}
+if (view.action !== "call" || view.button !== "Approve call" || !view.roles.includes("recipient")) {{
+  throw new Error("a structural transfer was not presented as a decoded call");
+}}
+
+view = show("structural-allowance-unlimited");
+if (view.heading !== "Review approval-shaped call for maximum uint256") throw new Error(`structural unlimited heading: ${{view.heading}}`);
+if (!view.primary.includes("maximum uint256") || !view.primary.includes("current and future tokens")) {{
+  throw new Error("the structural unlimited warning is not visible");
+}}
+if (view.primary.includes("115792089")) throw new Error("raw maximum led the structural decision");
+if (!view.technical.includes("115792089237316195423570985008687907853269984665640564039457584007913129639")) {{
+  throw new Error("the exact structural allowance left the signed details");
+}}
+
 // An uninterpretable call says so instead of drawing a transfer.
 view = show("deposit-native-opaque");
-if (!view.primary.includes("Native value sent") || !view.primary.includes("1 ETH")) {{
+if (!view.technical.includes("Native value sent") || !view.technical.includes("1 ETH")) {{
   throw new Error("an opaque payable call hid the native value it sends");
 }}
 for (const name of ["deposit-static", "stake-static", "operator-approval"]) {{
@@ -8847,9 +10785,9 @@ for (const name of ["deposit-static", "stake-static", "operator-approval"]) {{
   if (view.primary.includes("Requested movements")) throw new Error(`invented balance changes: ${{name}}`);
 }}
 view = show("opaque-call");
-if (!view.primary.includes("0xa9059cbb")) throw new Error("opaque calldata is not visible");
+if (!view.technical.includes("0xa9059cbb")) throw new Error("opaque calldata is not in details");
 if (view.action !== "opaque") throw new Error(`opaque action: ${{view.action}}`);
-if (!view.primary.includes("cannot say what")) throw new Error(`opaque detail: ${{view.primary}}`);
+if (!view.heading.includes("Bloom cannot read")) throw new Error(`opaque heading: ${{view.heading}}`);
 view = show("operator-approval");
 if (!view.primary.includes("Function arguments") ||
     !view.primary.includes("setApprovalForAll(address operator, bool approved)") ||
@@ -8870,6 +10808,15 @@ if (view.primary.indexOf("Transaction 1") > view.primary.indexOf("Transaction 2"
 if (view.button !== "Approve all transactions") throw new Error(`batch button: ${{view.button}}`);
 if (!view.roles.includes("spender") || !view.roles.includes("recipient")) {{
   throw new Error("batch members lost their distinct spender and recipient roles");
+}}
+
+// One catalogued member cannot lend its assurance to a structural member.
+view = show("mixed-assurance");
+if (!view.technical.includes("mixes trusted catalog descriptions with structural calldata readings")) {{
+  throw new Error("a mixed batch borrowed the first member's stronger assurance");
+}}
+if (!view.primary.includes("has not verified that this contract is a token")) {{
+  throw new Error("the mixed batch hid its structural member's warning");
 }}
 
 // Markup in a publisher's name is text, not markup, and does not reach innerHTML.
@@ -8895,7 +10842,7 @@ call.intent = "Totally different publisher story";
 renamed.review_manifest.canonical_plan = JSON.stringify(plan);
 renderReview(renamed);
 const relabelled = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
-if (nodes["panel-title"].textContent !== "Requested transfer") {{
+if (nodes["panel-title"].textContent !== "Send 250 USDC") {{
   throw new Error(`relabelling changed the heading: ${{relabelled}}`);
 }}
 if (!relabelled.includes("Beneficiary")) {{
@@ -8945,9 +10892,47 @@ async fn a_preview_name_reaches_no_session_and_cannot_be_completed() {
         }
     );
 
+    // The browser reads the same catalog compiled into the decoder.
+    let tokens = app
+        .clone()
+        .oneshot(get("/preview/tokens.json", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokens.status(),
+        if cfg!(feature = "triad-dev-harness") {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        }
+    );
+    if cfg!(feature = "triad-dev-harness") {
+        let bytes = axum::body::to_bytes(tokens.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let listed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            listed,
+            serde_json::to_value(bloom_broker_api::known_tokens()).unwrap()
+        );
+    }
+
     // Every approval path refuses a preview name. It is not a token, so it
     // resolves to nothing: there is no session to read and none to complete.
-    for name in ["transfer", "allowance-unlimited", "batch", "index"] {
+    for name in [
+        "transfer",
+        "tokens",
+        "tokens.json",
+        "transfer-dai",
+        "allowance-unlimited",
+        "batch",
+        "index",
+        "enso-output",
+        "enso-shortcut",
+        "enso-allowance",
+        "polymarket-auth",
+        "polymarket-order",
+    ] {
         let session = app
             .clone()
             .oneshot(get("/api/session", Some(name)))
@@ -8990,82 +10975,6 @@ async fn a_preview_name_reaches_no_session_and_cannot_be_completed() {
             "preview name `{name}` completed a ceremony"
         );
     }
-}
-
-/// Enabling unlimited allowances is an authority change, so the page has to
-/// show it as current → proposed and say what it does and does not grant.
-/// An empty diff for a real widening is the defect this guards.
-#[test]
-fn the_policy_page_shows_the_clear_signing_authority_change() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
-    let script = format!(
-        r#"
-class Node {{
-  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = "";
-                       this.attrs = {{}}; this.hidden = false; }}
-  setAttribute(key, value) {{ this.attrs[key] = value; }}
-  append(...children) {{ this.children.push(...children); }}
-  replaceChildren(...children) {{ this.children = children; }}
-}}
-const nodes = {{}};
-globalThis.document = {{
-  getElementById: id => nodes[id] ||= new Node(id),
-  createElement: name => new Node(name),
-  createElementNS: (_, name) => new Node(name),
-  createTextNode: text => String(text)
-}};
-globalThis.location = {{hash: "", search: "", pathname: "/"}};
-globalThis.history = {{replaceState: () => {{}}}};
-globalThis.setInterval = () => 1;
-globalThis.clearInterval = () => {{}};
-{executable}
-function allText(node) {{
-  if (typeof node === "string") return node;
-  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
-}}
-renderReview(previewSession("policy-unlimited"));
-const rendered = allText({{textContent: "", innerHTML: "", children: [nodes["panel-title"], ...nodes.review.children]}});
-for (const phrase of ["Allow requests for unlimited token spending", "blocked → allowed",
-                      "does not move tokens or grant a spender an allowance", "Each request will still need your approval",
-                      "applies to all supported tokens", "will name its token and spender"]) {{
-  if (!rendered.includes(phrase)) throw new Error(`policy page omitted ${{phrase}}: ${{rendered}}`);
-}}
-if (nodes.approve.textContent !== "Approve policy change") {{
-  throw new Error(`policy button: ${{nodes.approve.textContent}}`);
-}}
-const blocked = previewSession("policy-unlimited");
-const change = blocked.review_manifest.authority_diff.clear_signing;
-[change.before, change.after] = [change.after, change.before];
-renderReview(blocked);
-if (nodes["panel-title"].textContent !== "Block requests for unlimited token spending") {{
-  throw new Error("disabling unlimited requests was labelled as enabling them");
-}}
-// A verifier re-pin is authority too: it decides which build may describe
-// calls for this wallet at all.
-const repin = previewSession("policy-unlimited");
-repin.review_manifest.authority_diff = {{clear_signing: {{
-  before: {{unlimited_allowance_allowed: false,
-           verifier: {{verifier_digest: "77f7d9d939a496a16a9e5d517bb57c8e8eea397751dabdac5f923e0f2e91cc20"}}}},
-  after: {{unlimited_allowance_allowed: false,
-          verifier: {{verifier_digest: "e12e0cbb6873ab1c2ef89cb2e7e41333d0238b574a4629f36ba6b16f21b38beb"}}}}
-}}}};
-renderReview(repin);
-const pinned = allText({{textContent: "", innerHTML: "", children: nodes.review.children}});
-for (const phrase of ["Pinned verifier", "77f7d9d9", "e12e0cbb", "stops being able to describe"]) {{
-  if (!pinned.includes(phrase)) throw new Error(`verifier re-pin omitted ${{phrase}}: ${{pinned}}`);
-}}
-"#
-    );
-    let output = run_node(&script);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 /// Two differently configured Brokers in one process isolate Host, Origin,
@@ -9690,82 +11599,6 @@ async fn destination_reports_an_already_registered_device_over_http() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-}
-
-/// The clear-signing trusted publisher keys are the root of trust for every
-/// contract description Broker will later read calldata against, so rotating
-/// them is the largest authority a policy update can move. `describePolicy`
-/// enumerated the clear-signing fields it renders and left `trusted_keys` out,
-/// so a keys-only rotation reached the owner as "No rule changes are proposed."
-/// under an "Approve policy change" button.
-#[test]
-fn a_trusted_publisher_key_rotation_is_named_on_the_policy_page() {
-    let asset = include_str!("../src/ceremony_assets/app.js");
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
-    let script = format!(
-        r#"
-globalThis.document = {{getElementById: () => ({{}})}};
-globalThis.location = {{hash: "", search: "", pathname: "/"}};
-globalThis.history = {{replaceState: () => {{}}}};
-{executable}
-const settings = keys => ({{
-  catalog_id: "bloom-tokens",
-  trusted_keys: keys,
-  signature_threshold: 1,
-  maximum_observation_age_ms: "86400000",
-  opaque_exact_allowed: false,
-  unlimited_allowance_allowed: false,
-  verifier: {{verifier_id: "bloom-evm-clear-signing", verifier_digest: "{}"}}
-}});
-const oldKey = {{key_id: "publisher-1", verifying_key: "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE"}};
-const newKey = {{key_id: "publisher-1", verifying_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg"}};
-
-// Nothing else differs: only the Ed25519 verifying key behind the same id.
-const diff = clear_signing => describePolicy({{authority_diff: {{clear_signing}}}});
-const rotation = diff({{before: settings([oldKey]), after: settings([newKey])}});
-if (/No rule changes are proposed/.test(rotation.sentence)) {{
-  throw new Error("a trusted-key rotation was rendered as no change: " + rotation.sentence);
-}}
-const rotationFacts = JSON.stringify(rotation.facts);
-for (const needle of ["Stop trusting descriptions signed by", "Trust descriptions signed by"]) {{
-  if (!rotationFacts.includes(needle)) throw new Error("missing " + needle + " in " + rotationFacts);
-}}
-if (!rotation.intent) throw new Error("a key rotation must produce an action card");
-
-// Adding a second publisher is an addition only, and must still be named.
-const added = diff({{before: settings([oldKey]), after: settings([oldKey, {{key_id: "publisher-2", verifying_key: "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M"}}])}});
-if (!JSON.stringify(added.facts).includes("publisher-2")) {{
-  throw new Error("adding a publisher was not named: " + JSON.stringify(added.facts));
-}}
-
-// A clear-signing change this page cannot describe must not read as no change.
-const opaque = diff({{before: settings([oldKey]), after: settings([oldKey])}});
-if (/No rule changes are proposed/.test(opaque.sentence)) {{
-  throw new Error("an undescribable clear-signing change claimed nothing changed");
-}}
-if (!/cannot describe/.test(opaque.sentence)) {{
-  throw new Error("expected the undescribable-change wording, got: " + opaque.sentence);
-}}
-
-// A policy update with no clear-signing section keeps its existing wording.
-const none = describePolicy({{authority_diff: {{}}}});
-if (!/No rule changes are proposed/.test(none.sentence)) {{
-  throw new Error("an empty diff must still read as no change: " + none.sentence);
-}}
-process.stdout.write("trusted-keys-ok");
-"#,
-        "0".repeat(64)
-    );
-    let output = run_node(&script);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "trusted-keys-ok");
 }
 
 /// Runs a CommonJS script in Node, fed on stdin: the shipped asset alone is
