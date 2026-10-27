@@ -108,4 +108,20 @@ for (const [facts, expected] of [
   const value = name => fields[fields.findIndex(field => field.children[0] === name) + 1].children.join("");
   assert(value("Recurring charge").includes(expected), `${JSON.stringify(facts)}: ${value("Recurring charge")}`);
 }
+// A trial charges nothing today. The review says so in place of "$0.00",
+// and the lede says what is actually being handed over.
+renderCardReview({...session, expires_at_ms: now + 120000,
+  review_manifest: {host: "example.com", card_effect: {kind: "checkout",
+    facts: {origin: "https://example.com", payment_frame_origins: [], currency: "USD",
+      total_minor: 0, installments: 1, recurring: true, renewal_minor: 1299,
+      renewal_period: "month", renewal_starts_on: "2026-12-25"},
+    agent_description: "Synthetic free trial"}}});
+{
+  const fields = nodes.review.children[0].children;
+  const value = name => fields[fields.findIndex(field => field.children[0] === name) + 1].children.join("");
+  assert(value("Total").includes("Nothing today"), value("Total"));
+  assert(value("Recurring charge").includes("$12.99 every month, from 2026-12-25"), value("Recurring charge"));
+  assert(nodes["page-lede"].textContent.includes("nothing today"), nodes["page-lede"].textContent);
+  assert(nodes["page-lede"].textContent.includes("cannot cap"), nodes["page-lede"].textContent);
+}
 console.log("browser-handoff-ok");
