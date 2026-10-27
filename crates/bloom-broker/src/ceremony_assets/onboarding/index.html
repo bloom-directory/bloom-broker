@@ -16,31 +16,44 @@
     <header class="brand"><img src="/assets/bloom-primary.svg" width="24" height="24" alt=""><span><strong>Bloom</strong></span><p class="brand-context">Persona setup · this device</p></header>
     <section id="ceremony-panel" class="panel" aria-labelledby="panel-title">
       <header class="panel-header"><p id="page-title" class="panel-context">Your preferences</p><h1 id="panel-title" class="panel-title">How would you like to use Bloom?</h1><p id="status" role="status" aria-live="polite">Connecting to your local Bloom…</p></header>
+      <section id="setup-summary" class="setup-summary" hidden aria-label="Your setup">
+        <dl><dt>Mode</dt><dd id="summary-persona"></dd><dt>Apps</dt><dd id="summary-apps"></dd></dl>
+        <p id="summary-approvals"></p>
+      </section>
+      <div id="setup-content">
         <form id="setup-form">
           <fieldset data-step="0"><legend>Choose a starting point</legend><p id="wallet-message"></p><div id="wallet-choices"></div>
-            <p>These preferences do not grant signing permission. Custodian is the default.</p>
-            <label class="choice"><input type="radio" name="persona" value="custodian" checked><span><strong>Custodian</strong> — review each action. No automatic session permissions.</span></label>
-            <label class="choice"><input type="radio" name="persona" value="trader"><span><strong>Trader</strong> — suggested $100 per action, $1,000 per day, for 24 hours.</span></label>
-            <label class="choice"><input type="radio" name="persona" value="degen"><span><strong>Degen</strong> — suggested $1,000 per action, $10,000 per day, for 7 days.</span></label>
+            <p>These preferences do not grant signing permission. Institutional is the default.</p>
+            <label class="choice"><input type="radio" name="persona" value="custodian" checked><span><strong>Institutional</strong> — review each action. No automatic session permissions.</span></label>
+            <label class="choice"><input type="radio" name="persona" value="trader"><span><strong>Trader</strong> — token allowances per rolling 24 hours, until you revoke them.</span></label>
+            <label class="choice"><input type="radio" name="persona" value="degen"><span><strong>Degen</strong> — larger token allowances per rolling 7 days, until you revoke them.</span></label>
             <p id="legacy-note" hidden>Existing wallet permissions are preserved. Choose a persona explicitly to change your preferences.</p>
           </fieldset>
-          <fieldset data-step="1" hidden><legend>Limits and Petals</legend>
-            <div id="limits"><label>Per action · pUSD<input id="per-action" type="text" inputmode="decimal" value="100" pattern="[0-9]+(\.[0-9]{1,6})?" required></label><label>Per rolling 24 hours · pUSD<input id="daily" type="text" inputmode="decimal" value="1000" pattern="[0-9]+(\.[0-9]{1,6})?" required></label><label>Session duration<select id="duration"><option value="3600">1 hour</option><option value="86400" selected>24 hours</option><option value="604800">7 days</option></select></label></div>
-            <p id="custodian-note">Custodian reviews every action. No session limits are needed.</p>
-            <p>Choose the Petals your wallet policy should allow. Existing packages and settings are preserved.</p><div id="petal-choices"></div>
-            <p>Automatic sessions initially cover eligible Polymarket buys using nominal pUSD collateral. These limits do not cover your total wallet USD value. Other apps and uncovered assets require exact action review; native assets need explicit unit limits in a separate reviewed proposal.</p>
-            <p class="warn">Session coverage depends on the installed package and its verified permissions. A released package without debit accounting still requests individual approvals.</p>
+          <fieldset data-step="1" hidden><legend>Limits and apps</legend>
+            <div id="limits"><p>Each token has its own allowance. Polymarket: pUSD only. Trader: 100 per buy, 1,000 per rolling 24 hours. Degen: 1,000 per buy, 10,000 per rolling 7 days. Other integrations require supported, explicitly reviewed token scopes. Unlisted actions ask for approval.</p></div>
+            <p id="custodian-note">Institutional reviews every action. No session limits are needed.</p>
+            <p>Choose the apps you want to use with this wallet.</p><div id="petal-choices"></div>
+            <p>Automatic spending currently covers eligible Polymarket buy orders. Other actions still ask for your approval.</p>
+            <p class="warn">You approve app access first. Trader and Degen then require a separate approval for automatic spending. No funds move during setup.</p>
           </fieldset>
         </form>
-        <fieldset data-step="2" hidden><legend>Review your wallet policy</legend><p>Review the installed package permissions and destinations. Approve the exact permissions below with your existing passkey.</p><p id="policy-status"></p><button type="button" data-action="policy">Review or resume policy</button></fieldset>
-        <fieldset data-step="3" hidden><legend>Review session permissions</legend><p id="session-explanation">Trader and Degen can request bounded permissions after the wallet policy is applied. Each scope may need a separate approval.</p><p id="session-status"></p><div class="result-actions"><button type="button" id="finish" hidden>Finish</button><button type="button" data-action="activate" id="activate">Review session permissions</button><button type="button" class="secondary" data-action="stop">Stop persona sessions</button></div><p>Saving preferences does not activate sessions. Stopping revokes persona-managed grants.</p></fieldset>
+        <fieldset data-step="2" hidden><legend>Approve selected apps</legend><p>Use your passkey to approve the apps you selected. You’ll see exactly what they can access.</p><p id="policy-status"></p><button type="button" data-action="policy">Approve with passkey</button></fieldset>
+        <fieldset data-step="3" hidden><legend>Approve your limits</legend><p id="session-explanation">Use your passkey to approve your spending limits and expiry.</p><p id="session-status"></p><div class="result-actions"><button type="button" id="finish" hidden>Finish</button><button type="button" data-action="activate" id="activate">Approve your limits</button><button type="button" class="secondary" data-action="stop">Stop persona sessions</button></div><p>You can stop these permissions at any time.</p></fieldset>
 
         <fieldset data-step="4" hidden><legend>Ready to use Bloom</legend><p>You can close this tab and return to Bloom.</p></fieldset>
         <fieldset id="setup-diagnostics"><details class="ceremony-details"><summary>Activity and recovery details</summary><p>If a step fails, resolve the reported issue, refresh and resume. Keep this local setup link private.</p><pre id="activity">Waiting for local service.</pre><details><summary>Current service state</summary><pre id="raw-state"></pre></details></details></fieldset>
       <div id="setup-navigation" class="ceremony-actions actions"><p id="step-label" class="action-expiry">Step 1 of 4</p><div class="action-buttons"><button id="back" class="secondary" type="button" hidden>Back</button><button class="secondary" type="button" data-action="refresh">Refresh</button><button id="next" type="button">Next</button></div></div>
+      </div>
+      <section id="review-host" class="setup-review" hidden aria-label="Approve your setup">
+        <p id="approval-progress" class="setup-progress"></p>
+        <h2 id="approval-title"></h2>
+        <p id="approval-purpose"></p>
+        <p id="review-loading" role="status" aria-live="polite">Preparing your approval…</p>
+        <button id="approval-retry" type="button" class="secondary" hidden>Try loading approval again</button>
+        <iframe id="ceremony-frame" hidden title="Exact permissions for this approval" allow="publickey-credentials-get 'self'; publickey-credentials-create 'self'"></iframe>
+      </section>
     </section>
   </main>
-  <section id="review-host" hidden aria-label="Review permissions"><iframe id="ceremony-frame" title="Bloom permission review" allow="publickey-credentials-get 'self'; publickey-credentials-create 'self'"></iframe></section>
   <script src="app.js"></script>
 </body>
 </html>

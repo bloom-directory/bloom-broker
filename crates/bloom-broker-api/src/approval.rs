@@ -220,8 +220,8 @@ impl SealedApprovalTerms {
 
         if let Some(budget) = &self.session_budget {
             budget.validate()?;
-            if let Some(usd) = &budget.usd_policy {
-                usd.validate_member(self)?;
+            if let Some(policy) = &budget.token_policy {
+                policy.validate_member(self)?;
             }
             if matches!(self.selector, ApprovalSelector::Exact { .. })
                 || budget.wallet_id != self.wallet_id
@@ -238,6 +238,14 @@ impl SealedApprovalTerms {
                 ));
             }
         }
+        if self.expires_at_ms.get() == u64::MAX
+            && matches!(self.selector, ApprovalSelector::Exact { .. })
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "exact approvals cannot be standing permissions",
+            ));
+        }
         match (&self.subject, &self.selector) {
             (
                 ApprovalSubject::System { component_id, .. },
@@ -247,7 +255,7 @@ impl SealedApprovalTerms {
                 if self
                     .session_budget
                     .as_ref()
-                    .is_none_or(|b| b.usd_policy.is_none())
+                    .is_none_or(|b| b.token_policy.is_none())
                 {
                     return Err(ProtocolError::new(
                         ProtocolErrorCode::SelectorMismatch,

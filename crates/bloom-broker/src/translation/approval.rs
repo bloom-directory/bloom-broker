@@ -214,22 +214,13 @@ mod tests {
             }],
         };
         let budget = north::SessionBudget {
-            usd_policy: None,
+            token_policy: None,
             wallet_id: token("alice"),
             policy_version: north::DecimalU64::new(1),
             policy_digest: digest(2),
             wallet_revocation_epoch: north::DecimalU64::new(0),
             member_keys: vec![key.clone()],
             limits: limits.clone(),
-            nominal_asset_scales: vec![north::SessionAssetScale {
-                asset: asset.clone(),
-                units_per_nominal_unit: n("1000000"),
-            }],
-            nominal_limits: north::SessionNominalLimits {
-                per_action: n("1000000"),
-                lifetime: n("10000000"),
-                rolling_windows: vec![],
-            },
             per_action_value_limits: vec![north::SessionValueCeiling {
                 asset,
                 maximum: n("1000000"),
@@ -286,8 +277,8 @@ mod tests {
             .session_budget
             .as_mut()
             .unwrap()
-            .nominal_limits
-            .per_action = north::DecimalU256::parse("999999").unwrap();
+            .per_action_value_limits[0]
+            .maximum = north::DecimalU256::parse("999999").unwrap();
         assert_ne!(terms.approval_id().unwrap(), changed.approval_id().unwrap());
         assert_ne!(
             mapped.request_nonce,

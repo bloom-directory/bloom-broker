@@ -1,8 +1,7 @@
-//! Owner-reviewed session scopes and exact asset-unit accounting. Nominal units
-//! are a reviewed conversion convention, never an oracle claim about USD value.
+//! Owner-reviewed session scopes and exact asset-unit accounting.
 use crate::{
     ApprovalLimits, AssetId, DecimalU64, DecimalU256, Digest32, KeyRef, PolicyDestination,
-    ProtocolError, ProtocolErrorCode, Token, ValueWindow,
+    ProtocolError, ProtocolErrorCode, Token,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -142,39 +141,21 @@ pub struct SessionAssetAmount {
     pub amount: DecimalU256,
 }
 
-/// Base units representing one reviewed nominal collateral unit. E.g. USDC
-/// with six decimals uses 1_000_000. Accounting rounds upward to micro-units.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SessionAssetScale {
-    pub asset: AssetId,
-    pub units_per_nominal_unit: DecimalU256,
-}
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SessionNominalLimits {
-    pub per_action: DecimalU256,
-    pub lifetime: DecimalU256,
-    pub rolling_windows: Vec<ValueWindow>,
-}
-
 /// Every member approval signs this complete descriptor. The identifier is
 /// derived from it, so a caller cannot reuse a chosen alias with different caps.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionBudget {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usd_policy: Option<crate::SessionUsdPolicy>,
+    pub token_policy: Option<crate::SessionTokenPolicy>,
     pub wallet_id: Token,
     pub policy_version: DecimalU64,
     pub policy_digest: Digest32,
     pub wallet_revocation_epoch: DecimalU64,
     pub member_keys: Vec<KeyRef>,
     pub limits: ApprovalLimits,
-    pub nominal_asset_scales: Vec<SessionAssetScale>,
-    pub nominal_limits: SessionNominalLimits,
     /// Includes separately stated native-fee/transfer caps. Unknown assets
-    /// never count as free merely because they lack a nominal conversion.
+    /// always require their own explicitly reviewed allowance.
     pub per_action_value_limits: Vec<SessionValueCeiling>,
     pub not_before_ms: DecimalU64,
     pub expires_at_ms: DecimalU64,
@@ -196,20 +177,8 @@ impl SessionBudget {
             || self.expires_at_ms.get() <= self.not_before_ms.get()
             || self.limits.max_operations.get() == 0
             || self.limits.max_signatures.get() == 0
-            || self.nominal_limits.per_action.as_str() == "0"
-            || self.nominal_limits.lifetime.as_str() == "0"
-            || self.nominal_asset_scales.len() > 128
-            || (self.per_action_value_limits.is_empty() && self.usd_policy.is_none())
+            || self.per_action_value_limits.is_empty()
             || self.per_action_value_limits.len() > 128
-            || self
-                .nominal_asset_scales
-                .iter()
-                .any(|s| s.units_per_nominal_unit.as_str() == "0")
-            || self.nominal_asset_scales.iter().enumerate().any(|(i, s)| {
-                self.nominal_asset_scales[..i]
-                    .iter()
-                    .any(|x| x.asset == s.asset)
-            })
             || self
                 .per_action_value_limits
                 .iter()
@@ -220,17 +189,26 @@ impl SessionBudget {
                             .iter()
                             .any(|x| x.asset == s.asset)
                 })
-            || self
-                .nominal_limits
-                .rolling_windows
-                .iter()
-                .any(|w| w.maximum.as_str() == "0" || w.duration_ms.get() == 0)
         {
             return Err(invalid("invalid immutable session budget"));
         }
         crate::approval::validate_limits(&self.limits)?;
-        if let Some(usd) = &self.usd_policy {
-            usd.validate(&self.limits)?;
+        if let Some(policy) = &self.token_policy {
+            policy.validate(&self.limits)?;
+            if policy.assets.len() != self.per_action_value_limits.len()
+                || policy.assets.len() != self.limits.value_limits.len()
+                || policy.assets.iter().any(|a| {
+                    !self
+                        .per_action_value_limits
+                        .iter()
+                        .any(|v| v.asset == a.asset)
+                        || !self.limits.value_limits.iter().any(|v| v.asset == a.asset)
+                })
+            {
+                return Err(invalid(
+                    "every reviewed token needs independent action and rolling limits",
+                ));
+            }
         }
         if self
             .member_keys
@@ -300,12 +278,8 @@ impl SystemSessionUse {
 }
 
 impl SessionBudget {
-    /// Checked conservative conversion and per-action limits. Returns nominal
-    /// micro-units; unscaled assets require separately signed raw-unit caps.
-    pub fn action_nominal_quantity(
-        &self,
-        values: &[SessionAssetAmount],
-    ) -> Result<DecimalU256, ProtocolError> {
+    /// Aggregate duplicates before checking each exact asset independently.
+    pub fn check_action_values(&self, values: &[SessionAssetAmount]) -> Result<(), ProtocolError> {
         use num_bigint::BigUint;
         use std::str::FromStr;
         self.validate()?;
@@ -319,7 +293,6 @@ impl SessionBudget {
                 totals.push((v.asset.clone(), n));
             }
         }
-        let mut nominal = BigUint::from(0u8);
         for (asset, amount) in totals {
             let cap = self
                 .per_action_value_limits
@@ -335,35 +308,16 @@ impl SessionBudget {
                     "session per-action asset ceiling exceeded",
                 ));
             }
-            if let Some(scale) = self.nominal_asset_scales.iter().find(|s| s.asset == asset) {
-                let divisor = BigUint::from_str(scale.units_per_nominal_unit.as_str())
-                    .map_err(|_| invalid("invalid nominal scale"))?;
-                nominal += (amount * BigUint::from(1_000_000u64) + &divisor - BigUint::from(1u8))
-                    / divisor;
-            } else if !self.limits.value_limits.iter().any(|v| v.asset == asset) {
-                return Err(invalid(
-                    "unscaled asset has no separately signed unit budget",
-                ));
+            if !self.limits.value_limits.iter().any(|v| v.asset == asset) {
+                return Err(invalid("asset has no signed token-unit budget"));
             }
         }
-        if nominal
-            > BigUint::from_str(self.nominal_limits.per_action.as_str())
-                .map_err(|_| invalid("invalid nominal ceiling"))?
-        {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::LimitExceededValue,
-                "session nominal per-action ceiling exceeded",
-            ));
-        }
-        DecimalU256::parse(nominal.to_string())
-            .map_err(|_| invalid("nominal session quantity overflow"))
+        Ok(())
     }
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionRecordedUse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub valuation: Option<crate::SessionValuation>,
     pub accepted_at_ms: u64,
     pub signature_count: u64,
     pub values: Vec<SessionAssetAmount>,
@@ -404,61 +358,7 @@ impl SessionBudget {
         let number = |s: &DecimalU256| {
             BigUint::from_str(s.as_str()).map_err(|_| invalid("invalid budget quantity"))
         };
-        let current_nominal = number(&self.recorded_quantity(current)?)?;
-        if current_nominal > number(&self.nominal_limits.per_action)? {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::LimitExceededValue,
-                "session USD per-action ceiling exceeded",
-            ));
-        }
-        if self.usd_policy.is_some() {
-            let v = current
-                .valuation
-                .as_ref()
-                .ok_or_else(|| invalid("missing valuation"))?;
-            if v.accepted_at_ms.get() > current.accepted_at_ms
-                || current.accepted_at_ms - v.accepted_at_ms.get() > 10_000
-            {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::PriceStale,
-                    "quote acceptance expired before reservation",
-                ));
-            }
-            for q in &v.quotes {
-                if q.timestamp_ms.get() > current.accepted_at_ms.saturating_add(5000)
-                    || current.accepted_at_ms.saturating_sub(q.timestamp_ms.get())
-                        > crate::SESSION_QUOTE_MAX_AGE_MS
-                {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::PriceStale,
-                        "price expired before reservation",
-                    ));
-                }
-            }
-        }
-        let mut nominal = current_nominal.clone();
-        for p in previous {
-            nominal += number(&self.recorded_quantity(p)?)?;
-        }
-        if nominal > number(&self.nominal_limits.lifetime)? {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::LimitExceededValue,
-                "shared nominal lifetime budget exceeded",
-            ));
-        }
-        for w in &self.nominal_limits.rolling_windows {
-            let start = current.accepted_at_ms.saturating_sub(w.duration_ms.get());
-            let mut total = current_nominal.clone();
-            for p in previous.iter().filter(|p| p.accepted_at_ms > start) {
-                total += number(&self.recorded_quantity(p)?)?;
-            }
-            if total > number(&w.maximum)? {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::LimitExceededValue,
-                    "shared nominal rolling budget exceeded",
-                ));
-            }
-        }
+        self.check_action_values(&current.values)?;
         for cap in &self.limits.value_limits {
             let sum = |cutoff: Option<u64>| -> Result<BigUint, ProtocolError> {
                 let mut total = BigUint::from(0u8);
@@ -640,180 +540,10 @@ impl SystemSessionScope {
         Ok(())
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{KeySpec, ValueLimit};
-    fn n(v: &str) -> DecimalU256 {
-        DecimalU256::parse(v).unwrap()
-    }
-    fn token(s: &str) -> Token {
-        Token::new(s).unwrap()
-    }
-    fn asset(s: &str) -> AssetId {
-        AssetId {
-            chain: token("polygon"),
-            asset: s.into(),
-        }
-    }
-    fn budget() -> SessionBudget {
-        SessionBudget {
-            usd_policy: None,
-            wallet_id: token("main"),
-            policy_version: DecimalU64::new(1),
-            policy_digest: Digest32::from_bytes([1; 32]),
-            wallet_revocation_epoch: DecimalU64::new(0),
-            member_keys: vec![KeyRef {
-                backend: token("local"),
-                backend_instance: token("test"),
-                locator: "test-key".into(),
-                key_spec: KeySpec::Secp256k1,
-                public_key_fingerprint: Digest32::from_bytes([2; 32]),
-                derivation: None,
-            }],
-            limits: ApprovalLimits {
-                max_operations: DecimalU64::new(10),
-                max_signatures: DecimalU64::new(10),
-                operation_rate_limits: vec![],
-                signature_rate_limits: vec![],
-                value_limits: vec![ValueLimit {
-                    asset: asset("native"),
-                    lifetime: n("1000"),
-                    rolling_windows: vec![],
-                }],
-            },
-            nominal_asset_scales: vec![
-                SessionAssetScale {
-                    asset: asset("usdc"),
-                    units_per_nominal_unit: n("1000000"),
-                },
-                SessionAssetScale {
-                    asset: asset("pusd"),
-                    units_per_nominal_unit: n("1000000"),
-                },
-            ],
-            nominal_limits: SessionNominalLimits {
-                per_action: n("7000000"),
-                lifetime: n("10000000"),
-                rolling_windows: vec![ValueWindow {
-                    maximum: n("10000000"),
-                    duration_ms: DecimalU64::new(100),
-                }],
-            },
-            per_action_value_limits: vec![
-                SessionValueCeiling {
-                    asset: asset("usdc"),
-                    maximum: n("7000000"),
-                },
-                SessionValueCeiling {
-                    asset: asset("pusd"),
-                    maximum: n("7000000"),
-                },
-                SessionValueCeiling {
-                    asset: asset("native"),
-                    maximum: n("100"),
-                },
-            ],
-            not_before_ms: DecimalU64::new(1),
-            expires_at_ms: DecimalU64::new(1000),
-        }
-    }
-    fn use_(name: &str, quantity: &str, time: u64) -> SessionRecordedUse {
-        SessionRecordedUse {
-            valuation: None,
-            accepted_at_ms: time,
-            signature_count: 1,
-            values: vec![SessionAssetAmount {
-                asset: asset(name),
-                amount: n(quantity),
-            }],
-        }
-    }
-    #[test]
-    fn shared_budget_sums_distinct_collateral_assets_and_retains_reserved_uses() {
-        let b = budget();
-        let first = use_("usdc", "6000000", 10);
-        let second = use_("pusd", "5000000", 11);
-        b.check_reservation(&[], &first).unwrap();
-        assert!(b.check_reservation(&[first], &second).is_err());
-    }
-    #[test]
-    fn unknown_asset_and_per_action_excess_are_never_free() {
-        let b = budget();
-        assert!(
-            b.check_reservation(&[], &use_("shares:42", "1", 10))
-                .is_err()
-        );
-        assert!(
-            b.check_reservation(&[], &use_("usdc", "7000001", 10))
-                .is_err()
-        );
-        b.check_reservation(&[], &use_("native", "100", 10))
-            .unwrap();
-        assert!(
-            b.check_reservation(&[], &use_("native", "101", 10))
-                .is_err()
-        );
-    }
-    #[test]
-    fn group_identity_commits_caps_keys_and_asset_scales() {
-        let b = budget();
-        let id = b.budget_id().unwrap();
-        let mut changed = b.clone();
-        changed.nominal_limits.lifetime = n("20000000");
-        assert_ne!(id, changed.budget_id().unwrap());
-        changed = b.clone();
-        changed.member_keys[0].locator = "other-key".into();
-        assert_ne!(id, changed.budget_id().unwrap());
-        changed = b.clone();
-        changed.nominal_asset_scales[0].units_per_nominal_unit = n("1000000000000000000");
-        assert_ne!(id, changed.budget_id().unwrap());
-    }
-    #[test]
-    fn conversion_rounds_up_and_duplicate_values_cannot_split_the_cap() {
-        let mut b = budget();
-        b.nominal_asset_scales[0].units_per_nominal_unit = n("1000000000000000000");
-        assert_eq!(
-            b.action_nominal_quantity(&[SessionAssetAmount {
-                asset: asset("usdc"),
-                amount: n("1")
-            }])
-            .unwrap(),
-            n("1")
-        );
-        let b = budget();
-        assert!(
-            b.action_nominal_quantity(&[
-                SessionAssetAmount {
-                    asset: asset("usdc"),
-                    amount: n("4000000")
-                },
-                SessionAssetAmount {
-                    asset: asset("usdc"),
-                    amount: n("4000000")
-                }
-            ])
-            .is_err()
-        );
-    }
-    #[test]
-    fn rolling_limits_age_but_lifetime_caps_do_not_reset() {
-        let mut b = budget();
-        b.nominal_limits.lifetime = n("20000000");
-        let previous = use_("usdc", "6000000", 10);
-        let next = use_("pusd", "5000000", 11);
-        assert!(
-            b.check_reservation(std::slice::from_ref(&previous), &next)
-                .is_err()
-        );
-        let aged = use_("pusd", "5000000", 111);
-        b.check_reservation(&[previous], &aged).unwrap();
-        assert!(b.check_reservation(&[], &use_("usdc", "1", 1000)).is_err());
-    }
-}
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionWindowState {
+    pub asset: AssetId,
     pub duration_ms: DecimalU64,
     pub maximum: DecimalU256,
     pub used: DecimalU256,
@@ -828,8 +558,6 @@ pub struct SessionBudgetState {
     pub observed_at_ms: DecimalU64,
     pub operations: DecimalU64,
     pub signatures: DecimalU64,
-    pub nominal_used: DecimalU256,
-    pub nominal_remaining: DecimalU256,
     pub rolling_windows: Vec<SessionWindowState>,
     pub asset_usage: Vec<SessionAssetAmount>,
     /// Totals include outstanding reservations and ambiguous outcomes.
@@ -849,11 +577,9 @@ impl SessionBudget {
         let decimal = |v: BigUint| {
             DecimalU256::parse(v.to_string()).map_err(|_| invalid("session usage overflow"))
         };
-        let mut total = BigUint::from(0u8);
         let mut signatures = 0u64;
         let mut values = Vec::new();
         for p in previous {
-            total += n(&self.recorded_quantity(p)?)?;
             signatures = signatures
                 .checked_add(p.signature_count)
                 .ok_or_else(|| invalid("session signature usage overflow"))?;
@@ -867,20 +593,25 @@ impl SessionBudget {
             }
         };
         let mut windows = Vec::new();
-        for w in &self.nominal_limits.rolling_windows {
-            let mut used = BigUint::from(0u8);
-            for p in previous
-                .iter()
-                .filter(|p| p.accepted_at_ms > now.saturating_sub(w.duration_ms.get()))
-            {
-                used += n(&self.recorded_quantity(p)?)?;
+        for cap in &self.limits.value_limits {
+            for w in &cap.rolling_windows {
+                let mut used = BigUint::from(0u8);
+                for p in previous.iter().filter(|p| {
+                    p.accepted_at_ms <= now
+                        && p.accepted_at_ms > now.saturating_sub(w.duration_ms.get())
+                }) {
+                    for value in p.values.iter().filter(|v| v.asset == cap.asset) {
+                        used += n(&value.amount)?;
+                    }
+                }
+                windows.push(SessionWindowState {
+                    asset: cap.asset.clone(),
+                    duration_ms: w.duration_ms.clone(),
+                    maximum: w.maximum.clone(),
+                    remaining: decimal(remaining(n(&w.maximum)?, &used))?,
+                    used: decimal(used)?,
+                });
             }
-            windows.push(SessionWindowState {
-                duration_ms: w.duration_ms.clone(),
-                maximum: w.maximum.clone(),
-                remaining: decimal(remaining(n(&w.maximum)?, &used))?,
-                used: decimal(used)?,
-            });
         }
         Ok(SessionBudgetState {
             pool_state: None,
@@ -888,8 +619,6 @@ impl SessionBudget {
             observed_at_ms: DecimalU64::new(now),
             operations: DecimalU64::new(previous.len() as u64),
             signatures: DecimalU64::new(signatures),
-            nominal_remaining: decimal(remaining(n(&self.nominal_limits.lifetime)?, &total))?,
-            nominal_used: decimal(total)?,
             rolling_windows: windows,
             asset_usage: SessionAccounting::canonical_values(&values)?,
             includes_reserved_and_quarantined: true,
@@ -899,8 +628,7 @@ impl SessionBudget {
 
 impl SessionBudget {
     pub fn requires_trusted_time(&self) -> bool {
-        !self.nominal_limits.rolling_windows.is_empty()
-            || !self.limits.operation_rate_limits.is_empty()
+        !self.limits.operation_rate_limits.is_empty()
             || !self.limits.signature_rate_limits.is_empty()
             || self
                 .limits
@@ -962,4 +690,181 @@ fn native_session_scope_refuses_unpriced_layer_two_fees_and_sol_freshness() {
         asset: "mint".into(),
     });
     assert!(scope.validate().is_err());
+}
+
+#[cfg(test)]
+mod token_allowance_tests {
+    use super::*;
+    use crate::{KeySpec, ValueLimit, ValueWindow};
+    fn n(v: &str) -> DecimalU256 {
+        DecimalU256::parse(v).unwrap()
+    }
+    fn asset(name: &str) -> AssetId {
+        AssetId {
+            chain: Token::new("evm-137").unwrap(),
+            asset: name.into(),
+        }
+    }
+    fn budget() -> SessionBudget {
+        SessionBudget {
+            token_policy: None,
+            wallet_id: Token::new("wallet").unwrap(),
+            policy_version: DecimalU64::new(1),
+            policy_digest: Digest32::from_bytes([1; 32]),
+            wallet_revocation_epoch: DecimalU64::new(0),
+            member_keys: vec![KeyRef {
+                backend: Token::new("local").unwrap(),
+                backend_instance: Token::new("test").unwrap(),
+                locator: "key".into(),
+                key_spec: KeySpec::Secp256k1,
+                public_key_fingerprint: Digest32::from_bytes([2; 32]),
+                derivation: None,
+            }],
+            limits: ApprovalLimits {
+                max_operations: DecimalU64::new(u64::MAX),
+                max_signatures: DecimalU64::new(u64::MAX),
+                operation_rate_limits: vec![],
+                signature_rate_limits: vec![],
+                value_limits: ["usdc", "pusd", "native"]
+                    .into_iter()
+                    .map(|s| ValueLimit {
+                        asset: asset(s),
+                        lifetime: n("1000000000"),
+                        rolling_windows: vec![ValueWindow {
+                            maximum: n("100"),
+                            duration_ms: DecimalU64::new(100),
+                        }],
+                    })
+                    .collect(),
+            },
+            per_action_value_limits: ["usdc", "pusd", "native"]
+                .into_iter()
+                .map(|s| SessionValueCeiling {
+                    asset: asset(s),
+                    maximum: n("70"),
+                })
+                .collect(),
+            not_before_ms: DecimalU64::new(1),
+            expires_at_ms: DecimalU64::new(u64::MAX),
+        }
+    }
+    fn use_(name: &str, amount: &str, time: u64) -> SessionRecordedUse {
+        SessionRecordedUse {
+            accepted_at_ms: time,
+            signature_count: 1,
+            values: vec![SessionAssetAmount {
+                asset: asset(name),
+                amount: n(amount),
+            }],
+        }
+    }
+    #[test]
+    fn tokens_are_independent_and_reserved_spending_counts() {
+        let b = budget();
+        let first = use_("usdc", "60", 10);
+        b.check_reservation(std::slice::from_ref(&first), &use_("pusd", "50", 11))
+            .unwrap();
+        assert!(
+            b.check_reservation(&[first], &use_("usdc", "50", 11))
+                .is_err()
+        );
+    }
+    #[test]
+    fn rolling_capacity_returns_at_exact_boundary_without_expiring_permission() {
+        for duration in [100, 86_400_000, 604_800_000] {
+            let mut b = budget();
+            for cap in &mut b.limits.value_limits {
+                cap.rolling_windows[0].duration_ms = DecimalU64::new(duration);
+            }
+            let id = b.budget_id().unwrap();
+            let first = use_("usdc", "60", 10);
+            assert!(
+                b.check_reservation(
+                    std::slice::from_ref(&first),
+                    &use_("usdc", "50", 10 + duration - 1)
+                )
+                .is_err()
+            );
+            b.check_reservation(&[first], &use_("usdc", "50", 10 + duration))
+                .unwrap();
+            assert_eq!(id, b.budget_id().unwrap());
+            assert_eq!(b.expires_at_ms.get(), u64::MAX);
+        }
+    }
+    #[test]
+    fn unknown_assets_and_wrong_chains_need_owner_review() {
+        let b = budget();
+        assert!(b.check_reservation(&[], &use_("unknown", "1", 10)).is_err());
+        let mut wrong = use_("usdc", "1", 10);
+        wrong.values[0].asset.chain = Token::new("evm-1").unwrap();
+        assert!(b.check_reservation(&[], &wrong).is_err());
+    }
+    #[test]
+    fn batches_and_fees_cannot_split_the_per_action_cap() {
+        let b = budget();
+        let mut current = use_("usdc", "40", 10);
+        current.values.push(current.values[0].clone());
+        assert!(b.check_reservation(&[], &current).is_err());
+        let mut current = use_("native", "40", 10);
+        current.values.push(SessionAssetAmount {
+            asset: asset("native"),
+            amount: n("31"),
+        });
+        assert!(b.check_reservation(&[], &current).is_err());
+        assert!(SessionAccounting::canonical_values(&[SessionAssetAmount {asset:asset("usdc"),amount:n("115792089237316195423570985008687907853269984665640564039457584007913129639935")},SessionAssetAmount {asset:asset("usdc"),amount:n("1")}]).is_err());
+    }
+    #[test]
+    fn identity_commits_accounts_tokens_limits_and_validity() {
+        let b = budget();
+        let id = b.budget_id().unwrap();
+        let mut changed = b.clone();
+        changed.member_keys[0].locator = "other".into();
+        assert_ne!(id, changed.budget_id().unwrap());
+        let mut changed = b.clone();
+        changed.limits.value_limits[0].rolling_windows[0].maximum = n("99");
+        assert_ne!(id, changed.budget_id().unwrap());
+        let mut changed = b.clone();
+        changed.per_action_value_limits[0].maximum = n("69");
+        assert_ne!(id, changed.budget_id().unwrap());
+    }
+    #[test]
+    fn status_has_per_token_remaining_capacity() {
+        let b = budget();
+        let uses = [use_("usdc", "60", 10), use_("pusd", "20", 11)];
+        let state = b.usage_state(&uses, 12).unwrap();
+        assert_eq!(
+            state
+                .rolling_windows
+                .iter()
+                .find(|w| w.asset == asset("usdc"))
+                .unwrap()
+                .remaining,
+            n("40")
+        );
+        assert_eq!(
+            state
+                .rolling_windows
+                .iter()
+                .find(|w| w.asset == asset("pusd"))
+                .unwrap()
+                .remaining,
+            n("80")
+        );
+        assert_eq!(
+            b.usage_state(&uses, 110)
+                .unwrap()
+                .rolling_windows
+                .iter()
+                .find(|w| w.asset == asset("usdc"))
+                .unwrap()
+                .remaining,
+            n("100")
+        );
+    }
+    #[test]
+    fn old_usd_grants_are_rejected_instead_of_silently_converted() {
+        let mut old = serde_json::to_value(budget()).unwrap();
+        old["usd_policy"] = serde_json::json!({"schema_version":2});
+        assert!(serde_json::from_value::<SessionBudget>(old).is_err());
+    }
 }

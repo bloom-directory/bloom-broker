@@ -1,4 +1,4 @@
-//! Regressions for the boundary between generic USD sessions and existing
+//! Regressions for the boundary between generic token sessions and existing
 //! stronger review profiles. Economic admission is tested separately.
 use super::*;
 use bloom_broker_api::*;
@@ -53,17 +53,16 @@ fn terms(class: &str) -> SealedApprovalTerms {
         expires_at_ms: DecimalU64::new(100),
         renewal_of: None,
         // Selector validation must preserve exact-review restrictions even when
-        // a caller presents the new USD envelope. Other budget validation is
+        // a caller presents the new token envelope. Other budget validation is
         // intentionally independent of this profile-dispatch regression.
         session_budget: Some(SessionBudget {
-            usd_policy: Some(SessionUsdPolicy {
-                schema_version: 2,
+            token_policy: Some(SessionTokenPolicy {
+                schema_version: 3,
                 budget_nonce: RequestNonce::from_bytes([2; 16]),
                 member_scope_digests: vec![],
                 member_templates: vec![],
                 member_backstop_allocations: vec![],
                 assets: vec![],
-                pricing_policy_digest: session_pricing_policy_digest(),
             }),
             wallet_id: token("test"),
             policy_version: DecimalU64::new(1),
@@ -71,12 +70,6 @@ fn terms(class: &str) -> SealedApprovalTerms {
             wallet_revocation_epoch: DecimalU64::new(0),
             member_keys: vec![key],
             limits,
-            nominal_asset_scales: vec![],
-            nominal_limits: SessionNominalLimits {
-                per_action: DecimalU256::parse("1000000").unwrap(),
-                lifetime: DecimalU256::parse("10000000").unwrap(),
-                rolling_windows: vec![],
-            },
             per_action_value_limits: vec![],
             not_before_ms: DecimalU64::new(1),
             expires_at_ms: DecimalU64::new(100),
@@ -85,7 +78,7 @@ fn terms(class: &str) -> SealedApprovalTerms {
 }
 
 #[test]
-fn generic_usd_envelope_does_not_downgrade_existing_exact_review_classes() {
+fn generic_token_envelope_does_not_downgrade_existing_exact_review_classes() {
     let classes = MESSAGE_REVIEW_OPERATION_CLASSES.iter().chain([
         &SAFE_CONFIRM_OPERATION_CLASS,
         &"polymarket.onboard",

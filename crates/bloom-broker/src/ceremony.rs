@@ -406,6 +406,7 @@ pub fn install_owner_theme_css(css: String) {
 
 #[derive(Clone, Debug, Default)]
 pub struct ReviewManifestContext {
+    pub standing_rearm: bool,
     pub session_budget: Option<bloom_broker_api::SessionBudget>,
     pub petal_use_claim: Option<PetalUseClaim>,
     pub system_use_claim: Option<SystemUseClaim>,
@@ -419,6 +420,8 @@ pub struct ReviewManifestContext {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReviewManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing_rearm: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_budget: Option<bloom_broker_api::SessionBudget>,
     pub schema: Token,
@@ -3571,6 +3574,7 @@ impl CeremonyBroker {
             manifest.evm_review.as_ref(),
             manifest.safe_review.as_ref(),
             manifest.message_review.as_ref(),
+            manifest.standing_rearm == Some(true),
         )?;
         if manifest.approval_id != approval_id
             || manifest.approval_digest != approval_digest
@@ -3623,8 +3627,10 @@ impl CeremonyBroker {
             context.evm_review.as_ref(),
             context.safe_review.as_ref(),
             context.message_review.as_ref(),
+            context.standing_rearm,
         )?;
         let mut manifest = ReviewManifest {
+            standing_rearm: context.standing_rearm.then_some(true),
             session_budget: context.session_budget.clone(),
             schema: Token::new("bloom.review-manifest.v1")?,
             approval_id: request
@@ -5349,6 +5355,7 @@ fn canonical_review_plan(
     evm_review: Option<&crate::evm_review::EvmReview>,
     safe_review: Option<&crate::safe_review::SafeReview>,
     message_review: Option<&crate::message_review::MessageReview>,
+    standing_rearm: bool,
 ) -> Result<String, ProtocolError> {
     #[derive(Serialize)]
     struct AssetAmountReview {
@@ -5362,6 +5369,8 @@ fn canonical_review_plan(
 
     #[derive(Serialize)]
     struct Plan<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        standing_rearm: Option<bool>,
         schema: &'static str,
         asset_amounts: Vec<AssetAmountReview>,
         terms: serde_json::Value,
@@ -5478,6 +5487,7 @@ fn canonical_review_plan(
     }
 
     serde_jcs::to_string(&Plan {
+        standing_rearm: standing_rearm.then_some(true),
         schema: "bloom-review-plan/v1",
         asset_amounts,
         terms: {
@@ -5488,10 +5498,10 @@ fn canonical_review_plan(
                     request.terms.selector,
                     bloom_signer_api::ApprovalSelector::System { .. }
                 ) {
-                    let policy = budget.usd_policy.as_ref().ok_or_else(|| {
+                    let policy = budget.token_policy.as_ref().ok_or_else(|| {
                         protocol(
                             ProtocolErrorCode::SelectorMismatch,
-                            "System review requires USD member templates",
+                            "System review requires token member templates",
                         )
                     })?;
                     let template = policy
@@ -5544,26 +5554,26 @@ fn review_disclosures(
 ) -> Vec<String> {
     let mut disclosures = Vec::new();
     if let Some(budget) = session_budget {
-        if budget.usd_policy.is_some() {
-            disclosures.push(format!("Shared USD authorization budget {}: per action {} microdollars; lifetime {} microdollars. Gross outgoing assets and maximum wallet costs consume capacity; incoming funds do not replenish it. Keyless CoinGecko first, DefiLlama fallback, provider quotes at most 15 minutes old. Prices may lag market moves. Unpriced actions require separate approval.",budget.budget_id().map(|id|id.to_string()).unwrap_or_default(),budget.nominal_limits.per_action.as_str(),budget.nominal_limits.lifetime.as_str()));
-            disclosures.push("Trusted Petal/Machine claims are not independent verification of spending. A dishonest Petal or compromised Broker can misreport economic effects. Signer limits signature volume and duration, not dollars. Existing external permissions and spending are not contained by this budget.".into());
-        } else {
-            disclosures.push(format!("Shared nominal session budget {}: per action {}; lifetime {}. Owner-reviewed conversion conventions are not USD prices.",budget.budget_id().map(|id|id.to_string()).unwrap_or_default(),budget.nominal_limits.per_action.as_str(),budget.nominal_limits.lifetime.as_str()));
-        }
-        for scale in &budget.nominal_asset_scales {
+        disclosures.push("Token allowances use exact chain and token identities. Each token has an independent rolling limit; capacity returns as spending ages out. Incoming funds do not replenish it. Unlisted assets and continuing approvals/delegations require separate owner approval.".into());
+        disclosures.push("Generic spending is declared by the named Petal and Machine, not independently established from signed bytes. Signer does not enforce token economics. Existing venue permissions are separate.".into());
+        for cap in &budget.per_action_value_limits {
             disclosures.push(format!(
-                "Covered collateral: {} on {}, {} raw units per nominal unit.",
-                scale.asset.asset,
-                scale.asset.chain.as_str(),
-                scale.units_per_nominal_unit.as_str()
+                "Per action: {} raw units of {} on {}.",
+                cap.maximum.as_str(),
+                cap.asset.asset,
+                cap.asset.chain.as_str()
             ));
         }
-        for window in &budget.nominal_limits.rolling_windows {
-            disclosures.push(format!(
-                "Shared rolling accounting ceiling: {} micro-units per {} milliseconds.",
-                window.maximum.as_str(),
-                window.duration_ms.get()
-            ));
+        for cap in &budget.limits.value_limits {
+            for window in &cap.rolling_windows {
+                disclosures.push(format!(
+                    "Rolling allowance: {} raw units of {} on {} per {} milliseconds.",
+                    window.maximum.as_str(),
+                    cap.asset.asset,
+                    cap.asset.chain.as_str(),
+                    window.duration_ms.get()
+                ));
+            }
         }
     }
     if evm_review.is_none()
@@ -6261,6 +6271,7 @@ mod compatibility_tests {
     #[test]
     fn absent_evm_review_preserves_legacy_manifest_bytes() {
         let manifest = ReviewManifest {
+            standing_rearm: None,
             session_budget: None,
             schema: Token::new("bloom.review-manifest.v1").unwrap(),
             approval_id: Digest32::from_bytes([1; 32]),

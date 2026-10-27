@@ -1767,7 +1767,7 @@ renderReview({{
 const primary = allText({{textContent: "", innerHTML: "", children:
   nodes.review.children.filter(child => child?.name !== "details")}});
 const technical = allText(nodes.review.children.find(child => child?.name === "details"));
-for (const phrase of ["this Petal", "no funds move", "main wallet key stays inside Bloom", "1h 0m"]) {{
+for (const phrase of ["Pump.fun integration", "no funds move", "main wallet key stays inside Bloom", "1h 0m"]) {{
   if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
 }}
 for (const internal of ["allowed_routes", "custody_operation_id", "package_hash", "r000010"]) {{
@@ -1861,7 +1861,7 @@ renderReview({{
 const primary = allText({{textContent: "", innerHTML: "", children:
   nodes.review.children.filter(child => child?.name !== "details")}});
 const technical = allText(nodes.review.children.find(child => child?.name === "details"));
-for (const phrase of ["Finish setting up", "this Petal", "main wallet key stays inside Bloom"]) {{
+for (const phrase of ["Finish setting up", "Pump.fun integration", "main wallet key stays inside Bloom"]) {{
   if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
 }}
 for (const internal of ["route_grants", "machine_asserted", "r000010",
@@ -6046,10 +6046,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     // the first grant need no intervening ceremony; another grant cannot get
     // a second copy of the advertised cap. Everything is disposable/local.
     {
-        use bloom_broker_api::{
-            SessionAssetScale, SessionBudget, SessionNominalLimits, SessionValueCeiling,
-            ValueWindow,
-        };
+        use bloom_broker_api::{SessionBudget, SessionValueCeiling};
         let now: u64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -6073,25 +6070,13 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             }],
         };
         let budget = SessionBudget {
-            usd_policy: None,
+            token_policy: None,
             wallet_id: wallet_id.clone(),
             policy_version: committed.committed.version.clone(),
             policy_digest: committed.committed.policy_digest.clone(),
             wallet_revocation_epoch: DecimalU64::new(authority.wallet_epoch(&wallet_id).unwrap()),
             member_keys: vec![parent_key.clone()],
             limits: group_limits,
-            nominal_asset_scales: vec![SessionAssetScale {
-                asset: collateral.clone(),
-                units_per_nominal_unit: n("1000000"),
-            }],
-            nominal_limits: SessionNominalLimits {
-                per_action: n("2000000"),
-                lifetime: n("3000000"),
-                rolling_windows: vec![ValueWindow {
-                    maximum: n("3000000"),
-                    duration_ms: DecimalU64::new(86400000),
-                }],
-            },
             per_action_value_limits: vec![SessionValueCeiling {
                 asset: collateral.clone(),
                 maximum: n("2000000"),
@@ -6215,7 +6200,15 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             .unwrap()
             .unwrap();
         assert_eq!(before.operations.get(), 2);
-        assert_eq!(before.nominal_used, n("2000000"));
+        assert_eq!(
+            before
+                .asset_usage
+                .iter()
+                .find(|v| v.asset == collateral)
+                .unwrap()
+                .amount,
+            n("2000000")
+        );
         let replay = match MachineBrokerService::dispatch(
             &restarted_scoped_broker,
             MachineBrokerRequest::SigningSign(first.clone()),
@@ -11925,25 +11918,16 @@ const canonicalJson = value => JSON.stringify(value);
 {functions}
 const key=describePetalScope({{allowed_operation_classes:["polymarket.order"],maximum_lifetime_ms:"60000",package_hash:"abc"}});
 if (!key || !key.facts.some(f=>f[0]==="Session lasts")) throw new Error("key-scope review failed");
-const budget={{nominal_limits:{{per_action:"2000000",lifetime:"10000000",rolling_windows:[{{maximum:"5000000",duration_ms:"86400000"}}]}},nominal_asset_scales:[{{asset:{{chain:"polygon",asset:"pusd"}},units_per_nominal_unit:"1000000"}}],limits:{{value_limits:[]}},member_keys:[{{public_key_fingerprint:"def"}}]}};
-const terms={{subject:{{package_hash:"abc"}},selector:{{kind:"petal",package_hash:"abc",allowed_operation_classes:["polymarket.order"]}},limits:{{max_operations:"10"}},session_budget:budget,not_before_ms:"1000",expires_at_ms:"61000",activation_mode:{{kind:"boot_bound"}}}};
+const asset={{chain:"evm-137",asset:"pusd"}};
+const budget={{per_action_value_limits:[{{asset,maximum:"100000000"}}],limits:{{value_limits:[{{asset,lifetime:"999999999999999999999999999999",rolling_windows:[{{maximum:"1000000000",duration_ms:"86400000"}}]}}]}},token_policy:{{schema_version:3,assets:[{{asset,decimals:6,symbol:"pUSD"}}],member_templates:[{{subject:{{kind:"petal",package_hash:"reviewed-package",route:"reviewed-route"}},provenance_digest:"reviewed-provenance"}}]}}}};
+const terms={{subject:{{package_hash:"abc"}},selector:{{kind:"petal",package_hash:"abc",allowed_operation_classes:["polymarket.order.poly1271"]}},limits:{{max_operations:"18446744073709551615"}},session_budget:budget,not_before_ms:"1000",expires_at_ms:"18446744073709551615",activation_mode:{{kind:"durable_local"}}}};
 const session=describePetalApproval({{canonical_plan:JSON.stringify({{terms,session_budget_id:"budget-identity",asset_amounts:[]}})}});
 const facts=JSON.stringify(session.facts);
-for (const needle of ["budget-identity","Per action","Rolling cap","Covered assets","pusd","Expires","Activation","nominal"]) {{if (!facts.includes(needle))throw new Error("session review omitted "+needle);}}
-// USD members can intentionally omit raw-unit value limits while authorizing
-// spending. Owner review must show that authority and every reviewed scope.
-const petalMember={{...terms,subject:{{kind:"petal",package_hash:"usd-package",route:"usd-trade"}},key_ref:{{public_key_fingerprint:"petal-key"}},provenance_digest:"petal-provenance",allowed_crypto_suites:["secp256k1_keccak256_recoverable"],selector:{{kind:"petal",allowed_operation_classes:["generic.swap"],route_grants:[{{route:"reviewed-route"}}]}},limits:{{max_operations:"4",value_limits:[]}}}};
-const nativeMember={{...terms,subject:{{kind:"system",operation_class:"native.transfer"}},key_ref:{{public_key_fingerprint:"native-key"}},provenance_digest:"native-provenance",allowed_crypto_suites:["ed25519_message"],selector:{{kind:"system_session",scope:{{actions:["native_transfer"],chains:[{{chain:"solana-mainnet",genesis_hash:"reviewed-genesis"}}],destinations:[{{chain:"solana-mainnet",destination:"reviewed-recipient"}}],per_action_value_limits:[{{asset:{{chain:"solana-mainnet",asset:"native"}},maximum:"123456789"}}]}}}}}};
-const usdBudget={{...budget,limits:{{max_operations:"9",max_signatures:"12",value_limits:[],operation_rate_limits:[{{duration_ms:"60000",maximum:"3"}}],signature_rate_limits:[{{duration_ms:"60000",maximum:"6"}}]}},per_action_value_limits:[{{asset:{{chain:"solana-mainnet",asset:"native"}},maximum:"123456789"}}],usd_policy:{{schema_version:2,assets:[{{asset:{{chain:"solana-mainnet",asset:"native"}},decimals:9}}],member_templates:[petalMember,nativeMember],member_backstop_allocations:[{{scope_digest:"petal-scope",limits:petalMember.limits}},{{scope_digest:"native-scope",limits:{{max_operations:"5"}}}}]}}}};
-const usdReview=describePetalApproval({{canonical_plan:JSON.stringify({{terms:{{...petalMember,session_budget:usdBudget}},session_budget_id:"usd-budget",asset_amounts:[]}})}});
-const usdFacts=JSON.stringify(usdReview.facts);
-const spendingFact=usdReview.facts.find(f=>f[0]==="Shared spending authority");
-if (!spendingFact || !spendingFact[1].includes("shared USD caps") || spendingFact[1].includes("None")) throw new Error("USD review falsely claims no spending authority");
-for (const needle of ["$2.000000 USD","$10.000000 USD","9 operations; 12 signatures","60000","petal-scope","native-scope","usd-package","petal-provenance","native-provenance","reviewed-route","ed25519_message","solana-mainnet","reviewed-recipient","123456789"]) {{if (!usdFacts.includes(needle)) throw new Error("USD review omitted "+needle);}}
-// The ceremony canonical plan restores the current native member's exact
-// scope before JavaScript renders the reviewed descriptor.
-const nativeReview=describePetalApproval({{canonical_plan:JSON.stringify({{terms:{{...nativeMember,session_budget:usdBudget}},session_budget_id:"usd-budget"}})}});
-for (const [label,needle] of [["Actions","native_transfer"],["Chains","reviewed-genesis"],["Recipients","reviewed-recipient"],["Per-action asset ceilings","123456789"]]) {{const fact=nativeReview.facts.find(f=>f[0]===label);if (!fact || !fact[1].includes(needle)) throw new Error("native USD review omitted "+label);}}
+for(const needle of ["budget-identity","100 pUSD","1000 pUSD","24 hours","Until you revoke","reviewed-package","reviewed-route","reviewed-provenance","dishonest app"]) {{if(!facts.includes(needle)) throw new Error("token review omitted "+needle);}}
+if(facts.includes("CoinGecko") || facts.includes("nominal") || facts.includes("USD caps")) throw new Error("retired pricing shown");
+const nativeScope={{actions:["native_transfer"],chains:[{{chain:"solana-mainnet",genesis_hash:"reviewed-genesis"}}],destinations:[{{chain:"solana-mainnet",destination:"reviewed-recipient"}}],per_action_value_limits:[{{asset:{{chain:"solana-mainnet",asset:"native"}},maximum:"123456789"}}]}};
+const nativeReview=describePetalApproval({{canonical_plan:JSON.stringify({{terms:{{...terms,selector:{{kind:"system_session",scope:nativeScope}}}},session_budget_id:"budget-identity"}})}});
+for(const needle of ["reviewed-genesis","reviewed-recipient","123456789"]) {{if(!JSON.stringify(nativeReview.facts).includes(needle))throw new Error("native scope omitted "+needle);}}
 process.stdout.write("session-review-ok");
 "#
     );

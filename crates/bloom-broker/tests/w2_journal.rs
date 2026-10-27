@@ -905,7 +905,6 @@ fn ac10_rolling_asset_windows_are_atomic_and_release_aware() {
 
 fn reservation(value: u8) -> ReservationRequest {
     ReservationRequest {
-        session_valuation: None,
         approval_id: digest("22"),
         operation_id: operation_id(value),
         operation_digest: digest("33"),

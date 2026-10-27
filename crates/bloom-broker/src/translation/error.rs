@@ -82,9 +82,7 @@ fn code_to_machine(value: south::ProtocolErrorCode) -> north::ProtocolErrorCode 
 
 fn code_to_signer(value: north::ProtocolErrorCode) -> south::ProtocolErrorCode {
     match value {
-        north::ProtocolErrorCode::PriceUnavailable
-        | north::ProtocolErrorCode::PriceStale
-        | north::ProtocolErrorCode::AssetUnsupported
+        north::ProtocolErrorCode::AssetUnsupported
         | north::ProtocolErrorCode::EffectsUnsupported
         | north::ProtocolErrorCode::PoolInactive => south::ProtocolErrorCode::BackendUnsupported,
         north::ProtocolErrorCode::UnauthenticatedPeer => {
@@ -188,9 +186,7 @@ mod tests {
             assert!(mapped.has_valid_contract());
             if matches!(
                 code,
-                north::ProtocolErrorCode::PriceUnavailable
-                    | north::ProtocolErrorCode::PriceStale
-                    | north::ProtocolErrorCode::AssetUnsupported
+                north::ProtocolErrorCode::AssetUnsupported
                     | north::ProtocolErrorCode::EffectsUnsupported
                     | north::ProtocolErrorCode::PoolInactive
             ) {

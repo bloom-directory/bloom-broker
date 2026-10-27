@@ -17,7 +17,7 @@ macro_rules! method_enum {
 }
 
 method_enum!(MachineBrokerMethod {
-    SessionPrices => "session.prices", SessionStop => "session.stop",
+    SessionStop => "session.stop",
     SystemHello => "system.hello", BrokerReadiness => "broker.readiness", BrokerCapabilities => "broker.capabilities", CeremonySurfaceStatus => "ceremony.surface_status", ActionValidate => "action.validate",
     SealedApprovalPrepare => "sealed_approval.prepare", SealedApprovalStatus => "sealed_approval.status", SealedApprovalList => "sealed_approval.list", SealedApprovalLimitState => "sealed_approval.limit_state", SealedApprovalRevoke => "sealed_approval.revoke", SealedApprovalRevokeAll => "sealed_approval.revoke_all", SealedApprovalRevokeForKey => "sealed_approval.revoke_for_key", SealedApprovalRenew => "sealed_approval.renew",
     SigningSign => "signing.sign", SigningSignBatch => "signing.sign_batch", OperationStatus => "operation.status", OperationCancel => "operation.cancel",

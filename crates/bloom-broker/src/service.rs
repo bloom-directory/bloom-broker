@@ -242,14 +242,7 @@ impl BrokerRpcService {
             Request::BrokerReadiness(_) => {
                 Ok(Response::BrokerReadiness(self.triad_readiness().await?))
             }
-            Request::SessionPrices(request) => {
-                let (assets, quotes) =
-                    crate::session_pricing::prices(&request.assets, self.clock.now_ms(false)?)
-                        .await?;
-                Ok(Response::SessionPrices(
-                    bloom_broker_api::SessionPricesResponse { assets, quotes },
-                ))
-            }
+
             Request::SessionStop(request) => {
                 let ids = self
                     .journal
@@ -906,7 +899,7 @@ impl BrokerRpcService {
         if terms
             .session_budget
             .as_ref()
-            .is_none_or(|b| b.usd_policy.is_none())
+            .is_none_or(|b| b.token_policy.is_none())
             || !matches!(terms.subject, ApprovalSubject::Petal { .. })
         {
             return Ok(());
@@ -928,7 +921,7 @@ impl BrokerRpcService {
             {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::EffectsUnsupported,
-                    "This installed Petal retains its existing stronger approval profile; generic USD sessions cannot bypass it",
+                    "This installed Petal retains its existing stronger approval profile; generic token sessions cannot bypass it",
                 ));
             }
         }
@@ -944,6 +937,27 @@ impl BrokerRpcService {
                 ProtocolErrorCode::MalformedFrame,
                 "an approval cannot bind both Petal and system claims",
             ));
+        }
+        if request.terms.expires_at_ms.get() == u64::MAX {
+            match self
+                .signer
+                .request_for_machine(BrokerSignerRequest::SignerCapabilities(
+                    bloom_signer_api::Empty {},
+                ))
+                .await?
+            {
+                BrokerSignerResponse::SignerCapabilities(caps)
+                    if caps
+                        .schemas
+                        .iter()
+                        .any(|s| s.as_str() == "bloom.standing-approval/1") => {}
+                _ => {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::BackendUnsupported,
+                        "Signer must support standing permissions before reviewing this allowance",
+                    ));
+                }
+            }
         }
         self.validate_generic_session_profile(&request.terms)?;
         self.reconcile_wallet(&request.terms.wallet_id).await?;
@@ -990,12 +1004,12 @@ impl BrokerRpcService {
                     .terms
                     .session_budget
                     .as_ref()
-                    .and_then(|b| b.usd_policy.as_ref())
+                    .and_then(|b| b.token_policy.as_ref())
                     .is_none()
                 {
                     return Err(ProtocolError::new(
                         ProtocolErrorCode::SelectorMismatch,
-                        "native sessions require a reviewed USD pool",
+                        "native sessions require a reviewed token pool",
                     ));
                 }
             }
@@ -1208,6 +1222,18 @@ impl BrokerRpcService {
                 .as_ref()
                 .map(jcs_digest)
                 .transpose()?);
+        context.standing_rearm = request.terms.expires_at_ms.get() == u64::MAX
+            && self
+                .authority
+                .approval_terms(&request.terms.approval_id()?)
+                .map_err(authority_error)?
+                .as_ref()
+                == Some(&request.terms)
+            && self
+                .journal
+                .approval_state(&request.terms.approval_id()?)
+                .map_err(journal_error)?
+                == Some(ApprovalLifecycleState::Active);
         context.session_budget = request.terms.session_budget.clone();
         context.petal_use_claim = request.petal_use_claim;
         context.system_use_claim = request.system_use_claim;
@@ -1586,59 +1612,6 @@ impl BrokerRpcService {
         } else {
             None
         };
-        let mut newly_priced = false;
-        let mut session_valuation = if let Some(budget) = terms
-            .session_budget
-            .as_ref()
-            .filter(|b| b.usd_policy.is_some())
-        {
-            let values = if let Some(use_) = &request.session_use {
-                use_.accounting(Some(budget))?.values
-            } else {
-                bloom_broker_api::SessionAccounting::from_petal_claim(
-                    request.petal_use_claim.as_ref().ok_or_else(|| {
-                        ProtocolError::new(
-                            ProtocolErrorCode::EffectsUnsupported,
-                            "USD session needs economic effects",
-                        )
-                    })?,
-                    Some(budget),
-                )?
-                .values
-            };
-            Some(
-                if let Some(stored) = self
-                    .journal
-                    .session_valuation(&request.approval_id, &request.operation_id)
-                    .map_err(journal_error)?
-                {
-                    stored
-                } else {
-                    if self
-                        .journal
-                        .operation(&request.operation_id)
-                        .map_err(journal_error)?
-                        .is_some()
-                    {
-                        return Err(ProtocolError::new(
-                            ProtocolErrorCode::ServiceUnavailable,
-                            "Existing session operation needs reconciliation",
-                        ));
-                    }
-                    newly_priced = true;
-                    crate::session_pricing::valuation(budget, &values, reserved_at_ms).await?
-                },
-            )
-        } else {
-            None
-        };
-        let clock = self.clock.observe(trusted_time_required)?;
-        let reserved_at_ms = clock.effective_now_ms;
-        if newly_priced {
-            if let Some(valuation) = session_valuation.as_mut() {
-                valuation.accepted_at_ms = DecimalU64::new(reserved_at_ms);
-            }
-        }
         if let Some(observation) = &solana_observation {
             observation.ensure_fresh()?;
             tracing::debug!(
@@ -1652,7 +1625,6 @@ impl BrokerRpcService {
             .authority
             .authorize_for_clock_profile(
                 &AuthorizationInput {
-                    session_valuation,
                     request: request.clone(),
                     expected_signer_public_key,
                     reserved_at_ms,
@@ -2676,9 +2648,8 @@ impl BrokerRpcService {
                 .collect::<Result<_, _>>()?,
             schemas: vec![
                 Token::new(RPC_ENVELOPE_SCHEMA_V1)?,
-                Token::new("bloom.session-usd/2")?,
+                Token::new("bloom.session-token/3")?,
                 Token::new("bloom.economic-effects/1")?,
-                Token::new("bloom.keyless-pricing/1")?,
                 Token::new("bloom.native-transfer/1")?,
             ],
             backends: Vec::new(),

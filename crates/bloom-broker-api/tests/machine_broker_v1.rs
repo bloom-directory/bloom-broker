@@ -269,12 +269,6 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
         operation_id: operation(30),
     };
     vec![
-        MachineBrokerRequest::SessionPrices(SessionPricesRequest {
-            assets: vec![AssetId {
-                chain: token("evm-1"),
-                asset: "native".into(),
-            }],
-        }),
         MachineBrokerRequest::SessionStop(SessionStopRequest {
             budget_id: digest(76),
             operation_id: operation(77),
@@ -489,10 +483,6 @@ fn machine_responses() -> Vec<MachineBrokerResponse> {
         signer_contribution_digest: digest(55),
     };
     vec![
-        MachineBrokerResponse::SessionPrices(SessionPricesResponse {
-            assets: vec![],
-            quotes: vec![],
-        }),
         MachineBrokerResponse::SessionStop(SessionStopResponse {
             budget_id: digest(76),
             revoked: vec![],
@@ -605,21 +595,21 @@ where
 
 #[test]
 fn every_machine_broker_variant_matches_frozen_v1_frames() {
-    // The generic session release's 1.10 fixture includes keyless pricing and pool stop.
+    // The generic session release's 1.10 fixture includes token allowances and scope stop.
     // Existing optional session fields are omitted from these baseline frames.
     // The signing fixture combines the remote-ceremony methods and
     // surface selection with native and Safe review fields. Empty review
     // vectors remain omitted from pre-existing approval request frames.
-    assert_eq!(MachineBrokerMethod::ALL.len(), 47);
+    assert_eq!(MachineBrokerMethod::ALL.len(), 46);
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "da34b01c1f50b172b5a24b58449debb5bbbd6b4bd6188586feba0ffd0a178840",
+        "15e1760f60f13ebe007d3d329f2247cf25ab0da9698c9acdaf864501dba5ff51",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "8058384af13748202f0beaa2f425d97d82623a9a470db4b1d0d77a7286695a2b",
+        "683efeec9c8ccd03a3e03575438ce378f5ebfec930c5579db1055f40992468e6",
     );
 }
 

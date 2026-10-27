@@ -189,7 +189,6 @@ impl ReservationState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReservationRequest {
-    pub session_valuation: Option<bloom_broker_api::SessionValuation>,
     pub approval_id: Digest32,
     pub operation_id: OperationId,
     pub operation_digest: Digest32,
@@ -679,7 +678,7 @@ impl BrokerJournal {
         if let Some(budget) = terms
             .session_budget
             .as_ref()
-            .filter(|b| b.usd_policy.is_some())
+            .filter(|b| b.token_policy.is_some())
         {
             let id = budget.budget_id().map_err(JournalError::Protocol)?;
             let descriptor = serde_jcs::to_string(budget).map_err(storage)?;
@@ -705,6 +704,56 @@ impl BrokerJournal {
         drop(connection);
         self.checkpoint_committed_head()?;
         self.after_durable(DurablePoint::ApprovalTransition)
+    }
+
+    pub fn prepare_standing_rearm(
+        &self,
+        id: &Digest32,
+        review: &Digest32,
+    ) -> Result<(), JournalError> {
+        let mut connection = self.lock_for_mutation()?;
+        let transaction = connection.transaction()?;
+        let (terms,state):(String,String)=transaction.query_row("SELECT terms_jcs,state FROM approval_metadata JOIN approvals USING(approval_id) WHERE approval_id=?1",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let terms: SealedApprovalTerms = serde_json::from_str(&terms).map_err(storage)?;
+        if state != "ACTIVE"
+            || terms.expires_at_ms.get() != u64::MAX
+            || !matches!(
+                terms.activation_mode,
+                bloom_broker_api::ActivationMode::DurableLocal { .. }
+            )
+        {
+            return Err(protocol(
+                ProtocolErrorCode::ApprovalRevoked,
+                "standing permission is not active",
+            )
+            .into());
+        }
+        if let Some(budget) = terms
+            .session_budget
+            .as_ref()
+            .filter(|b| b.token_policy.is_some())
+        {
+            check_session_pool(
+                &transaction,
+                &budget.budget_id().map_err(JournalError::Protocol)?,
+                budget,
+                budget.not_before_ms.get(),
+            )?;
+        }
+        transaction.execute(
+            "UPDATE approval_metadata SET review_manifest_digest=?2 WHERE approval_id=?1",
+            params![id.as_str(), review.as_str()],
+        )?;
+        self.append_audit_transaction(
+            &transaction,
+            "approval.rearm_prepared",
+            &serde_json::json!({"approval_id":id,"review_manifest_digest":review}),
+            self.audit_signer.as_ref(),
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
+        Ok(())
     }
 
     pub fn approval_record(
@@ -790,7 +839,7 @@ impl BrokerJournal {
                 .ok_or_else(|| {
                     protocol(ProtocolErrorCode::ApprovalNotFound, "approval not found")
                 })?;
-        if let Some(existing_operation) = existing_operation {
+        let rearm = if let Some(existing_operation) = existing_operation {
             if existing_operation == activation_operation_id.as_str()
                 && parse_approval_state(&state)? == ApprovalLifecycleState::Active
             {
@@ -799,19 +848,36 @@ impl BrokerJournal {
                 self.checkpoint_committed_head()?;
                 return Ok(());
             }
-            return Err(protocol(
-                ProtocolErrorCode::OperationIdConflict,
-                "approval ceremony activation was replayed with conflicting authority",
-            )
-            .into());
-        }
-        if parse_approval_state(&state)? != ApprovalLifecycleState::AwaitingCeremony {
-            return Err(protocol(
-                ProtocolErrorCode::OperationIdConflict,
-                "approval is not awaiting ceremony activation",
-            )
-            .into());
-        }
+            let terms: String = transaction.query_row(
+                "SELECT terms_jcs FROM approval_metadata WHERE approval_id=?1",
+                [approval_id.as_str()],
+                |r| r.get(0),
+            )?;
+            let terms: SealedApprovalTerms = serde_json::from_str(&terms).map_err(storage)?;
+            if parse_approval_state(&state)? != ApprovalLifecycleState::Active
+                || terms.expires_at_ms.get() != u64::MAX
+                || !matches!(
+                    terms.activation_mode,
+                    bloom_broker_api::ActivationMode::DurableLocal { .. }
+                )
+            {
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "approval activation conflicts with existing authority",
+                )
+                .into());
+            }
+            true
+        } else {
+            if parse_approval_state(&state)? != ApprovalLifecycleState::AwaitingCeremony {
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "approval is not awaiting activation",
+                )
+                .into());
+            }
+            false
+        };
         if let Some(replacement) = &renewal_of {
             let replacement_state: String = transaction
                 .query_row(
@@ -862,7 +928,7 @@ impl BrokerJournal {
             "approval.transition",
             &serde_json::json!({
                 "approval_id": approval_id,
-                "from": ApprovalLifecycleState::AwaitingCeremony,
+                "from": if rearm {ApprovalLifecycleState::Active} else {ApprovalLifecycleState::AwaitingCeremony},
                 "to": ApprovalLifecycleState::Active,
                 "activation_operation_id": activation_operation_id,
                 "renewal_of": renewal_of,
@@ -1001,31 +1067,6 @@ impl BrokerJournal {
         })
     }
 
-    pub fn session_valuation(
-        &self,
-        approval_id: &Digest32,
-        operation_id: &OperationId,
-    ) -> Result<Option<bloom_broker_api::SessionValuation>, JournalError> {
-        let connection = self.lock()?;
-        let text:Option<(String,String)>=connection.query_row("SELECT record_jcs,state FROM session_uses JOIN reservations USING(approval_id,operation_id) WHERE approval_id=?1 AND operation_id=?2",params![approval_id.as_str(),operation_id.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-        text.map(|(s, state)| {
-            verify_session_use_evidence(
-                &connection,
-                approval_id.as_str(),
-                operation_id.as_str(),
-                &s,
-                Some(self.audit_signer.as_ref()),
-            )?;
-            if state == "RELEASED" {
-                return Ok(None);
-            }
-            serde_json::from_str::<bloom_broker_api::SessionRecordedUse>(&s)
-                .map(|r| r.valuation)
-                .map_err(storage)
-        })
-        .transpose()
-        .map(Option::flatten)
-    }
     pub fn stop_session_pool(
         &self,
         budget_id: &Digest32,
@@ -1143,7 +1184,7 @@ impl BrokerJournal {
         let mut previous = Vec::new();
         for row in rows {
             let (approval, operation, record, state) = row?;
-            if budget.usd_policy.is_some() {
+            if budget.token_policy.is_some() {
                 verify_session_use_evidence(
                     &connection,
                     &approval,
@@ -1163,7 +1204,7 @@ impl BrokerJournal {
         let mut usage = budget
             .usage_state(&previous, now)
             .map_err(JournalError::Protocol)?;
-        if budget.usd_policy.is_some() {
+        if budget.token_policy.is_some() {
             let state: String = connection.query_row(
                 "SELECT state FROM session_pools WHERE budget_id=?1",
                 [id.as_str()],
@@ -1635,7 +1676,7 @@ impl BrokerJournal {
             .optional()?;
         if let Some(terms) = session_terms {
             let terms: SealedApprovalTerms = serde_json::from_str(&terms).map_err(storage)?;
-            if let Some(budget) = terms.session_budget.filter(|b| b.usd_policy.is_some()) {
+            if let Some(budget) = terms.session_budget.filter(|b| b.token_policy.is_some()) {
                 check_session_pool(
                     &transaction,
                     &budget.budget_id().map_err(JournalError::Protocol)?,
@@ -1761,11 +1802,10 @@ impl BrokerJournal {
                 "operation_digest": request.operation_digest,
                 "signature_count": request.signature_count,
                 "values": request.values,
-                "session_valuation": request.session_valuation,
                 "reserved_at_ms": request.reserved_at_ms,
-                "correlation_schema": if request.session_valuation.is_some(){Some("v1")}else{None},
+                "correlation_schema": if session_binding.is_some(){Some("v1")}else{None},
                 "budget_id": session_binding.as_ref().map(|b| &b.0),
-                "valuation_record_digest": session_binding.as_ref().map(|b| &b.1)
+                "session_record_digest": session_binding.as_ref().map(|b| &b.1)
             }),
             self.audit_signer.as_ref(),
         )?;
@@ -2948,7 +2988,7 @@ fn verify_audit_correlation(
         return Ok(());
     }
     let correlated = match event_type {
-        "reservation.created" if payload.get("valuation_record_digest").is_some() => {
+        "reservation.created" if payload.get("session_record_digest").is_some() => {
             let approval_id = payload
                 .get("approval_id")
                 .and_then(|v| v.as_str())
@@ -3189,12 +3229,12 @@ fn verify_session_use_evidence(
             serde_json::from_str::<serde_json::Value>(&event.payload)
                 .map_err(|_| audit_degraded())?
         }
-        // Legacy nominal records predate valuation evidence; they retain their
-        // original behavior. A USD record must always have one bound event.
-        [] if budget.usd_policy.is_none() => return Ok(()),
+        // Non-generic legacy raw-unit records predate correlated evidence.
+        // A v3 token record must always have one authenticated bound event.
+        [] if budget.token_policy.is_none() => return Ok(()),
         _ => return Err(audit_degraded()),
     };
-    if budget.usd_policy.is_none()
+    if budget.token_policy.is_none()
         && payload.get("correlation_schema").and_then(|v| v.as_str()) != Some("v1")
     {
         return Ok(());
@@ -3252,14 +3292,13 @@ fn verify_session_use_evidence(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| audit_degraded())?;
-    if record.valuation.is_none()
-        || payload.get("correlation_schema").and_then(|v| v.as_str()) != Some("v1")
+    if payload.get("correlation_schema").and_then(|v| v.as_str()) != Some("v1")
         || payload.get("budget_id").and_then(|v| v.as_str()) != Some(budget_id.as_str())
         || budget.budget_id().map_err(|_| audit_degraded())?.as_str() != budget_id
         || reserved_at != record.accepted_at_ms.to_string()
         || signatures != record.signature_count.to_string()
         || payload.get("reserved_at_ms") != Some(&serde_json::json!(record.accepted_at_ms))
-        || payload.get("valuation_record_digest")
+        || payload.get("session_record_digest")
             != Some(&serde_json::json!(session_use_record_digest(&record)?))
     {
         return Err(audit_degraded());
@@ -3289,7 +3328,7 @@ fn verify_session_use_evidence(
         return Err(audit_degraded());
     }
     budget
-        .recorded_quantity(&record)
+        .check_action_values(&record.values)
         .map_err(|_| audit_degraded())?;
     Ok(())
 }
@@ -3891,7 +3930,7 @@ fn reserve_session_budget(
         return Ok(());
     };
     let id = budget.budget_id().map_err(JournalError::Protocol)?;
-    if budget.usd_policy.is_some() {
+    if budget.token_policy.is_some() {
         check_session_pool(transaction, &id, budget, request.reserved_at_ms)?;
     }
     let previous = {
@@ -3907,7 +3946,7 @@ fn reserve_session_budget(
         let mut records = Vec::new();
         for row in rows {
             let (approval, operation, record, state) = row?;
-            if budget.usd_policy.is_some() {
+            if budget.token_policy.is_some() {
                 verify_session_use_evidence(
                     transaction,
                     &approval,
@@ -3933,7 +3972,7 @@ fn reserve_session_budget(
                 .map(|v| &v.asset)
                 .chain(
                     budget
-                        .usd_policy
+                        .token_policy
                         .iter()
                         .flat_map(|p| p.assets.iter().map(|a| &a.asset)),
                 )
@@ -3951,7 +3990,6 @@ fn reserve_session_budget(
         })
         .collect::<Result<Vec<_>, JournalError>>()?;
     let current = SessionRecordedUse {
-        valuation: request.session_valuation.clone(),
         accepted_at_ms: request.reserved_at_ms,
         signature_count: request.signature_count,
         values,
@@ -4001,7 +4039,7 @@ fn check_session_pool(
         )
         .into());
     }
-    let policy = budget.usd_policy.as_ref().expect("USD pool");
+    let policy = budget.token_policy.as_ref().expect("token scope");
     let mut q=transaction.prepare("SELECT session_members.scope_digest,approvals.state,approval_metadata.terms_jcs FROM session_members JOIN approvals USING(approval_id) JOIN approval_metadata USING(approval_id) WHERE budget_id=?1")?;
     let rows = q.query_map([id.as_str()], |r| {
         Ok((
@@ -4072,12 +4110,12 @@ fn refresh_approval_session_pool(
         return Ok(());
     };
     let terms: SealedApprovalTerms = serde_json::from_str(&terms).map_err(storage)?;
-    let Some(budget) = terms.session_budget.filter(|b| b.usd_policy.is_some()) else {
+    let Some(budget) = terms.session_budget.filter(|b| b.token_policy.is_some()) else {
         return Ok(());
     };
     let id = budget.budget_id().map_err(JournalError::Protocol)?;
     let start = budget
-        .usd_policy
+        .token_policy
         .as_ref()
         .unwrap()
         .member_templates
@@ -4089,75 +4127,6 @@ fn refresh_approval_session_pool(
         Ok(()) => Ok(()),
         Err(JournalError::Protocol(e)) if e.code == ProtocolErrorCode::PoolInactive => Ok(()),
         Err(e) => Err(e),
-    }
-}
-
-#[cfg(test)]
-mod session_evidence_tests {
-    use super::*;
-    use bloom_broker_api::{
-        AssetId, SessionAssetAmount, SessionPriceQuote, SessionRecordedUse, SessionValuation,
-    };
-
-    #[test]
-    fn valuation_digest_binds_time_quantities_provider_quotes_and_charge() {
-        let asset = AssetId {
-            chain: Token::new("evm-137").unwrap(),
-            asset: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb".into(),
-        };
-        let record = SessionRecordedUse {
-            accepted_at_ms: 2_000_000,
-            signature_count: 1,
-            values: vec![SessionAssetAmount {
-                asset: asset.clone(),
-                amount: DecimalU256::parse("1000000").unwrap(),
-            }],
-            valuation: Some(SessionValuation {
-                accepted_at_ms: DecimalU64::new(2_000_000),
-                quotes: vec![SessionPriceQuote {
-                    asset,
-                    provider: Token::new("coingecko").unwrap(),
-                    price_usd: "0.9994".into(),
-                    timestamp_ms: DecimalU64::new(1_999_000),
-                }],
-                usd_microdollars: DecimalU256::parse("999400").unwrap(),
-            }),
-        };
-        let original = session_use_record_digest(&record).unwrap();
-        let canonical = serde_jcs::to_string(&record).unwrap();
-        assert_eq!(
-            session_use_record_digest(&serde_json::from_str(&canonical).unwrap()).unwrap(),
-            original
-        );
-        for field in 0..8 {
-            let mut changed = record.clone();
-            match field {
-                0 => changed.accepted_at_ms -= 1,
-                1 => changed.signature_count += 1,
-                2 => changed.values[0].amount = DecimalU256::parse("999999").unwrap(),
-                3 => {
-                    changed.valuation.as_mut().unwrap().accepted_at_ms = DecimalU64::new(1_999_999)
-                }
-                4 => {
-                    changed.valuation.as_mut().unwrap().quotes[0].provider =
-                        Token::new("defillama").unwrap()
-                }
-                5 => changed.valuation.as_mut().unwrap().quotes[0].price_usd = "0.0001".into(),
-                6 => {
-                    changed.valuation.as_mut().unwrap().quotes[0].timestamp_ms =
-                        DecimalU64::new(2_000_000)
-                }
-                _ => {
-                    changed.valuation.as_mut().unwrap().usd_microdollars =
-                        DecimalU256::parse("1").unwrap()
-                }
-            }
-            assert_ne!(
-                session_use_record_digest(&changed).unwrap(),
-                original,
-                "mutation {field}"
-            );
-        }
     }
 }
 

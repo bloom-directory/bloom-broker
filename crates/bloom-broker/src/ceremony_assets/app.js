@@ -1,5 +1,6 @@
 "use strict";
 const onboardingFrame = typeof window !== 'undefined' && window.parent !== window && location.search === '?onboarding=1';
+if (onboardingFrame) document.documentElement.dataset.embeddedSetup = 'true';
 function notifyOnboarding(state) {
   if (onboardingFrame) window.parent.postMessage({type:'bloom.onboarding.ceremony', ceremony_id:ceremonyId, state}, location.origin);
 }
@@ -229,7 +230,7 @@ function startExpiry(session, node) {
   const tick = () => {
     const left = expiresAt - Date.now();
     node.textContent = left <= 0 ? "Expired — ask Bloom to start this again"
-      : `Time left: ${fmtRemaining(left)}`;
+      : `${onboardingFrame ? 'Approve within' : 'Time left'}: ${fmtRemaining(left)}`;
     node.className = left <= 0 ? "expired" : (left < 60000 ? "expiry soon" : "expiry");
     countdown.textContent = left <= 0
       ? (session.is_preview ? "Demo expired — reload to replay" : "Expired")
@@ -1198,11 +1199,19 @@ function naturalList(items) {
   if (items.length === 2) return `${items[0]} and ${items[1]}`;
   return `${items.slice(0, -1).join(", ")}, and ${items.at(-1)}`;
 }
+// Operation families identify the integration being enabled, not a verified
+// publisher. Always retain the exact package identity in the signed review.
+function describeIntegration(classes, packageHash) {
+  const family = classes.length && classes.every(value => value.startsWith('polymarket.')) ? 'Polymarket'
+    : classes.length && classes.every(value => value.startsWith('pumpfun.')) ? 'Pump.fun'
+    : classes.length && classes.every(value => value.startsWith('hyperliquid.')) ? 'Hyperliquid' : null;
+  return {family, name:family ? `${family} integration` : `Installed app ${shortDigest(packageHash)}`};
+}
 function describePetalScope(scope) {
   if (!scope || typeof scope !== "object") return null;
   const classes = Array.isArray(scope.allowed_operation_classes)
     ? scope.allowed_operation_classes.map(String) : [];
-  const app = "this Petal";
+  const app = describeIntegration(classes, scope.package_hash).name;
   const actions = [...new Set(classes.map(value => {
     const action = value.includes(".") ? value.slice(value.indexOf(".") + 1) : value;
     return PETAL_ACTIONS[action] || action.replace(/[_-]/g, " ");
@@ -1228,78 +1237,81 @@ function describePetalApproval(manifest) {
   const selector = terms?.selector;
   if (selector?.kind !== "petal" && selector?.kind !== "system_session" && selector?.kind !== "system") return null;
   const budget = terms?.session_budget;
-  const usd = Boolean(budget?.usd_policy);
-  const nominal = value => {
-    const digits = String(value || "0").padStart(7,"0");
-    return `${digits.slice(0,-6)}.${digits.slice(-6)}`;
+  const rearm = plan.standing_rearm === true;
+  const token = Boolean(budget?.token_policy);
+  const amount = (asset, raw) => {
+    const meta = budget?.token_policy?.assets?.find(v => v.asset.chain === asset.chain && v.asset.asset === asset.asset);
+    if (!meta) return `${raw} raw units of ${asset.asset} on ${asset.chain}`;
+    const digits = String(raw).padStart(meta.decimals + 1, '0');
+    const number = meta.decimals ? `${digits.slice(0, -meta.decimals)}.${digits.slice(-meta.decimals)}`.replace(/\.?0+$/, '') : digits;
+    return `${number} ${meta.symbol} on ${asset.chain}`;
   };
-  const budgetFacts = budget ? [
-    ["Budget identity", plan.session_budget_id, true],
-    ["Shared budget", "These caps are shared by every approved grant and account in this budget, not granted again to each app"],
-    ["Per action", usd ? `$${nominal(budget.nominal_limits?.per_action)} USD` : `${nominal(budget.nominal_limits?.per_action)} nominal stablecoin collateral units`],
-    ["Total", usd ? `$${nominal(budget.nominal_limits?.lifetime)} USD` : `${nominal(budget.nominal_limits?.lifetime)} nominal stablecoin collateral units`],
-    ...(budget.nominal_limits?.rolling_windows || []).map(w => ["Rolling cap", `${usd ? "$" : ""}${nominal(w.maximum)} ${usd ? "USD" : "nominal units"} per ${w.duration_ms} ms`]),
-    ["Covered assets", usd ? (budget.usd_policy.assets || []).map(v=>`${v.asset?.asset} on ${v.asset?.chain} (${v.decimals} decimals)`).join("; ") : (budget.nominal_asset_scales || []).map(v => `${v.asset?.asset} on ${v.asset?.chain}: ${v.units_per_nominal_unit} base units per nominal unit`).join("; ")],
-    ["Separate asset caps", (budget.limits?.value_limits || []).map(v => `${v.lifetime} raw units of ${v.asset?.asset} on ${v.asset?.chain}`).join("; ")],
-    ["Member keys", (budget.member_keys || []).map(k => k.public_key_fingerprint).join(", "), true],
-    ...(usd ? [["Pool operation/signature backstops", `${budget.limits?.max_operations} operations; ${budget.limits?.max_signatures} signatures; operation rates ${canonicalJson(budget.limits?.operation_rate_limits || [])}; signature rates ${canonicalJson(budget.limits?.signature_rate_limits || [])}`], ["Fixed member backstop allocations", canonicalJson(budget.usd_policy.member_backstop_allocations), true]] : []),
-    ["Accounting", usd ? "Gross authorized outflows plus maximum wallet-paid costs. Incoming funds do not replenish capacity. CoinGecko first, DefiLlama fallback; provider quotes at most 15 minutes old. Unknown or unpriced assets require separate approval." : "Owner-reviewed nominal collateral conversion, not a current USD price or guarantee against depegging. Unknown assets require a separate exact approval."],
-    ...(usd ? [["All reviewed member scopes", (budget.usd_policy.member_templates || []).map(t=>{const s=t.selector || {}; const scope=s.scope || {}; return `${t.key_ref?.derivation?.path || t.key_ref?.public_key_fingerprint}: ${t.subject?.kind} ${t.subject?.route || t.subject?.operation_class || ""}; package ${t.subject?.package_hash || "native System"}; provenance ${t.provenance_digest}; suites ${(t.allowed_crypto_suites || []).join(", ")}; route grants ${canonicalJson(s.route_grants || [])}; actions ${(s.allowed_operation_classes || scope.actions || []).join(", ")}; networks ${(scope.chains || []).map(c=>c.chain).join(", ") || "declared priced assets"}; recipients ${(scope.destinations || []).map(d=>d.destination+" on "+d.chain).join(", ") || "Petal declared destinations"}; member raw caps ${canonicalJson(scope.per_action_value_limits || [])}`;}).join("\n"), true], ["Fixed raw per-action caps",canonicalJson(budget.per_action_value_limits),true], ["Trust boundary","Broker trusts the pinned Petal and Machine to declare all spending and continuing authority. Signer bounds signature volume and duration, not dollars."]] : [])
+  const tokenFacts = budget ? [
+    ...(budget.per_action_value_limits || []).map(v => ['Per action', amount(v.asset, v.maximum)]),
+    ...(budget.limits?.value_limits || []).flatMap(v => (v.rolling_windows || []).map(w => ['Rolling allowance', `${amount(v.asset,w.maximum)} per ${Number(w.duration_ms) === 86400000 ? '24 hours' : Number(w.duration_ms) === 604800000 ? '7 days' : fmtRemaining(Number(w.duration_ms))}`]))
   ] : [];
-  const wallTime = value => Number.isFinite(Number(value)) && Number(value)>0 ? new Date(Number(value)).toISOString() : "See signed approval terms";
+  const budgetFacts = budget ? [
+    ...tokenFacts,
+    ['Allowance identity',plan.session_budget_id,true],
+    ['Accounting','Independent token amounts for this app/account. All reviewed routes share usage. Capacity returns as spending ages out; incoming funds do not replenish it.'],
+    ['Token identities',canonicalJson(budget.token_policy?.assets || budget.per_action_value_limits),true],
+    ['Reviewed scopes',canonicalJson(budget.token_policy?.member_templates || []),true],
+    ['Structural limits',canonicalJson(terms.limits),true],
+    ['Trust boundary','Generic spending is declared by this app and Machine. A dishonest app can understate spending and exceed these accounting limits. Native transfer and supported Polymarket BUY checks provide stronger verification.']
+  ] : [];
+  const wallTime = value => String(value) === '18446744073709551615' ? 'Until you revoke this permission' : Number.isFinite(Number(value)) && Number(value)>0 ? new Date(Number(value)).toISOString() : 'See signed approval terms';
   const lifetimeFacts = [
-    ["Valid from", wallTime(terms.not_before_ms)],
-    ["Expires", wallTime(terms.expires_at_ms)],
-    ["Activation", terms.activation_mode?.kind === "boot_bound" ? "Bound to the active Signer process. Signing stops after logout or service restart. This screen does not rearm it; end the old session and review a new session with its separately reviewed budget. Old accounting records remain stored." : canonicalJson(terms.activation_mode)]
+    ['Valid from',wallTime(terms.not_before_ms)],
+    ['Permission lasts',wallTime(terms.expires_at_ms)],
+    ['Wallet security','Wallet locking still stops signing. Unlocking does not reset allowance usage.']
   ];
   if (selector?.kind === "system_session" || selector?.kind === "system") {
-    const scope=selector.scope || budget?.usd_policy?.member_templates?.find(t=>t.subject?.kind==="system" && t.key_ref?.public_key_fingerprint===terms.key_ref?.public_key_fingerprint && t.subject?.operation_class===terms.subject?.operation_class)?.selector?.scope || {};
+    const scope=selector.scope || budget?.token_policy?.member_templates?.find(t=>t.subject?.kind==="system" && t.key_ref?.public_key_fingerprint===terms.key_ref?.public_key_fingerprint && t.subject?.operation_class===terms.subject?.operation_class)?.selector?.scope || {};
     return {
-      title: "Activate bounded transfer session", button: "Activate session",
-      sentence: "Allow repeated transfers within the exact accounts, assets, recipients, time and budget shown below. Matching transfers will not ask for another passkey approval.",
+      title: rearm ? "Unlock existing transfer permission" : "Activate bounded transfer session", button: rearm ? "Unlock with passkey" : "Activate session",
+      sentence: rearm ? "Unlock your existing transfer permission. Its limits and previous usage stay unchanged. No funds move in this step." : "Allow repeated transfers within the exact accounts, assets, recipients, time and budget shown below. Matching transfers will not ask for another passkey approval.",
       facts: [["Actions",(scope.actions || []).join(", ")],["Chains",(scope.chains || []).map(c=>`${c.chain} (${c.chain_id || c.genesis_hash})`).join("; ")],["Recipients",(scope.destinations || []).map(d=>`${d.destination} on ${d.chain}`).join("; "),true],["Per-action asset ceilings",(scope.per_action_value_limits || []).map(v=>`${v.maximum} raw units of ${v.asset?.asset} on ${v.asset?.chain}`).join("; ")],["Operation limit",terms?.limits?.max_operations],...budgetFacts,...lifetimeFacts],
       warning: "Bloom decodes supported transfer bytes at signing. Token contract effects and market prices are not independently guaranteed. Anything outside this scope requires a new approval."
     };
   }
   const classes = Array.isArray(selector.allowed_operation_classes)
     ? selector.allowed_operation_classes.map(String) : [];
-  const app = "this Petal";
   const packageHash = terms?.subject?.package_hash || selector.package_hash || "";
+  const integration = describeIntegration(classes, packageHash);
+  const app = integration.name;
+  const polymarketBuy = classes.length === 1 && classes[0] === 'polymarket.order.poly1271';
   const actions = [...new Set(classes.map(value => {
     const action = value.includes(".") ? value.slice(value.indexOf(".") + 1) : value;
-    return PETAL_ACTIONS[action] || action.replace(/[_-]/g, " ");
+    return value === 'polymarket.order.poly1271' ? 'Create signed Polymarket BUY orders' : PETAL_ACTIONS[action] || value.replace(/[_-]/g, " ");
   }))];
   const operations = Number(terms?.limits?.max_operations);
   const operationLimit = Number.isSafeInteger(operations) && operations > 0
     ? `Up to ${operations} signed actions` : "Limited by the session rules";
-  // Legacy raw-unit ceilings and the versioned shared USD policy have
-  // different display semantics; an absent optional raw cap is not zero USD authority.
-  const ceilings = (Array.isArray(plan.asset_amounts) ? plan.asset_amounts : [])
-    .filter(amount => amount.kind === "value_limit")
-    .map(amount => amount.display);
-  const spending = usd
-    ? "Gross spending up to the shared USD caps below, including maximum wallet-paid costs, with fixed raw-token caps where present"
-    : ceilings.length
-    ? `Up to ${naturalList(ceilings)} in total across the whole session, counting fees and any funds sent back to your wallet`
-    : "None — Bloom will refuse any action that spends funds or pays a fee";
+  const ceilings = (Array.isArray(plan.asset_amounts) ? plan.asset_amounts : []).filter(v=>v.kind==='value_limit').map(v=>v.display);
+  const spending = token ? 'The independent token allowances shown below' : ceilings.length ? `Up to ${naturalList(ceilings)} in total across the whole session, counting fees and any funds sent back to your wallet` : 'None — Bloom will refuse any action that spends funds or pays a fee';
+  const primaryFacts = [
+    ['Integration',app],['Permitted actions',naturalList(actions)],...tokenFacts,...(!budget ? [['Spending ceiling',spending]] : []),
+    ['Permission lasts',wallTime(terms.expires_at_ms)]
+  ];
   return {
-    sentence: budget
-      ? `Authorize repeated <strong>${app}</strong> actions within the scope and shared budgets below until this approval expires. No funds move in this step, and your main wallet key stays inside Bloom.`
-      : `Finish setting up a temporary <strong>${app}</strong> session. It can sign only the actions listed below until the timer expires. No funds move in this step, and your main wallet key stays inside Bloom.`,
+    primaryFacts,
+    sentence: rearm ? "Unlock your existing automatic spending permission. Its token limits, previous usage and authority identity stay unchanged. No funds move in this step." : budget
+      ? (polymarketBuy ? 'Allow covered BUY orders without another passkey prompt, within the limits below. This approval moves no funds.' : `Allow repeated <strong>${escapeHtml(app)}</strong> actions within the permissions below. This approval moves no funds.`)
+      : `Finish setting up a temporary <strong>${escapeHtml(app)}</strong> session. It can sign only the actions listed below until the timer expires. No funds move in this step, and your main wallet key stays inside Bloom.`,
     facts: [
       ["App", app],
       ["Package", packageHash, true],
       ["Can", naturalList(actions)],
       ["Limit", operationLimit],
-      [usd ? "Shared spending authority" : "Spending ceiling", spending],
+      ["Token allowances", spending],
       ["Main wallet key", "Stays inside Bloom"],
       ...budgetFacts,
       ...lifetimeFacts
     ],
-    title: "Finish temporary session setup",
-    heading: "Create a temporary Petal session",
-    button: "Finish session setup",
-    warning: `${app} creates transactions within these permissions; if compromised, it could use the remaining session capacity before the timer expires.`
+    title: rearm ? "Unlock existing permission" : budget ? "Automatic spending permission" : "Finish temporary session setup",
+    heading: rearm ? `Unlock ${app}` : budget ? (polymarketBuy ? "Allow automatic Polymarket buys" : `Allow automatic actions for ${app}`) : "Create a temporary app session",
+    button: rearm ? "Unlock with passkey" : budget ? (polymarketBuy ? "Allow buys within these limits" : "Allow these automatic actions") : "Finish session setup",
+    warning: 'Automatic spending relies on app-reported amounts and supported transaction checks. A buggy or compromised app could misuse this permission.'
   };
 }
 // Policy updates: say what changes, in the order a person cares about.
@@ -1337,7 +1349,7 @@ function describePolicy(manifest) {
   const before = Number(diff.maximum_approval_lifetime_ms_before);
   const after = Number(diff.maximum_approval_lifetime_ms_after);
   if (Number.isFinite(before) && Number.isFinite(after) && before !== after) {
-    lines.push(["Max approval lifetime", `${fmtRemaining(before)} → ${fmtRemaining(after)}`]);
+    lines.push(["Max approval lifetime", `${String(diff.maximum_approval_lifetime_ms_before) === "9007199254740991" ? "Until revoked" : fmtRemaining(before)} → ${String(diff.maximum_approval_lifetime_ms_after) === "9007199254740991" ? "Until revoked" : fmtRemaining(after)}`]);
   }
   const n = lines.length;
   const sentence = n === 0
@@ -1433,6 +1445,11 @@ function renderReview(session) {
     if (transfer) {
       summaryHtml = transfer.sentence;
       approve.textContent = "Approve policy change";
+      if (onboardingFrame) {
+        transfer.intent = {action:'policy', heading:'Allow apps to request wallet actions', detail:'This updates the permitted apps and destinations. Automatic spending requires a separate approval.'};
+        summaryHtml = 'Your passkey approves these wallet permissions. No funds move. Future actions still need approval unless you separately enable automatic spending.';
+        approve.textContent = 'Allow these apps';
+      }
     }
   } else if (kind === "key_derive" && contribution.petal_key_scope) {
     petalScope = describePetalScope(contribution.petal_key_scope);
@@ -1526,6 +1543,11 @@ function renderReview(session) {
     decision.push(el("dl", {class: "facts ceremony-account"},
       el("dt", {}, "Signing account"),
       el("dd", {}, [walletName, accountLabel].filter(Boolean).join(" · "))));
+  }
+  if (petalApproval?.primaryFacts?.length) {
+    const reviewed = el('dl', {class:'facts ceremony-permission-summary'});
+    for (const [label, value] of petalApproval.primaryFacts) reviewed.append(el('dt', {}, label), el('dd', {}, value));
+    decision.push(reviewed);
   }
   if (transfer?.tokenAsset) {
     decision.push(assetCard(transfer.tokenAsset));
@@ -1854,6 +1876,7 @@ function renderReview(session) {
       transfer?.assurance ? el("p", {class: "ceremony-assurance"}, transfer.assurance) : null,
       ...evidence));
   startExpiry(session, expiry);
+  notifyOnboarding('ready');
 }
 
 function markDone(title) {
@@ -1945,7 +1968,7 @@ function createdWalletView(accounts, created = true) {
     next.onclick = () => location.assign(continueUrl);
     parts.splice(1, 0, el("section", {class:"wallet-setup"},
       el("h2", {}, "Make Bloom yours"),
-      el("p", {}, "Choose Custodian, Trader or Degen, then review your wallet permissions."),
+      el("p", {}, "Choose Institutional, Trader or Degen, then review your wallet permissions."),
       el("div", {class:"result-actions"}, next)));
   }
   const sortedAccounts = [...(accounts.accounts || [])].sort((a, b) =>
@@ -2023,6 +2046,7 @@ async function showCreatedWallet(session, recovery = null) {
 }
 
 function renderDone(session, result) {
+  if (onboardingFrame) { statusNode.textContent = 'Approved. Bloom is checking your setup…'; return; }
   const meta = KINDS[session.ceremony_kind] || {};
   const receipt = result?.receipt_digest || result?.approval_id || "";
   markDone(`${meta.title || "Ceremony"} — done`);
@@ -4264,6 +4288,7 @@ function chacha20Poly1305Open(key, nonce, aad, sealed) {
 }
 
 function reportLoadFailure(_error) {
+  notifyOnboarding('failed');
   clearInterval(expiryTimer);
   expiryTimer = null;
   stopCrossSurface();

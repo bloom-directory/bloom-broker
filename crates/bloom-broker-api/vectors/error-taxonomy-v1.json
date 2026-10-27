@@ -1,15 +1,5 @@
 [
   {
-    "code": "PRICE_UNAVAILABLE",
-    "durable_effect": "none",
-    "retry": "never"
-  },
-  {
-    "code": "PRICE_STALE",
-    "durable_effect": "none",
-    "retry": "never"
-  },
-  {
     "code": "ASSET_UNSUPPORTED",
     "durable_effect": "none",
     "retry": "never"

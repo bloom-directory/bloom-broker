@@ -16,5 +16,3 @@ mod token_artwork;
 mod translation;
 
 mod system_session;
-
-mod session_pricing;

@@ -2573,7 +2573,6 @@ fn solana_input(
     expected_signer_public_key: Option<[u8; 32]>,
 ) -> AuthorizationInput {
     let mut input = AuthorizationInput {
-        session_valuation: None,
         expected_signer_public_key,
         request: MachineSignRequest {
             session_use: None,
@@ -2660,7 +2659,6 @@ fn exact_input(
     payload: &[u8],
 ) -> AuthorizationInput {
     let mut input = AuthorizationInput {
-        session_valuation: None,
         expected_signer_public_key: None,
         request: MachineSignRequest {
             session_use: None,
@@ -2693,7 +2691,6 @@ fn exact_batch_input(
     payloads: &[&[u8]],
 ) -> AuthorizationInput {
     let mut input = AuthorizationInput {
-        session_valuation: None,
         expected_signer_public_key: None,
         request: MachineSignRequest {
             session_use: None,
@@ -2752,7 +2749,6 @@ fn petal_input(
     };
     let claim_nonce = nonce(operation_id.to_bytes()[31]);
     let mut input = AuthorizationInput {
-        session_valuation: None,
         expected_signer_public_key: None,
         request: MachineSignRequest {
             session_use: None,
@@ -3831,12 +3827,11 @@ fn key_stop_admission_rolls_back_and_replay_preserves_fresh_exact() {
 }
 
 #[test]
-fn generic_usd_authority_shares_priced_evm_svm_spending_with_certified_effects() {
+fn generic_token_authority_checks_evm_svm_effects_and_independent_assets() {
     use bloom_broker_api::{
-        EconomicEffectsV1, SessionBudget, SessionMemberAllocation, SessionNominalLimits,
-        SessionPayloadContext, SessionPermissionEffect, SessionPriceQuote, SessionUsdPolicy,
-        SessionValuation, approved_session_asset, session_member_scope_digest,
-        session_pricing_policy_digest,
+        EconomicEffectsV1, SessionBudget, SessionMemberAllocation, SessionPayloadContext,
+        SessionPermissionEffect, SessionTokenPolicy, approved_session_asset,
+        session_member_scope_digest,
     };
     let harness = Harness::new();
     let policy = CanonicalWalletPolicy {
@@ -3923,9 +3918,9 @@ fn generic_usd_authority_shares_priced_evm_svm_spending_with_certified_effects()
         .map(|t| (session_member_scope_digest(&t).unwrap(), t))
         .collect::<Vec<_>>();
     paired.sort_by_key(|(d, _)| d.as_str().to_owned());
-    let budget = SessionBudget {
-        usd_policy: Some(SessionUsdPolicy {
-            schema_version: 2,
+    let mut budget = SessionBudget {
+        token_policy: Some(SessionTokenPolicy {
+            schema_version: 3,
             budget_nonce: nonce(90),
             member_scope_digests: paired.iter().map(|(d, _)| d.clone()).collect(),
             member_templates: paired.iter().map(|(_, t)| t.clone()).collect(),
@@ -3942,7 +3937,6 @@ fn generic_usd_authority_shares_priced_evm_svm_spending_with_certified_effects()
                 approved_session_asset(&sol).unwrap(),
                 approved_session_asset(&svm_token).unwrap(),
             ],
-            pricing_policy_digest: session_pricing_policy_digest(),
         }),
         wallet_id: harness.wallet.clone(),
         policy_version: snapshot.version.clone(),
@@ -3956,16 +3950,26 @@ fn generic_usd_authority_shares_priced_evm_svm_spending_with_certified_effects()
             signature_rate_limits: vec![],
             value_limits: vec![],
         },
-        nominal_asset_scales: vec![],
-        nominal_limits: SessionNominalLimits {
-            per_action: DecimalU256::parse("2000000").unwrap(),
-            lifetime: DecimalU256::parse("1150000").unwrap(),
-            rolling_windows: vec![],
-        },
         per_action_value_limits: vec![],
         not_before_ms: DecimalU64::new(1000),
         expires_at_ms: DecimalU64::new(2000),
     };
+    for asset in budget.token_policy.as_ref().unwrap().assets.iter() {
+        budget
+            .per_action_value_limits
+            .push(bloom_broker_api::SessionValueCeiling {
+                asset: asset.asset.clone(),
+                maximum: DecimalU256::parse("10000000000000000000").unwrap(),
+            });
+        budget
+            .limits
+            .value_limits
+            .push(bloom_broker_api::ValueLimit {
+                asset: asset.asset.clone(),
+                lifetime: DecimalU256::parse("10000000000000000000").unwrap(),
+                rolling_windows: vec![],
+            });
+    }
     for terms in &mut templates {
         terms.session_budget = Some(budget.clone());
     }
@@ -4013,21 +4017,6 @@ fn generic_usd_authority_shares_priced_evm_svm_spending_with_certified_effects()
             }],
             permission_effect: SessionPermissionEffect::None,
         });
-        let quote = |asset: AssetId, price: &str| SessionPriceQuote {
-            asset,
-            price_usd: price.into(),
-            provider: token("coingecko"),
-            timestamp_ms: DecimalU64::new(1500),
-        };
-        input.session_valuation = Some(SessionValuation {
-            accepted_at_ms: DecimalU64::new(1500),
-            quotes: if svm {
-                vec![quote(svm_token.clone(), "1"), quote(sol.clone(), "100")]
-            } else {
-                vec![quote(pusd.clone(), "1"), quote(pol.clone(), "0.1")]
-            },
-            usd_microdollars: DecimalU256::parse(if svm { "100500" } else { "1001000" }).unwrap(),
-        });
         bind_operation_digest(&mut input, terms);
         input
     };
@@ -4057,22 +4046,15 @@ fn generic_usd_authority_shares_priced_evm_svm_spending_with_certified_effects()
     );
     let second = make_input(1, 92);
     harness.authority.authorize(&second).unwrap();
-    assert_eq!(
+    assert!(
         harness
             .journal
-            .session_valuation(&first.request.approval_id, &first.request.operation_id)
-            .unwrap(),
-        first.session_valuation
+            .session_budget_state(&first.request.approval_id, 1501)
+            .unwrap()
+            .is_some()
     );
-    assert_eq!(
-        harness
-            .journal
-            .session_valuation(&second.request.approval_id, &second.request.operation_id)
-            .unwrap(),
-        second.session_valuation
-    );
-    // Both unrelated Petals share gross costs: $1.001 + $0.1005 leaves $0.0485.
-    assert!(harness.authority.authorize(&make_input(1, 93)).is_err());
+    // Independent exact assets do not consume one another's allowance.
+    harness.authority.authorize(&make_input(1, 93)).unwrap();
     let mut uncertified = provenances[0].clone();
     uncertified.operation_classes[0].economic_effects_schema = None;
     sign_zeroed(
@@ -4087,16 +4069,15 @@ fn generic_usd_authority_shares_priced_evm_svm_spending_with_certified_effects()
 }
 
 #[test]
-fn native_evm_usd_authority_binds_structural_scope_bytes_and_operation_identity() {
+fn native_evm_token_authority_binds_structural_scope_bytes_and_operation_identity() {
     use alloy::{
         consensus::{SignableTransaction, TxLegacy},
         primitives::{Address, TxKind, U256},
     };
     use bloom_broker_api::{
-        SessionBudget, SessionMemberAllocation, SessionNominalLimits, SessionPriceQuote,
-        SessionUsdPolicy, SessionValuation, SessionValueCeiling, SystemSessionAction,
-        SystemSessionChain, SystemSessionScope, SystemSessionUse, approved_session_asset,
-        session_member_scope_digest, session_pricing_policy_digest,
+        SessionBudget, SessionMemberAllocation, SessionTokenPolicy, SessionValueCeiling,
+        SystemSessionAction, SystemSessionChain, SystemSessionScope, SystemSessionUse,
+        approved_session_asset, session_member_scope_digest,
     };
     let harness = Harness::new();
     let recipient = Address::repeat_byte(0x11);
@@ -4179,8 +4160,8 @@ fn native_evm_usd_authority_binds_structural_scope_bytes_and_operation_identity(
     let scope = session_member_scope_digest(&terms).unwrap();
     let template = terms.clone();
     terms.session_budget = Some(SessionBudget {
-        usd_policy: Some(SessionUsdPolicy {
-            schema_version: 2,
+        token_policy: Some(SessionTokenPolicy {
+            schema_version: 3,
             budget_nonce: nonce(95),
             member_scope_digests: vec![scope.clone()],
             member_templates: vec![template],
@@ -4189,7 +4170,6 @@ fn native_evm_usd_authority_binds_structural_scope_bytes_and_operation_identity(
                 limits: terms.limits.clone(),
             }],
             assets: vec![approved_session_asset(&native).unwrap()],
-            pricing_policy_digest: session_pricing_policy_digest(),
         }),
         wallet_id: terms.wallet_id.clone(),
         policy_version: terms.policy_version.clone(),
@@ -4197,16 +4177,23 @@ fn native_evm_usd_authority_binds_structural_scope_bytes_and_operation_identity(
         wallet_revocation_epoch: terms.wallet_revocation_epoch.clone(),
         member_keys: vec![terms.key_ref.clone()],
         limits: terms.limits.clone(),
-        nominal_asset_scales: vec![],
-        nominal_limits: SessionNominalLimits {
-            per_action: DecimalU256::parse("3000000000").unwrap(),
-            lifetime: DecimalU256::parse("5000000000").unwrap(),
-            rolling_windows: vec![],
-        },
         per_action_value_limits: vec![],
         not_before_ms: terms.not_before_ms.clone(),
         expires_at_ms: terms.expires_at_ms.clone(),
     });
+    let budget = terms.session_budget.as_mut().unwrap();
+    budget.per_action_value_limits.push(SessionValueCeiling {
+        asset: native.clone(),
+        maximum: DecimalU256::parse("2000000000000000000").unwrap(),
+    });
+    budget
+        .limits
+        .value_limits
+        .push(bloom_broker_api::ValueLimit {
+            asset: native.clone(),
+            lifetime: DecimalU256::parse("2000000000000000000").unwrap(),
+            rolling_windows: vec![],
+        });
     let south_bytes = terms.signer_canonical_bytes().unwrap();
     let south: bloom_signer_api::SealedApprovalTerms =
         serde_json::from_slice(&south_bytes).unwrap();
@@ -4229,16 +4216,6 @@ fn native_evm_usd_authority_binds_structural_scope_bytes_and_operation_identity(
         recipient: format!("{recipient:#x}"),
         amount: DecimalU256::parse("1000000000000000000").unwrap(),
         maximum_fee: DecimalU256::parse("42000").unwrap(),
-    });
-    input.session_valuation = Some(SessionValuation {
-        accepted_at_ms: DecimalU64::new(1500),
-        quotes: vec![SessionPriceQuote {
-            asset: native.clone(),
-            price_usd: "2000".into(),
-            provider: token("coingecko"),
-            timestamp_ms: DecimalU64::new(1500),
-        }],
-        usd_microdollars: DecimalU256::parse("2000000001").unwrap(),
     });
     bind_operation_digest(&mut input, &terms);
     assert_eq!(

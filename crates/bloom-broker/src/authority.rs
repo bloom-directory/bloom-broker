@@ -209,7 +209,6 @@ pub struct CeremonyApprovalGrant {
 
 #[derive(Clone, Debug)]
 pub struct AuthorizationInput {
-    pub session_valuation: Option<bloom_broker_api::SessionValuation>,
     pub request: MachineSignRequest,
     /// Canonical public key of the account named by the approval terms,
     /// resolved from the Signer projection before authorization. Native
@@ -1592,6 +1591,44 @@ impl BrokerAuthority {
                 && existing.approved_claim_digest.as_deref()
                     == approved_claim_digest.map(Digest32::as_str)
             {
+                if terms.expires_at_ms.get() == u64::MAX
+                    && matches!(
+                        terms.activation_mode,
+                        bloom_broker_api::ActivationMode::DurableLocal { .. }
+                    )
+                    && self.journal.approval_state(&approval_id)?
+                        == Some(ApprovalLifecycleState::Active)
+                {
+                    self.journal
+                        .prepare_standing_rearm(&approval_id, review_manifest_digest)?;
+                }
+                return Ok(approval_id);
+            }
+            if existing_terms == *terms
+                && terms.expires_at_ms.get() == u64::MAX
+                && matches!(
+                    terms.activation_mode,
+                    bloom_broker_api::ActivationMode::DurableLocal { .. }
+                )
+                && self.journal.approval_state(&approval_id)?
+                    == Some(ApprovalLifecycleState::Active)
+                && existing.approved_claim_digest.as_deref()
+                    == approved_claim_digest.map(Digest32::as_str)
+                && snapshot.version == terms.policy_version
+                && snapshot.policy_digest == terms.policy_digest
+                && policy.maximum_approval_lifetime_ms
+                    == bloom_broker_api::STANDING_APPROVAL_POLICY_LIFETIME_MS
+                && !self.is_tombstoned(&approval_id)?
+            {
+                let (epoch, reconciled) = self.epoch_state(&terms.wallet_id)?;
+                if !reconciled || epoch != terms.wallet_revocation_epoch.get() {
+                    return Err(denied(
+                        "REVOCATION_EPOCH_UNRECONCILED",
+                        "standing permission epoch changed",
+                    ));
+                }
+                self.journal
+                    .prepare_standing_rearm(&approval_id, review_manifest_digest)?;
                 return Ok(approval_id);
             }
             return Err(denied(
@@ -1612,17 +1649,23 @@ impl BrokerAuthority {
                 "approval is not bound to Broker's verified current policy",
             ));
         }
-        if terms
-            .expires_at_ms
-            .get()
-            .saturating_sub(terms.not_before_ms.get())
-            > policy.maximum_approval_lifetime_ms
+        let standing = terms.expires_at_ms.get() == u64::MAX;
+        if (standing
+            && policy.maximum_approval_lifetime_ms
+                != bloom_broker_api::STANDING_APPROVAL_POLICY_LIFETIME_MS)
+            || (!standing
+                && terms
+                    .expires_at_ms
+                    .get()
+                    .saturating_sub(terms.not_before_ms.get())
+                    > policy.maximum_approval_lifetime_ms)
         {
             return Err(denied(
                 "POLICY_LIFETIME_EXCEEDED",
-                "approval exceeds wallet policy lifetime",
+                "approval exceeds wallet policy lifetime or lacks standing-permission opt-in",
             ));
         }
+
         let (local_epoch, reconciled) = self.epoch_state(&terms.wallet_id)?;
         if !reconciled || terms.wallet_revocation_epoch.get() != local_epoch {
             return Err(denied(
@@ -1659,7 +1702,7 @@ impl BrokerAuthority {
                 if terms
                     .session_budget
                     .as_ref()
-                    .is_some_and(|b| b.usd_policy.is_some())
+                    .is_some_and(|b| b.token_policy.is_some())
                     && allowed_operation_classes.iter().any(|class| {
                         !record.operation_classes.iter().any(|entry| {
                             entry.operation_class == *class
@@ -1669,7 +1712,7 @@ impl BrokerAuthority {
                 {
                     return Err(denied(
                         "EFFECTS_UNSUPPORTED",
-                        "Installer provenance must certify effects v1 for every USD session class",
+                        "Installer provenance must certify effects v1 for every token session class",
                     ));
                 }
                 let declared: BTreeSet<_> = record
@@ -1700,7 +1743,7 @@ impl BrokerAuthority {
                     if terms
                         .session_budget
                         .as_ref()
-                        .is_some_and(|b| b.usd_policy.is_some())
+                        .is_some_and(|b| b.token_policy.is_some())
                         && grant.allowed_operation_classes.iter().any(|class| {
                             !granted.operation_classes.iter().any(|entry| {
                                 entry.operation_class == *class
@@ -1710,7 +1753,7 @@ impl BrokerAuthority {
                     {
                         return Err(denied(
                             "EFFECTS_UNSUPPORTED",
-                            "Route provenance must certify effects v1 for every USD session class",
+                            "Route provenance must certify effects v1 for every token session class",
                         ));
                     }
                     let granted_classes: BTreeSet<_> = granted
@@ -2626,10 +2669,10 @@ impl BrokerAuthority {
         if let Some(budget) = terms
             .session_budget
             .as_ref()
-            .filter(|b| b.usd_policy.is_some())
+            .filter(|b| b.token_policy.is_some())
         {
             budget
-                .usd_policy
+                .token_policy
                 .as_ref()
                 .unwrap()
                 .validate_member(&terms)
@@ -2659,7 +2702,7 @@ impl BrokerAuthority {
                         "Continuing permissions and missing effects need separate approval",
                     ));
                 }
-                let assets = &budget.usd_policy.as_ref().unwrap().assets;
+                let assets = &budget.token_policy.as_ref().unwrap().assets;
                 for (index, context) in effects.payload_contexts.iter().enumerate() {
                     if context.payload_index as usize != index
                         || context.spending_accounts != [terms.key_ref.clone()]
@@ -2813,7 +2856,7 @@ impl BrokerAuthority {
                         terms
                             .session_budget
                             .iter()
-                            .filter_map(|b| b.usd_policy.as_ref())
+                            .filter_map(|b| b.token_policy.as_ref())
                             .flat_map(|p| p.assets.iter())
                             .map(|a| asset_id(a.asset.chain.as_str(), &a.asset.asset)),
                     )
@@ -3083,7 +3126,6 @@ impl BrokerAuthority {
         }
         let reservation = self.journal.reserve_for_clock_profile(
             &ReservationRequest {
-                session_valuation: input.session_valuation.clone(),
                 approval_id: input.request.approval_id.clone(),
                 operation_id: input.request.operation_id.clone(),
                 operation_digest,
@@ -4394,7 +4436,7 @@ fn account_declared_values(
             terms
                 .session_budget
                 .iter()
-                .filter_map(|b| b.usd_policy.as_ref())
+                .filter_map(|b| b.token_policy.as_ref())
                 .flat_map(|p| p.assets.iter())
                 .map(|a| asset_id(a.asset.chain.as_str(), &a.asset.asset)),
         )
@@ -4492,7 +4534,7 @@ fn budget_limits(terms: &SealedApprovalTerms) -> BudgetLimits {
                     limit.lifetime.clone(),
                 )
             })
-            .chain(terms.session_budget.iter().filter_map(|b|b.usd_policy.as_ref()).flat_map(|p|p.assets.iter()).filter(|asset|!terms.limits.value_limits.iter().any(|v|v.asset==asset.asset)).map(|asset|(asset_id(asset.asset.chain.as_str(),&asset.asset.asset),bloom_broker_api::DecimalU256::parse("115792089237316195423570985008687907853269984665640564039457584007913129639935").expect("U256 max"))))
+            .chain(terms.session_budget.iter().filter_map(|b|b.token_policy.as_ref()).flat_map(|p|p.assets.iter()).filter(|asset|!terms.limits.value_limits.iter().any(|v|v.asset==asset.asset)).map(|asset|(asset_id(asset.asset.chain.as_str(),&asset.asset.asset),bloom_broker_api::DecimalU256::parse("115792089237316195423570985008687907853269984665640564039457584007913129639935").expect("U256 max"))))
             .collect(),
         rolling_value_limits: terms
             .limits

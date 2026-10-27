@@ -174,7 +174,7 @@ pub(crate) fn validate_selector(
     if terms
         .session_budget
         .as_ref()
-        .is_some_and(|b| b.usd_policy.is_none())
+        .is_some_and(|b| b.token_policy.is_none())
     {
         let ApprovalSelector::Petal {
             allowed_operation_classes,

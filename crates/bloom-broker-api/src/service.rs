@@ -363,8 +363,6 @@ pub struct CeremonyPublicStatus {
 #[allow(clippy::large_enum_variant)]
 #[serde(tag = "method", content = "body", deny_unknown_fields)]
 pub enum MachineBrokerRequest {
-    #[serde(rename = "session.prices")]
-    SessionPrices(crate::SessionPricesRequest),
     #[serde(rename = "session.stop")]
     SessionStop(crate::SessionStopRequest),
     #[serde(rename = "system.hello")]
@@ -462,8 +460,6 @@ pub enum MachineBrokerRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "method", content = "body", deny_unknown_fields)]
 pub enum MachineBrokerResponse {
-    #[serde(rename = "session.prices")]
-    SessionPrices(crate::SessionPricesResponse),
     #[serde(rename = "session.stop")]
     SessionStop(crate::SessionStopResponse),
     #[serde(rename = "system.hello")]
@@ -581,7 +577,6 @@ pub fn is_read_only_method(method: &Token) -> bool {
         || method == "wallet.accounts"
         || method == "credential.list_public"
         || method == "custody.result"
-        || method == "session.prices"
 }
 
 impl crate::TypedRequestMethod for MachineBrokerRequest {

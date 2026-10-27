@@ -1,4 +1,4 @@
-//! Real journal reservations exercise the shared USD pool and its authenticated
+//! Real journal reservations exercise the shared token scope and its authenticated
 //! evidence. Network/signing verification has separate deterministic fixtures.
 use super::*;
 use bloom_broker_api::*;
@@ -113,11 +113,23 @@ fn template(svm: bool) -> SealedApprovalTerms {
     }
 }
 fn members() -> Vec<SealedApprovalTerms> {
+    build_members(false)
+}
+fn build_members(standing: bool) -> Vec<SealedApprovalTerms> {
     let mut templates = vec![template(false), template(true)];
+    if standing {
+        for terms in &mut templates {
+            terms.expires_at_ms = DecimalU64::new(u64::MAX);
+            terms.activation_mode = ActivationMode::DurableLocal {
+                provider_tier: token("local-passkey"),
+                maximum_rearm_until_ms: DecimalU64::new(u64::MAX),
+            };
+        }
+    }
     templates.sort_by_key(|t| session_member_scope_digest(t).unwrap().as_str().to_owned());
     let budget = SessionBudget {
-        usd_policy: Some(SessionUsdPolicy {
-            schema_version: 2,
+        token_policy: Some(SessionTokenPolicy {
+            schema_version: 3,
             budget_nonce: RequestNonce::from_bytes([9; 16]),
             member_scope_digests: templates
                 .iter()
@@ -135,7 +147,6 @@ fn members() -> Vec<SealedApprovalTerms> {
                 approved_session_asset(&asset(false)).unwrap(),
                 approved_session_asset(&asset(true)).unwrap(),
             ],
-            pricing_policy_digest: session_pricing_policy_digest(),
         }),
         wallet_id: token("wallet"),
         policy_version: DecimalU64::new(1),
@@ -147,17 +158,37 @@ fn members() -> Vec<SealedApprovalTerms> {
             max_signatures: DecimalU64::new(10),
             operation_rate_limits: vec![],
             signature_rate_limits: vec![],
-            value_limits: vec![],
+            value_limits: vec![
+                ValueLimit {
+                    asset: asset(false),
+                    lifetime: n("100000000"),
+                    rolling_windows: vec![ValueWindow {
+                        maximum: n("10000000"),
+                        duration_ms: DecimalU64::new(86400000),
+                    }],
+                },
+                ValueLimit {
+                    asset: asset(true),
+                    lifetime: n("1000000000"),
+                    rolling_windows: vec![ValueWindow {
+                        maximum: n("100000000"),
+                        duration_ms: DecimalU64::new(86400000),
+                    }],
+                },
+            ],
         },
-        nominal_asset_scales: vec![],
-        nominal_limits: SessionNominalLimits {
-            per_action: n("10000000"),
-            lifetime: n("10000000"),
-            rolling_windows: vec![],
-        },
-        per_action_value_limits: vec![],
+        per_action_value_limits: vec![
+            SessionValueCeiling {
+                asset: asset(false),
+                maximum: n("10000000"),
+            },
+            SessionValueCeiling {
+                asset: asset(true),
+                maximum: n("100000000"),
+            },
+        ],
         not_before_ms: DecimalU64::new(1),
-        expires_at_ms: DecimalU64::new(10_000_000),
+        expires_at_ms: DecimalU64::new(if standing { u64::MAX } else { 10_000_000 }),
     };
     templates
         .iter_mut()
@@ -197,16 +228,6 @@ fn request(terms: &SealedApprovalTerms, id: u8, op: u8) -> ReservationRequest {
         monotonic_anchor_ns: 1000,
         clock_boot_epoch: BootEpoch::from_bytes([1; 16]),
         values: BTreeMap::from([(format!("{}:{}", a.chain.as_str(), a.asset), n(amount))]),
-        session_valuation: Some(SessionValuation {
-            accepted_at_ms: DecimalU64::new(1_000_000),
-            quotes: vec![SessionPriceQuote {
-                asset: a,
-                price_usd: if svm { "100" } else { "1" }.into(),
-                provider: token("coingecko"),
-                timestamp_ms: DecimalU64::new(1_000_000),
-            }],
-            usd_microdollars: n("6000000"),
-        }),
     }
 }
 fn limits() -> BudgetLimits {
@@ -229,7 +250,7 @@ fn limits() -> BudgetLimits {
 }
 
 #[test]
-fn usd_pool_requires_all_members_and_concurrent_evm_svm_reservations_share_capacity() {
+fn token_scope_requires_all_members_and_concurrent_assets_are_independent() {
     let journal = Arc::new(BrokerJournal::open_in_memory(audit()).unwrap());
     let m = members();
     prepare(&journal, &m[0], 1, true);
@@ -265,13 +286,13 @@ fn usd_pool_requires_all_members_and_concurrent_evm_svm_reservations_share_capac
             .map(|h| h.join().unwrap())
             .filter(Result::is_ok)
             .count(),
-        1
+        2
     );
     journal.verify_audit_chain().unwrap();
 }
 
 #[test]
-fn usd_reservation_survives_restart_and_stop_fences_all_members_and_retries() {
+fn token_reservation_survives_restart_and_stop_fences_all_members_and_retries() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("journal.sqlite");
     let m = members();
@@ -285,7 +306,7 @@ fn usd_reservation_survives_restart_and_stop_fences_all_members_and_retries() {
     }
     let j = BrokerJournal::open(&path, audit()).unwrap();
     j.verify_audit_chain().unwrap();
-    // Stable retries return the original reservation, without repricing.
+    // Stable retries return the original reservation, without charging again.
     j.reserve_for_clock_profile(&r, &limits(), false).unwrap();
     let id = m[0].session_budget.as_ref().unwrap().budget_id().unwrap();
     let stopped = j
@@ -311,12 +332,12 @@ fn usd_reservation_survives_restart_and_stop_fences_all_members_and_retries() {
 }
 
 #[test]
-fn authenticated_valuation_evidence_detects_changed_price_quantity_time_and_budget() {
+fn authenticated_token_evidence_detects_quantity_time_identity_and_budget_changes() {
     for field in [
-        "price",
+        "signatures",
         "quantity",
         "record_time",
-        "quote_time",
+        "asset",
         "budget",
         "delete",
     ] {
@@ -344,12 +365,10 @@ fn authenticated_valuation_evidence_detects_changed_price_quantity_time_and_budg
                     .unwrap();
                 let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
                 match field {
-                    "price" => {
-                        value["valuation"]["quotes"][0]["price_usd"] = serde_json::json!("0.5")
-                    }
+                    "signatures" => value["signature_count"] = serde_json::json!(9),
                     "quantity" => value["values"][0]["amount"] = serde_json::json!("1"),
                     "record_time" => value["accepted_at_ms"] = serde_json::json!(1),
-                    _ => value["valuation"]["quotes"][0]["timestamp_ms"] = serde_json::json!("1"),
+                    _ => value["values"][0]["asset"]["asset"] = serde_json::json!("other"),
                 }
                 connection
                     .execute(
@@ -381,14 +400,7 @@ fn matching_record_and_audit_payload_forgery_cannot_reuse_cached_signed_tail() {
             .query_row("SELECT record_jcs FROM session_uses", [], |row| row.get(0))
             .unwrap();
         let mut record: SessionRecordedUse = serde_json::from_str(&record).unwrap();
-        record.valuation.as_mut().unwrap().quotes[0].price_usd =
-            if m[0].key_ref.key_spec == KeySpec::Ed25519 {
-                "50"
-            } else {
-                "0.5"
-            }
-            .into();
-        record.valuation.as_mut().unwrap().usd_microdollars = n("3000000");
+        record.values[0].amount = n("1");
         let text = serde_jcs::to_string(&record).unwrap();
         connection
             .execute("UPDATE session_uses SET record_jcs=?1", [&text])
@@ -401,9 +413,8 @@ fn matching_record_and_audit_payload_forgery_cannot_reuse_cached_signed_tail() {
             )
             .unwrap();
         let mut payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        payload["valuation_record_digest"] =
+        payload["session_record_digest"] =
             serde_json::to_value(session_use_record_digest(&record).unwrap()).unwrap();
-        payload["session_valuation"] = serde_json::to_value(&record.valuation).unwrap();
         connection
             .execute(
                 "UPDATE audit_chain SET payload_jcs=?1 WHERE event_type='reservation.created'",
@@ -423,10 +434,7 @@ fn matching_record_and_audit_payload_forgery_cannot_reuse_cached_signed_tail() {
             .is_err()
         );
     }
-    assert!(
-        j.session_valuation(&r.approval_id, &r.operation_id)
-            .is_err()
-    );
+    assert!(j.session_budget_state(&r.approval_id, 1_000_001).is_err());
     assert!(
         j.reserve_for_clock_profile(&request(&m[1], 2, 11), &limits(), false)
             .is_err()
@@ -435,7 +443,7 @@ fn matching_record_and_audit_payload_forgery_cannot_reuse_cached_signed_tail() {
 }
 
 #[test]
-fn unsigned_terminal_state_changes_cannot_release_usd_capacity() {
+fn unsigned_terminal_state_changes_cannot_release_token_capacity() {
     for initial in [
         ReservationState::Reserved,
         ReservationState::Committed,
@@ -463,8 +471,7 @@ fn unsigned_terminal_state_changes_cannot_release_usd_capacity() {
                 .execute("UPDATE reservations SET state='RELEASED'", [])
                 .unwrap();
             assert!(
-                j.session_valuation(&r.approval_id, &r.operation_id)
-                    .is_err(),
+                j.session_budget_state(&r.approval_id, 1_000_001).is_err(),
                 "{initial:?}"
             );
             assert!(
@@ -489,7 +496,7 @@ fn unsigned_terminal_state_changes_cannot_release_usd_capacity() {
 }
 
 #[test]
-fn authenticated_release_frees_usd_capacity_and_survives_restart() {
+fn authenticated_release_frees_token_capacity_and_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("released.sqlite");
     let m = members();
@@ -503,9 +510,11 @@ fn authenticated_release_frees_usd_capacity_and_survives_restart() {
             .unwrap();
         j.verify_audit_chain().unwrap();
         assert!(
-            j.session_valuation(&r.approval_id, &r.operation_id)
+            j.session_budget_state(&r.approval_id, 1_000_001)
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .asset_usage
+                .is_empty()
         );
     }
     let reopened = BrokerJournal::open(&path, audit()).unwrap();
@@ -520,7 +529,7 @@ fn authenticated_release_frees_usd_capacity_and_survives_restart() {
 /// than calling finalize_reservation directly: the next admission must accept
 /// their authenticated COMMITTED state, including after restart.
 #[test]
-fn usd_publication_preserves_audit_recovery_and_shared_capacity() {
+fn token_publication_preserves_audit_recovery_and_shared_capacity() {
     for (batch, signature_count) in [(false, 1usize), (true, 1), (true, 2)] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("published.sqlite");
@@ -632,11 +641,6 @@ fn usd_publication_preserves_audit_recovery_and_shared_capacity() {
                     .count(),
                 1
             );
-            assert_eq!(
-                j.session_valuation(&reservation.approval_id, &result.operation_id)
-                    .unwrap(),
-                reservation.session_valuation
-            );
             assert!(
                 j.session_budget_state(&reservation.approval_id, 1_000_001)
                     .is_ok()
@@ -652,12 +656,11 @@ fn usd_publication_preserves_audit_recovery_and_shared_capacity() {
         let mut next = request(&m[1], 2, 80);
         next.values.values_mut().for_each(|amount| {
             *amount = n(if m[1].key_ref.key_spec == KeySpec::Ed25519 {
-                "30000000"
+                "60000000"
             } else {
-                "3000000"
+                "6000000"
             });
         });
-        next.session_valuation.as_mut().unwrap().usd_microdollars = n("3000000");
         j.reserve_for_clock_profile(&next, &limits(), false)
             .unwrap();
         assert!(
@@ -666,4 +669,101 @@ fn usd_publication_preserves_audit_recovery_and_shared_capacity() {
         );
         j.verify_audit_chain().unwrap();
     }
+}
+
+#[test]
+fn same_token_allowances_are_independent_per_petal_and_account_but_routes_share_usage() {
+    let j = BrokerJournal::open_in_memory(audit()).unwrap();
+    let mut grants = Vec::new();
+    for id in 1..=3 {
+        let mut terms = template(false);
+        if id == 2 {
+            // another Petal on the same account
+            terms.subject = ApprovalSubject::Petal {
+                package_hash: digest(22),
+                route: "trade".into(),
+                agent_id: None,
+            };
+            if let ApprovalSelector::Petal { package_hash, .. } = &mut terms.selector {
+                *package_hash = digest(22);
+            }
+        }
+        if id == 3 {
+            // the original Petal on another exact account
+            terms.key_ref.locator = "another-account".into();
+            terms.key_ref.public_key_fingerprint = digest(33);
+        }
+        let scope = session_member_scope_digest(&terms).unwrap();
+        let mut budget = members()[0].session_budget.clone().unwrap();
+        budget.member_keys = vec![terms.key_ref.clone()];
+        budget.limits = terms.limits.clone();
+        budget.limits.value_limits = vec![ValueLimit {
+            asset: asset(false),
+            lifetime: n("100000000"),
+            rolling_windows: vec![ValueWindow {
+                duration_ms: DecimalU64::new(86400000),
+                maximum: n("10000000"),
+            }],
+        }];
+        budget.per_action_value_limits = vec![SessionValueCeiling {
+            asset: asset(false),
+            maximum: n("10000000"),
+        }];
+        budget.token_policy = Some(SessionTokenPolicy {
+            schema_version: 3,
+            budget_nonce: RequestNonce::from_bytes([id; 16]),
+            member_scope_digests: vec![scope.clone()],
+            member_templates: vec![terms.clone()],
+            member_backstop_allocations: vec![SessionMemberAllocation {
+                scope_digest: scope,
+                limits: terms.limits.clone(),
+            }],
+            assets: vec![approved_session_asset(&asset(false)).unwrap()],
+        });
+        terms.session_budget = Some(budget);
+        prepare(&j, &terms, id, true);
+        j.reserve_for_clock_profile(&request(&terms, id, id + 20), &limits(), false)
+            .unwrap();
+        grants.push(terms);
+    }
+    for (index, terms) in grants.iter().enumerate() {
+        let id = index as u8 + 1;
+        assert!(
+            j.reserve_for_clock_profile(&request(terms, id, id + 40), &limits(), false)
+                .is_err()
+        );
+        // Route selection never creates another ledger: every use binds the
+        // same owner-reviewed budget identity and counts toward its window.
+        let usage = j
+            .session_budget_state(&digest(id), 1_000_001)
+            .unwrap()
+            .unwrap();
+        assert_eq!(usage.asset_usage[0].amount, n("6000000"));
+    }
+    j.verify_audit_chain().unwrap();
+}
+
+#[test]
+fn rearming_standing_authority_preserves_usage_and_cannot_bypass_a_stopped_budget() {
+    let j = BrokerJournal::open_in_memory(audit()).unwrap();
+    let m = build_members(true);
+    prepare(&j, &m[0], 1, true);
+    prepare(&j, &m[1], 2, true);
+    j.reserve_for_clock_profile(&request(&m[0], 1, 10), &limits(), false)
+        .unwrap();
+    let before = j.session_budget_state(&digest(1), 1_000_001).unwrap();
+    let counters = j.approval_limit_state(&digest(1)).unwrap();
+    j.prepare_standing_rearm(&digest(1), &digest(99)).unwrap();
+    j.activate_approval_record(&digest(1), &operation(99), "{}")
+        .unwrap();
+    assert_eq!(
+        before,
+        j.session_budget_state(&digest(1), 1_000_001).unwrap()
+    );
+    assert_eq!(counters, j.approval_limit_state(&digest(1)).unwrap());
+    j.verify_audit_chain().unwrap();
+    let id = m[0].session_budget.as_ref().unwrap().budget_id().unwrap();
+    j.stop_session_pool(&id, &operation(98), "owner stop", 1_000_002)
+        .unwrap();
+    assert!(j.prepare_standing_rearm(&digest(1), &digest(97)).is_err());
 }
