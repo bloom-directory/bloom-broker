@@ -1966,7 +1966,10 @@ async fn activate_signing_approval(
         stack.broker.as_ref(),
         MachineBrokerRequest::SealedApprovalPrepare(bloom_broker_api::ApprovalPrepareRequest {
             evm_reported_token: None,
-            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            // The restored Signer's passkey is re-registered only in its
+            // ceremony service, not its durable credential projection, so
+            // Default would find no passkey to approve with.
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Local,
             operation_id: approval_operation.clone(),
             terms: terms.clone(),
             canonical_plan_facts_digest: terms.approval_digest().unwrap(),
