@@ -1535,13 +1535,21 @@ impl BrokerRpcService {
         // the only layer that can: authority is synchronous and journal-
         // backed, while the account projection comes from the Signer.
         let expected_signer_public_key = self.resolve_terms_signer_public_key(&terms).await?;
-        let polymarket_session = terms.session_budget.is_some()
-            && matches!(terms.subject, ApprovalSubject::Petal { .. })
-            && self
-                .authority
-                .subject_declares_operation_class(&terms.subject, "polymarket.order.poly1271")
-                .map_err(authority_error)?;
-        if clob_auth || hyperliquid_agent || pump_review || polymarket_session {
+        let mut reusable_profile = None;
+        if terms.session_budget.is_some() && matches!(terms.subject, ApprovalSubject::Petal { .. })
+        {
+            for profile in bloom_broker_api::reusable_signing_profiles() {
+                if self
+                    .authority
+                    .subject_declares_operation_class(&terms.subject, profile.operation_class)
+                    .map_err(authority_error)?
+                {
+                    reusable_profile = Some(profile);
+                    break;
+                }
+            }
+        }
+        if clob_auth || hyperliquid_agent || pump_review || reusable_profile.is_some() {
             let response = self
                 .signer
                 .request_for_machine(BrokerSignerRequest::KeyGetPublic(
@@ -1584,8 +1592,12 @@ impl BrokerRpcService {
                 )?;
             } else {
                 let owner = evm_address_from_public_key(&key.canonical_public_key.decode())?;
-                if polymarket_session {
-                    crate::message_review::verify_polymarket_session_use(&request, owner)?;
+                if let Some(profile) = reusable_profile {
+                    match profile.verifier {
+                        bloom_broker_api::ReusableEffectsVerifier::PolymarketBuyV1 => {
+                            crate::message_review::verify_polymarket_session_use(&request, owner)?;
+                        }
+                    }
                 }
                 if hyperliquid_agent {
                     crate::message_review::verify_hyperliquid_agent_use(&request, owner)?;

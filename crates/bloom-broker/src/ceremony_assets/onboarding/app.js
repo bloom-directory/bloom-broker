@@ -2,6 +2,7 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   let bridge = null, activeReview = null, reviewTimer = null, reviewLoadTimer = null;
+  let spendingReview = null;
   const bridgeFragment = location.hash;
   const form = $('setup-form');
   const titles = ['How would you like to use Bloom?', 'Choose your apps', 'Finish setting up Bloom', 'Finish setting up Bloom', 'Setup complete'];
@@ -34,11 +35,11 @@
     $('summary-approvals').textContent = persona === 'custodian' ?
       'One approval allows your selected apps. You will still approve every action.' :
       persona === 'degen' ? 'Approve your selected apps and token allowances once, including ERC20 transfers to any recipient. Transfers within those limits need no further approval.' :
-      'First allow your apps, then enable automatic Polymarket buys. Other actions still ask for approval.';
+      'First allow your apps, then review supported automatic actions and token allowances. Other actions still ask for approval.';
     if (step === 4) $('summary-approvals').textContent = persona === 'custodian' ?
       'Automatic spending is off. Each wallet action still needs your approval.' :
       persona === 'degen' ? 'Your reviewed token permissions are active, including ERC20 transfers to any recipient within the transfer and gas limits.' :
-      'Automatic Polymarket buy permissions are active. Other actions still ask for your approval.';
+      'Your reviewed automatic spending permissions are active. Other actions still ask for your approval.';
     $('setup-summary').hidden = step < 2;
   }
   function showApprovalStage(action, checking = false) {
@@ -47,11 +48,12 @@
     $('review-host').hidden = false;
     $('review-loading').hidden = false; $('approval-retry').hidden = true;
     $('approval-title').hidden = false; $('approval-purpose').hidden = false;
-    $('approval-progress').textContent = action === 'policy' ? `Approval 1 of ${selected() === 'custodian' ? 1 : 2}` : 'Approval 2 of 2';
-    $('approval-title').textContent = action === 'policy' ? 'App access' : 'Automatic spending';
+    $('approval-progress').textContent = action === 'policy' ? 'Wallet policy approval' : spendingReview ? `Spending permission ${spendingReview.index} of ${spendingReview.total}` : 'Spending permissions';
+    $('approval-title').textContent = action === 'policy' ? 'Wallet policy' : spendingReview?.title ?? 'Automatic spending';
     $('approval-purpose').textContent = action === 'policy' ?
-      'This signature allows your selected apps to request wallet actions. It does not move funds or enable automatic spending.' :
-      'This separate signature enables automatic buys. Check which integration can act, how much it can spend, and when permission ends.';
+      'This signature sets wallet policy for your selected apps and transfer destinations. It does not move funds or enable automatic spending.' :
+      spendingReview?.transfers ? 'This signature enables automatic wallet transfers within the reviewed transfer and gas limits. Other spending permissions require separate review.' :
+      'This separate signature enables the automatic actions shown below. Check which integration can act, how much it can spend, and when permission ends.';
     $('review-loading').textContent = checking ? 'Approval received. Checking it with Bloom…' : 'Preparing the exact permissions for your passkey approval…';
     $('setup-navigation').hidden = true;
     notice(checking ? 'Checking your approval…' : 'Preparing your approval…');
@@ -91,7 +93,7 @@
     $('ceremony-page').hidden = false;
   }
   function resetWalletReview() {
-    closeReview(); policyApplied = false; sessionReady = false;
+    closeReview(); policyApplied = false; sessionReady = false; spendingReview = null;
   }
   function walletChoices(data) {
     $('wallet-choices').replaceChildren();
@@ -133,6 +135,18 @@
     const session = await response.json();
     if (!/^[0-9a-f]{64}$/.test(session.ceremony_id) || !Number.isFinite(Number(session.expires_at_ms)) || Number(session.expires_at_ms) <= Date.now()) throw new Error('This approval is unavailable or expired.');
     closeReview(true);
+    if (action === 'activate') {
+      const scopes = Array.isArray(result.data) ? result.data : [];
+      const index = scopes.findIndex(scope => {
+        try { return new URL(scope.authority?.ceremony_url).pathname === url.pathname; }
+        catch (_) { return false; }
+      });
+      const scope = scopes[index], transfers = scope?.terms?.subject?.kind === 'system';
+      const classes = scope?.terms?.selector?.allowed_operation_classes ?? [];
+      const profile = state?.reusable_profiles?.find(p => classes.includes(p.operation_class));
+      spendingReview = index < 0 ? null : {index:index + 1,total:scopes.length,transfers,
+        title:transfers ? 'Wallet transfers' : profile?.display_name ?? 'App spending'};
+    }
     showApprovalStage(action);
     activeReview = {action, wallet, preset, id:session.ceremony_id};
     url.search = 'onboarding=1';

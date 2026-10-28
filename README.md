@@ -416,3 +416,26 @@ Land the reviewed Broker, repin Machine to its landed commit, and publish/adopt
 the combined Polymarket review/accounting package with immutable archive hashes
 and installer provenance before enabling the default flow. Local source tests
 do not establish installed-release compatibility.
+
+## Reusable operation profiles
+
+`bloom_broker_api::reusable_signing_profiles()` is the shared eligibility catalog
+for automatic onboarding. Each entry names a protocol operation class, effects
+schema, crypto suite, exact budget assets and a compiled Broker verifier.
+Machine matches it against the **installed package hash** and installer-signed
+route provenance, then proposes owner-reviewed terms. Neither a package name
+nor `economic_effects_schema = 1` alone makes a route eligible. The catalog does
+not grant authority and does not replace wallet policy or approval activation.
+
+Polymarket BUY is the first profile. Its adapter still reconstructs and compares
+the signed order bytes, owner, chain and gross collateral debit. SELL shares,
+fees, credential creation and continuing permissions do not acquire this BUY
+permission. Other integrations remain unchanged; generic explicit selections
+retain their existing assurance and approval contract. A new automatically
+advertised protocol profile requires a Broker-owned verifier and adversarial
+signed-byte tests, rather than another app-name branch in onboarding.
+
+This is additive compiled metadata, not a new wire format. Effects-v1 claims,
+route WIT, approval selectors and Signer custody are unchanged. Supported
+semantic checks do not promote `machine_asserted` to proof-based assurance or
+prove token-contract behavior, venue settlement, prices or market identity.

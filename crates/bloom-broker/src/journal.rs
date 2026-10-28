@@ -2831,6 +2831,13 @@ fn verify_audit_chain_connection(
          FROM audit_chain ORDER BY sequence",
     )?;
     let mut rows = statement.query([])?;
+    #[derive(Deserialize)]
+    struct ActivationEvidence {
+        approval_id: Digest32,
+        activation_operation_id: OperationId,
+        signer_activation_receipt_digest: Digest32,
+    }
+    let mut latest_activations = BTreeMap::<String, (u64, ActivationEvidence)>::new();
     let mut expected_sequence = 0_u64;
     let mut expected_previous = Digest32::new("00".repeat(32))?;
     let mut expected_key_id: Option<Token> = None;
@@ -2891,7 +2898,22 @@ fn verify_audit_chain_connection(
         {
             return Err(audit_verification_failure(sequence, "signature"));
         }
-        if verify_audit_correlation(connection, &event_type, &payload_jcs).is_err() {
+        let payload: serde_json::Value = serde_json::from_str(&payload_jcs)
+            .map_err(|_| audit_verification_failure(sequence, "durable_state_correlation"))?;
+        if event_type == "approval.transition"
+            && payload.get("correlation_schema").and_then(|v| v.as_str()) == Some("v1")
+            && payload.get("to").and_then(|v| v.as_str()) == Some("ACTIVE")
+        {
+            // Every event's signature and receipt commitment remain verified.
+            // The mutable metadata row represents only the latest activation,
+            // so reconcile it after replay rather than against historical receipts.
+            let evidence: ActivationEvidence = serde_json::from_value(payload)
+                .map_err(|_| audit_verification_failure(sequence, "durable_state_correlation"))?;
+            latest_activations.insert(
+                evidence.approval_id.as_str().to_owned(),
+                (sequence, evidence),
+            );
+        } else if verify_audit_correlation(connection, &event_type, &payload_jcs).is_err() {
             return Err(audit_verification_failure(
                 sequence,
                 "durable_state_correlation",
@@ -2970,6 +2992,26 @@ fn verify_audit_chain_connection(
             "key_rotation",
         ));
     }
+    for (approval_id, (sequence, evidence)) in latest_activations {
+        let (operation_id, receipt_jcs): (String, String) = connection
+            .query_row(
+                "SELECT activation_operation_id, ceremony_grant_jcs
+                 FROM approval_metadata WHERE approval_id=?1",
+                [approval_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| audit_verification_failure(sequence, "durable_state_correlation"))?;
+        if operation_id != evidence.activation_operation_id.as_str()
+            || Digest32::from_bytes(Sha256::digest(receipt_jcs.as_bytes()).into())
+                != evidence.signer_activation_receipt_digest
+        {
+            return Err(audit_verification_failure(
+                sequence,
+                "durable_state_correlation",
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -3112,25 +3154,6 @@ fn verify_audit_correlation(
                         validation_receipt.digest().map_err(signer_protocol)?
                     ))
                 && payload.get("children") == Some(&serde_json::Value::Array(children))
-        }
-        "approval.transition"
-            if payload.get("to").and_then(|value| value.as_str()) == Some("ACTIVE") =>
-        {
-            let approval_id = payload
-                .get("approval_id")
-                .and_then(|value| value.as_str())
-                .ok_or_else(audit_degraded)?;
-            let receipt_jcs: String = connection
-                .query_row(
-                    "SELECT ceremony_grant_jcs FROM approval_metadata WHERE approval_id=?1",
-                    [approval_id],
-                    |row| row.get(0),
-                )
-                .map_err(|_| audit_degraded())?;
-            payload.get("signer_activation_receipt_digest")
-                == Some(&serde_json::json!(Digest32::from_bytes(
-                    Sha256::digest(receipt_jcs.as_bytes()).into()
-                )))
         }
         _ => true,
     };

@@ -1938,19 +1938,36 @@ function renderResult(session, plaintext) {
 function walletPageUrl(wallet) { return "/wallet/" + encodeURIComponent(wallet); }
 // The Machine supplies a temporary loopback connection in the launch fragment.
 // Keep it in this tab only; never infer a connection from a public wallet ID.
+function validatedWalletSetupConnection(saved) {
+  if (!saved || !Number.isFinite(saved.expires_at) || saved.expires_at <= Date.now()) return null;
+  const bridge = new URL(saved.url);
+  if (bridge.href !== saved.url || bridge.protocol !== "http:" || bridge.hostname !== "127.0.0.1" || !bridge.port || bridge.username || bridge.password || bridge.search || bridge.hash || !/^\/onboarding\/[0-9a-f]{64}\/$/.test(bridge.pathname)) return null;
+  return saved;
+}
+// Save the launch connection before the ceremony URL is scrubbed. Bind pending
+// connections to the exact ceremony token until the wallet identity is known.
+function rememberWalletSetupConnection(fragment, key) {
+  try {
+    const storage = browserSessionStorage();
+    const saved = JSON.parse(storage?.getItem(key) ?? "null");
+    const params = new URLSearchParams(fragment.slice(1));
+    const fresh = [...params.keys()].length === 1 ? params.get("setup") : null;
+    // Reopening the same URL must not refill the connection's lifetime.
+    const candidate = fresh && fresh !== saved?.url
+      ? {url:fresh, expires_at:Date.now() + 30*60*1000} : saved;
+    const connection = validatedWalletSetupConnection(candidate);
+    if (connection && key) { try { storage?.setItem(key, JSON.stringify(connection)); } catch (_) {} }
+    return connection;
+  } catch (_) { return null; }
+}
 function walletSetupContinuation(wallet) {
   const key = "bloom.wallet.setup." + wallet;
-  let storage;
-  try { storage = globalThis.sessionStorage; } catch (_) {}
   try {
-    const params = new URLSearchParams(walletSetupFragment.slice(1));
-    const fresh = [...params.keys()].length === 1 ? params.get("setup") : null;
-    const saved = fresh ? {url:fresh, expires_at:Date.now() + 30*60*1000} : JSON.parse(storage?.getItem(key) ?? "null");
-    if (!saved || !Number.isFinite(saved.expires_at) || saved.expires_at <= Date.now()) return null;
-    const bridge = new URL(saved.url);
-    if (bridge.href !== saved.url || bridge.protocol !== "http:" || bridge.hostname !== "127.0.0.1" || !bridge.port || bridge.username || bridge.password || bridge.search || bridge.hash || !/^\/onboarding\/[0-9a-f]{64}\/$/.test(bridge.pathname)) return null;
+    const storage = browserSessionStorage();
+    const saved = validatedWalletSetupConnection(walletSetupConnection || JSON.parse(storage?.getItem(key) ?? "null"));
+    if (!saved) return null;
     try { storage?.setItem(key, JSON.stringify(saved)); } catch (_) {}
-    return "/onboarding/#bridge=" + encodeURIComponent(bridge.href);
+    return "/onboarding/#bridge=" + encodeURIComponent(saved.url);
   } catch (_) { return null; }
 }
 
@@ -2070,10 +2087,14 @@ const tokenFromPath = location.pathname.startsWith("/ceremony/")
 const remoteCeremony = location.protocol === "https:";
 const remoteFragment = remoteCeremony && location.hash.startsWith("#cap=")
   ? location.hash.slice("#cap=".length) : "";
-const walletSetupFragment = !remoteCeremony ? location.hash : "";
 const sessionTokenKey = "bloom.ceremony.token.v1";
 let token = remoteCeremony ? remoteFragment : (tokenFromPath || readSessionToken());
 let ceremonyId = null;
+const walletSetupConnection = !remoteCeremony && (walletPath || token)
+  ? rememberWalletSetupConnection(location.hash, walletPath
+      ? "bloom.wallet.setup." + decodeURIComponent(walletPath.slice("/wallet/".length))
+      : "bloom.wallet.setup.ceremony." + token)
+  : null;
 if (!remoteCeremony && tokenFromPath) writeSessionToken(tokenFromPath);
 if ((remoteCeremony || token) && !previewPath && !walletPath) history.replaceState(null, "", "/ceremony/");
 const authHeaders = remoteCeremony ? {} : {"x-bloom-ceremony-token": token};

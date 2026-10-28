@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../crates/bloom-broker/src/ceremony_assets/onboarding/app.js'), 'utf8');
-const baseState = {selected_wallet:'alice',wallet_choices:[{id:'alice'}],machine:{available:true},config:{exists:true,setup_complete:true,persona:{preset:'trader'},persona_limits:{window_secs:'86400'},petals:['polymarket']},catalog:[]};
+const baseState = {selected_wallet:'alice',wallet_choices:[{id:'alice'}],machine:{available:true},config:{exists:true,setup_complete:true,persona:{preset:'trader'},persona_limits:{window_secs:'86400'},petals:['polymarket']},catalog:[],reusable_profiles:[{operation_class:'polymarket.order.poly1271',display_name:'Polymarket buys'}]};
 function harness(actions, options = {}) {
   const expectedAction = options.action ?? 'policy';
   const pauseActions = options.pauseActions ?? [];
@@ -106,6 +106,22 @@ const pending = token => ({ceremony_url:'http://localhost:18734/ceremony/'+token
   assert.equal(guided.hooks.step,3);assert.notEqual(guided.hooks.pending.id,appReview);
   guided.message();await guided.settle();assert.equal(guided.hooks.step,4);assert.equal(guided.hooks.pending,null);
   assert.deepEqual(guided.calls.filter(c=>c.body).map(c=>JSON.parse(c.body).action),['policy','policy','activate','activate']);
+  // Degen has independent wallet-transfer and Polymarket spending reviews.
+  const transferScope = {...activeScope,terms:{subject:{kind:'system'}},authority:{state:'AWAITING_CEREMONY',ceremony_url:pending('m').ceremony_url}};
+  const buyScope = {...activeScope,terms:{subject:{kind:'petal'},selector:{allowed_operation_classes:['polymarket.order.poly1271']}},authority:{state:'AWAITING_CEREMONY',ceremony_url:pending('n').ceremony_url}};
+  const multiple=harness([
+    {...pending('m'),data:[transferScope,buyScope]},
+    {...pending('n'),data:[{...transferScope,authority:{state:'ACTIVE'}},buyScope]},
+    {data:[activeScope,activeScope]}
+  ],{action:'activate',persona:'degen'});
+  await multiple.settle();await multiple.hooks.runAction('activate');
+  assert.equal(multiple.get('approval-progress').textContent,'Spending permission 1 of 2');
+  assert.equal(multiple.get('approval-title').textContent,'Wallet transfers');
+  assert.match(multiple.get('approval-purpose').textContent,/transfer and gas limits/);
+  multiple.message();await multiple.settle();
+  assert.equal(multiple.get('approval-progress').textContent,'Spending permission 2 of 2');
+  assert.equal(multiple.get('approval-title').textContent,'Polymarket buys');
+  multiple.message();await multiple.settle();assert.equal(multiple.hooks.pending,null);
   // Delayed reconciliation must keep the outer setup and explanation visible.
   const delayed=harness([pending('j'),{data:{state:'applied',petals:['polymarket']}},pending('k'),{data:[activeScope]}],{action:['policy','policy','activate','activate'],pauseActions:[2,4]});
   await delayed.settle();delayed.hooks.showStep(2);await delayed.hooks.runAction('policy');delayed.message();await delayed.settle();

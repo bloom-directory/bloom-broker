@@ -767,3 +767,100 @@ fn rearming_standing_authority_preserves_usage_and_cannot_bypass_a_stopped_budge
         .unwrap();
     assert!(j.prepare_standing_rearm(&digest(1), &digest(97)).is_err());
 }
+
+#[test]
+fn distinct_rearm_receipts_survive_restart_without_resetting_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rearm.sqlite");
+    let m = build_members(true);
+    let j = BrokerJournal::open(&path, audit()).unwrap();
+    prepare(&j, &m[0], 1, true);
+    prepare(&j, &m[1], 2, true);
+    j.reserve_for_clock_profile(&request(&m[0], 1, 10), &limits(), false)
+        .unwrap();
+    let usage = j.session_budget_state(&digest(1), 1_000_001).unwrap();
+    let counters = j.approval_limit_state(&digest(1)).unwrap();
+    for id in [98, 99] {
+        j.prepare_standing_rearm(&digest(1), &digest(id)).unwrap();
+        j.activate_approval_record(
+            &digest(1),
+            &operation(id),
+            &format!(r#"{{"ceremony_id":"rearm-{id}"}}"#),
+        )
+        .unwrap();
+    }
+    drop(j);
+    let reopened = BrokerJournal::open(&path, audit()).unwrap();
+    reopened.verify_audit_chain().unwrap();
+    assert!(!reopened.audit_degraded());
+    assert_eq!(
+        usage,
+        reopened
+            .session_budget_state(&digest(1), 1_000_001)
+            .unwrap()
+    );
+    assert_eq!(counters, reopened.approval_limit_state(&digest(1)).unwrap());
+    reopened
+        .prepare_standing_rearm(&digest(1), &digest(97))
+        .unwrap();
+}
+
+#[test]
+fn rearm_audit_rejects_receipt_rollback_operation_rollback_and_history_tampering() {
+    for corruption in ["receipt", "operation", "history", "missing_metadata"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rearm.sqlite");
+        let j = BrokerJournal::open(&path, audit()).unwrap();
+        let m = build_members(true);
+        prepare(&j, &m[0], 1, true);
+        prepare(&j, &m[1], 2, true);
+        j.prepare_standing_rearm(&digest(1), &digest(99)).unwrap();
+        j.activate_approval_record(&digest(1), &operation(99), r#"{"ceremony_id":"new"}"#)
+            .unwrap();
+        j.verify_audit_chain().unwrap();
+        drop(j);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        match corruption {
+            "receipt" => {
+                connection
+                    .execute(
+                        "UPDATE approval_metadata SET ceremony_grant_jcs='{}' WHERE approval_id=?1",
+                        [digest(1).as_str()],
+                    )
+                    .unwrap();
+            }
+            "operation" => {
+                connection.execute(
+                    "UPDATE approval_metadata SET activation_operation_id=?1 WHERE approval_id=?2",
+                    params![operation(1).as_str(), digest(1).as_str()],
+                ).unwrap();
+            }
+            "history" => {
+                connection.execute(
+                    "UPDATE audit_chain SET payload_jcs=json_set(payload_jcs,'$.signer_activation_receipt_digest',?1)
+                     WHERE event_type='approval.transition' AND json_extract(payload_jcs,'$.activation_operation_id')=?2",
+                    params![digest(77).as_str(), operation(1).as_str()],
+                ).unwrap();
+            }
+            "missing_metadata" => {
+                connection
+                    .execute(
+                        "DELETE FROM approval_metadata WHERE approval_id=?1",
+                        [digest(1).as_str()],
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        drop(connection);
+        let reopened = BrokerJournal::open(&path, audit()).unwrap();
+        assert!(reopened.verify_audit_chain().is_err(), "{corruption}");
+        assert!(reopened.audit_degraded(), "{corruption}");
+        assert!(
+            reopened
+                .prepare_standing_rearm(&digest(1), &digest(98))
+                .is_err(),
+            "{corruption}"
+        );
+    }
+}
