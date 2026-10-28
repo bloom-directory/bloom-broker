@@ -109,6 +109,7 @@ function el(tag, attrs = {}, ...children) {
 // Bundled geometric symbols, never images fetched by ticker. Network marks
 // are selected by numeric chain ID. Unknown tokens use a neutral coin.
 function reviewIcon(kind) {
+  if (String(kind).startsWith("native:")) return nativeIcon(String(kind).slice(7));
   if (kind === "solana") return el("img", {src: "/assets/networks/solana.svg", alt: "Solana", width: "32", height: "32"});
   const svg = el("svg", {viewBox: "0 0 32 32", "aria-hidden": "true", focusable: "false"});
   if (kind === "ethereum") {
@@ -134,8 +135,30 @@ function reviewIcon(kind) {
   return svg;
 }
 
+// Each chain's native asset, by chain ID. A logo reuses the reviewed catalog
+// artwork for the same asset (its L1 or wrapped contract), never a ticker.
+const ETHER = {name: "Ether", mark: "ethereum"};
+const NATIVE_ASSETS = {
+  1: ETHER, 10: ETHER, 8453: ETHER, 42161: ETHER, 59144: ETHER, 4663: ETHER, 31337: ETHER,
+  137: {name: "POL", art: "1:0x455e53cbb86018ac2b8092fdcd39d8444affc3f6"},
+  56: {name: "BNB", art: "56:0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"},
+  43114: {name: "AVAX", art: "43114:0xb31f66aa3c1e785363f0875a1b74e27b85fd66c7"},
+  100: {name: "xDAI", art: "100:0xe91d153e0b41518a2ce8dd3d7944fa863463a97d"},
+  999: {name: "HYPE", art: "999:0x5555555555555555555555555555555555555555"},
+};
+function nativeAsset(chainId) {
+  return NATIVE_ASSETS[Number(chainId)] || null;
+}
+function nativeIcon(chainId) {
+  const asset = nativeAsset(chainId);
+  if (asset?.mark) return reviewIcon(asset.mark);
+  const [chain, address] = (asset?.art || ":").split(":");
+  return artworkIcon(tokenArt(chain, address));
+}
+// Network marks where one is bundled; otherwise the network's native asset.
 function chainIcon(chainId) {
-  return {1: "ethereum", 8453: "base", 31337: "test"}[Number(chainId)] || "unknown";
+  return {1: "ethereum", 8453: "base", 31337: "test"}[Number(chainId)]
+    || (nativeAsset(chainId) ? `native:${Number(chainId)}` : "unknown");
 }
 
 // Reviewed, bundled artwork is generated from exact catalog identities.
@@ -163,8 +186,10 @@ function artworkIcon(art) {
 function assetCard({chainId, address, venueAsset, native, title, subtitle, amount, amountLabel, tone}) {
   const art = venueAsset ? venueTokenArt(venueAsset) : address ? tokenArt(chainId, address) : null;
   const mark = native ? reviewIcon(native) : artworkIcon(art);
+  const nativeMark = String(native).startsWith("native:") ? nativeAsset(String(native).slice(7))?.mark : native;
+  const branded = art || mark.tagName === "IMG" || nativeMark === "ethereum" || nativeMark === "base";
   const icon = el("span", {
-    class: `ceremony-token-icon${art || native === "ethereum" || native === "base" ? " has-artwork" : ""}`,
+    class: `ceremony-token-icon${branded ? " has-artwork" : ""}`,
     "aria-hidden": "true"
   }, mark);
   const copy = el("div", {class: "ceremony-asset-copy"},
@@ -1638,9 +1663,9 @@ function renderReview(session) {
         if (field.format === "nativeAmount") {
           // The reader marks native amounts explicitly. Never infer asset
           // identity from a descriptor label or a ticker in formatted text.
-          const ether = [1, 10, 8453, 42161, 59144, 4663, 31337].includes(Number(payload.chain_id));
-          decision.push(assetCard({native: ether ? "ethereum" : "token",
-            title: ether ? "Ether" : "Native asset",
+          const native = nativeAsset(payload.chain_id);
+          decision.push(assetCard({native: native ? `native:${Number(payload.chain_id)}` : "token",
+            title: native?.name || "Native asset",
             amount: String(field.value).replace(/ \((transaction value|minimum balance increase)\)$/, ""),
             amountLabel: enso && /^Source asset/.test(field.label) ? "You pay"
               : enso && /^Requested minimum balance increase/.test(field.label) ? "Minimum output" : field.label,
@@ -1745,7 +1770,7 @@ function renderReview(session) {
     const exact = payload.maximum_execution_gas_fee_display;
     const label = transfer.payloads.length > 1 ? `Transaction ${index + 1} gas fee` : "Gas fee";
     const amount = exact ? el("span", {class: "ceremony-fee-amount"},
-      reviewIcon(exact.endsWith(" ETH") ? "ethereum" : "token"),
+      nativeIcon(payload.chain_id),
       el("span", {}, `Up to ${compactFeeCap(exact)}`))
       : el("span", {}, "Not available in this review");
     decision.push(el("div", {class: "ceremony-fee", "aria-label": "Execution gas only; other network charges may apply"},

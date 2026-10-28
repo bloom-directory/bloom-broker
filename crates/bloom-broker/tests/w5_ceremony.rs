@@ -1061,6 +1061,27 @@ for (const stale of ["Native value (wei)", "per gas (wei)", "Some("]) {{
   if (rendered.includes(stale)) throw new Error(`stale EVM rendering ${{stale}}: ${{rendered}}`);
 }}
 
+// A non-ETH network shows its own native asset, chosen by chain ID: POL's
+// reviewed catalog artwork in the header and beside the gas fee.
+renderReview(session({{
+  chain_id: "137", chain: "polygon",
+  sender: "0x1111111111111111111111111111111111111111",
+  destination: "0x2222222222222222222222222222222222222222",
+  value: "10000000000000000", value_display: "0.01 POL",
+  nonce: "0", gas_limit: "26250",
+  fee: {{kind: "eip1559", max_fee_per_gas: "549987553048",
+    max_fee_per_gas_display: "549.99 Gwei", max_priority_fee_per_gas: "27499377652",
+    max_priority_fee_per_gas_display: "27.5 Gwei"}},
+  maximum_execution_gas_fee_display: "0.014799 POL",
+  payload_keccak: "0xabd",
+  calldata_bytes: "0"
+}}));
+const polArt = `/assets/tokens/${{REVIEWED_TOKEN_ARTWORK["1:0x455e53cbb86018ac2b8092fdcd39d8444affc3f6"].file}}`;
+const polImages = node => walk(node).filter(child => child.tagName === "IMG" && child.src === polArt);
+if (polImages(nodes["page-title"]).length !== 1 || polImages(nodes.review).length < 1) {{
+  throw new Error("Polygon header or gas fee is missing the POL mark");
+}}
+
 renderReview(session({{
   chain_id: "999999", chain: "evm-999999",
   sender: "0x1111111111111111111111111111111111111111",
