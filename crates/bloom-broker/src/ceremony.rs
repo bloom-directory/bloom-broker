@@ -1,3 +1,9 @@
+mod cards;
+pub use cards::{
+    CheckoutIntakeRequest, CheckoutIntakeResponse, OrderField, bind_checkout_intake,
+    serve_checkout_intake, serve_checkout_listener,
+};
+
 use crate::{
     authority::PolicyAuthorityDiff,
     journal::BrokerJournal,
@@ -540,6 +546,56 @@ impl PolicyUpdateReviewManifest {
 /// Typed Broker-to-Signer seam. Broker only forwards raw proof and opaque HPKE
 /// envelopes; no method accepts plaintext PRF or custody input.
 pub trait CeremonySigner: Send + Sync {
+    fn traveler_list(&self) -> Result<Vec<bloom_signer_api::TravelerPublic>, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "traveler listing unavailable",
+        ))
+    }
+    fn card_list(&self) -> Result<Vec<bloom_signer_api::CardPublic>, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "card listing unavailable",
+        ))
+    }
+    fn prepare_card(
+        &self,
+        _request: bloom_signer_api::CardPrepareRequest,
+        _now_ms: u64,
+    ) -> Result<SignerPreparedCustody, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "card preparation unavailable",
+        ))
+    }
+    fn complete_card(
+        &self,
+        _request: CustodyCompleteRequest,
+        _now_ms: u64,
+    ) -> Result<CustodyResult, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "card completion unavailable",
+        ))
+    }
+    fn card_status(
+        &self,
+        _operation_id: &OperationId,
+    ) -> Result<bloom_signer_api::CardOperationStatus, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "card status unavailable",
+        ))
+    }
+    fn card_cancel(
+        &self,
+        _operation_id: &OperationId,
+    ) -> Result<bloom_signer_api::CardOperationStatus, SignerProtocolError> {
+        Err(SignerProtocolError::new(
+            SignerProtocolErrorCode::ServiceUnavailable,
+            "card cancellation unavailable",
+        ))
+    }
     fn derived_accounts_public(
         &self,
         _request: bloom_signer_api::WalletRequest,
@@ -738,6 +794,7 @@ impl BackoffDeadline {
 }
 
 struct BrokerInner {
+    cards: cards::CardChannels,
     signer: Arc<dyn CeremonySigner>,
     endpoint: CeremonyEndpoint,
     limits: CeremonyLimits,
@@ -1377,6 +1434,7 @@ impl CeremonyBroker {
         Self {
             served_origin: endpoint.origin(),
             inner: Arc::new(BrokerInner {
+                cards: cards::CardChannels::default(),
                 signer,
                 endpoint,
                 limits,
@@ -2466,13 +2524,14 @@ impl CeremonyBroker {
     fn cancel_signer_or_already_released(
         &self,
         operation_id: &OperationId,
+        card: bool,
     ) -> Result<(), ProtocolError> {
-        match self
-            .inner
-            .signer
-            .cancel(operation_id)
-            .map_err(signer_error_to_machine)
-        {
+        let result = if card {
+            self.inner.signer.card_cancel(operation_id).map(|_| ())
+        } else {
+            self.inner.signer.cancel(operation_id)
+        };
+        match result.map_err(signer_error_to_machine) {
             Ok(())
             | Err(ProtocolError {
                 code: ProtocolErrorCode::ApprovalNotFound,
@@ -2526,15 +2585,10 @@ impl CeremonyBroker {
             latch_terminal(&mut snapshot, now_ms);
             (session.wallet_id.clone(), snapshot)
         };
-        // A Signer that no longer holds this operation has nothing left to
-        // release, which is the state cancelling asks for. Reporting that as a
-        // failed cancel left the Broker session non-terminal, and a live
-        // session occupies the wallet's one-ceremony slot: every later prepare
-        // answered `CEREMONY_RATE_LIMITED` until the session expired on its
-        // own, and cancelling again could not clear it either. Any other
-        // rejection still fails closed, because the Signer operation may well
-        // still be pending there.
-        self.cancel_signer_or_already_released(operation_id)?;
+        self.cancel_signer_or_already_released(
+            operation_id,
+            cards::is_card(snapshot.ceremony_kind),
+        )?;
         // Both tabs belong to one operation. Leaving its auxiliary source live
         // would strand the wallet's admission slot after a successful cancel.
         let auxiliary = self
@@ -2582,7 +2636,13 @@ impl CeremonyBroker {
                 continue;
             }
             if state == CeremonyState::AwaitingUser {
-                self.cancel_signer_or_already_released(&operation_id)?;
+                let card = self
+                    .inner
+                    .sessions
+                    .lock()
+                    .get(&ceremony_id)
+                    .is_some_and(|s| cards::is_card(s.ceremony_kind));
+                self.cancel_signer_or_already_released(&operation_id, card)?;
             }
             let snapshot = {
                 let sessions = self.inner.sessions.lock();
@@ -2629,6 +2689,14 @@ impl CeremonyBroker {
             .route("/wallet/{wallet}", get(wallet_shell))
             .route("/api/wallet/{wallet}", get(read_wallet))
             .route("/api/wallet/{wallet}/backup", post(prepare_wallet_backup))
+            .route(
+                "/api/session/{ceremony_id}/order-preview",
+                get(read_order_preview),
+            )
+            .route(
+                "/api/session/{ceremony_id}/order-fields",
+                get(read_order_fields),
+            )
             .route(
                 "/api/session/{ceremony_id}/complete",
                 post(complete_session),
@@ -2833,6 +2901,37 @@ impl CeremonyBroker {
                     .insert(ceremony_id.clone(), snapshot);
                 continue;
             }
+            if self
+                .inner
+                .sessions
+                .lock()
+                .get(&ceremony_id)
+                .is_some_and(|s| cards::is_card(s.ceremony_kind))
+            {
+                if let Err(error) = self.cancel_signer_or_already_released(&operation_id, true) {
+                    // The Signer's own expiry still closes a prepared card
+                    // operation; record why this cancel did not.
+                    tracing::warn!(
+                        event = "ceremony.card_cancel_failed",
+                        operation_id = operation_id.as_str(),
+                        code = ?error.code,
+                        "Broker could not cancel an expiring card operation in Signer"
+                    );
+                }
+                let mut snapshot = self
+                    .inner
+                    .sessions
+                    .lock()
+                    .get(&ceremony_id)
+                    .cloned()
+                    .ok_or_else(not_found)?;
+                snapshot.state = CeremonyState::Expired;
+                latch_terminal(&mut snapshot, now_ms);
+                self.persist_session(&snapshot)?;
+                self.inner.sessions.lock().insert(ceremony_id, snapshot);
+                self.inner.cards.forget(&operation_id);
+                continue;
+            }
             let signer_status = self
                 .inner
                 .signer
@@ -2848,7 +2947,7 @@ impl CeremonyBroker {
                     Some(serde_json::to_value(result).map_err(malformed)?),
                 ),
                 SignerCeremonyStatus::Pending => {
-                    self.cancel_signer_or_already_released(&operation_id)?;
+                    self.cancel_signer_or_already_released(&operation_id, false)?;
                     (CeremonyState::Expired, None)
                 }
                 SignerCeremonyStatus::Terminal(state) => (state, None),
@@ -3384,8 +3483,9 @@ impl CeremonyBroker {
             .map_err(|_| storage("ceremony database mutex poisoned"))?;
         let mut statement = database
             .prepare(
-                "SELECT ceremony_id, operation_id, session_jcs
-                 FROM ceremony_sessions",
+                "SELECT ceremony_id, operation_id, session_jcs FROM ceremony_sessions
+                 UNION ALL
+                 SELECT ceremony_id, operation_id, session_jcs FROM pending_card_sessions",
             )
             .map_err(storage)?;
         let rows = statement
@@ -3492,7 +3592,7 @@ impl CeremonyBroker {
                             Some(serde_json::to_value(result).map_err(malformed)?);
                     }
                     SignerCeremonyStatus::Pending => {
-                        self.cancel_signer_or_already_released(&session.operation_id)?;
+                        self.cancel_signer_or_already_released(&session.operation_id, false)?;
                         session.state = CeremonyState::Expired;
                     }
                     SignerCeremonyStatus::Terminal(state) => {
@@ -3661,13 +3761,21 @@ impl CeremonyBroker {
                 .map_err(|_| storage("ceremony database mutex poisoned"))?
         };
         let transaction = database.transaction().map_err(storage)?;
+        let pending_card = cards::is_card(session.ceremony_kind) && !is_terminal(session.state);
+        let table = if pending_card {
+            "pending_card_sessions"
+        } else {
+            "ceremony_sessions"
+        };
         transaction
             .execute(
-                "INSERT INTO ceremony_sessions(ceremony_id, operation_id, session_jcs)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(ceremony_id) DO UPDATE SET
-                    operation_id = excluded.operation_id,
-                    session_jcs = excluded.session_jcs",
+                &format!(
+                    "INSERT INTO {table}(ceremony_id, operation_id, session_jcs)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(ceremony_id) DO UPDATE SET
+                        operation_id = excluded.operation_id,
+                        session_jcs = excluded.session_jcs"
+                ),
                 params![
                     session.projection.ceremony_id.as_str(),
                     session.operation_id.as_str(),
@@ -3675,6 +3783,14 @@ impl CeremonyBroker {
                 ],
             )
             .map_err(storage)?;
+        if !pending_card {
+            transaction
+                .execute(
+                    "DELETE FROM pending_card_sessions WHERE ceremony_id = ?1",
+                    [session.projection.ceremony_id.as_str()],
+                )
+                .map_err(storage)?;
+        }
         if let Some(journal) = &self.inner.journal {
             journal
                 .append_external_audit(
@@ -4068,6 +4184,54 @@ async fn read_session_by_token(
     Json(&session.projection).into_response()
 }
 
+async fn read_order_preview(
+    State(broker): State<CeremonyBroker>,
+    Path(ceremony_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if broker.validate_served_host(&headers).is_err()
+        || broker
+            .authorize_browser(&ceremony_id, &headers, false)
+            .is_err()
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let operation_id = match broker.inner.sessions.lock().get(&ceremony_id) {
+        Some(session) if session.ceremony_kind == CeremonyKind::CardCheckout => {
+            session.operation_id.clone()
+        }
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    match broker.inner.cards.order_preview(&operation_id) {
+        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn read_order_fields(
+    State(broker): State<CeremonyBroker>,
+    Path(ceremony_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if broker.validate_served_host(&headers).is_err()
+        || broker
+            .authorize_browser(&ceremony_id, &headers, false)
+            .is_err()
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let operation_id = match broker.inner.sessions.lock().get(&ceremony_id) {
+        Some(session) if session.ceremony_kind == CeremonyKind::CardCheckout => {
+            session.operation_id.clone()
+        }
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    match broker.inner.cards.order_fields(&operation_id) {
+        Some(fields) => Json(fields).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 // Local owner pages expose public addresses, never custody material. They
 // cannot enumerate wallets. Export preparation requires the exact local origin;
 // Signer still requires a fresh passkey ceremony before releasing any secret.
@@ -4403,7 +4567,7 @@ async fn complete_session(
         return StatusCode::FORBIDDEN.into_response();
     }
     let (ceremony_kind, operation_id, projection, verifying_snapshot) = {
-        let sessions = broker.inner.sessions.lock();
+        let mut sessions = broker.inner.sessions.lock();
         let Some(session) = sessions.get(&ceremony_id) else {
             return StatusCode::NOT_FOUND.into_response();
         };
@@ -4426,12 +4590,19 @@ async fn complete_session(
         }
         let mut verifying_snapshot = session.clone();
         verifying_snapshot.state = CeremonyState::Verifying;
-        (
+        if cards::is_card(session.ceremony_kind) && session.state != CeremonyState::AwaitingUser {
+            return StatusCode::CONFLICT.into_response();
+        }
+        let prepared_completion = (
             session.ceremony_kind,
             session.operation_id.clone(),
             session.projection.clone(),
-            verifying_snapshot,
-        )
+            verifying_snapshot.clone(),
+        );
+        if cards::is_card(session.ceremony_kind) {
+            sessions.insert(ceremony_id.clone(), verifying_snapshot);
+        }
+        prepared_completion
     };
     if broker.persist_session(&verifying_snapshot).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -4441,6 +4612,9 @@ async fn complete_session(
         .sessions
         .lock()
         .insert(ceremony_id.clone(), verifying_snapshot.clone());
+    if cards::is_card(ceremony_kind) {
+        return cards::complete_card_session(&broker, &ceremony_id, verifying_snapshot, body);
+    }
     let recovery_error_floor = (ceremony_kind == CeremonyKind::WalletRecovery)
         .then(|| tokio::time::Instant::now() + Duration::from_millis(750));
     let result = if ceremony_kind == CeremonyKind::SealedApproval {
@@ -4971,7 +5145,7 @@ fn apply_security_headers(response: &mut Response) {
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self'; img-src 'self' blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         ),
     );
     headers.insert(
@@ -5119,6 +5293,9 @@ fn ceremony_kind_name(kind: CeremonyKind) -> &'static str {
         CeremonyKind::PolicyUpdate => "policy_update",
         CeremonyKind::AccountAllocate => "account_allocate",
         CeremonyKind::AccountRetire => "account_retire",
+        CeremonyKind::CardAdd => "card_add",
+        CeremonyKind::CardDelete => "card_delete",
+        CeremonyKind::CardCheckout => "card_checkout",
     }
 }
 
@@ -5599,11 +5776,18 @@ fn open_audited_ceremony_store(
             )
         })?;
         guard_ceremony_storage_version(&connection)?;
+        // Pending card sessions live apart: the released Broker cannot decode
+        // card kinds and refuses to start on a pending row it cannot read.
         connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS ceremony_sessions (
                     ceremony_id TEXT PRIMARY KEY,
                     operation_id TEXT NOT NULL,
+                    session_jcs TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS pending_card_sessions (
+                    ceremony_id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL UNIQUE,
                     session_jcs TEXT NOT NULL
                 );",
             )
@@ -5866,6 +6050,18 @@ fn rolling_quota_exhausted(
 /// can actually read.
 fn custody_review_text(kind: CeremonyKind) -> (&'static str, &'static str) {
     match kind {
+        CeremonyKind::CardAdd => (
+            "Save a card",
+            "Save this card encrypted in Signer, replacing any saved card with the same ID; CVC is never saved.",
+        ),
+        CeremonyKind::CardDelete => (
+            "Delete a card",
+            "Remove the saved card. The enrolled container remains.",
+        ),
+        CeremonyKind::CardCheckout => (
+            "Approve a purchase",
+            "Fill and submit the displayed checkout once. The merchant controls the actual charge.",
+        ),
         CeremonyKind::WalletRegistration => (
             "Create a new wallet",
             "Signer creates custody for a new wallet and binds the passkey you are about to \
@@ -6287,6 +6483,24 @@ mod origin_tests {
     fn matching_origin_passes() {
         check_origin(Some("http://localhost:28736"), "http://localhost:28736")
             .expect("exact origin match must pass");
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    #[test]
+    fn every_element_the_ceremony_script_looks_up_exists_in_the_page() {
+        // A lookup of a removed element throws and shows every review as an
+        // unavailable link.
+        let missing: Vec<&str> = APP_JS
+            .split("getElementById(\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .filter(|id| !SHELL_HTML.contains(&format!("id=\"{id}\"")))
+            .collect();
+        assert!(missing.is_empty(), "missing page elements: {missing:?}");
     }
 }
 
