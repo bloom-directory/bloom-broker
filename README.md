@@ -422,7 +422,9 @@ do not establish installed-release compatibility.
 `bloom_broker_api::reusable_signing_profiles()` is the shared eligibility catalog
 for automatic onboarding. Each entry names a protocol operation class, effects
 schema, crypto suite, exact budget assets and a compiled Broker verifier.
-Machine matches it against the **installed package hash** and installer-signed
+Broker advertises each compiled profile as `bloom.reusable-profile/<id>` through
+its existing capability response. Machine requires that advertisement before
+automatic selection, then matches the **installed package hash** and installer-signed
 route provenance, then proposes owner-reviewed terms. Neither a package name
 nor `economic_effects_schema = 1` alone makes a route eligible. The catalog does
 not grant authority and does not replace wallet policy or approval activation.

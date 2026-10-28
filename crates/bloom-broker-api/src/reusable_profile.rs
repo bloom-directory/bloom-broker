@@ -26,6 +26,15 @@ pub struct ReusableSigningProfile {
     pub verifier: ReusableEffectsVerifier,
 }
 impl ReusableSigningProfile {
+    pub fn capability_schema(&self) -> String {
+        format!("bloom.reusable-profile/{}", self.id)
+    }
+    pub fn is_advertised(&self, schemas: &[Token]) -> bool {
+        schemas
+            .iter()
+            .any(|s| s.as_str() == self.capability_schema())
+    }
+
     pub fn matches_certified_class(&self, class: &ProvenanceOperationClass) -> bool {
         class.operation_class.as_str() == self.operation_class
             && class.economic_effects_schema == Some(self.effects_schema)
@@ -64,6 +73,8 @@ mod tests {
     #[test]
     fn only_supported_fee_free_certified_profiles_are_discoverable() {
         let profile = &reusable_signing_profiles()[0];
+        assert!(!profile.is_advertised(&[]));
+        assert!(profile.is_advertised(&[Token::new(profile.capability_schema()).unwrap()]));
         let mut class = ProvenanceOperationClass {
             economic_effects_schema: Some(1),
             operation_class: Token::new(profile.operation_class).unwrap(),

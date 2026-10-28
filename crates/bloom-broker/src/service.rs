@@ -2684,12 +2684,21 @@ impl BrokerRpcService {
                 .iter()
                 .map(|method| Token::new(method.as_str()))
                 .collect::<Result<_, _>>()?,
-            schemas: vec![
-                Token::new(RPC_ENVELOPE_SCHEMA_V1)?,
-                Token::new("bloom.session-token/3")?,
-                Token::new("bloom.economic-effects/1")?,
-                Token::new("bloom.native-transfer/1")?,
-            ],
+            schemas: [
+                RPC_ENVELOPE_SCHEMA_V1,
+                "bloom.session-token/3",
+                "bloom.economic-effects/1",
+                "bloom.native-transfer/1",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .chain(
+                bloom_broker_api::reusable_signing_profiles()
+                    .iter()
+                    .map(|p| p.capability_schema()),
+            )
+            .map(Token::new)
+            .collect::<Result<_, _>>()?,
             backends: Vec::new(),
             assurance_verifiers: self
                 .authority
