@@ -5759,21 +5759,14 @@ fn storage(error: impl std::fmt::Display) -> ProtocolError {
 // See the authority migration: ceremony state formerly lived in a separate
 // SQLite file, which cannot commit atomically with the Broker audit chain.
 // Import it once into the consolidated journal database and retain the source
-// file untouched as a rollback artifact.
+// file untouched as a rollback artifact. The legacy file is only opened when
+// it is there and is never created, so a fresh home grows no empty store and a
+// dangling link, a vanished target or a mistyped directory fails startup.
 fn open_audited_ceremony_store(
     legacy_path: impl AsRef<FsPath>,
     journal: &Arc<BrokerJournal>,
 ) -> Result<Arc<std::sync::Mutex<Connection>>, ProtocolError> {
-    let legacy = Connection::open(legacy_path).map_err(storage)?;
-    legacy
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS ceremony_sessions (
-                ceremony_id TEXT PRIMARY KEY,
-                operation_id TEXT NOT NULL UNIQUE,
-                session_jcs TEXT NOT NULL
-            );",
-        )
-        .map_err(storage)?;
+    let legacy = crate::legacy_store::open(legacy_path.as_ref(), "ceremony").map_err(storage)?;
     let database = journal.shared_connection();
     {
         let mut connection = database.lock().map_err(|_| {
@@ -5799,7 +5792,9 @@ fn open_audited_ceremony_store(
                 );",
             )
             .map_err(storage)?;
-        migrate_legacy_ceremonies(&mut connection, &legacy, journal)?;
+        if let Some(legacy) = &legacy {
+            migrate_legacy_ceremonies(&mut connection, legacy, journal)?;
+        }
         let transaction = connection.transaction().map_err(storage)?;
         if migrate_pairing_session_index(&transaction)? {
             journal
@@ -5889,6 +5884,11 @@ fn migrate_legacy_ceremonies(
     legacy: &Connection,
     journal: &BrokerJournal,
 ) -> Result<(), ProtocolError> {
+    // The legacy file is opened as it is and is no longer given the table,
+    // so one without it, such as an empty file, has nothing to migrate.
+    if !crate::legacy_store::has_table(legacy, "ceremony_sessions").map_err(storage)? {
+        return Ok(());
+    }
     let legacy_path: String = legacy
         .query_row(
             "SELECT file FROM pragma_database_list WHERE name='main'",
@@ -5933,8 +5933,7 @@ fn migrate_legacy_ceremonies(
     if migrated {
         return Ok(());
     }
-    target
-        .execute("ATTACH DATABASE ?1 AS ceremony_legacy", [&legacy_path])
+    crate::legacy_store::attach(target, &legacy_path, "ceremony_legacy", "ceremony")
         .map_err(storage)?;
     journal.verify_migration_target(target).map_err(storage)?;
     let migration = (|| -> Result<(), ProtocolError> {
@@ -6271,6 +6270,52 @@ mod remote_storage_tests {
         transaction.commit().unwrap();
     }
 
+    /// A fresh install creates `ceremony_sessions` without the old UNIQUE
+    /// constraint on `operation_id`, so it takes the branch that only adds
+    /// the partial index, never the rebuild above. On every fresh install
+    /// that index is all that keeps one primary session per operation.
+    #[test]
+    fn a_fresh_ceremony_table_still_allows_one_primary_session_per_operation() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ceremony_sessions (
+                    ceremony_id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL,
+                    session_jcs TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(
+            !migrate_pairing_session_index(&transaction).unwrap(),
+            "a fresh table has nothing to rebuild"
+        );
+        transaction.commit().unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO ceremony_sessions VALUES ('destination', 'operation', '{}')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO ceremony_sessions VALUES ('source', 'operation', ?1)",
+                [r#"{"auxiliary":true}"#],
+            )
+            .expect("an auxiliary session may share the primary's operation");
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO ceremony_sessions VALUES ('duplicate', 'operation', '{}')",
+                    [],
+                )
+                .is_err(),
+            "a second primary session for one operation must be refused"
+        );
+    }
+
     #[test]
     fn precommit_cookie_expires_even_while_browser_cookie_remains_present() {
         let auth = RemoteBrowserAuth {
@@ -6456,5 +6501,69 @@ mod shell_tests {
             .filter(|id| !SHELL_HTML.contains(&format!("id=\"{id}\"")))
             .collect();
         assert!(missing.is_empty(), "missing page elements: {missing:?}");
+    }
+}
+
+#[cfg(test)]
+mod legacy_attach_tests {
+    use super::*;
+    use crate::legacy_store::TestAuditSigner;
+
+    /// The startup probe opens the legacy store without the create flag, but
+    /// the migration attaches it afresh on the journal connection, which does
+    /// create. A store that disappears between the two would come back as an
+    /// empty file, and every later start would read that file as a home with
+    /// nothing to migrate.
+    #[test]
+    fn a_legacy_ceremony_store_that_vanishes_before_the_attach_is_not_recreated() {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy_path = directory.path().join("ceremonies.sqlite");
+        let legacy = Connection::open(&legacy_path).unwrap();
+        // One row, so the migration has something to carry and reaches the
+        // attach.
+        legacy
+            .execute_batch(
+                "CREATE TABLE ceremony_sessions (
+                    ceremony_id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL UNIQUE,
+                    session_jcs TEXT NOT NULL
+                );
+                INSERT INTO ceremony_sessions VALUES ('ceremony', 'operation', '{}');",
+            )
+            .unwrap();
+        // The open connection keeps the file; only its directory entry goes,
+        // which is what the migration sees when the store vanishes after the
+        // probe.
+        std::fs::remove_file(&legacy_path).unwrap();
+
+        let journal = BrokerJournal::open(
+            directory.path().join("journal.sqlite"),
+            Arc::new(TestAuditSigner),
+        )
+        .unwrap();
+        let connection = journal.shared_connection();
+        let mut target = connection.lock().unwrap();
+        target
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS ceremony_sessions (
+                    ceremony_id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL,
+                    session_jcs TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+
+        let error = migrate_legacy_ceremonies(&mut target, &legacy, &journal)
+            .expect_err("a legacy store that is gone cannot be migrated");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot attach the legacy ceremony store"),
+            "the error must say which store could not be attached: {error}"
+        );
+        assert!(
+            !legacy_path.exists(),
+            "the attach must not recreate a vanished legacy store"
+        );
     }
 }

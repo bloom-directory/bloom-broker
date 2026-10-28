@@ -1156,9 +1156,12 @@ function describeTransfer(manifest) {
   const reviewedDebits = reviewed.filter(a => a.kind === "declared_debit");
   const amounts = debits.map((d, i) => reviewedDebits[i]?.display || `${d.amount} ${d.asset.asset}`);
   const to = dests.map(d => d.destination);
+  // A Petal's declared destinations are the addresses its transaction may
+  // reach, such as the program a swap routes through, not a recipient.
+  const isTransfer = Boolean(manifest?.system_use_claim);
   const network = chainLabel(chain, ctx);
   let sentence;
-  if (amounts.length && to.length) {
+  if (amounts.length && to.length && isTransfer) {
     sentence = `Send <strong>${escapeHtml(amounts.join(" + "))}</strong> on ${escapeHtml(network)} to the address below.`;
   } else if (amounts.length) {
     sentence = `Spend up to <strong>${escapeHtml(amounts.join(" + "))}</strong> on ${escapeHtml(network)}.`;
@@ -1166,7 +1169,7 @@ function describeTransfer(manifest) {
     sentence = `Sign one operation on ${escapeHtml(network)}.`;
   }
   const facts = [];
-  if (to.length) facts.push(["To", to.join(", "), true]);
+  if (to.length) facts.push([isTransfer ? "To" : "Declared destinations", to.join(", "), true]);
   if (amounts.length) facts.push(["Amount", amounts.join(" + ")]);
   if (fee && fee.amount) {
     const reviewedFee = reviewed.find(a => a.kind === "declared_fee");
