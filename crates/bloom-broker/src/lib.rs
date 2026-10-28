@@ -15,3 +15,5 @@ pub mod signer_client;
 mod solana_review;
 mod token_artwork;
 mod translation;
+
+mod system_session;

@@ -424,6 +424,7 @@ async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
         publisher: Token::new("fixture-publisher").unwrap(),
         petal_lineage: None,
         operation_classes: vec![ProvenanceOperationClass {
+            economic_effects_schema: None,
             operation_class: Token::new("wallet-sign").unwrap(),
             fee_asset: None,
         }],
@@ -1808,7 +1809,7 @@ renderReview({{
 const primary = allText({{textContent: "", innerHTML: "", children:
   nodes.review.children.filter(child => child?.name !== "details")}});
 const technical = allText(nodes.review.children.find(child => child?.name === "details"));
-for (const phrase of ["this Petal", "no funds move", "main wallet key stays inside Bloom", "1h 0m"]) {{
+for (const phrase of ["Pump.fun integration", "no funds move", "main wallet key stays inside Bloom", "1h 0m"]) {{
   if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
 }}
 for (const internal of ["allowed_routes", "custody_operation_id", "package_hash", "r000010"]) {{
@@ -1902,7 +1903,7 @@ renderReview({{
 const primary = allText({{textContent: "", innerHTML: "", children:
   nodes.review.children.filter(child => child?.name !== "details")}});
 const technical = allText(nodes.review.children.find(child => child?.name === "details"));
-for (const phrase of ["Finish setting up", "this Petal", "main wallet key stays inside Bloom"]) {{
+for (const phrase of ["Finish setting up", "Pump.fun integration", "main wallet key stays inside Bloom"]) {{
   if (!primary.includes(phrase)) throw new Error(`primary review omitted ${{phrase}}: ${{primary}}`);
 }}
 for (const internal of ["route_grants", "machine_asserted", "r000010",
@@ -2385,6 +2386,46 @@ fn sign_provenance(record: &mut ProvenanceRecord, key: &SigningKey) {
     record.installer_signature = Base64UrlBytes::from_bytes(&key.sign(&message).to_bytes());
 }
 
+fn polymarket_buy_witness(
+    owner: alloy::primitives::Address,
+    quantity: &str,
+    salt: &str,
+) -> (Vec<u8>, Vec<u8>) {
+    use serde_json::json;
+    let fields = |signature: &str| {
+        serde_json::Value::Array(
+            signature
+                .split(',')
+                .map(|s| {
+                    let (kind, name) = s.split_once(' ').unwrap();
+                    json!({"name":name,"type":kind})
+                })
+                .collect(),
+        )
+    };
+    let funder = "0x6c625c75652cf2cdf2bfe94ad59cb6f79b899a18";
+    let salt = u64::from_str_radix(salt, 16).unwrap().to_string();
+    let typed = json!({
+        "domain":{"name":"Polymarket CTF Exchange","version":"2","chainId":137,"verifyingContract":"0xe111180000d2663c0091e4f400237545b87b996b"},
+        "types":{"EIP712Domain":fields("string name,string version,uint256 chainId,address verifyingContract"),
+            "Order":fields("uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder"),
+            "TypedDataSign":fields("Order contents,string name,string version,uint256 chainId,address verifyingContract,bytes32 salt")},
+        "primaryType":"TypedDataSign", "message":{"contents":{"salt":salt,"maker":funder,"signer":funder,"tokenId":"42","makerAmount":quantity,"takerAmount":"20000000","side":0,"signatureType":3,"timestamp":"1765432100000","metadata":format!("0x{}","00".repeat(32)),"builder":format!("0x{}","00".repeat(32))},
+            "name":"DepositWallet","version":"1","chainId":137,"verifyingContract":funder,"salt":format!("0x{}","00".repeat(32))}
+    });
+    let typed: alloy_dyn_abi::eip712::TypedData = serde_json::from_value(typed).unwrap();
+    let mut payload = vec![0x19, 0x01];
+    payload.extend_from_slice(typed.domain.separator().as_slice());
+    payload.extend_from_slice(typed.hash_struct().unwrap().as_slice());
+    let witness=serde_json::to_vec(&json!([{
+        "operation":"order","intent":"polymarket.order.poly1271","owner":owner,
+        "signing_hash":format!("{:#x}",alloy::primitives::keccak256(&payload)),"signing_preimage_hex":hex::encode(&payload),
+        "preimage":{"chain_id":137,"owner":owner,"funder":funder,"token_id":"42","salt":salt,"maker_amount":quantity,
+            "taker_amount":"20000000","side":0,"signature_type":3,"timestamp_ms":"1765432100000","neg_risk":false}
+    }])).unwrap();
+    (payload, witness)
+}
+
 fn petal_sign_request(
     terms: &SealedApprovalTerms,
     operation_id: OperationId,
@@ -2399,6 +2440,7 @@ fn petal_sign_request(
     claim_payload_digest.update((payload.len() as u64).to_be_bytes());
     claim_payload_digest.update(payload);
     let claim = PetalUseClaim {
+        economic_effects: None,
         package_hash: package_hash.clone(),
         route: route.into(),
         operation_class: Token::new("exchange-order").unwrap(),
@@ -2429,6 +2471,7 @@ fn petal_sign_request(
         policy_digest: terms.policy_digest.clone(),
     };
     MachineSignRequest {
+        session_use: None,
         operation_id,
         operation_digest: identity.digest(),
         approval_id: terms.approval_id().unwrap(),
@@ -2468,6 +2511,7 @@ fn exact_petal_sign_request(
         policy_digest: terms.policy_digest.clone(),
     };
     MachineSignRequest {
+        session_use: None,
         operation_id,
         operation_digest: identity.digest(),
         approval_id: terms.approval_id().unwrap(),
@@ -4276,6 +4320,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             active: true,
         }),
         operation_classes: vec![ProvenanceOperationClass {
+            economic_effects_schema: None,
             operation_class: Token::new("exchange-order").unwrap(),
             fee_asset: None,
         }],
@@ -4503,6 +4548,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         not_before_ms: DecimalU64::new(approval_now_ms),
         expires_at_ms: DecimalU64::new(approval_expires_at_ms),
         renewal_of: None,
+        session_budget: None,
     };
     // A native EVM review reads the creation opt-in from the policy the terms
     // are bound to: terms naming another policy are refused before review.
@@ -4566,6 +4612,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         route: safe_route.into(),
     };
     safe_provenance.operation_classes = vec![ProvenanceOperationClass {
+        economic_effects_schema: None,
         operation_class: Token::new(bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS).unwrap(),
         fee_asset: None,
     }];
@@ -6036,6 +6083,238 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .is_err()
     );
 
+    // A new owner-reviewed group on the ordinary account shares one
+    // collateral budget across independent grants. Two distinct actions under
+    // the first grant need no intervening ceremony; another grant cannot get
+    // a second copy of the advertised cap. Everything is disposable/local.
+    {
+        use bloom_broker_api::{SessionBudget, SessionValueCeiling};
+        let now: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap();
+        let n = |v: &str| DecimalU256::parse(v).unwrap();
+        let collateral = AssetId {
+            chain: Token::new("polygon").unwrap(),
+            asset: "pusd".into(),
+        };
+        let group_limits = ApprovalLimits {
+            max_operations: DecimalU64::new(10),
+            max_signatures: DecimalU64::new(10),
+            operation_rate_limits: vec![],
+            signature_rate_limits: vec![],
+            value_limits: vec![bloom_broker_api::ValueLimit {
+                asset: collateral.clone(),
+                lifetime: n("3000000"),
+                rolling_windows: vec![],
+            }],
+        };
+        let budget = SessionBudget {
+            token_policy: None,
+            wallet_id: wallet_id.clone(),
+            policy_version: committed.committed.version.clone(),
+            policy_digest: committed.committed.policy_digest.clone(),
+            wallet_revocation_epoch: DecimalU64::new(authority.wallet_epoch(&wallet_id).unwrap()),
+            member_keys: vec![parent_key.clone()],
+            limits: group_limits,
+            per_action_value_limits: vec![SessionValueCeiling {
+                asset: collateral.clone(),
+                maximum: n("2000000"),
+            }],
+            not_before_ms: DecimalU64::new(now),
+            expires_at_ms: DecimalU64::new(now + 60000),
+        };
+        let group_route = "/petals/fixture/polymarket-buy";
+        let mut group_provenance = petal_provenance.clone();
+        group_provenance.subject = ProvenanceSubject::Petal {
+            package_hash: petal_package.clone(),
+            route: group_route.into(),
+        };
+        group_provenance.operation_classes = vec![ProvenanceOperationClass {
+            economic_effects_schema: None,
+            operation_class: Token::new("polymarket.order.poly1271").unwrap(),
+            fee_asset: None,
+        }];
+        sign_provenance(&mut group_provenance, &installer_key);
+        authority.install_provenance(&group_provenance).unwrap();
+        let mut grant = approval_terms.clone();
+        grant.provenance_digest = group_provenance.digest().unwrap();
+        grant.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Keccak256Recoverable];
+        grant.selector = ApprovalSelector::Petal {
+            package_hash: petal_package.clone(),
+            route: group_route.into(),
+            allowed_operation_classes: vec![Token::new("polymarket.order.poly1271").unwrap()],
+            route_grants: vec![],
+            required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+        };
+        grant.key_ref = parent_key.clone();
+        grant.subject = ApprovalSubject::Petal {
+            package_hash: petal_package.clone(),
+            route: group_route.into(),
+            agent_id: None,
+        };
+        grant.not_before_ms = DecimalU64::new(now);
+        grant.issued_at_ms = DecimalU64::new(now);
+        grant.expires_at_ms = DecimalU64::new(now + 60000);
+        grant.request_nonce = RequestNonce::from_bytes([0xaa; 16]);
+        grant.session_budget = Some(budget.clone());
+        grant.limits.max_operations = DecimalU64::new(8);
+        grant.limits.max_signatures = DecimalU64::new(8);
+        grant.limits.value_limits = vec![bloom_broker_api::ValueLimit {
+            asset: collateral.clone(),
+            lifetime: n("10000000"),
+            rolling_windows: vec![],
+        }];
+        let mut other = grant.clone();
+        other.request_nonce = RequestNonce::from_bytes([0xab; 16]);
+        for (terms, id, count) in [(&grant, operation("aa"), 50), (&other, operation("ab"), 51)] {
+            let prepared = prepare_scoped_approval(&restarted_scoped_broker, terms, id.clone())
+                .await
+                .unwrap();
+            let (status, body) = complete_scoped_ceremony(
+                &restarted_scoped_broker,
+                &authenticator,
+                terms,
+                &prepared,
+                &id,
+                &key_to_signer(&parent_key),
+                count,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        }
+        let signed_request =
+            |terms: &SealedApprovalTerms, id: &str, _payload: &[u8], quantity: &str| {
+                let (payload, witness) = polymarket_buy_witness(owner, quantity, id);
+                let mut request = petal_sign_request(
+                    terms,
+                    operation(id),
+                    petal_package.clone(),
+                    group_route,
+                    &payload,
+                );
+                request.crypto_suite = CryptoSuite::Secp256k1Keccak256Recoverable;
+                request.claim_assurance_evidence = Some(Base64UrlBytes::from_bytes(&witness));
+                let claim = request.petal_use_claim.as_mut().unwrap();
+                claim.crypto_suite = request.crypto_suite;
+                claim.operation_class = Token::new("polymarket.order.poly1271").unwrap();
+                claim.ordered_hashes = vec![Digest32::from_bytes(
+                    alloy::primitives::keccak256(&payload).into(),
+                )];
+                claim.declared_debits = vec![DeclaredDebit {
+                    asset: collateral.clone(),
+                    amount: n(quantity),
+                }];
+                request.operation_digest = authority.request_operation_digest(&request).unwrap();
+                request
+            };
+        let first = signed_request(&grant, "ac", b"group action one", "1000000");
+        let first_result = match MachineBrokerService::dispatch(
+            &restarted_scoped_broker,
+            MachineBrokerRequest::SigningSign(first.clone()),
+        )
+        .await
+        .unwrap()
+        {
+            MachineBrokerResponse::SigningSign(result) => result,
+            response => panic!("{response:?}"),
+        };
+        let second = signed_request(&grant, "ad", b"group action two", "1000000");
+        let second_result = match MachineBrokerService::dispatch(
+            &restarted_scoped_broker,
+            MachineBrokerRequest::SigningSign(second),
+        )
+        .await
+        .unwrap()
+        {
+            MachineBrokerResponse::SigningSign(result) => result,
+            response => panic!("{response:?}"),
+        };
+        assert_ne!(first_result.signatures, second_result.signatures);
+        assert_eq!(
+            restarted_scoped_broker.ceremony().status(&operation("aa")),
+            Some(CeremonyState::Completed)
+        );
+        let before = journal
+            .session_budget_state(&grant.approval_id().unwrap(), now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.operations.get(), 2);
+        assert_eq!(
+            before
+                .asset_usage
+                .iter()
+                .find(|v| v.asset == collateral)
+                .unwrap()
+                .amount,
+            n("2000000")
+        );
+        let replay = match MachineBrokerService::dispatch(
+            &restarted_scoped_broker,
+            MachineBrokerRequest::SigningSign(first.clone()),
+        )
+        .await
+        .unwrap()
+        {
+            MachineBrokerResponse::SigningSign(result) => result,
+            response => panic!("{response:?}"),
+        };
+        assert_eq!(replay, first_result);
+        let after = journal
+            .session_budget_state(&grant.approval_id().unwrap(), now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before, after, "retry must not reserve or spend twice");
+        let mut mutated = first.clone();
+        mutated.payloads = SigningPayloads::Single {
+            payload: Base64UrlBytes::from_bytes(b"different replay bytes"),
+        };
+        assert!(
+            MachineBrokerService::dispatch(
+                &restarted_scoped_broker,
+                MachineBrokerRequest::SigningSign(mutated)
+            )
+            .await
+            .is_err()
+        );
+        let too_much = signed_request(&other, "ae", b"different child grant action", "2000000");
+        assert!(
+            MachineBrokerService::dispatch(
+                &restarted_scoped_broker,
+                MachineBrokerRequest::SigningSign(too_much)
+            )
+            .await
+            .is_err(),
+            "second grant must share the first grant's spent budget"
+        );
+        MachineBrokerService::dispatch(
+            &restarted_scoped_broker,
+            MachineBrokerRequest::SealedApprovalRevoke(RevokeRequest {
+                operation_id: operation("af"),
+                approval_id: grant.approval_id().unwrap(),
+                wallet_id: wallet_id.clone(),
+                reason: "end disposable session".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            MachineBrokerService::dispatch(
+                &restarted_scoped_broker,
+                MachineBrokerRequest::SigningSign(signed_request(
+                    &grant,
+                    "b0",
+                    b"after group grant revoke",
+                    "1"
+                ))
+            )
+            .await
+            .is_err()
+        );
+    }
+
     let now_after_scope_ms: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -6736,6 +7015,7 @@ async fn review_plan_formats_known_asset_base_units_without_hiding_raw_authority
         SigningKey::from_bytes(&[32; 32]),
     );
     let claim = PetalUseClaim {
+        economic_effects: None,
         package_hash: digest("91"),
         route: "/mainnet/exchange/wallet/usd_send.json".into(),
         operation_class: Token::new("hyperliquid.usd_send").unwrap(),
@@ -11917,4 +12197,218 @@ fn run_node(script: &str) -> std::process::Output {
         .expect("node stdin writer")
         .expect("write node script");
     output
+}
+
+#[test]
+fn key_scope_and_grouped_session_review_helpers_execute_without_scope_errors() {
+    let source = include_str!("../src/ceremony_assets/app.js");
+    let start = source.find("const PETAL_ACTIONS").unwrap();
+    let end = source[start..].find("// Policy updates:").unwrap() + start;
+    let functions = &source[start..end];
+    let script = format!(
+        r#"
+const fmtRemaining = value => String(value);
+const canonicalJson = value => JSON.stringify(value);
+{functions}
+const key=describePetalScope({{allowed_operation_classes:["polymarket.order"],maximum_lifetime_ms:"60000",package_hash:"abc"}});
+if (!key || !key.facts.some(f=>f[0]==="Session lasts")) throw new Error("key-scope review failed");
+const asset={{chain:"evm-137",asset:"pusd"}};
+const budget={{per_action_value_limits:[{{asset,maximum:"100000000"}}],limits:{{value_limits:[{{asset,lifetime:"999999999999999999999999999999",rolling_windows:[{{maximum:"1000000000",duration_ms:"86400000"}}]}}]}},token_policy:{{schema_version:3,assets:[{{asset,decimals:6,symbol:"pUSD"}}],member_templates:[{{subject:{{kind:"petal",package_hash:"reviewed-package",route:"reviewed-route"}},provenance_digest:"reviewed-provenance"}}]}}}};
+const terms={{subject:{{package_hash:"abc"}},selector:{{kind:"petal",package_hash:"abc",allowed_operation_classes:["polymarket.order.poly1271"]}},limits:{{max_operations:"18446744073709551615"}},session_budget:budget,not_before_ms:"1000",expires_at_ms:"18446744073709551615",activation_mode:{{kind:"durable_local"}}}};
+const session=describePetalApproval({{canonical_plan:JSON.stringify({{terms,session_budget_id:"budget-identity",asset_amounts:[]}})}});
+const facts=JSON.stringify(session.facts);
+for(const needle of ["budget-identity","100 pUSD","1000 pUSD","24 hours","Until you revoke","reviewed-package","reviewed-route","reviewed-provenance","dishonest app"]) {{if(!facts.includes(needle)) throw new Error("token review omitted "+needle);}}
+if(facts.includes("CoinGecko") || facts.includes("nominal") || facts.includes("USD caps")) throw new Error("retired pricing shown");
+const nativeScope={{actions:["native_transfer"],chains:[{{chain:"solana-mainnet",genesis_hash:"reviewed-genesis"}}],destinations:[{{chain:"solana-mainnet",destination:"reviewed-recipient"}}],per_action_value_limits:[{{asset:{{chain:"solana-mainnet",asset:"native"}},maximum:"123456789"}}]}};
+const nativeReview=describePetalApproval({{canonical_plan:JSON.stringify({{terms:{{...terms,selector:{{kind:"system_session",scope:nativeScope}}}},session_budget_id:"budget-identity"}})}});
+for(const needle of ["reviewed-genesis","reviewed-recipient","123456789"]) {{if(!JSON.stringify(nativeReview.facts).includes(needle))throw new Error("native scope omitted "+needle);}}
+process.stdout.write("session-review-ok");
+"#
+    );
+    let output = run_node(&script);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "session-review-ok");
+}
+
+#[tokio::test]
+async fn onboarding_page_is_local_and_host_bound_with_a_narrow_bridge_csp() {
+    let broker = CeremonyBroker::new(Arc::new(MockSigner::new()));
+    let app = broker.router();
+    let get = |path: &str, host: &str| {
+        Request::builder()
+            .uri(path)
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let page = app
+        .clone()
+        .oneshot(get("/onboarding/", "localhost:18734"))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let csp = page.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap();
+    assert!(csp.contains("connect-src 'self' http://127.0.0.1:*"));
+    assert!(csp.contains("frame-src 'self'"));
+    assert!(csp.contains("frame-ancestors 'none'"));
+    assert_eq!(page.headers()["x-frame-options"], "DENY");
+    assert_eq!(page.headers()[header::CACHE_CONTROL], "no-store");
+    assert!(
+        !page
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+    );
+    let html = String::from_utf8(
+        page.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("/assets/style.css"));
+    assert!(html.contains("/assets/theme.css"));
+    for path in [
+        "/onboarding/",
+        "/onboarding/app.js",
+        "/onboarding/style.css",
+    ] {
+        let wrong_host = app
+            .clone()
+            .oneshot(get(path, "attacker.example"))
+            .await
+            .unwrap();
+        assert_eq!(wrong_host.status(), StatusCode::NOT_FOUND);
+        assert!(
+            wrong_host.headers()[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .contains("frame-ancestors 'none'")
+        );
+    }
+    let remote = broker
+        .for_remote_origin("https://abcdefghijklmnopqrstuv2345.relay.bloom.directory")
+        .unwrap()
+        .router();
+    for path in [
+        "/onboarding/",
+        "/onboarding/app.js",
+        "/onboarding/style.css",
+    ] {
+        let denied = remote
+            .clone()
+            .oneshot(get(
+                path,
+                "abcdefghijklmnopqrstuv2345.relay.bloom.directory",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn onboarding_framing_requires_a_valid_local_ceremony_capability_and_explicit_opt_in() {
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        Arc::new(MockSigner::new()),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[31; 32]),
+    );
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let prepared = broker
+        .prepare_approval(approval_request(), ReviewManifestContext::default(), now_ms)
+        .unwrap();
+    let token = url_token(&prepared.ceremony_url);
+    let app = broker.router();
+    for query in ["", "?onboarding=0", "?onboarding=1"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/ceremony/{token}{query}"))
+                    .header(header::HOST, "localhost:18734")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let embed = query == "?onboarding=1";
+        assert_eq!(
+            response.headers()["x-frame-options"],
+            if embed { "SAMEORIGIN" } else { "DENY" }
+        );
+        assert!(
+            response.headers()[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .contains(if embed {
+                    "frame-ancestors 'self'"
+                } else {
+                    "frame-ancestors 'none'"
+                })
+        );
+    }
+    let invalid = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ceremony/invalid?onboarding=1")
+                .header(header::HOST, "localhost:18734")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::NOT_FOUND);
+    assert_eq!(invalid.headers()["x-frame-options"], "DENY");
+    let remote = broker
+        .for_remote_origin("https://abcdefghijklmnopqrstuv2345.relay.bloom.directory")
+        .unwrap()
+        .router();
+    let denied = remote
+        .oneshot(
+            Request::builder()
+                .uri(format!("/ceremony/{token}?onboarding=1"))
+                .header(
+                    header::HOST,
+                    "abcdefghijklmnopqrstuv2345.relay.bloom.directory",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(denied.headers()["x-frame-options"], "DENY");
+    let hosted_shell = broker
+        .for_remote_origin("https://abcdefghijklmnopqrstuv2345.relay.bloom.directory")
+        .unwrap()
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/ceremony/?onboarding=1")
+                .header(
+                    header::HOST,
+                    "abcdefghijklmnopqrstuv2345.relay.bloom.directory",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hosted_shell.status(), StatusCode::OK);
+    assert_eq!(hosted_shell.headers()["x-frame-options"], "DENY");
 }

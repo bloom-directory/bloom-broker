@@ -366,12 +366,12 @@ pub(crate) fn review(
                 call.fields
                     .iter()
                     .filter(|field| {
-                        !matches!(
+                        !(matches!(
                             field.label.as_str(),
                             "Safe transaction" | "Safe calls" | "Safe sends" | "Operation"
-                        ) && !field.label.starts_with("Owner signatures")
-                            && !(field.raw == "0"
-                                && matches!(field.label.as_str(), "Safe gas limit" | "Base gas"))
+                        ) || field.label.starts_with("Owner signatures")
+                            || (field.raw == "0"
+                                && matches!(field.label.as_str(), "Safe gas limit" | "Base gas")))
                     })
                     .flat_map(|field| {
                         let label = field.label.trim_start_matches("Safe transaction · ");
@@ -536,6 +536,7 @@ mod tests {
             petal_use_claim: None,
             system_use_claim: None,
             terms: SealedApprovalTerms {
+                session_budget: None,
                 subject: ApprovalSubject::Petal {
                     package_hash: digest.clone(),
                     route: "transactions/a/b/confirm.json".into(),
@@ -965,6 +966,7 @@ mod tests {
         let from = address("0x3000000000000000000000000000000000000000", "owner").unwrap();
         let mut request = request(envelope());
         let claim = PetalUseClaim {
+            economic_effects: None,
             package_hash: Digest32::from_bytes([1; 32]),
             route: "transactions/a/b/confirm.json".into(),
             operation_class: token(SAFE_CONFIRM_OPERATION_CLASS),
@@ -980,6 +982,7 @@ mod tests {
         request.petal_use_claim = Some(claim.clone());
         assert!(review(&request, &policy(), from).unwrap().is_some());
         request.petal_use_claim = Some(PetalUseClaim {
+            economic_effects: None,
             declared_destinations: vec![DeclaredDestination {
                 chain: token("evm-31337"),
                 destination: "0x4000000000000000000000000000000000000000".into(),

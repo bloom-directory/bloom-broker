@@ -535,6 +535,7 @@ pub(crate) mod tests {
                 not_before_ms: DecimalU64::new(10),
                 expires_at_ms: DecimalU64::new(20),
                 renewal_of: None,
+                session_budget: None,
             },
         }
     }
@@ -1038,6 +1039,7 @@ pub(crate) mod tests {
         };
         let mut req = request(&tx.encoded_for_signing());
         req.petal_use_claim = Some(PetalUseClaim {
+            economic_effects: None,
             package_hash: Digest32::from_bytes([9; 32]),
             route: "orders/place".into(),
             operation_class: Token::new("transaction.confirm").unwrap(),

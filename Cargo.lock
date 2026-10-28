@@ -1125,6 +1125,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "ureq",
  "uuid",
  "x509-parser",
  "zeroize",
@@ -1138,6 +1139,7 @@ dependencies = [
  "bloom-rpc-wire",
  "bs58",
  "hex",
+ "num-bigint 0.4.8",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -1285,7 +1287,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=10b6c3f58fd03bd1746b72224299de2a9f77152f#10b6c3f58fd03bd1746b72224299de2a9f77152f"
 dependencies = [
  "blake3",
  "bloom-audit-checkpoint",
@@ -1332,7 +1334,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=10b6c3f58fd03bd1746b72224299de2a9f77152f#10b6c3f58fd03bd1746b72224299de2a9f77152f"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek 3.0.0",
@@ -1347,7 +1349,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-backend-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=10b6c3f58fd03bd1746b72224299de2a9f77152f#10b6c3f58fd03bd1746b72224299de2a9f77152f"
 dependencies = [
  "bloom-signer-api",
  "serde",
@@ -1358,7 +1360,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-backend-local"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=10b6c3f58fd03bd1746b72224299de2a9f77152f#10b6c3f58fd03bd1746b72224299de2a9f77152f"
 dependencies = [
  "bip32 0.6.0-rc.0",
  "bloom-signer-api",
@@ -1381,7 +1383,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=10b6c3f58fd03bd1746b72224299de2a9f77152f#10b6c3f58fd03bd1746b72224299de2a9f77152f"
 dependencies = [
  "bip39",
  "ed25519-dalek 3.0.0",
@@ -1398,7 +1400,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-process-hardening"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=10b6c3f58fd03bd1746b72224299de2a9f77152f#10b6c3f58fd03bd1746b72224299de2a9f77152f"
 dependencies = [
  "libc",
  "zeroize",
@@ -1407,7 +1409,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-vectors"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=10b6c3f58fd03bd1746b72224299de2a9f77152f#10b6c3f58fd03bd1746b72224299de2a9f77152f"
 
 [[package]]
 name = "bloom-solana-clear-signing"
@@ -1904,9 +1906,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-bigint"
-version = "0.7.5"
+version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a52aa3fcda4e6302a9f48734f234d35d4721b96f8fe07d073f07ce9df4f0271"
+checksum = "9c035cb64cba03dad2fb921f3e218785e8cf9a41790da5eb3a1400f62fa2be11"
 dependencies = [
  "cpubits",
  "ctutils",
@@ -1941,9 +1943,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "fe3e9d21d39e6f39ff46e03d5b621424f88ee23d8a1672c6bfc9ccc7f2da4f6a"
 dependencies = [
  "cmov",
  "subtle",
@@ -2367,7 +2369,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d65aa39b3a5c1c9c1b745c9a019234bb7a21b77abcb4f4d266d706e2d577d65"
 dependencies = [
  "base16ct 1.0.0",
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.10",
  "crypto-common 0.2.2",
  "digest 0.11.3",
  "ff 0.14.0",
@@ -3900,7 +3902,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c555a6e4eb7d4e158fcb028c835c3b8642206ddc279b5c6b202ef9a8bdb592f4"
 dependencies = [
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.10",
  "crypto-common 0.2.2",
  "ff 0.14.0",
  "rand_core 0.10.1",
@@ -4187,7 +4189,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4a459cddafb3fe76b31fd8f1108007566c40301feb64dc7b54656eb7388172b"
 dependencies = [
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.10",
  "hmac 0.13.0",
 ]
 

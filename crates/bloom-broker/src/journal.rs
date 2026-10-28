@@ -368,6 +368,10 @@ impl BrokerJournal {
                 UNIQUE (parent_operation_id, ordinal),
                 UNIQUE (child_operation_id)
             );
+            CREATE TABLE IF NOT EXISTS session_pools (budget_id TEXT PRIMARY KEY, descriptor_jcs TEXT NOT NULL, state TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS session_stops (operation_id TEXT PRIMARY KEY,budget_id TEXT NOT NULL,reason TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS session_members (budget_id TEXT NOT NULL,scope_digest TEXT NOT NULL,approval_id TEXT NOT NULL,PRIMARY KEY(budget_id,scope_digest),UNIQUE(approval_id));
+            CREATE TABLE IF NOT EXISTS session_uses (approval_id TEXT NOT NULL, operation_id TEXT NOT NULL, budget_id TEXT NOT NULL, record_jcs TEXT NOT NULL, PRIMARY KEY(approval_id,operation_id));
             CREATE TABLE IF NOT EXISTS reservations (
                 approval_id TEXT NOT NULL,
                 operation_id TEXT NOT NULL,
@@ -670,6 +674,22 @@ impl BrokerJournal {
                 new.renewal_of.map(Digest32::as_str)
             ],
         )?;
+        let terms: SealedApprovalTerms = serde_json::from_str(new.terms_jcs).map_err(storage)?;
+        if let Some(budget) = terms
+            .session_budget
+            .as_ref()
+            .filter(|b| b.token_policy.is_some())
+        {
+            let id = budget.budget_id().map_err(JournalError::Protocol)?;
+            let descriptor = serde_jcs::to_string(budget).map_err(storage)?;
+            transaction.execute("INSERT OR IGNORE INTO session_pools(budget_id,descriptor_jcs,state) VALUES(?1,?2,'PENDING')",params![id.as_str(),descriptor])?;
+            let scope = bloom_broker_api::session_member_scope_digest(&terms)
+                .map_err(JournalError::Protocol)?;
+            transaction.execute(
+                "INSERT INTO session_members(budget_id,scope_digest,approval_id) VALUES(?1,?2,?3)",
+                params![id.as_str(), scope.as_str(), approval_id.as_str()],
+            )?;
+        }
         self.append_audit_transaction(
             &transaction,
             "approval.prepared",
@@ -684,6 +704,56 @@ impl BrokerJournal {
         drop(connection);
         self.checkpoint_committed_head()?;
         self.after_durable(DurablePoint::ApprovalTransition)
+    }
+
+    pub fn prepare_standing_rearm(
+        &self,
+        id: &Digest32,
+        review: &Digest32,
+    ) -> Result<(), JournalError> {
+        let mut connection = self.lock_for_mutation()?;
+        let transaction = connection.transaction()?;
+        let (terms,state):(String,String)=transaction.query_row("SELECT terms_jcs,state FROM approval_metadata JOIN approvals USING(approval_id) WHERE approval_id=?1",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let terms: SealedApprovalTerms = serde_json::from_str(&terms).map_err(storage)?;
+        if state != "ACTIVE"
+            || terms.expires_at_ms.get() != u64::MAX
+            || !matches!(
+                terms.activation_mode,
+                bloom_broker_api::ActivationMode::DurableLocal { .. }
+            )
+        {
+            return Err(protocol(
+                ProtocolErrorCode::ApprovalRevoked,
+                "standing permission is not active",
+            )
+            .into());
+        }
+        if let Some(budget) = terms
+            .session_budget
+            .as_ref()
+            .filter(|b| b.token_policy.is_some())
+        {
+            check_session_pool(
+                &transaction,
+                &budget.budget_id().map_err(JournalError::Protocol)?,
+                budget,
+                budget.not_before_ms.get(),
+            )?;
+        }
+        transaction.execute(
+            "UPDATE approval_metadata SET review_manifest_digest=?2 WHERE approval_id=?1",
+            params![id.as_str(), review.as_str()],
+        )?;
+        self.append_audit_transaction(
+            &transaction,
+            "approval.rearm_prepared",
+            &serde_json::json!({"approval_id":id,"review_manifest_digest":review}),
+            self.audit_signer.as_ref(),
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
+        Ok(())
     }
 
     pub fn approval_record(
@@ -769,7 +839,7 @@ impl BrokerJournal {
                 .ok_or_else(|| {
                     protocol(ProtocolErrorCode::ApprovalNotFound, "approval not found")
                 })?;
-        if let Some(existing_operation) = existing_operation {
+        let rearm = if let Some(existing_operation) = existing_operation {
             if existing_operation == activation_operation_id.as_str()
                 && parse_approval_state(&state)? == ApprovalLifecycleState::Active
             {
@@ -778,19 +848,36 @@ impl BrokerJournal {
                 self.checkpoint_committed_head()?;
                 return Ok(());
             }
-            return Err(protocol(
-                ProtocolErrorCode::OperationIdConflict,
-                "approval ceremony activation was replayed with conflicting authority",
-            )
-            .into());
-        }
-        if parse_approval_state(&state)? != ApprovalLifecycleState::AwaitingCeremony {
-            return Err(protocol(
-                ProtocolErrorCode::OperationIdConflict,
-                "approval is not awaiting ceremony activation",
-            )
-            .into());
-        }
+            let terms: String = transaction.query_row(
+                "SELECT terms_jcs FROM approval_metadata WHERE approval_id=?1",
+                [approval_id.as_str()],
+                |r| r.get(0),
+            )?;
+            let terms: SealedApprovalTerms = serde_json::from_str(&terms).map_err(storage)?;
+            if parse_approval_state(&state)? != ApprovalLifecycleState::Active
+                || terms.expires_at_ms.get() != u64::MAX
+                || !matches!(
+                    terms.activation_mode,
+                    bloom_broker_api::ActivationMode::DurableLocal { .. }
+                )
+            {
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "approval activation conflicts with existing authority",
+                )
+                .into());
+            }
+            true
+        } else {
+            if parse_approval_state(&state)? != ApprovalLifecycleState::AwaitingCeremony {
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "approval is not awaiting activation",
+                )
+                .into());
+            }
+            false
+        };
         if let Some(replacement) = &renewal_of {
             let replacement_state: String = transaction
                 .query_row(
@@ -831,6 +918,7 @@ impl BrokerJournal {
             "UPDATE approvals SET state = 'ACTIVE' WHERE approval_id = ?1",
             [approval_id.as_str()],
         )?;
+        refresh_approval_session_pool(&transaction, approval_id)?;
         let signer_receipt_digest =
             Digest32::from_bytes(Sha256::digest(ceremony_grant_jcs.as_bytes()).into());
         let signer_receipt: serde_json::Value =
@@ -840,7 +928,7 @@ impl BrokerJournal {
             "approval.transition",
             &serde_json::json!({
                 "approval_id": approval_id,
-                "from": ApprovalLifecycleState::AwaitingCeremony,
+                "from": if rearm {ApprovalLifecycleState::Active} else {ApprovalLifecycleState::AwaitingCeremony},
                 "to": ApprovalLifecycleState::Active,
                 "activation_operation_id": activation_operation_id,
                 "renewal_of": renewal_of,
@@ -888,6 +976,9 @@ impl BrokerJournal {
             "UPDATE approvals SET state = ?2 WHERE approval_id = ?1",
             params![approval_id.as_str(), approval_state_text(next)?],
         )?;
+        if next == ApprovalLifecycleState::Active {
+            refresh_approval_session_pool(&transaction, approval_id)?;
+        }
         self.append_audit_transaction(
             &transaction,
             "approval.transition",
@@ -972,7 +1063,164 @@ impl BrokerJournal {
             committed_signatures: DecimalU64::new(committed_signatures),
             reserved_signatures: DecimalU64::new(reserved_signatures),
             quarantined_signatures: DecimalU64::new(quarantined_signatures),
+            session_budget_state: None,
         })
+    }
+
+    pub fn stop_session_pool(
+        &self,
+        budget_id: &Digest32,
+        operation_id: &OperationId,
+        reason: &str,
+        _now: u64,
+    ) -> Result<Vec<(Digest32, bloom_broker_api::Token)>, JournalError> {
+        if reason.len() > 512 {
+            return Err(protocol(
+                ProtocolErrorCode::MalformedFrame,
+                "session stop reason too long",
+            )
+            .into());
+        }
+        let mut connection = self.lock_for_mutation()?;
+        let transaction = connection.transaction()?;
+        let descriptor: Option<String> = transaction
+            .query_row(
+                "SELECT descriptor_jcs FROM session_pools WHERE budget_id=?1",
+                [budget_id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let descriptor = descriptor.ok_or_else(|| {
+            protocol(
+                ProtocolErrorCode::ApprovalNotFound,
+                "session pool not found",
+            )
+        })?;
+        let budget: bloom_broker_api::SessionBudget =
+            serde_json::from_str(&descriptor).map_err(storage)?;
+        let prior: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT budget_id,reason FROM session_stops WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((id, old_reason)) = prior {
+            if id != budget_id.as_str() || old_reason != reason {
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "stop operation identity changed",
+                )
+                .into());
+            }
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO session_stops(operation_id,budget_id,reason) VALUES(?1,?2,?3)",
+            params![operation_id.as_str(), budget_id.as_str(), reason],
+        )?;
+        transaction.execute(
+            "UPDATE session_pools SET state='STOPPED' WHERE budget_id=?1",
+            [budget_id.as_str()],
+        )?;
+        let ids = {
+            let mut q = transaction.prepare(
+                "SELECT approval_id FROM session_members WHERE budget_id=?1 ORDER BY approval_id",
+            )?;
+            let rows = q.query_map([budget_id.as_str()], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        self.append_audit_transaction(
+            &transaction,
+            "session.stopped",
+            &serde_json::json!({"budget_id":budget_id,"operation_id":operation_id,"reason":reason}),
+            self.audit_signer.as_ref(),
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
+        ids.into_iter()
+            .map(|id| {
+                Digest32::new(id)
+                    .map(|id| (id, budget.wallet_id.clone()))
+                    .map_err(|e| {
+                        JournalError::Protocol(protocol(
+                            ProtocolErrorCode::MalformedFrame,
+                            e.to_string(),
+                        ))
+                    })
+            })
+            .collect()
+    }
+    pub fn session_budget_state(
+        &self,
+        approval_id: &Digest32,
+        now: u64,
+    ) -> Result<Option<bloom_broker_api::SessionBudgetState>, JournalError> {
+        let connection = self.lock()?;
+        let terms: Option<String> = connection
+            .query_row(
+                "SELECT terms_jcs FROM approval_metadata WHERE approval_id=?1",
+                [approval_id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(terms) = terms else {
+            return Ok(None);
+        };
+        let terms: SealedApprovalTerms = serde_json::from_str(&terms).map_err(storage)?;
+        let Some(budget) = terms.session_budget else {
+            return Ok(None);
+        };
+        let id = budget.budget_id().map_err(JournalError::Protocol)?;
+        let mut statement=connection.prepare("SELECT session_uses.approval_id,session_uses.operation_id,session_uses.record_jcs,reservations.state FROM session_uses JOIN reservations USING(approval_id,operation_id) WHERE session_uses.budget_id=?1")?;
+        let rows = statement.query_map([id.as_str()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut previous = Vec::new();
+        for row in rows {
+            let (approval, operation, record, state) = row?;
+            if budget.token_policy.is_some() {
+                verify_session_use_evidence(
+                    &connection,
+                    &approval,
+                    &operation,
+                    &record,
+                    Some(self.audit_signer.as_ref()),
+                )?;
+            }
+            if state == "RELEASED" {
+                continue;
+            }
+            previous.push(
+                serde_json::from_str::<bloom_broker_api::SessionRecordedUse>(&record)
+                    .map_err(storage)?,
+            );
+        }
+        let mut usage = budget
+            .usage_state(&previous, now)
+            .map_err(JournalError::Protocol)?;
+        if budget.token_policy.is_some() {
+            let state: String = connection.query_row(
+                "SELECT state FROM session_pools WHERE budget_id=?1",
+                [id.as_str()],
+                |r| r.get(0),
+            )?;
+            usage.pool_state = Some(if state == "STOPPED" {
+                bloom_broker_api::SessionPoolState::Stopped
+            } else if now >= budget.expires_at_ms.get() {
+                bloom_broker_api::SessionPoolState::Expired
+            } else if state == "ACTIVE" {
+                bloom_broker_api::SessionPoolState::Active
+            } else {
+                bloom_broker_api::SessionPoolState::Pending
+            });
+        }
+        Ok(Some(usage))
     }
 
     pub fn begin_sign_attempt(
@@ -1418,6 +1666,25 @@ impl BrokerJournal {
                 !limits.rate_limits.is_empty() || !limits.rolling_value_limits.is_empty(),
             )?;
         }
+        // Pool stop fences even retries of reserved operations before dispatch.
+        let session_terms: Option<String> = transaction
+            .query_row(
+                "SELECT terms_jcs FROM approval_metadata WHERE approval_id=?1",
+                [request.approval_id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(terms) = session_terms {
+            let terms: SealedApprovalTerms = serde_json::from_str(&terms).map_err(storage)?;
+            if let Some(budget) = terms.session_budget.filter(|b| b.token_policy.is_some()) {
+                check_session_pool(
+                    &transaction,
+                    &budget.budget_id().map_err(JournalError::Protocol)?,
+                    &budget,
+                    request.reserved_at_ms,
+                )?;
+            }
+        }
         if let Some(existing) = reservation_state(&transaction, request)? {
             if existing == ReservationState::Reserved {
                 if reservation_matches(&transaction, request)? {
@@ -1485,6 +1752,7 @@ impl BrokerJournal {
             )
             .into());
         }
+        reserve_session_budget(&transaction, request, self.audit_signer.as_ref())?;
         validate_rate_limits(&transaction, request, limits)?;
         validate_value_limits(&transaction, request, limits)?;
         validate_rolling_value_limits(&transaction, request, limits)?;
@@ -1517,6 +1785,14 @@ impl BrokerJournal {
                 ],
             )?;
         }
+        let session_record:Option<(String,String)>=transaction.query_row("SELECT budget_id,record_jcs FROM session_uses WHERE approval_id=?1 AND operation_id=?2",params![request.approval_id.as_str(),request.operation_id.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let session_binding = session_record
+            .map(|(id, record)| -> Result<_, JournalError> {
+                let record: bloom_broker_api::SessionRecordedUse =
+                    serde_json::from_str(&record).map_err(storage)?;
+                Ok((id, session_use_record_digest(&record)?))
+            })
+            .transpose()?;
         self.append_audit_transaction(
             &transaction,
             "reservation.created",
@@ -1525,7 +1801,11 @@ impl BrokerJournal {
                 "operation_id": request.operation_id,
                 "operation_digest": request.operation_digest,
                 "signature_count": request.signature_count,
-                "values": request.values
+                "values": request.values,
+                "reserved_at_ms": request.reserved_at_ms,
+                "correlation_schema": if session_binding.is_some(){Some("v1")}else{None},
+                "budget_id": session_binding.as_ref().map(|b| &b.0),
+                "session_record_digest": session_binding.as_ref().map(|b| &b.1)
             }),
             self.audit_signer.as_ref(),
         )?;
@@ -1574,13 +1854,30 @@ impl BrokerJournal {
                 .into());
             }
         }
+        self.finalize_reservation_in_transaction(&transaction, approval_id, operation_id, next)?;
+        transaction.commit()?;
+        drop(connection);
+        self.checkpoint_committed_head()?;
+        self.after_durable(DurablePoint::ReservationFinalized)
+    }
+
+    /// Keep the state change and its authenticated evidence in the same
+    /// transaction, including when successful signing publishes its result.
+    /// Callers validate the transition (or require a RESERVED row) first.
+    fn finalize_reservation_in_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        approval_id: &Digest32,
+        operation_id: &OperationId,
+        next: ReservationState,
+    ) -> Result<(), JournalError> {
         transaction.execute(
             "UPDATE reservations SET state = ?3
              WHERE approval_id = ?1 AND operation_id = ?2",
             params![approval_id.as_str(), operation_id.as_str(), next.as_str()],
         )?;
         self.append_audit_transaction(
-            &transaction,
+            transaction,
             "reservation.finalized",
             &serde_json::json!({
                 "approval_id": approval_id,
@@ -1589,10 +1886,7 @@ impl BrokerJournal {
             }),
             self.audit_signer.as_ref(),
         )?;
-        transaction.commit()?;
-        drop(connection);
-        self.checkpoint_committed_head()?;
-        self.after_durable(DurablePoint::ReservationFinalized)
+        Ok(())
     }
 
     pub fn reservation_status(
@@ -1687,10 +1981,11 @@ impl BrokerJournal {
              WHERE operation_id = ?1",
             params![result.operation_id.as_str(), result_jcs],
         )?;
-        transaction.execute(
-            "UPDATE reservations SET state = 'COMMITTED'
-             WHERE approval_id = ?1 AND operation_id = ?2",
-            params![approval_id.as_str(), result.operation_id.as_str()],
+        self.finalize_reservation_in_transaction(
+            &transaction,
+            approval_id,
+            &result.operation_id,
+            ReservationState::Committed,
         )?;
         self.append_audit_transaction(
             &transaction,
@@ -1830,10 +2125,11 @@ impl BrokerJournal {
              WHERE operation_id = ?1",
             params![parent_result.operation_id.as_str(), parent_jcs],
         )?;
-        transaction.execute(
-            "UPDATE reservations SET state = 'COMMITTED'
-             WHERE approval_id = ?1 AND operation_id = ?2",
-            params![approval_id.as_str(), parent_result.operation_id.as_str()],
+        self.finalize_reservation_in_transaction(
+            &transaction,
+            approval_id,
+            &parent_result.operation_id,
+            ReservationState::Committed,
         )?;
         self.append_audit_transaction(
             &transaction,
@@ -2692,6 +2988,25 @@ fn verify_audit_correlation(
         return Ok(());
     }
     let correlated = match event_type {
+        "reservation.created" if payload.get("session_record_digest").is_some() => {
+            let approval_id = payload
+                .get("approval_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(audit_degraded)?;
+            let operation_id = payload
+                .get("operation_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(audit_degraded)?;
+            let record_jcs: String = connection
+                .query_row(
+                    "SELECT record_jcs FROM session_uses WHERE approval_id=?1 AND operation_id=?2",
+                    params![approval_id, operation_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| audit_degraded())?;
+            verify_session_use_evidence(connection, approval_id, operation_id, &record_jcs, None)?;
+            true
+        }
         "operation.received" => {
             let operation_id = payload
                 .get("operation_id")
@@ -2824,6 +3139,198 @@ fn verify_audit_correlation(
     } else {
         Err(audit_degraded())
     }
+}
+
+/// Authenticated reservation events bind the complete immutable use, including
+/// window timing, canonical quantities and the selected provider observations.
+fn session_use_record_digest(
+    record: &bloom_broker_api::SessionRecordedUse,
+) -> Result<Digest32, JournalError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bloom-session-use-record/v1");
+    hasher.update(serde_jcs::to_vec(record).map_err(storage)?);
+    Ok(Digest32::from_bytes(hasher.finalize().into()))
+}
+
+/// Called after the journal's existing audit authentication, both on startup
+/// correlation and before historic records are used for admission/recovery.
+fn verify_session_use_evidence(
+    connection: &Connection,
+    approval_id: &str,
+    operation_id: &str,
+    record_jcs: &str,
+    audit_signer: Option<&dyn AuditSigner>,
+) -> Result<(), JournalError> {
+    struct Event {
+        payload: String,
+        sequence: i64,
+        previous_hash: String,
+        entry_hash: String,
+        key_id: String,
+        signature: String,
+    }
+    fn verify_event(
+        event: &Event,
+        event_type: &str,
+        audit_signer: Option<&dyn AuditSigner>,
+    ) -> Result<(), JournalError> {
+        if let Some(signer) = audit_signer {
+            let sequence = u64::try_from(event.sequence).map_err(|_| audit_degraded())?;
+            let previous =
+                Digest32::new(event.previous_hash.clone()).map_err(|_| audit_degraded())?;
+            let entry_hash =
+                Digest32::new(event.entry_hash.clone()).map_err(|_| audit_degraded())?;
+            let key = Token::new(event.key_id.clone()).map_err(|_| audit_degraded())?;
+            let signature =
+                Base64UrlBytes::parse(event.signature.clone()).map_err(|_| audit_degraded())?;
+            if compute_audit_hash(sequence, event_type, &event.payload, &previous) != entry_hash {
+                return Err(audit_degraded());
+            }
+            signer
+                .verify(&key, &audit_signature_message(&entry_hash), &signature)
+                .map_err(|_| audit_degraded())?;
+        }
+        Ok(())
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT payload_jcs,sequence,previous_hash,entry_hash,signing_key_id,signature FROM audit_chain WHERE event_type='reservation.created'
+         AND json_extract(payload_jcs,'$.approval_id')=?1
+         AND json_extract(payload_jcs,'$.operation_id')=?2",
+        )
+        .map_err(|_| audit_degraded())?;
+    let events = statement
+        .query_map(params![approval_id, operation_id], |row| {
+            Ok(Event {
+                payload: row.get(0)?,
+                sequence: row.get(1)?,
+                previous_hash: row.get(2)?,
+                entry_hash: row.get(3)?,
+                key_id: row.get(4)?,
+                signature: row.get(5)?,
+            })
+        })
+        .map_err(|_| audit_degraded())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| audit_degraded())?;
+    let terms_jcs: String = connection
+        .query_row(
+            "SELECT terms_jcs FROM approval_metadata WHERE approval_id=?1",
+            [approval_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| audit_degraded())?;
+    let terms: SealedApprovalTerms =
+        serde_json::from_str(&terms_jcs).map_err(|_| audit_degraded())?;
+    let budget = terms.session_budget.as_ref().ok_or_else(audit_degraded)?;
+    let payload = match events.as_slice() {
+        [event] => {
+            verify_event(event, "reservation.created", audit_signer)?;
+            serde_json::from_str::<serde_json::Value>(&event.payload)
+                .map_err(|_| audit_degraded())?
+        }
+        // Non-generic legacy raw-unit records predate correlated evidence.
+        // A v3 token record must always have one authenticated bound event.
+        [] if budget.token_policy.is_none() => return Ok(()),
+        _ => return Err(audit_degraded()),
+    };
+    if budget.token_policy.is_none()
+        && payload.get("correlation_schema").and_then(|v| v.as_str()) != Some("v1")
+    {
+        return Ok(());
+    }
+    // A released row cannot free capacity unless the authenticated terminal
+    // event says it was released. Validate it before callers filter usage rows.
+    let state: String = connection
+        .query_row(
+            "SELECT state FROM reservations WHERE approval_id=?1 AND operation_id=?2",
+            params![approval_id, operation_id],
+            |r| r.get(0),
+        )
+        .map_err(|_| audit_degraded())?;
+    let mut finalized = connection.prepare(
+        "SELECT payload_jcs,sequence,previous_hash,entry_hash,signing_key_id,signature FROM audit_chain WHERE event_type='reservation.finalized'
+         AND json_extract(payload_jcs,'$.approval_id')=?1
+         AND json_extract(payload_jcs,'$.operation_id')=?2",
+    ).map_err(|_| audit_degraded())?;
+    let finals = finalized
+        .query_map(params![approval_id, operation_id], |row| {
+            Ok(Event {
+                payload: row.get(0)?,
+                sequence: row.get(1)?,
+                previous_hash: row.get(2)?,
+                entry_hash: row.get(3)?,
+                key_id: row.get(4)?,
+                signature: row.get(5)?,
+            })
+        })
+        .map_err(|_| audit_degraded())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| audit_degraded())?;
+    match finals.as_slice() {
+        [] if state == "RESERVED" => {}
+        [event] if event.sequence > events[0].sequence => {
+            verify_event(event, "reservation.finalized", audit_signer)?;
+            let final_payload: serde_json::Value =
+                serde_json::from_str(&event.payload).map_err(|_| audit_degraded())?;
+            if !matches!(state.as_str(), "COMMITTED" | "QUARANTINED" | "RELEASED")
+                || final_payload.get("state").and_then(|v| v.as_str()) != Some(state.as_str())
+            {
+                return Err(audit_degraded());
+            }
+        }
+        _ => return Err(audit_degraded()),
+    }
+    let record: bloom_broker_api::SessionRecordedUse =
+        serde_json::from_str(record_jcs).map_err(|_| audit_degraded())?;
+    let (budget_id, reserved_at, signatures): (String, String, String) = connection
+        .query_row(
+            "SELECT session_uses.budget_id,reservations.reserved_at_ms,reservations.signature_count
+         FROM session_uses JOIN reservations USING(approval_id,operation_id)
+         WHERE approval_id=?1 AND operation_id=?2",
+            params![approval_id, operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| audit_degraded())?;
+    if payload.get("correlation_schema").and_then(|v| v.as_str()) != Some("v1")
+        || payload.get("budget_id").and_then(|v| v.as_str()) != Some(budget_id.as_str())
+        || budget.budget_id().map_err(|_| audit_degraded())?.as_str() != budget_id
+        || reserved_at != record.accepted_at_ms.to_string()
+        || signatures != record.signature_count.to_string()
+        || payload.get("reserved_at_ms") != Some(&serde_json::json!(record.accepted_at_ms))
+        || payload.get("session_record_digest")
+            != Some(&serde_json::json!(session_use_record_digest(&record)?))
+    {
+        return Err(audit_degraded());
+    }
+    let mut values = connection.prepare(
+        "SELECT asset_id,amount FROM reservation_values WHERE approval_id=?1 AND operation_id=?2 ORDER BY asset_id",
+    ).map_err(|_| audit_degraded())?;
+    let rows = values
+        .query_map(params![approval_id, operation_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| audit_degraded())?
+        .collect::<Result<BTreeMap<_, _>, _>>()
+        .map_err(|_| audit_degraded())?;
+    let canonical = bloom_broker_api::SessionAccounting::canonical_values(&record.values)
+        .map_err(|_| audit_degraded())?;
+    let expected: BTreeMap<String, String> = canonical
+        .iter()
+        .map(|v| {
+            (
+                format!("{}:{}", v.asset.chain.as_str(), v.asset.asset),
+                v.amount.as_str().to_owned(),
+            )
+        })
+        .collect();
+    if rows != expected {
+        return Err(audit_degraded());
+    }
+    budget
+        .check_action_values(&record.values)
+        .map_err(|_| audit_degraded())?;
+    Ok(())
 }
 
 fn audit_degraded() -> JournalError {
@@ -3401,3 +3908,228 @@ fn valid_operation_transition(current: OperationState, next: OperationState) -> 
         )
     )
 }
+
+fn reserve_session_budget(
+    transaction: &Transaction<'_>,
+    request: &ReservationRequest,
+    audit_signer: &dyn AuditSigner,
+) -> Result<(), JournalError> {
+    use bloom_broker_api::{SessionAssetAmount, SessionRecordedUse};
+    let terms: Option<String> = transaction
+        .query_row(
+            "SELECT terms_jcs FROM approval_metadata WHERE approval_id=?1",
+            [request.approval_id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(terms) = terms else {
+        return Ok(());
+    };
+    let terms: SealedApprovalTerms = serde_json::from_str(&terms).map_err(storage)?;
+    let Some(budget) = &terms.session_budget else {
+        return Ok(());
+    };
+    let id = budget.budget_id().map_err(JournalError::Protocol)?;
+    if budget.token_policy.is_some() {
+        check_session_pool(transaction, &id, budget, request.reserved_at_ms)?;
+    }
+    let previous = {
+        let mut statement=transaction.prepare("SELECT session_uses.approval_id,session_uses.operation_id,session_uses.record_jcs,reservations.state FROM session_uses JOIN reservations USING(approval_id,operation_id) WHERE session_uses.budget_id=?1")?;
+        let rows = statement.query_map([id.as_str()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (approval, operation, record, state) = row?;
+            if budget.token_policy.is_some() {
+                verify_session_use_evidence(
+                    transaction,
+                    &approval,
+                    &operation,
+                    &record,
+                    Some(audit_signer),
+                )?;
+            }
+            if state == "RELEASED" {
+                continue;
+            }
+            records.push(serde_json::from_str::<SessionRecordedUse>(&record).map_err(storage)?);
+        }
+        records
+    };
+    let values = request
+        .values
+        .iter()
+        .map(|(name, amount)| {
+            let asset = budget
+                .per_action_value_limits
+                .iter()
+                .map(|v| &v.asset)
+                .chain(
+                    budget
+                        .token_policy
+                        .iter()
+                        .flat_map(|p| p.assets.iter().map(|a| &a.asset)),
+                )
+                .find(|a| format!("{}:{}", a.chain.as_str(), a.asset) == *name)
+                .ok_or_else(|| {
+                    JournalError::Protocol(protocol(
+                        ProtocolErrorCode::LimitExceededValue,
+                        "asset is outside the shared session budget",
+                    ))
+                })?;
+            Ok(SessionAssetAmount {
+                asset: asset.clone(),
+                amount: amount.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, JournalError>>()?;
+    let current = SessionRecordedUse {
+        accepted_at_ms: request.reserved_at_ms,
+        signature_count: request.signature_count,
+        values,
+    };
+    budget
+        .check_reservation(&previous, &current)
+        .map_err(JournalError::Protocol)?;
+    transaction.execute("INSERT INTO session_uses(approval_id,operation_id,budget_id,record_jcs) VALUES(?1,?2,?3,?4)",params![request.approval_id.as_str(),request.operation_id.as_str(),id.as_str(),serde_jcs::to_string(&current).map_err(storage)?])?;
+    Ok(())
+}
+
+fn check_session_pool(
+    transaction: &Transaction<'_>,
+    id: &Digest32,
+    budget: &bloom_broker_api::SessionBudget,
+    now: u64,
+) -> Result<(), JournalError> {
+    let stopped:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM audit_chain WHERE event_type='session.stopped' AND json_extract(payload_jcs,'$.budget_id')=?1)",[id.as_str()],|r|r.get(0))?;
+    if stopped {
+        return Err(protocol(
+            ProtocolErrorCode::PoolInactive,
+            "session pool is durably stopped",
+        )
+        .into());
+    }
+    let ledger_count: i64 = transaction.query_row(
+        "SELECT count(*) FROM session_uses WHERE budget_id=?1",
+        [id.as_str()],
+        |r| r.get(0),
+    )?;
+    let reservation_count:i64=transaction.query_row("SELECT count(*) FROM reservations JOIN session_members USING(approval_id) WHERE budget_id=?1",[id.as_str()],|r|r.get(0))?;
+    let witnessed_count:i64=transaction.query_row("SELECT count(*) FROM audit_chain WHERE event_type='reservation.created' AND json_extract(payload_jcs,'$.budget_id')=?1",[id.as_str()],|r|r.get(0))?;
+    if ledger_count != reservation_count || ledger_count != witnessed_count {
+        return Err(audit_degraded());
+    }
+    let state: Option<String> = transaction
+        .query_row(
+            "SELECT state FROM session_pools WHERE budget_id=?1",
+            [id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if state.as_deref() == Some("STOPPED") || state.is_none() || now >= budget.expires_at_ms.get() {
+        return Err(protocol(
+            ProtocolErrorCode::PoolInactive,
+            "session pool stopped, expired or missing",
+        )
+        .into());
+    }
+    let policy = budget.token_policy.as_ref().expect("token scope");
+    let mut q=transaction.prepare("SELECT session_members.scope_digest,approvals.state,approval_metadata.terms_jcs FROM session_members JOIN approvals USING(approval_id) JOIN approval_metadata USING(approval_id) WHERE budget_id=?1")?;
+    let rows = q.query_map([id.as_str()], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut live = Vec::new();
+    for row in rows {
+        let (scope, state, terms) = row?;
+        if state != "ACTIVE" {
+            return Err(protocol(
+                ProtocolErrorCode::PoolInactive,
+                "all session members must be active",
+            )
+            .into());
+        }
+        let terms: SealedApprovalTerms = serde_json::from_str(&terms).map_err(storage)?;
+        terms.validate().map_err(JournalError::Protocol)?;
+        if terms.session_budget.as_ref() != Some(budget)
+            || terms.not_before_ms.get() > now
+            || terms.expires_at_ms.get() <= now
+            || bloom_broker_api::session_member_scope_digest(&terms)
+                .map_err(JournalError::Protocol)?
+                .as_str()
+                != scope
+        {
+            return Err(protocol(
+                ProtocolErrorCode::PoolInactive,
+                "session member scope changed",
+            )
+            .into());
+        }
+        live.push(scope);
+    }
+    if live.len() != policy.member_scope_digests.len()
+        || !policy
+            .member_scope_digests
+            .iter()
+            .all(|d| live.iter().any(|v| v == d.as_str()))
+    {
+        return Err(protocol(
+            ProtocolErrorCode::PoolInactive,
+            "session member set incomplete",
+        )
+        .into());
+    }
+    transaction.execute(
+        "UPDATE session_pools SET state='ACTIVE' WHERE budget_id=?1 AND state='PENDING'",
+        [id.as_str()],
+    )?;
+    Ok(())
+}
+
+fn refresh_approval_session_pool(
+    transaction: &Transaction<'_>,
+    approval_id: &Digest32,
+) -> Result<(), JournalError> {
+    let terms: Option<String> = transaction
+        .query_row(
+            "SELECT terms_jcs FROM approval_metadata WHERE approval_id=?1",
+            [approval_id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(terms) = terms else {
+        return Ok(());
+    };
+    let terms: SealedApprovalTerms = serde_json::from_str(&terms).map_err(storage)?;
+    let Some(budget) = terms.session_budget.filter(|b| b.token_policy.is_some()) else {
+        return Ok(());
+    };
+    let id = budget.budget_id().map_err(JournalError::Protocol)?;
+    let start = budget
+        .token_policy
+        .as_ref()
+        .unwrap()
+        .member_templates
+        .iter()
+        .map(|m| m.not_before_ms.get())
+        .max()
+        .unwrap_or(budget.not_before_ms.get());
+    match check_session_pool(transaction, &id, &budget, start) {
+        Ok(()) => Ok(()),
+        Err(JournalError::Protocol(e)) if e.code == ProtocolErrorCode::PoolInactive => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+#[path = "generic_session_journal_tests.rs"]
+mod generic_session_tests;

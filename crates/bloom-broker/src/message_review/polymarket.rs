@@ -312,6 +312,111 @@ fn describe_calls(value: &Value, review: &mut MessageReview) -> Result<(), Proto
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn session_request(prepared: &Prepared) -> bloom_broker_api::MachineSignRequest {
+        use bloom_broker_api::*;
+        let token = |s| Token::new(s).unwrap();
+        let digest = Digest32::from_bytes([1; 32]);
+        let payload = hex::decode(&prepared.signing_preimage_hex).unwrap();
+        let mut claim = PetalUseClaim {
+            economic_effects: None,
+            package_hash: digest.clone(),
+            route: "trade/alice/0/new".into(),
+            operation_class: token("polymarket.order.poly1271"),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: digest.clone(),
+            ordered_hashes: vec![Digest32::from_bytes(keccak256(&payload).into())],
+            declared_debits: vec![],
+            declared_destinations: vec![],
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([1; 16]),
+            claim_assurance: ClaimAssurance::MachineAsserted,
+        };
+        claim.declared_debits = serde_json::from_value(
+            json!([{"asset":{"chain":"polygon","asset":"pusd"},"amount":"11782400"}]),
+        )
+        .unwrap();
+        MachineSignRequest {
+            session_use: None,
+            operation_id: OperationId::from_bytes([1; 32]),
+            operation_digest: digest.clone(),
+            approval_id: digest.clone(),
+            key_ref: KeyRef {
+                backend: token("local"),
+                backend_instance: token("test"),
+                locator: "test".into(),
+                key_spec: KeySpec::Secp256k1,
+                public_key_fingerprint: digest.clone(),
+                derivation: None,
+            },
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payloads: SigningPayloads::Batch {
+                children: vec![Base64UrlBytes::from_bytes(&payload)],
+            },
+            petal_use_claim: Some(claim),
+            system_use_claim: None,
+            claim_assurance_evidence: Some(Base64UrlBytes::from_bytes(
+                &serde_json::to_vec(&vec![prepared]).unwrap(),
+            )),
+            provenance: ProvenanceSubject::Petal {
+                package_hash: digest,
+                route: "trade/alice/0/new".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn session_debit_must_match_signed_buy_economics() {
+        use bloom_broker_api::*;
+        let (prepared, signer) = prepared_order();
+        let request = session_request(&prepared);
+        super::super::verify_polymarket_session_use(&request, signer).unwrap();
+        let verify =
+            |r: &MachineSignRequest| super::super::verify_polymarket_session_use(r, signer);
+        let mut changed = request.clone();
+        changed.petal_use_claim.as_mut().unwrap().declared_debits[0].amount =
+            DecimalU256::parse("1").unwrap();
+        assert!(verify(&changed).is_err());
+        let mut changed = request.clone();
+        changed.petal_use_claim.as_mut().unwrap().declared_debits[0]
+            .asset
+            .asset = "usdc".into();
+        assert!(verify(&changed).is_err());
+        let mut changed = request.clone();
+        changed.claim_assurance_evidence = None;
+        assert!(verify(&changed).is_err());
+        let mut changed = request.clone();
+        changed.payloads = SigningPayloads::Single {
+            payload: Base64UrlBytes::from_bytes(&[1; 66]),
+        };
+        assert!(verify(&changed).is_err());
+        let mut changed = request.clone();
+        changed
+            .petal_use_claim
+            .as_mut()
+            .unwrap()
+            .declared_debits
+            .clear();
+        assert!(verify(&changed).is_err());
+        let mut changed = request.clone();
+        let debit = changed.petal_use_claim.as_ref().unwrap().declared_debits[0].clone();
+        changed
+            .petal_use_claim
+            .as_mut()
+            .unwrap()
+            .declared_debits
+            .push(debit);
+        assert!(verify(&changed).is_err());
+        assert!(super::super::verify_polymarket_session_use(&request, Address::ZERO).is_err());
+        let mut sell = prepared;
+        sell.preimage["side"] = json!(1);
+        let envelope = json!({"schema":super::super::SCHEMA,"kind":"eip712","typed_data":typed(&sell,&sell.intent).unwrap()});
+        let (bytes, _) =
+            super::super::decode(&serde_json::to_vec(&envelope).unwrap(), signer).unwrap();
+        sell.signing_preimage_hex = hex::encode(&bytes);
+        sell.signing_hash = keccak256(bytes);
+        assert!(verify(&session_request(&sell)).is_err());
+    }
+
     #[test]
     fn erc7739_order_matches_independent_known_answer() {
         let signer = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
@@ -385,6 +490,7 @@ mod tests {
             &serde_json::to_vec(&vec![&prepared]).unwrap(),
         )];
         request.petal_use_claim = Some(PetalUseClaim {
+            economic_effects: None,
             package_hash: Digest32::from_bytes([1; 32]),
             route: "payment/a/0/confirm".into(),
             operation_class: Token::new(&prepared.intent).unwrap(),
@@ -404,6 +510,16 @@ mod tests {
         };
         let review = super::super::review(&request, signer).unwrap().unwrap();
         assert_eq!(review.kind, "polymarket_exact");
+        let mut accounted = request.clone();
+        accounted.petal_use_claim.as_mut().unwrap().declared_debits =
+            serde_json::from_value(json!([
+                {"asset":{"chain":"polygon","asset":"pusd"},"amount":"11782400"}
+            ]))
+            .unwrap();
+        super::super::review(&accounted, signer).unwrap();
+        accounted.petal_use_claim.as_mut().unwrap().declared_debits[0].amount =
+            bloom_broker_api::DecimalU256::parse("1").unwrap();
+        assert!(super::super::review(&accounted, signer).is_err());
         let mut changed = request.clone();
         if let ApprovalSelector::Exact { ordered_hashes, .. } = &mut changed.terms.selector {
             ordered_hashes[0] = Digest32::from_bytes([7; 32]);

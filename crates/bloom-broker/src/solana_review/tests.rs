@@ -11,6 +11,7 @@ fn request(bytes: &[u8], class: &str) -> ApprovalPrepareRequest {
     batch.update((bytes.len() as u64).to_be_bytes());
     batch.update(bytes);
     let claim = PetalUseClaim {
+        economic_effects: None,
         package_hash: digest.clone(),
         route: "trade/alice/0/buy.json".into(),
         operation_class: token(class),
@@ -34,6 +35,7 @@ fn request(bytes: &[u8], class: &str) -> ApprovalPrepareRequest {
         petal_use_claim: Some(claim),
         system_use_claim: None,
         terms: SealedApprovalTerms {
+            session_budget: None,
             subject: ApprovalSubject::Petal {
                 package_hash: digest.clone(),
                 route: "trade/alice/0/buy.json".into(),
@@ -79,6 +81,7 @@ fn request(bytes: &[u8], class: &str) -> ApprovalPrepareRequest {
 
 fn signing(input: &ApprovalPrepareRequest, bytes: &[u8]) -> MachineSignRequest {
     MachineSignRequest {
+        session_use: None,
         operation_id: input.operation_id.clone(),
         operation_digest: Digest32::from_bytes([4; 32]),
         approval_id: input.terms.approval_id().unwrap(),

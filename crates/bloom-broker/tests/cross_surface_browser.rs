@@ -11,6 +11,8 @@ fn browser_script(body: &str) -> String {
     format!(
         r#"
 globalThis.crypto = require("node:crypto").webcrypto;
+globalThis.window = globalThis;
+window.parent = window;
 globalThis.document = {{getElementById: () => ({{}})}};
 globalThis.location = {{pathname: "/", protocol: "https:", hostname: "abcdefghijklmnopqrstuvwxyz.relay.bloom.directory", origin: "https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory", hash: ""}};
 globalThis.history = {{replaceState: () => {{}}}};
@@ -379,6 +381,21 @@ process.stdout.write(JSON.stringify({ok:true}));
 "#,
     );
     assert_eq!(output, json!({"ok": true}));
+}
+
+#[test]
+fn onboarding_completion_requires_machine_reconciliation() {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/test-onboarding-flow.cjs");
+    let output = std::process::Command::new("node")
+        .arg(script)
+        .output()
+        .expect("Node.js is required to validate the shipped onboarding asset");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Runs a CommonJS script in Node, fed on stdin: the shipped asset alone is

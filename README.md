@@ -366,3 +366,53 @@ Signer and Broker keep independent clocks. An ordinary confirmed reboot allows
 each to recover from a nondecreasing wall clock. If either service rejects a
 rollback, same-boot jump, or unknown-domain jump, that affected service must be
 repaired independently; repairing only one does not clear the other's fault.
+
+
+## Owner-reviewed Petal sessions
+
+Persona onboarding reuses Petal Sealed Approvals. The first automatic scope is
+fee-free Polymarket BUY orders on Polygon with positive `polygon:pusd` debits.
+SELLs, allowances, funding, withdrawals, native transfers and other classes do
+not inherit that session. Native `SystemSession` draft terms are refused.
+
+Machine–Broker uses protocol 1.9 for Broker-owned session descriptors. The
+Broker–Signer edge remains production protocol 1.6. No session-budget API,
+asset conversion, economic ledger or new selector is added to Signer.
+
+Broker owns per-action, lifetime, rolling and shared economic accounting. It
+reconstructs the order from the full prepared witness, compares it to the actual
+signing preimage and checks the declared debit against the signed gross BUY
+maker amount before reserving capacity. Missing evidence, SELLs, changed
+amounts, unexpected assets and fees fail closed. This proves the signed order
+terms, not venue execution, deposit-wallet ownership or settlement.
+
+The immutable `session_budget` stays on the north edge and in Broker's durable
+approval metadata and signed review. Its canonical digest and original request
+nonce derive the existing 128-bit Signer request nonce under the
+`bloom-broker-session-nonce/v1` domain. The approval ID hashes the ordinary
+Signer enforcement projection. Changing or removing economics changes that
+identity; both edges still agree on the approval ID. Budgetless approvals keep
+their existing canonical identities. The complete descriptor is shown in the
+signed Broker review, whose digest Signer binds opaquely to owner activation.
+Signer continues to enforce its existing key/selector/suite, operation and
+signature counts, rates, expiry, revocation and replay checks. It does not
+independently guarantee economic containment of a compromised Broker.
+
+Broker reserves shared capacity in the same SQLite transaction as the signing
+operation. Reserved, committed and ambiguous operations continue to count;
+only definitively released operations stop counting. Replays retrieve their
+original result without another reservation. Different member approvals share
+one Broker ledger; their Signer counters remain approval-local. Shared
+signature-count enforcement in Signer is not claimed.
+
+Nominal units are owner-reviewed collateral conventions, not live USD prices.
+Keep the Broker journal and its accounting history intact. Restoring or losing
+that history must never be treated as unused allowance. Signer archive recovery
+does not restore Broker budgets, and this feature makes no new cross-service
+restore guarantee. Existing startup/audit/recovery fences remain in force.
+
+The candidate uses the production Signer rather than the experimental #68.
+Land the reviewed Broker, repin Machine to its landed commit, and publish/adopt
+the combined Polymarket review/accounting package with immutable archive hashes
+and installer provenance before enabling the default flow. Local source tests
+do not establish installed-release compatibility.

@@ -82,6 +82,9 @@ fn code_to_machine(value: south::ProtocolErrorCode) -> north::ProtocolErrorCode 
 
 fn code_to_signer(value: north::ProtocolErrorCode) -> south::ProtocolErrorCode {
     match value {
+        north::ProtocolErrorCode::AssetUnsupported
+        | north::ProtocolErrorCode::EffectsUnsupported
+        | north::ProtocolErrorCode::PoolInactive => south::ProtocolErrorCode::BackendUnsupported,
         north::ProtocolErrorCode::UnauthenticatedPeer => {
             south::ProtocolErrorCode::UnauthenticatedPeer
         }
@@ -181,7 +184,16 @@ mod tests {
         for code in north::ProtocolErrorCode::ALL {
             let mapped = machine_error_to_signer(north::ProtocolError::new(code, code.as_str()));
             assert!(mapped.has_valid_contract());
-            assert_eq!(mapped.code.as_str(), code.as_str());
+            if matches!(
+                code,
+                north::ProtocolErrorCode::AssetUnsupported
+                    | north::ProtocolErrorCode::EffectsUnsupported
+                    | north::ProtocolErrorCode::PoolInactive
+            ) {
+                assert_eq!(mapped.code, south::ProtocolErrorCode::BackendUnsupported);
+            } else {
+                assert_eq!(mapped.code.as_str(), code.as_str());
+            }
         }
     }
 }

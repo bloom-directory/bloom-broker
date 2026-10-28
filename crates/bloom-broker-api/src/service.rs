@@ -207,6 +207,8 @@ pub struct ApprovalLimitState {
     pub committed_signatures: DecimalU64,
     pub reserved_signatures: DecimalU64,
     pub quarantined_signatures: DecimalU64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_budget_state: Option<crate::SessionBudgetState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -361,6 +363,8 @@ pub struct CeremonyPublicStatus {
 #[allow(clippy::large_enum_variant)]
 #[serde(tag = "method", content = "body", deny_unknown_fields)]
 pub enum MachineBrokerRequest {
+    #[serde(rename = "session.stop")]
+    SessionStop(crate::SessionStopRequest),
     #[serde(rename = "system.hello")]
     SystemHello(HelloChallenge),
     #[serde(rename = "broker.readiness")]
@@ -456,6 +460,8 @@ pub enum MachineBrokerRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "method", content = "body", deny_unknown_fields)]
 pub enum MachineBrokerResponse {
+    #[serde(rename = "session.stop")]
+    SessionStop(crate::SessionStopResponse),
     #[serde(rename = "system.hello")]
     SystemHello(HelloChallenge),
     #[serde(rename = "broker.readiness")]
@@ -577,6 +583,7 @@ impl crate::TypedRequestMethod for MachineBrokerRequest {
     fn operation_id(&self) -> Result<Option<OperationId>, crate::WireError> {
         use MachineBrokerRequest as Request;
         Ok(match self {
+            Request::SessionStop(request) => Some(request.operation_id.clone()),
             Request::SealedApprovalPrepare(request) => Some(request.operation_id.clone()),
             Request::SealedApprovalRenew(request) => Some(request.operation_id.clone()),
             Request::SealedApprovalRevoke(request) => Some(request.operation_id.clone()),

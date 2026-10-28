@@ -15,6 +15,8 @@ const SCHEMA: &str = "bloom.message.review.v1";
 const MAX_FIELDS: usize = 256;
 const MAX_DEPTH: usize = 12;
 
+#[cfg(test)]
+mod generic_session_tests;
 mod hyperliquid;
 mod polymarket;
 pub(crate) mod polymarket_auth;
@@ -67,12 +69,135 @@ pub(crate) fn verify_hyperliquid_agent_use(
     Ok(review)
 }
 
+/// Reconstruct the actual signing preimage, then charge its gross BUY amount.
+/// Package claims, draft labels and nominal conversions cannot replace this check.
+pub(crate) fn verify_polymarket_session_use(
+    request: &bloom_broker_api::MachineSignRequest,
+    signer: Address,
+) -> Result<(), ProtocolError> {
+    let claim = request
+        .petal_use_claim
+        .as_ref()
+        .ok_or_else(|| invalid("BUY session needs a claim"))?;
+    if request.crypto_suite != CryptoSuite::Secp256k1Keccak256Recoverable
+        || claim.crypto_suite != request.crypto_suite
+        || claim.operation_class.as_str() != "polymarket.order.poly1271"
+        || claim.declared_fee != bloom_broker_api::DeclaredFee::None
+        || !claim.declared_destinations.is_empty()
+        || request.system_use_claim.is_some()
+        || request.session_use.is_some()
+    {
+        return Err(invalid("Unsupported BUY session claim"));
+    }
+    let evidence = request
+        .claim_assurance_evidence
+        .as_ref()
+        .ok_or_else(|| invalid("BUY session needs the complete prepared order witness"))?;
+    let bytes = evidence.decode();
+    let (preimage, review) = polymarket::decode(&bytes, signer, "polymarket.order.poly1271")?;
+    let payload = match &request.payloads {
+        bloom_broker_api::SigningPayloads::Single { payload } => payload,
+        bloom_broker_api::SigningPayloads::Batch { children } if children.len() == 1 => {
+            &children[0]
+        }
+        _ => {
+            return Err(invalid(
+                "BUY session authorizes exactly one order per signing operation",
+            ));
+        }
+    };
+    if payload.decode() != preimage {
+        return Err(invalid("BUY session witness differs from signing bytes"));
+    }
+    validate_order_debit(claim, &review, true)
+}
+
+fn validate_order_debit(
+    claim: &bloom_broker_api::PetalUseClaim,
+    review: &MessageReview,
+    buy_only: bool,
+) -> Result<(), ProtocolError> {
+    let field = |name: &str| {
+        review
+            .fields
+            .iter()
+            .find(|f| f.path == name)
+            .map(|f| f.value.as_str())
+            .ok_or_else(|| invalid("Signed order economics are missing"))
+    };
+    let side = field("Side (0 buy, 1 sell)")?;
+    if buy_only && side != "0" {
+        return Err(invalid("A BUY session cannot authorize a SELL"));
+    }
+    let amount = field("Maker amount (raw protocol units)")?;
+    let shares = field("Taker amount (raw protocol units)")?;
+    if amount == "0" || shares == "0" || claim.declared_debits.len() != 1 {
+        return Err(invalid("Order requires one positive signed maker debit"));
+    }
+    let asset = match side {
+        "0" => "pusd".to_owned(),
+        "1" => format!(
+            "erc1155:0x4d97dcd97ec945f40cf65f87097ace5ea0476045:{}",
+            field("Outcome token ID (market identity unverified)")?
+        ),
+        _ => return Err(invalid("Unsupported signed order side")),
+    };
+    let debit = &claim.declared_debits[0];
+    let canonical = debit.asset.chain.as_str() == "evm-137"
+        && debit.asset.asset
+            == if side == "0" {
+                "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb".to_owned()
+            } else {
+                asset.clone()
+            };
+    let legacy = debit.asset.chain.as_str() == "polygon"
+        && debit.asset.asset == asset
+        && claim.economic_effects.is_none();
+    if !(canonical || legacy)
+        || debit.amount.as_str() != amount
+        || !claim.declared_destinations.is_empty()
+        || claim.declared_fee != bloom_broker_api::DeclaredFee::None
+    {
+        return Err(invalid(
+            "Order debit differs from its signed maker economics",
+        ));
+    }
+    Ok(())
+}
+
 /// Check at preparation AND signing use, including grants made by older
 /// Broker versions. Upgrading must not leave old opaque reusable grants usable.
 pub(crate) fn validate_selector(
     terms: &bloom_broker_api::SealedApprovalTerms,
     claim: Option<&bloom_broker_api::PetalUseClaim>,
 ) -> Result<(), ProtocolError> {
+    if terms
+        .session_budget
+        .as_ref()
+        .is_some_and(|b| b.token_policy.is_none())
+    {
+        let ApprovalSelector::Petal {
+            allowed_operation_classes,
+            route_grants,
+            ..
+        } = &terms.selector
+        else {
+            return Err(invalid("Budgeted sessions require a Petal approval"));
+        };
+        if allowed_operation_classes
+            .iter()
+            .chain(
+                route_grants
+                    .iter()
+                    .flat_map(|g| &g.allowed_operation_classes),
+            )
+            .any(|c| c.as_str() != "polymarket.order.poly1271")
+        {
+            return Err(invalid(
+                "Budgeted sessions currently cover Polymarket BUY orders only",
+            ));
+        }
+    }
     if let ApprovalSelector::Petal {
         allowed_operation_classes,
         route_grants,
@@ -88,7 +213,9 @@ pub(crate) fn validate_selector(
             )
             .any(|class| {
                 class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
-                    || bloom_broker_api::message_review_requires_exact(class.as_str())
+                    || (bloom_broker_api::message_review_requires_exact(class.as_str())
+                        && !(class.as_str() == "polymarket.order.poly1271"
+                            && terms.session_budget.is_some()))
             })
         {
             return Err(invalid(
@@ -775,8 +902,11 @@ fn validate_petal_profile(
             "Polymarket exact approval requires its independently rebuilt prepared record",
         ));
     }
+    if class == "polymarket.order.poly1271" && !claim.declared_debits.is_empty() {
+        validate_order_debit(claim, review, false)?;
+    }
     if bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES.contains(&class)
-        && (!claim.declared_debits.is_empty()
+        && ((class != "polymarket.order.poly1271" && !claim.declared_debits.is_empty())
             || !claim.declared_destinations.is_empty()
             || !matches!(claim.declared_fee, bloom_broker_api::DeclaredFee::None))
     {
@@ -931,6 +1061,7 @@ mod tests {
             petal_use_claim: None,
             system_use_claim: None,
             terms: SealedApprovalTerms {
+                session_budget: None,
                 subject: ApprovalSubject::Petal {
                     package_hash: digest.clone(),
                     route: "payment/a/0/confirm".into(),
@@ -1019,6 +1150,7 @@ mod tests {
             rolling_windows: vec![],
         }];
         request.petal_use_claim = Some(PetalUseClaim {
+            economic_effects: None,
             package_hash: Digest32::from_bytes([1; 32]),
             route: "payment/a/0/confirm".into(),
             operation_class: Token::new("venice-x402.topup").unwrap(),
@@ -1095,6 +1227,7 @@ mod tests {
             );
             let base = request(bytes.clone());
             let mut input = MachineSignRequest {
+                session_use: None,
                 operation_id: base.operation_id,
                 operation_digest: Digest32::from_bytes([4; 32]),
                 approval_id: Digest32::from_bytes([5; 32]),
@@ -1104,6 +1237,7 @@ mod tests {
                     payload: Base64UrlBytes::from_bytes(&raw),
                 },
                 petal_use_claim: Some(PetalUseClaim {
+                    economic_effects: None,
                     package_hash: Digest32::from_bytes([1; 32]),
                     route: "agent/cancel".into(),
                     operation_class: Token::new("hyperliquid.agent_action").unwrap(),
@@ -1192,6 +1326,7 @@ mod tests {
         let (raw, _) = decode(&bytes, signer()).unwrap();
         let base = request(bytes.clone());
         let mut input = MachineSignRequest {
+            session_use: None,
             operation_id: base.operation_id,
             operation_digest: Digest32::from_bytes([4; 32]),
             approval_id: Digest32::from_bytes([5; 32]),
@@ -1201,6 +1336,7 @@ mod tests {
                 payload: Base64UrlBytes::from_bytes(&raw),
             },
             petal_use_claim: Some(PetalUseClaim {
+                economic_effects: None,
                 package_hash: Digest32::from_bytes([1; 32]),
                 route: "agent/cancel".into(),
                 operation_class: Token::new("hyperliquid.agent_action").unwrap(),

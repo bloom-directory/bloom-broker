@@ -178,6 +178,7 @@ mod tests {
             required_claim_assurance: bloom_broker_api::ClaimAssuranceLevel::MachineAsserted,
         };
         let claim = PetalUseClaim {
+            economic_effects: None,
             package_hash: Digest32::from_bytes([1; 32]),
             route: "auth/wallet/0".into(),
             operation_class: Token::new(POLYMARKET_CLOB_AUTH_CLASS).unwrap(),
@@ -191,6 +192,7 @@ mod tests {
             claim_assurance: ClaimAssurance::MachineAsserted,
         };
         let mut request = MachineSignRequest {
+            session_use: None,
             operation_id: base.operation_id,
             operation_digest: Digest32::from_bytes([4; 32]),
             approval_id: Digest32::from_bytes([5; 32]),
