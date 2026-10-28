@@ -33,9 +33,11 @@
     $('summary-apps').textContent = names.join(', ') || 'No apps selected';
     $('summary-approvals').textContent = persona === 'custodian' ?
       'One approval allows your selected apps. You will still approve every action.' :
+      persona === 'degen' ? 'Approve your selected apps and token allowances once, including ERC20 transfers to any recipient. Transfers within those limits need no further approval.' :
       'First allow your apps, then enable automatic Polymarket buys. Other actions still ask for approval.';
     if (step === 4) $('summary-approvals').textContent = persona === 'custodian' ?
       'Automatic spending is off. Each wallet action still needs your approval.' :
+      persona === 'degen' ? 'Your reviewed token permissions are active, including ERC20 transfers to any recipient within the transfer and gas limits.' :
       'Automatic Polymarket buy permissions are active. Other actions still ask for your approval.';
     $('setup-summary').hidden = step < 2;
   }

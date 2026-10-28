@@ -999,6 +999,32 @@ impl BrokerRpcService {
         match &request.terms.selector {
             ApprovalSelector::SystemSession { scope } => {
                 scope.validate()?;
+                if scope.any_erc20_recipient {
+                    let snapshot = self
+                        .authority
+                        .policy_snapshot(&request.terms.wallet_id)
+                        .map_err(authority_error)?;
+                    let policy: bloom_broker_api::CanonicalWalletPolicy = serde_json::from_slice(
+                        &snapshot.canonical_policy.decode(),
+                    )
+                    .map_err(|_| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::SelectorMismatch,
+                            "invalid wallet policy",
+                        )
+                    })?;
+                    if scope.chains.iter().any(|c| {
+                        !policy.allowed_destinations.iter().any(|d| {
+                            &d.chain == c.chain()
+                                && d.destination == bloom_broker_api::ERC20_ANY_RECIPIENT
+                        })
+                    }) {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::SelectorMismatch,
+                            "wallet policy must first allow any-recipient ERC20 sessions",
+                        ));
+                    }
+                }
                 crate::system_session::validate_solana_scope_live(scope).await?;
                 if request
                     .terms

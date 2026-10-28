@@ -11,3 +11,16 @@ The durable journal still atomically reserves, authenticates quantities/time/ide
 The full product contract and quantity presets are in Machine's `docs/specs/2026-10-26-generic-evm-svm-sessions.md`.
 
 An owner can unlock retained local authority with `bloom wallet persona rearm WALLET` (`--approval ID` selects a specific grant). This reuses the sealed-approval passkey ceremony with the unchanged standing terms and a signed rearm purpose. It preserves both Broker usage and Signer counters, refuses stopped/revoked or changed terms, and retains an operation identity across retries. It does not add a wallet-unlock ceremony kind or silently create replacement authority.
+
+### Any-recipient native ERC20 transfers
+
+`SystemSessionScope.any_erc20_recipient` defaults to false and is omitted from
+legacy signed terms. True requires an ERC20-only EVM scope, no fixed recipients,
+explicit token contracts, and native gas caps. The signed wallet policy must
+also contain `erc20:any-recipient` on each numeric `evm-N` chain. This marker
+is not an address wildcard for Petals, native sends, exact arbitrary calls or
+approvals. Broker validates both opt-ins and decodes canonical transfer bytes
+before reserving token amount and maximum native gas. Repeated covered sends
+need no new owner ceremony. Each account's native transfer budget is separate
+from every Petal budget. Contract behavior beyond a standard transfer remains
+outside this verification guarantee.

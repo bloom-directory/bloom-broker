@@ -40,9 +40,18 @@ pub struct SystemSessionScope {
     pub actions: Vec<SystemSessionAction>,
     pub chains: Vec<SystemSessionChain>,
     pub destinations: Vec<PolicyDestination>,
+    /// Explicit owner-reviewed recipient freedom for ERC20-only EVM sessions.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub any_erc20_recipient: bool,
     pub tokens: Vec<AssetId>,
     pub per_action_value_limits: Vec<SessionValueCeiling>,
 }
+/// A signed wallet-policy opt-in, never a literal destination or a general wildcard.
+pub const ERC20_ANY_RECIPIENT: &str = "erc20:any-recipient";
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl SystemSessionScope {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.component_id.as_str() != "bloom-machine"
@@ -50,7 +59,14 @@ impl SystemSessionScope {
             || self.actions.len() > 2
             || self.chains.is_empty()
             || self.chains.len() > 64
-            || self.destinations.is_empty()
+            || (self.destinations.is_empty() && !self.any_erc20_recipient)
+            || (self.any_erc20_recipient
+                && (!self.destinations.is_empty()
+                    || self.actions != [SystemSessionAction::Erc20Transfer]
+                    || self
+                        .chains
+                        .iter()
+                        .any(|c| !matches!(c, SystemSessionChain::Evm { .. }))))
             || self.destinations.len() > 256
             || self.per_action_value_limits.is_empty()
             || self.per_action_value_limits.len() > 128
@@ -496,15 +512,16 @@ impl SystemSessionScope {
         self.validate()?;
         if !self.actions.contains(&use_.action)
             || !self.chains.contains(&use_.chain)
-            || !self.destinations.iter().any(|d| {
-                &d.chain == use_.chain.chain()
-                    && match use_.chain {
-                        SystemSessionChain::Evm { .. } => {
-                            d.destination.eq_ignore_ascii_case(&use_.recipient)
+            || !(self.any_erc20_recipient
+                || self.destinations.iter().any(|d| {
+                    &d.chain == use_.chain.chain()
+                        && match use_.chain {
+                            SystemSessionChain::Evm { .. } => {
+                                d.destination.eq_ignore_ascii_case(&use_.recipient)
+                            }
+                            SystemSessionChain::Solana { .. } => d.destination == use_.recipient,
                         }
-                        SystemSessionChain::Solana { .. } => d.destination == use_.recipient,
-                    }
-            })
+                }))
             || match (&use_.action, &use_.token) {
                 (SystemSessionAction::NativeTransfer, None) => false,
                 (SystemSessionAction::Erc20Transfer, Some(token)) => {
@@ -642,6 +659,7 @@ impl SessionBudget {
 #[test]
 fn native_session_scope_refuses_unpriced_layer_two_fees_and_sol_freshness() {
     let mut scope = SystemSessionScope {
+        any_erc20_recipient: false,
         component_id: Token::new("bloom-machine").unwrap(),
         actions: vec![SystemSessionAction::NativeTransfer],
         chains: vec![SystemSessionChain::Evm {
@@ -867,4 +885,56 @@ mod token_allowance_tests {
         old["usd_policy"] = serde_json::json!({"schema_version":2});
         assert!(serde_json::from_value::<SessionBudget>(old).is_err());
     }
+}
+
+#[test]
+fn any_recipient_is_explicit_erc20_only_and_preserves_old_scope_bytes() {
+    let mut scope = SystemSessionScope {
+        any_erc20_recipient: true,
+        component_id: Token::new("bloom-machine").unwrap(),
+        actions: vec![SystemSessionAction::Erc20Transfer],
+        chains: vec![SystemSessionChain::Evm {
+            chain: Token::new("evm-1").unwrap(),
+            chain_id: DecimalU64::new(1),
+        }],
+        destinations: vec![],
+        tokens: vec![AssetId {
+            chain: Token::new("evm-1").unwrap(),
+            asset: "0x1111111111111111111111111111111111111111".into(),
+        }],
+        per_action_value_limits: vec![],
+    };
+    for asset in ["native", "0x1111111111111111111111111111111111111111"] {
+        scope.per_action_value_limits.push(SessionValueCeiling {
+            asset: AssetId {
+                chain: Token::new("evm-1").unwrap(),
+                asset: asset.into(),
+            },
+            maximum: DecimalU256::parse("100").unwrap(),
+        });
+    }
+    scope.validate().unwrap();
+    let mut use_ = SystemSessionUse {
+        action: SystemSessionAction::Erc20Transfer,
+        chain: scope.chains[0].clone(),
+        token: Some(scope.tokens[0].clone()),
+        recipient: "0x2222222222222222222222222222222222222222".into(),
+        amount: DecimalU256::parse("10").unwrap(),
+        maximum_fee: DecimalU256::parse("1").unwrap(),
+    };
+    scope.validate_use(&use_).unwrap();
+    use_.recipient = "0x3333333333333333333333333333333333333333".into();
+    scope.validate_use(&use_).unwrap();
+    use_.amount = DecimalU256::parse("101").unwrap();
+    assert!(scope.validate_use(&use_).is_err());
+    scope.actions.push(SystemSessionAction::NativeTransfer);
+    assert!(scope.validate().is_err());
+    scope.actions.pop();
+    scope.any_erc20_recipient = false;
+    assert!(scope.validate().is_err());
+    assert!(
+        !serde_json::to_string(&scope)
+            .unwrap()
+            .contains("any_erc20_recipient")
+    );
 }

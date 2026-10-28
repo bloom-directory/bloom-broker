@@ -1583,6 +1583,21 @@ impl BrokerAuthority {
         let approval_id = terms
             .approval_id()
             .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?;
+        if let ApprovalSelector::SystemSession { scope } = &terms.selector {
+            if scope.any_erc20_recipient
+                && scope.chains.iter().any(|chain| {
+                    !policy.allowed_destinations.iter().any(|d| {
+                        &d.chain == chain.chain()
+                            && d.destination == bloom_broker_api::ERC20_ANY_RECIPIENT
+                    })
+                })
+            {
+                return Err(denied(
+                    "DESTINATION_NOT_ALLOWED",
+                    "wallet policy does not permit any-recipient ERC20 sessions on every selected chain",
+                ));
+            }
+        }
         if let Some(existing) = self.journal.approval_record(&approval_id)? {
             let existing_terms: SealedApprovalTerms =
                 serde_json::from_str(&existing.terms_jcs).map_err(storage)?;
@@ -2826,19 +2841,26 @@ impl BrokerAuthority {
                         }
                     }
                 }
-                if !policy.allowed_destinations.iter().any(|d| {
-                    (&d.chain == use_.chain.chain()
-                        || (use_.chain.chain().as_str() == "solana-mainnet"
-                            && d.chain.as_str() == "solana"))
-                        && match use_.chain {
-                            bloom_broker_api::SystemSessionChain::Evm { .. } => {
-                                d.destination.eq_ignore_ascii_case(&use_.recipient)
+                let any_recipient = scope.any_erc20_recipient
+                    && policy.allowed_destinations.iter().any(|d| {
+                        &d.chain == use_.chain.chain()
+                            && d.destination == bloom_broker_api::ERC20_ANY_RECIPIENT
+                    });
+                if !any_recipient
+                    && !policy.allowed_destinations.iter().any(|d| {
+                        (&d.chain == use_.chain.chain()
+                            || (use_.chain.chain().as_str() == "solana-mainnet"
+                                && d.chain.as_str() == "solana"))
+                            && match use_.chain {
+                                bloom_broker_api::SystemSessionChain::Evm { .. } => {
+                                    d.destination.eq_ignore_ascii_case(&use_.recipient)
+                                }
+                                bloom_broker_api::SystemSessionChain::Solana { .. } => {
+                                    d.destination == use_.recipient
+                                }
                             }
-                            bloom_broker_api::SystemSessionChain::Solana { .. } => {
-                                d.destination == use_.recipient
-                            }
-                        }
-                }) {
+                    })
+                {
                     return Err(denied(
                         "DESTINATION_NOT_ALLOWED",
                         "session destination is outside current wallet policy",

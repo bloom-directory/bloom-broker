@@ -1268,9 +1268,12 @@ function describePetalApproval(manifest) {
   if (selector?.kind === "system_session" || selector?.kind === "system") {
     const scope=selector.scope || budget?.token_policy?.member_templates?.find(t=>t.subject?.kind==="system" && t.key_ref?.public_key_fingerprint===terms.key_ref?.public_key_fingerprint && t.subject?.operation_class===terms.subject?.operation_class)?.selector?.scope || {};
     return {
-      title: rearm ? "Unlock existing transfer permission" : "Activate bounded transfer session", button: rearm ? "Unlock with passkey" : "Activate session",
+      title: rearm ? "Unlock existing transfer permission" : "Activate bounded transfer session",
+      heading: rearm ? "Unlock existing transfer permission" : scope.any_erc20_recipient ? "Allow automatic ERC20 transfers" : "Allow automatic transfers",
+      button: rearm ? "Unlock with passkey" : "Activate session",
+      primaryFacts: [["Actions",(scope.actions || []).join(", ")],["Networks",(scope.chains || []).map(c=>c.chain).join(", ")],["Recipients",scope.any_erc20_recipient ? "Any recipient (ERC20 transfers only)" : (scope.destinations || []).map(d=>`${d.destination} on ${d.chain}`).join("; ")],...tokenFacts,...lifetimeFacts],
       sentence: rearm ? "Unlock your existing transfer permission. Its limits and previous usage stay unchanged. No funds move in this step." : "Allow repeated transfers within the exact accounts, assets, recipients, time and budget shown below. Matching transfers will not ask for another passkey approval.",
-      facts: [["Actions",(scope.actions || []).join(", ")],["Chains",(scope.chains || []).map(c=>`${c.chain} (${c.chain_id || c.genesis_hash})`).join("; ")],["Recipients",(scope.destinations || []).map(d=>`${d.destination} on ${d.chain}`).join("; "),true],["Per-action asset ceilings",(scope.per_action_value_limits || []).map(v=>`${v.maximum} raw units of ${v.asset?.asset} on ${v.asset?.chain}`).join("; ")],["Operation limit",terms?.limits?.max_operations],...budgetFacts,...lifetimeFacts],
+      facts: [["Actions",(scope.actions || []).join(", ")],["Chains",(scope.chains || []).map(c=>`${c.chain} (${c.chain_id || c.genesis_hash})`).join("; ")],["Recipients",scope.any_erc20_recipient ? "Any recipient (ERC20 transfers only)" : (scope.destinations || []).map(d=>`${d.destination} on ${d.chain}`).join("; "),true],["Per-action asset ceilings",(scope.per_action_value_limits || []).map(v=>`${v.maximum} raw units of ${v.asset?.asset} on ${v.asset?.chain}`).join("; ")],["Operation limit",terms?.limits?.max_operations],...budgetFacts.filter(([label])=>label!=="Trust boundary"),...lifetimeFacts],
       warning: "Bloom decodes supported transfer bytes at signing. Token contract effects and market prices are not independently guaranteed. Anything outside this scope requires a new approval."
     };
   }
@@ -1326,11 +1329,13 @@ function describePolicy(manifest) {
   for (const d of diff.added_destinations || []) {
     if (isDeployGrant(d)) lines.push([`Allow exact transactions on ${chainLabel(d.chain)}`,
       "any address through the deployment workflow, including contract creation, and Safe owner signing; every transaction still needs its own approval"]);
+    else if (d.destination === "erc20:any-recipient") lines.push([`Allow ERC20 transfers to any recipient on ${chainLabel(d.chain)}`, "Automatic transfers require a separately approved token and gas allowance; other calls remain restricted"]);
     else lines.push(["Allow sending to", dest(d), true]);
   }
   for (const d of diff.removed_destinations || []) {
     if (isDeployGrant(d)) lines.push([`Stop allowing exact transactions on ${chainLabel(d.chain)}`,
       "deployment transactions need listed recipients again; contract creation and Safe owner signing are refused"]);
+    else if (d.destination === "erc20:any-recipient") lines.push([`Stop allowing ERC20 transfers to any recipient on ${chainLabel(d.chain)}`, "Recipient allowlisting applies again"]);
     else lines.push(["Stop allowing sending to", dest(d), true]);
   }
   for (const p of diff.added_petal_packages || []) lines.push(["Allow app (petal)", shortDigest(p), true]);

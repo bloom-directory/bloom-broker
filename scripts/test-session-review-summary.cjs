@@ -27,3 +27,11 @@ const rearm=ctx.describePetalApproval({canonical_plan:JSON.stringify({terms,stan
 assert.match(rearm.heading,/Unlock/);assert.equal(rearm.button,'Unlock with passkey');
 assert.match(rearm.sentence,/previous usage and authority identity stay unchanged/);
 assert.deepEqual(rearm.primaryFacts,result.primaryFacts,'rearm cannot show different allowances');
+
+terms.selector={kind:'system_session',scope:{actions:['erc20_transfer'],chains:[{chain:'evm-1',chain_id:'1'}],destinations:[],any_erc20_recipient:true}};
+const transfers=ctx.describePetalApproval({canonical_plan:JSON.stringify({terms})});
+assert.match(JSON.stringify(transfers),/Any recipient \(ERC20 transfers only\)/);
+
+assert.equal(transfers.heading,'Allow automatic ERC20 transfers');
+assert.equal(new Map(transfers.primaryFacts).get('Recipients'),'Any recipient (ERC20 transfers only)');
+assert.ok(transfers.primaryFacts.some(([label])=>label==='Rolling allowance'));

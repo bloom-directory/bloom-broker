@@ -4070,6 +4070,17 @@ fn generic_token_authority_checks_evm_svm_effects_and_independent_assets() {
 
 #[test]
 fn native_evm_token_authority_binds_structural_scope_bytes_and_operation_identity() {
+    typed_transfer_authority(false, true);
+}
+#[test]
+fn any_recipient_erc20_authority_binds_bytes_and_accounts_for_token_and_gas() {
+    typed_transfer_authority(true, true);
+}
+#[test]
+fn any_recipient_erc20_requires_signed_wallet_policy_opt_in() {
+    typed_transfer_authority(true, false);
+}
+fn typed_transfer_authority(erc20: bool, opt_in: bool) {
     use alloy::{
         consensus::{SignableTransaction, TxLegacy},
         primitives::{Address, TxKind, U256},
@@ -4085,27 +4096,55 @@ fn native_evm_token_authority_binds_structural_scope_bytes_and_operation_identit
         chain: token("evm-1"),
         asset: "native".into(),
     };
+    let token_asset = AssetId {
+        chain: native.chain.clone(),
+        asset: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
+    };
     let policy = CanonicalWalletPolicy {
         wallet_id: harness.wallet.clone(),
         maximum_approval_lifetime_ms: 100_000,
         allowed_petal_packages: vec![],
         allowed_destinations: vec![PolicyDestination {
             chain: native.chain.clone(),
-            destination: format!("{recipient:#x}"),
+            destination: if erc20 {
+                if opt_in {
+                    bloom_broker_api::ERC20_ANY_RECIPIENT.into()
+                } else {
+                    "0x9999999999999999999999999999999999999999".into()
+                }
+            } else {
+                format!("{recipient:#x}")
+            },
         }],
         required_verifiers: vec![],
         clear_signing: None,
     };
     let snapshot = signed_policy_snapshot(&harness, 2, &policy);
     harness.authority.install_policy(&snapshot).unwrap();
+    let mut calldata = vec![0xa9, 0x05, 0x9c, 0xbb];
+    calldata.extend_from_slice(&[0; 12]);
+    calldata.extend_from_slice(recipient.as_slice());
+    calldata.extend_from_slice(&U256::from(100u64).to_be_bytes::<32>());
     let tx = TxLegacy {
         chain_id: Some(1),
         nonce: 0,
         gas_price: 2,
         gas_limit: 21000,
-        to: TxKind::Call(recipient),
-        value: U256::from(1_000_000_000_000_000_000u64),
-        input: Default::default(),
+        to: TxKind::Call(if erc20 {
+            token_asset.asset.parse().unwrap()
+        } else {
+            recipient
+        }),
+        value: if erc20 {
+            U256::ZERO
+        } else {
+            U256::from(1_000_000_000_000_000_000u64)
+        },
+        input: if erc20 {
+            calldata.into()
+        } else {
+            Default::default()
+        },
     };
     let bytes = tx.encoded_for_signing();
     let chain = SystemSessionChain::Evm {
@@ -4143,20 +4182,44 @@ fn native_evm_token_authority_binds_structural_scope_bytes_and_operation_identit
     terms.limits.value_limits.clear();
     terms.selector = ApprovalSelector::SystemSession {
         scope: SystemSessionScope {
+            any_erc20_recipient: erc20,
             component_id: token("bloom-machine"),
-            actions: vec![SystemSessionAction::NativeTransfer],
-            chains: vec![chain.clone()],
-            destinations: vec![bloom_broker_api::PolicyDestination {
-                chain: native.chain.clone(),
-                destination: format!("{recipient:#x}"),
+            actions: vec![if erc20 {
+                SystemSessionAction::Erc20Transfer
+            } else {
+                SystemSessionAction::NativeTransfer
             }],
-            tokens: vec![],
+            chains: vec![chain.clone()],
+            destinations: if erc20 {
+                vec![]
+            } else {
+                vec![bloom_broker_api::PolicyDestination {
+                    chain: native.chain.clone(),
+                    destination: format!("{recipient:#x}"),
+                }]
+            },
+            tokens: if erc20 {
+                vec![token_asset.clone()]
+            } else {
+                vec![]
+            },
             per_action_value_limits: vec![SessionValueCeiling {
                 asset: native.clone(),
                 maximum: DecimalU256::parse("2000000000000000000").unwrap(),
             }],
         },
     };
+    if erc20 {
+        terms.limits.max_operations = DecimalU64::new(10);
+        terms.limits.max_signatures = DecimalU64::new(10);
+        let ApprovalSelector::SystemSession { scope } = &mut terms.selector else {
+            unreachable!()
+        };
+        scope.per_action_value_limits.push(SessionValueCeiling {
+            asset: token_asset.clone(),
+            maximum: DecimalU256::parse("150").unwrap(),
+        });
+    }
     let scope = session_member_scope_digest(&terms).unwrap();
     let template = terms.clone();
     terms.session_budget = Some(SessionBudget {
@@ -4194,6 +4257,30 @@ fn native_evm_token_authority_binds_structural_scope_bytes_and_operation_identit
             lifetime: DecimalU256::parse("2000000000000000000").unwrap(),
             rolling_windows: vec![],
         });
+    if erc20 {
+        let budget = terms.session_budget.as_mut().unwrap();
+        budget
+            .token_policy
+            .as_mut()
+            .unwrap()
+            .assets
+            .push(approved_session_asset(&token_asset).unwrap());
+        budget.per_action_value_limits.push(SessionValueCeiling {
+            asset: token_asset.clone(),
+            maximum: DecimalU256::parse("150").unwrap(),
+        });
+        budget
+            .limits
+            .value_limits
+            .push(bloom_broker_api::ValueLimit {
+                asset: token_asset.clone(),
+                lifetime: DecimalU256::parse("1000").unwrap(),
+                rolling_windows: vec![bloom_broker_api::ValueWindow {
+                    maximum: DecimalU256::parse("200").unwrap(),
+                    duration_ms: DecimalU64::new(604800000),
+                }],
+            });
+    }
     let south_bytes = terms.signer_canonical_bytes().unwrap();
     let south: bloom_signer_api::SealedApprovalTerms =
         serde_json::from_slice(&south_bytes).unwrap();
@@ -4205,16 +4292,32 @@ fn native_evm_token_authority_binds_structural_scope_bytes_and_operation_identit
         serde_json::json!({"kind":"system","component_id":"bloom-machine","allowed_operation_classes":["evm.native-transfer"]})
     );
     assert!(projected.get("session_budget").is_none());
+    if erc20 && !opt_in {
+        let err = harness
+            .authority
+            .prepare_approval(&terms, &digest(44))
+            .unwrap_err();
+        assert!(err.to_string().contains("DESTINATION_NOT_ALLOWED"));
+        return;
+    }
     harness.activate(&terms, Some(&provenance));
     let mut input = exact_input(&harness, &terms, operation(96), &bytes);
     input.request.crypto_suite = CryptoSuite::Secp256k1Keccak256Recoverable;
     input.request.provenance = provenance.subject.clone();
     input.request.session_use = Some(SystemSessionUse {
-        action: SystemSessionAction::NativeTransfer,
+        action: if erc20 {
+            SystemSessionAction::Erc20Transfer
+        } else {
+            SystemSessionAction::NativeTransfer
+        },
         chain,
-        token: None,
+        token: if erc20 {
+            Some(token_asset.clone())
+        } else {
+            None
+        },
         recipient: format!("{recipient:#x}"),
-        amount: DecimalU256::parse("1000000000000000000").unwrap(),
+        amount: DecimalU256::parse(if erc20 { "100" } else { "1000000000000000000" }).unwrap(),
         maximum_fee: DecimalU256::parse("42000").unwrap(),
     });
     bind_operation_digest(&mut input, &terms);
@@ -4232,7 +4335,48 @@ fn native_evm_token_authority_binds_structural_scope_bytes_and_operation_identit
     let decision = harness.authority.authorize(&input).unwrap();
     assert_eq!(
         decision.reserved_values["evm-1:native"].as_str(),
-        "1000000000000042000"
+        if erc20 {
+            "42000"
+        } else {
+            "1000000000000042000"
+        }
     );
+    if erc20 {
+        assert_eq!(
+            decision.reserved_values["evm-1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"].as_str(),
+            "100"
+        );
+        // Another unlisted recipient reuses the same grant and rolling pool.
+        let mut data = tx.input.to_vec();
+        data[16..36].copy_from_slice(Address::repeat_byte(0x22).as_slice());
+        let next = TxLegacy {
+            nonce: 1,
+            input: data.into(),
+            ..tx.clone()
+        };
+        let mut second = exact_input(&harness, &terms, operation(97), &next.encoded_for_signing());
+        second.request.crypto_suite = input.request.crypto_suite;
+        second.request.provenance = provenance.subject.clone();
+        let mut use_ = input.request.session_use.clone().unwrap();
+        use_.recipient = format!("{:#x}", Address::repeat_byte(0x22));
+        second.request.session_use = Some(use_);
+        bind_operation_digest(&mut second, &terms);
+        harness.authority.authorize(&second).unwrap();
+        let third_tx = TxLegacy { nonce: 2, ..next };
+        let mut third = exact_input(
+            &harness,
+            &terms,
+            operation(98),
+            &third_tx.encoded_for_signing(),
+        );
+        third.request.crypto_suite = second.request.crypto_suite;
+        third.request.provenance = provenance.subject.clone();
+        third.request.session_use = second.request.session_use.clone();
+        bind_operation_digest(&mut third, &terms);
+        assert!(
+            harness.authority.authorize(&third).is_err(),
+            "third spend must exceed the shared rolling token cap"
+        );
+    }
     harness.journal.verify_audit_chain().unwrap();
 }
