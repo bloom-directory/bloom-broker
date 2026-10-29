@@ -1087,7 +1087,7 @@ dependencies = [
  "bloom-signer-vectors",
  "bloom-solana-verify",
  "bloom-triad-local-transport",
- "bloom-trusted-time",
+ "bloom-trusted-time 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=df5dfcb2514f29b98613d215f07c378ccbf6decf)",
  "bs58",
  "config",
  "ed25519-dalek 3.0.0",
@@ -1291,7 +1291,7 @@ dependencies = [
  "bloom-signer-derive",
  "bloom-signer-process-hardening",
  "bloom-triad-local-transport",
- "bloom-trusted-time",
+ "bloom-trusted-time 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab)",
  "bs58",
  "chacha20poly1305",
  "ciborium",
@@ -1423,7 +1423,7 @@ version = "0.1.3"
 source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab#ad0072512bb97fb4eb68d249ce785ea3ea4a49ab"
 dependencies = [
  "bloom-rpc-wire",
- "bloom-trusted-time",
+ "bloom-trusted-time 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab)",
  "ed25519-dalek 3.0.0",
  "hex",
  "rand 0.10.2",
@@ -1440,6 +1440,15 @@ dependencies = [
 name = "bloom-trusted-time"
 version = "0.1.3"
 source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab#ad0072512bb97fb4eb68d249ce785ea3ea4a49ab"
+dependencies = [
+ "libc",
+ "thiserror",
+]
+
+[[package]]
+name = "bloom-trusted-time"
+version = "0.1.3"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=df5dfcb2514f29b98613d215f07c378ccbf6decf#df5dfcb2514f29b98613d215f07c378ccbf6decf"
 dependencies = [
  "libc",
  "thiserror",
