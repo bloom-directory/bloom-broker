@@ -142,10 +142,22 @@ impl BrokerRpcService {
         &self,
         request: bloom_broker_api::CustodyPrepareRequest,
     ) -> Result<bloom_signer_api::CustodyPrepareRequest, ProtocolError> {
-        let surface = self
-            .ceremony
-            .select_surface(request.surface_selection)?
-            .reference();
+        use bloom_broker_api::CeremonyKind::{WalletImport, WalletRecovery, WalletRegistration};
+        // Every other custody kind is approved by one of the wallet's passkeys.
+        let surface = match &request.wallet_id {
+            Some(wallet_id)
+                if request.legacy_passkey_migration.is_none()
+                    && !matches!(
+                        request.ceremony_kind,
+                        WalletRegistration | WalletImport | WalletRecovery
+                    ) =>
+            {
+                self.ceremony
+                    .select_wallet_surface(request.surface_selection, wallet_id)?
+            }
+            _ => self.ceremony.select_surface(request.surface_selection)?,
+        }
+        .reference();
         Ok(translate_custody::prepare_to_signer(request, surface))
     }
 
@@ -957,7 +969,7 @@ impl BrokerRpcService {
         let ceremony_request = bloom_signer_api::CeremonyPrepareRequest {
             surface: self
                 .ceremony
-                .select_surface(request.surface_selection)?
+                .select_wallet_surface(request.surface_selection, &request.terms.wallet_id)?
                 .reference(),
             activation_operation_id: request.operation_id.clone(),
             terms: translate_approval::validated_terms_to_signer(request.terms.clone()),
@@ -1153,7 +1165,10 @@ impl BrokerRpcService {
                 custody: bloom_signer_api::CustodyPrepareRequest {
                     surface: self
                         .ceremony
-                        .select_surface(bloom_broker_api::CeremonySurfaceSelection::Default)?
+                        .select_wallet_surface(
+                            bloom_broker_api::CeremonySurfaceSelection::Default,
+                            &request.wallet_id,
+                        )?
                         .reference(),
                     ceremony_kind: bloom_signer_api::CeremonyKind::PolicyUpdate,
                     custody_operation_id: request.operation_id.clone(),

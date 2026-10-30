@@ -1228,6 +1228,49 @@ impl CeremonyBroker {
         }
     }
 
+    /// Resolve the surface for a ceremony that one of `wallet_id`'s passkeys
+    /// approves. An explicit selection is honored as is. By default the
+    /// default surface approves when the wallet has an active passkey there,
+    /// otherwise the local one does: a hosted link for a wallet whose
+    /// passkeys are all on localhost offers the browser no credential and
+    /// can never be approved. With neither, the ceremony is refused here
+    /// instead of reaching `AWAITING_USER`.
+    pub fn select_wallet_surface(
+        &self,
+        selection: CeremonySurfaceSelection,
+        wallet_id: &Token,
+    ) -> Result<SurfaceDescriptor, ProtocolError> {
+        if selection != CeremonySurfaceSelection::Default {
+            return self.select_surface(selection);
+        }
+        let credentials = self
+            .inner
+            .signer
+            .credential_list_public(bloom_signer_api::WalletRequest {
+                wallet_id: wallet_id.clone(),
+            })
+            .map_err(signer_error_to_machine)?;
+        let local = self.select_surface(CeremonySurfaceSelection::Local)?;
+        let only_local_passkeys = credentials.iter().all(|credential| {
+            credential.state != bloom_signer_api::CredentialState::Active
+                || credential.surface == local.reference()
+        });
+        match self.select_surface(CeremonySurfaceSelection::Default) {
+            Ok(surface) if has_active_passkey_on(&credentials, &surface) => Ok(surface),
+            // An unusable hosted surface is an outage, not a reason to move a
+            // wallet with hosted passkeys to localhost.
+            Err(error) if !only_local_passkeys => Err(error),
+            _ if has_active_passkey_on(&credentials, &local) => Ok(local),
+            _ => Err(protocol(
+                ProtocolErrorCode::ApprovalNotFound,
+                format!(
+                    "wallet {} has no active passkey on a usable ceremony surface",
+                    wallet_id.as_str()
+                ),
+            )),
+        }
+    }
+
     /// Records whether the relay refuses to renew Broker's scoped credentials.
     /// Returns the previous value, so a caller can report only the change.
     pub fn set_remote_credentials_rejected(&self, rejected: bool) -> bool {
@@ -4805,16 +4848,21 @@ fn approving_surface(
     destination: &SurfaceDescriptor,
     other: Option<SurfaceDescriptor>,
 ) -> Option<SurfaceDescriptor> {
-    let has_passkey_on = |surface: &SurfaceRef| {
-        credentials.iter().any(|credential| {
-            credential.state == bloom_signer_api::CredentialState::Active
-                && &credential.surface == surface
-        })
-    };
-    if has_passkey_on(&destination.reference()) {
+    if has_active_passkey_on(credentials, destination) {
         return Some(destination.clone());
     }
-    other.filter(|other| has_passkey_on(&other.reference()))
+    other.filter(|other| has_active_passkey_on(credentials, other))
+}
+
+fn has_active_passkey_on(
+    credentials: &[bloom_signer_api::CredentialPublic],
+    surface: &SurfaceDescriptor,
+) -> bool {
+    let surface = surface.reference();
+    credentials.iter().any(|credential| {
+        credential.state == bloom_signer_api::CredentialState::Active
+            && credential.surface == surface
+    })
 }
 
 fn latch_terminal(session: &mut BrowserSession, now_ms: u64) {
