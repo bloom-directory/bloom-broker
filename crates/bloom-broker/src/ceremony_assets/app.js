@@ -1473,6 +1473,10 @@ function requestOptions(session, phase, restrictTo) {
   const options = session.webauthn_options;
   const allowed = options.allowed_credentials
     .filter(item => !restrictTo || item.credential_id === restrictTo);
+  if (!allowed.length) {
+    // An empty PRF allow list is a browser exception, not a prompt.
+    throw new Error(`This wallet has no passkey for ${location.hostname}, so this ceremony cannot be approved here. Cancel it and start it again from Bloom.`);
+  }
   const evalByCredential = {};
   for (const item of allowed) {
     evalByCredential[item.credential_id] = {first: decodeUrl(item.prf_salt)};

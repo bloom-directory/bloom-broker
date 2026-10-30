@@ -404,3 +404,25 @@ fn run_node(script: &str) -> std::process::Output {
         .expect("write node script");
     output
 }
+
+#[test]
+fn an_empty_passkey_allow_list_fails_with_a_readable_message() {
+    let output = run_browser(
+        r#"
+const session = {webauthn_options: {allowed_credentials: []}, challenges: [{challenge: "AA"}]};
+let message = null;
+try { requestOptions(session, 0); } catch (error) { message = error.message; }
+const listed = requestOptions({webauthn_options: {allowed_credentials:
+  [{credential_id: "ZA", prf_salt: "ZQ"}]}, challenges: [{challenge: "AA"}]}, 0);
+process.stdout.write(JSON.stringify({message, listed: listed.allowCredentials.length}));
+"#,
+    );
+    assert!(
+        output["message"]
+            .as_str()
+            .unwrap()
+            .contains("no passkey for abcdefghijklmnopqrstuvwxyz.relay.bloom.directory"),
+        "{output}"
+    );
+    assert_eq!(output["listed"], 1);
+}

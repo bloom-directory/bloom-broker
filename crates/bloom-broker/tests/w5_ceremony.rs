@@ -6469,6 +6469,78 @@ fn assigned_remote_outage_never_silently_changes_default_to_local() {
     );
 }
 
+#[test]
+fn default_wallet_surface_is_one_where_the_wallet_has_a_passkey() {
+    use bloom_broker_api::CeremonySurfaceSelection::{Default, Local, Remote};
+    let wallet = Token::new("main").unwrap();
+    let chosen = |signer: MockSigner, selection| {
+        CeremonyBroker::new(Arc::new(signer))
+            .select_wallet_surface(selection, &wallet)
+            .map(|surface| surface.identity.surface_id.as_str().to_owned())
+    };
+    let with_passkeys = |signer: MockSigner, passkey_surfaces| MockSigner {
+        passkey_surfaces,
+        ..signer
+    };
+    // The live defect: hosted mode on, the wallet's only passkey on localhost.
+    assert_eq!(
+        chosen(MockSigner::with_remote_surface(), Default).unwrap(),
+        "local"
+    );
+    // A hosted passkey keeps the hosted default.
+    for passkeys in [vec!["remote"], vec!["local", "remote"]] {
+        assert_eq!(
+            chosen(
+                with_passkeys(MockSigner::with_remote_surface(), passkeys),
+                Default
+            )
+            .unwrap(),
+            "remote"
+        );
+    }
+    // No passkey on any usable surface is refused before a link exists.
+    for signer in [
+        MockSigner::with_remote_surface(),
+        MockSigner::with_remote_disabled(),
+    ] {
+        let error = chosen(with_passkeys(signer, Vec::new()), Default).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::ApprovalNotFound);
+        assert!(error.message.contains("no active passkey"), "{error:?}");
+    }
+    // A hosted-only wallet keeps the outage error instead of moving to localhost.
+    let error = chosen(
+        with_passkeys(MockSigner::with_remote_degraded(), vec!["remote"]),
+        Default,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+    let rejected = CeremonyBroker::new(Arc::new(with_passkeys(
+        MockSigner::with_remote_surface(),
+        vec!["remote"],
+    )));
+    rejected.set_remote_credentials_rejected(true);
+    let error = rejected
+        .select_wallet_surface(Default, &wallet)
+        .unwrap_err();
+    assert!(
+        error.message.contains("bloom-signer admin provision"),
+        "{error:?}"
+    );
+    // Explicit selections are honored whatever the wallet holds.
+    assert_eq!(
+        chosen(MockSigner::with_remote_surface(), Remote).unwrap(),
+        "remote"
+    );
+    assert_eq!(
+        chosen(
+            with_passkeys(MockSigner::with_remote_surface(), vec!["remote"]),
+            Local
+        )
+        .unwrap(),
+        "local"
+    );
+}
+
 #[tokio::test]
 async fn bare_root_redirects_while_ceremonies_remain_available_and_public_recovery_is_absent() {
     let remote = "https://abcdefghijklmnopqrstuv2345.relay.bloom.directory";

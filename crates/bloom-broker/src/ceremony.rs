@@ -1,6 +1,6 @@
 use crate::{
     authority::PolicyAuthorityDiff,
-    journal::BrokerJournal,
+    journal::{BrokerJournal, UnsupportedStoreVersion},
     translation::{
         ceremony::{kind_to_machine, state_to_machine},
         error::signer_error_to_machine,
@@ -1225,6 +1225,49 @@ impl CeremonyBroker {
                     )
                 })
             }
+        }
+    }
+
+    /// Resolve the surface for a ceremony that one of `wallet_id`'s passkeys
+    /// approves. An explicit selection is honored as is. By default the
+    /// default surface approves when the wallet has an active passkey there,
+    /// otherwise the local one does: a hosted link for a wallet whose
+    /// passkeys are all on localhost offers the browser no credential and
+    /// can never be approved. With neither, the ceremony is refused here
+    /// instead of reaching `AWAITING_USER`.
+    pub fn select_wallet_surface(
+        &self,
+        selection: CeremonySurfaceSelection,
+        wallet_id: &Token,
+    ) -> Result<SurfaceDescriptor, ProtocolError> {
+        if selection != CeremonySurfaceSelection::Default {
+            return self.select_surface(selection);
+        }
+        let credentials = self
+            .inner
+            .signer
+            .credential_list_public(bloom_signer_api::WalletRequest {
+                wallet_id: wallet_id.clone(),
+            })
+            .map_err(signer_error_to_machine)?;
+        let local = self.select_surface(CeremonySurfaceSelection::Local)?;
+        let only_local_passkeys = credentials.iter().all(|credential| {
+            credential.state != bloom_signer_api::CredentialState::Active
+                || credential.surface == local.reference()
+        });
+        match self.select_surface(CeremonySurfaceSelection::Default) {
+            Ok(surface) if has_active_passkey_on(&credentials, &surface) => Ok(surface),
+            // An unusable hosted surface is an outage, not a reason to move a
+            // wallet with hosted passkeys to localhost.
+            Err(error) if !only_local_passkeys => Err(error),
+            _ if has_active_passkey_on(&credentials, &local) => Ok(local),
+            _ => Err(protocol(
+                ProtocolErrorCode::ApprovalNotFound,
+                format!(
+                    "wallet {} has no active passkey on a usable ceremony surface",
+                    wallet_id.as_str()
+                ),
+            )),
         }
     }
 
@@ -4805,16 +4848,21 @@ fn approving_surface(
     destination: &SurfaceDescriptor,
     other: Option<SurfaceDescriptor>,
 ) -> Option<SurfaceDescriptor> {
-    let has_passkey_on = |surface: &SurfaceRef| {
-        credentials.iter().any(|credential| {
-            credential.state == bloom_signer_api::CredentialState::Active
-                && &credential.surface == surface
-        })
-    };
-    if has_passkey_on(&destination.reference()) {
+    if has_active_passkey_on(credentials, destination) {
         return Some(destination.clone());
     }
-    other.filter(|other| has_passkey_on(&other.reference()))
+    other.filter(|other| has_active_passkey_on(credentials, other))
+}
+
+fn has_active_passkey_on(
+    credentials: &[bloom_signer_api::CredentialPublic],
+    surface: &SurfaceDescriptor,
+) -> bool {
+    let surface = surface.reference();
+    credentials.iter().any(|credential| {
+        credential.state == bloom_signer_api::CredentialState::Active
+            && credential.surface == surface
+    })
 }
 
 fn latch_terminal(session: &mut BrowserSession, now_ms: u64) {
@@ -5371,13 +5419,33 @@ fn migrate_pairing_session_index(
 /// are decoded by the normal legacy session migration path before this gate
 /// advances the marker.
 fn guard_ceremony_storage_version(connection: &Connection) -> Result<(), ProtocolError> {
-    let version: i64 = connection
+    let found: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(storage)?;
-    if !(0..=CEREMONY_STORAGE_VERSION).contains(&version) {
-        return Err(storage("unsupported ceremony storage version"));
+    supported_ceremony_storage_version(found).map_err(storage)
+}
+
+/// Startup check of the same gate with a typed refusal, so the Broker can log
+/// why it will not open a journal a newer Broker wrote.
+pub fn require_supported_ceremony_storage(
+    journal: &BrokerJournal,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let found: i64 = journal
+        .shared_connection()
+        .lock()
+        .map_err(|_| "ceremony database mutex poisoned")?
+        .pragma_query_value(None, "user_version", |row| row.get(0))?;
+    Ok(supported_ceremony_storage_version(found)?)
+}
+
+fn supported_ceremony_storage_version(found: i64) -> Result<(), UnsupportedStoreVersion> {
+    if (0..=CEREMONY_STORAGE_VERSION).contains(&found) {
+        return Ok(());
     }
-    Ok(())
+    Err(UnsupportedStoreVersion::CeremonyStorage {
+        found,
+        supported: CEREMONY_STORAGE_VERSION,
+    })
 }
 
 fn migrate_legacy_ceremonies(
