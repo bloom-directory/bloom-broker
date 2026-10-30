@@ -1915,7 +1915,10 @@ async fn approve_and_sign(
     let approve_prepared = match MachineBrokerService::dispatch(
         stack.broker.as_ref(),
         MachineBrokerRequest::SealedApprovalPrepare(bloom_broker_api::ApprovalPrepareRequest {
-            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            // The restored Signer's passkey is re-registered only in its
+            // ceremony service, not its durable credential projection, so
+            // Default would find no passkey to approve with.
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Local,
             requested_review_mode: None,
             operation_id: approval_operation.clone(),
             terms: terms.clone(),
