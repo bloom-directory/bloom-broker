@@ -680,6 +680,14 @@ function naturalList(items) {
   if (items.length === 2) return `${items[0]} and ${items[1]}`;
   return `${items.slice(0, -1).join(", ")}, and ${items.at(-1)}`;
 }
+// Name the session key by the suites the scope allows, not by assumption.
+function sessionKeyKind(scope) {
+  const suites = Array.isArray(scope.allowed_crypto_suites)
+    ? scope.allowed_crypto_suites.map(String) : [];
+  if (suites.length && suites.every(suite => suite === "ed25519-message")) return "Solana ";
+  if (suites.length && suites.every(suite => suite === "secp256k1-keccak256-recoverable")) return "EVM ";
+  return "";
+}
 function describePetalScope(scope) {
   if (!scope || typeof scope !== "object") return null;
   const classes = Array.isArray(scope.allowed_operation_classes)
@@ -692,7 +700,7 @@ function describePetalScope(scope) {
   const lifetime = Number(scope.maximum_lifetime_ms);
   const duration = Number.isFinite(lifetime) && lifetime > 0 ? fmtRemaining(lifetime) : "a limited time";
   return {
-    sentence: `Allow <strong>${app}</strong> to use a temporary Solana session key for up to <strong>${duration}</strong>. No funds move in this step, and your main wallet key stays inside Bloom.`,
+    sentence: `Allow <strong>${app}</strong> to use a temporary ${sessionKeyKind(scope)}session key for up to <strong>${duration}</strong>. No funds move in this step, and your main wallet key stays inside Bloom.`,
     facts: [
       ["App", app],
       ["Package", scope.package_hash, true],
