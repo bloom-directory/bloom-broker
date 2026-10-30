@@ -2567,7 +2567,7 @@ fn jcs_digest(value: &impl serde::Serialize) -> Result<Digest32, ProtocolError> 
 fn authority_error(error: AuthorityError) -> ProtocolError {
     let error_kind = match &error {
         AuthorityError::Journal(_) => "journal",
-        AuthorityError::Storage(_) => "storage",
+        AuthorityError::Storage(_) | AuthorityError::UnsupportedStoreVersion(_) => "storage",
         AuthorityError::Denied { .. } => "denied",
     };
     tracing::warn!(
@@ -2579,6 +2579,9 @@ fn authority_error(error: AuthorityError) -> ProtocolError {
         AuthorityError::Journal(error) => journal_error(error),
         AuthorityError::Storage(message) => {
             ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, message)
+        }
+        AuthorityError::UnsupportedStoreVersion(error) => {
+            ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, error.to_string())
         }
         AuthorityError::Denied { code, message } => {
             let protocol_code = match code {

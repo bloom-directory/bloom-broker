@@ -18,12 +18,12 @@ use bloom_audit_checkpoint::{
 };
 use bloom_broker::{
     assurance_verifiers::SolanaSystemTransferVerifier,
-    authority::{AssuranceRegistry, BrokerAuthority},
+    authority::{AssuranceRegistry, AuthorityError, BrokerAuthority},
     ceremony::{
         CeremonyBroker, CeremonyEndpoint, DEFAULT_CEREMONY_PORT, DEFAULT_REMOTE_UPSTREAM_PORT,
     },
     clock::BrokerClock,
-    journal::{AuditSigner, BrokerJournal},
+    journal::{AuditSigner, BrokerJournal, JournalError, UnsupportedStoreVersion},
     service::BrokerRpcService,
     signer_client::BrokerSignerClient,
 };
@@ -301,12 +301,83 @@ async fn main() {
 
 fn log_unreported_run_failure(error: &(dyn std::error::Error + 'static)) {
     if error.downcast_ref::<TrustedTerminalError>().is_none() {
+        let reason = FailureReason::of(error);
         tracing::error!(
             event = "service.fatal",
             service = "broker",
             error_kind = "bootstrap_failure",
+            reason = reason.code,
+            reason_detail = reason.detail,
+            found_version = reason.found_version,
+            supported_version = reason.supported_version,
+            reason_message = reason.message,
             "Bloom Broker exited before trusted service metadata was loaded"
         );
+    }
+}
+
+/// A bounded, secret-free account of why the Broker stopped. Error text is
+/// logged only for types whose messages are built from version numbers;
+/// everything else contributes a fixed code, because config, protocol and
+/// storage messages can carry paths, payload fragments or rejected values.
+#[derive(Debug, Default, PartialEq)]
+struct FailureReason {
+    code: &'static str,
+    detail: Option<&'static str>,
+    found_version: Option<i64>,
+    supported_version: Option<i64>,
+    message: Option<String>,
+}
+
+impl FailureReason {
+    fn of(error: &(dyn std::error::Error + 'static)) -> Self {
+        let fixed = |code, detail| Self {
+            code,
+            detail,
+            ..Self::default()
+        };
+        if let Some(version) = error.downcast_ref::<UnsupportedStoreVersion>() {
+            return Self::version(version);
+        }
+        if let Some(error) = error.downcast_ref::<AuthorityError>() {
+            return match error {
+                AuthorityError::UnsupportedStoreVersion(version) => Self::version(version),
+                AuthorityError::Denied { code, .. } => fixed("authority_denied", Some(*code)),
+                AuthorityError::Storage(_) => fixed("authority_storage", None),
+                AuthorityError::Journal(_) => fixed("journal", None),
+            };
+        }
+        if error.downcast_ref::<JournalError>().is_some() {
+            return fixed("journal", None);
+        }
+        if let Some(error) = error.downcast_ref::<ProtocolError>() {
+            return fixed("protocol_error", Some(error.code.as_str()));
+        }
+        if let Some(error) = error.downcast_ref::<CheckpointError>() {
+            return fixed("checkpoint_store", Some(checkpoint_error_kind(error)));
+        }
+        if error.downcast_ref::<std::io::Error>().is_some() {
+            return fixed("io", None);
+        }
+        fixed("unclassified", None)
+    }
+
+    fn version(error: &UnsupportedStoreVersion) -> Self {
+        let (code, found, supported) = match *error {
+            UnsupportedStoreVersion::CeremonyStorage { found, supported } => {
+                ("unsupported_ceremony_storage_version", found, supported)
+            }
+            UnsupportedStoreVersion::StateFloor { floor, supported } => {
+                ("unsupported_state_floor", floor, supported)
+            }
+        };
+        Self {
+            code,
+            detail: None,
+            found_version: Some(found),
+            supported_version: Some(supported),
+            message: Some(error.to_string()),
+        }
     }
 }
 
@@ -328,21 +399,30 @@ fn init_observability() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn log_service_terminal(service_span: &tracing::Span, clean: bool) {
+fn log_service_terminal(
+    service_span: &tracing::Span,
+    error: Option<&(dyn std::error::Error + 'static)>,
+) {
     service_span.in_scope(|| {
-        if clean {
+        if let Some(error) = error {
+            let reason = FailureReason::of(error);
+            tracing::error!(
+                event = "service.fatal",
+                service = "broker",
+                error_kind = "startup_or_runtime",
+                reason = reason.code,
+                reason_detail = reason.detail,
+                found_version = reason.found_version,
+                supported_version = reason.supported_version,
+                reason_message = reason.message,
+                "Bloom Broker exited with an error"
+            );
+        } else {
             tracing::info!(
                 event = "service.shutdown",
                 service = "broker",
                 outcome = "clean",
                 "Bloom Broker stopped"
-            );
-        } else {
-            tracing::error!(
-                event = "service.fatal",
-                service = "broker",
-                error_kind = "startup_or_runtime",
-                "Bloom Broker exited with an error"
             );
         }
     });
@@ -563,6 +643,7 @@ async fn run_with_paths(
             &config.audit_historical_public_keys,
             previous_audit_signing_key,
         )?);
+        bloom_broker::ceremony::require_supported_ceremony_storage(&journal)?;
         if signer_acl.service_id.as_str() != "bloom-signer" {
             return Err("edge manifest does not pin bloom-signer for the Broker edge".into());
         }
@@ -1203,7 +1284,10 @@ fn complete_trusted_service_run(
     service_span: &tracing::Span,
     result: Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    log_service_terminal(service_span, result.is_ok());
+    log_service_terminal(
+        service_span,
+        result.as_ref().err().map(|error| error.as_ref()),
+    );
     result.map_err(|error| Box::new(TrustedTerminalError(error)) as Box<dyn std::error::Error>)
 }
 
@@ -2762,7 +2846,7 @@ mod startup_failure_tests {
                 Some(501),
                 Some("test-build-digest"),
             );
-            log_service_terminal(&span, true);
+            log_service_terminal(&span, None);
         });
 
         let events = capture
@@ -2847,6 +2931,126 @@ mod startup_failure_tests {
         assert_eq!(events[0]["span"]["enrolled_login_uid"], 501);
         assert_eq!(events[0]["span"]["release_digest"], "test-build-digest");
         assert!(!output.contains(marker_secret), "{output}");
+    }
+
+    fn fatal_events_for(error: Box<dyn std::error::Error>) -> (Vec<serde_json::Value>, String) {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(capture.clone()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let span = bloom_service_observability::service_span(
+                "broker",
+                "test-version",
+                "bloom-broker",
+                None,
+                None,
+            );
+            let error = complete_trusted_service_run(&span, Err(error)).unwrap_err();
+            log_unreported_run_failure(error.as_ref());
+        });
+        let output = capture.text();
+        let events = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["fields"]["event"] == "service.fatal")
+            .collect();
+        (events, output)
+    }
+
+    #[test]
+    fn journal_written_by_a_newer_broker_logs_the_version_refusal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("journal.db");
+        let open = || {
+            open_operational_audit_journal(
+                &path,
+                Token::new("broker-audit-1").unwrap(),
+                SigningKey::from_bytes(&[61; 32]),
+                &[],
+                None,
+            )
+            .unwrap()
+        };
+        drop(open());
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", 3)
+            .unwrap();
+
+        let error = bloom_broker::ceremony::require_supported_ceremony_storage(&open())
+            .expect_err("a journal at ceremony storage version 3 must be refused");
+        let (events, output) = fatal_events_for(error);
+
+        assert_eq!(events.len(), 1, "{output}");
+        let fields = &events[0]["fields"];
+        assert_eq!(fields["error_kind"], "startup_or_runtime");
+        assert_eq!(fields["reason"], "unsupported_ceremony_storage_version");
+        assert_eq!(fields["found_version"], 3);
+        assert_eq!(fields["supported_version"], 2);
+        let message = fields["reason_message"].as_str().unwrap();
+        assert!(message.contains("written by a newer Broker"), "{message}");
+        assert!(message.contains("restore a backup"), "{message}");
+    }
+
+    #[test]
+    fn state_floor_refusal_is_named_with_its_versions() {
+        let reason =
+            FailureReason::of(&AuthorityError::from(UnsupportedStoreVersion::StateFloor {
+                floor: 3,
+                supported: 2,
+            }));
+        assert_eq!(reason.code, "unsupported_state_floor");
+        assert_eq!(
+            (reason.found_version, reason.supported_version),
+            (Some(3), Some(2))
+        );
+        assert!(
+            reason
+                .message
+                .unwrap()
+                .contains("written by a newer Broker")
+        );
+    }
+
+    #[test]
+    fn failure_reasons_never_echo_error_text_of_unvetted_types() {
+        let marker = "MARKER_SEED_0123456789abcdef_MUST_NOT_BE_LOGGED";
+        let errors: Vec<(Box<dyn std::error::Error>, &str, Option<&str>)> = vec![
+            (
+                ProtocolError::new(ProtocolErrorCode::UnauthenticatedPeer, marker).into(),
+                "protocol_error",
+                Some("UNAUTHENTICATED_PEER"),
+            ),
+            (
+                AuthorityError::Storage(marker.to_owned()).into(),
+                "authority_storage",
+                None,
+            ),
+            (
+                AuthorityError::Denied {
+                    code: "KEY_STOPPED",
+                    message: marker.to_owned(),
+                }
+                .into(),
+                "authority_denied",
+                Some("KEY_STOPPED"),
+            ),
+            (
+                format!("config value {marker}").into(),
+                "unclassified",
+                None,
+            ),
+        ];
+        for (error, code, detail) in errors {
+            let (events, output) = fatal_events_for(error);
+            assert_eq!(events.len(), 1, "{output}");
+            assert_eq!(events[0]["fields"]["reason"], code, "{output}");
+            assert_eq!(events[0]["fields"]["reason_detail"].as_str(), detail);
+            assert!(!output.contains(marker), "{output}");
+        }
     }
 
     #[tokio::test]
