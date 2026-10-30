@@ -1,6 +1,6 @@
 use crate::{
     authority::PolicyAuthorityDiff,
-    journal::BrokerJournal,
+    journal::{BrokerJournal, UnsupportedStoreVersion},
     translation::{
         ceremony::{kind_to_machine, state_to_machine},
         error::signer_error_to_machine,
@@ -5371,13 +5371,33 @@ fn migrate_pairing_session_index(
 /// are decoded by the normal legacy session migration path before this gate
 /// advances the marker.
 fn guard_ceremony_storage_version(connection: &Connection) -> Result<(), ProtocolError> {
-    let version: i64 = connection
+    let found: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(storage)?;
-    if !(0..=CEREMONY_STORAGE_VERSION).contains(&version) {
-        return Err(storage("unsupported ceremony storage version"));
+    supported_ceremony_storage_version(found).map_err(storage)
+}
+
+/// Startup check of the same gate with a typed refusal, so the Broker can log
+/// why it will not open a journal a newer Broker wrote.
+pub fn require_supported_ceremony_storage(
+    journal: &BrokerJournal,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let found: i64 = journal
+        .shared_connection()
+        .lock()
+        .map_err(|_| "ceremony database mutex poisoned")?
+        .pragma_query_value(None, "user_version", |row| row.get(0))?;
+    Ok(supported_ceremony_storage_version(found)?)
+}
+
+fn supported_ceremony_storage_version(found: i64) -> Result<(), UnsupportedStoreVersion> {
+    if (0..=CEREMONY_STORAGE_VERSION).contains(&found) {
+        return Ok(());
     }
-    Ok(())
+    Err(UnsupportedStoreVersion::CeremonyStorage {
+        found,
+        supported: CEREMONY_STORAGE_VERSION,
+    })
 }
 
 fn migrate_legacy_ceremonies(

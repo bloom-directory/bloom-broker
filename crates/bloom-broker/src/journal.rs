@@ -105,6 +105,23 @@ impl AuditSigner for ActiveAuditSigner {
     }
 }
 
+/// A store this build refuses because a newer Broker wrote it. Carries only
+/// version numbers, so its text is safe to log.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum UnsupportedStoreVersion {
+    #[error(
+        "unsupported ceremony storage version {found} (this Broker supports up to {supported}); \
+         the store was written by a newer Broker: restore a backup or run a compatible Broker"
+    )]
+    CeremonyStorage { found: i64, supported: i64 },
+    #[error(
+        "this Broker interprets durable state version {supported}, but the store requires at \
+         least {floor}; the store was written by a newer Broker: restore a backup or run a \
+         compatible Broker instead of downgrading, which would have to drop a security field"
+    )]
+    StateFloor { floor: i64, supported: i64 },
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
     #[error("{0}")]

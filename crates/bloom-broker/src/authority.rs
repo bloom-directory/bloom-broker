@@ -1,7 +1,7 @@
 pub use crate::journal::FrozenReview;
 use crate::journal::{
     BrokerJournal, BudgetLimits, JournalError, NewApprovalRecord, ReservationRequest, ReviewKind,
-    SlidingBudgetLimit, SlidingValueLimit,
+    SlidingBudgetLimit, SlidingValueLimit, UnsupportedStoreVersion,
 };
 use bloom_broker_api::{
     ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
@@ -238,6 +238,8 @@ pub enum AuthorityError {
     Storage(String),
     #[error(transparent)]
     Journal(#[from] JournalError),
+    #[error(transparent)]
+    UnsupportedStoreVersion(#[from] UnsupportedStoreVersion),
 }
 
 impl From<rusqlite::Error> for AuthorityError {
@@ -4525,11 +4527,11 @@ fn enforce_state_floor(connection: &Connection) -> Result<(), AuthorityError> {
         )
         .optional()?;
     match floor {
-        Some(floor) if floor > BROKER_STATE_VERSION => Err(AuthorityError::Storage(format!(
-            "this Broker interprets durable state version {BROKER_STATE_VERSION}, but the store \
-             requires at least {floor}; run a build that understands the stored wallet policy \
-             instead of downgrading, which would have to drop a security field to proceed"
-        ))),
+        Some(floor) if floor > BROKER_STATE_VERSION => Err(UnsupportedStoreVersion::StateFloor {
+            floor,
+            supported: BROKER_STATE_VERSION,
+        }
+        .into()),
         _ => Ok(()),
     }
 }
