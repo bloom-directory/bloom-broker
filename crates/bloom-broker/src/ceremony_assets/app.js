@@ -2009,6 +2009,11 @@ function reportCeremonyError(error, fallback = "Ceremony failed") {
 
 function reportApprovalFailure(error) {
   if (approvalTerminal) return;
+  if (error instanceof NoPasskeyHereError) {
+    // Retrying on this surface cannot succeed, so approval stays disabled.
+    statusNode.textContent = error.message;
+    return;
+  }
   const missingPrf = error?.name === "NotSupportedError" ||
     (typeof error?.message === "string" && error.message.includes("required PRF output"));
   reportCeremonyError(error, missingPrf
@@ -2198,13 +2203,14 @@ function prfResult(credential) {
   const first = credential.getClientExtensionResults()?.prf?.results?.first;
   return first ? new Uint8Array(first) : null;
 }
+class NoPasskeyHereError extends Error {}
 function requestOptions(session, phase, restrictTo) {
   const options = session.webauthn_options;
   const allowed = options.allowed_credentials
     .filter(item => !restrictTo || item.credential_id === restrictTo);
   if (!allowed.length) {
     // An empty PRF allow list is a browser exception, not a prompt.
-    throw new Error(`This wallet has no passkey for ${location.hostname}, so this ceremony cannot be approved here. Cancel it and start it again from Bloom.`);
+    throw new NoPasskeyHereError(`This wallet has no passkey for ${location.hostname}, so this ceremony cannot be approved here. Cancel it and start it again from Bloom.`);
   }
   const evalByCredential = {};
   for (const item of allowed) {
