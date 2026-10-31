@@ -678,9 +678,25 @@ const scope = {{
   allowed_operation_classes: ["pumpfun.buy", "pumpfun.sell", "pumpfun.sweep"],
   allowed_routes: ["r000010", "r000011", "r000020"],
   custody_operation_id: "internal-operation-id",
+  allowed_crypto_suites: ["ed25519-message"],
   maximum_lifetime_ms: "3600000",
   package_hash: "b868911206a002dd48c11fb59e8aaa8bd8b4716f70b671e10be18bd24bf7c738"
 }};
+// The key is named by the scope's suites: EVM for secp256k1/keccak, generic
+// when the suites are mixed or missing, Solana only for Ed25519.
+for (const [suites, expected, forbidden] of [
+  [["secp256k1-keccak256-recoverable"], "temporary EVM session key", "Solana"],
+  [["secp256k1-sha256-recoverable"], "temporary session key", "Solana"],
+  [undefined, "temporary session key", "Solana"],
+]) {{
+  const sentence = describePetalScope({{...scope, allowed_crypto_suites: suites}}).sentence;
+  if (!sentence.includes(expected) || sentence.includes(forbidden)) {{
+    throw new Error(`wrong session key wording for ${{suites}}: ${{sentence}}`);
+  }}
+}}
+if (!describePetalScope(scope).sentence.includes("temporary Solana session key")) {{
+  throw new Error("an Ed25519 scope must still say Solana");
+}}
 renderReview({{
   ceremony_kind: "key_derive",
   expires_at_ms: Date.now() + 300000,
