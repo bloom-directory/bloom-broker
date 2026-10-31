@@ -984,14 +984,19 @@ globalThis.history = {{replaceState: () => {{}}}};
 globalThis.setInterval = () => 1;
 globalThis.clearInterval = () => {{}};
 {executable}
-// The wallet read never succeeds, the way it does not while the account's
-// address is still being projected.
 let walletReads = 0;
+let walletReadable = false;
 globalThis.fetch = async url => {{
-  if (String(url).startsWith("/api/wallet/")) {{ walletReads++; return {{ok: false, status: 404}}; }}
-  throw new Error(`unexpected fetch ${{url}}`);
+  if (!String(url).startsWith("/api/wallet/")) throw new Error(`unexpected fetch ${{url}}`);
+  walletReads++;
+  // An unreadable wallet is what a read sees while the account's address is
+  // still being projected.
+  return walletReadable
+    ? {{ok: true, json: async () => ({{wallet_id: "wallet-primary", accounts: [{{key_ref: {{}},
+        chain_projections: [{{chain_family: "evm", address: "0xabc"}}]}}]}})}}
+    : {{ok: false, status: 404}};
 }};
-const acknowledged = [];
+let acknowledged = [];
 mutate = async url => {{ acknowledged.push(url); return {{}}; }};
 clearBrowserState = async () => {{}};
 hpkeOpen = async () => new TextEncoder().encode(JSON.stringify({{
@@ -1003,19 +1008,20 @@ function allText(node) {{
   if (typeof node === "string") return node;
   return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
 }}
-finishBrowserResult({{
-  ceremony_kind: "wallet_registration",
+const ack = `/api/session/${{ceremonyId}}/ack`;
+const finish = kind => finishBrowserResult({{
+  ceremony_kind: kind,
   signer_contribution: {{
     wallet_id: "wallet-primary",
     ceremony_id: ceremonyId,
-    ceremony_kind: "wallet_registration",
+    ceremony_kind: kind,
     custody_operation_id: "op_1"
   }},
   challenges: [{{binding: {{exact_terms_digest: "d1", signer_contribution_digest: "d2"}}}}]
-}}, {{encrypted_browser_result: "sealed"}}).then(() => {{
-  if (!acknowledged.includes(`/api/session/${{ceremonyId}}/ack`)) {{
-    throw new Error("a committed registration was not acknowledged");
-  }}
+}}, {{encrypted_browser_result: "sealed"}});
+(async () => {{
+  await finish("wallet_registration");
+  if (!acknowledged.includes(ack)) throw new Error("a committed registration was not acknowledged");
   if (walletReads < 2) throw new Error(`the wallet read was not retried: ${{walletReads}}`);
   if (!allText(nodes.review).includes("Download Bloom recovery code")) {{
     throw new Error("the recovery code was not offered");
@@ -1023,8 +1029,25 @@ finishBrowserResult({{
   if (!nodes.status.textContent.includes("Wallet created")) {{
     throw new Error(`unexpected status: ${{nodes.status.textContent}}`);
   }}
+
+  // The normal path: the wallet view replaces the review contents, and the
+  // recovery code must still be on the page afterwards.
+  walletReadable = true; acknowledged = []; nodes.review.children = [];
+  await finish("wallet_registration");
+  const page = allText(nodes.review);
+  if (!acknowledged.includes(ack)) throw new Error("a readable registration was not acknowledged");
+  if (!page.includes("0xabc")) throw new Error("the created wallet was not shown");
+  if (!page.includes("Download Bloom recovery code")) {{
+    throw new Error("the wallet view erased the recovery code");
+  }}
+
+  // Other sensitive results are acknowledged only after they are drawn.
+  acknowledged = [];
+  renderResult = () => {{ throw new Error("render failed"); }};
+  const failed = await finish("wallet_export").then(() => false, () => true);
+  if (!failed || acknowledged.length) throw new Error("an export was acknowledged before it was drawn");
   process.stdout.write("registration-acknowledged");
-}}).catch(error => {{ console.error(error); process.exit(1); }});
+}})().catch(error => {{ console.error(error); process.exit(1); }});
 "#
     );
     let output = run_node(&script);

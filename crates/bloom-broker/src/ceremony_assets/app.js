@@ -3949,18 +3949,22 @@ async function finishBrowserResult(session, result) {
       te.encode(outputAad),
       result.encrypted_browser_result
     );
-    // Opening the output is what the acknowledgement attests, so send it
-    // before drawing anything. Custody has already committed; a registration
-    // must not lapse to failed because a view would not render.
-    await mutate(`/api/session/${ceremonyId}/ack`, {});
     if (session.ceremony_kind === "wallet_registration") {
+      // Custody has committed, and the wallet view below is best effort, so a
+      // registration must not lapse to failed because that view would not
+      // render. Other results are acknowledged only once they are drawn.
+      await mutate(`/api/session/${ceremonyId}/ack`, {});
       let recovery;
       try { recovery = JSON.parse(new TextDecoder().decode(plaintext)); } catch (_) {}
-      showRecoveryCode(recovery);
       if (!await showCreatedWallet(session, 10)) {
         statusNode.textContent = "Wallet created. Its addresses are not readable here yet; open Bloom to see them.";
       }
-    } else renderResult(session, plaintext);
+      // After the wallet view, which replaces the review contents.
+      showRecoveryCode(recovery);
+    } else {
+      renderResult(session, plaintext);
+      await mutate(`/api/session/${ceremonyId}/ack`, {});
+    }
   } else {
     if (session.ceremony_kind !== "wallet_registration" || !await showCreatedWallet(session)) renderDone(session, result);
   }
