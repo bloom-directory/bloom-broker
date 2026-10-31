@@ -137,6 +137,8 @@ function reviewIcon(kind) {
 
 // Each chain's native asset, by chain ID. A logo reuses the reviewed catalog
 // artwork for the same asset (its L1 or wrapped contract), never a ticker.
+// Units come from Broker's native_asset_metadata; keep both lists in step.
+// Tempo has no native asset (fees are paid in USD stablecoins): neutral mark.
 const ETHER = {name: "Ether", mark: "ethereum"};
 const NATIVE_ASSETS = {
   1: ETHER, 10: ETHER, 8453: ETHER, 42161: ETHER, 59144: ETHER, 4663: ETHER, 31337: ETHER,
@@ -145,9 +147,15 @@ const NATIVE_ASSETS = {
   43114: {name: "AVAX", art: "43114:0xb31f66aa3c1e785363f0875a1b74e27b85fd66c7"},
   100: {name: "xDAI", art: "100:0xe91d153e0b41518a2ce8dd3d7944fa863463a97d"},
   999: {name: "HYPE", art: "999:0x5555555555555555555555555555555555555555"},
+  5042: {name: "USDC", art: "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"},
 };
 function nativeAsset(chainId) {
   return NATIVE_ASSETS[Number(chainId)] || null;
+}
+// Every native amount card: the chain ID alone picks its name and mark.
+function nativeCard(chainId) {
+  const asset = nativeAsset(chainId);
+  return {native: asset ? `native:${Number(chainId)}` : "token", title: asset?.name || "Native asset"};
 }
 function nativeIcon(chainId) {
   const asset = nativeAsset(chainId);
@@ -274,8 +282,9 @@ function chainLabel(chain, ctx) {
       ? "Solana mainnet" : "Solana";
   }
   return {ethereum: "Ethereum", mainnet: "Ethereum", base: "Base", arbitrum: "Arbitrum",
-    optimism: "Optimism", polygon: "Polygon", "evm-56": "BNB Chain",
-    "evm-43114": "Avalanche", "evm-999": "HyperEVM", anvil: "local test chain"}[chain] || chain;
+    optimism: "Optimism", polygon: "Polygon", "evm-56": "BNB Chain", "evm-100": "Gnosis",
+    "evm-43114": "Avalanche", "evm-999": "HyperEVM", "evm-59144": "Linea", "evm-4663": "Robinhood",
+    "evm-4217": "Tempo", "evm-5042": "Arc", anvil: "local test chain"}[chain] || chain;
 }
 
 function addressExplorer(chainId, address) {
@@ -723,7 +732,7 @@ function describeTransfer(manifest) {
         : authenticationScope ? "Allow the fixed authentication profile below. Broker checks the fresh message when this permission is used."
         : payment ? "Authorize this exact token payment within the signed validity window." : "Review the exact fields bound to this message signature.",
       chainId, networkIdentity: solana ? "Solana · cluster not encoded in message" : hyperliquid ? `Hyperliquid · ${venueNetwork || "Unknown environment"}`
-        : chainId ? `${({1:"Ethereum",10:"Optimism",56:"BNB Chain",100:"Gnosis",137:"Polygon",8453:"Base",42161:"Arbitrum",43114:"Avalanche",59144:"Linea",999:"HyperEVM",4663:"Robinhood",4217:"Tempo"})[chainId] || "EVM"} · Chain ID ${chainId}` : "Message signature",
+        : chainId ? `${({1:"Ethereum",10:"Optimism",56:"BNB Chain",100:"Gnosis",137:"Polygon",8453:"Base",42161:"Arbitrum",43114:"Avalanche",59144:"Linea",999:"HyperEVM",4663:"Robinhood",4217:"Tempo",5042:"Arc"})[chainId] || "EVM"} · Chain ID ${chainId}` : "Message signature",
       networkIcon: solana ? "solana" : chainId ? chainIcon(chainId) : "unknown",
       facts: [], technical: [...(message.payload_keccak ? [["Signing hash", message.payload_keccak, true]] : []),
         ...extraTechnical, ...(message.venue_asset?.base_units ? [["USDC base units", message.venue_asset.base_units, true]] : []),
@@ -1116,7 +1125,7 @@ function describeTransfer(manifest) {
           asset: address && amount ? {chainId: String(safe.chain_id), address, amount: unlimited ? "Unlimited" : amount,
             amountLabel: permission ? "Spending limit" : morpho ? "Tokens supplied" : "Amount",
             tone: unlimited ? "danger" : permission ? "permission" : "outgoing"}
-            : native ? {native: / ETH$/.test(amount) ? "ethereum" : "token", amount, amountLabel: "Amount"} : null,
+            : native ? {...nativeCard(safe.chain_id), amount, amountLabel: "Amount"} : null,
           parties: [
             [permission ? "Spender" : "Recipient", permission ? value("Spender") : value("To") || value("Recipient") || native?.[2]],
             ["Vault", morpho ? value("Action 2 · Vault") : ""],
@@ -1135,9 +1144,7 @@ function describeTransfer(manifest) {
       ? {chainId: String(safe.chain_id), address: tokenAddress, amount: unlimited ? "Unlimited" : amount,
           amountLabel: permission ? "Spending limit" : "Amount",
           tone: unlimited ? "danger" : permission ? "permission" : "outgoing"}
-      : sendTo ? {native: / ETH$/.test(sendTo[1]) ? "ethereum" : "token",
-          title: / ETH$/.test(sendTo[1]) ? "Ether" : "Native asset", amount: sendTo[1],
-          amountLabel: "Amount", tone: "outgoing"} : null;
+      : sendTo ? {...nativeCard(safe.chain_id), amount: sendTo[1], amountLabel: "Amount", tone: "outgoing"} : null;
     const safeRecipient = directToken ? recipient : sendTo?.[2];
     const safeParties = [
       [permission ? "Token holder · Safe address" : "Sender · Safe address", safe.safe],
@@ -1558,12 +1565,9 @@ function renderReview(session) {
         tone: unlimited ? "danger" : sending ? "outgoing" : "permission"
       }));
     } else if (transfer.intent.action === "send") {
-      const display = String(transfer.payloads?.[0]?.value_display || "");
-      const eth = / ETH$/.test(display);
       decision.push(assetCard({
-        native: eth ? "ethereum" : "token",
-        title: eth ? "Ether" : "Native asset",
-        amount: display,
+        ...nativeCard(transfer.payloads?.[0]?.chain_id),
+        amount: String(transfer.payloads?.[0]?.value_display || ""),
         amountLabel: "Amount",
         tone: "outgoing"
       }));
@@ -1663,9 +1667,7 @@ function renderReview(session) {
         if (field.format === "nativeAmount") {
           // The reader marks native amounts explicitly. Never infer asset
           // identity from a descriptor label or a ticker in formatted text.
-          const native = nativeAsset(payload.chain_id);
-          decision.push(assetCard({native: native ? `native:${Number(payload.chain_id)}` : "token",
-            title: native?.name || "Native asset",
+          decision.push(assetCard({...nativeCard(payload.chain_id),
             amount: String(field.value).replace(/ \((transaction value|minimum balance increase)\)$/, ""),
             amountLabel: enso && /^Source asset/.test(field.label) ? "You pay"
               : enso && /^Requested minimum balance increase/.test(field.label) ? "Minimum output" : field.label,

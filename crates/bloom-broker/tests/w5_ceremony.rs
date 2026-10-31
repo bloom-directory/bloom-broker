@@ -1061,25 +1061,34 @@ for (const stale of ["Native value (wei)", "per gas (wei)", "Some("]) {{
   if (rendered.includes(stale)) throw new Error(`stale EVM rendering ${{stale}}: ${{rendered}}`);
 }}
 
-// A non-ETH network shows its own native asset, chosen by chain ID: POL's
-// reviewed catalog artwork in the header and beside the gas fee.
-renderReview(session({{
-  chain_id: "137", chain: "polygon",
-  sender: "0x1111111111111111111111111111111111111111",
-  destination: "0x2222222222222222222222222222222222222222",
-  value: "10000000000000000", value_display: "0.01 POL",
-  nonce: "0", gas_limit: "26250",
-  fee: {{kind: "eip1559", max_fee_per_gas: "549987553048",
-    max_fee_per_gas_display: "549.99 Gwei", max_priority_fee_per_gas: "27499377652",
-    max_priority_fee_per_gas_display: "27.5 Gwei"}},
-  maximum_execution_gas_fee_display: "0.014799 POL",
-  payload_keccak: "0xabd",
-  calldata_bytes: "0"
-}}));
-const polArt = `/assets/tokens/${{REVIEWED_TOKEN_ARTWORK["1:0x455e53cbb86018ac2b8092fdcd39d8444affc3f6"].file}}`;
-const polImages = node => walk(node).filter(child => child.tagName === "IMG" && child.src === polArt);
-if (polImages(nodes["page-title"]).length !== 1 || polImages(nodes.review).length < 1) {{
-  throw new Error("Polygon header or gas fee is missing the POL mark");
+// A non-ETH network shows its own native asset, chosen by chain ID, in the
+// header, the primary amount card, and beside the gas fee.
+for (const [chainId, chain, name, artKey] of [
+  ["137", "polygon", "POL", "1:0x455e53cbb86018ac2b8092fdcd39d8444affc3f6"],
+  ["5042", "evm-5042", "USDC", "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"],
+]) {{
+  renderReview(session({{
+    chain_id: chainId, chain,
+    sender: "0x1111111111111111111111111111111111111111",
+    destination: "0x2222222222222222222222222222222222222222",
+    value: "10000000000000000", value_display: `0.01 ${{name}}`,
+    nonce: "0", gas_limit: "26250",
+    fee: {{kind: "eip1559", max_fee_per_gas: "549987553048",
+      max_fee_per_gas_display: "549.99 Gwei", max_priority_fee_per_gas: "27499377652",
+      max_priority_fee_per_gas_display: "27.5 Gwei"}},
+    maximum_execution_gas_fee_display: `0.014799 ${{name}}`,
+    payload_keccak: "0xabd",
+    calldata_bytes: "0"
+  }}));
+  const art = `/assets/tokens/${{REVIEWED_TOKEN_ARTWORK[artKey].file}}`;
+  const marked = node => walk(node).some(child => child.tagName === "IMG" && child.src === art);
+  const byClass = name => walk(nodes.review).find(node => String(node.className).includes(name));
+  const card = byClass("ceremony-asset");
+  if (!marked(nodes["page-title"])) throw new Error(`${{chain}} header is missing the ${{name}} mark`);
+  if (!marked(card) || !allText(card).includes(name) || allText(card).includes("Native asset")) {{
+    throw new Error(`${{chain}} amount card is not ${{name}}: ${{allText(card)}}`);
+  }}
+  if (!marked(byClass("ceremony-fee-amount"))) throw new Error(`${{chain}} gas fee is missing the ${{name}} mark`);
 }}
 
 renderReview(session({{
@@ -2230,6 +2239,9 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
         ".ceremony-party{",
         ".ceremony-warning{",
         ".ceremony-actions{",
+        // Catalog artwork is a 56px image; compact rows must size it too.
+        ".panel-context svg,.panel-context img{width:22px;height:22px",
+        ".ceremony-fee-amount svg,.ceremony-fee-amount img{width:14px;height:14px",
         "env(safe-area-inset-top,0px)",
         "env(safe-area-inset-right,0px)",
         "env(safe-area-inset-bottom,0px)",

@@ -5240,6 +5240,9 @@ pub(crate) fn native_asset_metadata(chain: &str, asset: &str) -> Option<(u8, &'s
         ("evm-56", "native") => Some((18, "BNB")),
         ("evm-43114", "native") => Some((18, "AVAX")),
         ("evm-999", "native") => Some((18, "HYPE")),
+        // Arc's gas token is USDC: 18 decimals natively, 6 only through its
+        // ERC-20 interface. Tempo has no native asset, so it stays unlisted.
+        ("evm-5042", "native") => Some((18, "USDC")),
         _ => None,
     }
 }
