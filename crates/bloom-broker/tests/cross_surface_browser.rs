@@ -406,23 +406,32 @@ fn run_node(script: &str) -> std::process::Output {
 }
 
 #[test]
-fn an_empty_passkey_allow_list_fails_with_a_readable_message() {
+fn an_empty_passkey_allow_list_shows_its_message_and_keeps_approval_disabled() {
     let output = run_browser(
         r#"
 const session = {webauthn_options: {allowed_credentials: []}, challenges: [{challenge: "AA"}]};
-let message = null;
-try { requestOptions(session, 0); } catch (error) { message = error.message; }
+console.error = () => {};
+approve.disabled = true;
+try { requestOptions(session, 0); } catch (error) { reportApprovalFailure(error); }
+const empty = {status: statusNode.textContent, disabled: approve.disabled};
+reportApprovalFailure(new Error("user dismissed the prompt"));
+const other = {status: statusNode.textContent, disabled: approve.disabled};
 const listed = requestOptions({webauthn_options: {allowed_credentials:
   [{credential_id: "ZA", prf_salt: "ZQ"}]}, challenges: [{challenge: "AA"}]}, 0);
-process.stdout.write(JSON.stringify({message, listed: listed.allowCredentials.length}));
+process.stdout.write(JSON.stringify({empty, other, listed: listed.allowCredentials.length}));
 "#,
     );
     assert!(
-        output["message"]
+        output["empty"]["status"]
             .as_str()
             .unwrap()
             .contains("no passkey for abcdefghijklmnopqrstuvwxyz.relay.bloom.directory"),
         "{output}"
+    );
+    assert_eq!(output["empty"]["disabled"], true, "{output}");
+    assert_eq!(
+        output["other"],
+        json!({"status": "Passkey verification failed. Please try again.", "disabled": false})
     );
     assert_eq!(output["listed"], 1);
 }
