@@ -60,5 +60,13 @@ mod tests {
         // Two listed tokens share this symbol on Ethereum: no guess.
         assert!(token_by_symbol(1, "LIT").is_none());
         assert!(token_by_symbol(1, "NOT-A-TOKEN").is_none());
+        // Tempo mainnet MPP tokens, checked on chain 4217 on 2026-11-01.
+        for (symbol, address) in [
+            ("pathUSD", "0x20c0000000000000000000000000000000000000"),
+            ("USDC.e", "0x20c000000000000000000000b9537d11c60e8b50"),
+        ] {
+            let token = token_by_symbol(4217, symbol).unwrap();
+            assert_eq!((token.address.as_str(), token.decimals), (address, 6));
+        }
     }
 }

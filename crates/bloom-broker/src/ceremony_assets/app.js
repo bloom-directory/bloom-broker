@@ -618,6 +618,7 @@ function describeTransfer(manifest) {
     const polymarket = message.kind === "polymarket_exact";
     const authenticationScope = message.kind === "polymarket_auth_scope";
     const solana = message.kind === "solana_message";
+    const tempo = String(message.kind).startsWith("tempo_");
     const signingChain = chainId;
     const venueNetwork = fields.find(field => ["hyperliquidChain", "Hyperliquid environment"].includes(field.path))?.value;
     if (hyperliquid) chainId = null;
@@ -692,9 +693,10 @@ function describeTransfer(manifest) {
         ? ["The Petal reports the destination and policy limits. These claims are not established by the message signature; review them separately from the signed authorization."] : [];
     return {
       intent: {action: "sign_message", heading: message.title || "Sign a message"},
-      button: solana ? "Approve Solana transaction" : authenticationScope ? "Allow one authentication" : payment ? "Approve payment authorization" : agent ? "Authorize trading agent"
+      button: solana ? "Approve Solana transaction" : tempo ? "Approve Tempo payment" : authenticationScope ? "Allow one authentication" : payment ? "Approve payment authorization" : agent ? "Authorize trading agent"
         : hyperliquid ? "Approve exchange action" : "Approve message signature",
       sentence: solana ? "Approve one transaction. Only its recent blockhash may refresh; every other signed byte remains bound to this review."
+        : tempo ? "Bloom decoded this payment from the exact bytes the wallet signs. Check the amounts and recipients below."
         : authenticationScope ? "Allow the fixed authentication profile below. Broker checks the fresh message when this permission is used."
         : payment ? "Authorize this exact token payment within the signed validity window." : "Review the exact fields bound to this message signature.",
       chainId, networkIdentity: solana ? "Solana · cluster not encoded in message" : hyperliquid ? `Hyperliquid · ${venueNetwork || "Unknown environment"}`

@@ -837,6 +837,14 @@ impl BrokerRpcService {
                         "Machine x402 payment approval requires its payment review envelope; upgrade Bloom Machine",
                     ));
                 }
+                if crate::message_review::is_system_mpp(&request.terms.subject)
+                    && request.message_review_payloads.is_empty()
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "Machine MPP payment approval requires its payment review envelope; upgrade Bloom Machine",
+                    ));
+                }
                 if safe_petal && request.safe_review_payloads.is_empty() {
                     return Err(ProtocolError::new(
                         ProtocolErrorCode::SelectorMismatch,
