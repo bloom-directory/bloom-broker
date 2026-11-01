@@ -1939,7 +1939,7 @@ async fn approve_and_sign(
     payload: &[u8],
     sign_count: u32,
 ) -> bloom_broker_api::SigningResult {
-    activate_signing_approval(stack, authenticator, terms, payload, sign_count, None).await;
+    activate_signing_approval(stack, authenticator, terms, sign_count, None, None).await;
     let sign_request = signing_request(terms, payload, None, stack.next_operation());
     match MachineBrokerService::dispatch(
         stack.broker.as_ref(),
@@ -1957,10 +1957,10 @@ async fn activate_signing_approval(
     stack: &mut AccountStack,
     authenticator: &VirtualAuthenticator,
     terms: &SealedApprovalTerms,
-    payload: &[u8],
     sign_count: u32,
     claim: Option<&bloom_broker_api::PetalUseClaim>,
-) {
+    message_review: Option<&[u8]>,
+) -> serde_json::Value {
     let approval_operation = stack.next_operation();
     let approve_prepared = match MachineBrokerService::dispatch(
         stack.broker.as_ref(),
@@ -1971,13 +1971,10 @@ async fn activate_signing_approval(
             terms: terms.clone(),
             canonical_plan_facts_digest: terms.approval_digest().unwrap(),
             evm_review_payloads: Vec::new(),
-            message_review_payloads: if claim.is_some_and(|claim| {
-                bloom_broker_api::pumpfun_review_required(claim.operation_class.as_str())
-            }) {
-                vec![Base64UrlBytes::from_bytes(payload)]
-            } else {
-                vec![]
-            },
+            message_review_payloads: message_review
+                .map(Base64UrlBytes::from_bytes)
+                .into_iter()
+                .collect(),
             safe_review_payloads: Vec::new(),
             petal_use_claim: claim.cloned(),
             system_use_claim: None,
@@ -2043,6 +2040,7 @@ async fn activate_signing_approval(
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    session
 }
 
 fn signing_request(
@@ -2318,9 +2316,9 @@ async fn pump_review_binds_real_signer_to_the_reviewed_transaction() {
         &mut stack,
         &authenticator,
         &terms,
-        &bytes,
         3,
         Some(&claim(&bytes)),
+        Some(&bytes),
     )
     .await;
 
@@ -2503,9 +2501,9 @@ async fn delegated_hyperliquid_witness_is_enforced_over_real_signer_transport() 
         &mut stack,
         &authenticator,
         &terms,
-        &raw,
         3,
         Some(&claim(&raw, nonce)),
+        None,
     )
     .await;
     let (broker, authority) = open_broker(
@@ -2727,4 +2725,183 @@ async fn restored_wallet_signs_from_restored_derived_account_over_real_transport
         .to_public_key_der()
         .unwrap();
     assert_eq!(descriptor.canonical_public_key.decode(), spki.as_bytes());
+}
+
+/// Machine's own x402 payment: Broker shows the token, amount, recipient and
+/// validity it independently rebuilds from the typed data, and refuses an
+/// approval without that envelope or with one that differs from the bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn machine_x402_payment_is_shown_from_the_signed_bytes() {
+    use alloy_dyn_abi::eip712::TypedData;
+    use ed25519_dalek::Signer as _;
+    use k256::elliptic_curve::sec1::ToEncodedPoint as _;
+    use k256::pkcs8::DecodePublicKey as _;
+    use serde_json::json;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut stack = account_stack(directory.path(), "x402").await;
+    let authenticator = VirtualAuthenticator::generate();
+    let wallet_id = Token::new("machine-x402").unwrap();
+    register_bip39_wallet(&mut stack, &wallet_id, &authenticator, None).await;
+    let class = Token::new(bloom_broker_api::SYSTEM_X402_OPERATION_CLASS).unwrap();
+    let mut provenance = system_provenance();
+    provenance.subject = ProvenanceSubject::System {
+        component_id: Token::new("bloom-machine").unwrap(),
+        operation_class: class.clone(),
+    };
+    provenance.operation_classes[0].operation_class = class.clone();
+    provenance.installer_signature = Base64UrlBytes::from_bytes(&[]);
+    let mut signed = PROVENANCE_RECORD_SIGNATURE_DOMAIN.to_vec();
+    signed.extend(serde_jcs::to_vec(&provenance).unwrap());
+    provenance.installer_signature =
+        Base64UrlBytes::from_bytes(&SigningKey::from_bytes(&[5; 32]).sign(&signed).to_bytes());
+    stack.authority.install_provenance(&provenance).unwrap();
+
+    let accounts = wallet_accounts(&stack, &wallet_id).await;
+    let account = accounts
+        .accounts
+        .iter()
+        .find(|a| a.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1)
+        .unwrap();
+    let point = k256::PublicKey::from_public_key_der(&account.canonical_public_key.decode())
+        .unwrap()
+        .to_encoded_point(false);
+    let payer = alloy::primitives::Address::from_raw_public_key(&point.as_bytes()[1..]);
+    let typed_data = |value: &str| {
+        json!({
+            "types": {
+                "EIP712Domain": [{"name":"name","type":"string"},{"name":"version","type":"string"},{"name":"chainId","type":"uint256"},{"name":"verifyingContract","type":"address"}],
+                "TransferWithAuthorization": [{"name":"from","type":"address"},{"name":"to","type":"address"},{"name":"value","type":"uint256"},{"name":"validAfter","type":"uint256"},{"name":"validBefore","type":"uint256"},{"name":"nonce","type":"bytes32"}]
+            },
+            "primaryType":"TransferWithAuthorization",
+            "domain":{"name":"USD Coin","version":"2","chainId":8453,"verifyingContract":"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"},
+            "message":{"from":format!("{payer:#x}"),"to":"0x0000000000000000000000000000000000000008","value":value,"validAfter":"0","validBefore":"2000000000","nonce":format!("0x{}","11".repeat(32))}
+        })
+    };
+    let envelope = |value: &str| {
+        serde_json::to_vec(&json!({"schema":"bloom.message.review.v1","kind":"eip712","typed_data":typed_data(value)}))
+            .unwrap()
+    };
+    let typed: TypedData = serde_json::from_value(typed_data("2500000")).unwrap();
+    let mut payload = vec![0x19, 0x01];
+    payload.extend_from_slice(typed.domain.separator().as_slice());
+    payload.extend_from_slice(typed.hash_struct().unwrap().as_slice());
+    let public = wallet_public(&stack, &wallet_id).await;
+    let mut terms = sign_terms(&public, account.key_ref.clone(), &payload, &provenance);
+    terms.subject = ApprovalSubject::System {
+        component_id: Token::new("bloom-machine").unwrap(),
+        operation_class: class,
+    };
+    terms.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Keccak256Recoverable];
+    terms.selector = ApprovalSelector::Exact {
+        ordered_payload_digests: vec![Digest32::from_bytes(Sha256::digest(&payload).into())],
+        ordered_hashes: vec![Digest32::from_bytes(
+            alloy::primitives::keccak256(&payload).into(),
+        )],
+    };
+
+    for (review, expected) in [
+        (vec![], "requires its payment review envelope"),
+        (
+            envelope("2500001"),
+            "differs from the exact approved payload",
+        ),
+    ] {
+        let operation_id = stack.next_operation();
+        let error = MachineBrokerService::dispatch(
+            stack.broker.as_ref(),
+            MachineBrokerRequest::SealedApprovalPrepare(bloom_broker_api::ApprovalPrepareRequest {
+                evm_reported_token: None,
+                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+                operation_id,
+                terms: terms.clone(),
+                canonical_plan_facts_digest: terms.approval_digest().unwrap(),
+                evm_review_payloads: Vec::new(),
+                message_review_payloads: [review]
+                    .iter()
+                    .filter(|bytes| !bytes.is_empty())
+                    .map(|bytes| Base64UrlBytes::from_bytes(bytes))
+                    .collect(),
+                safe_review_payloads: Vec::new(),
+                petal_use_claim: None,
+                system_use_claim: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains(expected), "{}", error.message);
+    }
+
+    let session = activate_signing_approval(
+        &mut stack,
+        &authenticator,
+        &terms,
+        2,
+        None,
+        Some(&envelope("2500000")),
+    )
+    .await;
+    let manifest = &session["review_manifest"];
+    let payment = &manifest["message_review"]["payment"];
+    assert_eq!(payment["amount_display"], "2.5 USDC");
+    assert_eq!(
+        payment["recipient"],
+        "0x0000000000000000000000000000000000000008"
+    );
+    assert_eq!(payment["valid_before"], "2000000000");
+
+    // The shipped page renders the same facts with no Petal or System claim.
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
+    let script = format!(
+        r#"globalThis.document = {{getElementById: () => ({{}})}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+{}
+const view = describeTransfer({manifest});
+const fact = label => view.messageFields.find(([name]) => name === label)?.[1];
+if (view.tokenAsset.amount !== "2.5 USDC" || view.tokenAsset.subtitle !== "USDC") throw new Error(JSON.stringify(view.tokenAsset));
+if (view.parties[1].value !== "0x0000000000000000000000000000000000000008") throw new Error(JSON.stringify(view.parties));
+if (!String(fact("Valid until")).startsWith("2033-05-18T03:33:20")) throw new Error(fact("Valid until"));
+if (!String(fact("Valid from")).startsWith("Immediately")) throw new Error(fact("Valid from"));
+process.stdout.write("ok");"#,
+        asset.split_once("\nload().catch").unwrap().0
+    );
+    let page = directory.path().join("page-check.js");
+    fs::write(&page, script).unwrap();
+    let output = std::process::Command::new("node")
+        .arg(&page)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "ok",
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let sign_request = signing_request(&terms, &payload, None, stack.next_operation());
+    let result = match MachineBrokerService::dispatch(
+        stack.broker.as_ref(),
+        MachineBrokerRequest::SigningSign(sign_request),
+    )
+    .await
+    .unwrap()
+    {
+        MachineBrokerResponse::SigningSign(result) => result,
+        other => panic!("unexpected sign response: {other:?}"),
+    };
+    let bytes = result.signatures[0].bytes.decode();
+    let recovered = k256::ecdsa::VerifyingKey::recover_from_prehash(
+        alloy::primitives::keccak256(&payload).as_slice(),
+        &k256::ecdsa::Signature::from_slice(&bytes[..64]).unwrap(),
+        k256::ecdsa::RecoveryId::from_byte(bytes[64]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        recovered.to_encoded_point(false).as_bytes(),
+        point.as_bytes()
+    );
 }

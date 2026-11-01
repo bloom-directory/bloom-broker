@@ -714,7 +714,8 @@ pub(crate) fn review(
     if request.message_review_payloads.is_empty() {
         return Ok(None);
     }
-    if !matches!(request.terms.subject, ApprovalSubject::Petal { .. })
+    let system_x402 = is_system_x402(&request.terms.subject);
+    if !(system_x402 || matches!(request.terms.subject, ApprovalSubject::Petal { .. }))
         || !request.evm_review_payloads.is_empty()
         || !request.safe_review_payloads.is_empty()
     {
@@ -756,8 +757,18 @@ pub(crate) fn review(
             "message review differs from the exact approved payload",
         ));
     }
+    if system_x402 && review.payment.is_none() {
+        return Err(invalid(
+            "Machine x402 approval requires an EIP-3009 payment authorization; Broker cannot review other x402 payment forms",
+        ));
+    }
     validate_petal_profile(request, &review)?;
     Ok(Some(review))
+}
+
+pub(crate) fn is_system_x402(subject: &ApprovalSubject) -> bool {
+    matches!(subject, ApprovalSubject::System { operation_class, .. }
+        if operation_class.as_str() == bloom_broker_api::SYSTEM_X402_OPERATION_CLASS)
 }
 
 fn validate_petal_profile(
@@ -1061,6 +1072,55 @@ mod tests {
         request.petal_use_claim.as_mut().unwrap().operation_class =
             Token::new("venice-x402.chat").unwrap();
         assert!(review(&request, signer()).is_err());
+    }
+
+    #[test]
+    fn machine_x402_shows_the_signed_payment_and_refuses_relabels() {
+        let system = |data: Value| {
+            let mut request = request(envelope(data));
+            request.terms.subject = ApprovalSubject::System {
+                component_id: Token::new("bloom-machine").unwrap(),
+                operation_class: Token::new(bloom_broker_api::SYSTEM_X402_OPERATION_CLASS).unwrap(),
+            };
+            request
+        };
+        let approved = system(payment_data());
+        let payment = review(&approved, signer())
+            .unwrap()
+            .unwrap()
+            .payment
+            .unwrap();
+        assert_eq!(payment.amount_display, "2.5 USDC");
+        assert_eq!(
+            payment.recipient,
+            "0x0000000000000000000000000000000000000008"
+        );
+        assert_eq!(payment.valid_before, "2000000000");
+        for (section, key, value) in [
+            ("message", "value", json!("2500001")),
+            (
+                "message",
+                "to",
+                json!("0x0000000000000000000000000000000000000009"),
+            ),
+            (
+                "domain",
+                "verifyingContract",
+                json!("0x0000000000000000000000000000000000000009"),
+            ),
+            ("message", "validBefore", json!("2000000001")),
+        ] {
+            let mut relabelled = payment_data();
+            relabelled[section][key] = value;
+            let mut wrong = approved.clone();
+            wrong.message_review_payloads = vec![Base64UrlBytes::from_bytes(&envelope(relabelled))];
+            assert!(review(&wrong, signer()).is_err(), "{key}");
+        }
+        let mut other = payment_data();
+        other["primaryType"] = json!("EIP712Domain");
+        other["message"] = json!({});
+        let error = review(&system(other), signer()).unwrap_err();
+        assert!(error.message.contains("EIP-3009"), "{}", error.message);
     }
 
     #[test]

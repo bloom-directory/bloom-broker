@@ -64,6 +64,10 @@ pub const POLYMARKET_REVIEW_OPERATION_CLASSES: &[&str] = &[
 /// profile must have a new class so existing grants cannot silently widen.
 pub const POLYMARKET_CLOB_AUTH_CLASS: &str = "polymarket.clob_auth.v1";
 
+/// Machine's own x402 payments. Exact approvals for this System class must
+/// carry the EIP-3009 typed data so the owner sees the signed payment.
+pub const SYSTEM_X402_OPERATION_CLASS: &str = "paid-http.x402";
+
 pub fn message_review_requires_exact(class: &str) -> bool {
     MESSAGE_REVIEW_OPERATION_CLASSES.contains(&class)
         || matches!(

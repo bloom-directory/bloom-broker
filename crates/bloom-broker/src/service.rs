@@ -829,6 +829,14 @@ impl BrokerRpcService {
                         "This message operation requires a review envelope; upgrade Bloom Machine and the Petal",
                     ));
                 }
+                if crate::message_review::is_system_x402(&request.terms.subject)
+                    && request.message_review_payloads.is_empty()
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "Machine x402 payment approval requires its payment review envelope; upgrade Bloom Machine",
+                    ));
+                }
                 if safe_petal && request.safe_review_payloads.is_empty() {
                     return Err(ProtocolError::new(
                         ProtocolErrorCode::SelectorMismatch,
