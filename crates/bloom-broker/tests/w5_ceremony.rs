@@ -988,6 +988,122 @@ if (nodes["page-title"].textContent !== "Remove a passkey from a wallet" ||
     );
 }
 
+/// A wallet registration commits custody before the page draws anything. On
+/// 2026-10-26 an owner's registration completed, the wallet existed, and the
+/// page still said "the result could not be recovered or acknowledged": the
+/// created wallet was read once, that read lost the race with the account's
+/// own address projection, and the throw skipped the acknowledgement. The
+/// session then sat in AWAITING_RECOVERY_ACK until it lapsed to failed, and
+/// the Bloom recovery code was never offered, because it was rendered inside
+/// the same wallet read.
+#[test]
+fn a_registration_is_acknowledged_even_when_the_new_wallet_cannot_be_read() {
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  setAttribute() {{}}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+let walletReads = 0;
+let walletReadable = false;
+globalThis.fetch = async url => {{
+  if (!String(url).startsWith("/api/wallet/")) throw new Error(`unexpected fetch ${{url}}`);
+  walletReads++;
+  // An unreadable wallet is what a read sees while the account's address is
+  // still being projected.
+  return walletReadable
+    ? {{ok: true, json: async () => ({{wallet_id: "wallet-primary", accounts: [{{key_ref: {{}},
+        chain_projections: [{{chain_family: "evm", address: "0xabc"}}]}}]}})}}
+    : {{ok: false, status: 404}};
+}};
+let acknowledged = [];
+mutate = async url => {{ acknowledged.push(url); return {{}}; }};
+clearBrowserState = async () => {{}};
+hpkeOpen = async () => new TextEncoder().encode(JSON.stringify({{
+  recovery_id: "rec_1", recovery_secret: "s3cret"
+}}));
+outputRecipient = {{}};
+ceremonyId = "a".repeat(64);
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+const ack = `/api/session/${{ceremonyId}}/ack`;
+const finish = kind => finishBrowserResult({{
+  ceremony_kind: kind,
+  signer_contribution: {{
+    wallet_id: "wallet-primary",
+    ceremony_id: ceremonyId,
+    ceremony_kind: kind,
+    custody_operation_id: "op_1"
+  }},
+  challenges: [{{binding: {{exact_terms_digest: "d1", signer_contribution_digest: "d2"}}}}]
+}}, {{encrypted_browser_result: "sealed"}});
+(async () => {{
+  await finish("wallet_registration");
+  if (!acknowledged.includes(ack)) throw new Error("a committed registration was not acknowledged");
+  if (walletReads < 2) throw new Error(`the wallet read was not retried: ${{walletReads}}`);
+  if (!allText(nodes.review).includes("Download Bloom recovery code")) {{
+    throw new Error("the recovery code was not offered");
+  }}
+  if (!nodes.status.textContent.includes("Wallet created")) {{
+    throw new Error(`unexpected status: ${{nodes.status.textContent}}`);
+  }}
+
+  // The normal path: the wallet view replaces the review contents, and the
+  // recovery code must still be on the page afterwards.
+  walletReadable = true; acknowledged = []; nodes.review.children = [];
+  await finish("wallet_registration");
+  const page = allText(nodes.review);
+  if (!acknowledged.includes(ack)) throw new Error("a readable registration was not acknowledged");
+  if (!page.includes("0xabc")) throw new Error("the created wallet was not shown");
+  if (!page.includes("Download Bloom recovery code")) {{
+    throw new Error("the wallet view erased the recovery code");
+  }}
+
+  // Other sensitive results are acknowledged only after they are drawn.
+  acknowledged = [];
+  renderResult = () => {{ throw new Error("render failed"); }};
+  const failed = await finish("wallet_export").then(() => false, () => true);
+  if (!failed || acknowledged.length) throw new Error("an export was acknowledged before it was drawn");
+  process.stdout.write("registration-acknowledged");
+}})().catch(error => {{ console.error(error); process.exit(1); }});
+"#
+    );
+    let output = run_node(&script);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "registration-acknowledged"
+    );
+}
+
 #[test]
 fn evm_manifest_is_rendered_as_primary_review_facts() {
     let asset = concat!(
