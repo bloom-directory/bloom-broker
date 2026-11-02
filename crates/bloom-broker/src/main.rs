@@ -2899,19 +2899,19 @@ mod startup_failure_tests {
         drop(open());
         rusqlite::Connection::open(&path)
             .unwrap()
-            .pragma_update(None, "user_version", 3)
+            .pragma_update(None, "user_version", 4)
             .unwrap();
 
         let error = bloom_broker::ceremony::require_supported_ceremony_storage(&open())
-            .expect_err("a journal at ceremony storage version 3 must be refused");
+            .expect_err("a journal at ceremony storage version 4 must be refused");
         let (events, output) = fatal_events_for(error);
 
         assert_eq!(events.len(), 1, "{output}");
         let fields = &events[0]["fields"];
         assert_eq!(fields["error_kind"], "startup_or_runtime");
         assert_eq!(fields["reason"], "unsupported_ceremony_storage_version");
-        assert_eq!(fields["found_version"], 3);
-        assert_eq!(fields["supported_version"], 2);
+        assert_eq!(fields["found_version"], 4);
+        assert_eq!(fields["supported_version"], 3);
         let message = fields["reason_message"].as_str().unwrap();
         assert!(message.contains("written by a newer Broker"), "{message}");
         assert!(message.contains("restore a backup"), "{message}");
