@@ -1066,6 +1066,10 @@ for (const stale of ["Native value (wei)", "per gas (wei)", "Some("]) {{
 for (const [chainId, chain, name, artKey] of [
   ["137", "polygon", "POL", "1:0x455e53cbb86018ac2b8092fdcd39d8444affc3f6"],
   ["5042", "evm-5042", "USDC", "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"],
+  ["56", "bsc", "BNB", "56:0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"],
+  ["43114", "avalanche", "AVAX", "43114:0xb31f66aa3c1e785363f0875a1b74e27b85fd66c7"],
+  ["100", "gnosis", "xDAI", "100:0xe91d153e0b41518a2ce8dd3d7944fa863463a97d"],
+  ["999", "hyperevm", "HYPE", "999:0x5555555555555555555555555555555555555555"],
 ]) {{
   renderReview(session({{
     chain_id: chainId, chain,

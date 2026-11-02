@@ -195,7 +195,7 @@ function assetCard({chainId, address, venueAsset, native, title, subtitle, amoun
   const art = venueAsset ? venueTokenArt(venueAsset) : address ? tokenArt(chainId, address) : null;
   const mark = native ? reviewIcon(native) : artworkIcon(art);
   const nativeMark = String(native).startsWith("native:") ? nativeAsset(String(native).slice(7))?.mark : native;
-  const branded = art || mark.tagName === "IMG" || nativeMark === "ethereum" || nativeMark === "base";
+  const branded = art || mark.tagName === "IMG" || nativeMark === "ethereum";
   const icon = el("span", {
     class: `ceremony-token-icon${branded ? " has-artwork" : ""}`,
     "aria-hidden": "true"
