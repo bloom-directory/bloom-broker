@@ -988,6 +988,122 @@ if (nodes["page-title"].textContent !== "Remove a passkey from a wallet" ||
     );
 }
 
+/// A wallet registration commits custody before the page draws anything. On
+/// 2026-10-26 an owner's registration completed, the wallet existed, and the
+/// page still said "the result could not be recovered or acknowledged": the
+/// created wallet was read once, that read lost the race with the account's
+/// own address projection, and the throw skipped the acknowledgement. The
+/// session then sat in AWAITING_RECOVERY_ACK until it lapsed to failed, and
+/// the Bloom recovery code was never offered, because it was rendered inside
+/// the same wallet read.
+#[test]
+fn a_registration_is_acknowledged_even_when_the_new_wallet_cannot_be_read() {
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  setAttribute() {{}}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+let walletReads = 0;
+let walletReadable = false;
+globalThis.fetch = async url => {{
+  if (!String(url).startsWith("/api/wallet/")) throw new Error(`unexpected fetch ${{url}}`);
+  walletReads++;
+  // An unreadable wallet is what a read sees while the account's address is
+  // still being projected.
+  return walletReadable
+    ? {{ok: true, json: async () => ({{wallet_id: "wallet-primary", accounts: [{{key_ref: {{}},
+        chain_projections: [{{chain_family: "evm", address: "0xabc"}}]}}]}})}}
+    : {{ok: false, status: 404}};
+}};
+let acknowledged = [];
+mutate = async url => {{ acknowledged.push(url); return {{}}; }};
+clearBrowserState = async () => {{}};
+hpkeOpen = async () => new TextEncoder().encode(JSON.stringify({{
+  recovery_id: "rec_1", recovery_secret: "s3cret"
+}}));
+outputRecipient = {{}};
+ceremonyId = "a".repeat(64);
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+const ack = `/api/session/${{ceremonyId}}/ack`;
+const finish = kind => finishBrowserResult({{
+  ceremony_kind: kind,
+  signer_contribution: {{
+    wallet_id: "wallet-primary",
+    ceremony_id: ceremonyId,
+    ceremony_kind: kind,
+    custody_operation_id: "op_1"
+  }},
+  challenges: [{{binding: {{exact_terms_digest: "d1", signer_contribution_digest: "d2"}}}}]
+}}, {{encrypted_browser_result: "sealed"}});
+(async () => {{
+  await finish("wallet_registration");
+  if (!acknowledged.includes(ack)) throw new Error("a committed registration was not acknowledged");
+  if (walletReads < 2) throw new Error(`the wallet read was not retried: ${{walletReads}}`);
+  if (!allText(nodes.review).includes("Download Bloom recovery code")) {{
+    throw new Error("the recovery code was not offered");
+  }}
+  if (!nodes.status.textContent.includes("Wallet created")) {{
+    throw new Error(`unexpected status: ${{nodes.status.textContent}}`);
+  }}
+
+  // The normal path: the wallet view replaces the review contents, and the
+  // recovery code must still be on the page afterwards.
+  walletReadable = true; acknowledged = []; nodes.review.children = [];
+  await finish("wallet_registration");
+  const page = allText(nodes.review);
+  if (!acknowledged.includes(ack)) throw new Error("a readable registration was not acknowledged");
+  if (!page.includes("0xabc")) throw new Error("the created wallet was not shown");
+  if (!page.includes("Download Bloom recovery code")) {{
+    throw new Error("the wallet view erased the recovery code");
+  }}
+
+  // Other sensitive results are acknowledged only after they are drawn.
+  acknowledged = [];
+  renderResult = () => {{ throw new Error("render failed"); }};
+  const failed = await finish("wallet_export").then(() => false, () => true);
+  if (!failed || acknowledged.length) throw new Error("an export was acknowledged before it was drawn");
+  process.stdout.write("registration-acknowledged");
+}})().catch(error => {{ console.error(error); process.exit(1); }});
+"#
+    );
+    let output = run_node(&script);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "registration-acknowledged"
+    );
+}
+
 #[test]
 fn evm_manifest_is_rendered_as_primary_review_facts() {
     let asset = concat!(
@@ -1059,6 +1175,40 @@ for (const expected of ["0x2222222222222222222222222222222222222222", "0.0003 ET
 }}
 for (const stale of ["Native value (wei)", "per gas (wei)", "Some("]) {{
   if (rendered.includes(stale)) throw new Error(`stale EVM rendering ${{stale}}: ${{rendered}}`);
+}}
+
+// A non-ETH network shows its own native asset, chosen by chain ID, in the
+// header, the primary amount card, and beside the gas fee.
+for (const [chainId, chain, name, artKey] of [
+  ["137", "polygon", "POL", "1:0x455e53cbb86018ac2b8092fdcd39d8444affc3f6"],
+  ["5042", "evm-5042", "USDC", "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"],
+  ["56", "bsc", "BNB", "56:0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"],
+  ["43114", "avalanche", "AVAX", "43114:0xb31f66aa3c1e785363f0875a1b74e27b85fd66c7"],
+  ["100", "gnosis", "xDAI", "100:0xe91d153e0b41518a2ce8dd3d7944fa863463a97d"],
+  ["999", "hyperevm", "HYPE", "999:0x5555555555555555555555555555555555555555"],
+]) {{
+  renderReview(session({{
+    chain_id: chainId, chain,
+    sender: "0x1111111111111111111111111111111111111111",
+    destination: "0x2222222222222222222222222222222222222222",
+    value: "10000000000000000", value_display: `0.01 ${{name}}`,
+    nonce: "0", gas_limit: "26250",
+    fee: {{kind: "eip1559", max_fee_per_gas: "549987553048",
+      max_fee_per_gas_display: "549.99 Gwei", max_priority_fee_per_gas: "27499377652",
+      max_priority_fee_per_gas_display: "27.5 Gwei"}},
+    maximum_execution_gas_fee_display: `0.014799 ${{name}}`,
+    payload_keccak: "0xabd",
+    calldata_bytes: "0"
+  }}));
+  const art = `/assets/tokens/${{REVIEWED_TOKEN_ARTWORK[artKey].file}}`;
+  const marked = node => walk(node).some(child => child.tagName === "IMG" && child.src === art);
+  const byClass = name => walk(nodes.review).find(node => String(node.className).includes(name));
+  const card = byClass("ceremony-asset");
+  if (!marked(nodes["page-title"])) throw new Error(`${{chain}} header is missing the ${{name}} mark`);
+  if (!marked(card) || !allText(card).includes(name) || allText(card).includes("Native asset")) {{
+    throw new Error(`${{chain}} amount card is not ${{name}}: ${{allText(card)}}`);
+  }}
+  if (!marked(byClass("ceremony-fee-amount"))) throw new Error(`${{chain}} gas fee is missing the ${{name}} mark`);
 }}
 
 renderReview(session({{
@@ -1786,9 +1936,25 @@ const scope = {{
   allowed_operation_classes: ["pumpfun.buy", "pumpfun.sell", "pumpfun.sweep"],
   allowed_routes: ["r000010", "r000011", "r000020"],
   custody_operation_id: "internal-operation-id",
+  allowed_crypto_suites: ["ed25519-message"],
   maximum_lifetime_ms: "3600000",
   package_hash: "b868911206a002dd48c11fb59e8aaa8bd8b4716f70b671e10be18bd24bf7c738"
 }};
+// The key is named by the scope's suites: EVM for secp256k1/keccak, generic
+// when the suites are mixed or missing, Solana only for Ed25519.
+for (const [suites, expected, forbidden] of [
+  [["secp256k1-keccak256-recoverable"], "temporary EVM session key", "Solana"],
+  [["secp256k1-sha256-recoverable"], "temporary session key", "Solana"],
+  [undefined, "temporary session key", "Solana"],
+]) {{
+  const sentence = describePetalScope({{...scope, allowed_crypto_suites: suites}}).sentence;
+  if (!sentence.includes(expected) || sentence.includes(forbidden)) {{
+    throw new Error(`wrong session key wording for ${{suites}}: ${{sentence}}`);
+  }}
+}}
+if (!describePetalScope(scope).sentence.includes("temporary Solana session key")) {{
+  throw new Error("an Ed25519 scope must still say Solana");
+}}
 renderReview({{
   ceremony_kind: "key_derive",
   expires_at_ms: Date.now() + 300000,
@@ -2209,6 +2375,9 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
         ".ceremony-party{",
         ".ceremony-warning{",
         ".ceremony-actions{",
+        // Catalog artwork is a 56px image; compact rows must size it too.
+        ".panel-context svg,.panel-context img{width:22px;height:22px",
+        ".ceremony-fee-amount svg,.ceremony-fee-amount img{width:14px;height:14px",
         "env(safe-area-inset-top,0px)",
         "env(safe-area-inset-right,0px)",
         "env(safe-area-inset-bottom,0px)",
@@ -7569,6 +7738,78 @@ fn assigned_remote_outage_never_silently_changes_default_to_local() {
         disabled
             .select_surface(bloom_broker_api::CeremonySurfaceSelection::Remote)
             .is_err()
+    );
+}
+
+#[test]
+fn default_wallet_surface_is_one_where_the_wallet_has_a_passkey() {
+    use bloom_broker_api::CeremonySurfaceSelection::{Default, Local, Remote};
+    let wallet = Token::new("main").unwrap();
+    let chosen = |signer: MockSigner, selection| {
+        CeremonyBroker::new(Arc::new(signer))
+            .select_wallet_surface(selection, &wallet)
+            .map(|surface| surface.identity.surface_id.as_str().to_owned())
+    };
+    let with_passkeys = |signer: MockSigner, passkey_surfaces| MockSigner {
+        passkey_surfaces,
+        ..signer
+    };
+    // The live defect: hosted mode on, the wallet's only passkey on localhost.
+    assert_eq!(
+        chosen(MockSigner::with_remote_surface(), Default).unwrap(),
+        "local"
+    );
+    // A hosted passkey keeps the hosted default.
+    for passkeys in [vec!["remote"], vec!["local", "remote"]] {
+        assert_eq!(
+            chosen(
+                with_passkeys(MockSigner::with_remote_surface(), passkeys),
+                Default
+            )
+            .unwrap(),
+            "remote"
+        );
+    }
+    // No passkey on any usable surface is refused before a link exists.
+    for signer in [
+        MockSigner::with_remote_surface(),
+        MockSigner::with_remote_disabled(),
+    ] {
+        let error = chosen(with_passkeys(signer, Vec::new()), Default).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::ApprovalNotFound);
+        assert!(error.message.contains("no active passkey"), "{error:?}");
+    }
+    // A hosted-only wallet keeps the outage error instead of moving to localhost.
+    let error = chosen(
+        with_passkeys(MockSigner::with_remote_degraded(), vec!["remote"]),
+        Default,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+    let rejected = CeremonyBroker::new(Arc::new(with_passkeys(
+        MockSigner::with_remote_surface(),
+        vec!["remote"],
+    )));
+    rejected.set_remote_credentials_rejected(true);
+    let error = rejected
+        .select_wallet_surface(Default, &wallet)
+        .unwrap_err();
+    assert!(
+        error.message.contains("bloom-signer admin provision"),
+        "{error:?}"
+    );
+    // Explicit selections are honored whatever the wallet holds.
+    assert_eq!(
+        chosen(MockSigner::with_remote_surface(), Remote).unwrap(),
+        "remote"
+    );
+    assert_eq!(
+        chosen(
+            with_passkeys(MockSigner::with_remote_surface(), vec!["remote"]),
+            Local
+        )
+        .unwrap(),
+        "local"
     );
 }
 

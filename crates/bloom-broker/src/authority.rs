@@ -1,6 +1,6 @@
 use crate::journal::{
     BrokerJournal, BudgetLimits, JournalError, NewApprovalRecord, ReservationRequest,
-    SlidingBudgetLimit, SlidingValueLimit,
+    SlidingBudgetLimit, SlidingValueLimit, UnsupportedStoreVersion,
 };
 use bloom_broker_api::address;
 use bloom_broker_api::{
@@ -185,6 +185,8 @@ pub enum AuthorityError {
     Storage(String),
     #[error(transparent)]
     Journal(#[from] JournalError),
+    #[error(transparent)]
+    UnsupportedStoreVersion(#[from] UnsupportedStoreVersion),
 }
 
 impl From<rusqlite::Error> for AuthorityError {
@@ -3547,8 +3549,12 @@ fn enforce_authority_state_floor(connection: &Connection) -> Result<(), Authorit
                 |row| row.get(0),
             )
             .optional()?;
-        if floor.is_some_and(|floor| floor > BROKER_STATE_VERSION) {
-            return Err(AuthorityError::Storage("unsupported Broker state floor; restore a compatible backup instead of downgrading".into()));
+        if let Some(floor) = floor.filter(|floor| *floor > BROKER_STATE_VERSION) {
+            return Err(UnsupportedStoreVersion::StateFloor {
+                floor,
+                supported: BROKER_STATE_VERSION,
+            }
+            .into());
         }
     }
     Ok(())

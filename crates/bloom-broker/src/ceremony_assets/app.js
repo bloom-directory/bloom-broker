@@ -109,6 +109,7 @@ function el(tag, attrs = {}, ...children) {
 // Bundled geometric symbols, never images fetched by ticker. Network marks
 // are selected by numeric chain ID. Unknown tokens use a neutral coin.
 function reviewIcon(kind) {
+  if (String(kind).startsWith("native:")) return nativeIcon(String(kind).slice(7));
   if (kind === "solana") return el("img", {src: "/assets/networks/solana.svg", alt: "Solana", width: "32", height: "32"});
   const svg = el("svg", {viewBox: "0 0 32 32", "aria-hidden": "true", focusable: "false"});
   if (kind === "ethereum") {
@@ -134,8 +135,38 @@ function reviewIcon(kind) {
   return svg;
 }
 
+// Each chain's native asset, by chain ID. A logo reuses the reviewed catalog
+// artwork for the same asset (its L1 or wrapped contract), never a ticker.
+// Units come from Broker's native_asset_metadata; keep both lists in step.
+// Tempo has no native asset (fees are paid in USD stablecoins): neutral mark.
+const ETHER = {name: "Ether", mark: "ethereum"};
+const NATIVE_ASSETS = {
+  1: ETHER, 10: ETHER, 8453: ETHER, 42161: ETHER, 59144: ETHER, 4663: ETHER, 31337: ETHER,
+  137: {name: "POL", art: "1:0x455e53cbb86018ac2b8092fdcd39d8444affc3f6"},
+  56: {name: "BNB", art: "56:0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"},
+  43114: {name: "AVAX", art: "43114:0xb31f66aa3c1e785363f0875a1b74e27b85fd66c7"},
+  100: {name: "xDAI", art: "100:0xe91d153e0b41518a2ce8dd3d7944fa863463a97d"},
+  999: {name: "HYPE", art: "999:0x5555555555555555555555555555555555555555"},
+  5042: {name: "USDC", art: "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"},
+};
+function nativeAsset(chainId) {
+  return NATIVE_ASSETS[Number(chainId)] || null;
+}
+// Every native amount card: the chain ID alone picks its name and mark.
+function nativeCard(chainId) {
+  const asset = nativeAsset(chainId);
+  return {native: asset ? `native:${Number(chainId)}` : "token", title: asset?.name || "Native asset"};
+}
+function nativeIcon(chainId) {
+  const asset = nativeAsset(chainId);
+  if (asset?.mark) return reviewIcon(asset.mark);
+  const [chain, address] = (asset?.art || ":").split(":");
+  return artworkIcon(tokenArt(chain, address));
+}
+// Network marks where one is bundled; otherwise the network's native asset.
 function chainIcon(chainId) {
-  return {1: "ethereum", 8453: "base", 31337: "test"}[Number(chainId)] || "unknown";
+  return {1: "ethereum", 8453: "base", 31337: "test"}[Number(chainId)]
+    || (nativeAsset(chainId) ? `native:${Number(chainId)}` : "unknown");
 }
 
 // Reviewed, bundled artwork is generated from exact catalog identities.
@@ -163,8 +194,10 @@ function artworkIcon(art) {
 function assetCard({chainId, address, venueAsset, native, title, subtitle, amount, amountLabel, tone}) {
   const art = venueAsset ? venueTokenArt(venueAsset) : address ? tokenArt(chainId, address) : null;
   const mark = native ? reviewIcon(native) : artworkIcon(art);
+  const nativeMark = String(native).startsWith("native:") ? nativeAsset(String(native).slice(7))?.mark : native;
+  const branded = art || mark.tagName === "IMG" || nativeMark === "ethereum";
   const icon = el("span", {
-    class: `ceremony-token-icon${art || native === "ethereum" || native === "base" ? " has-artwork" : ""}`,
+    class: `ceremony-token-icon${branded ? " has-artwork" : ""}`,
     "aria-hidden": "true"
   }, mark);
   const copy = el("div", {class: "ceremony-asset-copy"},
@@ -249,8 +282,9 @@ function chainLabel(chain, ctx) {
       ? "Solana mainnet" : "Solana";
   }
   return {ethereum: "Ethereum", mainnet: "Ethereum", base: "Base", arbitrum: "Arbitrum",
-    optimism: "Optimism", polygon: "Polygon", "evm-56": "BNB Chain",
-    "evm-43114": "Avalanche", "evm-999": "HyperEVM", anvil: "local test chain"}[chain] || chain;
+    optimism: "Optimism", polygon: "Polygon", "evm-56": "BNB Chain", "evm-100": "Gnosis",
+    "evm-43114": "Avalanche", "evm-999": "HyperEVM", "evm-59144": "Linea", "evm-4663": "Robinhood",
+    "evm-4217": "Tempo", "evm-5042": "Arc", anvil: "local test chain"}[chain] || chain;
 }
 
 function addressExplorer(chainId, address) {
@@ -700,7 +734,7 @@ function describeTransfer(manifest) {
         : authenticationScope ? "Allow the fixed authentication profile below. Broker checks the fresh message when this permission is used."
         : payment ? "Authorize this exact token payment within the signed validity window." : "Review the exact fields bound to this message signature.",
       chainId, networkIdentity: solana ? "Solana · cluster not encoded in message" : hyperliquid ? `Hyperliquid · ${venueNetwork || "Unknown environment"}`
-        : chainId ? `${({1:"Ethereum",10:"Optimism",56:"BNB Chain",100:"Gnosis",137:"Polygon",8453:"Base",42161:"Arbitrum",43114:"Avalanche",59144:"Linea",999:"HyperEVM",4663:"Robinhood",4217:"Tempo"})[chainId] || "EVM"} · Chain ID ${chainId}` : "Message signature",
+        : chainId ? `${({1:"Ethereum",10:"Optimism",56:"BNB Chain",100:"Gnosis",137:"Polygon",8453:"Base",42161:"Arbitrum",43114:"Avalanche",59144:"Linea",999:"HyperEVM",4663:"Robinhood",4217:"Tempo",5042:"Arc"})[chainId] || "EVM"} · Chain ID ${chainId}` : "Message signature",
       networkIcon: solana ? "solana" : chainId ? chainIcon(chainId) : "unknown",
       facts: [], technical: [...(message.payload_keccak ? [["Signing hash", message.payload_keccak, true]] : []),
         ...extraTechnical, ...(message.venue_asset?.base_units ? [["USDC base units", message.venue_asset.base_units, true]] : []),
@@ -1093,7 +1127,7 @@ function describeTransfer(manifest) {
           asset: address && amount ? {chainId: String(safe.chain_id), address, amount: unlimited ? "Unlimited" : amount,
             amountLabel: permission ? "Spending limit" : morpho ? "Tokens supplied" : "Amount",
             tone: unlimited ? "danger" : permission ? "permission" : "outgoing"}
-            : native ? {native: / ETH$/.test(amount) ? "ethereum" : "token", amount, amountLabel: "Amount"} : null,
+            : native ? {...nativeCard(safe.chain_id), amount, amountLabel: "Amount"} : null,
           parties: [
             [permission ? "Spender" : "Recipient", permission ? value("Spender") : value("To") || value("Recipient") || native?.[2]],
             ["Vault", morpho ? value("Action 2 · Vault") : ""],
@@ -1112,9 +1146,7 @@ function describeTransfer(manifest) {
       ? {chainId: String(safe.chain_id), address: tokenAddress, amount: unlimited ? "Unlimited" : amount,
           amountLabel: permission ? "Spending limit" : "Amount",
           tone: unlimited ? "danger" : permission ? "permission" : "outgoing"}
-      : sendTo ? {native: / ETH$/.test(sendTo[1]) ? "ethereum" : "token",
-          title: / ETH$/.test(sendTo[1]) ? "Ether" : "Native asset", amount: sendTo[1],
-          amountLabel: "Amount", tone: "outgoing"} : null;
+      : sendTo ? {...nativeCard(safe.chain_id), amount: sendTo[1], amountLabel: "Amount", tone: "outgoing"} : null;
     const safeRecipient = directToken ? recipient : sendTo?.[2];
     const safeParties = [
       [permission ? "Token holder · Safe address" : "Sender · Safe address", safe.safe],
@@ -1199,6 +1231,14 @@ function naturalList(items) {
   if (items.length === 2) return `${items[0]} and ${items[1]}`;
   return `${items.slice(0, -1).join(", ")}, and ${items.at(-1)}`;
 }
+// Name the session key by the suites the scope allows, not by assumption.
+function sessionKeyKind(scope) {
+  const suites = Array.isArray(scope.allowed_crypto_suites)
+    ? scope.allowed_crypto_suites.map(String) : [];
+  if (suites.length && suites.every(suite => suite === "ed25519-message")) return "Solana ";
+  if (suites.length && suites.every(suite => suite === "secp256k1-keccak256-recoverable")) return "EVM ";
+  return "";
+}
 function describePetalScope(scope) {
   if (!scope || typeof scope !== "object") return null;
   const classes = Array.isArray(scope.allowed_operation_classes)
@@ -1211,7 +1251,7 @@ function describePetalScope(scope) {
   const lifetime = Number(scope.maximum_lifetime_ms);
   const duration = Number.isFinite(lifetime) && lifetime > 0 ? fmtRemaining(lifetime) : "a limited time";
   return {
-    sentence: `Allow <strong>${app}</strong> to use a temporary Solana session key for up to <strong>${duration}</strong>; no funds move, and your main wallet key stays inside Bloom.`,
+    sentence: `Allow <strong>${app}</strong> to use a temporary ${sessionKeyKind(scope)}session key for up to <strong>${duration}</strong>; no funds move, and your main wallet key stays inside Bloom.`,
     facts: [
       ["App", app],
       ["Package", scope.package_hash, true],
@@ -1535,12 +1575,9 @@ function renderReview(session) {
         tone: unlimited ? "danger" : sending ? "outgoing" : "permission"
       }));
     } else if (transfer.intent.action === "send") {
-      const display = String(transfer.payloads?.[0]?.value_display || "");
-      const eth = / ETH$/.test(display);
       decision.push(assetCard({
-        native: eth ? "ethereum" : "token",
-        title: eth ? "Ether" : "Native asset",
-        amount: display,
+        ...nativeCard(transfer.payloads?.[0]?.chain_id),
+        amount: String(transfer.payloads?.[0]?.value_display || ""),
         amountLabel: "Amount",
         tone: "outgoing"
       }));
@@ -1640,9 +1677,7 @@ function renderReview(session) {
         if (field.format === "nativeAmount") {
           // The reader marks native amounts explicitly. Never infer asset
           // identity from a descriptor label or a ticker in formatted text.
-          const ether = [1, 10, 8453, 42161, 59144, 4663, 31337].includes(Number(payload.chain_id));
-          decision.push(assetCard({native: ether ? "ethereum" : "token",
-            title: ether ? "Ether" : "Native asset",
+          decision.push(assetCard({...nativeCard(payload.chain_id),
             amount: String(field.value).replace(/ \((transaction value|minimum balance increase)\)$/, ""),
             amountLabel: enso && /^Source asset/.test(field.label) ? "You pay"
               : enso && /^Requested minimum balance increase/.test(field.label) ? "Minimum output" : field.label,
@@ -1747,7 +1782,7 @@ function renderReview(session) {
     const exact = payload.maximum_execution_gas_fee_display;
     const label = transfer.payloads.length > 1 ? `Transaction ${index + 1} gas fee` : "Gas fee";
     const amount = exact ? el("span", {class: "ceremony-fee-amount"},
-      reviewIcon(exact.endsWith(" ETH") ? "ethereum" : "token"),
+      nativeIcon(payload.chain_id),
       el("span", {}, `Up to ${compactFeeCap(exact)}`))
       : el("span", {}, "Not available in this review");
     decision.push(el("div", {class: "ceremony-fee", "aria-label": "Execution gas only; other network charges may apply"},
@@ -1934,26 +1969,40 @@ function createdWalletView(accounts, created = true) {
   reviewNode.replaceChildren(el("div", {class: "wallet-home"}, ...parts));
 }
 
-async function showCreatedWallet(session, recovery = null) {
+// The code is in the output the page just decrypted, so it is offered
+// whatever any later read of the wallet does. It is the one thing here that
+// cannot be obtained again.
+function showRecoveryCode(recovery) {
+  if (!recovery?.recovery_id || !recovery?.recovery_secret) return;
+  const download = el("button", {type: "button", class: "secondary"}, "Download Bloom recovery code");
+  download.onclick = () => {
+    const url = URL.createObjectURL(new Blob([JSON.stringify(recovery)], {type: "application/json"}));
+    const link = el("a", {href: url, download: "bloom-recovery-code.json"});
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  reviewNode.append(el("details", {class: "ceremony-details"},
+    el("summary", {}, "Bloom recovery code"),
+    el("p", {}, "This code restores access on this Bloom host. It is different from your portable recovery phrase. Keep it private and offline."),
+    download));
+}
+
+// An account is created before its address can be read back, so a refused
+// read right after a registration means "not yet", not "no wallet", and the
+// caller there waits. On the load path one read answers a different question,
+// whether a wallet is already there, and must not stall the form.
+async function showCreatedWallet(session, attempts = 1) {
   const wallet = session.signer_contribution?.wallet_id;
   if (!wallet || remoteCeremony) return false;
-  const response = await fetch(`/api/wallet/${encodeURIComponent(wallet)}`, {credentials: "same-origin", cache: "no-store"});
-  if (!response.ok) return false;
-  createdWalletView(await response.json());
-  if (recovery?.recovery_id && recovery?.recovery_secret) {
-    const download = el("button", {type: "button", class: "secondary"}, "Download Bloom recovery code");
-    download.onclick = () => {
-      const url = URL.createObjectURL(new Blob([JSON.stringify(recovery)], {type: "application/json"}));
-      const link = el("a", {href: url, download: "bloom-recovery-code.json"});
-      link.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-    };
-    reviewNode.append(el("details", {class: "ceremony-details"},
-      el("summary", {}, "Bloom recovery code"),
-      el("p", {}, "This code restores access on this Bloom host. It is different from your portable recovery phrase. Keep it private and offline."),
-      download));
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt) await new Promise(resolve => setTimeout(resolve, 300));
+    const response = await fetch(`/api/wallet/${encodeURIComponent(wallet)}`, {credentials: "same-origin", cache: "no-store"});
+    if (response.ok) {
+      createdWalletView(await response.json());
+      return true;
+    }
   }
-  return true;
+  return false;
 }
 
 function renderDone(session, result) {
@@ -2011,6 +2060,11 @@ function reportCeremonyError(error, fallback = "Ceremony failed") {
 
 function reportApprovalFailure(error) {
   if (approvalTerminal) return;
+  if (error instanceof NoPasskeyHereError) {
+    // Retrying on this surface cannot succeed, so approval stays disabled.
+    statusNode.textContent = error.message;
+    return;
+  }
   const missingPrf = error?.name === "NotSupportedError" ||
     (typeof error?.message === "string" && error.message.includes("required PRF output"));
   reportCeremonyError(error, missingPrf
@@ -2200,10 +2254,15 @@ function prfResult(credential) {
   const first = credential.getClientExtensionResults()?.prf?.results?.first;
   return first ? new Uint8Array(first) : null;
 }
+class NoPasskeyHereError extends Error {}
 function requestOptions(session, phase, restrictTo) {
   const options = session.webauthn_options;
   const allowed = options.allowed_credentials
     .filter(item => !restrictTo || item.credential_id === restrictTo);
+  if (!allowed.length) {
+    // An empty PRF allow list is a browser exception, not a prompt.
+    throw new NoPasskeyHereError(`This wallet has no passkey for ${location.hostname}, so this ceremony cannot be approved here. Cancel it and start it again from Bloom.`);
+  }
   const evalByCredential = {};
   for (const item of allowed) {
     evalByCredential[item.credential_id] = {first: decodeUrl(item.prf_salt)};
@@ -3941,11 +4000,21 @@ async function finishBrowserResult(session, result) {
       result.encrypted_browser_result
     );
     if (session.ceremony_kind === "wallet_registration") {
+      // Custody has committed, and the wallet view below is best effort, so a
+      // registration must not lapse to failed because that view would not
+      // render. Other results are acknowledged only once they are drawn.
+      await mutate(`/api/session/${ceremonyId}/ack`, {});
       let recovery;
       try { recovery = JSON.parse(new TextDecoder().decode(plaintext)); } catch (_) {}
-      if (!await showCreatedWallet(session, recovery)) throw new Error("Could not load the created wallet; keep this tab open");
-    } else renderResult(session, plaintext);
-    await mutate(`/api/session/${ceremonyId}/ack`, {});
+      if (!await showCreatedWallet(session, 10)) {
+        statusNode.textContent = "Wallet created. Its addresses are not readable here yet; open Bloom to see them.";
+      }
+      // After the wallet view, which replaces the review contents.
+      showRecoveryCode(recovery);
+    } else {
+      renderResult(session, plaintext);
+      await mutate(`/api/session/${ceremonyId}/ack`, {});
+    }
   } else {
     if (session.ceremony_kind !== "wallet_registration" || !await showCreatedWallet(session)) renderDone(session, result);
   }
