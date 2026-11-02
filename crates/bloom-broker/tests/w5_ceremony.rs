@@ -1177,6 +1177,40 @@ for (const stale of ["Native value (wei)", "per gas (wei)", "Some("]) {{
   if (rendered.includes(stale)) throw new Error(`stale EVM rendering ${{stale}}: ${{rendered}}`);
 }}
 
+// A non-ETH network shows its own native asset, chosen by chain ID, in the
+// header, the primary amount card, and beside the gas fee.
+for (const [chainId, chain, name, artKey] of [
+  ["137", "polygon", "POL", "1:0x455e53cbb86018ac2b8092fdcd39d8444affc3f6"],
+  ["5042", "evm-5042", "USDC", "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"],
+  ["56", "bsc", "BNB", "56:0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"],
+  ["43114", "avalanche", "AVAX", "43114:0xb31f66aa3c1e785363f0875a1b74e27b85fd66c7"],
+  ["100", "gnosis", "xDAI", "100:0xe91d153e0b41518a2ce8dd3d7944fa863463a97d"],
+  ["999", "hyperevm", "HYPE", "999:0x5555555555555555555555555555555555555555"],
+]) {{
+  renderReview(session({{
+    chain_id: chainId, chain,
+    sender: "0x1111111111111111111111111111111111111111",
+    destination: "0x2222222222222222222222222222222222222222",
+    value: "10000000000000000", value_display: `0.01 ${{name}}`,
+    nonce: "0", gas_limit: "26250",
+    fee: {{kind: "eip1559", max_fee_per_gas: "549987553048",
+      max_fee_per_gas_display: "549.99 Gwei", max_priority_fee_per_gas: "27499377652",
+      max_priority_fee_per_gas_display: "27.5 Gwei"}},
+    maximum_execution_gas_fee_display: `0.014799 ${{name}}`,
+    payload_keccak: "0xabd",
+    calldata_bytes: "0"
+  }}));
+  const art = `/assets/tokens/${{REVIEWED_TOKEN_ARTWORK[artKey].file}}`;
+  const marked = node => walk(node).some(child => child.tagName === "IMG" && child.src === art);
+  const byClass = name => walk(nodes.review).find(node => String(node.className).includes(name));
+  const card = byClass("ceremony-asset");
+  if (!marked(nodes["page-title"])) throw new Error(`${{chain}} header is missing the ${{name}} mark`);
+  if (!marked(card) || !allText(card).includes(name) || allText(card).includes("Native asset")) {{
+    throw new Error(`${{chain}} amount card is not ${{name}}: ${{allText(card)}}`);
+  }}
+  if (!marked(byClass("ceremony-fee-amount"))) throw new Error(`${{chain}} gas fee is missing the ${{name}} mark`);
+}}
+
 renderReview(session({{
   chain_id: "999999", chain: "evm-999999",
   sender: "0x1111111111111111111111111111111111111111",
@@ -2325,6 +2359,9 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
         ".ceremony-party{",
         ".ceremony-warning{",
         ".ceremony-actions{",
+        // Catalog artwork is a 56px image; compact rows must size it too.
+        ".panel-context svg,.panel-context img{width:22px;height:22px",
+        ".ceremony-fee-amount svg,.ceremony-fee-amount img{width:14px;height:14px",
         "env(safe-area-inset-top,0px)",
         "env(safe-area-inset-right,0px)",
         "env(safe-area-inset-bottom,0px)",
