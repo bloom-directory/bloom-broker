@@ -14,9 +14,13 @@
 //! lamport debit, and the message commitment (SHA-256 digest / ordered signing
 //! hash).
 //!
+//! [`verify_fee`] separately establishes the fee on a network whose genesis
+//! hash names a reviewed fee schedule ([`REVIEWED_FEE_SCHEDULES`]).
+//!
 //! Facts it does *not* establish: cluster/genesis identity, blockhash
-//! freshness, last-valid height, fee quote, balance, simulation result,
-//! broadcast acceptance, or finality. Those remain `machine_asserted`.
+//! freshness, last-valid height, the fee on any other network, balance,
+//! simulation result, broadcast acceptance, or finality. Those remain
+//! `machine_asserted`.
 
 use crate::message::{self, LegacyMessage};
 use crate::message_digest;
@@ -67,6 +71,45 @@ pub enum RejectionReason {
     LamportsMismatch { expected: u64, actual: u64 },
     /// The computed message digest does not match the claimed digest.
     DigestMismatch,
+    /// The declared fee differs from the reviewed network's signature fee.
+    FeeMismatch { expected: u64, actual: u64 },
+}
+
+/// Lamports per signature on the networks whose fee schedule was reviewed,
+/// keyed by base58 genesis hash. The signed message carries no fee schedule,
+/// so a fee is only established on a network listed here.
+pub const REVIEWED_FEE_SCHEDULES: [(&str, u64); 3] = [
+    ("5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d", 5_000), // mainnet-beta
+    ("EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG", 5_000), // devnet
+    ("4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY", 5_000), // testnet
+];
+
+/// Check a verified transfer's declared fee against the reviewed schedule for
+/// `genesis_hash`.
+///
+/// Returns `Ok(true)` when the fee is established, and `Ok(false)` on a
+/// network with no reviewed schedule, where the fee stays `machine_asserted`.
+/// A verified transfer has one signature and no compute-budget instruction,
+/// so its whole fee is `signer_count × lamports_per_signature`.
+pub fn verify_fee(
+    verified: &VerifiedTransfer,
+    genesis_hash: &str,
+    declared_lamports: u64,
+) -> Result<bool, RejectionReason> {
+    let Some(&(_, per_signature)) = REVIEWED_FEE_SCHEDULES
+        .iter()
+        .find(|(genesis, _)| *genesis == genesis_hash)
+    else {
+        return Ok(false);
+    };
+    let expected = u64::from(verified.signer_count) * per_signature;
+    if declared_lamports != expected {
+        return Err(RejectionReason::FeeMismatch {
+            expected,
+            actual: declared_lamports,
+        });
+    }
+    Ok(true)
 }
 
 /// The facts established by a successful verification.
@@ -233,6 +276,33 @@ mod tests {
         assert_eq!(verified.lamports, lamports);
         assert_eq!(verified.program, SYSTEM_PROGRAM_ID.to_string());
         assert_eq!(verified.signer_count, 1);
+    }
+
+    #[test]
+    fn fee_is_established_only_on_reviewed_networks() {
+        let payer = Pubkey::from_bytes([1u8; 32]);
+        let dest = Pubkey::from_bytes([2u8; 32]);
+        let bytes = transfer_message(payer, dest, 1, [7u8; 32])
+            .unwrap()
+            .serialize();
+        let verified = verify_native_transfer(&bytes, payer, dest, 1, None).unwrap();
+        for (genesis, _) in REVIEWED_FEE_SCHEDULES {
+            assert_eq!(verify_fee(&verified, genesis, 5_000), Ok(true));
+            for wrong in [0, 4_999, 5_001, 1_000_000] {
+                assert_eq!(
+                    verify_fee(&verified, genesis, wrong),
+                    Err(RejectionReason::FeeMismatch {
+                        expected: 5_000,
+                        actual: wrong
+                    })
+                );
+            }
+        }
+        // No reviewed schedule: the fee is not established, whatever it is.
+        assert_eq!(
+            verify_fee(&verified, "local-validator-genesis", 7),
+            Ok(false)
+        );
     }
 
     #[test]
