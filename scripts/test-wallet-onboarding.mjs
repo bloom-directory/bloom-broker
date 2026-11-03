@@ -9,10 +9,14 @@ if (!["localhost", "127.0.0.1"].includes(base.hostname) || base.protocol !== "ht
 const output = process.env.BLOOM_UI_SCREENSHOT_DIR;
 if (!output || !process.env.BLOOM_TEST_MACHINE_BIN || !process.env.BLOOM_TEST_MACHINE_HOME || !process.env.BLOOM_TEST_MACHINE_ENDPOINT) throw new Error("Set the isolated Machine and screenshot paths");
 const name = "onboarding-test-" + Date.now();
-const prepared = spawnSync(process.env.BLOOM_TEST_MACHINE_BIN, ["--home", process.env.BLOOM_TEST_MACHINE_HOME,
-  "--connect", process.env.BLOOM_TEST_MACHINE_ENDPOINT, "wallet", "new", name, "--local"], {encoding: "utf8"});
-const url = prepared.stdout?.match(/^ceremony_url: (.+)$/m)?.[1];
-if (prepared.status || !url || new URL(url).origin !== base.origin) throw new Error("Could not prepare isolated test registration");
+function prepare(command, wallet) {
+  const prepared = spawnSync(process.env.BLOOM_TEST_MACHINE_BIN, ["--home", process.env.BLOOM_TEST_MACHINE_HOME,
+    "--connect", process.env.BLOOM_TEST_MACHINE_ENDPOINT, "wallet", command, wallet, "--local"], {encoding: "utf8"});
+  const url = prepared.stdout?.match(/^ceremony_url: (.+)$/m)?.[1];
+  if (prepared.status || !url || new URL(url).origin !== base.origin) throw new Error("Could not prepare isolated test " + command);
+  return url;
+}
+const url = prepare("new", name);
 await fs.mkdir(output, {recursive: true});
 const browser = await chromium.launch({executablePath: "/usr/bin/chromium", headless: true, args: ["--no-sandbox"]});
 let stage = "start", errors = 0, external = 0;
@@ -69,11 +73,22 @@ try {
   await page.getByRole("button", {name: "Back up wallet", exact: true}).waitFor();
   await page.reload();
   await page.getByRole("heading", {name, exact: true}).waitFor();
-  if (await page.locator("ol.words li").count() || external || errors) throw new Error();
+  if (await page.locator("ol.words li").count()) throw new Error();
+  // The public BIP-39 test vector, never a real wallet. Import must end on the
+  // same addresses-and-backup page as creation.
+  stage = "import shows addresses and backup";
+  await page.goto(prepare("import", name + "-imported"));
+  await page.locator("#mnemonic-input").fill(Array(11).fill("abandon").concat("about").join(" "));
+  await page.getByRole("button", {name: "Import with passkey", exact: true}).click();
+  await page.getByRole("heading", {name: "Wallet imported", exact: true}).waitFor();
+  if (await page.getByRole("button", {name: "Copy address", exact: true}).count() !== 2) throw new Error();
+  if (!(await page.locator(".wallet-address").allTextContents()).some(a => a.toLowerCase() === "0x9858effd232b4033e47d90003d41ec34ecaeda94")) throw new Error();
+  await page.getByRole("button", {name: "Back up wallet", exact: true}).waitFor();
+  if (external || errors) throw new Error();
   await fs.writeFile(path.join(output, "results.json"), JSON.stringify({passed: true, virtualPasskey: true,
     create: true, addressCount: 2, later: true, refresh: true, cancelBackup: true, freshBackupApproval: true,
-    returnedToWallet: true, externalRequests: external, browserErrors: errors, capturedSecrets: false}, null, 2));
-  console.log("Create → addresses → Later/refresh → backup/cancel → fresh approval → return passed; no secret capture");
+    returnedToWallet: true, importShowsWallet: true, externalRequests: external, browserErrors: errors, capturedSecrets: false}, null, 2));
+  console.log("Create → addresses → Later/refresh → backup/cancel → fresh approval → return → import → addresses passed; no secret capture");
 } catch (_) {
   throw new Error("Onboarding failed at: " + stage + " (no secret output captured)");
 } finally { await browser.close(); }

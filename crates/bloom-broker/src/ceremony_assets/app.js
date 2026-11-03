@@ -1902,8 +1902,10 @@ function renderResult(session, plaintext) {
 }
 
 function walletPageUrl(wallet) { return "/wallet/" + encodeURIComponent(wallet); }
-function createdWalletView(accounts, created = true) {
-  markDone(created ? "Wallet created" : accounts.wallet_id);
+// `title` names a just-finished ceremony; the plain wallet page passes none.
+function createdWalletView(accounts, title = "Wallet created") {
+  const created = Boolean(title);
+  markDone(title || accounts.wallet_id);
   document.getElementById("review-deadline").textContent = "";
   document.getElementById("action-expiry").textContent = "";
   document.getElementById("ceremony-actions").hidden = true;
@@ -1989,6 +1991,8 @@ function showRecoveryCode(recovery) {
 // read right after a registration means "not yet", not "no wallet", and the
 // caller there waits. On the load path one read answers a different question,
 // whether a wallet is already there, and must not stall the form.
+// Creating or importing a wallet ends on its addresses and backup.
+function opensWallet(kind) { return kind === "wallet_registration" || kind === "wallet_import"; }
 async function showCreatedWallet(session, attempts = 1) {
   const wallet = session.signer_contribution?.wallet_id;
   if (!wallet || remoteCeremony) return false;
@@ -1996,7 +2000,7 @@ async function showCreatedWallet(session, attempts = 1) {
     if (attempt) await new Promise(resolve => setTimeout(resolve, 300));
     const response = await fetch(`/api/wallet/${encodeURIComponent(wallet)}`, {credentials: "same-origin", cache: "no-store"});
     if (response.ok) {
-      createdWalletView(await response.json());
+      createdWalletView(await response.json(), session.ceremony_kind === "wallet_import" ? "Wallet imported" : "Wallet created");
       return true;
     }
   }
@@ -3580,7 +3584,7 @@ async function load() {
     const wallet = decodeURIComponent(walletPath.slice("/wallet/".length));
     const response = await fetch(`/api/wallet/${encodeURIComponent(wallet)}`, {credentials: "same-origin", cache: "no-store"});
     if (!response.ok) throw new Error("Wallet is unavailable on this Bloom host");
-    createdWalletView(await response.json(), false);
+    createdWalletView(await response.json(), null);
     approve.hidden = true;
     cancel.hidden = true;
     statusNode.textContent = "";
@@ -3678,7 +3682,7 @@ async function load() {
     if (result.encrypted_browser_result) outputRecipient = await outputRecipientFor(session, true);
     return finishBrowserResult(session, result);
   }
-  if (session.ceremony_kind === "wallet_registration" && await showCreatedWallet(session)) {
+  if (opensWallet(session.ceremony_kind) && await showCreatedWallet(session)) {
     approvalTerminal = true;
     approve.hidden = true;
     cancel.hidden = true;
@@ -3997,7 +4001,7 @@ async function finishBrowserResult(session, result) {
       te.encode(outputAad),
       result.encrypted_browser_result
     );
-    if (session.ceremony_kind === "wallet_registration") {
+    if (opensWallet(session.ceremony_kind)) {
       // Custody has committed, and the wallet view below is best effort, so a
       // registration must not lapse to failed because that view would not
       // render. Other results are acknowledged only once they are drawn.
@@ -4005,7 +4009,7 @@ async function finishBrowserResult(session, result) {
       let recovery;
       try { recovery = JSON.parse(new TextDecoder().decode(plaintext)); } catch (_) {}
       if (!await showCreatedWallet(session, 10)) {
-        statusNode.textContent = "Wallet created. Its addresses are not readable here yet; open Bloom to see them.";
+        statusNode.textContent = "Wallet saved. Its addresses are not readable here yet; open Bloom to see them.";
       }
       // After the wallet view, which replaces the review contents.
       showRecoveryCode(recovery);
@@ -4014,7 +4018,7 @@ async function finishBrowserResult(session, result) {
       await mutate(`/api/session/${ceremonyId}/ack`, {});
     }
   } else {
-    if (session.ceremony_kind !== "wallet_registration" || !await showCreatedWallet(session)) renderDone(session, result);
+    if (!opensWallet(session.ceremony_kind) || !await showCreatedWallet(session)) renderDone(session, result);
   }
   await clearBrowserState(ceremonyId);
 }
