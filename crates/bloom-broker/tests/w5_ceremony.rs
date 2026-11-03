@@ -908,7 +908,7 @@ async fn private_traveler_save_and_release_use_real_signer_and_hide_values() {
 }
 
 #[tokio::test]
-async fn card_checkout_private_delivery_is_single_use_and_manual_has_no_release() {
+async fn card_checkout_private_delivery_replays_and_manual_has_no_release() {
     use bloom_broker::ceremony::{
         CheckoutIntakeRequest, CheckoutIntakeResponse, bind_checkout_intake,
         serve_checkout_listener,
@@ -1120,16 +1120,29 @@ async fn card_checkout_private_delivery_is_single_use_and_manual_has_no_release(
         .unwrap();
     let value: serde_json::Value = serde_json::from_slice(plaintext.expose_to_backend()).unwrap();
     assert!(value["number"] == "4242424242424242" && value["cvc"] == "937");
-    assert!(matches!(
-        card_intake(
-            &socket,
-            CheckoutIntakeRequest::Result {
-                operation_id: operation("a2")
-            }
-        )
-        .await,
-        CheckoutIntakeResponse::Result { receipt: None, .. }
-    ));
+    // A lost response is recovered by asking again: the same sealed receipt
+    // and AAD come back, never a second release.
+    match card_intake(
+        &socket,
+        CheckoutIntakeRequest::Result {
+            operation_id: operation("a2"),
+        },
+    )
+    .await
+    {
+        CheckoutIntakeResponse::Result {
+            receipt: Some(again),
+            output_aad: Some(again_aad),
+            ..
+        } => {
+            assert_eq!(again, receipt);
+            assert_eq!(again_aad, aad);
+        }
+        _ => panic!("receipt not replayed"),
+    }
+    // Machine's status never carries the sealed receipt.
+    let public = broker.card_status(&operation("a2")).unwrap();
+    assert!(public.receipt.is_none() && public.output_aad.is_none());
     let completed_session = broker
         .router()
         .oneshot(
@@ -1487,9 +1500,57 @@ async fn released_broker_never_reads_a_pending_card_session() {
     );
     drop(broker);
     let restarted = open();
-    assert_eq!(restarted.status(&pending), Some(CeremonyState::Expired));
+    // Restart closes the prepared card operation in Signer too, so Broker,
+    // Signer and a later cancel all agree.
+    assert_eq!(restarted.status(&pending), Some(CeremonyState::Cancelled));
+    assert_eq!(
+        signer.card_status(&pending).unwrap().state,
+        bloom_signer_api::CardOperationState::Cancelled
+    );
+    assert_eq!(
+        restarted
+            .card_cancel(&pending, card_test_now())
+            .unwrap()
+            .state,
+        bloom_signer_api::CardOperationState::Cancelled
+    );
     assert_eq!(restarted.status(&cancelled), Some(CeremonyState::Cancelled));
     assert_eq!(released_rows().len(), 2);
+}
+
+/// Signer commits a card change but its response is lost. Broker asks Signer
+/// what happened, so the owner's page says it succeeded instead of "Card not
+/// saved".
+#[tokio::test]
+async fn a_lost_card_completion_response_is_reconciled_as_success() {
+    use bloom_signer_api::CardEffect;
+    let signer = real_ceremony_signer();
+    signer.lose_card_response.store(true, Ordering::SeqCst);
+    let broker = CeremonyBroker::new(signer.clone());
+    let prepared = broker
+        .prepare_card(
+            operation("98"),
+            CardEffect::Add {
+                card_id: Token::new("card-one").unwrap(),
+                label: "Synthetic card".into(),
+            },
+            card_test_now(),
+        )
+        .unwrap();
+    let session = card_session_json(&broker, &prepared).await;
+    let handle: Base64UrlBytes =
+        serde_json::from_value(session["webauthn_options"]["registration_user_handle"].clone())
+            .unwrap();
+    let auth = VirtualAuthenticator::generate_for_registration(handle, "http://localhost:18734");
+    let input = serde_json::json!({"credential_prf":Base64UrlBytes::from_bytes(&auth.deterministic_prf()),"card":{"number":"4242424242424242","expiry_month":12,"expiry_year":2034,"name":"Synthetic Card"}});
+    let (status, body) = card_approve(&broker, &prepared, &auth, input, 1).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["state"], "SUCCEEDED");
+    assert_eq!(
+        broker.status(&operation("98")),
+        Some(CeremonyState::Succeeded)
+    );
+    assert_eq!(broker.card_list().unwrap().len(), 1);
 }
 
 /// Bind IPv4 on port 0, hold it, bind IPv6 on the same selected port, and
@@ -3558,6 +3619,8 @@ struct MockSigner {
 struct RealSigner {
     service: Arc<SignerCeremonyService>,
     engine: Option<Arc<SignerEngine>>,
+    /// Commit card completions but lose the response, as a dropped socket would.
+    lose_card_response: AtomicBool,
 }
 
 fn real_ceremony_signer() -> Arc<RealSigner> {
@@ -3585,6 +3648,7 @@ fn real_ceremony_signer() -> Arc<RealSigner> {
     Arc::new(RealSigner {
         service,
         engine: Some(engine),
+        lose_card_response: AtomicBool::new(false),
     })
 }
 
@@ -3887,7 +3951,14 @@ impl CeremonySigner for RealSigner {
         request: CustodyCompleteRequest,
         now_ms: u64,
     ) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
-        self.service.complete_card(request, now_ms)
+        let result = self.service.complete_card(request, now_ms)?;
+        if self.lose_card_response.load(Ordering::SeqCst) {
+            return Err(bloom_signer_api::ProtocolError::new(
+                bloom_signer_api::ProtocolErrorCode::ServiceUnavailable,
+                "card response lost",
+            ));
+        }
+        Ok(result)
     }
     fn card_status(
         &self,
@@ -11083,6 +11154,7 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
     let broker = CeremonyBroker::new(Arc::new(RealSigner {
         service,
         engine: None,
+        lose_card_response: AtomicBool::new(false),
     }));
     for index in 0..4_u8 {
         let operation_id = operation(&format!("d{index}"));

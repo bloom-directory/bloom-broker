@@ -3614,6 +3614,26 @@ impl CeremonyBroker {
                 session.state = CeremonyState::Failed;
                 latch_terminal(&mut session, unix_time_ms());
                 self.persist_session(&session)?;
+            } else if cards::is_card(session.ceremony_kind) && !is_terminal(session.state) {
+                // Card operations live in Signer's card store, visible only
+                // through card status. Close a still-prepared one there too,
+                // so both services agree it is over.
+                use bloom_signer_api::CardOperationState as Card;
+                let card = |result: Result<bloom_signer_api::CardOperationStatus, _>| {
+                    result.map(|s| s.state).map_err(signer_error_to_machine)
+                };
+                let mut state = card(self.inner.signer.card_status(&session.operation_id))?;
+                if state == Card::Prepared {
+                    state = card(self.inner.signer.card_cancel(&session.operation_id))?;
+                }
+                session.state = match state {
+                    Card::Succeeded => CeremonyState::Succeeded,
+                    Card::Failed | Card::Consumed => CeremonyState::Failed,
+                    Card::Cancelled => CeremonyState::Cancelled,
+                    Card::Prepared | Card::Expired | Card::Missing => CeremonyState::Expired,
+                };
+                latch_terminal(&mut session, unix_time_ms());
+                self.persist_session(&session)?;
             } else if !preserve_awaiting
                 && session.state != CeremonyState::WalletCommitted
                 && !is_terminal(session.state)

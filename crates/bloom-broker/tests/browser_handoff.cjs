@@ -89,15 +89,14 @@ for (const [currency, total_minor, installments, total, installment] of [
   assert(value("Installments").includes(installment), `${currency}: ${value("Installments")}`);
 }
 // A trial price is not the price: the review states the ongoing charge, how
-// often it recurs and the day it starts, and says so plainly when the page
-// did not give one.
+// often it recurs and the day it starts. Signer refuses a recurring checkout
+// without them, so the review never shows one.
 for (const [facts, expected] of [
   [{currency: "USD", total_minor: 100, installments: 1, recurring: true,
     renewal_minor: 1299, renewal_period: "month", renewal_starts_on: "2026-11-25"},
    "$12.99 every month, from 2026-11-25"],
   [{currency: "USD", total_minor: 1799, installments: 1, recurring: true,
     renewal_minor: 1799, renewal_period: "month"}, "$17.99 every month"],
-  [{currency: "USD", total_minor: 100, installments: 1, recurring: true}, "could not read"],
   [{currency: "USD", total_minor: 100, installments: 1, recurring: false}, "No"],
 ]) {
   renderCardReview({...session, expires_at_ms: now + 120000,

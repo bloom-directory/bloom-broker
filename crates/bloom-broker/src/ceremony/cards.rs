@@ -1,8 +1,8 @@
 //! Card ceremonies share Broker's browser sessions; release delivery is private.
 use super::*;
 use bloom_signer_api::{
-    CardEffect, CardOperationStatus, CardPrepareRequest, CardPublic, CheckoutFacts,
-    CustodyOutputHpkeAad,
+    CardEffect, CardOperationState, CardOperationStatus, CardPrepareRequest, CardPublic,
+    CheckoutFacts, CustodyOutputHpkeAad,
 };
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -14,9 +14,7 @@ pub(super) struct CardChannels {
 }
 struct Channel {
     challenge_url: String,
-    result: Option<CustodyResult>,
     expires_at_ms: u64,
-    output_aad: CustodyOutputHpkeAad,
     /// Merchant page as checkout saw it, shown on the review page only. Kept
     /// in memory: it can show the buyer's address and is not a bound fact.
     order_preview: Option<Vec<u8>>,
@@ -273,7 +271,17 @@ impl CeremonyBroker {
             .card_list()
             .map_err(signer_error_to_machine)
     }
+    /// Public status: Signer's retained receipt goes only to Checkout.
     pub fn card_status(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CardOperationStatus, ProtocolError> {
+        let mut status = self.card_status_with_receipt(operation_id)?;
+        status.receipt = None;
+        status.output_aad = None;
+        Ok(status)
+    }
+    fn card_status_with_receipt(
         &self,
         operation_id: &OperationId,
     ) -> Result<CardOperationStatus, ProtocolError> {
@@ -501,11 +509,11 @@ impl CeremonyBroker {
             }
             CheckoutIntakeRequest::Result { operation_id } => {
                 self.expire_sessions(now_ms)?;
-                let status = self.card_status(&operation_id)?;
-                let mut channels = self.inner.cards.channels.lock();
-                let channel = channels.get_mut(&operation_id);
-                let output_aad = channel.as_ref().map(|c| c.output_aad.clone());
-                let receipt = channel.and_then(|c| c.result.take()).map(Box::new);
+                // Signer keeps the sealed receipt, so a lost response or a
+                // Broker restart does not strand an approved release.
+                let mut status = self.card_status_with_receipt(&operation_id)?;
+                let receipt = status.receipt.take();
+                let output_aad = status.output_aad.take();
                 Ok(CheckoutIntakeResponse::Result {
                     status,
                     receipt,
@@ -554,30 +562,11 @@ impl CeremonyBroker {
             return Err(operation_conflict());
         }
         let prepared = self.prepare_card(operation_id.clone(), effect, now_ms)?;
-        let sessions = self.inner.sessions.lock();
-        let session = sessions
-            .values()
-            .find(|s| s.operation_id == operation_id)
-            .ok_or_else(operation_conflict)?;
-        let contribution: CustodySignerContribution =
-            serde_json::from_value(session.projection.signer_contribution.clone())
-                .map_err(malformed)?;
-        let output_aad = CustodyOutputHpkeAad {
-            surface: contribution.surface.clone(),
-            ceremony_id: contribution.ceremony_id.clone(),
-            ceremony_kind: contribution.ceremony_kind,
-            custody_operation_id: operation_id.clone(),
-            signer_contribution_digest: contribution.digest().map_err(signer_error_to_machine)?,
-            public_binding_digest: contribution.review_manifest_digest,
-        };
-        drop(sessions);
         let mut channels = self.inner.cards.channels.lock();
         channels.retain(|_, c| c.expires_at_ms > now_ms);
         channels.entry(operation_id).or_insert(Channel {
             challenge_url,
-            result: None,
             expires_at_ms: prepared.ceremony_expires_at_ms.get(),
-            output_aad,
             order_preview,
             order_fields,
         });
@@ -616,7 +605,17 @@ pub(super) fn complete_card_session(
             },
             now_ms,
         )
-        .map_err(signer_error_to_machine);
+        .map_err(signer_error_to_machine)
+        // A lost Signer response is an unknown outcome, not a failure: ask
+        // Signer what it committed before telling the owner anything.
+        .or_else(
+            |error| match broker.card_status_with_receipt(&session.operation_id) {
+                Ok(status) if status.state == CardOperationState::Succeeded => {
+                    status.receipt.map(|r| *r).ok_or(error)
+                }
+                _ => Err(error),
+            },
+        );
     let response = match result {
         Ok(receipt) => {
             if receipt.ceremony_kind != session.ceremony_kind
@@ -626,18 +625,17 @@ pub(super) fn complete_card_session(
             }
             session.state = CeremonyState::Succeeded;
             // Never persist release ciphertext or expose a challenge URL via result/status.
-            let challenge_url = if session.ceremony_kind == CeremonyKind::CardCheckout {
-                let mut channels = broker.inner.cards.channels.lock();
-                if let Some(channel) = channels.get_mut(&session.operation_id) {
-                    channel.result = Some(receipt);
-                    Some(channel.challenge_url.clone())
-                } else {
-                    session.state = CeremonyState::Failed;
-                    None
-                }
-            } else {
-                None
-            };
+            let challenge_url = (session.ceremony_kind == CeremonyKind::CardCheckout)
+                .then(|| {
+                    broker
+                        .inner
+                        .cards
+                        .channels
+                        .lock()
+                        .get(&session.operation_id)
+                        .map(|c| c.challenge_url.clone())
+                })
+                .flatten();
             Json(serde_json::json!({"state":session.state, "challenge_url":challenge_url}))
                 .into_response()
         }

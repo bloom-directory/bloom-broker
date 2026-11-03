@@ -59,7 +59,7 @@ bloom-relay-admin-client.workspace = true
 # The socket-activation regression hands a real descriptor to a child process
 # between fork and exec, which needs dup2/fcntl directly.
 libc = "0.2"
-bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "7dd2569ed0aad165f9b03ff9cdebe0c03f951abb" }
+bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "5d2320a9996a9ab539e2b7f6c541dd59b7f2f487" }
 bloom-signer-vectors.workspace = true
 futures = "0.3"
 http-body-util = "0.1"

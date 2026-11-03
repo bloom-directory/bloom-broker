@@ -99,6 +99,8 @@ mod tests {
             let status = south::CardOperationStatus {
                 operation_id: south::OperationId::from_bytes([1; 32]),
                 state,
+                receipt: None,
+                output_aad: None,
             };
             assert_eq!(
                 serde_json::to_value(super::status(status.clone())).unwrap(),

@@ -1448,8 +1448,6 @@ function renderCardReview(session) {
       fact("Recurring charge", payment.renewal_starts_on
         ? `${renewal} every ${every}, from ${payment.renewal_starts_on}`
         : `${renewal} every ${every}`);
-    } else if (payment.recurring) {
-      fact("Recurring charge", "Yes. Bloom could not read what each later charge costs; check the merchant's page below.");
     } else fact("Recurring charge", "No");
     // The merchant's page as checkout saw it, so items, quantity and delivery
     // details can be checked. Only the total above is bound to the approval.
@@ -2315,6 +2313,16 @@ function cardFieldsInput(session) {
 // After the passkey approves a card request, Signer has consumed the link.
 function reportCardFailure(session, error) {
   console.error("Bloom card ceremony failed", error);
+  // Only Broker's refusal is a definite answer. A lost response or a server
+  // error can follow a change Signer already committed.
+  if (!(error?.status >= 400 && error.status < 500)) {
+    statusNode.textContent = "Outcome unknown.";
+    formError.textContent = "Bloom lost the answer to this approval, so the change may already have been made. Ask your agent to check your saved cards and travelers before trying again.";
+    formError.hidden = false;
+    clearInterval(expiryTimer);
+    for (const node of [approve, cancel, cardFields, cardCvcFields, travelerFields]) node.hidden = true;
+    return;
+  }
   const effect = session.review_manifest?.card_effect?.kind;
   const action = effect === "save_traveler" ? "Traveler not saved"
     : effect === "delete_traveler" ? "Traveler not deleted"
@@ -4407,6 +4415,7 @@ async function mutate(url, body) {
     } catch (_) {}
     const error = new Error(detail || `Ceremony request failed (${response.status})`);
     error.retryAfterMs = retryAfterMs;
+    error.status = response.status;
     throw error;
   }
   return response.status === 204 ? null : response.json();
