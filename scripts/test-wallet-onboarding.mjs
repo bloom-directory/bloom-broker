@@ -64,6 +64,7 @@ try {
   // Never screenshot, trace, read, print or persist the phrase.
   await page.getByRole("heading", {name: "Your recovery phrase", exact: true}).waitFor();
   if (await page.locator("ol.words li").count() !== 24) throw new Error();
+  if (await page.locator("#review-deadline").textContent() || await page.locator("#action-expiry").textContent()) throw new Error();
   stage = "return after backup";
   await page.getByRole("link", {name: "Return to wallet", exact: true}).click();
   await page.getByRole("button", {name: "Back up wallet", exact: true}).waitFor();
