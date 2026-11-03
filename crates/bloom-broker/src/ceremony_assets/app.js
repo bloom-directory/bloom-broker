@@ -1861,6 +1861,9 @@ function markDone(title) {
 
 function renderResult(session, plaintext) {
   const kind = session.ceremony_kind;
+  // The approval deadline no longer applies once the result is shown.
+  document.getElementById("review-deadline").textContent = "";
+  document.getElementById("action-expiry").textContent = "";
   const text = new TextDecoder().decode(plaintext).trim();
   let parsed = null;
   try { parsed = JSON.parse(text); } catch (_) {}
@@ -3912,7 +3915,7 @@ async function run(session) {
     if (genericKinds.has(kind)) {
       let effect = {kind};
       if (kind === "wallet_export") {
-        const format = document.querySelector('input[name="export-format"]:checked')?.value;
+        const format = document.querySelector('input[name="export-format"]')?.value;
         if (!format) throw new Error("Choose what to export");
         effect = {format, kind};
       } else if (!scopedPetalKey && !genericFields.hidden) {
