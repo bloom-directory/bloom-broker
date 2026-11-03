@@ -989,11 +989,15 @@ fn validate_petal_profile(
     let payment = review
         .payment
         .as_ref()
+        // Allow only ERC-3009 by name, so a missing primaryType refuses instead of passing.
         .filter(|_| {
-            !review
-                .domain
-                .iter()
-                .any(|field| field.path == "primaryType" && field.value == PERMIT2_PRIMARY)
+            review.domain.iter().any(|field| {
+                field.path == "primaryType"
+                    && matches!(
+                        field.value.as_str(),
+                        "TransferWithAuthorization" | "ReceiveWithAuthorization"
+                    )
+            })
         })
         .ok_or_else(|| {
             invalid("This payment operation requires a canonical ERC-3009 authorization")
@@ -1398,6 +1402,12 @@ mod tests {
             claim_assurance: ClaimAssurance::MachineAsserted,
         });
         let error = review(&request, signer()).unwrap_err();
+        assert!(error.message.contains("ERC-3009"), "{}", error.message);
+
+        // A payment review without its primaryType field also refuses.
+        let mut reading = decode(&envelope(permit2_data()), signer()).unwrap().1;
+        reading.domain.retain(|field| field.path != "primaryType");
+        let error = validate_petal_profile(&request, &reading).unwrap_err();
         assert!(error.message.contains("ERC-3009"), "{}", error.message);
     }
 
