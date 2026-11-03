@@ -671,6 +671,10 @@ const PERMIT2: Address = alloy::primitives::address!("000000000022D473030F116dDE
 /// the witness recipient is the payee; any other spender could pay anyone.
 const X402_PERMIT2_PROXY: Address =
     alloy::primitives::address!("402085c248EeA27D92E8b30b2C58ed07f9E20001");
+/// Chains where the Permit2 and x402 proxy deployments at these addresses
+/// were reviewed: Ethereum, Arbitrum, Base. Elsewhere the same address may
+/// hold other code, so `witness.to` is not shown as the recipient.
+const X402_PERMIT2_REVIEWED_CHAINS: [u64; 3] = [1, 42161, 8453];
 const PERMIT2_PRIMARY: &str = "PermitWitnessTransferFrom";
 const PERMIT2_TYPE: &str = "PermitWitnessTransferFrom(TokenPermissions permitted,address spender,uint256 nonce,uint256 deadline,Witness witness)TokenPermissions(address token,uint256 amount)Witness(address to,uint256 validAfter)";
 
@@ -737,6 +741,11 @@ fn payment(
         }) else {
             return Ok(None);
         };
+        if !X402_PERMIT2_REVIEWED_CHAINS.contains(&chain) {
+            return Err(invalid(
+                "x402 Permit2 payment on a chain whose proxy deployment was not reviewed",
+            ));
+        }
         // Permit2 pulls the tokens from the signing account.
         return payment_review(
             chain,
@@ -989,11 +998,15 @@ fn validate_petal_profile(
     let payment = review
         .payment
         .as_ref()
+        // Allow only ERC-3009 by name, so a missing primaryType refuses instead of passing.
         .filter(|_| {
-            !review
-                .domain
-                .iter()
-                .any(|field| field.path == "primaryType" && field.value == PERMIT2_PRIMARY)
+            review.domain.iter().any(|field| {
+                field.path == "primaryType"
+                    && matches!(
+                        field.value.as_str(),
+                        "TransferWithAuthorization" | "ReceiveWithAuthorization"
+                    )
+            })
         })
         .ok_or_else(|| {
             invalid("This payment operation requires a canonical ERC-3009 authorization")
@@ -1362,6 +1375,25 @@ mod tests {
         for changed in [version, other_name] {
             assert!(review(&system(envelope(changed), class), signer()).is_err());
         }
+        // The proxy's semantics were reviewed only where it is deployed;
+        // the same address on another chain may hold other code.
+        for (chain, reviewed) in [(1, true), (42161, true), (10, false), (137, false)] {
+            let mut changed = permit2_data();
+            changed["domain"]["chainId"] = json!(chain);
+            if reviewed {
+                assert!(
+                    review(&system(envelope(changed), class), signer()).is_ok(),
+                    "{chain}"
+                );
+            } else {
+                let error = decode(&envelope(changed), signer()).unwrap_err();
+                assert!(
+                    error.message.contains("not reviewed"),
+                    "{chain}: {}",
+                    error.message
+                );
+            }
+        }
         let mut empty = permit2_data();
         empty["message"]["witness"]["validAfter"] = json!("2000000000");
         assert!(decode(&envelope(empty), signer()).is_err());
@@ -1398,6 +1430,12 @@ mod tests {
             claim_assurance: ClaimAssurance::MachineAsserted,
         });
         let error = review(&request, signer()).unwrap_err();
+        assert!(error.message.contains("ERC-3009"), "{}", error.message);
+
+        // A payment review without its primaryType field also refuses.
+        let mut reading = decode(&envelope(permit2_data()), signer()).unwrap().1;
+        reading.domain.retain(|field| field.path != "primaryType");
+        let error = validate_petal_profile(&request, &reading).unwrap_err();
         assert!(error.message.contains("ERC-3009"), "{}", error.message);
     }
 
