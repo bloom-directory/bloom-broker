@@ -35,7 +35,7 @@ pub use pubkey::{PUBKEY_BYTES, Pubkey};
 pub use short_vec::{ShortVecError, read_short_vec, write_short_vec};
 pub use system_transfer::{SYSTEM_PROGRAM_ID, SystemTransferError, transfer_data};
 pub use verifier::{
-    REVIEWED_FEE_SCHEDULES, RejectionReason, VerifiedTransfer, verify_fee, verify_native_transfer,
+    LAMPORTS_PER_SIGNATURE, RejectionReason, VerifiedTransfer, verify_fee, verify_native_transfer,
 };
 
 /// The `solana-system-transfer-v1` verifier identifier, as advertised by

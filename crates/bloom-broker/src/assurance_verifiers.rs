@@ -43,12 +43,11 @@ impl AssuranceVerifier for SolanaSystemTransferVerifier {
             // message evidence. Provenance/identity fields (package_hash,
             // route, operation_class, crypto_suite, ordered_hashes, nonce)
             // are bound by Broker's own claim-mismatch checks and are not
-            // verifier-proven. The fee is checked only on networks with a
-            // reviewed fee schedule (`bloom_solana_verify::REVIEWED_FEE_SCHEDULES`),
-            // so it is not a field this verifier establishes everywhere.
+            // verifier-proven. The fee is computed from the message (bloom#305).
             established_fields: vec![
                 Token::new("declared_destinations").expect("valid token"),
                 Token::new("declared_debits").expect("valid token"),
+                Token::new("declared_fee").expect("valid token"),
                 Token::new("payload_digest").expect("valid token"),
                 Token::new("recent_blockhash").expect("valid token"),
             ],
@@ -124,9 +123,8 @@ impl AssuranceVerifier for SolanaSystemTransferVerifier {
         if verified.recent_blockhash != claim.chain_context.recent_blockhash {
             return Err("signed message blockhash differs from system claim".to_owned());
         }
-        // The owner is shown this fee and it is charged to the wallet's limits.
-        // On a network with a reviewed fee schedule it must match that
-        // schedule, not just the RPC that priced it.
+        // The owner is shown this fee and it is charged to the wallet's limits,
+        // so it must match the message, not just the RPC that priced it.
         let DeclaredFee::Fee {
             chain,
             asset,
@@ -139,12 +137,8 @@ impl AssuranceVerifier for SolanaSystemTransferVerifier {
             Ok(lamports) if chain.as_str() == "solana" && asset == "native" => lamports,
             _ => return Err("native Solana transfer requires a solana:native fee".to_owned()),
         };
-        bloom_solana_verify::verify_fee(
-            &verified,
-            &claim.chain_context.genesis_hash,
-            declared_lamports,
-        )
-        .map_err(|reason| format!("{reason:?}"))?;
+        bloom_solana_verify::verify_fee(&verified, declared_lamports)
+            .map_err(|reason| format!("{reason:?}"))?;
         // Belt and braces: `verify_native_transfer` already rejects a payer
         // mismatch, so this asserts the verified identity we carry forward is
         // the one that was checked rather than re-deriving trust from it.
@@ -203,11 +197,10 @@ mod tests {
     }
 
     /// bloom#305: Machine takes this fee from its RPC. The owner sees it and
-    /// it counts against the wallet's limits, so on a network with a reviewed
-    /// fee schedule a figure that differs from it is refused, high or low.
-    /// Elsewhere the message proves no schedule, so the fee is not checked.
+    /// it counts against the wallet's limits, so a figure other than one base
+    /// fee per signature is refused, high or low, whatever genesis is claimed.
     #[test]
-    fn declared_fee_must_match_a_reviewed_network_schedule() {
+    fn declared_fee_must_equal_the_message_signature_fee() {
         let payer = Pubkey::from_bytes([1u8; 32]);
         let dest = Pubkey::from_bytes([2u8; 32]);
         let bytes = transfer_message(payer, dest, 42, [7u8; 32])
@@ -222,12 +215,21 @@ mod tests {
         let verify = |claim: &SystemUseClaim| {
             SolanaSystemTransferVerifier.verify_system(claim, Some(&bytes), Some(&payer.to_bytes()))
         };
-        claim.chain_context.genesis_hash = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d".into();
-        verify(&claim).unwrap();
-        for wrong in [native_fee(0), native_fee(4_999), native_fee(1_000_000)] {
-            claim.declared_fee = wrong.clone();
-            let error = verify(&claim).unwrap_err();
-            assert!(error.contains("FeeMismatch"), "{wrong:?}: {error}");
+        for genesis in [
+            "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+            "local-validator-genesis",
+        ] {
+            claim.chain_context.genesis_hash = genesis.into();
+            claim.declared_fee = native_fee(5_000);
+            verify(&claim).unwrap();
+            for wrong in [native_fee(0), native_fee(4_999), native_fee(10_000)] {
+                claim.declared_fee = wrong.clone();
+                let error = verify(&claim).unwrap_err();
+                assert!(
+                    error.contains("FeeMismatch"),
+                    "{genesis} {wrong:?}: {error}"
+                );
+            }
         }
         for wrong in [
             DeclaredFee::None,
@@ -241,11 +243,6 @@ mod tests {
             let error = verify(&claim).unwrap_err();
             assert!(error.contains("solana:native fee"), "{wrong:?}: {error}");
         }
-        // An unreviewed network (a local validator here) has no schedule to
-        // check, so its RPC-quoted fee stays machine-asserted.
-        claim.chain_context.genesis_hash = "local-validator-genesis".into();
-        claim.declared_fee = native_fee(10_000);
-        verify(&claim).unwrap();
     }
 
     fn system_claim(
