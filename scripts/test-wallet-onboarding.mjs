@@ -43,6 +43,8 @@ try {
   for (const width of [390, 1280]) {
     await page.setViewportSize({width, height: 1000});
     if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)) throw new Error();
+    // Each whole address reads on one line.
+    if (await page.evaluate(() => [...document.querySelectorAll(".wallet-address code")].some(c => c.getClientRects().length !== 1))) throw new Error();
     await page.screenshot({path: path.join(output, "wallet-created-" + width + ".png"), fullPage: true});
   }
   stage = "later and refresh";
