@@ -1200,7 +1200,8 @@ function describeTransfer(manifest) {
       ? "Required before signing — Bloom will decode the transaction and require it to match this summary"
       : "No — these figures are claimed, not verified"]);
   }
-  return {sentence, facts, willVerify};
+  // A transfer's destinations are its recipients, shown on the main review.
+  return {sentence, facts, willVerify, recipients: isTransfer ? to : [], chainId: chain};
 }
 // Turn a Signer key reference into "Solana account 0 (m/44'/501'/0'/0')".
 function describeKey(ref) {
@@ -1525,6 +1526,12 @@ function renderReview(session) {
     decision.push(el("dl", {class: "facts ceremony-account"},
       el("dt", {}, "Signing account"),
       el("dd", {}, [walletName, accountLabel].filter(Boolean).join(" · "))));
+  }
+  // The sentence says "to the address below", so the address must be here,
+  // not only in the collapsed technical details.
+  for (const value of transfer?.recipients || []) {
+    decision.push(el("div", {class: "ceremony-identity ceremony-transfer-path"},
+      partyRow({role: "recipient", label: "Recipient", value})));
   }
   if (transfer?.tokenAsset) {
     decision.push(assetCard(transfer.tokenAsset));

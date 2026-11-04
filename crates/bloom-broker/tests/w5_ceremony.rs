@@ -926,6 +926,73 @@ process.stdout.write("ok");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "ok");
 }
 
+/// "Send 0.001 SOL … to the address below" once had no address below: the
+/// recipient was drawn only inside the collapsed technical details.
+#[test]
+fn system_transfer_recipient_is_on_the_primary_review_surface() {
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; this.className = ""; }}
+  setAttribute() {{}}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+const recipient = "GWGW3TzM5dEDV38xK1F8chQJptJ6aywQkwksgfhKztEu";
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "main", key_ref: {{derivation: {{path: "m/44'/501'/0'/0'"}}}}}},
+  review_manifest: {{system_use_claim: {{
+    declared_debits: [{{amount: "1000000", asset: {{chain: "solana", asset: "SOL"}}}}],
+    declared_destinations: [{{chain: "solana", destination: recipient}}]
+  }}}}
+}});
+// Walk the review, skipping collapsed <details>, and find a recipient row.
+const shown = node => typeof node === "string" ? node
+  : node.name === "details" ? "" : `${{node.textContent}} ${{node.children.map(shown).join(" ")}}`;
+const rows = [];
+const find = node => {{
+  if (typeof node === "string" || node.name === "details") return;
+  if (node.className === "ceremony-party") rows.push(node);
+  node.children.forEach(find);
+}};
+find(nodes.review);
+if (!rows.some(row => shown(row).includes("Recipient") && shown(row).includes(recipient))) {{
+  throw new Error(`recipient missing from the main review: ${{shown(nodes.review)}}`);
+}}
+process.stdout.write("ok");
+"#
+    );
+    let output = run_node(&script);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "ok");
+}
+
 #[test]
 fn custody_manifest_is_rendered_on_the_primary_review_surface() {
     let asset = concat!(
