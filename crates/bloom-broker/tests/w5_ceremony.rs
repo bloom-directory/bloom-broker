@@ -1384,7 +1384,9 @@ if (safeFactText.includes("Token amount (base units): 123") || safeFactText.incl
   throw new Error(`Safe review still dumps action lines: ${{safeFactText}}`);
 }}
 const openTags = nodes.review.children.map(node => node.tagName);
-if (openTags.join(",") !== "P,SECTION,DIV,ASIDE,DETAILS") {{
+// The amount sits in the centred hero, then the parties table.
+if (openTags.join(",") !== "P,DIV,DIV,ASIDE,DETAILS" || nodes.review.children[1].className !== "ceremony-hero"
+    || nodes.review.children[2].className !== "ceremony-rows") {{
   throw new Error(`Safe open view is not summary, decision, warning, details: ${{openTags}}`);
 }}
 const banners = node => !node || typeof node === "string" ? [] : [
@@ -1691,7 +1693,7 @@ for (const empty of [false, true]) {{
   if (!empty) noMinimum.fields.find(field => field.label.startsWith("Requested minimum balance increase")).raw = "0x" + "0".repeat(128);
   if (ensoHasMinimum(noMinimum) || callIntent(noMinimum).heading.includes("swap")) throw new Error("Empty or zero output checks falsely protected");
 }}
-const outputCard = nodes.review.children.find(node => allText(node).includes("1.25 USDC"));
+const outputCard = walk(nodes.review).find(node => node.className === "ceremony-asset" && allText(node).includes("1.25 USDC"));
 if (!outputCard || !allText(outputCard).includes("Minimum output") || !allText(outputCard).includes("+1.25 USDC") ||
     !walk(outputCard).some(node => String(node.className).includes("incoming")) ||
     !allText(nodes.review).includes("reverts if it is not met") || !allText(nodes.review).includes("not a quote or proof of receipt") ||
@@ -1743,7 +1745,7 @@ if (!nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allTex
   throw new Error("An Enso call in a batch hid another transaction's warning");
 }}
 renderReview(previewSession("safe-token-transfer"));
-const safeFlow = nodes.review.children.find(node => String(node.className).includes("ceremony-transfer-path"));
+const safeFlow = walk(nodes.review).find(node => String(node.className).includes("ceremony-transfer-path"));
 if (!safeFlow || !allText(safeFlow).includes("−25 USDC") || !allText(safeFlow).includes("+25 USDC")) {{
   throw new Error("Safe transfer omitted requested sender and recipient deltas");
 }}

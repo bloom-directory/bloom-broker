@@ -1864,14 +1864,33 @@ function renderReview(session) {
   const primary = [];
   if (outputWarning) primary.push(outputWarning);
   if (summaryHtml) primary.push(el("p", {class: "summary", html: summaryHtml}));
+  // Every review has the same shape: the amounts, centred, then one table of
+  // parties and fees. Batch cards repeat that table inside each card.
   const hero = decision.filter(node => String(node.className || "").includes("ceremony-asset"));
   const rest = decision.filter(node => !String(node.className || "").includes("ceremony-asset"));
   const enso = transfer?.payloads?.some(payload => payload.contract_call?.contract_name === "Enso Router V2");
-  hero.forEach((card, index) => {
-    if (enso && index) primary.push(el("div", {class: "ceremony-flow-arrow", "aria-hidden": "true"}, "↓"));
-    primary.push(card);
-  });
-  primary.push(...rest);
+  if (hero.length) {
+    const action = ["send", "transfer"].includes(transfer?.intent?.action) ? "send" : "other";
+    const stage = el("div", {class: hero.length > 1 ? "ceremony-hero ceremony-hero-pair" : "ceremony-hero",
+      "data-hero": action});
+    hero.forEach((card, index) => {
+      if (enso && index) stage.append(el("div", {class: "ceremony-flow-arrow", "aria-hidden": "true"}, "↓"));
+      stage.append(card);
+    });
+    primary.push(stage);
+  }
+  const rowLike = node => /\bceremony-(identity|party|fee|account)\b/.test(String(node?.className || ""));
+  const groupRows = nodes => nodes.reduce((out, node) => {
+    const last = out[out.length - 1];
+    if (!rowLike(node)) out.push(node);
+    else if (String(last?.className || "") === "ceremony-rows") last.append(node);
+    else out.push(el("div", {class: "ceremony-rows"}, node));
+    return out;
+  }, []);
+  for (const node of rest) {
+    if (String(node.className || "").includes("ceremony-card")) node.replaceChildren(...groupRows([...node.children]));
+  }
+  primary.push(...groupRows(rest));
   if (warning) primary.push(warning);
   reviewNode.replaceChildren(...primary,
     el("details", {class: "ceremony-details ceremony-evidence"},
