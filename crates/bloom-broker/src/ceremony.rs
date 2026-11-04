@@ -4201,7 +4201,8 @@ fn add_address_qr_codes(accounts: &mut serde_json::Value) {
         if let Ok(code) = qrcode::QrCode::new(address.as_bytes()) {
             let svg = code
                 .render::<qrcode::render::svg::Color>()
-                .quiet_zone(true)
+                // The page frames it with a white margin instead.
+                .quiet_zone(false)
                 .build();
             chain["address_qr"] = serde_json::Value::String(svg);
         }
