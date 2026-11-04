@@ -872,6 +872,9 @@ impl BrokerAuthority {
                     "wallet deletion receipt retained public custody projections",
                 ));
             }
+            // Serialize with install_policy: a policy read that verified its
+            // snapshot before this delete must not persist it afterward.
+            let _barrier = self.lock_authorization_barrier()?;
             let mut connection = self.lock_for_mutation()?;
             let transaction = connection.transaction()?;
             let removed = transaction.execute(
@@ -892,6 +895,12 @@ impl BrokerAuthority {
             }
             transaction.commit()?;
             drop(connection);
+            // Unpin the wallet's policy key so a stale snapshot no longer
+            // verifies. Only registration/import may pin it again.
+            self.policy_keys
+                .lock()
+                .map_err(|_| storage("policy key registry lock poisoned"))?
+                .remove(wallet_id.as_str());
             self.journal.checkpoint_committed_head()?;
             return Ok(());
         }

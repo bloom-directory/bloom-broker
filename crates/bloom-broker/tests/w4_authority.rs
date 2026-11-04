@@ -4398,3 +4398,57 @@ fn key_stop_admission_rolls_back_and_replay_preserves_fresh_exact() {
         Some(bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony)
     );
 }
+
+#[test]
+fn deleted_wallet_rejects_late_policy_read_install() {
+    let harness = Harness::new();
+    // This snapshot represents a valid read that started before deletion.
+    let before_delete = harness.authority.policy_snapshot(&harness.wallet).unwrap();
+    let mut receipt = CustodyResult {
+        surface: Some(bloom_broker_api::CeremonySurfaceRef {
+            surface_id: token("local"),
+            identity_digest: digest(91),
+        }),
+        credential_authority_generation: Some(DecimalU64::new(0)),
+        ceremony_kind: CeremonyKind::WalletDelete,
+        custody_operation_id: operation(90),
+        public_status: CeremonyState::Succeeded,
+        wallet_id: Some(harness.wallet.clone()),
+        public_key_refs: Vec::new(),
+        credential_summaries: Vec::new(),
+        initial_policy: None,
+        receipt_digest: digest(90),
+        encrypted_browser_result: None,
+        signer_key_id: token("ceremony-key"),
+        signer_signature: Base64UrlBytes::from_bytes(&[]),
+    };
+    sign_custody_receipt(&mut receipt, &harness.ceremony_key);
+    harness
+        .authority
+        .adopt_custody_receipt(&receipt, 1_000)
+        .unwrap();
+    assert!(
+        !harness
+            .authority
+            .wallet_ids()
+            .unwrap()
+            .contains(&harness.wallet)
+    );
+    // service::policy_read installs a Signer snapshot after awaiting its RPC.
+    // A response obtained before deletion can reach this call afterward.
+    let error = harness
+        .authority
+        .install_policy(&before_delete)
+        .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("POLICY_KEY_UNKNOWN"),
+        "{error:?}"
+    );
+    assert!(
+        !harness
+            .authority
+            .wallet_ids()
+            .unwrap()
+            .contains(&harness.wallet)
+    );
+}
