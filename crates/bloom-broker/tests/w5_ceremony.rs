@@ -915,6 +915,12 @@ if (label(petal) !== "Declared destinations") throw new Error(label(petal));
 if (system.intent?.action !== "send") throw new Error(JSON.stringify(system.intent));
 if (system.parties.find(party => party.role === "recipient")?.value !== "PumpProgram111") throw new Error("no recipient");
 if (label(system) !== "To") throw new Error(label(system));
+// Only a review bound to the mainnet genesis hash links to a mainnet explorer.
+const solanaAddress = "GWGW3TzM5dEDV38xK1F8chQJptJ6aywQkwksgfhKztEu";
+const mainnet = describeTransfer({{system_use_claim: {{...claim,
+  chain_context: {{chain_family: "solana", genesis_hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"}}}}}});
+if (addressExplorer(mainnet.chainId, solanaAddress)?.url !== `https://solscan.io/account/${{solanaAddress}}`) throw new Error(mainnet.chainId);
+if (addressExplorer(system.chainId, solanaAddress)) throw new Error("unbound cluster links to mainnet");
 process.stdout.write("ok");
 "#
     );
@@ -964,8 +970,9 @@ renderReview({{
   ceremony_kind: "sealed_approval",
   expires_at_ms: Date.now() + 60000,
   signer_contribution: {{wallet_id: "main", key_ref: {{derivation: {{path: "m/44'/501'/0'/0'"}}}}}},
-  review_manifest: {{system_use_claim: {{
-    declared_debits: [{{amount: "1000000", asset: {{chain: "solana", asset: "SOL"}}}}],
+  review_manifest: {{canonical_plan: JSON.stringify({{asset_amounts: [{{kind: "declared_debit", display: "0.001 SOL"}}]}}),
+    system_use_claim: {{
+    declared_debits: [{{amount: "1000000", asset: {{chain: "solana", asset: "native"}}}}],
     declared_destinations: [{{chain: "solana", destination: recipient}}]
   }}}}
 }});
@@ -988,6 +995,10 @@ if (!rows.some(row => shown(row).includes("Sender") && shown(row).includes("main
   throw new Error(`sender missing from the main review: ${{shown(nodes.review)}}`);
 }}
 if (shown(nodes.review).includes("Signing account")) throw new Error("separate signing account block");
+// The real claim names the asset "native"; the card must name the network's coin.
+if (!shown(nodes.review).includes("Solana") || / native /.test(shown(nodes.review))) {{
+  throw new Error(`asset card does not name Solana: ${{shown(nodes.review)}}`);
+}}
 process.stdout.write("ok");
 "#
     );

@@ -288,6 +288,11 @@ function chainLabel(chain, ctx) {
 }
 
 function addressExplorer(chainId, address) {
+  // Only a review bound to the mainnet genesis hash gets this ID, so a
+  // devnet or local address never links to mainnet.
+  if (chainId === "solana-mainnet" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) {
+    return {name: "solscan.io", url: `https://solscan.io/account/${address}`};
+  }
   if (!/^0x[0-9a-fA-F]{40}$/.test(address)) return null;
   // Etherscan public chainlist snapshot, 2026-09-22: https://api.etherscan.io/v2/chainlist
   const explorers = {
@@ -1205,9 +1210,10 @@ function describeTransfer(manifest) {
   if (isTransfer && amounts.length === 1 && to.length === 1) {
     const native = chain === "solana" ? "solana" : "token";
     return {intent: {action: "send", eyebrow: "Native transfer", heading: `Send ${amounts[0]}`, detail: ""},
-      sentence: "", facts, willVerify, chainId: chain,
+      sentence: "", facts, willVerify,
+      chainId: network === "Solana mainnet" ? "solana-mainnet" : chain,
       parties: [{role: "source", value: ""}, {role: "recipient", label: "Recipient", value: to[0]}],
-      sendAsset: {native, title: debits[0].asset.asset, amount: amounts[0], amountLabel: "Amount", tone: "outgoing"},
+      sendAsset: {native, title: native === "solana" ? "Solana" : debits[0].asset.asset, amount: amounts[0], amountLabel: "Amount", tone: "outgoing"},
       fee: feeDisplay ? {native, amount: feeDisplay} : null,
       networkIdentity: network, networkIcon: native};
   }
@@ -3511,7 +3517,7 @@ const PREVIEWS = {
       canonical_plan: JSON.stringify({asset_amounts: [{kind: "declared_debit", display: "0.001 SOL"},
         {kind: "declared_fee", display: "0.000005 SOL"}]}),
       system_use_claim: {
-        declared_debits: [{amount: "1000000", asset: {chain: "solana", asset: "SOL"}}],
+        declared_debits: [{amount: "1000000", asset: {chain: "solana", asset: "native"}}],
         declared_destinations: [{chain: "solana", destination: "GWGW3TzM5dEDV38xK1F8chQJptJ6aywQkwksgfhKztEu"}],
         declared_fee: {kind: "fee", chain: "solana", asset: "lamports", amount: "5000"},
         chain_context: {chain_family: "solana", genesis_hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"},
