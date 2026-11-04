@@ -206,6 +206,7 @@ impl ReservationState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReservationRequest {
+    pub zero_spend_class: Option<Token>,
     pub approval_id: Digest32,
     pub operation_id: OperationId,
     pub operation_digest: Digest32,
@@ -3724,6 +3725,24 @@ fn reservation_matches(
     {
         return Ok(false);
     }
+    let record: Option<String> = transaction
+        .query_row(
+            "SELECT record_jcs FROM session_uses WHERE approval_id=?1 AND operation_id=?2",
+            params![request.approval_id.as_str(), request.operation_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let zero = record
+        .map(|record| {
+            serde_json::from_str::<bloom_broker_api::SessionRecordedUse>(&record)
+                .map(|record| record.zero_spend_class)
+                .map_err(storage)
+        })
+        .transpose()?
+        .flatten();
+    if zero != request.zero_spend_class {
+        return Ok(false);
+    }
     let mut statement = transaction.prepare(
         "SELECT asset_id, amount FROM reservation_values
          WHERE approval_id = ?1 AND operation_id = ?2 ORDER BY asset_id",
@@ -3973,6 +3992,7 @@ fn reserve_session_budget(
     if budget.token_policy.is_some() {
         check_session_pool(transaction, &id, budget, request.reserved_at_ms)?;
     }
+    let mut zero_uses = Vec::new();
     let previous = {
         let mut statement=transaction.prepare("SELECT session_uses.approval_id,session_uses.operation_id,session_uses.record_jcs,reservations.state FROM session_uses JOIN reservations USING(approval_id,operation_id) WHERE session_uses.budget_id=?1")?;
         let rows = statement.query_map([id.as_str()], |r| {
@@ -3998,7 +4018,11 @@ fn reserve_session_budget(
             if state == "RELEASED" {
                 continue;
             }
-            records.push(serde_json::from_str::<SessionRecordedUse>(&record).map_err(storage)?);
+            let record: SessionRecordedUse = serde_json::from_str(&record).map_err(storage)?;
+            if approval == request.approval_id.as_str() && record.zero_spend_class.is_some() {
+                zero_uses.push(record.accepted_at_ms);
+            }
+            records.push(record);
         }
         records
     };
@@ -4029,7 +4053,44 @@ fn reserve_session_budget(
             })
         })
         .collect::<Result<Vec<_>, JournalError>>()?;
+    if let Some(class) = &request.zero_spend_class {
+        let policy = budget.petal_policy.as_ref().ok_or_else(|| {
+            protocol(
+                ProtocolErrorCode::ClaimInvalid,
+                "zero spend requires a persona grant",
+            )
+        })?;
+        let cap = policy
+            .zero_spend_rate_limit
+            .as_ref()
+            .filter(|_| policy.zero_spend_classes.contains(class) && request.values.is_empty())
+            .ok_or_else(|| {
+                protocol(
+                    ProtocolErrorCode::ClaimInvalid,
+                    "zero spend is outside its grant",
+                )
+            })?;
+        let start = request.reserved_at_ms.saturating_sub(cap.duration_ms.get());
+        let count = zero_uses
+            .iter()
+            .filter(|time| **time > start && **time <= request.reserved_at_ms)
+            .try_fold(0u64, |n, _| n.checked_add(1))
+            .ok_or_else(|| {
+                protocol(
+                    ProtocolErrorCode::LimitExceededRate,
+                    "zero-spend counter overflow",
+                )
+            })?;
+        if count >= cap.maximum.get() {
+            return Err(protocol(
+                ProtocolErrorCode::LimitExceededRate,
+                "zero-spend grant rate cap exceeded; exact review is required",
+            )
+            .into());
+        }
+    }
     let current = SessionRecordedUse {
+        zero_spend_class: request.zero_spend_class.clone(),
         accepted_at_ms: request.reserved_at_ms,
         signature_count: request.signature_count,
         values,

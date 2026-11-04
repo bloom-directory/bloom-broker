@@ -128,6 +128,11 @@ fn build_members(standing: bool) -> Vec<SealedApprovalTerms> {
     }
     templates.sort_by_key(|t| session_member_scope_digest(t).unwrap().as_str().to_owned());
     let budget = SessionBudget {
+        petal_policy: Some(PetalSessionPolicy {
+            persona: PetalSessionPersona::Trader,
+            zero_spend_classes: vec![],
+            zero_spend_rate_limit: None,
+        }),
         token_policy: Some(SessionTokenPolicy {
             schema_version: 3,
             budget_nonce: RequestNonce::from_bytes([9; 16]),
@@ -219,6 +224,7 @@ fn request(terms: &SealedApprovalTerms, id: u8, op: u8) -> ReservationRequest {
     let a = asset(svm);
     let amount = if svm { "60000000" } else { "6000000" };
     ReservationRequest {
+        zero_spend_class: None,
         approval_id: digest(id),
         operation_id: operation(op),
         operation_digest: digest(op),
@@ -863,4 +869,167 @@ fn rearm_audit_rejects_receipt_rollback_operation_rollback_and_history_tampering
             "{corruption}"
         );
     }
+}
+
+fn zero_member() -> SealedApprovalTerms {
+    let mut member = template(false);
+    member.expires_at_ms = DecimalU64::new(u64::MAX);
+    member.activation_mode = ActivationMode::DurableLocal {
+        provider_tier: token("local-passkey"),
+        maximum_rearm_until_ms: DecimalU64::new(u64::MAX),
+    };
+    member.limits.value_limits.clear();
+    if let ApprovalSelector::Petal {
+        allowed_operation_classes,
+        ..
+    } = &mut member.selector
+    {
+        *allowed_operation_classes = vec![token("example.first"), token("example.second")];
+    }
+    let scope = session_member_scope_digest(&member).unwrap();
+    let mut budget = build_members(true)[0].session_budget.clone().unwrap();
+    budget.petal_policy = Some(PetalSessionPolicy {
+        persona: PetalSessionPersona::Degen,
+        zero_spend_classes: vec![token("example.first"), token("example.second")],
+        zero_spend_rate_limit: Some(SlidingWindow {
+            maximum: DecimalU64::new(2),
+            duration_ms: DecimalU64::new(3_600_000),
+        }),
+    });
+    budget.token_policy = Some(SessionTokenPolicy {
+        schema_version: 3,
+        budget_nonce: RequestNonce::from_bytes([8; 16]),
+        member_scope_digests: vec![scope.clone()],
+        member_templates: vec![member.clone()],
+        member_backstop_allocations: vec![SessionMemberAllocation {
+            scope_digest: scope,
+            limits: member.limits.clone(),
+        }],
+        assets: vec![],
+    });
+    budget.member_keys = vec![member.key_ref.clone()];
+    budget.limits = member.limits.clone();
+    budget.per_action_value_limits.clear();
+    member.session_budget = Some(budget);
+    member
+}
+#[test]
+fn zero_spend_cap_is_shared_across_classes_and_survives_retries_rearm_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("zero.sqlite");
+    let member = zero_member();
+    let j = BrokerJournal::open(&path, audit()).unwrap();
+    prepare(&j, &member, 1, true);
+    let mut first = request(&member, 1, 10);
+    first.values.clear();
+    first.zero_spend_class = Some(token("example.first"));
+    j.reserve_for_clock_profile(&first, &limits(), false)
+        .unwrap();
+    j.reserve_for_clock_profile(&first, &limits(), false)
+        .unwrap();
+    let mut second = first.clone();
+    second.operation_id = operation(11);
+    second.operation_digest = digest(11);
+    second.zero_spend_class = Some(token("example.second"));
+    j.reserve_for_clock_profile(&second, &limits(), false)
+        .unwrap();
+    let mut third = first.clone();
+    third.operation_id = operation(12);
+    third.operation_digest = digest(12);
+    let error = j
+        .reserve_for_clock_profile(&third, &limits(), false)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        JournalError::Protocol(ProtocolError {
+            code: ProtocolErrorCode::LimitExceededRate,
+            ..
+        })
+    ));
+    assert_eq!(
+        j.approval_limit_state(&digest(1))
+            .unwrap()
+            .reserved_operations
+            .get(),
+        2
+    );
+    j.prepare_standing_rearm(&digest(1), &digest(90)).unwrap();
+    j.activate_approval_record(&digest(1), &operation(90), "{}")
+        .unwrap();
+    assert!(
+        j.reserve_for_clock_profile(&third, &limits(), false)
+            .is_err()
+    );
+    j.verify_audit_chain().unwrap();
+    drop(j);
+    let j = BrokerJournal::open(&path, audit()).unwrap();
+    assert!(
+        j.reserve_for_clock_profile(&third, &limits(), false)
+            .is_err()
+    );
+    third.reserved_at_ms += 3_600_001;
+    third.observed_utc_ms = Some(third.reserved_at_ms);
+    j.reserve_for_clock_profile(&third, &limits(), false)
+        .unwrap();
+    j.verify_audit_chain().unwrap();
+}
+#[test]
+fn concurrent_zero_spend_admission_is_atomic_and_marker_tampering_is_detected() {
+    let j = Arc::new(BrokerJournal::open_in_memory(audit()).unwrap());
+    let mut member = zero_member();
+    member
+        .session_budget
+        .as_mut()
+        .unwrap()
+        .petal_policy
+        .as_mut()
+        .unwrap()
+        .zero_spend_rate_limit
+        .as_mut()
+        .unwrap()
+        .maximum = DecimalU64::new(1);
+    prepare(&j, &member, 1, true);
+    let barrier = Arc::new(Barrier::new(3));
+    let mut handles = vec![];
+    for op in [10, 11] {
+        let j = j.clone();
+        let barrier = barrier.clone();
+        let mut r = request(&member, 1, op);
+        r.values.clear();
+        r.zero_spend_class = Some(token(if op == 10 {
+            "example.first"
+        } else {
+            "example.second"
+        }));
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            j.reserve_for_clock_profile(&r, &limits(), false)
+        }));
+    }
+    barrier.wait();
+    assert_eq!(
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(Result::is_ok)
+            .count(),
+        1
+    );
+    let connection = j.lock_for_mutation().unwrap();
+    let record: String = connection
+        .query_row("SELECT record_jcs FROM session_uses", [], |r| r.get(0))
+        .unwrap();
+    let mut record: serde_json::Value = serde_json::from_str(&record).unwrap();
+    record["zero_spend_class"] = serde_json::Value::Null;
+    connection
+        .execute(
+            "UPDATE session_uses SET record_jcs=?1",
+            [serde_jcs::to_string(&record).unwrap()],
+        )
+        .unwrap();
+    drop(connection);
+    let mut r = request(&member, 1, 12);
+    r.values.clear();
+    r.zero_spend_class = Some(token("example.first"));
+    assert!(j.reserve_for_clock_profile(&r, &limits(), false).is_err());
 }

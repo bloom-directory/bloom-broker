@@ -42,6 +42,23 @@
       'Your reviewed automatic spending permissions are active. Other actions still ask for your approval.';
     $('setup-summary').hidden = step < 2;
   }
+  function renderLimits() {
+    $('declared-limits').replaceChildren();
+    const persona=selected();
+    for(const item of state?.display_data?.petals||[]) {
+      const row=document.createElement('p');
+      const amounts=(item.assets||[]).flatMap(asset=>{
+        const limits=asset.limits?.[persona];
+        if(!limits)return [];
+        const number=raw=>{const digits=String(raw).padStart(Number(asset.decimals)+1,'0');return asset.decimals?`${digits.slice(0,-asset.decimals)}.${digits.slice(-asset.decimals)}`.replace(/\.?0+$/,''):digits;};
+        return [`${asset.symbol} on ${asset.chain}: can sign ${number(limits.per_action)} per action and ${number(limits.per_window)} per ${Number(limits.window_secs)/3600} hours`];
+      });
+      const cap=state?.display_data?.zero_spend_rate_limits?.[persona];
+      const zero=persona!=='custodian'&&item.zero_spend_classes?.length?` These actions move no tokens from your wallet and have no spending limit: ${item.zero_spend_classes.join(', ')}. Rate cap: ${cap?.maximum} actions per ${Number(cap?.duration_ms)/60000} minutes per grant. These zero-spend classes can sign on any network. Venue balances or margin can still be at risk.`:'';
+      row.textContent=`${item.display_name}: ${amounts.join('; ')}.${zero} Allowances are independent and additive. Cancelling signed orders does not refund usage; open orders are not limited by the window.`;
+      $('declared-limits').append(row);
+    }
+  }
   function showApprovalStage(action, checking = false) {
     updateSummary();
     $('setup-content').hidden = true;
@@ -62,6 +79,7 @@
     for (const button of document.querySelectorAll('button')) button.disabled = busy;
     for (const input of form.querySelectorAll('input, select')) input.disabled = busy;
     const custodian = selected() === 'custodian';
+    renderLimits();
     $('limits').hidden = custodian; $('custodian-note').hidden = !custodian;
     for (const input of $('limits').querySelectorAll('input, select')) input.disabled = busy || custodian;
     const available = !!state?.machine?.available && state?.machine?.persona_supported !== false && !!state?.selected_wallet;
@@ -113,9 +131,8 @@
     $('existing-sessions').hidden = !scopes.length;
     $('session-controls').replaceChildren();
     for (const scope of scopes) {
-      const classes = scope.terms?.selector?.allowed_operation_classes ?? [];
-      const profile = state?.reusable_profiles?.find(p => classes.includes(p.operation_class));
-      const name = scope.terms?.subject?.kind === 'system' ? 'Wallet transfers' : profile?.display_name ?? 'App permission';
+      const metadata=state?.display_data?.petals?.find(p=>p.package_hash===scope.terms?.subject?.package_hash);
+      const name=scope.terms?.subject?.kind==='system'?'Wallet transfers':metadata?.display_name??'Reviewed package';
       const row = document.createElement('div');
       const label = document.createElement('p');
       label.textContent = `${name} · account ${scope.account ?? '?'} · ${scope.locally_disabled ? 'Stopped' : scope.authority?.state ?? 'Pending'}. Independent token allowance; adds to your other app/account allowances. Cancelling does not refund signed orders; open orders are not limited by the rolling window.`;
@@ -163,10 +180,9 @@
         catch (_) { return false; }
       });
       const scope = scopes[index], transfers = scope?.terms?.subject?.kind === 'system';
-      const classes = scope?.terms?.selector?.allowed_operation_classes ?? [];
-      const profile = state?.reusable_profiles?.find(p => classes.includes(p.operation_class));
+      const metadata=state?.display_data?.petals?.find(p=>p.package_hash===scope?.terms?.subject?.package_hash);
       spendingReview = index < 0 ? null : {index:index + 1,total:scopes.length,transfers,
-        title:transfers ? 'Wallet transfers' : profile?.display_name ?? 'App spending'};
+        title:transfers ? 'Wallet transfers' : metadata?.display_name ?? 'Package spending'};
     }
     showApprovalStage(action);
     activeReview = {action, wallet, preset, approval, id:session.ceremony_id};
@@ -240,7 +256,7 @@
 
       }
       const saved = Array.isArray(config.petals) ? config.petals : [];
-      renderPetals(data.catalog ?? [], saved.length || config.setup_complete ? saved : ['polymarket', 'hyperliquid']);
+      renderPetals(data.catalog ?? [], saved);
       hydrated = true;
     }
     if (data.machine?.persona_supported === false) notice('This Bloom installation needs updated services before persona permissions can be configured. Your existing wallets are unchanged.', true);

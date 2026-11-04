@@ -52,7 +52,9 @@ fn decode_transfer<T: Transaction + SignableTransaction<Signature>>(
     declared_chain: &SystemSessionChain,
 ) -> Result<SystemSessionUse, ProtocolError> {
     if tx.encoded_for_signing() != bytes || tx.gas_limit() == 0 {
-        return Err(refused("session transaction is noncanonical or gasless"));
+        return Err(refused(
+            "session transaction is noncanonical or has no transaction fee",
+        ));
     }
     let SystemSessionChain::Evm { chain, chain_id } = declared_chain else {
         return Err(refused("EVM bytes require an EVM session chain"));

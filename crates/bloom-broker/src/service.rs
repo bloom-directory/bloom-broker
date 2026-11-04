@@ -904,46 +904,6 @@ impl BrokerRpcService {
         ))
     }
 
-    fn validate_generic_session_profile(
-        &self,
-        terms: &bloom_broker_api::SealedApprovalTerms,
-    ) -> Result<(), ProtocolError> {
-        if terms
-            .session_budget
-            .as_ref()
-            .is_none_or(|b| b.token_policy.is_none())
-            || !matches!(terms.subject, ApprovalSubject::Petal { .. })
-        {
-            return Ok(());
-        }
-        let ApprovalSelector::Petal {
-            allowed_operation_classes,
-            route_grants,
-            ..
-        } = &terms.selector
-        else {
-            return Ok(());
-        };
-        for class in allowed_operation_classes.iter().chain(
-            route_grants
-                .iter()
-                .flat_map(|grant| &grant.allowed_operation_classes),
-        ) {
-            let class = class.as_str();
-            if (bloom_broker_api::message_review_requires_exact(class)
-                || class == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
-                || bloom_broker_api::PUMPFUN_REVIEW_OPERATION_CLASSES.contains(&class))
-                && !bloom_broker_api::reusable_message_session_class(terms, class)
-            {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::EffectsUnsupported,
-                    "This operation retains its stronger exact approval profile; generic token sessions cannot bypass it",
-                ));
-            }
-        }
-        Ok(())
-    }
-
     async fn prepare_approval(
         &self,
         request: ApprovalPrepareRequest,
@@ -975,7 +935,6 @@ impl BrokerRpcService {
                 }
             }
         }
-        self.validate_generic_session_profile(&request.terms)?;
         self.reconcile_wallet(&request.terms.wallet_id).await?;
         let mut context = ReviewManifestContext::default();
         let native_evm =
@@ -984,7 +943,7 @@ impl BrokerRpcService {
             && request.evm_review_payloads.is_empty()
             && !matches!(
                 request.terms.selector,
-                bloom_broker_api::ApprovalSelector::SystemSession { .. }
+                bloom_broker_api::ApprovalSelector::NativeSession { .. }
             )
         {
             return Err(ProtocolError::new(
@@ -1000,20 +959,8 @@ impl BrokerRpcService {
                 .authority
                 .subject_declares_operation_class(&request.terms.subject, safe_class)
                 .map_err(authority_error)?;
-        let mut message_petal = false;
-        if matches!(request.terms.subject, ApprovalSubject::Petal { .. }) {
-            for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
-                .iter()
-                .chain(bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES)
-            {
-                message_petal |= self
-                    .authority
-                    .subject_declares_operation_class(&request.terms.subject, class)
-                    .map_err(authority_error)?;
-            }
-        }
         match &request.terms.selector {
-            ApprovalSelector::SystemSession { scope } => {
+            ApprovalSelector::NativeSession { scope } => {
                 scope.validate()?;
                 if scope.any_erc20_recipient {
                     let snapshot = self
@@ -1056,12 +1003,6 @@ impl BrokerRpcService {
                 }
             }
             ApprovalSelector::Exact { .. } => {
-                if message_petal && request.message_review_payloads.is_empty() {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::SelectorMismatch,
-                        "This message operation requires a review envelope; upgrade Bloom Machine and the Petal",
-                    ));
-                }
                 if crate::message_review::is_system_x402(&request.terms.subject)
                     && request.message_review_payloads.is_empty()
                 {
@@ -1085,33 +1026,7 @@ impl BrokerRpcService {
                     ));
                 }
             }
-            ApprovalSelector::Petal {
-                allowed_operation_classes,
-                route_grants,
-                ..
-            } => {
-                if allowed_operation_classes
-                    .iter()
-                    .chain(
-                        route_grants
-                            .iter()
-                            .flat_map(|grant| &grant.allowed_operation_classes),
-                    )
-                    .any(|class| {
-                        class.as_str() == safe_class
-                            || (bloom_broker_api::message_review_requires_exact(class.as_str())
-                                && !bloom_broker_api::reusable_message_session_class(
-                                    &request.terms,
-                                    class.as_str(),
-                                ))
-                    })
-                {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::SelectorMismatch,
-                        "Reviewed Petal transactions and messages require exact approval",
-                    ));
-                }
-            }
+            ApprovalSelector::Petal { .. } => {}
         }
         if !request.safe_review_payloads.is_empty() && !safe_petal {
             return Err(ProtocolError::new(
@@ -1119,62 +1034,13 @@ impl BrokerRpcService {
                 "Safe review payloads require a Safe Petal subject",
             ));
         }
-        if message_petal && !request.message_review_payloads.is_empty() {
-            let claim = request.petal_use_claim.as_ref().ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorCode::ClaimInvalid,
-                    "Reviewed message operation requires its Petal claim",
-                )
-            })?;
-            if !self
-                .authority
-                .subject_declares_operation_class(
-                    &request.terms.subject,
-                    claim.operation_class.as_str(),
-                )
-                .map_err(authority_error)?
-            {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::ClaimInvalid,
-                    "Message claim operation class differs from installer provenance",
-                ));
-            }
-        }
-        let clob_auth = crate::message_review::polymarket_auth::is_scope(&request.terms);
         let pump_review = crate::solana_review::is_scope(&request.terms)
             || request.petal_use_claim.as_ref().is_some_and(|c| {
                 bloom_broker_api::pumpfun_review_required(c.operation_class.as_str())
             });
-        crate::message_review::validate_selector(&request.terms, request.petal_use_claim.as_ref())?;
-        if clob_auth {
-            let claim = request.petal_use_claim.as_ref().ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorCode::ClaimInvalid,
-                    "CLOB authentication requires its versioned claim",
-                )
-            })?;
-            crate::message_review::polymarket_auth::validate_claim(claim)?;
-            if !request.evm_review_payloads.is_empty()
-                || !request.safe_review_payloads.is_empty()
-                || !request.message_review_payloads.is_empty()
-                || !self
-                    .authority
-                    .subject_declares_operation_class(
-                        &request.terms.subject,
-                        bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS,
-                    )
-                    .map_err(authority_error)?
-            {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::ClaimInvalid,
-                    "CLOB authentication must match installer provenance and cannot mix exact reviews",
-                ));
-            }
-        }
         if !request.evm_review_payloads.is_empty()
             || !request.safe_review_payloads.is_empty()
             || !request.message_review_payloads.is_empty()
-            || clob_auth
             || pump_review
         {
             let response = self
@@ -1231,14 +1097,7 @@ impl BrokerRpcService {
                         crate::evm_review::review(&request, &policy, from, catalog)?;
                 }
                 context.safe_review = crate::safe_review::review(&request, &policy, from, catalog)?;
-                context.message_review = if clob_auth {
-                    Some(crate::message_review::polymarket_auth::review(
-                        &request.terms,
-                        from,
-                    )?)
-                } else {
-                    crate::message_review::review(&request, from)?
-                };
+                context.message_review = crate::message_review::review(&request, from)?;
             }
         }
         let (exact_ordered_payload_digests, exact_ordered_hashes) = match &request.terms.selector {
@@ -1246,7 +1105,7 @@ impl BrokerRpcService {
                 ordered_payload_digests,
                 ordered_hashes,
             } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
-            ApprovalSelector::Petal { .. } | ApprovalSelector::SystemSession { .. } => {
+            ApprovalSelector::Petal { .. } | ApprovalSelector::NativeSession { .. } => {
                 (Vec::new(), Vec::new())
             }
         };
@@ -1294,6 +1153,10 @@ impl BrokerRpcService {
                 .approval_state(&request.terms.approval_id()?)
                 .map_err(journal_error)?
                 == Some(ApprovalLifecycleState::Active);
+        context.package_display_name = self
+            .authority
+            .package_display_name(&request.terms)
+            .map_err(authority_error)?;
         context.session_budget = request.terms.session_budget.clone();
         context.petal_use_claim = request.petal_use_claim;
         context.system_use_claim = request.system_use_claim;
@@ -1515,9 +1378,8 @@ impl BrokerRpcService {
                 ProtocolError::new(ProtocolErrorCode::ApprovalNotFound, "approval not found")
             })?;
         terms.validate()?;
-        self.validate_generic_session_profile(&terms)?;
         if terms.session_budget.is_some()
-            || matches!(terms.selector, ApprovalSelector::SystemSession { .. })
+            || matches!(terms.selector, ApprovalSelector::NativeSession { .. })
         {
             if let Some(stored) = self
                 .journal
@@ -1542,21 +1404,19 @@ impl BrokerRpcService {
                 }
             }
         }
-        let clob_auth = crate::message_review::polymarket_auth::is_scope(&terms);
-        let hyperliquid_agent = request
-            .petal_use_claim
+        let pump_review = terms.session_budget.is_none()
+            && (crate::solana_review::is_scope(&terms)
+                || request.petal_use_claim.as_ref().is_some_and(|c| {
+                    bloom_broker_api::pumpfun_review_required(c.operation_class.as_str())
+                }));
+        // The existing owner-reviewed single-operation path validates its
+        // exact scope independently; recurring persona coverage is generic.
+        let automatic_petal =
+            matches!(terms.selector, ApprovalSelector::Petal { .. }) && !pump_review;
+        let trusted_time_required = terms
+            .session_budget
             .as_ref()
-            .is_some_and(|claim| claim.operation_class.as_str() == "hyperliquid.agent_action");
-        let pump_review = crate::solana_review::is_scope(&terms)
-            || request.petal_use_claim.as_ref().is_some_and(|c| {
-                bloom_broker_api::pumpfun_review_required(c.operation_class.as_str())
-            });
-        crate::message_review::validate_selector(&terms, request.petal_use_claim.as_ref())?;
-        let trusted_time_required = clob_auth
-            || terms
-                .session_budget
-                .as_ref()
-                .is_some_and(bloom_broker_api::SessionBudget::requires_trusted_time)
+            .is_some_and(bloom_broker_api::SessionBudget::requires_trusted_time)
             || !terms.limits.operation_rate_limits.is_empty()
             || !terms.limits.signature_rate_limits.is_empty()
             || terms
@@ -1572,20 +1432,22 @@ impl BrokerRpcService {
         // the only layer that can: authority is synchronous and journal-
         // backed, while the account projection comes from the Signer.
         let expected_signer_public_key = self.resolve_terms_signer_public_key(&terms).await?;
-        let reusable_profile = request
-            .petal_use_claim
-            .as_ref()
-            .filter(|claim| {
-                matches!(terms.subject, ApprovalSubject::Petal { .. })
-                    && bloom_broker_api::reusable_message_session_class(
-                        &terms,
-                        claim.operation_class.as_str(),
-                    )
-            })
-            .and_then(|claim| {
-                bloom_broker_api::reusable_signing_profile_for_class(claim.operation_class.as_str())
-            });
-        if clob_auth || hyperliquid_agent || pump_review || reusable_profile.is_some() {
+        let declared_use = automatic_petal && terms.session_budget.is_some();
+        let generic_input = AuthorizationInput {
+            request: request.clone(),
+            expected_signer_public_key,
+            reserved_at_ms,
+            observed_utc_ms: clock.observed_utc_ms,
+            monotonic_anchor_ns: clock.monotonic_anchor_ns,
+            clock_boot_epoch: clock.boot_epoch.clone(),
+        };
+        let review_only = automatic_petal && request.claim_assurance_evidence.is_some();
+        if automatic_petal && !declared_use && !review_only {
+            self.authority
+                .validate_automatic_petal_request(&generic_input)
+                .map_err(authority_error)?;
+        }
+        if declared_use || review_only || pump_review {
             let response = self
                 .signer
                 .request_for_machine(BrokerSignerRequest::KeyGetPublic(
@@ -1628,40 +1490,11 @@ impl BrokerRpcService {
                 )?;
             } else {
                 let owner = evm_address_from_public_key(&key.canonical_public_key.decode())?;
-                if let Some(profile) = reusable_profile {
-                    match profile.verifier {
-                        bloom_broker_api::ReusableEffectsVerifier::PolymarketBuyV1 => {
-                            crate::message_review::verify_polymarket_session_use(&request, owner)?;
-                        }
-                        bloom_broker_api::ReusableEffectsVerifier::GaslessEip3009V1 => {
-                            self.authority
-                                .validate_petal_profile_preflight(&AuthorizationInput {
-                                    request: request.clone(),
-                                    expected_signer_public_key,
-                                    reserved_at_ms,
-                                    observed_utc_ms: clock.observed_utc_ms,
-                                    monotonic_anchor_ns: clock.monotonic_anchor_ns,
-                                    clock_boot_epoch: clock.boot_epoch.clone(),
-                                })
-                                .map_err(authority_error)?;
-                            crate::message_review::gasless::verify_use(
-                                &request,
-                                owner,
-                                reserved_at_ms,
-                            )?;
-                        }
-                    }
-                }
-                if hyperliquid_agent {
-                    crate::message_review::verify_hyperliquid_agent_use(&request, owner)?;
-                }
-                if clob_auth {
-                    crate::message_review::polymarket_auth::verify_use(
-                        &terms,
-                        &request,
-                        owner,
-                        reserved_at_ms,
-                    )?;
+                if declared_use || review_only {
+                    crate::message_review::verify_declared_use(&request, owner)?;
+                    self.authority
+                        .validate_automatic_petal_request(&generic_input)
+                        .map_err(authority_error)?;
                 }
             }
         }
@@ -2742,14 +2575,10 @@ impl BrokerRpcService {
                 "bloom.session-token/3",
                 "bloom.economic-effects/1",
                 "bloom.native-transfer/1",
+                bloom_broker_api::DECLARED_EFFECTS_CAPABILITY,
             ]
             .into_iter()
             .map(str::to_owned)
-            .chain(
-                bloom_broker_api::reusable_signing_profiles()
-                    .iter()
-                    .map(|p| p.capability_schema()),
-            )
             .map(Token::new)
             .collect::<Result<_, _>>()?,
             backends: Vec::new(),

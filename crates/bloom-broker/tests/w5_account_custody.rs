@@ -1868,6 +1868,7 @@ async fn scan_directory_for(root: &Path, secrets: &[Vec<u8>]) {
 fn system_provenance() -> ProvenanceRecord {
     use ed25519_dalek::Signer as _;
     let mut record = ProvenanceRecord {
+        package_display_name: None,
         subject: ProvenanceSubject::System {
             component_id: Token::new("cli").unwrap(),
             operation_class: Token::new("sign").unwrap(),
@@ -1875,6 +1876,7 @@ fn system_provenance() -> ProvenanceRecord {
         publisher: Token::new("installer").unwrap(),
         petal_lineage: None,
         operation_classes: vec![ProvenanceOperationClass {
+            zero_spend: false,
             economic_effects_schema: None,
             operation_class: Token::new("sign").unwrap(),
             fee_asset: None,
@@ -2416,7 +2418,7 @@ async fn pump_review_binds_real_signer_to_the_reviewed_transaction() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delegated_hyperliquid_witness_is_enforced_over_real_signer_transport() {
+async fn certified_opaque_reusable_grant_without_persona_budget_is_rejected_over_real_transport() {
     use alloy::primitives::keccak256;
     use alloy_dyn_abi::eip712::TypedData;
     use bloom_broker_api::{ClaimAssurance, ClaimAssuranceLevel, DeclaredFee, PetalUseClaim};
@@ -2450,7 +2452,7 @@ async fn delegated_hyperliquid_witness_is_enforced_over_real_signer_transport() 
     let package = digest("d1");
     let route = "sessions/hyper-use-review/cancel.json";
     let class = Token::new("hyperliquid.agent_action").unwrap();
-    let provenance = authorize_fixture_petal(
+    let mut provenance = authorize_fixture_petal(
         &mut stack,
         &authenticator,
         &wallet_id,
@@ -2459,6 +2461,15 @@ async fn delegated_hyperliquid_witness_is_enforced_over_real_signer_transport() 
         &class,
     )
     .await;
+    provenance.operation_classes[0].economic_effects_schema = Some(1);
+    provenance.operation_classes[0].zero_spend = true;
+    provenance.installer_signature = Base64UrlBytes::from_bytes(&[]);
+    let mut certification = PROVENANCE_RECORD_SIGNATURE_DOMAIN.to_vec();
+    certification.extend_from_slice(&serde_jcs::to_vec(&provenance).unwrap());
+    provenance.installer_signature = Base64UrlBytes::from_bytes(
+        &ed25519_dalek::Signer::sign(&SigningKey::from_bytes(&[5; 32]), &certification).to_bytes(),
+    );
+    stack.authority.install_provenance(&provenance).unwrap();
     let accounts = wallet_accounts(&stack, &wallet_id).await;
     let account = accounts
         .accounts
@@ -2522,87 +2533,53 @@ async fn delegated_hyperliquid_witness_is_enforced_over_real_signer_transport() 
     stack.authority = authority;
     stack.authority.install_provenance(&provenance).unwrap();
 
-    // Missing or changed witnesses must not consume either approved operation.
-    let missing = signing_request(
-        &terms,
-        &raw,
-        Some(claim(&raw, nonce)),
-        stack.next_operation(),
+    // A certified declaration still cannot turn an opaque structural grant
+    // without persona budget/consent into recurring automatic authority.
+    let mut explicit = claim(&raw, nonce);
+    explicit.economic_effects = Some(bloom_broker_api::EconomicEffectsV1 {
+        spend: bloom_broker_api::DeclaredSpendKind::None,
+        schema_version: 1,
+        payload_contexts: vec![bloom_broker_api::SessionPayloadContext {
+            payload_index: 0,
+            network: Token::new("message").unwrap(),
+            spending_accounts: vec![terms.key_ref.clone()],
+        }],
+        permission_effect: bloom_broker_api::SessionPermissionEffect::None,
+    });
+    let request = signing_request(&terms, &raw, Some(explicit), stack.next_operation());
+    let error = MachineBrokerService::dispatch(
+        stack.broker.as_ref(),
+        MachineBrokerRequest::SigningSign(request),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.code,
+        bloom_broker_api::ProtocolErrorCode::EffectsUnsupported
     );
-    assert!(
-        MachineBrokerService::dispatch(
-            stack.broker.as_ref(),
-            MachineBrokerRequest::SigningSign(missing)
-        )
-        .await
-        .is_err()
+    let mut malformed = claim(&raw, nonce);
+    malformed.ordered_hashes[0] = digest("e1");
+    let request = signing_request(&terms, &raw, Some(malformed), stack.next_operation());
+    let error = MachineBrokerService::dispatch(
+        stack.broker.as_ref(),
+        MachineBrokerRequest::SigningSign(request),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.code,
+        bloom_broker_api::ProtocolErrorCode::ClaimInvalid
     );
-    let mut changed = signing_request(
-        &terms,
-        &raw,
-        Some(claim(&raw, nonce)),
-        stack.next_operation(),
-    );
-    changed.claim_assurance_evidence = Some(Base64UrlBytes::from_bytes(
-        &serde_json::to_vec(&json!({
-            "schema":"bloom.message.review.v1","kind":"hyperliquid_l1","network":"mainnet",
-            "action":{"type":"cancel","cancels":[{"a":0,"o":43}]},"nonce":nonce
-        }))
-        .unwrap(),
-    ));
-    assert!(
-        MachineBrokerService::dispatch(
-            stack.broker.as_ref(),
-            MachineBrokerRequest::SigningSign(changed)
-        )
-        .await
-        .is_err()
-    );
-
-    // Two fresh actions use the one existing grant, with no second ceremony.
-    // This tests the use-time profile on a derived wallet child, not venue
-    // effects, Petal session-key enrollment, local caps or order cancellation.
-    for nonce in [nonce, nonce + 1] {
-        let raw = payload(nonce);
-        let mut request = signing_request(
-            &terms,
-            &raw,
-            Some(claim(&raw, nonce)),
-            stack.next_operation(),
-        );
-        request.claim_assurance_evidence = Some(Base64UrlBytes::from_bytes(
-            &serde_json::to_vec(&json!({
-                "schema":"bloom.message.review.v1","kind":"hyperliquid_l1","network":"mainnet",
-                "action":{"type":"cancel","cancels":[{"a":0,"o":42}]},"nonce":nonce
-            }))
-            .unwrap(),
-        ));
-        let result = match MachineBrokerService::dispatch(
-            stack.broker.as_ref(),
-            MachineBrokerRequest::SigningSign(request),
-        )
-        .await
-        .unwrap()
-        {
-            MachineBrokerResponse::SigningSign(result) => result,
-            other => panic!("unexpected delegated sign response: {other:?}"),
-        };
-        assert_eq!(result.signatures.len(), 1);
-        let bytes = result.signatures[0].bytes.decode();
-        let signature = k256::ecdsa::Signature::from_slice(&bytes[..64]).unwrap();
-        let recovery = k256::ecdsa::RecoveryId::from_byte(bytes[64]).unwrap();
-        let recovered = k256::ecdsa::VerifyingKey::recover_from_prehash(
-            keccak256(&raw).as_slice(),
-            &signature,
-            recovery,
+    let connection =
+        rusqlite::Connection::open(directory.path().join("broker-journal.sqlite")).unwrap();
+    let reservations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM reservations WHERE approval_id=?1",
+            [terms.approval_id().unwrap().as_str()],
+            |row| row.get(0),
         )
         .unwrap();
-        let spki = k256::PublicKey::from_sec1_bytes(recovered.to_encoded_point(false).as_bytes())
-            .unwrap()
-            .to_public_key_der()
-            .unwrap();
-        assert_eq!(account.canonical_public_key.decode(), spki.as_bytes());
-    }
+    assert_eq!(reservations, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

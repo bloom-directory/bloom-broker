@@ -38,6 +38,8 @@ jobs:
           node scripts/test-onboarding-flow.cjs
           node scripts/test-session-review-summary.cjs
           node scripts/test-wallet-continue.cjs
+      - name: Guard generic Broker source
+        run: python3 scripts/test-no-petal-logic.py
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Check the developer-harness build

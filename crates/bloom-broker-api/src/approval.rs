@@ -187,6 +187,14 @@ impl SealedApprovalTerms {
 
         if let Some(budget) = &self.session_budget {
             budget.validate()?;
+            if matches!(self.subject, ApprovalSubject::Petal { .. })
+                != budget.petal_policy.is_some()
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::SelectorMismatch,
+                    "automatic Petal grants require an explicit persona policy; native grants do not carry one",
+                ));
+            }
             if let Some(policy) = &budget.token_policy {
                 policy.validate_member(self)?;
             }

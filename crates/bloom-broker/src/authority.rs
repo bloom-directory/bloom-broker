@@ -1467,7 +1467,7 @@ impl BrokerAuthority {
         // otherwise.
         let scope_bound = match terms.selector {
             ApprovalSelector::Exact { .. } => false,
-            ApprovalSelector::Petal { .. } | ApprovalSelector::SystemSession { .. } => true,
+            ApprovalSelector::Petal { .. } | ApprovalSelector::NativeSession { .. } => true,
         };
         let outlives_scope = scope_bound && terms.expires_at_ms.get() > expires_at_ms;
         if !identity_matches
@@ -1504,7 +1504,7 @@ impl BrokerAuthority {
             _ => unreachable!("identity_matches requires a Petal subject"),
         };
         match &terms.selector {
-            ApprovalSelector::SystemSession { .. } => {
+            ApprovalSelector::NativeSession { .. } => {
                 return Err(denied(
                     "SELECTOR_MISMATCH",
                     "native sessions cannot use Petal-scoped keys",
@@ -1594,7 +1594,7 @@ impl BrokerAuthority {
         let approval_id = terms
             .approval_id()
             .map_err(|error| denied("APPROVAL_INVALID", error.to_string()))?;
-        if let ApprovalSelector::SystemSession { scope } = &terms.selector {
+        if let ApprovalSelector::NativeSession { scope } = &terms.selector {
             if scope.any_erc20_recipient
                 && scope.chains.iter().any(|chain| {
                     !policy.allowed_destinations.iter().any(|d| {
@@ -1795,6 +1795,57 @@ impl BrokerAuthority {
                         return Err(denied(
                             "PROVENANCE_CLASS_MISMATCH",
                             "route grant class is absent from installer-signed provenance",
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(persona) = terms
+            .session_budget
+            .as_ref()
+            .and_then(|budget| budget.petal_policy.as_ref())
+        {
+            if let ApprovalSelector::Petal {
+                package_hash,
+                route,
+                allowed_operation_classes,
+                route_grants,
+                ..
+            } = &terms.selector
+            {
+                for class in &persona.zero_spend_classes {
+                    let scopes: Vec<_> = if route_grants.is_empty() {
+                        vec![(route, allowed_operation_classes)]
+                    } else {
+                        route_grants
+                            .iter()
+                            .map(|grant| (&grant.route, &grant.allowed_operation_classes))
+                            .collect()
+                    };
+                    let mut certified = false;
+                    for (route, classes) in scopes {
+                        if classes.contains(class) {
+                            let record = self.catalog_provenance(&ProvenanceSubject::Petal {
+                                package_hash: package_hash.clone(),
+                                route: route.clone(),
+                            })?;
+                            if !record.operation_classes.iter().any(|entry| {
+                                entry.operation_class == *class
+                                    && entry.zero_spend
+                                    && entry.economic_effects_schema == Some(1)
+                            }) {
+                                return Err(denied(
+                                    "PROVENANCE_MISMATCH",
+                                    "zero-spend class lacks certified route opt-in",
+                                ));
+                            }
+                            certified = true;
+                        }
+                    }
+                    if !certified {
+                        return Err(denied(
+                            "PROVENANCE_MISMATCH",
+                            "zero-spend class is outside the grant selector",
                         ));
                     }
                 }
@@ -2116,7 +2167,7 @@ impl BrokerAuthority {
                     required_claim_assurance,
                     ..
                 } => Some(required_claim_assurance),
-                ApprovalSelector::Exact { .. } | ApprovalSelector::SystemSession { .. } => None,
+                ApprovalSelector::Exact { .. } | ApprovalSelector::NativeSession { .. } => None,
             },
             ceremony_url: None,
             ceremony_expires_at_ms: None,
@@ -2316,7 +2367,7 @@ impl BrokerAuthority {
         // later stays stopped until this check is changed to say otherwise.
         let automation = match terms.selector {
             ApprovalSelector::Exact { .. } => false,
-            ApprovalSelector::Petal { .. } | ApprovalSelector::SystemSession { .. } => true,
+            ApprovalSelector::Petal { .. } | ApprovalSelector::NativeSession { .. } => true,
         };
         if !automation {
             return Ok(());
@@ -2612,10 +2663,12 @@ impl BrokerAuthority {
         Ok(current_provenance)
     }
 
-    /// Read-only admission checks before a supported verifier can offer exact
-    /// review for a valid scope miss. Invalid provenance, claims and selectors
-    /// must never be mistaken for an approvable scope miss.
-    pub fn validate_petal_profile_preflight(
+    /// Validate generic automatic coverage without reserving anything. Exact
+    /// selectors never use this path. Admission repeats provenance, claims
+    /// and declared-effects validation under the authorization barrier. The
+    /// no-budget refusal here is eligibility at the authenticated RPC boundary;
+    /// existing individually reviewed standard scopes are dispatched separately.
+    pub(crate) fn validate_automatic_petal_request(
         &self,
         input: &AuthorizationInput,
     ) -> Result<(), AuthorityError> {
@@ -2623,19 +2676,6 @@ impl BrokerAuthority {
         let terms = self
             .approval_terms(&request.approval_id)?
             .ok_or_else(|| denied("APPROVAL_NOT_FOUND", "approval does not exist"))?;
-        if terms.key_ref != request.key_ref {
-            return Err(denied(
-                "KEYREF_MISMATCH",
-                "profile request changed the approved key",
-            ));
-        }
-        if self.request_operation_digest(request)? != request.operation_digest {
-            return Err(denied(
-                "OPERATION_ID_CONFLICT",
-                "profile request identity changed",
-            ));
-        }
-        let provenance = self.verified_request_provenance(&terms, request)?;
         let ApprovalSelector::Petal {
             package_hash,
             route,
@@ -2644,35 +2684,55 @@ impl BrokerAuthority {
             required_claim_assurance,
         } = &terms.selector
         else {
-            return Err(denied(
-                "SELECTOR_MISMATCH",
-                "profile requires a Petal selector",
-            ));
+            return Ok(());
         };
-        let claim = request
-            .petal_use_claim
-            .as_ref()
-            .ok_or_else(|| denied("PETAL_CLAIM_MISMATCH", "profile requires its claim"))?;
+        if request.key_ref != terms.key_ref {
+            return Err(denied(
+                "KEYREF_MISMATCH",
+                "automatic request changed its approved key",
+            ));
+        }
+        if self.request_operation_digest(request)? != request.operation_digest {
+            return Err(denied(
+                "OPERATION_ID_CONFLICT",
+                "automatic request changed its identity",
+            ));
+        }
+        if self
+            .journal
+            .operation(&request.operation_id)?
+            .is_some_and(|stored| stored.operation_digest != request.operation_digest)
+        {
+            return Err(denied(
+                "OPERATION_ID_CONFLICT",
+                "automatic request reuses an operation with changed immutable identity",
+            ));
+        }
+        let provenance = self.verified_request_provenance(&terms, request)?;
+        let claim = request.petal_use_claim.as_ref().ok_or_else(|| {
+            denied(
+                "PETAL_CLAIM_MISMATCH",
+                "automatic Petal request requires its claim",
+            )
+        })?;
         let (route, classes) = if route_grants.is_empty() {
             (route, allowed_operation_classes)
         } else {
             let grant = route_grants
                 .iter()
                 .find(|grant| grant.route == claim.route)
-                .ok_or_else(|| denied("SELECTOR_MISMATCH", "profile route is not granted"))?;
+                .ok_or_else(|| denied("PROVENANCE_MISMATCH", "executing route is not granted"))?;
             (&grant.route, &grant.allowed_operation_classes)
         };
-        if !provenance.operation_classes.iter().any(|entry| {
-            entry.operation_class == claim.operation_class
-                && entry.economic_effects_schema == Some(1)
-        }) {
+        let (snapshot, policy) = self.current_policy(&terms.wallet_id)?;
+        ensure_policy_signing_enabled(&policy)?;
+        if snapshot.version != terms.policy_version || snapshot.policy_digest != terms.policy_digest
+        {
             return Err(denied(
-                "PROVENANCE_MISMATCH",
-                "profile lacks its certified effects contract",
+                "POLICY_SNAPSHOT_MISMATCH",
+                "automatic request uses a stale policy",
             ));
         }
-        let (_, policy) = self.current_policy(&terms.wallet_id)?;
-        ensure_policy_signing_enabled(&policy)?;
         if !policy.allowed_petal_packages.contains(package_hash) {
             return Err(denied(
                 "PROVENANCE_MISMATCH",
@@ -2695,7 +2755,15 @@ impl BrokerAuthority {
             *required_claim_assurance,
             &payloads,
             &hashes,
-        )
+        )?;
+        if terms.session_budget.is_none() {
+            return Err(denied(
+                "EFFECTS_UNSUPPORTED",
+                "automatic Petal actions require a declared-effects persona grant",
+            ));
+        }
+        self.validate_declared_session_effects(&terms, &provenance, claim, payloads.len())?;
+        Ok(())
     }
 
     pub fn authorize_for_clock_profile(
@@ -2769,100 +2837,29 @@ impl BrokerAuthority {
             .collect();
         let current_provenance = self.verified_request_provenance(&terms, &input.request)?;
         if input.request.session_use.is_some()
-            && !matches!(terms.selector, ApprovalSelector::SystemSession { .. })
+            && !matches!(terms.selector, ApprovalSelector::NativeSession { .. })
         {
             return Err(denied(
                 "SELECTOR_MISMATCH",
                 "non-session approval cannot accept typed session claims",
             ));
         }
-        if terms.session_budget.is_some()
-            && input.request.petal_use_claim.as_ref().is_some_and(|c| {
-                c.declared_debits.is_empty()
-                    || c.declared_debits.iter().all(|d| d.amount.as_str() == "0")
-            })
-        {
-            return Err(denied(
-                "VALUE_ASSET_NOT_ALLOWED",
-                "monetary Petal session requires a positive declared debit",
-            ));
-        }
-        if let Some(budget) = terms
-            .session_budget
-            .as_ref()
-            .filter(|b| b.token_policy.is_some())
-        {
-            budget
-                .token_policy
-                .as_ref()
-                .unwrap()
-                .validate_member(&terms)
-                .map_err(JournalError::Protocol)?;
-            if let Some(claim) = &input.request.petal_use_claim {
-                if !current_provenance.operation_classes.iter().any(|entry| {
-                    entry.operation_class == claim.operation_class
-                        && entry.economic_effects_schema == Some(1)
-                }) {
-                    return Err(denied(
-                        "EFFECTS_UNSUPPORTED",
-                        "Current provenance lacks effects v1 contract",
-                    ));
-                }
-                let effects = claim.economic_effects.as_ref().ok_or_else(|| {
-                    denied(
-                        "EFFECTS_UNSUPPORTED",
-                        "Session requires versioned economic effects",
-                    )
-                })?;
-                if effects.schema_version != 1
-                    || effects.permission_effect != bloom_broker_api::SessionPermissionEffect::None
-                    || effects.payload_contexts.len() != payloads.len()
-                {
-                    return Err(denied(
-                        "EFFECTS_UNSUPPORTED",
-                        "Continuing permissions and missing effects need separate approval",
-                    ));
-                }
-                let assets = &budget.token_policy.as_ref().unwrap().assets;
-                for (index, context) in effects.payload_contexts.iter().enumerate() {
-                    if context.payload_index as usize != index
-                        || context.spending_accounts != [terms.key_ref.clone()]
-                        || !assets.iter().any(|a| a.asset.chain == context.network)
-                    {
-                        return Err(denied(
-                            "SESSION_SCOPE_MISMATCH",
-                            "Effects payload network/account differs from reviewed scope",
-                        ));
-                    }
-                }
-                for debit in &claim.declared_debits {
-                    if !effects
-                        .payload_contexts
-                        .iter()
-                        .any(|c| c.network == debit.asset.chain)
-                    {
-                        return Err(denied(
-                            "EFFECTS_UNSUPPORTED",
-                            "Debit has no payload network context",
-                        ));
-                    }
-                }
-                if let bloom_broker_api::DeclaredFee::Fee { chain, .. } = &claim.declared_fee {
-                    if !effects.payload_contexts.iter().any(|c| c.network == *chain) {
-                        return Err(denied(
-                            "EFFECTS_UNSUPPORTED",
-                            "Fee has no payload network context",
-                        ));
-                    }
-                }
-            }
-        }
+        let zero_spend_class = if let Some(claim) = &input.request.petal_use_claim {
+            self.validate_declared_session_effects(
+                &terms,
+                &current_provenance,
+                claim,
+                payloads.len(),
+            )?
+        } else {
+            None
+        };
         let (values, assurance, fee_asset) = match (
             &terms.selector,
             &input.request.petal_use_claim,
             &input.request.system_use_claim,
         ) {
-            (ApprovalSelector::SystemSession { scope }, None, system_claim) => {
+            (ApprovalSelector::NativeSession { scope }, None, system_claim) => {
                 let use_ = input.request.session_use.as_ref().ok_or_else(|| {
                     denied(
                         "SELECTOR_MISMATCH",
@@ -3263,6 +3260,7 @@ impl BrokerAuthority {
                 monotonic_anchor_ns: input.monotonic_anchor_ns,
                 clock_boot_epoch: input.clock_boot_epoch.clone(),
                 values: values.clone(),
+                zero_spend_class: zero_spend_class.clone(),
             },
             &budget_limits(&terms),
             durable_clock_guard,
@@ -3300,6 +3298,142 @@ impl BrokerAuthority {
             reservation_ids: vec![reservation_id],
             session_accounting,
         })
+    }
+
+    fn validate_declared_session_effects(
+        &self,
+        terms: &SealedApprovalTerms,
+        provenance: &ProvenanceRecord,
+        claim: &PetalUseClaim,
+        payload_count: usize,
+    ) -> Result<Option<Token>, AuthorityError> {
+        let Some(budget) = &terms.session_budget else {
+            return Ok(None);
+        };
+        let policy = budget.token_policy.as_ref().ok_or_else(|| {
+            denied(
+                "EFFECTS_UNSUPPORTED",
+                "automatic coverage requires a token policy",
+            )
+        })?;
+        policy
+            .validate_member(terms)
+            .map_err(JournalError::Protocol)?;
+        let entry = provenance
+            .operation_classes
+            .iter()
+            .find(|entry| entry.operation_class == claim.operation_class)
+            .ok_or_else(|| denied("PROVENANCE_MISMATCH", "operation class is not certified"))?;
+        if entry.economic_effects_schema != Some(1) {
+            return Err(denied(
+                "EFFECTS_UNSUPPORTED",
+                "route does not enable declared effects",
+            ));
+        }
+        let effects = claim
+            .economic_effects
+            .as_ref()
+            .ok_or_else(|| denied("EFFECTS_UNSUPPORTED", "action does not declare its spend"))?;
+        if effects.schema_version != 1
+            || effects.permission_effect != bloom_broker_api::SessionPermissionEffect::None
+            || effects.payload_contexts.len() != payload_count
+        {
+            return Err(denied(
+                "PETAL_CLAIM_MISMATCH",
+                "invalid effects schema, permission or payload contexts",
+            ));
+        }
+        let zero = effects.spend == bloom_broker_api::DeclaredSpendKind::None;
+        if zero && (!claim.declared_debits.is_empty() || claim.declared_fee != DeclaredFee::None) {
+            return Err(denied(
+                "PETAL_CLAIM_MISMATCH",
+                "zero spend cannot declare a debit or fee",
+            ));
+        }
+        if !zero
+            && (claim.declared_debits.is_empty()
+                || claim
+                    .declared_debits
+                    .iter()
+                    .any(|debit| debit.amount.as_str() == "0"))
+        {
+            return Err(denied(
+                "PETAL_CLAIM_MISMATCH",
+                "bounded spend requires positive debits",
+            ));
+        }
+        for (index, context) in effects.payload_contexts.iter().enumerate() {
+            if context.payload_index as usize != index
+                || context.spending_accounts != [terms.key_ref.clone()]
+            {
+                return Err(denied(
+                    "PETAL_CLAIM_MISMATCH",
+                    "effects payload/account binding differs from grant",
+                ));
+            }
+            if !zero
+                && !policy
+                    .assets
+                    .iter()
+                    .any(|asset| asset.asset.chain == context.network)
+            {
+                return Err(denied(
+                    "EFFECTS_UNSUPPORTED",
+                    "declared network is outside the grant",
+                ));
+            }
+        }
+        for debit in &claim.declared_debits {
+            if !effects
+                .payload_contexts
+                .iter()
+                .any(|context| context.network == debit.asset.chain)
+            {
+                return Err(denied(
+                    "PETAL_CLAIM_MISMATCH",
+                    "debit has no payload network context",
+                ));
+            }
+            if !policy.assets.iter().any(|asset| asset.asset == debit.asset) {
+                return Err(denied(
+                    "EFFECTS_UNSUPPORTED",
+                    "declared asset is outside the grant",
+                ));
+            }
+        }
+        if let DeclaredFee::Fee { chain, .. } = &claim.declared_fee {
+            if !effects
+                .payload_contexts
+                .iter()
+                .any(|context| context.network == *chain)
+            {
+                return Err(denied(
+                    "PETAL_CLAIM_MISMATCH",
+                    "fee has no payload network context",
+                ));
+            }
+        }
+        let persona = budget.petal_policy.as_ref().ok_or_else(|| {
+            denied(
+                "EFFECTS_UNSUPPORTED",
+                "automatic grant lacks its persona policy",
+            )
+        })?;
+        persona.validate().map_err(JournalError::Protocol)?;
+        if zero {
+            if !entry.zero_spend
+                || !persona.zero_spend_classes.contains(&claim.operation_class)
+                || persona.zero_spend_rate_limit.is_none()
+            {
+                return Err(denied(
+                    "EFFECTS_UNSUPPORTED",
+                    "zero-spend class is outside owner-reviewed coverage",
+                ));
+            }
+            Ok(Some(claim.operation_class.clone()))
+        } else {
+            Ok(None)
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3849,6 +3983,23 @@ impl BrokerAuthority {
             .and_then(|value| serde_json::from_str(&value).map_err(storage))
     }
 
+    pub(crate) fn package_display_name(
+        &self,
+        terms: &SealedApprovalTerms,
+    ) -> Result<Option<String>, AuthorityError> {
+        if !matches!(terms.subject, ApprovalSubject::Petal { .. }) {
+            return Ok(None);
+        }
+        let record = self.catalog_provenance(&subject_for(&terms.subject))?;
+        verify_provenance(
+            &record,
+            &self.installer_key_id,
+            &self.installer_key,
+            &terms.provenance_digest,
+        )?;
+        Ok(record.package_display_name)
+    }
+
     pub(crate) fn subject_declares_operation_class(
         &self,
         subject: &ApprovalSubject,
@@ -4281,7 +4432,13 @@ fn verify_catalog_provenance(
     let mut classes = BTreeSet::new();
     let lineage_only =
         matches!(record.subject, ProvenanceSubject::Petal { .. }) && record.petal_lineage.is_some();
-    if matches!(&record.subject, ProvenanceSubject::Petal { route, .. } if route.is_empty())
+    if record.package_display_name.as_ref().is_some_and(|name| {
+        name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control)
+    }) || record
+        .operation_classes
+        .iter()
+        .any(|entry| entry.zero_spend && entry.economic_effects_schema != Some(1))
+        || matches!(&record.subject, ProvenanceSubject::Petal { route, .. } if route.is_empty())
         || (record.operation_classes.is_empty() && !lineage_only)
         || record
             .operation_classes
@@ -4764,6 +4921,7 @@ mod lineage_only_provenance_tests {
         let signing = SigningKey::from_bytes(&[7; 32]);
         let key_id = Token::new("installer-key").unwrap();
         let mut record = ProvenanceRecord {
+            package_display_name: None,
             subject: ProvenanceSubject::Petal {
                 package_hash: Digest32::new("00".repeat(32)).unwrap(),
                 route: "r000001".into(),

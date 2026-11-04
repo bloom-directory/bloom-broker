@@ -12,7 +12,7 @@ pub(crate) fn selector_to_signer(
     Ok(match value {
         north::ApprovalSelector::Exact { .. } => south::SelectorKind::Exact,
         north::ApprovalSelector::Petal { .. } => south::SelectorKind::Petal,
-        north::ApprovalSelector::SystemSession { scope } => {
+        north::ApprovalSelector::NativeSession { scope } => {
             let terms = terms.ok_or_else(|| {
                 north::ProtocolError::new(
                     north::ProtocolErrorCode::SelectorMismatch,

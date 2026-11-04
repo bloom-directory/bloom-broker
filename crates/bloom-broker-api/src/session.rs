@@ -655,7 +655,10 @@ impl SessionBudget {
 
 impl SessionBudget {
     pub fn requires_trusted_time(&self) -> bool {
-        !self.limits.operation_rate_limits.is_empty()
+        self.petal_policy
+            .as_ref()
+            .is_some_and(|p| p.zero_spend_rate_limit.is_some())
+            || !self.limits.operation_rate_limits.is_empty()
             || !self.limits.signature_rate_limits.is_empty()
             || self
                 .limits

@@ -406,6 +406,7 @@ pub fn install_owner_theme_css(css: String) {
 
 #[derive(Clone, Debug, Default)]
 pub struct ReviewManifestContext {
+    pub package_display_name: Option<String>,
     pub standing_rearm: bool,
     pub session_budget: Option<bloom_broker_api::SessionBudget>,
     pub petal_use_claim: Option<PetalUseClaim>,
@@ -420,6 +421,8 @@ pub struct ReviewManifestContext {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReviewManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standing_rearm: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -451,6 +454,8 @@ impl ReviewManifest {
     fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
         #[derive(Serialize)]
         struct Unsigned<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            package_display_name: &'a Option<String>,
             schema: &'a Token,
             approval_id: &'a Digest32,
             approval_digest: &'a Digest32,
@@ -473,6 +478,7 @@ impl ReviewManifest {
             broker_key_id: &'a Token,
         }
         serde_jcs::to_vec(&Unsigned {
+            package_display_name: &self.package_display_name,
             schema: &self.schema,
             approval_id: &self.approval_id,
             approval_digest: &self.approval_digest,
@@ -3618,6 +3624,7 @@ impl CeremonyBroker {
             manifest.safe_review.as_ref(),
             manifest.message_review.as_ref(),
             manifest.standing_rearm == Some(true),
+            manifest.package_display_name.as_deref(),
         )?;
         if manifest.approval_id != approval_id
             || manifest.approval_digest != approval_digest
@@ -3671,8 +3678,10 @@ impl CeremonyBroker {
             context.safe_review.as_ref(),
             context.message_review.as_ref(),
             context.standing_rearm,
+            context.package_display_name.as_deref(),
         )?;
         let mut manifest = ReviewManifest {
+            package_display_name: context.package_display_name,
             standing_rearm: context.standing_rearm.then_some(true),
             session_budget: context.session_budget.clone(),
             schema: Token::new("bloom.review-manifest.v1")?,
@@ -5407,6 +5416,7 @@ fn canonical_review_plan(
     safe_review: Option<&crate::safe_review::SafeReview>,
     message_review: Option<&crate::message_review::MessageReview>,
     standing_rearm: bool,
+    package_display_name: Option<&str>,
 ) -> Result<String, ProtocolError> {
     #[derive(Serialize)]
     struct AssetAmountReview {
@@ -5420,6 +5430,8 @@ fn canonical_review_plan(
 
     #[derive(Serialize)]
     struct Plan<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        package_display_name: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         standing_rearm: Option<bool>,
         schema: &'static str,
@@ -5538,6 +5550,7 @@ fn canonical_review_plan(
     }
 
     serde_jcs::to_string(&Plan {
+        package_display_name,
         standing_rearm: standing_rearm.then_some(true),
         schema: "bloom-review-plan/v1",
         asset_amounts,
@@ -5701,33 +5714,10 @@ fn review_disclosures(
     // Exact EVM and Safe reviews are rebuilt from transaction bytes and do
     // not display Petal-asserted limits. Keep this disclosure for the claim
     // pages where those limits are actually part of the review.
-    if machine_asserted && message_review.is_some() {
-        let bound_payment = message_review
-            .is_some_and(|review| review.payment.is_some() || review.venue_asset.is_some())
-            && claim.is_some_and(|claim| {
-                matches!(
-                    claim.operation_class.as_str(),
-                    "gasless.relay"
-                        | "venice-x402.topup"
-                        | "hyperliquid.usd_send"
-                        | "hyperliquid.withdraw"
-                )
-            });
-        disclosures.push(if bound_payment {
-            "Bloom matched the declared payment debit and approval amount to the signed message. Route quotes, other claims and execution effects remain unverified."
-        } else {
-            "Bloom verified the exact signed message fields. Petal-reported limits and other claims are separate; Bloom has not established them from this signature."
-        }.into());
-    } else if machine_asserted && evm_review.is_none() && safe_review.is_none() {
-        let source = if system_claim.is_some() {
-            "the named system component"
-        } else {
-            "the named Petal"
-        };
-        disclosures.push(format!(
-            "The displayed limits are asserted by {source}. Bloom does not verify them against the payload, and a compromised Petal or Machine can consume the full remaining capacity."
-        ));
+    if machine_asserted && evm_review.is_none() && safe_review.is_none() {
+        disclosures.push("Amounts are reported by the named reviewed Bloom package. Automatic coverage uses its declared effects; Bloom does not independently verify those declarations against the signed bytes.".into());
     }
+
     disclosures
 }
 
@@ -6387,6 +6377,7 @@ mod compatibility_tests {
     #[test]
     fn absent_evm_review_preserves_legacy_manifest_bytes() {
         let manifest = ReviewManifest {
+            package_display_name: None,
             standing_rearm: None,
             session_budget: None,
             schema: Token::new("bloom.review-manifest.v1").unwrap(),

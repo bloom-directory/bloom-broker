@@ -368,84 +368,36 @@ rollback, same-boot jump, or unknown-domain jump, that affected service must be
 repaired independently; repairing only one does not clear the other's fault.
 
 
-## Owner-reviewed Petal sessions
+## Owner-reviewed declared-effects sessions
 
-Persona onboarding reuses Petal Sealed Approvals. The first automatic scope is
-fee-free Polymarket BUY orders on Polygon with positive canonical
-`evm-137:0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb` pUSD debits. Legacy
-non-effects claims retain `polygon:pusd` compatibility. SELLs, allowances,
-funding, withdrawals and other classes do not inherit that session. Native
-`SystemSession` transfers use separately reviewed token and gas limits; Degen
-can explicitly allow ERC20 transfers to any recipient (see
-[recurring token allowances](docs/generic-sessions.md)).
+Automatic Petal coverage trusts the pinned, installer-signed package's explicit
+effects-v1 declaration. Broker validates provenance, exact key and payload
+identity, network/account contexts, positive checked token quantities and
+owner-reviewed per-action and rolling limits. It independently binds generic
+EIP-712 or EIP-191 review artifacts to the actual signing bytes; it does not
+compare the package's economic declaration with those bytes.
 
-Machine–Broker uses protocol 1.10 for Broker-owned session descriptors. The
-Broker–Signer edge uses the pinned Signer protocol 1.8. No session-budget API,
-asset conversion, economic ledger or new selector is added to Signer.
+Trader and Degen grants may list certified zero-spend classes under an explicitly
+reviewed total rate cap per grant. Those classes are network-unrestricted and
+have no token spending limit; exact account, package, class and payload indexes
+still bind each use. A zero declaration cannot contain any debit or fee.
+Institutional has no automatic grants. Missing declarations, uncovered assets
+and exhausted token/rate limits need exact review. Invalid provenance, malformed
+claims and mismatched review bytes are rejected.
 
-Broker owns per-action and rolling token accounting for each Petal/account. It
-reconstructs the order from the full prepared witness, compares it to the actual
-signing preimage and derives typed order economics and checks the compatible declared debit against the signed gross BUY
-maker amount before reserving capacity. Missing evidence, SELLs, changed
-amounts, unexpected assets and fees fail closed. This proves the signed order
-terms, not venue execution, deposit-wallet ownership or settlement.
+Every automatic action binds one signing payload. One zero-spend use therefore
+cannot authorize a batch of signatures under one rate slot. The zero-use marker
+is part of the authenticated session record, and its rate check shares the same
+SQLite transaction as the existing token reservation. Retries deduplicate and
+rearm preserves usage. Independent package/account allowances are additive.
+Cancelling signed orders does not refund usage; windows do not bound open orders.
 
-The immutable `session_budget` stays on the north edge and in Broker's durable
-approval metadata and signed review. Its canonical digest and original request
-nonce derive the existing 128-bit Signer request nonce under the
-`bloom-broker-session-nonce/v1` domain. The approval ID hashes the ordinary
-Signer enforcement projection. Changing or removing economics changes that
-identity; both edges still agree on the approval ID. Budgetless approvals keep
-their existing canonical identities. The complete descriptor is shown in the
-signed Broker review, whose digest Signer binds opaquely to owner activation.
-Signer continues to enforce its existing key/selector/suite, operation and
-signature counts, rates, expiry, revocation and replay checks. It does not
-independently guarantee economic containment of a compromised Broker.
+Native wallet transfers retain independent standard EVM, ERC20 and SOL byte
+checks. The north selector is `native_session`; the old draft wire name is not
+accepted. Machine–Broker uses protocol 1.11; the pinned Signer edge remains 1.8.
+The complete budget, including persona/rate terms, stays in Broker and commits
+through the existing Signer request nonce. Signer receives no economics.
 
-Broker reserves shared capacity in the same SQLite transaction as the signing
-operation. Reserved, committed and ambiguous operations continue to count;
-only definitively released operations stop counting. Replays retrieve their
-original result without another reservation. Different member approvals share
-one Broker ledger; their Signer counters remain approval-local. Shared
-signature-count enforcement in Signer is not claimed.
-
-Exact token identities and raw quantities govern allowances; no prices or USD
-conversions apply. Limits govern signed volume per rolling window. Cancelling
-does not refund signed orders, and open orders are not limited by that window.
-Petal/account allowances are independent and additive, rather than one
-wallet-wide pool.
-Keep the Broker journal and its accounting history intact. Restoring or losing
-that history must never be treated as unused allowance. Signer archive recovery
-does not restore Broker budgets, and this feature makes no new cross-service
-restore guarantee. Existing startup/audit/recovery fences remain in force.
-
-The candidate uses the production Signer rather than the experimental #68.
-Land the reviewed Broker, repin Machine to its landed commit, and publish/adopt
-the combined Polymarket review/accounting package with immutable archive hashes
-and installer provenance before enabling the default flow. Local source tests
-do not establish installed-release compatibility.
-
-## Reusable operation profiles
-
-`bloom_broker_api::reusable_signing_profiles()` is the shared eligibility catalog
-for automatic onboarding. Each entry names a protocol operation class, effects
-schema, crypto suite, exact budget assets and a compiled Broker verifier.
-Broker advertises each compiled profile as `bloom.reusable-profile/<id>` through
-its existing capability response. Machine requires that advertisement before
-automatic selection, then matches the **installed package hash** and installer-signed
-route provenance, then proposes owner-reviewed terms. Neither a package name
-nor `economic_effects_schema = 1` alone makes a route eligible. The catalog does
-not grant authority and does not replace wallet policy or approval activation.
-
-Polymarket BUY is the first profile. Its adapter still reconstructs and compares
-the signed order bytes, owner, chain and gross collateral debit. SELL shares,
-fees, credential creation and continuing permissions do not acquire this BUY
-permission. Other integrations remain unchanged; generic explicit selections
-retain their existing assurance and approval contract. A new automatically
-advertised protocol profile requires a Broker-owned verifier and adversarial
-signed-byte tests, rather than another app-name branch in onboarding.
-
-This is additive compiled metadata, not a new wire format. Effects-v1 claims,
-route WIT, approval selectors and Signer custody are unchanged. Supported
-semantic checks do not promote `machine_asserted` to proof-based assurance or
-prove token-contract behavior, venue settlement, prices or market identity.
+See [recurring allowances](docs/generic-sessions.md) for accounting and trust
+semantics. The [source guard](scripts/test-no-petal-logic.py) freezes the reviewed
+master's pre-existing exact-review references; its allowlist can only shrink.

@@ -127,7 +127,13 @@ impl ProvenanceCatalog {
             // still rejects an empty class list.
             let lineage_only = matches!(record.subject, ProvenanceSubject::Petal { .. })
                 && record.petal_lineage.is_some();
-            if !subjects.insert(subject)
+            if record.package_display_name.as_ref().is_some_and(|name| {
+                name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control)
+            }) || record
+                .operation_classes
+                .iter()
+                .any(|entry| entry.zero_spend && entry.economic_effects_schema != Some(1))
+                || !subjects.insert(subject)
                 || (record.operation_classes.is_empty() && !lineage_only)
                 || record
                     .operation_classes
@@ -186,6 +192,10 @@ impl ProvenanceCatalog {
             .iter()
             .find(|record| &record.subject == subject)
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[cfg(test)]
@@ -271,8 +281,4 @@ mod tests {
         assert_eq!(first.unsigned_canonical_bytes().unwrap(), unsigned);
         assert_ne!(first.digest().unwrap(), digest);
     }
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }

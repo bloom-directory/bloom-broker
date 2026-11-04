@@ -6,13 +6,13 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../crates/bloom-broker/src/ceremony_assets/onboarding/app.js'), 'utf8');
-const baseState = {selected_wallet:'alice',wallet_choices:[{id:'alice'}],machine:{available:true},config:{exists:true,setup_complete:true,persona:{preset:'trader'},persona_limits:{window_secs:'86400'},petals:['polymarket']},catalog:[],reusable_profiles:[{operation_class:'polymarket.order.poly1271',display_name:'Polymarket buys'}]};
+const baseState = {selected_wallet:'alice',wallet_choices:[{id:'alice'}],machine:{available:true},config:{exists:true,setup_complete:true,persona:{preset:'trader'},persona_limits:{window_secs:'86400'},petals:['polymarket']},catalog:[],display_data:{petals:[{package_hash:'reviewed-package',display_name:'Reviewed test app',assets:[],zero_spend_classes:[]}]}};
 function harness(actions, options = {}) {
   const expectedAction = options.action ?? 'policy';
   const pauseActions = options.pauseActions ?? [];
   const elements = new Map(), listeners = {}, calls = [], releases = new Map();
   let actionNumber = 0;
-  function element() { return {hidden:false,value:'',options:[],style:{},dataset:{},handlers:{},classList:{toggle(){}},contentWindow:{},querySelectorAll:()=>[],addEventListener(name,fn){this.handlers[name]=fn;},append(){},replaceChildren(){},removeAttribute(name){delete this[name];},getAttribute(name){return this[name]??null;},add(option){this.options.push(option);}}; }
+  function element() { return {children:[],hidden:false,value:'',options:[],style:{},dataset:{},handlers:{},classList:{toggle(){}},contentWindow:{},querySelectorAll:()=>[],addEventListener(name,fn){this.handlers[name]=fn;},append(...nodes){this.children.push(...nodes);},replaceChildren(...nodes){this.children=[...nodes];},removeAttribute(name){delete this[name];},getAttribute(name){return this[name]??null;},add(option){this.options.push(option);}}; }
   const get = id => {if (!elements.has(id)) elements.set(id,element()); return elements.get(id);};
   get('review-host').hidden=true;get('ceremony-frame').hidden=true;
   get('setup-form').elements = {persona:{value:options.persona ?? (options.action ? 'trader' : 'custodian')}};
@@ -21,10 +21,11 @@ function harness(actions, options = {}) {
   const storage = options.storage ?? new Map();
   const sessionStorage = options.storageUnavailable ? {getItem(){throw Error('storage unavailable');},setItem(){throw Error('storage unavailable');},removeItem(){throw Error('storage unavailable');}} : {getItem:key=>storage.get(key) ?? null,setItem:(key,value)=>storage.set(key,value),removeItem:key=>storage.delete(key)};
   const response = (data,ok=true) => ({ok,status:ok?200:409,json:async()=>data,text:async()=>JSON.stringify(data)});
+  const initialState=options.state??baseState;
   let sessionCount = 0;
   const sandbox = {URL,URLSearchParams,Date,Number,JSON,Option:function(text,value){this.value=value;},location,history:{replaceState(){location.hash='';}},document:{getElementById:get,querySelectorAll:()=>[],createElement:element},window:{sessionStorage,addEventListener:(name,fn)=>{listeners[name]=fn;}},setTimeout:()=>1,clearTimeout(){},ResizeObserver:function(){},fetch:async(raw,options={})=>{
     const url = new URL(raw,location); calls.push({url:url.href,body:options.body});
-    if (url.pathname.endsWith('/api/state')) return response(JSON.parse(JSON.stringify(options.state ?? baseState)));
+    if (url.pathname.endsWith('/api/state')) return response(JSON.parse(JSON.stringify(initialState)));
     if (url.pathname.endsWith('/api/action')) {assert.equal(JSON.parse(options.body).action,Array.isArray(expectedAction)?expectedAction.shift():expectedAction); assert.ok(actions.length,'unexpected reconciliation');const data=actions.shift();const n=++actionNumber;if(pauseActions.includes(n))await new Promise(resolve=>releases.set(n,resolve));return response(data);}
     if (url.pathname === '/api/session') return response({ceremony_id:String(++sessionCount).repeat(64),expires_at_ms:Date.now()+60000});
     throw new Error('unexpected fetch '+url);
@@ -52,6 +53,14 @@ const pending = token => ({ceremony_url:'http://localhost:18734/ceremony/'+token
     const invalid=harness([],{hash:'',storage:new Map([[key,JSON.stringify(cached)]])});await invalid.settle();assert.equal(invalid.calls.length,0);assert.equal(invalid.get('next').disabled,true);
   }
   const malformed=harness([],{hash:'#bridge=https://attacker.example/',storage:connected.storage});await malformed.settle();assert.equal(malformed.calls.length,0,'an invalid new fragment cannot fall back to a cached connection');
+
+  const rendered=harness([],{persona:'trader',state:{...baseState,display_data:{petals:[{package_hash:'reviewed-package',display_name:'Reviewed test app',assets:[{chain:'evm-1',asset:'0x'+'7'.repeat(40),symbol:'TEST',decimals:6,limits:{trader:{per_action:'100000000',per_window:'1000000000',window_secs:'86400'}}}],zero_spend_classes:['example.login']}],zero_spend_rate_limits:{trader:{maximum:'60',duration_ms:'3600000'}}}}});
+  await rendered.settle();
+  const limits=rendered.get('declared-limits').children.map(node=>node.textContent).join(' ');
+  assert.match(limits,/can sign 100 per action and 1000 per 24 hours/);
+  assert.match(limits,/These actions move no tokens from your wallet and have no spending limit/);
+  assert.match(limits,/can sign on any network/);
+  assert.ok(!limits.includes('100000000 per action'));
 
   // Rearm keeps the exact approval identity through the existing review and
   // reconciles against Machine; a browser completion message alone cannot unlock.
@@ -127,7 +136,7 @@ const pending = token => ({ceremony_url:'http://localhost:18734/ceremony/'+token
   assert.deepEqual(guided.calls.filter(c=>c.body).map(c=>JSON.parse(c.body).action),['policy','policy','activate','activate']);
   // Degen has independent wallet-transfer and Polymarket spending reviews.
   const transferScope = {...activeScope,terms:{subject:{kind:'system'}},authority:{state:'AWAITING_CEREMONY',ceremony_url:pending('m').ceremony_url}};
-  const buyScope = {...activeScope,terms:{subject:{kind:'petal'},selector:{allowed_operation_classes:['polymarket.order.poly1271']}},authority:{state:'AWAITING_CEREMONY',ceremony_url:pending('n').ceremony_url}};
+  const buyScope = {...activeScope,terms:{subject:{kind:'petal',package_hash:'reviewed-package'},selector:{allowed_operation_classes:['polymarket.order.poly1271']}},authority:{state:'AWAITING_CEREMONY',ceremony_url:pending('n').ceremony_url}};
   const multiple=harness([
     {...pending('m'),data:[transferScope,buyScope]},
     {...pending('n'),data:[{...transferScope,authority:{state:'ACTIVE'}},buyScope]},
@@ -139,7 +148,7 @@ const pending = token => ({ceremony_url:'http://localhost:18734/ceremony/'+token
   assert.match(multiple.get('approval-purpose').textContent,/transfer and gas limits/);
   multiple.message();await multiple.settle();
   assert.equal(multiple.get('approval-progress').textContent,'Spending permission 2 of 2');
-  assert.equal(multiple.get('approval-title').textContent,'Polymarket buys');
+  assert.equal(multiple.get('approval-title').textContent,'Reviewed test app');
   multiple.message();await multiple.settle();assert.equal(multiple.hooks.pending,null);
   // Delayed reconciliation must keep the outer setup and explanation visible.
   const delayed=harness([pending('j'),{data:{state:'applied',petals:['polymarket']}},pending('k'),{data:[activeScope]}],{action:['policy','policy','activate','activate'],pauseActions:[2,4]});

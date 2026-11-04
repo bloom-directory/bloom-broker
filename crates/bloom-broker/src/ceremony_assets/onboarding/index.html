@@ -30,10 +30,10 @@
             <p id="legacy-note" hidden>Existing wallet permissions are preserved. Choose a persona explicitly to change your preferences.</p>
           </fieldset>
           <fieldset data-step="1" hidden><legend>Limits and apps</legend>
-            <div id="limits"><p>Each app/account has independent token allowances that add to your other allowances. Polymarket: pUSD only. Trader can sign 100 per buy and 1,000 per rolling 24 hours. Degen can sign 1,000 per buy and 10,000 per rolling 7 days. Cancelling does not refund signed orders; open orders are not limited by the window. Other integrations require supported, explicitly reviewed token scopes. Unlisted actions ask for approval.</p></div>
+            <div id="limits"><p>Each reviewed package/account has independent token allowances that add to your other allowances. Exact assets and persona amounts are listed below and in your signed approval.</p><div id="declared-limits"></div></div>
             <p id="custodian-note">Institutional reviews every action. No session limits are needed.</p>
             <p>Choose the apps you want to use with this wallet.</p><div id="petal-choices"></div>
-            <p>Automatic spending covers eligible Polymarket buy orders and supported Gasless Relay USDC payments when installed and reviewed. Relay quotes, outputs, fees and settlement remain unverified. Other actions still ask for your approval.</p>
+            <p>Automatic coverage uses the declared effects of installed, reviewed packages. Other actions ask for exact approval.</p>
             <p class="warn">You approve app access first. Trader and Degen then require a separate approval for automatic spending. No funds move during setup.</p>
           </fieldset>
         </form>

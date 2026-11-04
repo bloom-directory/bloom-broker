@@ -31,6 +31,9 @@ pub enum PetalSessionPersona {
 #[serde(deny_unknown_fields)]
 pub struct PetalSessionPolicy {
     pub persona: PetalSessionPersona,
+    /// Zero-token classes are explicitly network-unrestricted. Index, exact
+    /// spending account, package and class still bind every use. Token spend
+    /// retains the token policy's network and asset constraints.
     pub zero_spend_classes: Vec<Token>,
     pub zero_spend_rate_limit: Option<SlidingWindow>,
 }

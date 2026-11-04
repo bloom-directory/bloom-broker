@@ -48,7 +48,7 @@ fn selector_to_signer(
     subject: &north::ApprovalSubject,
 ) -> Result<south::ApprovalSelector, north::ProtocolError> {
     Ok(match value {
-        north::ApprovalSelector::SystemSession { scope } => {
+        north::ApprovalSelector::NativeSession { scope } => {
             let north::ApprovalSubject::System {
                 operation_class, ..
             } = subject
@@ -214,6 +214,11 @@ mod tests {
             }],
         };
         let budget = north::SessionBudget {
+            petal_policy: Some(north::PetalSessionPolicy {
+                persona: north::PetalSessionPersona::Trader,
+                zero_spend_classes: vec![],
+                zero_spend_rate_limit: None,
+            }),
             token_policy: None,
             wallet_id: token("alice"),
             policy_version: north::DecimalU64::new(1),
@@ -293,20 +298,6 @@ mod tests {
                 .approval_id()
                 .unwrap()
         );
-    }
-
-    #[test]
-    fn budgeted_selector_is_closed_to_other_operations() {
-        let mut terms = session_terms();
-        crate::message_review::validate_selector(&terms, None).unwrap();
-        if let north::ApprovalSelector::Petal {
-            allowed_operation_classes,
-            ..
-        } = &mut terms.selector
-        {
-            *allowed_operation_classes = vec![north::Token::new("polymarket.withdraw").unwrap()];
-        }
-        assert!(crate::message_review::validate_selector(&terms, None).is_err());
     }
 
     #[test]
