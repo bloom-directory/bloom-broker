@@ -3138,8 +3138,7 @@ const PREVIEW_PM80_READINGS = {
       "Shortcut program not independently decoded: unknown shortcut entry-point selector. Exact bytes are retained.",
       "Enso input amounts and supported shortcut commands are decoded. Ordinary route envelopes do not constrain output token, recipient or minimum output. Runtime values, fees and destination settlement are not verified; route quotes are not signed guarantees."
     ]
-  },
-
+  }
 };
 function previewAccountOne(session) {
   session.signer_contribution.key_ref = {
