@@ -244,7 +244,7 @@ pub enum CheckoutIntakeResponse {
     Result {
         status: CardOperationStatus,
         receipt: Option<Box<CustodyResult>>,
-        output_aad: Option<CustodyOutputHpkeAad>,
+        output_aad: Option<Box<CustodyOutputHpkeAad>>,
     },
     Error {
         message: String,
@@ -513,7 +513,7 @@ impl CeremonyBroker {
                 // Broker restart does not strand an approved release.
                 let mut status = self.card_status_with_receipt(&operation_id)?;
                 let receipt = status.receipt.take();
-                let output_aad = status.output_aad.take();
+                let output_aad = status.output_aad.take().map(Box::new);
                 Ok(CheckoutIntakeResponse::Result {
                     status,
                     receipt,

@@ -1136,7 +1136,7 @@ async fn card_checkout_private_delivery_replays_and_manual_has_no_release() {
             ..
         } => {
             assert_eq!(again, receipt);
-            assert_eq!(again_aad, aad);
+            assert_eq!(*again_aad, aad);
         }
         _ => panic!("receipt not replayed"),
     }
