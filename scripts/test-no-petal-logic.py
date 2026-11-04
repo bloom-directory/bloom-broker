@@ -18,8 +18,8 @@ BASELINE = ROOT / 'scripts/fixtures/source-guard-master.json'
 ALLOWLIST = ROOT / 'scripts/fixtures/source-guard-allowlist.json'
 # Frozen once from the reviewed master commit. Changing this is a guard policy
 # change, not an automatically generated allowlist update.
-BASELINE_SHA256 = '261aa740225fe9fa0f9bff49de38f853b5d23133f816255f43f44b5ce4a20a26'
-WORDS = re.compile(r'polymarket|gasless|venice|hyperliquid|near-intents|pendle|privacy-pools|enso|relay', re.I)
+BASELINE_SHA256 = '2f55985445f116e97437473def52b42900956024d426fc98147709271bfa0af0'
+WORDS = re.compile(r'polymarket|gasless|venice|hyperliquid|near-intents|pendle|privacy-pools|enso|relay|pumpfun', re.I)
 LITERALS = re.compile(r'r(#{0,32})".*?"\1|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])\'|//[^\n]*|/\*.*?\*/', re.S)
 
 

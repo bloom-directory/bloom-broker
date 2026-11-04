@@ -54,13 +54,42 @@ const pending = token => ({ceremony_url:'http://localhost:18734/ceremony/'+token
   }
   const malformed=harness([],{hash:'#bridge=https://attacker.example/',storage:connected.storage});await malformed.settle();assert.equal(malformed.calls.length,0,'an invalid new fragment cannot fall back to a cached connection');
 
-  const rendered=harness([],{persona:'trader',state:{...baseState,display_data:{petals:[{package_hash:'reviewed-package',display_name:'Reviewed test app',assets:[{chain:'evm-1',asset:'0x'+'7'.repeat(40),symbol:'TEST',decimals:6,limits:{trader:{per_action:'100000000',per_window:'1000000000',window_secs:'86400'}}}],zero_spend_classes:['example.login']}],zero_spend_rate_limits:{trader:{maximum:'60',duration_ms:'3600000'}}}}});
+  const asset={chain:'evm-1',asset:'0x'+'7'.repeat(40)};
+  const terms={wallet_id:'alice',subject:{kind:'petal',package_hash:'reviewed-package'},session_budget:{
+    token_policy:{assets:[{asset,symbol:'TEST',decimals:6}]},
+    per_action_value_limits:[{asset,maximum:'100000000'}],
+    limits:{value_limits:[{asset,rolling_windows:[{maximum:'1000000000',duration_ms:'86400000'}]}]},
+    petal_policy:{persona:'trader',zero_spend_classes:['example.login'],zero_spend_rate_limit:{maximum:'60',duration_ms:'3600000'}}
+  }};
+  const proposal={persona:'trader',account:0,authority:{state:'PREPARED'},preparation_pending:true,terms};
+  // Advisory metadata intentionally disagrees with the actual proposal. Only
+  // proposed terms can supply quantities, asset decimals, zero classes or caps.
+  const presentation={petals:[{package_hash:'reviewed-package',display_name:'Reviewed test app',assets:[{...asset,symbol:'FAKE',decimals:0,limits:{trader:{per_action:'9',per_window:'99',window_secs:'1'}}}],zero_spend_classes:['unreviewed.fake']}],zero_spend_rate_limits:{trader:{maximum:'999',duration_ms:'1'}}};
+  const limitsText=h=>h.get('declared-limits').children.map(node=>node.textContent).join(' ');
+  const rendered=harness([],{persona:'trader',state:{...baseState,display_data:presentation,sessions:{data:[proposal]}}});
   await rendered.settle();
-  const limits=rendered.get('declared-limits').children.map(node=>node.textContent).join(' ');
-  assert.match(limits,/can sign 100 per action and 1000 per 24 hours/);
-  assert.match(limits,/These actions move no tokens from your wallet and have no spending limit/);
+  const limits=limitsText(rendered);
+  assert.match(limits,/can sign 100 TEST on evm-1 per action/);
+  assert.match(limits,/can sign 1000 TEST on evm-1 per 24 hours/);
+  assert.match(limits,/These actions move no tokens from your wallet and have no spending limit: example.login/);
+  assert.match(limits,/60 actions per 1 hours per member approval, shared across these classes/);
   assert.match(limits,/can sign on any network/);
-  assert.ok(!limits.includes('100000000 per action'));
+  assert.match(limits,/Token limits are shared by approvals using this budget; separate budgets are additive/);
+  assert.doesNotMatch(limits,/FAKE|unreviewed.fake|999|100000000 per action/);
+  const beforeProposal=harness([],{persona:'trader',state:{...baseState,display_data:presentation}});await beforeProposal.settle();
+  assert.match(limitsText(beforeProposal),/Exact allowances will be shown in the permission review/);
+  assert.doesNotMatch(limitsText(beforeProposal),/can sign|999|FAKE/);
+  const precise=JSON.parse(JSON.stringify(proposal));precise.terms.session_budget.per_action_value_limits[0].maximum='900719925474099312345678';
+  const exact=harness([],{persona:'trader',state:{...baseState,sessions:{data:[precise]}}});await exact.settle();
+  assert.match(limitsText(exact),/900719925474099312.345678 TEST/);
+  for(const stale of [
+    {...proposal,persona:'degen'}, {...proposal,locally_disabled:true},
+    {...proposal,authority:{state:'REVOKED'}},
+    {...proposal,terms:{...terms,wallet_id:'another-wallet'}}
+  ]) {
+    const hidden=harness([],{persona:'trader',state:{...baseState,sessions:{data:[stale]}}});await hidden.settle();
+    assert.doesNotMatch(limitsText(hidden),/can sign|example.login/);
+  }
 
   // Rearm keeps the exact approval identity through the existing review and
   // reconciles against Machine; a browser completion message alone cannot unlock.
@@ -68,6 +97,7 @@ const pending = token => ({ceremony_url:'http://localhost:18734/ceremony/'+token
   const retained={approval_id:approval,account:'0',authority:{state:'ACTIVE'},locally_disabled:false,preparation_pending:false};
   const unlocked=harness([{...pending('R'),data:retained},{data:retained}],{action:'rearm',state:{...baseState,sessions:{data:[retained]}}});
   await unlocked.settle();
+  assert.match(unlocked.get('session-controls').children[0].children[0].textContent,/Token limits are shared by approvals using the same budget; separate budgets are additive/);
   await unlocked.hooks.runAction('rearm',{approval});
   assert.equal(unlocked.hooks.pending.approval,approval);
   assert.match(unlocked.get('approval-purpose').textContent,/previous usage/);

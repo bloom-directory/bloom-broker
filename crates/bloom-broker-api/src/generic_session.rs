@@ -26,7 +26,9 @@ pub enum PetalSessionPersona {
 }
 
 /// Owner-reviewed automatic authority. The single zero-spend rate cap is
-/// shared by every listed class within this grant, never multiplied by classes.
+/// shared by every listed class within one member approval, never multiplied
+/// by classes. It is not pooled across other member approvals that share this
+/// session budget; token usage follows the shared token budget independently.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PetalSessionPolicy {

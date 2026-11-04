@@ -12430,7 +12430,7 @@ const budget={{per_action_value_limits:[{{asset,maximum:"100000000"}}],limits:{{
 const terms={{subject:{{package_hash:"abc"}},selector:{{kind:"petal",package_hash:"abc",allowed_operation_classes:["example.action"]}},limits:{{max_operations:"18446744073709551615"}},session_budget:budget,not_before_ms:"1000",expires_at_ms:"18446744073709551615",activation_mode:{{kind:"durable_local"}}}};
 const session=describePetalApproval({{canonical_plan:JSON.stringify({{terms,package_display_name:"Reviewed package",session_budget_id:"budget-identity",asset_amounts:[]}})}});
 const facts=JSON.stringify(session.facts);
-for(const needle of ["budget-identity","100 pUSD","1000 pUSD","24 hours","Until you revoke","reviewed-package","reviewed-route","reviewed-provenance","Independent allowance for this package/account"]) {{if(!facts.includes(needle)) throw new Error("token review omitted "+needle);}}
+for(const needle of ["budget-identity","100 pUSD","1000 pUSD","24 hours","Until you revoke","reviewed-package","reviewed-route","reviewed-provenance","Token limits are shared by approvals using this budget"]) {{if(!facts.includes(needle)) throw new Error("token review omitted "+needle);}}
 if(facts.includes("CoinGecko") || facts.includes("nominal") || facts.includes("USD caps")) throw new Error("retired pricing shown");
 const generic=describePetalApproval({{canonical_plan:JSON.stringify({{terms:{{...terms,selector:{{kind:"petal",allowed_operation_classes:["generic.action"]}}}}}})}});
 if(!generic.warning.includes("Amounts are reported by") || !generic.warning.includes("does not independently verify")) throw new Error("generic assurance overstated");

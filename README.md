@@ -389,7 +389,8 @@ Every automatic action binds one signing payload. One zero-spend use therefore
 cannot authorize a batch of signatures under one rate slot. The zero-use marker
 is part of the authenticated session record, and its rate check shares the same
 SQLite transaction as the existing token reservation. Retries deduplicate and
-rearm preserves usage. Independent package/account allowances are additive.
+rearm preserves usage. Separate token budgets are additive; member approvals
+within one budget share token usage and retain separate zero-spend rate caps.
 Cancelling signed orders does not refund usage; windows do not bound open orders.
 
 Native wallet transfers retain independent standard EVM, ERC20 and SOL byte

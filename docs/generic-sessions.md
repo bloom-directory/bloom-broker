@@ -12,16 +12,19 @@ owner-reviewed token limits. Different assets never net. Explicit zero spend
 requires a certified class named in a Trader or Degen grant, no debit/fee, and
 valid payload indexes and accounts. Zero-spend class consent covers any network;
 it has no token spending limit and can risk venue balances or margin. Its one
-rate cap is shared by all zero-spend classes in that grant. Institutional grants
+rate cap is shared by all zero-spend classes in that member approval. Each
+member approval has its own zero-spend cap, even when members share a token
+budget; zero-spend admission is not pooled across those members. Institutional grants
 have no automatic tier. Absence of effects is unspecified, never zero spend.
 
 One automatic operation signs exactly one payload. All reservations, including
 zero-use rate admissions, commit atomically into the existing authenticated
 journal. Reserved, committed and ambiguous uses count. Definitive release frees
 capacity. Retrying the same operation does not charge again; unlocking/rearm
-retains budget identity and usage. New package/account grants need fresh owner
-review and explicitly grant new independent capacity. Allowances add across
-packages/accounts; routes within one allowance share token usage.
+retains budget identity and usage. New independent budgets need fresh owner
+review and grant new capacity; usage from different budgets does not carry over.
+Separate budgets are additive. Member approvals and routes within one budget
+share its token usage, while each member approval retains its own zero-spend cap.
 
 Limits govern signed volume per rolling window, not outstanding exposure.
 Cancelling signed orders does not refund usage; open orders are not limited by
