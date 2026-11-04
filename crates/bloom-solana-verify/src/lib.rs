@@ -34,7 +34,9 @@ pub use message::{CompiledInstruction, LegacyMessage, MessageHeader, ParseError}
 pub use pubkey::{PUBKEY_BYTES, Pubkey};
 pub use short_vec::{ShortVecError, read_short_vec, write_short_vec};
 pub use system_transfer::{SYSTEM_PROGRAM_ID, SystemTransferError, transfer_data};
-pub use verifier::{RejectionReason, VerifiedTransfer, verify_native_transfer};
+pub use verifier::{
+    LAMPORTS_PER_SIGNATURE, RejectionReason, VerifiedTransfer, verify_fee, verify_native_transfer,
+};
 
 /// The `solana-system-transfer-v1` verifier identifier, as advertised by
 /// Broker capabilities and required by wallet policy.

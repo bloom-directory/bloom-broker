@@ -14,9 +14,12 @@
 //! lamport debit, and the message commitment (SHA-256 digest / ordered signing
 //! hash).
 //!
+//! [`verify_fee`] separately establishes the fee: one base fee per signature.
+//!
 //! Facts it does *not* establish: cluster/genesis identity, blockhash
-//! freshness, last-valid height, fee quote, balance, simulation result,
-//! broadcast acceptance, or finality. Those remain `machine_asserted`.
+//! freshness, last-valid height, balance,
+//! simulation result, broadcast acceptance, or finality. Those remain
+//! `machine_asserted`.
 
 use crate::message::{self, LegacyMessage};
 use crate::message_digest;
@@ -67,6 +70,29 @@ pub enum RejectionReason {
     LamportsMismatch { expected: u64, actual: u64 },
     /// The computed message digest does not match the claimed digest.
     DigestMismatch,
+    /// The declared fee differs from the reviewed network's signature fee.
+    FeeMismatch { expected: u64, actual: u64 },
+}
+
+/// Solana's base fee per signature. Mainnet-beta, devnet, testnet and
+/// `solana-test-validator` all charge it. The signed message names no network,
+/// so a validator configured with another fee is refused rather than trusted.
+pub const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
+
+/// Check a verified transfer's declared fee. It has no compute-budget
+/// instruction, so its whole fee is `signer_count × LAMPORTS_PER_SIGNATURE`.
+pub fn verify_fee(
+    verified: &VerifiedTransfer,
+    declared_lamports: u64,
+) -> Result<(), RejectionReason> {
+    let expected = u64::from(verified.signer_count) * LAMPORTS_PER_SIGNATURE;
+    if declared_lamports != expected {
+        return Err(RejectionReason::FeeMismatch {
+            expected,
+            actual: declared_lamports,
+        });
+    }
+    Ok(())
 }
 
 /// The facts established by a successful verification.
@@ -233,6 +259,26 @@ mod tests {
         assert_eq!(verified.lamports, lamports);
         assert_eq!(verified.program, SYSTEM_PROGRAM_ID.to_string());
         assert_eq!(verified.signer_count, 1);
+    }
+
+    #[test]
+    fn fee_must_be_one_base_fee_per_signature() {
+        let payer = Pubkey::from_bytes([1u8; 32]);
+        let dest = Pubkey::from_bytes([2u8; 32]);
+        let bytes = transfer_message(payer, dest, 1, [7u8; 32])
+            .unwrap()
+            .serialize();
+        let verified = verify_native_transfer(&bytes, payer, dest, 1, None).unwrap();
+        assert_eq!(verify_fee(&verified, 5_000), Ok(()));
+        for wrong in [0, 4_999, 5_001, 10_000, 1_000_000] {
+            assert_eq!(
+                verify_fee(&verified, wrong),
+                Err(RejectionReason::FeeMismatch {
+                    expected: 5_000,
+                    actual: wrong
+                })
+            );
+        }
     }
 
     #[test]
