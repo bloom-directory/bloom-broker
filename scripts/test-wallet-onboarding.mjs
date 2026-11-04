@@ -39,6 +39,7 @@ try {
   await page.getByRole("button", {name: "Create wallet with passkey", exact: true}).click();
   await page.getByRole("heading", {name: "Wallet created", exact: true}).waitFor();
   if (await page.getByRole("button", {name: "Copy address", exact: true}).count() !== 2) throw new Error();
+  if (await page.locator(".wallet-qr svg").count() !== 2) throw new Error();
   if (await page.locator("#review-deadline").textContent() || await page.locator("#ceremony-actions").isVisible()) throw new Error();
   for (const width of [390, 1280]) {
     await page.setViewportSize({width, height: 1000});
@@ -77,6 +78,28 @@ try {
   await page.reload();
   await page.getByRole("heading", {name, exact: true}).waitFor();
   if (await page.locator("ol.words li").count()) throw new Error();
+  // A second tab replaces an open backup instead of refusing it.
+  stage = "backup from a second tab";
+  await page.getByRole("button", {name: "Back up wallet", exact: true}).click();
+  await page.getByRole("button", {name: "Reveal with passkey", exact: true}).waitFor();
+  const second = await context.newPage();
+  await second.goto(new URL("/wallet/" + encodeURIComponent(name), base).href);
+  await second.getByRole("button", {name: "Back up wallet", exact: true}).click();
+  await second.getByRole("button", {name: "Reveal with passkey", exact: true}).waitFor();
+  await second.getByRole("button", {name: "Cancel", exact: true}).click();
+  await second.close();
+  await page.waitForTimeout(2100); // Owner-cancellation cooldown.
+  stage = "backup after cancelling";
+  await page.goto(new URL("/wallet/" + encodeURIComponent(name), base).href);
+  await page.getByRole("button", {name: "Back up wallet", exact: true}).click();
+  await page.getByRole("button", {name: "Reveal with passkey", exact: true}).waitFor();
+  await page.getByRole("button", {name: "Cancel", exact: true}).click();
+  await page.goto(new URL("/wallet/" + encodeURIComponent(name), base).href);
+  // Right after a cancel: the page waits out the cooldown, never a dead click.
+  await page.getByRole("button", {name: "Back up wallet", exact: true}).click();
+  await page.getByRole("button", {name: "Reveal with passkey", exact: true}).waitFor();
+  await page.getByRole("button", {name: "Cancel", exact: true}).click();
+  await page.waitForTimeout(2100);
   // The public BIP-39 test vector, never a real wallet. Import must end on the
   // same addresses-and-backup page as creation.
   stage = "import shows addresses and backup";
@@ -90,8 +113,8 @@ try {
   if (external || errors) throw new Error();
   await fs.writeFile(path.join(output, "results.json"), JSON.stringify({passed: true, virtualPasskey: true,
     create: true, addressCount: 2, later: true, refresh: true, cancelBackup: true, freshBackupApproval: true,
-    returnedToWallet: true, importShowsWallet: true, externalRequests: external, browserErrors: errors, capturedSecrets: false}, null, 2));
-  console.log("Create → addresses → Later/refresh → backup/cancel → fresh approval → return → import → addresses passed; no secret capture");
+    returnedToWallet: true, addressQrCodes: true, secondTabBackup: true, importShowsWallet: true, externalRequests: external, browserErrors: errors, capturedSecrets: false}, null, 2));
+  console.log("Create → addresses → Later/refresh → backup/cancel → fresh approval → return → second-tab backup → import → addresses passed; no secret capture");
 } catch (_) {
   throw new Error("Onboarding failed at: " + stage + " (no secret output captured)");
 } finally { await browser.close(); }

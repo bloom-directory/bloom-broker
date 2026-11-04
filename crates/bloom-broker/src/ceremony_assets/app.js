@@ -1904,6 +1904,15 @@ function renderResult(session, plaintext) {
     el("p", {}, el("a", {href: walletPageUrl(session.signer_contribution.wallet_id)}, "Return to wallet")));
 }
 
+// The Broker renders the QR as SVG; it is parsed as SVG, never as HTML.
+function addressQr(svg) {
+  if (typeof svg !== "string") return null;
+  const parsed = new DOMParser().parseFromString(svg, "image/svg+xml").documentElement;
+  if (parsed.nodeName !== "svg") return null;
+  parsed.setAttribute("role", "img");
+  parsed.setAttribute("aria-label", "Address QR code");
+  return el("div", {class: "wallet-qr"}, document.importNode(parsed, true));
+}
 function walletPageUrl(wallet) { return "/wallet/" + encodeURIComponent(wallet); }
 // `title` names a just-finished ceremony; the plain wallet page passes none.
 function createdWalletView(accounts, title = "Wallet created") {
@@ -1937,21 +1946,35 @@ function createdWalletView(accounts, title = "Wallet created") {
           el("div", {}, el("h3", {}, chain.chain_family === "evm" ? "Ethereum & EVM" : label),
             el("p", {}, describeKey(account.key_ref).account.replace(/ \(m\/[^)]*\)$/, "") || "Initial account"))),
         el("p", {class: "wallet-address"}, el("code", {}, chain.address)),
+        addressQr(chain.address_qr),
         copy));
     }
   }
   if (!accounts.accounts?.length) parts.push(el("p", {class: "ceremony-warning"}, "Addresses could not be loaded. Your wallet was created; do not create it again."));
   const backup = el("button", {type: "button"}, "Back up wallet");
+  // Beside the button, so a refused backup never looks like a dead click.
+  const backupError = el("p", {class: "wallet-backup-error", role: "alert"});
+  const backupUrl = `/api/wallet/${encodeURIComponent(accounts.wallet_id)}/backup`;
   backup.onclick = async () => {
     backup.disabled = true;
+    backupError.textContent = "";
     try {
-      const prepared = await mutate(`/api/wallet/${encodeURIComponent(accounts.wallet_id)}/backup`, {});
+      let prepared;
+      try { prepared = await mutate(backupUrl, {}); }
+      catch (error) {
+        // Opening a backup that another tab left open cancels it, and that
+        // cancellation starts a short cooldown. Wait it out once, visibly.
+        if (!(error.retryAfterMs > 0 && error.retryAfterMs <= 10_000)) throw error;
+        backupError.textContent = "Opening backup…";
+        await new Promise(resolve => setTimeout(resolve, error.retryAfterMs + 200));
+        prepared = await mutate(backupUrl, {});
+      }
       const target = new URL(prepared.ceremony_url, location.href);
       if (target.origin !== location.origin || !target.pathname.startsWith("/ceremony/")) throw new Error("Unexpected backup destination");
       location.assign(target.href);
     } catch (error) {
       backup.disabled = false;
-      statusNode.textContent = Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0
+      backupError.textContent = Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0
         ? `Please wait ${Math.ceil(error.retryAfterMs / 1000)} seconds before starting another backup.`
         : "Could not open backup. Finish or cancel any pending wallet request, then try again.";
     }
@@ -1962,7 +1985,7 @@ function createdWalletView(accounts, title = "Wallet created") {
       el("h2", {}, "Back up your wallet"),
       el("p", {}, "Save your recovery phrase offline. It restores your wallet if you lose access to your passkey.")),
     el("div", {class: "wallet-backup-actions"}, backup,
-      el("span", {}, "Requires your passkey"),
+      el("span", {}, "Requires your passkey"), backupError,
       created ? el("a", {href: walletPageUrl(accounts.wallet_id)}, "Later — return to wallet") : null),
     el("details", {class: "wallet-backup-details"},
       el("summary", {}, "About your backup"),
@@ -4012,7 +4035,7 @@ async function finishBrowserResult(session, result) {
       let recovery;
       try { recovery = JSON.parse(new TextDecoder().decode(plaintext)); } catch (_) {}
       if (!await showCreatedWallet(session, 10)) {
-        statusNode.textContent = "Wallet saved. Its addresses are not readable here yet; open Bloom to see them.";
+        statusNode.textContent = `${session.ceremony_kind === "wallet_import" ? "Wallet imported" : "Wallet created"}. Its addresses are not readable here yet; open Bloom to see them.`;
       }
       // After the wallet view, which replaces the review contents.
       showRecoveryCode(recovery);
