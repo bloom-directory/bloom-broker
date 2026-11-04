@@ -275,3 +275,13 @@ button.wallet-copy{width:100%;min-height:40px;border-radius:9px;font-size:13px;b
   .action-buttons button{flex:1 1 auto}
 }
 @media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+
+/* Embedded setup approvals retain the parent wallet/persona/progress context. */
+html[data-embedded-setup="true"],html[data-embedded-setup="true"] body{min-height:0;height:auto;background:transparent}
+html[data-embedded-setup="true"] .brand{display:none}
+html[data-embedded-setup="true"] .page{width:100%;max-width:none;margin:0;padding:0;min-height:0}
+html[data-embedded-setup="true"] .panel{border:0;border-radius:0;box-shadow:none;background:transparent}
+html[data-embedded-setup="true"] .panel-header{padding:0 0 20px}
+html[data-embedded-setup="true"] #review{padding:0}
+html[data-embedded-setup="true"] .ceremony-actions{padding:20px 0 0}
+.ceremony-permission-summary{padding:20px;border:1px solid var(--ceremony-border);border-radius:12px;background:var(--ceremony-bg)}

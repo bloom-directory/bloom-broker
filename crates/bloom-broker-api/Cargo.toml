@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+num-bigint = "0.4"
 bloom-rpc-wire.workspace = true
 # Address decoders: `PolicyDestination` is compared by decoded bytes, so this
 # crate carries the per-chain decoding rules both Broker and Machine share.

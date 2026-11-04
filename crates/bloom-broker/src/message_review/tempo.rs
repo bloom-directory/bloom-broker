@@ -653,7 +653,7 @@ pub(super) mod tests {
             fields: vec![],
             payment: None,
             venue_asset: None,
-            collateral_asset: None,
+
             warnings: vec![],
         }
     }

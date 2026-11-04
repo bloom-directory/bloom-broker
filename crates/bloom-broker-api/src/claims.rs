@@ -64,6 +64,8 @@ impl ClaimAssurance {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PetalUseClaim {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub economic_effects: Option<crate::EconomicEffectsV1>,
     pub package_hash: Digest32,
     pub route: String,
     pub operation_class: Token,

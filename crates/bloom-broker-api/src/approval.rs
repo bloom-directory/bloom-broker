@@ -32,38 +32,6 @@ const APPROVAL_DOMAIN: &[u8] = b"bloom-sealed-approval-terms/v1";
 /// the Safe Petal under this class is a release-trust requirement.
 pub const SAFE_CONFIRM_OPERATION_CLASS: &str = "safe.transaction.confirm";
 
-/// Released Petal operation classes whose exact signatures require a full
-/// message preimage review. Reusable grants cannot review future messages.
-pub const MESSAGE_REVIEW_OPERATION_CLASSES: &[&str] = &[
-    "gasless.relay",
-    "venice-x402.topup",
-    "venice-x402.chat",
-    "venice-x402.balance",
-    "hyperliquid.approve_agent",
-    "hyperliquid.usd_send",
-    "hyperliquid.usd_class_transfer",
-    "hyperliquid.withdraw",
-    "hyperliquid.order",
-    "hyperliquid.cancel",
-    "hyperliquid.cancel_by_cloid",
-    "hyperliquid.schedule_cancel",
-    "hyperliquid.update_leverage",
-];
-
-/// These callers use the batch host API with one exact prepared signature.
-/// Onboarding also has a separate reusable, single-use login grant; it is
-/// intentionally not converted into an exact timestamp-bound login approval.
-pub const POLYMARKET_REVIEW_OPERATION_CLASSES: &[&str] = &[
-    "polymarket.order.poly1271",
-    "polymarket.relayer_batch",
-    "polymarket.onboard",
-];
-
-/// Immutable v1 profile: Polygon ClobAuth, nonce 0, one signature, selected
-/// owner, fixed attestation and a timestamp within 300 seconds at use. A wider
-/// profile must have a new class so existing grants cannot silently widen.
-pub const POLYMARKET_CLOB_AUTH_CLASS: &str = "polymarket.clob_auth.v1";
-
 /// Machine's own x402 payments. Exact approvals for this System class must
 /// carry the EIP-3009 or Permit2 typed data so the owner sees the signed payment.
 pub const SYSTEM_X402_OPERATION_CLASS: &str = "paid-http.x402";
@@ -71,14 +39,6 @@ pub const SYSTEM_X402_OPERATION_CLASS: &str = "paid-http.x402";
 /// Machine's own MPP (Tempo) payments. Exact approvals for this System class
 /// must carry a `tempo_transaction` or `tempo_voucher` review envelope.
 pub const SYSTEM_MPP_OPERATION_CLASS: &str = "paid-http.mpp";
-
-pub fn message_review_requires_exact(class: &str) -> bool {
-    MESSAGE_REVIEW_OPERATION_CLASSES.contains(&class)
-        || matches!(
-            class,
-            "polymarket.order.poly1271" | "polymarket.relayer_batch" | "polymarket.onboard"
-        )
-}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -113,6 +73,8 @@ pub enum ApprovalSelector {
         ordered_payload_digests: Vec<Digest32>,
         ordered_hashes: Vec<Digest32>,
     },
+    /// Standard native wallet transfers with independently checked bytes.
+    NativeSession { scope: crate::SystemSessionScope },
     Petal {
         package_hash: Digest32,
         route: String,
@@ -204,6 +166,8 @@ pub struct SealedApprovalTerms {
     pub not_before_ms: DecimalU64,
     pub expires_at_ms: DecimalU64,
     pub renewal_of: Option<Digest32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_budget: Option<crate::SessionBudget>,
 }
 
 impl SealedApprovalTerms {
@@ -221,7 +185,59 @@ impl SealedApprovalTerms {
             ));
         }
 
+        if let Some(budget) = &self.session_budget {
+            budget.validate()?;
+            if matches!(self.subject, ApprovalSubject::Petal { .. })
+                != budget.petal_policy.is_some()
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::SelectorMismatch,
+                    "automatic Petal grants require an explicit persona policy; native grants do not carry one",
+                ));
+            }
+            if let Some(policy) = &budget.token_policy {
+                policy.validate_member(self)?;
+            }
+            if matches!(self.selector, ApprovalSelector::Exact { .. })
+                || budget.wallet_id != self.wallet_id
+                || budget.policy_version != self.policy_version
+                || budget.policy_digest != self.policy_digest
+                || budget.wallet_revocation_epoch != self.wallet_revocation_epoch
+                || !budget.member_keys.contains(&self.key_ref)
+                || budget.not_before_ms.get() > self.not_before_ms.get()
+                || budget.expires_at_ms.get() < self.expires_at_ms.get()
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::SelectorMismatch,
+                    "approval differs from its signed session budget",
+                ));
+            }
+        }
+        if self.expires_at_ms.get() == u64::MAX
+            && matches!(self.selector, ApprovalSelector::Exact { .. })
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "exact approvals cannot be standing permissions",
+            ));
+        }
         match (&self.subject, &self.selector) {
+            (
+                ApprovalSubject::System { component_id, .. },
+                ApprovalSelector::NativeSession { scope },
+            ) if component_id == &scope.component_id => {
+                scope.validate()?;
+                if self
+                    .session_budget
+                    .as_ref()
+                    .is_none_or(|b| b.token_policy.is_none())
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "native sessions require a reviewed token policy",
+                    ));
+                }
+            }
             (
                 ApprovalSubject::Petal {
                     package_hash,
@@ -275,10 +291,53 @@ impl SealedApprovalTerms {
         })
     }
 
+    /// Broker-only economics are committed through the existing opaque nonce.
+    /// Signer sees ordinary Petal terms and need not interpret asset accounting.
+    pub fn signer_request_nonce(&self) -> Result<RequestNonce, ProtocolError> {
+        let Some(budget) = &self.session_budget else {
+            return Ok(self.request_nonce.clone());
+        };
+        let mut hash = Sha256::new();
+        hash.update(b"bloom-broker-session-nonce/v1");
+        hash.update(self.request_nonce.as_str().as_bytes());
+        hash.update(budget.budget_id()?.as_str().as_bytes());
+        let bytes = hash.finalize();
+        let mut nonce = [0; 16];
+        nonce.copy_from_slice(&bytes[..16]);
+        Ok(RequestNonce::from_bytes(nonce))
+    }
+
+    pub fn signer_canonical_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        self.validate()?;
+        let mut value = serde_json::to_value(self)
+            .map_err(|e| ProtocolError::new(ProtocolErrorCode::MalformedFrame, e.to_string()))?;
+        let object = value
+            .as_object_mut()
+            .expect("approval terms serialize as an object");
+        object.remove("session_budget");
+        if let ApprovalSelector::NativeSession { scope } = &self.selector {
+            let operation_class = match &self.subject {
+                ApprovalSubject::System {
+                    operation_class, ..
+                } => operation_class,
+                _ => unreachable!("validated system subject"),
+            };
+            object.insert("selector".into(),serde_json::json!({"kind":"system","component_id":scope.component_id,"allowed_operation_classes":[operation_class]}));
+        }
+        object.insert(
+            "request_nonce".into(),
+            serde_json::to_value(self.signer_request_nonce()?).map_err(|e| {
+                ProtocolError::new(ProtocolErrorCode::MalformedFrame, e.to_string())
+            })?,
+        );
+        serde_jcs::to_vec(&value)
+            .map_err(|e| ProtocolError::new(ProtocolErrorCode::MalformedFrame, e.to_string()))
+    }
+
     pub fn approval_digest(&self) -> Result<Digest32, ProtocolError> {
         let mut hasher = Sha256::new();
         hasher.update(APPROVAL_DOMAIN);
-        hasher.update(self.canonical_bytes()?);
+        hasher.update(self.signer_canonical_bytes()?);
         Ok(Digest32::from_bytes(hasher.finalize().into()))
     }
 
@@ -327,7 +386,7 @@ fn validate_suites(suites: &[CryptoSuite], key_spec: crate::KeySpec) -> Result<(
     Ok(())
 }
 
-fn validate_limits(limits: &ApprovalLimits) -> Result<(), ProtocolError> {
+pub(crate) fn validate_limits(limits: &ApprovalLimits) -> Result<(), ProtocolError> {
     if limits.max_operations.get() == 0 || limits.max_signatures.get() == 0 {
         return Err(ProtocolError::new(
             ProtocolErrorCode::LimitExceededOperations,
@@ -400,6 +459,7 @@ mod tests {
             not_before_ms: DecimalU64::new(1_900_000_000_000),
             expires_at_ms: DecimalU64::new(1_900_000_600_000),
             renewal_of: None,
+            session_budget: None,
         }
     }
 

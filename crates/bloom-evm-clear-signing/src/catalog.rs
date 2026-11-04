@@ -230,9 +230,9 @@ impl Catalog {
                 || !crate::is_canonical_address(&binding.vault)
                 || !crate::is_canonical_address(&binding.asset)
                 || binding.vault == format!("0x{}", "0".repeat(40))
-                || !self
+                || self
                     .entry(binding.chain_id, &binding.asset)
-                    .is_some_and(|entry| entry.token_metadata.is_some())
+                    .is_none_or(|entry| entry.token_metadata.is_none())
             {
                 return Err(rejected(
                     "vault binding requires a canonical vault and catalogued underlying token",

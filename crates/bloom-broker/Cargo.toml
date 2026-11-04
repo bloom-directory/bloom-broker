@@ -9,6 +9,7 @@ license.workspace = true
 triad-dev-harness = ["bloom-triad-local-transport/triad-dev-harness"]
 
 [dependencies]
+ureq.workspace = true
 axum.workspace = true
 axum-server.workspace = true
 alloy = { version = "2.0.5", default-features = false, features = ["std", "consensus", "rlp"] }
@@ -57,7 +58,7 @@ bloom-relay-admin-client.workspace = true
 # The socket-activation regression hands a real descriptor to a child process
 # between fork and exec, which needs dup2/fcntl directly.
 libc = "0.2"
-bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "c157444af1b118a2d03f1ac5ce7a04933669c084" }
+bloom-signer = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "dd8717982812affc436bdc23a49fb381caa19039" }
 bloom-signer-vectors.workspace = true
 futures = "0.3"
 http-body-util = "0.1"
