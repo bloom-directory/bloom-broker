@@ -1187,10 +1187,9 @@ function describeTransfer(manifest) {
   const facts = [];
   if (to.length) facts.push([isTransfer ? "To" : "Declared destinations", to.join(", "), true]);
   if (amounts.length) facts.push(["Amount", amounts.join(" + ")]);
-  if (fee && fee.amount) {
-    const reviewedFee = reviewed.find(a => a.kind === "declared_fee");
-    facts.push(["Estimated network fee", reviewedFee?.display || `${fee.amount} ${fee.asset}`]);
-  }
+  const feeDisplay = fee?.amount
+    ? reviewed.find(a => a.kind === "declared_fee")?.display || `${fee.amount} ${fee.asset}` : "";
+  if (feeDisplay) facts.push(["Estimated network fee", feeDisplay]);
   facts.push(["Network", network]);
   if (claim.route) facts.push(["Requested by", `Petal ${claim.route}`]);
   const assurance = claim.claim_assurance?.kind || manifest?.claim_assurance?.kind;
@@ -1200,7 +1199,18 @@ function describeTransfer(manifest) {
       ? "Required before signing — Bloom will decode the transaction and require it to match this summary"
       : "No — these figures are claimed, not verified"]);
   }
-  // A transfer's destinations are its recipients, shown on the main review.
+  // A single native send uses the same layout as an EVM native send:
+  // asset card, sender → recipient, fee. The claim carries no sender
+  // address, so the sender row names the signing account only.
+  if (isTransfer && amounts.length === 1 && to.length === 1) {
+    const native = chain === "solana" ? "solana" : "token";
+    return {intent: {action: "send", eyebrow: "Native transfer", heading: `Send ${amounts[0]}`, detail: ""},
+      sentence: "", facts, willVerify, chainId: chain,
+      parties: [{role: "source", value: ""}, {role: "recipient", label: "Recipient", value: to[0]}],
+      sendAsset: {native, title: debits[0].asset.asset, amount: amounts[0], amountLabel: "Amount", tone: "outgoing"},
+      fee: feeDisplay ? {native, amount: feeDisplay} : null,
+      networkIdentity: network, networkIcon: native};
+  }
   return {sentence, facts, willVerify, recipients: isTransfer ? to : [], chainId: chain};
 }
 // Turn a Signer key reference into "Solana account 0 (m/44'/501'/0'/0')".
@@ -1488,6 +1498,7 @@ function renderReview(session) {
       el("p", {class: "ceremony-party-label"}, party.label));
     if (party.name) row.append(el("p", {class: "ceremony-party-name"}, party.name));
     if (party.change) row.append(el("span", {class: `ceremony-balance-change ${party.role === "source" ? "outgoing" : "incoming"}`}, party.change));
+    if (!party.value) return row;
     const address = el("code", {}, party.value);
     const explorer = addressExplorer(party.chainId || transfer?.chainId, party.value);
     const identity = explorer ? el("a", {class: "ceremony-address-link", href: explorer.url,
@@ -1527,8 +1538,8 @@ function renderReview(session) {
       el("dt", {}, "Signing account"),
       el("dd", {}, [walletName, accountLabel].filter(Boolean).join(" · "))));
   }
-  // The sentence says "to the address below", so the address must be here,
-  // not only in the collapsed technical details.
+  // A multi-recipient claim says "to the address below", so the addresses
+  // must be here, not only in the collapsed technical details.
   for (const value of transfer?.recipients || []) {
     decision.push(el("div", {class: "ceremony-identity ceremony-transfer-path"},
       partyRow({role: "recipient", label: "Recipient", value})));
@@ -1579,6 +1590,8 @@ function renderReview(session) {
         amountLabel: sending ? "Amount" : "Spending limit",
         tone: unlimited ? "danger" : sending ? "outgoing" : "permission"
       }));
+    } else if (transfer.sendAsset) {
+      decision.push(assetCard(transfer.sendAsset));
     } else if (transfer.intent.action === "send") {
       decision.push(assetCard({
         ...nativeCard(transfer.payloads?.[0]?.chain_id),
@@ -1792,6 +1805,11 @@ function renderReview(session) {
       : el("span", {}, "Not available in this review");
     decision.push(el("div", {class: "ceremony-fee", "aria-label": "Execution gas only; other network charges may apply"},
       el("span", {class: "ceremony-fee-label"}, label), amount));
+  }
+  if (transfer?.fee) {
+    decision.push(el("div", {class: "ceremony-fee"},
+      el("span", {class: "ceremony-fee-label"}, "Network fee"),
+      el("span", {class: "ceremony-fee-amount"}, reviewIcon(transfer.fee.native), el("span", {}, transfer.fee.amount))));
   }
   if (meta.warn) primaryWarnings.unshift(meta.warn);
   for (const note of detailNotes) evidence.push(el("p", {class: "ceremony-assurance"}, note));
@@ -3486,6 +3504,21 @@ const PREVIEWS = {
   "opaque-call": () => previewApproval([previewPayload({calldata_hex:
     "0xa9059cbb" + PREVIEW_SPENDER.slice(2).toLowerCase().padStart(64, "0") +
     (250000000n).toString(16).padStart(64, "0")})], null),
+  "solana-send": () => ({
+    ceremony_kind: "sealed_approval", expires_at_ms: Date.now() + 9 * 60 * 1000,
+    signer_contribution: {wallet_id: "main", key_ref: {derivation: {path: "m/44'/501'/0'/0'"}}},
+    review_manifest: {
+      canonical_plan: JSON.stringify({asset_amounts: [{kind: "declared_debit", display: "0.001 SOL"},
+        {kind: "declared_fee", display: "0.000005 SOL"}]}),
+      system_use_claim: {
+        declared_debits: [{amount: "1000000", asset: {chain: "solana", asset: "SOL"}}],
+        declared_destinations: [{chain: "solana", destination: "GWGW3TzM5dEDV38xK1F8chQJptJ6aywQkwksgfhKztEu"}],
+        declared_fee: {kind: "fee", chain: "solana", asset: "lamports", amount: "5000"},
+        chain_context: {chain_family: "solana", genesis_hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"},
+        claim_assurance: {kind: "proof_verified"}
+      }
+    }
+  }),
   "native-send": () => previewApproval([previewPayload({
     destination: PREVIEW_SPENDER, value: "10000000000000000", value_display: "0.01 ETH",
     calldata_bytes: "0", calldata_keccak: undefined
@@ -3642,6 +3675,7 @@ async function load() {
             "transfer-ethereum": "USDC transfer · Ethereum · ordinary wallet",
             "transfer-dai": "DAI transfer · Ethereum · ordinary wallet",
             "native-send": "Ether transfer · Base · ordinary wallet",
+            "solana-send": "SOL transfer · Solana mainnet · ordinary wallet",
             "safe-token-transfer": "USDC transfer · Base · Safe signature",
             "safe-allowance-unlimited": "Unlimited USDC permission · Safe signature",
             "structural-transfer": "Unverified token identity · transfer-shaped calldata"

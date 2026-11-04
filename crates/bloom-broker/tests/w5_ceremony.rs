@@ -912,7 +912,8 @@ const system = describeTransfer({{system_use_claim: claim}});
 const label = view => view.facts.find(([, value]) => value === "PumpProgram111")[0];
 if (petal.sentence.includes("address below")) throw new Error(petal.sentence);
 if (label(petal) !== "Declared destinations") throw new Error(label(petal));
-if (!system.sentence.includes("address below")) throw new Error(system.sentence);
+if (system.intent?.action !== "send") throw new Error(JSON.stringify(system.intent));
+if (system.parties.find(party => party.role === "recipient")?.value !== "PumpProgram111") throw new Error("no recipient");
 if (label(system) !== "To") throw new Error(label(system));
 process.stdout.write("ok");
 "#
@@ -926,8 +927,8 @@ process.stdout.write("ok");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "ok");
 }
 
-/// "Send 0.001 SOL … to the address below" once had no address below: the
-/// recipient was drawn only inside the collapsed technical details.
+/// A SOL send once said "to the address below" with no address below. It now
+/// uses the EVM native-send layout: amount card, then sender → recipient.
 #[test]
 fn system_transfer_recipient_is_on_the_primary_review_surface() {
     let asset = concat!(
@@ -978,9 +979,15 @@ const find = node => {{
   node.children.forEach(find);
 }};
 find(nodes.review);
+// Same layout as an EVM native send: sender above recipient, no separate
+// "Signing account" block.
 if (!rows.some(row => shown(row).includes("Recipient") && shown(row).includes(recipient))) {{
   throw new Error(`recipient missing from the main review: ${{shown(nodes.review)}}`);
 }}
+if (!rows.some(row => shown(row).includes("Sender") && shown(row).includes("main · Solana account 0"))) {{
+  throw new Error(`sender missing from the main review: ${{shown(nodes.review)}}`);
+}}
+if (shown(nodes.review).includes("Signing account")) throw new Error("separate signing account block");
 process.stdout.write("ok");
 "#
     );
