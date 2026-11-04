@@ -885,6 +885,48 @@ cryptoSelfTest().then(
     assert_eq!(String::from_utf8_lossy(&output.stdout), "browser-crypto-ok");
 }
 
+/// A Petal's declared destination is where its transaction may reach (a swap
+/// names the program it routes through), so the page must not call it a
+/// recipient. A system transfer's destination is a recipient.
+#[test]
+fn petal_destinations_are_not_shown_as_recipients() {
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+globalThis.document = {{getElementById: () => ({{}})}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+{executable}
+const claim = {{
+  declared_debits: [{{amount: "1", asset: {{chain: "solana", asset: "SOL"}}}}],
+  declared_destinations: [{{chain: "solana", destination: "PumpProgram111"}}],
+}};
+const petal = describeTransfer({{petal_use_claim: claim}});
+const system = describeTransfer({{system_use_claim: claim}});
+const label = view => view.facts.find(([, value]) => value === "PumpProgram111")[0];
+if (petal.sentence.includes("address below")) throw new Error(petal.sentence);
+if (label(petal) !== "Declared destinations") throw new Error(label(petal));
+if (!system.sentence.includes("address below")) throw new Error(system.sentence);
+if (label(system) !== "To") throw new Error(label(system));
+process.stdout.write("ok");
+"#
+    );
+    let output = run_node(&script);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "ok");
+}
+
 #[test]
 fn custody_manifest_is_rendered_on_the_primary_review_surface() {
     let asset = concat!(
@@ -944,6 +986,122 @@ if (nodes["page-title"].textContent !== "Remove a passkey from a wallet" ||
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A wallet registration commits custody before the page draws anything. On
+/// 2026-10-26 an owner's registration completed, the wallet existed, and the
+/// page still said "the result could not be recovered or acknowledged": the
+/// created wallet was read once, that read lost the race with the account's
+/// own address projection, and the throw skipped the acknowledgement. The
+/// session then sat in AWAITING_RECOVERY_ACK until it lapsed to failed, and
+/// the Bloom recovery code was never offered, because it was rendered inside
+/// the same wallet read.
+#[test]
+fn a_registration_is_acknowledged_even_when_the_new_wallet_cannot_be_read() {
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
+  setAttribute() {{}}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+let walletReads = 0;
+let walletReadable = false;
+globalThis.fetch = async url => {{
+  if (!String(url).startsWith("/api/wallet/")) throw new Error(`unexpected fetch ${{url}}`);
+  walletReads++;
+  // An unreadable wallet is what a read sees while the account's address is
+  // still being projected.
+  return walletReadable
+    ? {{ok: true, json: async () => ({{wallet_id: "wallet-primary", accounts: [{{key_ref: {{}},
+        chain_projections: [{{chain_family: "evm", address: "0xabc"}}]}}]}})}}
+    : {{ok: false, status: 404}};
+}};
+let acknowledged = [];
+mutate = async url => {{ acknowledged.push(url); return {{}}; }};
+clearBrowserState = async () => {{}};
+hpkeOpen = async () => new TextEncoder().encode(JSON.stringify({{
+  recovery_id: "rec_1", recovery_secret: "s3cret"
+}}));
+outputRecipient = {{}};
+ceremonyId = "a".repeat(64);
+function allText(node) {{
+  if (typeof node === "string") return node;
+  return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
+}}
+const ack = `/api/session/${{ceremonyId}}/ack`;
+const finish = kind => finishBrowserResult({{
+  ceremony_kind: kind,
+  signer_contribution: {{
+    wallet_id: "wallet-primary",
+    ceremony_id: ceremonyId,
+    ceremony_kind: kind,
+    custody_operation_id: "op_1"
+  }},
+  challenges: [{{binding: {{exact_terms_digest: "d1", signer_contribution_digest: "d2"}}}}]
+}}, {{encrypted_browser_result: "sealed"}});
+(async () => {{
+  await finish("wallet_registration");
+  if (!acknowledged.includes(ack)) throw new Error("a committed registration was not acknowledged");
+  if (walletReads < 2) throw new Error(`the wallet read was not retried: ${{walletReads}}`);
+  if (!allText(nodes.review).includes("Download Bloom recovery code")) {{
+    throw new Error("the recovery code was not offered");
+  }}
+  if (!nodes.status.textContent.includes("Wallet created")) {{
+    throw new Error(`unexpected status: ${{nodes.status.textContent}}`);
+  }}
+
+  // The normal path: the wallet view replaces the review contents, and the
+  // recovery code must still be on the page afterwards.
+  walletReadable = true; acknowledged = []; nodes.review.children = [];
+  await finish("wallet_registration");
+  const page = allText(nodes.review);
+  if (!acknowledged.includes(ack)) throw new Error("a readable registration was not acknowledged");
+  if (!page.includes("0xabc")) throw new Error("the created wallet was not shown");
+  if (!page.includes("Download Bloom recovery code")) {{
+    throw new Error("the wallet view erased the recovery code");
+  }}
+
+  // Other sensitive results are acknowledged only after they are drawn.
+  acknowledged = [];
+  renderResult = () => {{ throw new Error("render failed"); }};
+  const failed = await finish("wallet_export").then(() => false, () => true);
+  if (!failed || acknowledged.length) throw new Error("an export was acknowledged before it was drawn");
+  process.stdout.write("registration-acknowledged");
+}})().catch(error => {{ console.error(error); process.exit(1); }});
+"#
+    );
+    let output = run_node(&script);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "registration-acknowledged"
     );
 }
 
@@ -1018,6 +1176,40 @@ for (const expected of ["0x2222222222222222222222222222222222222222", "0.0003 ET
 }}
 for (const stale of ["Native value (wei)", "per gas (wei)", "Some("]) {{
   if (rendered.includes(stale)) throw new Error(`stale EVM rendering ${{stale}}: ${{rendered}}`);
+}}
+
+// A non-ETH network shows its own native asset, chosen by chain ID, in the
+// header, the primary amount card, and beside the gas fee.
+for (const [chainId, chain, name, artKey] of [
+  ["137", "polygon", "POL", "1:0x455e53cbb86018ac2b8092fdcd39d8444affc3f6"],
+  ["5042", "evm-5042", "USDC", "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"],
+  ["56", "bsc", "BNB", "56:0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"],
+  ["43114", "avalanche", "AVAX", "43114:0xb31f66aa3c1e785363f0875a1b74e27b85fd66c7"],
+  ["100", "gnosis", "xDAI", "100:0xe91d153e0b41518a2ce8dd3d7944fa863463a97d"],
+  ["999", "hyperevm", "HYPE", "999:0x5555555555555555555555555555555555555555"],
+]) {{
+  renderReview(session({{
+    chain_id: chainId, chain,
+    sender: "0x1111111111111111111111111111111111111111",
+    destination: "0x2222222222222222222222222222222222222222",
+    value: "10000000000000000", value_display: `0.01 ${{name}}`,
+    nonce: "0", gas_limit: "26250",
+    fee: {{kind: "eip1559", max_fee_per_gas: "549987553048",
+      max_fee_per_gas_display: "549.99 Gwei", max_priority_fee_per_gas: "27499377652",
+      max_priority_fee_per_gas_display: "27.5 Gwei"}},
+    maximum_execution_gas_fee_display: `0.014799 ${{name}}`,
+    payload_keccak: "0xabd",
+    calldata_bytes: "0"
+  }}));
+  const art = `/assets/tokens/${{REVIEWED_TOKEN_ARTWORK[artKey].file}}`;
+  const marked = node => walk(node).some(child => child.tagName === "IMG" && child.src === art);
+  const byClass = name => walk(nodes.review).find(node => String(node.className).includes(name));
+  const card = byClass("ceremony-asset");
+  if (!marked(nodes["page-title"])) throw new Error(`${{chain}} header is missing the ${{name}} mark`);
+  if (!marked(card) || !allText(card).includes(name) || allText(card).includes("Native asset")) {{
+    throw new Error(`${{chain}} amount card is not ${{name}}: ${{allText(card)}}`);
+  }}
+  if (!marked(byClass("ceremony-fee-amount"))) throw new Error(`${{chain}} gas fee is missing the ${{name}} mark`);
 }}
 
 renderReview(session({{
@@ -1745,9 +1937,25 @@ const scope = {{
   allowed_operation_classes: ["pumpfun.buy", "pumpfun.sell", "pumpfun.sweep"],
   allowed_routes: ["r000010", "r000011", "r000020"],
   custody_operation_id: "internal-operation-id",
+  allowed_crypto_suites: ["ed25519-message"],
   maximum_lifetime_ms: "3600000",
   package_hash: "b868911206a002dd48c11fb59e8aaa8bd8b4716f70b671e10be18bd24bf7c738"
 }};
+// The key is named by the scope's suites: EVM for secp256k1/keccak, generic
+// when the suites are mixed or missing, Solana only for Ed25519.
+for (const [suites, expected, forbidden] of [
+  [["secp256k1-keccak256-recoverable"], "temporary EVM session key", "Solana"],
+  [["secp256k1-sha256-recoverable"], "temporary session key", "Solana"],
+  [undefined, "temporary session key", "Solana"],
+]) {{
+  const sentence = describePetalScope({{...scope, allowed_crypto_suites: suites}}).sentence;
+  if (!sentence.includes(expected) || sentence.includes(forbidden)) {{
+    throw new Error(`wrong session key wording for ${{suites}}: ${{sentence}}`);
+  }}
+}}
+if (!describePetalScope(scope).sentence.includes("temporary Solana session key")) {{
+  throw new Error("an Ed25519 scope must still say Solana");
+}}
 renderReview({{
   ceremony_kind: "key_derive",
   expires_at_ms: Date.now() + 300000,
@@ -2168,6 +2376,9 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
         ".ceremony-party{",
         ".ceremony-warning{",
         ".ceremony-actions{",
+        // Catalog artwork is a 56px image; compact rows must size it too.
+        ".panel-context svg,.panel-context img{width:22px;height:22px",
+        ".ceremony-fee-amount svg,.ceremony-fee-amount img{width:14px;height:14px",
         "env(safe-area-inset-top,0px)",
         "env(safe-area-inset-right,0px)",
         "env(safe-area-inset-bottom,0px)",
@@ -7810,6 +8021,78 @@ fn assigned_remote_outage_never_silently_changes_default_to_local() {
     );
 }
 
+#[test]
+fn default_wallet_surface_is_one_where_the_wallet_has_a_passkey() {
+    use bloom_broker_api::CeremonySurfaceSelection::{Default, Local, Remote};
+    let wallet = Token::new("main").unwrap();
+    let chosen = |signer: MockSigner, selection| {
+        CeremonyBroker::new(Arc::new(signer))
+            .select_wallet_surface(selection, &wallet)
+            .map(|surface| surface.identity.surface_id.as_str().to_owned())
+    };
+    let with_passkeys = |signer: MockSigner, passkey_surfaces| MockSigner {
+        passkey_surfaces,
+        ..signer
+    };
+    // The live defect: hosted mode on, the wallet's only passkey on localhost.
+    assert_eq!(
+        chosen(MockSigner::with_remote_surface(), Default).unwrap(),
+        "local"
+    );
+    // A hosted passkey keeps the hosted default.
+    for passkeys in [vec!["remote"], vec!["local", "remote"]] {
+        assert_eq!(
+            chosen(
+                with_passkeys(MockSigner::with_remote_surface(), passkeys),
+                Default
+            )
+            .unwrap(),
+            "remote"
+        );
+    }
+    // No passkey on any usable surface is refused before a link exists.
+    for signer in [
+        MockSigner::with_remote_surface(),
+        MockSigner::with_remote_disabled(),
+    ] {
+        let error = chosen(with_passkeys(signer, Vec::new()), Default).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::ApprovalNotFound);
+        assert!(error.message.contains("no active passkey"), "{error:?}");
+    }
+    // A hosted-only wallet keeps the outage error instead of moving to localhost.
+    let error = chosen(
+        with_passkeys(MockSigner::with_remote_degraded(), vec!["remote"]),
+        Default,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+    let rejected = CeremonyBroker::new(Arc::new(with_passkeys(
+        MockSigner::with_remote_surface(),
+        vec!["remote"],
+    )));
+    rejected.set_remote_credentials_rejected(true);
+    let error = rejected
+        .select_wallet_surface(Default, &wallet)
+        .unwrap_err();
+    assert!(
+        error.message.contains("bloom-signer admin provision"),
+        "{error:?}"
+    );
+    // Explicit selections are honored whatever the wallet holds.
+    assert_eq!(
+        chosen(MockSigner::with_remote_surface(), Remote).unwrap(),
+        "remote"
+    );
+    assert_eq!(
+        chosen(
+            with_passkeys(MockSigner::with_remote_surface(), vec!["remote"]),
+            Local
+        )
+        .unwrap(),
+        "local"
+    );
+}
+
 #[tokio::test]
 async fn bare_root_redirects_while_ceremonies_remain_available_and_public_recovery_is_absent() {
     let remote = "https://abcdefghijklmnopqrstuv2345.relay.bloom.directory";
@@ -8907,6 +9190,258 @@ fn ac18_populated_ceremony_migration_is_atomic_idempotent_and_retains_source() {
         )
         .unwrap();
     assert_eq!(marker, 0);
+}
+
+fn open_ceremony_at(
+    legacy_path: &std::path::Path,
+    journal_path: &std::path::Path,
+) -> Result<CeremonyBroker, ProtocolError> {
+    let journal =
+        Arc::new(BrokerJournal::open(journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    CeremonyBroker::open(legacy_path, Arc::new(MockSigner::new()), journal)
+}
+
+/// Writes a legacy ceremony store holding one cancelled session and returns
+/// that session's operation.
+fn seed_legacy_ceremony_store(path: &std::path::Path) -> OperationId {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Older packages kept sessions in their own file. A broker whose journal
+    // is that file writes real sessions there; the file then also holds the
+    // journal's other tables, which the migration ignores.
+    let journal = Arc::new(BrokerJournal::open(path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let broker = CeremonyBroker::open_with_manifest_signer_audited(
+        path,
+        Arc::new(MockSigner::new()),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[7; 32]),
+        journal,
+        CeremonyLimits::default(),
+    )
+    .unwrap();
+    let operation_id = operation("3a");
+    broker
+        .prepare_custody(
+            CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
+                ceremony_kind: CeremonyKind::WalletDelete,
+                custody_operation_id: operation_id.clone(),
+                wallet_id: Some(Token::new("wallet-legacy-store").unwrap()),
+                key_ref: None,
+                exact_terms_digest: digest("3a"),
+                expected_input_class: Token::new("policy-document").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_requests: Vec::new(),
+            },
+            50_000,
+        )
+        .unwrap();
+    broker.cancel(&operation_id, 50_001).unwrap();
+    operation_id
+}
+
+/// Ceremony state lives in the journal; the legacy file is only a migration
+/// source. Creating it puts an empty store exactly where someone debugging
+/// ceremony state looks first.
+#[test]
+fn a_home_with_nothing_to_migrate_grows_no_legacy_ceremony_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let legacy_path = directory.path().join("ceremonies.sqlite");
+
+    let broker = open_ceremony_at(&legacy_path, &directory.path().join("journal.sqlite"))
+        .expect("a fresh home opens");
+    drop(broker);
+
+    assert!(
+        !legacy_path.exists(),
+        "opening a fresh home must not create an empty legacy ceremony store"
+    );
+}
+
+/// Legacy ceremony files with nothing to migrate open, and are left exactly
+/// as they were, with no migration recorded. Every release before this one
+/// gave the file an empty `ceremony_sessions` table, so that is the shape most
+/// upgraded homes have; a file without the table, empty or not, has nothing
+/// to migrate either.
+#[test]
+fn a_legacy_ceremony_file_without_sessions_is_left_untouched() {
+    let directory = tempfile::tempdir().unwrap();
+    fn older_release(path: &std::path::Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE ceremony_sessions (
+                    ceremony_id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL UNIQUE,
+                    session_jcs TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+    }
+    fn other_tables(path: &std::path::Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch("CREATE TABLE policies(wallet_id TEXT PRIMARY KEY);")
+            .unwrap();
+    }
+    fn empty_file(path: &std::path::Path) {
+        std::fs::write(path, b"").unwrap();
+    }
+    let shapes = [
+        (
+            "an older release's empty table",
+            older_release as fn(&std::path::Path),
+        ),
+        ("a file with other tables only", other_tables),
+        ("an empty file", empty_file),
+    ];
+
+    for (index, (shape, write)) in shapes.into_iter().enumerate() {
+        let legacy_path = directory.path().join(format!("ceremonies-{index}.sqlite"));
+        write(&legacy_path);
+        let before = std::fs::read(&legacy_path).unwrap();
+        let journal = Arc::new(
+            BrokerJournal::open(
+                directory.path().join(format!("journal-{index}.sqlite")),
+                Arc::new(ServiceTestAuditSigner),
+            )
+            .unwrap(),
+        );
+
+        let broker =
+            CeremonyBroker::open(&legacy_path, Arc::new(MockSigner::new()), journal.clone())
+                .unwrap_or_else(|error| panic!("{shape} means nothing to migrate: {error}"));
+        drop(broker);
+
+        assert_eq!(
+            std::fs::read(&legacy_path).unwrap(),
+            before,
+            "{shape} must not be written to"
+        );
+        assert!(
+            !journal
+                .audit_entries()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.event_type == "storage.ceremony_migrated"),
+            "{shape} must not record a migration"
+        );
+    }
+}
+
+/// A legacy store reached through a symlink whose target is missing is not
+/// "nothing to migrate": the entry is there, its sessions are not. The
+/// target's directory exists, as for a mounted volume whose file is gone, so
+/// an open that could create would succeed and leave an empty store there.
+#[test]
+fn a_dangling_legacy_ceremony_symlink_fails_startup_and_creates_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let legacy_path = directory.path().join("ceremonies.sqlite");
+    let volume = directory.path().join("mounted-volume");
+    std::fs::create_dir(&volume).unwrap();
+    let target = volume.join("ceremonies.sqlite");
+    std::os::unix::fs::symlink(&target, &legacy_path).unwrap();
+
+    let error = open_ceremony_at(&legacy_path, &directory.path().join("journal.sqlite"))
+        .err()
+        .expect("a dangling legacy ceremony symlink must fail startup");
+    assert!(
+        error.to_string().contains("ceremonies.sqlite"),
+        "the error must name the legacy store: {error}"
+    );
+    assert!(
+        !target.exists(),
+        "a missing target must not be created by the open"
+    );
+}
+
+/// A missing directory in the configured path, or a path that cannot be
+/// inspected because a component is a file or a symlink loop, cannot be read
+/// as a home with nothing to migrate.
+#[test]
+fn an_unreachable_legacy_ceremony_path_fails_startup() {
+    let directory = tempfile::tempdir().unwrap();
+    let plain_file = directory.path().join("plain-file");
+    std::fs::write(&plain_file, b"not a directory").unwrap();
+    let looping = directory.path().join("loop");
+    std::os::unix::fs::symlink(&looping, &looping).unwrap();
+
+    for (index, (parent, expected)) in [
+        (
+            directory.path().join("no-such-dir"),
+            "cannot read the legacy ceremony store's directory",
+        ),
+        (plain_file, "cannot tell whether the legacy ceremony store"),
+        (looping, "cannot tell whether the legacy ceremony store"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let legacy_path = parent.join("ceremonies.sqlite");
+        let journal_path = directory.path().join(format!("journal-{index}.sqlite"));
+        let error = open_ceremony_at(&legacy_path, &journal_path)
+            .err()
+            .unwrap_or_else(|| panic!("{} must fail startup", legacy_path.display()));
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+    assert!(!directory.path().join("no-such-dir").exists());
+}
+
+/// A directory the Broker may not search hides whether a store is there, so
+/// startup fails rather than reading the store as absent. Root can search any
+/// directory, so the case cannot be set up as root and is skipped there.
+#[test]
+fn a_legacy_ceremony_store_in_an_unsearchable_directory_fails_startup() {
+    use std::os::unix::fs::PermissionsExt as _;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root can search a mode 000 directory");
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let locked = directory.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = open_ceremony_at(
+        &locked.join("ceremonies.sqlite"),
+        &directory.path().join("journal.sqlite"),
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let error = result
+        .err()
+        .expect("a legacy store in an unsearchable directory must fail startup");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot tell whether the legacy ceremony store"),
+        "{error}"
+    );
+}
+
+/// A populated legacy store behind a live symlink, in a directory whose name
+/// is URI syntax for the migration's `file:` attach or would be rewritten by a
+/// form-style encoder, still has its sessions carried over.
+#[test]
+fn a_legacy_ceremony_store_behind_a_symlink_at_an_unusual_path_is_migrated() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory
+        .path()
+        .join("volume %41?#+é dir")
+        .join("ceremonies.sqlite");
+    let operation_id = seed_legacy_ceremony_store(&target);
+    let legacy_path = directory.path().join("ceremonies.sqlite");
+    std::os::unix::fs::symlink(&target, &legacy_path).unwrap();
+
+    let migrated = open_ceremony_at(&legacy_path, &directory.path().join("journal.sqlite"))
+        .expect("a legacy store behind a live symlink must open");
+    assert_eq!(
+        migrated.status(&operation_id),
+        Some(CeremonyState::Cancelled),
+        "the legacy session must be carried over"
+    );
 }
 
 #[test]

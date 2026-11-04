@@ -34,6 +34,8 @@ pub use petal_key::*;
 pub use policy::*;
 pub use provenance::*;
 pub use reusable_profile::*;
+pub mod address;
+
 pub use revocation::*;
 pub use service::*;
 pub use session::*;

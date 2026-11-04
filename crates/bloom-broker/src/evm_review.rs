@@ -817,6 +817,7 @@ pub(crate) mod tests {
             (56, "BNB"),
             (43114, "AVAX"),
             (999, "HYPE"),
+            (5042, "USDC"),
         ] {
             let mut tx = legacy.clone();
             tx.chain_id = Some(chain_id);

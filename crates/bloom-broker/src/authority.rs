@@ -1,7 +1,8 @@
 use crate::journal::{
     BrokerJournal, BudgetLimits, JournalError, NewApprovalRecord, ReservationRequest,
-    SlidingBudgetLimit, SlidingValueLimit,
+    SlidingBudgetLimit, SlidingValueLimit, UnsupportedStoreVersion,
 };
+use bloom_broker_api::address;
 use bloom_broker_api::{
     ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
     ApprovalTombstone, Base64UrlBytes, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite,
@@ -184,6 +185,8 @@ pub enum AuthorityError {
     Storage(String),
     #[error(transparent)]
     Journal(#[from] JournalError),
+    #[error(transparent)]
+    UnsupportedStoreVersion(#[from] UnsupportedStoreVersion),
 }
 
 impl From<rusqlite::Error> for AuthorityError {
@@ -456,8 +459,14 @@ impl BrokerAuthority {
         revocation_key: VerifyingKey,
         assurance: AssuranceRegistry,
     ) -> Result<Self, AuthorityError> {
+        // Only a legacy store that is actually there is opened, and never
+        // created; the real tables live in the journal. A dangling link, a
+        // vanished target or a mistyped directory fails startup instead of
+        // reading as a home with nothing to migrate.
+        let legacy = crate::legacy_store::open(path.as_ref(), "authority")
+            .map_err(AuthorityError::Storage)?;
         Self::from_connection(
-            Connection::open(path)?,
+            legacy,
             journal,
             policy_keys,
             installer_key_id,
@@ -483,7 +492,7 @@ impl BrokerAuthority {
         assurance: AssuranceRegistry,
     ) -> Result<Self, AuthorityError> {
         Self::from_connection(
-            Connection::open_in_memory()?,
+            None,
             journal,
             policy_keys,
             installer_key_id,
@@ -498,7 +507,7 @@ impl BrokerAuthority {
 
     #[allow(clippy::too_many_arguments)]
     fn from_connection(
-        legacy_connection: Connection,
+        legacy_connection: Option<Connection>,
         journal: Arc<BrokerJournal>,
         policy_keys: BTreeMap<String, (Token, VerifyingKey)>,
         installer_key_id: Token,
@@ -583,7 +592,9 @@ impl BrokerAuthority {
             );
             ",
             )?;
-            migrate_legacy_authority(&mut connection, &legacy_connection, &journal)?;
+            if let Some(legacy) = &legacy_connection {
+                migrate_legacy_authority(&mut connection, legacy, &journal)?;
+            }
             enforce_authority_state_floor(&connection)?;
         }
         let mut policy_keys = policy_keys;
@@ -3352,17 +3363,10 @@ impl BrokerAuthority {
                 "verifier contract does not establish every selector and accounting field",
             ));
         }
-        let allowed_destinations: BTreeSet<_> =
-            policy.allowed_destinations.iter().cloned().collect();
-        if let Some(declared) = claim.declared_destinations.iter().find(|destination| {
-            !allowed_destinations.contains(&PolicyDestination {
-                chain: destination.chain.clone(),
-                destination: destination.destination.clone(),
-            })
-        }) {
+        if let Some(declared) = destination_outside_policy(policy, &claim.declared_destinations) {
             return Err(denied(
                 "DESTINATION_NOT_ALLOWED",
-                destination_policy_violation("claim", declared, &allowed_destinations),
+                destination_policy_violation("claim", declared, &policy.allowed_destinations),
             ));
         }
         Ok(())
@@ -3443,17 +3447,14 @@ impl BrokerAuthority {
                 "system verifier does not establish every semantic transfer field",
             ));
         }
-        let allowed_destinations: BTreeSet<_> =
-            policy.allowed_destinations.iter().cloned().collect();
-        if let Some(declared) = claim.declared_destinations.iter().find(|destination| {
-            !allowed_destinations.contains(&PolicyDestination {
-                chain: destination.chain.clone(),
-                destination: destination.destination.clone(),
-            })
-        }) {
+        if let Some(declared) = destination_outside_policy(policy, &claim.declared_destinations) {
             return Err(denied(
                 "DESTINATION_NOT_ALLOWED",
-                destination_policy_violation("system claim", declared, &allowed_destinations),
+                destination_policy_violation(
+                    "system claim",
+                    declared,
+                    &policy.allowed_destinations,
+                ),
             ));
         }
         Ok(())
@@ -3974,12 +3975,7 @@ fn migrate_legacy_authority(
     legacy: &Connection,
     journal: &BrokerJournal,
 ) -> Result<(), AuthorityError> {
-    let legacy_has_schema: bool = legacy.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='policies')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !legacy_has_schema {
+    if !crate::legacy_store::has_table(legacy, "policies")? {
         return Ok(());
     }
     let legacy_path: String = legacy.query_row(
@@ -4013,7 +4009,8 @@ fn migrate_legacy_authority(
     if migrated {
         return Ok(());
     }
-    target.execute("ATTACH DATABASE ?1 AS authority_legacy", [&legacy_path])?;
+    crate::legacy_store::attach(target, &legacy_path, "authority_legacy", "authority")
+        .map_err(AuthorityError::Storage)?;
     journal.verify_migration_target(target)?;
     let migration = (|| -> Result<(), AuthorityError> {
         let transaction = target.transaction()?;
@@ -4138,8 +4135,12 @@ fn enforce_authority_state_floor(connection: &Connection) -> Result<(), Authorit
                 |row| row.get(0),
             )
             .optional()?;
-        if floor.is_some_and(|floor| floor > BROKER_STATE_VERSION) {
-            return Err(AuthorityError::Storage("unsupported Broker state floor; restore a compatible backup instead of downgrading".into()));
+        if let Some(floor) = floor.filter(|floor| *floor > BROKER_STATE_VERSION) {
+            return Err(UnsupportedStoreVersion::StateFloor {
+                floor,
+                supported: BROKER_STATE_VERSION,
+            }
+            .into());
         }
     }
     Ok(())
@@ -4675,19 +4676,56 @@ fn asset_id(chain: &str, asset: &str) -> String {
     format!("{chain}:{asset}")
 }
 
+/// The first declared destination the wallet policy does not allow.
+///
+/// Compared by decoded value rather than by spelling: one account has several
+/// spellings on most chains, and only the chain's own rules say which of them
+/// name the same account. Entries this build cannot decode still compare
+/// verbatim, so this can widen a policy's reach but never narrow it.
+fn destination_outside_policy<'a>(
+    policy: &CanonicalWalletPolicy,
+    declared: &'a [DeclaredDestination],
+) -> Option<&'a DeclaredDestination> {
+    let allowed: BTreeSet<_> = policy
+        .allowed_destinations
+        .iter()
+        .map(|entry| {
+            (
+                entry.chain.clone(),
+                address::comparable(&entry.chain, &entry.destination),
+            )
+        })
+        .collect();
+    declared.iter().find(|destination| {
+        !allowed.contains(&(
+            destination.chain.clone(),
+            address::comparable(&destination.chain, &destination.destination),
+        ))
+    })
+}
+
 fn destination_policy_violation(
     subject: &str,
     declared: &DeclaredDestination,
-    allowed: &BTreeSet<PolicyDestination>,
+    allowed: &[PolicyDestination],
 ) -> String {
     let mut message = format!(
         "{subject} names destination {} for chain \"{}\" outside wallet policy",
         declared.destination,
         declared.chain.as_str()
     );
-    let conflicting: Vec<&str> = allowed
+    let declared_target = address::comparable(&declared.chain, &declared.destination);
+    // A set, so a policy that lists one entry twice names its chain once.
+    let conflicting: BTreeSet<&str> = allowed
         .iter()
-        .filter(|entry| entry.destination == declared.destination && entry.chain != declared.chain)
+        .filter(|entry| {
+            // Same spelling, or the same account spelled differently. This is
+            // a diagnostic, so it leans towards saying too much: the literal
+            // arm still reports chains whose addresses nothing here decodes.
+            entry.chain != declared.chain
+                && (entry.destination == declared.destination
+                    || address::comparable(&entry.chain, &entry.destination) == declared_target)
+        })
         .map(|entry| entry.chain.as_str())
         .collect();
     if !conflicting.is_empty() {
@@ -4834,5 +4872,52 @@ mod path_index_tests {
             "m/44'/501'/1'/0'",
             Some(0),
         ));
+    }
+}
+
+#[cfg(test)]
+mod legacy_attach_tests {
+    use super::*;
+    use crate::legacy_store::TestAuditSigner;
+
+    /// The startup probe opens the legacy store without the create flag, but
+    /// the migration attaches it afresh on the journal connection, which does
+    /// create. A store that disappears between the two would come back as an
+    /// empty file, and every later start would read that file as a home with
+    /// nothing to migrate, even where the store sits behind a link that would
+    /// otherwise fail startup.
+    #[test]
+    fn a_legacy_store_that_vanishes_before_the_attach_is_not_recreated() {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy_path = directory.path().join("authority.sqlite");
+        let legacy = Connection::open(&legacy_path).unwrap();
+        legacy
+            .execute_batch("CREATE TABLE policies(wallet_id TEXT PRIMARY KEY);")
+            .unwrap();
+        // The open connection keeps the file; only its directory entry goes,
+        // which is what the migration sees when the store vanishes after the
+        // probe.
+        std::fs::remove_file(&legacy_path).unwrap();
+
+        let journal = BrokerJournal::open(
+            directory.path().join("journal.sqlite"),
+            Arc::new(TestAuditSigner),
+        )
+        .unwrap();
+        let connection = journal.shared_connection();
+        let mut target = connection.lock().unwrap();
+
+        let error = migrate_legacy_authority(&mut target, &legacy, &journal)
+            .expect_err("a legacy store that is gone cannot be migrated");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot attach the legacy authority store"),
+            "the error must say which store could not be attached: {error}"
+        );
+        assert!(
+            !legacy_path.exists(),
+            "the attach must not recreate a vanished legacy store"
+        );
     }
 }
