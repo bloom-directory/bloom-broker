@@ -3510,6 +3510,22 @@ const PREVIEWS = {
     session.preview_status = "Synthetic DAI transfer · Not a live request";
     return session;
   },
+  "transfer-uni": () => {
+    const token = {address: "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", name: "Uniswap", symbol: "UNI", decimals: 18};
+    const session = previewApproval([previewPayload({chain_id: "1", chain: "ethereum", destination: token.address,
+      contract_call: previewCall("transfer", "40000000000000000000", "40 UNI", "finite", [], token)
+    })], previewClearSigning("1", token.address));
+    session.preview_status = "Synthetic UNI transfer · Not a live request";
+    return session;
+  },
+  "allowance-crv": () => {
+    const token = {address: "0xD533a949740bb3306d119CC777fa900bA034cd52", name: "Curve DAO Token", symbol: "CRV", decimals: 18};
+    const session = previewApproval([previewPayload({chain_id: "1", chain: "ethereum", destination: token.address,
+      contract_call: previewCall("allowance", "500000000000000000000", "500 CRV", "finite", [PREVIEW_ALLOWANCE_ADVISORY], token)
+    })], previewClearSigning("1", token.address));
+    session.preview_status = "Synthetic CRV spending permission · Not a live request";
+    return session;
+  },
   "allowance-finite": () => previewApproval([previewPayload({
     contract_call: previewCall("allowance", "100000000", "100 USDC", "finite", [
       PREVIEW_ALLOWANCE_ADVISORY,
@@ -3699,6 +3715,8 @@ async function load() {
             "enso-shortcut": "Enso edge case · No output protection · Runtime-dependent calls",
             "transfer-ethereum": "USDC transfer · Ethereum · ordinary wallet",
             "transfer-dai": "DAI transfer · Ethereum · ordinary wallet",
+            "transfer-uni": "UNI transfer · Ethereum · ordinary wallet",
+            "allowance-crv": "CRV spending permission · Ethereum · ordinary wallet",
             "native-send": "Ether transfer · Base · ordinary wallet",
             "solana-send": "SOL transfer · Solana mainnet · ordinary wallet",
             "safe-token-transfer": "USDC transfer · Base · Safe signature",
