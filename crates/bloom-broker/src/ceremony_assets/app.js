@@ -163,6 +163,15 @@ function nativeIcon(chainId) {
   const [chain, address] = (asset?.art || ":").split(":");
   return artworkIcon(tokenArt(chain, address));
 }
+// Plain network names for the page header. The exact chain ID stays in the
+// technical details; a chain without a name here shows its ID instead.
+const EVM_NETWORK_NAMES = {1: "Ethereum mainnet", 10: "Optimism", 56: "BNB Chain", 100: "Gnosis",
+  137: "Polygon", 8453: "Base", 42161: "Arbitrum", 43114: "Avalanche", 59144: "Linea", 999: "HyperEVM",
+  4663: "Robinhood", 4217: "Tempo", 5042: "Arc", 11155111: "Sepolia testnet", 84532: "Base Sepolia testnet",
+  31337: "Local test chain"};
+function evmNetworkName(chainId) {
+  return EVM_NETWORK_NAMES[Number(chainId)] || `Chain ID ${chainId}`;
+}
 // Network marks where one is bundled; otherwise the network's native asset.
 function chainIcon(chainId) {
   return {1: "ethereum", 8453: "base", 31337: "test"}[Number(chainId)]
@@ -682,7 +691,8 @@ function describeTransfer(manifest) {
       const row = [field.path === "chainId" && hyperliquid ? "Signing domain chain ID" : labels[field.path] || field.path,
         field.path === "chainId" && signingChain ? signingChain : field.value, true];
       if (hyperliquid || (polymarket && ["primaryType", "version", "salt", "chainId"].includes(field.path))
-        || (payment && ["primaryType", "version", "salt"].includes(field.path))) extraTechnical.push(row);
+        || (payment && ["primaryType", "version", "salt", "name", "verifyingContract"].includes(field.path))
+        || (field.path === "chainId" && signingChain)) extraTechnical.push(row);
       else primary.push(row);
     }
     if (payment) primary.push(["Valid from", time(payment.valid_after)], ["Valid until", time(payment.valid_before)]);
@@ -736,8 +746,8 @@ function describeTransfer(manifest) {
       sentence: solana ? "Approve one transaction. Only its recent blockhash may refresh; every other signed byte remains bound to this review."
         : authenticationScope ? "Allow the fixed authentication profile below. Broker checks the fresh message when this permission is used."
         : payment ? "Authorize this exact token payment within the signed validity window." : "Review the exact fields bound to this message signature.",
-      chainId, networkIdentity: solana ? "Solana · cluster not encoded in message" : hyperliquid ? `Hyperliquid · ${venueNetwork || "Unknown environment"}`
-        : chainId ? `${({1:"Ethereum",10:"Optimism",56:"BNB Chain",100:"Gnosis",137:"Polygon",8453:"Base",42161:"Arbitrum",43114:"Avalanche",59144:"Linea",999:"HyperEVM",4663:"Robinhood",4217:"Tempo",5042:"Arc"})[chainId] || "EVM"} · Chain ID ${chainId}` : "Message signature",
+      chainId, networkIdentity: solana ? "Solana · network not stated in the transaction" : hyperliquid ? `Hyperliquid · ${venueNetwork || "Unknown environment"}`
+        : chainId ? evmNetworkName(chainId) : "Message signature",
       networkIcon: solana ? "solana" : chainId ? chainIcon(chainId) : "unknown",
       facts: [], technical: [...(message.payload_keccak ? [["Signing hash", message.payload_keccak, true]] : []),
         ...extraTechnical, ...(message.venue_asset?.base_units ? [["USDC base units", message.venue_asset.base_units, true]] : []),
@@ -779,6 +789,7 @@ function describeTransfer(manifest) {
     }
     else technical.push([label("Native value sent"), payload.value_display]);
     facts.push([label("Network"), chainLabel(payload.chain)]);
+    technical.push([label("Chain ID"), String(payload.chain_id)]);
     // A ceiling on execution gas, computed by Broker from the envelope's own
     // gas limit and price in the chain's authenticated units. It is a maximum
     // for that charge, not an estimate and not a cap on every network charge.
@@ -986,8 +997,7 @@ function describeTransfer(manifest) {
     if (clear) {
       interpretation.push(["Assurance class", clear.assurance]);
     }
-    const networkIdentity = oneNetwork
-      ? `EVM · ${network} · Chain ID ${first.chain_id}` : "EVM · Multiple networks";
+    const networkIdentity = oneNetwork ? evmNetworkName(first.chain_id) : "Multiple networks";
     // The amount, the token mark, and the counterparties are on the page.
     // A sentence that points at a closed disclosure is how those disappeared.
     const sentence = intent.action === "batch"
@@ -1104,7 +1114,7 @@ function describeTransfer(manifest) {
     for (const row of rows.filter(safeTechnical)) {
       technical.push([row.label, row.value, /^0x[0-9a-fA-F]{40}$/.test(row.value) || row.label === "Contract code"]);
     }
-    technical.push(["Signing owner", safe.owner, true]);
+    technical.push(["Chain ID", String(safe.chain_id)], ["Signing owner", safe.owner, true]);
     if (safe.destination.toLowerCase() !== safe.safe.toLowerCase()) technical.push(["Calls", safe.destination, true]);
     if (safe.operation === "delegatecall") technical.push(["Operation", "delegatecall"]);
     technical.push(["Safe transaction hash", safe.safe_tx_hash, true]);
@@ -1160,7 +1170,7 @@ function describeTransfer(manifest) {
     const safeMovement = !permission && directToken && safeRecipient && amount ? amount : null;
     return {sentence, facts, technical, warnings, willVerify: true, heading, safeMovement,
       button: "Approve Safe signature", chainId: safe.chain_id, tokenAsset, safeCards, safeParties,
-      networkIdentity: `EVM · ${network} · Chain ID ${safe.chain_id}`,
+      networkIdentity: evmNetworkName(safe.chain_id),
       networkIcon: chainIcon(safe.chain_id)};
   }
   if (!claim) return null;

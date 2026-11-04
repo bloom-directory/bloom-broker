@@ -11269,8 +11269,11 @@ if (!view.primary.includes("−250 USDC") || !view.primary.includes("+250 USDC")
 if (!view.technical.includes("Contract behavior has not been verified")) {{
   throw new Error("the interpretation limitation disappeared from details");
 }}
-if (!allText(nodes["page-title"]).includes("Chain ID 8453")) {{
-  throw new Error("the exact EVM chain is missing from the primary context");
+// The header names the network in plain words; the exact chain ID is in
+// the technical details.
+if (!allText(nodes["page-title"]).includes("Base") || allText(nodes["page-title"]).includes("Chain ID")
+    || !view.technical.includes("8453")) {{
+  throw new Error(`network name or exact chain ID missing: ${{allText(nodes["page-title"])}}`);
 }}
 if (!view.primary.includes("USD Coin") || !view.primary.includes("USDC")) {{
   throw new Error("the token's full name is missing from the decision");
