@@ -11,7 +11,6 @@ mod methods;
 mod petal_key;
 mod policy;
 mod provenance;
-mod reusable_profile;
 mod revocation;
 mod service;
 mod session;
@@ -33,7 +32,6 @@ pub use methods::*;
 pub use petal_key::*;
 pub use policy::*;
 pub use provenance::*;
-pub use reusable_profile::*;
 pub mod address;
 
 pub use revocation::*;
@@ -66,8 +64,8 @@ pub const RATE_LIMIT_DETAILS_MINOR: u16 = 4;
 // Released 1.7 used strict catalog-policy and hash-only caller shapes.
 // Broker-owned token sessions use the strict Machine edge at 1.10.
 // The pinned Broker–Signer edge uses Signer protocol 1.8.
-pub const BROKER_API_MINOR_MIN: u16 = 10;
-pub const BROKER_API_MINOR_MAX: u16 = 10;
+pub const BROKER_API_MINOR_MIN: u16 = 11;
+pub const BROKER_API_MINOR_MAX: u16 = 11;
 pub const BROKER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(BROKER_API_MAJOR, BROKER_API_MINOR_MAX);
 pub const BROKER_API_RANGE: ProtocolVersionRange =

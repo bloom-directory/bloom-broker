@@ -8,6 +8,53 @@ use sha2::{Digest as _, Sha256};
 /// Approval expiry itself uses DecimalU64(u64::MAX), serialized as a string.
 pub const STANDING_APPROVAL_POLICY_LIFETIME_MS: u64 = 9_007_199_254_740_991;
 
+pub const DECLARED_EFFECTS_CAPABILITY: &str = "bloom.declared-effects.v1";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclaredSpendKind {
+    None,
+    Bounded,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PetalSessionPersona {
+    Institutional,
+    Trader,
+    Degen,
+}
+
+/// Owner-reviewed automatic authority. The single zero-spend rate cap is
+/// shared by every listed class within this grant, never multiplied by classes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PetalSessionPolicy {
+    pub persona: PetalSessionPersona,
+    pub zero_spend_classes: Vec<Token>,
+    pub zero_spend_rate_limit: Option<SlidingWindow>,
+}
+impl PetalSessionPolicy {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.persona == PetalSessionPersona::Institutional
+            || self.zero_spend_classes.len() > 128
+            || self
+                .zero_spend_classes
+                .iter()
+                .enumerate()
+                .any(|(i, class)| self.zero_spend_classes[..i].contains(class))
+            || self.zero_spend_classes.is_empty() != self.zero_spend_rate_limit.is_none()
+            || self
+                .zero_spend_rate_limit
+                .as_ref()
+                .is_some_and(|cap| cap.maximum.get() == 0 || cap.duration_ms.get() == 0)
+        {
+            return Err(invalid("invalid automatic persona grant"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionTokenAsset {
@@ -47,6 +94,7 @@ pub struct SessionPayloadContext {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EconomicEffectsV1 {
+    pub spend: DeclaredSpendKind,
     pub schema_version: u16,
     pub payload_contexts: Vec<SessionPayloadContext>,
     pub permission_effect: SessionPermissionEffect,
@@ -76,7 +124,6 @@ fn invalid(s: &str) -> ProtocolError {
 impl SessionTokenPolicy {
     pub fn validate(&self, limits: &ApprovalLimits) -> Result<(), ProtocolError> {
         if self.schema_version != 3
-            || self.assets.is_empty()
             || self.assets.len() > 128
             || self.member_scope_digests.is_empty()
             || self.member_templates.len() != self.member_scope_digests.len()
@@ -223,8 +270,6 @@ pub fn approved_session_asset(asset: &AssetId) -> Option<SessionTokenAsset> {
                     _ => return None,
                 },
             )
-        } else if id == 137 && asset.asset == "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb" {
-            (6, "pUSD")
         } else {
             let token = known_tokens()
                 .iter()
@@ -286,6 +331,40 @@ mod standing_policy_tests {
         assert_eq!(
             decoded["maximum_approval_lifetime_ms"].as_u64(),
             Some(STANDING_APPROVAL_POLICY_LIFETIME_MS)
+        );
+    }
+}
+
+#[cfg(test)]
+mod declaration_tests {
+    use super::*;
+    #[test]
+    fn explicit_declaration_and_persona_cap_are_required() {
+        let raw = serde_json::json!({"schema_version":1,"payload_contexts":[],"permission_effect":"none"});
+        assert!(serde_json::from_value::<EconomicEffectsV1>(raw).is_err());
+        let cap = SlidingWindow {
+            maximum: DecimalU64::new(60),
+            duration_ms: DecimalU64::new(3_600_000),
+        };
+        let mut policy = PetalSessionPolicy {
+            persona: PetalSessionPersona::Trader,
+            zero_spend_classes: vec![Token::new("example.login").unwrap()],
+            zero_spend_rate_limit: Some(cap),
+        };
+        policy.validate().unwrap();
+        policy.persona = PetalSessionPersona::Institutional;
+        assert!(policy.validate().is_err());
+        policy.persona = PetalSessionPersona::Degen;
+        policy.zero_spend_rate_limit = None;
+        assert!(policy.validate().is_err());
+    }
+    #[test]
+    fn legacy_native_selector_is_not_an_alias() {
+        assert!(
+            serde_json::from_value::<ApprovalSelector>(
+                serde_json::json!({"kind":"system_session","scope":{}})
+            )
+            .is_err()
         );
     }
 }

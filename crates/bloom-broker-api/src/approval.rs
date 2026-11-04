@@ -32,38 +32,6 @@ const APPROVAL_DOMAIN: &[u8] = b"bloom-sealed-approval-terms/v1";
 /// the Safe Petal under this class is a release-trust requirement.
 pub const SAFE_CONFIRM_OPERATION_CLASS: &str = "safe.transaction.confirm";
 
-/// Released Petal operation classes whose exact signatures require a full
-/// message preimage review. Reusable grants cannot review future messages.
-pub const MESSAGE_REVIEW_OPERATION_CLASSES: &[&str] = &[
-    "gasless.relay",
-    "venice-x402.topup",
-    "venice-x402.chat",
-    "venice-x402.balance",
-    "hyperliquid.approve_agent",
-    "hyperliquid.usd_send",
-    "hyperliquid.usd_class_transfer",
-    "hyperliquid.withdraw",
-    "hyperliquid.order",
-    "hyperliquid.cancel",
-    "hyperliquid.cancel_by_cloid",
-    "hyperliquid.schedule_cancel",
-    "hyperliquid.update_leverage",
-];
-
-/// These callers use the batch host API with one exact prepared signature.
-/// Onboarding also has a separate reusable, single-use login grant; it is
-/// intentionally not converted into an exact timestamp-bound login approval.
-pub const POLYMARKET_REVIEW_OPERATION_CLASSES: &[&str] = &[
-    "polymarket.order.poly1271",
-    "polymarket.relayer_batch",
-    "polymarket.onboard",
-];
-
-/// Immutable v1 profile: Polygon ClobAuth, nonce 0, one signature, selected
-/// owner, fixed attestation and a timestamp within 300 seconds at use. A wider
-/// profile must have a new class so existing grants cannot silently widen.
-pub const POLYMARKET_CLOB_AUTH_CLASS: &str = "polymarket.clob_auth.v1";
-
 /// Machine's own x402 payments. Exact approvals for this System class must
 /// carry the EIP-3009 or Permit2 typed data so the owner sees the signed payment.
 pub const SYSTEM_X402_OPERATION_CLASS: &str = "paid-http.x402";
@@ -71,14 +39,6 @@ pub const SYSTEM_X402_OPERATION_CLASS: &str = "paid-http.x402";
 /// Machine's own MPP (Tempo) payments. Exact approvals for this System class
 /// must carry a `tempo_transaction` or `tempo_voucher` review envelope.
 pub const SYSTEM_MPP_OPERATION_CLASS: &str = "paid-http.mpp";
-
-pub fn message_review_requires_exact(class: &str) -> bool {
-    MESSAGE_REVIEW_OPERATION_CLASSES.contains(&class)
-        || matches!(
-            class,
-            "polymarket.order.poly1271" | "polymarket.relayer_batch" | "polymarket.onboard"
-        )
-}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -113,9 +73,8 @@ pub enum ApprovalSelector {
         ordered_payload_digests: Vec<Digest32>,
         ordered_hashes: Vec<Digest32>,
     },
-    /// Legacy draft shape retained only for an explicit fail-closed refusal.
-    /// Native reusable authority is outside the Petal-only release.
-    SystemSession { scope: crate::SystemSessionScope },
+    /// Standard native wallet transfers with independently checked bytes.
+    NativeSession { scope: crate::SystemSessionScope },
     Petal {
         package_hash: Digest32,
         route: String,
@@ -257,7 +216,7 @@ impl SealedApprovalTerms {
         match (&self.subject, &self.selector) {
             (
                 ApprovalSubject::System { component_id, .. },
-                ApprovalSelector::SystemSession { scope },
+                ApprovalSelector::NativeSession { scope },
             ) if component_id == &scope.component_id => {
                 scope.validate()?;
                 if self
@@ -348,7 +307,7 @@ impl SealedApprovalTerms {
             .as_object_mut()
             .expect("approval terms serialize as an object");
         object.remove("session_budget");
-        if let ApprovalSelector::SystemSession { scope } = &self.selector {
+        if let ApprovalSelector::NativeSession { scope } = &self.selector {
             let operation_class = match &self.subject {
                 ApprovalSubject::System {
                     operation_class, ..

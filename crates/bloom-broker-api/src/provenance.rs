@@ -37,6 +37,8 @@ pub enum ProvenanceSubject {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_display_name: Option<String>,
     pub subject: ProvenanceSubject,
     pub publisher: Token,
     /// Installer-verified publisher/controller assertion that this package is
@@ -62,6 +64,8 @@ pub struct PetalLineageMembership {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceOperationClass {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub zero_spend: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub economic_effects_schema: Option<u16>,
     pub operation_class: Token,
@@ -190,10 +194,12 @@ mod tests {
 
     fn record(subject: ProvenanceSubject) -> ProvenanceRecord {
         ProvenanceRecord {
+            package_display_name: None,
             subject,
             publisher: Token::new("bloom-installer").unwrap(),
             petal_lineage: None,
             operation_classes: vec![ProvenanceOperationClass {
+                zero_spend: false,
                 economic_effects_schema: None,
                 operation_class: Token::new("transaction.confirm").unwrap(),
                 fee_asset: None,
@@ -265,4 +271,8 @@ mod tests {
         assert_eq!(first.unsigned_canonical_bytes().unwrap(), unsigned);
         assert_ne!(first.digest().unwrap(), digest);
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }

@@ -162,6 +162,7 @@ pub struct SessionAssetAmount {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionBudget {
+    pub petal_policy: Option<crate::PetalSessionPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_policy: Option<crate::SessionTokenPolicy>,
     pub wallet_id: Token,
@@ -193,7 +194,11 @@ impl SessionBudget {
             || self.expires_at_ms.get() <= self.not_before_ms.get()
             || self.limits.max_operations.get() == 0
             || self.limits.max_signatures.get() == 0
-            || self.per_action_value_limits.is_empty()
+            || (self.per_action_value_limits.is_empty()
+                && self
+                    .petal_policy
+                    .as_ref()
+                    .is_none_or(|p| p.zero_spend_classes.is_empty()))
             || self.per_action_value_limits.len() > 128
             || self
                 .per_action_value_limits
@@ -207,6 +212,9 @@ impl SessionBudget {
                 })
         {
             return Err(invalid("invalid immutable session budget"));
+        }
+        if let Some(policy) = &self.petal_policy {
+            policy.validate()?;
         }
         crate::approval::validate_limits(&self.limits)?;
         if let Some(policy) = &self.token_policy {
@@ -334,6 +342,8 @@ impl SessionBudget {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionRecordedUse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zero_spend_class: Option<Token>,
     pub accepted_at_ms: u64,
     pub signature_count: u64,
     pub values: Vec<SessionAssetAmount>,
@@ -725,6 +735,7 @@ mod token_allowance_tests {
     }
     fn budget() -> SessionBudget {
         SessionBudget {
+            petal_policy: None,
             token_policy: None,
             wallet_id: Token::new("wallet").unwrap(),
             policy_version: DecimalU64::new(1),
@@ -768,6 +779,7 @@ mod token_allowance_tests {
     }
     fn use_(name: &str, amount: &str, time: u64) -> SessionRecordedUse {
         SessionRecordedUse {
+            zero_spend_class: None,
             accepted_at_ms: time,
             signature_count: 1,
             values: vec![SessionAssetAmount {
