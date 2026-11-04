@@ -8,7 +8,7 @@
 //! Solana's own construction code cannot redefine what is being signed.
 
 use bloom_broker_api::{
-    ClaimAssuranceLevel, CryptoSuite, Digest32, PetalUseClaim,
+    ClaimAssuranceLevel, CryptoSuite, DeclaredFee, Digest32, PetalUseClaim,
     SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES, SOLANA_SYSTEM_TRANSFER_VERIFIER_ID,
     SystemUseClaim, Token,
 };
@@ -42,11 +42,12 @@ impl AssuranceVerifier for SolanaSystemTransferVerifier {
             // The fields this verifier independently establishes from the
             // message evidence. Provenance/identity fields (package_hash,
             // route, operation_class, crypto_suite, ordered_hashes, nonce)
-            // are bound by Broker's own claim-mismatch checks, and Solana's
-            // fee is machine-asserted — neither is verifier-proven.
+            // are bound by Broker's own claim-mismatch checks and are not
+            // verifier-proven. The fee is computed from the message (bloom#305).
             established_fields: vec![
                 Token::new("declared_destinations").expect("valid token"),
                 Token::new("declared_debits").expect("valid token"),
+                Token::new("declared_fee").expect("valid token"),
                 Token::new("payload_digest").expect("valid token"),
                 Token::new("recent_blockhash").expect("valid token"),
             ],
@@ -122,6 +123,22 @@ impl AssuranceVerifier for SolanaSystemTransferVerifier {
         if verified.recent_blockhash != claim.chain_context.recent_blockhash {
             return Err("signed message blockhash differs from system claim".to_owned());
         }
+        // The owner is shown this fee and it is charged to the wallet's limits,
+        // so it must match the message, not just the RPC that priced it.
+        let DeclaredFee::Fee {
+            chain,
+            asset,
+            amount,
+        } = &claim.declared_fee
+        else {
+            return Err("native Solana transfer requires a solana:native fee".to_owned());
+        };
+        let declared_lamports = match amount.as_str().parse::<u64>() {
+            Ok(lamports) if chain.as_str() == "solana" && asset == "native" => lamports,
+            _ => return Err("native Solana transfer requires a solana:native fee".to_owned()),
+        };
+        bloom_solana_verify::verify_fee(&verified, declared_lamports)
+            .map_err(|reason| format!("{reason:?}"))?;
         // Belt and braces: `verify_native_transfer` already rejects a payer
         // mismatch, so this asserts the verified identity we carry forward is
         // the one that was checked rather than re-deriving trust from it.
@@ -161,13 +178,70 @@ mod tests {
                 chain: Token::new("solana").unwrap(),
                 destination: destination.to_string(),
             }],
-            declared_fee: DeclaredFee::None,
+            declared_fee: native_fee(5_000),
             nonce: bloom_broker_api::RequestNonce::new("00".repeat(16)).unwrap(),
             claim_assurance: ClaimAssurance::ProofVerified {
                 verifier_id: Token::new(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID).unwrap(),
                 verifier_digest: Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES),
                 proof_digest: Digest32::from_bytes([0x22; 32]),
             },
+        }
+    }
+
+    fn native_fee(lamports: u64) -> DeclaredFee {
+        DeclaredFee::Fee {
+            chain: Token::new("solana").unwrap(),
+            asset: "native".into(),
+            amount: bloom_broker_api::DecimalU256::parse(lamports.to_string()).unwrap(),
+        }
+    }
+
+    /// bloom#305: Machine takes this fee from its RPC. The owner sees it and
+    /// it counts against the wallet's limits, so a figure other than one base
+    /// fee per signature is refused, high or low, whatever genesis is claimed.
+    #[test]
+    fn declared_fee_must_equal_the_message_signature_fee() {
+        let payer = Pubkey::from_bytes([1u8; 32]);
+        let dest = Pubkey::from_bytes([2u8; 32]);
+        let bytes = transfer_message(payer, dest, 42, [7u8; 32])
+            .unwrap()
+            .serialize();
+        let mut claim = system_claim(
+            &dest,
+            42,
+            bloom_solana_verify::message_digest(&bytes),
+            [7u8; 32],
+        );
+        let verify = |claim: &SystemUseClaim| {
+            SolanaSystemTransferVerifier.verify_system(claim, Some(&bytes), Some(&payer.to_bytes()))
+        };
+        for genesis in [
+            "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+            "local-validator-genesis",
+        ] {
+            claim.chain_context.genesis_hash = genesis.into();
+            claim.declared_fee = native_fee(5_000);
+            verify(&claim).unwrap();
+            for wrong in [native_fee(0), native_fee(4_999), native_fee(10_000)] {
+                claim.declared_fee = wrong.clone();
+                let error = verify(&claim).unwrap_err();
+                assert!(
+                    error.contains("FeeMismatch"),
+                    "{genesis} {wrong:?}: {error}"
+                );
+            }
+        }
+        for wrong in [
+            DeclaredFee::None,
+            DeclaredFee::Fee {
+                chain: Token::new("solana").unwrap(),
+                asset: "usdc".into(),
+                amount: bloom_broker_api::DecimalU256::parse("5000").unwrap(),
+            },
+        ] {
+            claim.declared_fee = wrong.clone();
+            let error = verify(&claim).unwrap_err();
+            assert!(error.contains("solana:native fee"), "{wrong:?}: {error}");
         }
     }
 

@@ -18,6 +18,7 @@ const MAX_DEPTH: usize = 12;
 mod hyperliquid;
 mod polymarket;
 pub(crate) mod polymarket_auth;
+mod tempo;
 
 /// A standing agent grant authorizes future actions, so its exact witness
 /// arrives at signing use rather than through a new owner ceremony. This
@@ -177,6 +178,18 @@ enum Envelope {
         nonce: u64,
         vault_address: Option<String>,
         expires_after: Option<u64>,
+    },
+    TempoTransaction {
+        schema: String,
+        transaction: String,
+    },
+    TempoVoucher {
+        schema: String,
+        chain_id: u64,
+        escrow: String,
+        channel_id: String,
+        cumulative_amount: String,
+        channel: Option<tempo::Channel>,
     },
 }
 
@@ -504,6 +517,36 @@ fn decode_with_exchange_limit(
             review.warnings.push("Bloom rebuilt the exchange action's MessagePack commitment. Market IDs, order bounds and fees are signed; Bloom has not checked market identity, available balance, fills or venue execution.".into());
             return Ok((preimage, review));
         }
+        Envelope::TempoTransaction {
+            schema,
+            transaction,
+        } => {
+            if schema != SCHEMA {
+                return Err(invalid("unsupported message review schema"));
+            }
+            tempo::transaction(&transaction, signer, &mut review)?
+        }
+        Envelope::TempoVoucher {
+            schema,
+            chain_id,
+            escrow,
+            channel_id,
+            cumulative_amount,
+            channel,
+        } => {
+            if schema != SCHEMA {
+                return Err(invalid("unsupported message review schema"));
+            }
+            tempo::voucher(
+                chain_id,
+                &escrow,
+                &channel_id,
+                &cumulative_amount,
+                channel,
+                signer,
+                &mut review,
+            )?
+        }
         Envelope::Eip712 { schema, typed_data } => {
             if schema != SCHEMA {
                 return Err(invalid("unsupported message review schema"));
@@ -589,6 +632,9 @@ fn decode_with_exchange_limit(
                 review.payment = payment(&typed, &value, signer)?;
                 if review.payment.is_some() {
                     review.title = "Authorize a token payment".into();
+                    if typed.primary_type == PERMIT2_PRIMARY {
+                        review.warnings.push("Permit2 collects this payment only if the wallet has already approved Permit2 to spend this token.".into());
+                    }
                 }
                 hyperliquid::decorate(&typed, &mut review);
             }
@@ -620,21 +666,33 @@ fn decode_with_exchange_limit(
     Ok((preimage, review))
 }
 
+const PERMIT2: Address = alloy::primitives::address!("000000000022D473030F116dDEE9F6B43aC78BA3");
+/// The x402 exact Permit2 proxy. Its `settle` pays only `witness.to`, so
+/// the witness recipient is the payee; any other spender could pay anyone.
+const X402_PERMIT2_PROXY: Address =
+    alloy::primitives::address!("402085c248EeA27D92E8b30b2C58ed07f9E20001");
+const PERMIT2_PRIMARY: &str = "PermitWitnessTransferFrom";
+const PERMIT2_TYPE: &str = "PermitWitnessTransferFrom(TokenPermissions permitted,address spender,uint256 nonce,uint256 deadline,Witness witness)TokenPermissions(address token,uint256 amount)Witness(address to,uint256 validAfter)";
+
 fn payment(
     typed: &TypedData,
     value: &DynSolValue,
     signer: Address,
 ) -> Result<Option<PaymentReview>, ProtocolError> {
+    let primary = typed.primary_type.as_str();
     if !matches!(
-        typed.primary_type.as_str(),
-        "TransferWithAuthorization" | "ReceiveWithAuthorization"
+        primary,
+        "TransferWithAuthorization" | "ReceiveWithAuthorization" | PERMIT2_PRIMARY
     ) {
         return Ok(None);
     }
-    let expected = format!(
-        "{}(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)",
-        typed.primary_type
-    );
+    let expected = if primary == PERMIT2_PRIMARY {
+        PERMIT2_TYPE.to_owned()
+    } else {
+        format!(
+            "{primary}(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
+        )
+    };
     if typed
         .encode_type()
         .map_err(|_| invalid("invalid payment type"))?
@@ -645,6 +703,52 @@ fn payment(
     let DynSolValue::CustomStruct { tuple, .. } = value else {
         return Err(invalid("payment must be a typed struct"));
     };
+    let chain = typed
+        .domain
+        .chain_id
+        .and_then(|chain| u64::try_from(chain).ok());
+    if primary == PERMIT2_PRIMARY {
+        let [
+            DynSolValue::CustomStruct {
+                tuple: permitted, ..
+            },
+            DynSolValue::Address(spender),
+            DynSolValue::Uint(nonce, _),
+            DynSolValue::Uint(deadline, _),
+            DynSolValue::CustomStruct { tuple: witness, .. },
+        ] = tuple.as_slice()
+        else {
+            return Err(invalid("invalid Permit2 payment fields"));
+        };
+        let (
+            [DynSolValue::Address(token), DynSolValue::Uint(amount, _)],
+            [DynSolValue::Address(to), DynSolValue::Uint(after, _)],
+        ) = (permitted.as_slice(), witness.as_slice())
+        else {
+            return Err(invalid("invalid Permit2 payment fields"));
+        };
+        let domain = &typed.domain;
+        let Some(chain) = chain.filter(|_| {
+            domain.name.as_deref() == Some("Permit2")
+                && domain.version.is_none()
+                && domain.salt.is_none()
+                && domain.verifying_contract == Some(PERMIT2)
+                && *spender == X402_PERMIT2_PROXY
+        }) else {
+            return Ok(None);
+        };
+        // Permit2 pulls the tokens from the signing account.
+        return payment_review(
+            chain,
+            *token,
+            signer,
+            *to,
+            *amount,
+            (*after, *deadline),
+            nonce.to_string(),
+        )
+        .map(Some);
+    }
     let [
         DynSolValue::Address(from),
         DynSolValue::Address(to),
@@ -661,50 +765,70 @@ fn payment(
             "payment authorizer differs from the approved signing account",
         ));
     }
-    let Some(chain) = typed
-        .domain
-        .chain_id
-        .and_then(|chain| u64::try_from(chain).ok())
-    else {
+    let (Some(chain), Some(contract)) = (chain, typed.domain.verifying_contract) else {
         return Ok(None);
     };
-    let Some(contract) = typed.domain.verifying_contract else {
-        return Ok(None);
-    };
-    let address = format!("{contract:#x}");
-    let token = bloom_broker_api::tokens_on(chain)
+    payment_review(
+        chain,
+        contract,
+        *from,
+        *to,
+        *amount,
+        (*after, *before),
+        format!("{nonce:#x}"),
+    )
+    .map(Some)
+}
+
+fn payment_review(
+    chain: u64,
+    token_address: Address,
+    from: Address,
+    to: Address,
+    amount: alloy::primitives::U256,
+    (after, before): (alloy::primitives::U256, alloy::primitives::U256),
+    nonce: String,
+) -> Result<PaymentReview, ProtocolError> {
+    if before <= after {
+        return Err(invalid("payment validity interval is empty"));
+    }
+    let token = known_token(chain, token_address);
+    Ok(PaymentReview {
+        chain_id: chain.to_string(),
+        token_address: format!("{token_address:#x}"),
+        from: format!("{from:#x}"),
+        recipient: format!("{to:#x}"),
+        amount: amount.to_string(),
+        amount_display: display_amount(&amount.to_string(), token.as_ref()),
+        valid_after: after.to_string(),
+        valid_before: before.to_string(),
+        nonce,
+        token,
+    })
+}
+
+fn known_token(chain: u64, address: Address) -> Option<TokenIdentity> {
+    let address = format!("{address:#x}");
+    bloom_broker_api::tokens_on(chain)
         .find(|token| token.address == address)
         .map(|token| TokenIdentity {
             address: token.address.clone(),
             symbol: token.symbol.clone(),
             name: token.name.clone(),
             decimals: token.decimals,
-        });
-    let display = token
-        .as_ref()
+        })
+}
+
+fn display_amount(base_units: &str, token: Option<&TokenIdentity>) -> String {
+    token
         .map(|token| {
             format!(
                 "{} {}",
-                format_base_units(&amount.to_string(), token.decimals),
+                format_base_units(base_units, token.decimals),
                 token.symbol
             )
         })
-        .unwrap_or_else(|| format!("{amount} raw units"));
-    if *before <= *after {
-        return Err(invalid("payment validity interval is empty"));
-    }
-    Ok(Some(PaymentReview {
-        chain_id: chain.to_string(),
-        token_address: address,
-        from: format!("{from:#x}"),
-        recipient: format!("{to:#x}"),
-        amount: amount.to_string(),
-        amount_display: display,
-        valid_after: after.to_string(),
-        valid_before: before.to_string(),
-        nonce: format!("{nonce:#x}"),
-        token,
-    }))
+        .unwrap_or_else(|| format!("{base_units} raw units"))
 }
 
 pub(crate) fn review(
@@ -714,7 +838,11 @@ pub(crate) fn review(
     if request.message_review_payloads.is_empty() {
         return Ok(None);
     }
-    if !matches!(request.terms.subject, ApprovalSubject::Petal { .. })
+    let system_x402 = is_system_x402(&request.terms.subject);
+    let system_mpp = is_system_mpp(&request.terms.subject);
+    if !(system_x402
+        || system_mpp
+        || matches!(request.terms.subject, ApprovalSubject::Petal { .. }))
         || !request.evm_review_payloads.is_empty()
         || !request.safe_review_payloads.is_empty()
     {
@@ -742,7 +870,7 @@ pub(crate) fn review(
         .petal_use_claim
         .as_ref()
         .map(|claim| claim.operation_class.as_str());
-    let (preimage, review) = if let Some(class) =
+    let (preimage, mut review) = if let Some(class) =
         class.filter(|class| bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES.contains(class))
     {
         polymarket::decode(&request.message_review_payloads[0].decode(), signer, class)?
@@ -756,8 +884,35 @@ pub(crate) fn review(
             "message review differs from the exact approved payload",
         ));
     }
+    if system_x402 && review.payment.is_none() {
+        return Err(invalid(
+            "Machine x402 approval requires an EIP-3009 payment authorization or a Permit2 transfer through the x402 Permit2 proxy; Broker cannot review other x402 payment forms",
+        ));
+    }
+    // The approval subject, not the message, establishes that this is
+    // Bloom Machine paying an x402 request, so the heading can say so.
+    if system_x402 {
+        review.title = "Authorize an x402 payment".into();
+    }
+    if system_mpp != review.kind.starts_with("tempo_") {
+        return Err(invalid(if system_mpp {
+            "Machine MPP approval requires a Tempo transaction or voucher review"
+        } else {
+            "Tempo payment reviews are only for Machine MPP approvals"
+        }));
+    }
     validate_petal_profile(request, &review)?;
     Ok(Some(review))
+}
+
+pub(crate) fn is_system_x402(subject: &ApprovalSubject) -> bool {
+    matches!(subject, ApprovalSubject::System { operation_class, .. }
+        if operation_class.as_str() == bloom_broker_api::SYSTEM_X402_OPERATION_CLASS)
+}
+
+pub(crate) fn is_system_mpp(subject: &ApprovalSubject) -> bool {
+    matches!(subject, ApprovalSubject::System { operation_class, .. }
+        if operation_class.as_str() == bloom_broker_api::SYSTEM_MPP_OPERATION_CLASS)
 }
 
 fn validate_petal_profile(
@@ -836,9 +991,22 @@ fn validate_petal_profile(
     if !needs_payment {
         return Ok(());
     }
-    let payment = review.payment.as_ref().ok_or_else(|| {
-        invalid("This payment operation requires a canonical ERC-3009 authorization")
-    })?;
+    let payment = review
+        .payment
+        .as_ref()
+        // Allow only ERC-3009 by name, so a missing primaryType refuses instead of passing.
+        .filter(|_| {
+            review.domain.iter().any(|field| {
+                field.path == "primaryType"
+                    && matches!(
+                        field.value.as_str(),
+                        "TransferWithAuthorization" | "ReceiveWithAuthorization"
+                    )
+            })
+        })
+        .ok_or_else(|| {
+            invalid("This payment operation requires a canonical ERC-3009 authorization")
+        })?;
     let chain: u64 = payment
         .chain_id
         .parse()
@@ -1061,6 +1229,234 @@ mod tests {
         request.petal_use_claim.as_mut().unwrap().operation_class =
             Token::new("venice-x402.chat").unwrap();
         assert!(review(&request, signer()).is_err());
+    }
+
+    #[test]
+    fn machine_x402_shows_the_signed_payment_and_refuses_relabels() {
+        let system = |data: Value| {
+            let mut request = request(envelope(data));
+            request.terms.subject = ApprovalSubject::System {
+                component_id: Token::new("bloom-machine").unwrap(),
+                operation_class: Token::new(bloom_broker_api::SYSTEM_X402_OPERATION_CLASS).unwrap(),
+            };
+            request
+        };
+        let approved = system(payment_data());
+        let reading = review(&approved, signer()).unwrap().unwrap();
+        assert_eq!(reading.title, "Authorize an x402 payment");
+        let payment = reading.payment.unwrap();
+        assert_eq!(payment.amount_display, "2.5 USDC");
+        assert_eq!(
+            payment.recipient,
+            "0x0000000000000000000000000000000000000008"
+        );
+        assert_eq!(payment.valid_before, "2000000000");
+        for (section, key, value) in [
+            ("message", "value", json!("2500001")),
+            (
+                "message",
+                "to",
+                json!("0x0000000000000000000000000000000000000009"),
+            ),
+            (
+                "domain",
+                "verifyingContract",
+                json!("0x0000000000000000000000000000000000000009"),
+            ),
+            ("message", "validBefore", json!("2000000001")),
+        ] {
+            let mut relabelled = payment_data();
+            relabelled[section][key] = value;
+            let mut wrong = approved.clone();
+            wrong.message_review_payloads = vec![Base64UrlBytes::from_bytes(&envelope(relabelled))];
+            assert!(review(&wrong, signer()).is_err(), "{key}");
+        }
+        let mut other = payment_data();
+        other["primaryType"] = json!("EIP712Domain");
+        other["message"] = json!({});
+        let error = review(&system(other), signer()).unwrap_err();
+        assert!(error.message.contains("EIP-3009"), "{}", error.message);
+    }
+
+    fn system(bytes: Vec<u8>, class: &str) -> ApprovalPrepareRequest {
+        let mut request = request(bytes);
+        request.terms.subject = ApprovalSubject::System {
+            component_id: Token::new("bloom-machine").unwrap(),
+            operation_class: Token::new(class).unwrap(),
+        };
+        request
+    }
+
+    fn permit2_data() -> Value {
+        json!({
+            "types": {
+                "EIP712Domain": [{"name":"name","type":"string"},{"name":"chainId","type":"uint256"},{"name":"verifyingContract","type":"address"}],
+                "PermitWitnessTransferFrom": [{"name":"permitted","type":"TokenPermissions"},{"name":"spender","type":"address"},{"name":"nonce","type":"uint256"},{"name":"deadline","type":"uint256"},{"name":"witness","type":"Witness"}],
+                "TokenPermissions": [{"name":"token","type":"address"},{"name":"amount","type":"uint256"}],
+                "Witness": [{"name":"to","type":"address"},{"name":"validAfter","type":"uint256"}]
+            },
+            "primaryType":"PermitWitnessTransferFrom",
+            "domain":{"name":"Permit2","chainId":8453,"verifyingContract":"0x000000000022D473030F116dDEE9F6B43aC78BA3"},
+            "message":{"permitted":{"token":"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913","amount":"2500000"},
+                "spender":"0x402085c248EeA27D92E8b30b2C58ed07f9E20001","nonce":"77","deadline":"2000000000",
+                "witness":{"to":"0x0000000000000000000000000000000000000008","validAfter":"0"}}
+        })
+    }
+
+    #[test]
+    fn machine_x402_permit2_through_the_proxy_shows_the_witness_recipient() {
+        let class = bloom_broker_api::SYSTEM_X402_OPERATION_CLASS;
+        let approved = system(envelope(permit2_data()), class);
+        let reading = review(&approved, signer()).unwrap().unwrap();
+        let payment = reading.payment.as_ref().unwrap();
+        assert_eq!(payment.amount_display, "2.5 USDC");
+        assert_eq!(
+            payment.recipient,
+            "0x0000000000000000000000000000000000000008"
+        );
+        assert_eq!(payment.from, format!("{:#x}", signer()));
+        assert_eq!(payment.valid_before, "2000000000");
+        assert_eq!(payment.nonce, "77");
+        assert!(
+            reading
+                .warnings
+                .iter()
+                .any(|w| w.contains("already approved Permit2"))
+        );
+        // Changed signed values no longer match the approved digests.
+        for (path, value) in [
+            ("/message/permitted/amount", json!("2500001")),
+            (
+                "/message/witness/to",
+                json!("0x0000000000000000000000000000000000000009"),
+            ),
+            ("/message/deadline", json!("2000000001")),
+        ] {
+            let mut changed = permit2_data();
+            *changed.pointer_mut(path).unwrap() = value;
+            let mut wrong = approved.clone();
+            wrong.message_review_payloads = vec![Base64UrlBytes::from_bytes(&envelope(changed))];
+            assert!(review(&wrong, signer()).is_err(), "{path}");
+        }
+        // Not the canonical Permit2 payment: not a payment, so refused.
+        let mut version = permit2_data();
+        version["types"]["EIP712Domain"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":"version","type":"string"}));
+        version["domain"]["version"] = json!("1");
+        let mut other_name = permit2_data();
+        other_name["domain"]["name"] = json!("Permit3");
+        for (path, value) in [
+            (
+                "/message/spender",
+                json!("0x0000000000000000000000000000000000000009"),
+            ),
+            (
+                "/domain/verifyingContract",
+                json!("0x0000000000000000000000000000000000000009"),
+            ),
+        ] {
+            let mut changed = permit2_data();
+            *changed.pointer_mut(path).unwrap() = value;
+            let error = review(&system(envelope(changed), class), signer()).unwrap_err();
+            assert!(
+                error.message.contains("Permit2 proxy"),
+                "{path}: {}",
+                error.message
+            );
+        }
+        for changed in [version, other_name] {
+            assert!(review(&system(envelope(changed), class), signer()).is_err());
+        }
+        let mut empty = permit2_data();
+        empty["message"]["witness"]["validAfter"] = json!("2000000000");
+        assert!(decode(&envelope(empty), signer()).is_err());
+    }
+
+    #[test]
+    fn petal_payment_classes_still_require_eip3009() {
+        use bloom_broker_api::{
+            AssetId, ClaimAssurance, DecimalU256, DeclaredDebit, DeclaredFee, PetalUseClaim,
+            ValueLimit,
+        };
+        let mut request = request(envelope(permit2_data()));
+        let asset = AssetId {
+            chain: Token::new("base").unwrap(),
+            asset: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".into(),
+        };
+        let amount = DecimalU256::parse("2500000").unwrap();
+        request.terms.limits.value_limits = vec![ValueLimit {
+            asset: asset.clone(),
+            lifetime: amount.clone(),
+            rolling_windows: vec![],
+        }];
+        request.petal_use_claim = Some(PetalUseClaim {
+            package_hash: Digest32::from_bytes([1; 32]),
+            route: "payment/a/0/confirm".into(),
+            operation_class: Token::new("gasless.relay").unwrap(),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: Digest32::from_bytes([2; 32]),
+            ordered_hashes: vec![],
+            declared_debits: vec![DeclaredDebit { asset, amount }],
+            declared_destinations: vec![],
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([3; 16]),
+            claim_assurance: ClaimAssurance::MachineAsserted,
+        });
+        let error = review(&request, signer()).unwrap_err();
+        assert!(error.message.contains("ERC-3009"), "{}", error.message);
+
+        // A payment review without its primaryType field also refuses.
+        let mut reading = decode(&envelope(permit2_data()), signer()).unwrap().1;
+        reading.domain.retain(|field| field.path != "primaryType");
+        let error = validate_petal_profile(&request, &reading).unwrap_err();
+        assert!(error.message.contains("ERC-3009"), "{}", error.message);
+    }
+
+    #[test]
+    fn tempo_reviews_belong_only_to_machine_mpp_approvals() {
+        let class = bloom_broker_api::SYSTEM_MPP_OPERATION_CLASS;
+        let charge = serde_json::to_vec(&json!({"schema":SCHEMA,"kind":"tempo_transaction",
+            "transaction":tempo::tests::CHARGE_UNSPONSORED_MEMO}))
+        .unwrap();
+        let reading = review(&system(charge.clone(), class), signer())
+            .unwrap()
+            .unwrap();
+        assert_eq!(reading.kind, "tempo_transaction");
+        let voucher = serde_json::to_vec(
+            &json!({"schema":SCHEMA,"kind":"tempo_voucher","chain_id":4217,
+            "escrow":"0x33b901018174ddabe4841042ab76ba85d4e24f25",
+            "channel_id":format!("0x{}", "12".repeat(32)),"cumulative_amount":"5"}),
+        )
+        .unwrap();
+        assert!(review(&system(voucher, class), signer()).unwrap().is_some());
+        // A Petal, or Machine x402, cannot present a Tempo review.
+        assert!(review(&request(charge.clone()), signer()).is_err());
+        assert!(
+            review(
+                &system(
+                    charge.clone(),
+                    bloom_broker_api::SYSTEM_X402_OPERATION_CLASS
+                ),
+                signer()
+            )
+            .is_err()
+        );
+        // Machine MPP cannot present some other message as its payment.
+        let error = review(&system(envelope(payment_data()), class), signer()).unwrap_err();
+        assert!(error.message.contains("Tempo"), "{}", error.message);
+        // The envelope must be the approved transaction.
+        let mut other = system(charge, class);
+        let mut bytes = hex::decode(&tempo::tests::CHARGE_UNSPONSORED_MEMO[2..]).unwrap();
+        let last = bytes.len() - 5;
+        bytes[last] ^= 1;
+        other.message_review_payloads = vec![Base64UrlBytes::from_bytes(
+            &serde_json::to_vec(&json!({"schema":SCHEMA,"kind":"tempo_transaction",
+                "transaction":format!("0x{}", hex::encode(bytes))}))
+            .unwrap(),
+        )];
+        assert!(review(&other, signer()).is_err());
     }
 
     #[test]
