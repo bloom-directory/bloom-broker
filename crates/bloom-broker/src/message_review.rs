@@ -870,7 +870,7 @@ pub(crate) fn review(
         .petal_use_claim
         .as_ref()
         .map(|claim| claim.operation_class.as_str());
-    let (preimage, review) = if let Some(class) =
+    let (preimage, mut review) = if let Some(class) =
         class.filter(|class| bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES.contains(class))
     {
         polymarket::decode(&request.message_review_payloads[0].decode(), signer, class)?
@@ -888,6 +888,11 @@ pub(crate) fn review(
         return Err(invalid(
             "Machine x402 approval requires an EIP-3009 payment authorization or a Permit2 transfer through the x402 Permit2 proxy; Broker cannot review other x402 payment forms",
         ));
+    }
+    // The approval subject, not the message, establishes that this is
+    // Bloom Machine paying an x402 request, so the heading can say so.
+    if system_x402 {
+        review.title = "Authorize an x402 payment".into();
     }
     if system_mpp != review.kind.starts_with("tempo_") {
         return Err(invalid(if system_mpp {
@@ -1237,11 +1242,9 @@ mod tests {
             request
         };
         let approved = system(payment_data());
-        let payment = review(&approved, signer())
-            .unwrap()
-            .unwrap()
-            .payment
-            .unwrap();
+        let reading = review(&approved, signer()).unwrap().unwrap();
+        assert_eq!(reading.title, "Authorize an x402 payment");
+        let payment = reading.payment.unwrap();
         assert_eq!(payment.amount_display, "2.5 USDC");
         assert_eq!(
             payment.recipient,
