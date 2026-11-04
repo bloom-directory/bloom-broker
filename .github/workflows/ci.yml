@@ -30,6 +30,14 @@ jobs:
           python3 scripts/test_token_artwork.py
           python3 -B scripts/test_token_derivation.py
           python3 -B crates/bloom-broker-api/tokens/tokens.py --offline crates/bloom-broker-api/tokens/fixtures/inputs-2026-10-22.json.gz --check crates/bloom-broker-api/tokens/tokens.json > /dev/null
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check onboarding, session review and wallet continuation
+        run: |
+          node scripts/test-onboarding-flow.cjs
+          node scripts/test-session-review-summary.cjs
+          node scripts/test-wallet-continue.cjs
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Check the developer-harness build

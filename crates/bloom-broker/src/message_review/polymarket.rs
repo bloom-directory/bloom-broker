@@ -1,6 +1,7 @@
 //! Current Polymarket PreparedSigning records, reconstructed independently.
 //! Auxiliary draft/quote fields never become signed review facts.
-use alloy::primitives::{Address, B256, keccak256};
+use alloy::primitives::{Address, B256, U256, keccak256};
+use alloy_dyn_abi::{DynSolValue, eip712::TypedData};
 use bloom_broker_api::{ProtocolError, SINGLE_PAYLOAD_MAX_BYTES};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -9,7 +10,95 @@ use super::{MessageField, MessageReview, bounded, invalid};
 
 const EXCHANGE: &str = "0xe111180000d2663c0091e4f400237545b87b996b";
 const NEG_RISK_EXCHANGE: &str = "0xe2222d279d744050d28e00520010520000310f59";
+const COLLATERAL: &str = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb";
+const OUTCOME_TOKEN: &str = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
 const ORDER: &str = "uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder";
+
+/// Facts from the same typed input that reconstructs the signing preimage.
+/// This result is internal: display wording and the existing wire/claim formats
+/// cannot select the accounting asset or amount.
+pub(super) struct Decoded {
+    pub preimage: Vec<u8>,
+    pub review: MessageReview,
+    pub order: Option<VerifiedOrder>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum OrderSide {
+    Buy,
+    Sell,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct VerifiedOrder {
+    pub side: OrderSide,
+    pub token_id: U256,
+    pub maker_amount: U256,
+    pub taker_amount: U256,
+}
+
+impl VerifiedOrder {
+    pub fn debit(&self) -> (bloom_broker_api::AssetId, U256) {
+        let asset = match self.side {
+            OrderSide::Buy => COLLATERAL.into(),
+            OrderSide::Sell => format!("erc1155:{OUTCOME_TOKEN}:{}", self.token_id),
+        };
+        (
+            bloom_broker_api::AssetId {
+                chain: bloom_broker_api::Token::new("evm-137").expect("compiled chain"),
+                asset,
+            },
+            self.maker_amount,
+        )
+    }
+
+    pub fn legacy_asset(&self) -> String {
+        match self.side {
+            OrderSide::Buy => "pusd".into(),
+            OrderSide::Sell => self.debit().0.asset,
+        }
+    }
+
+    fn from_typed(typed: &Value) -> Result<Self, ProtocolError> {
+        let typed: TypedData = serde_json::from_value(typed.clone())
+            .map_err(|_| invalid("invalid Polymarket typed order"))?;
+        let value = typed
+            .coerce()
+            .map_err(|_| invalid("Polymarket order does not match its type"))?;
+        fn member<'a>(
+            value: &'a DynSolValue,
+            name: &str,
+        ) -> Result<&'a DynSolValue, ProtocolError> {
+            let DynSolValue::CustomStruct {
+                prop_names, tuple, ..
+            } = value
+            else {
+                return Err(invalid("invalid typed order struct"));
+            };
+            prop_names
+                .iter()
+                .position(|field| field == name)
+                .and_then(|index| tuple.get(index))
+                .ok_or_else(|| invalid("typed order field is missing"))
+        }
+        let contents = member(&value, "contents")?;
+        let uint = |name| match member(contents, name)? {
+            DynSolValue::Uint(value, _) => Ok(*value),
+            _ => Err(invalid("invalid typed order integer")),
+        };
+        let side = match uint("side")? {
+            value if value == U256::ZERO => OrderSide::Buy,
+            value if value == U256::from(1) => OrderSide::Sell,
+            _ => return Err(invalid("unsupported typed order side")),
+        };
+        Ok(Self {
+            side,
+            token_id: uint("tokenId")?,
+            maker_amount: uint("makerAmount")?,
+            taker_amount: uint("takerAmount")?,
+        })
+    }
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -154,11 +243,7 @@ fn typed(prepared: &Prepared, class: &str) -> Result<Value, ProtocolError> {
     }
 }
 
-pub(super) fn decode(
-    bytes: &[u8],
-    signer: Address,
-    class: &str,
-) -> Result<(Vec<u8>, MessageReview), ProtocolError> {
+pub(super) fn decode(bytes: &[u8], signer: Address, class: &str) -> Result<Decoded, ProtocolError> {
     if !bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES.contains(&class) {
         return Err(invalid("unsupported Polymarket review operation"));
     }
@@ -182,6 +267,11 @@ pub(super) fn decode(
         ));
     }
     let typed = typed(&prepared, class)?;
+    let order = if class == "polymarket.order.poly1271" {
+        Some(VerifiedOrder::from_typed(&typed)?)
+    } else {
+        None
+    };
     let envelope =
         serde_json::to_vec(&json!({"schema":super::SCHEMA,"kind":"eip712","typed_data":typed}))
             .map_err(|_| invalid("cannot encode Polymarket typed review"))?;
@@ -194,40 +284,47 @@ pub(super) fn decode(
         ));
     }
     review.kind = "polymarket_exact".into();
-    if class == "polymarket.order.poly1271" {
-        review.title = if prepared.preimage["side"] == 0 {
-            "Sign a prediction-market buy order"
-        } else {
-            "Sign a prediction-market sell order"
+    if let Some(order) = &order {
+        review.title = match order.side {
+            OrderSide::Buy => "Sign a prediction-market buy order",
+            OrderSide::Sell => "Sign a prediction-market sell order",
         }
         .into();
         for field in &mut review.fields {
-            field.path = match field.path.as_str() {
-                "contents.makerAmount" => "Maker amount (raw protocol units)",
-                "contents.takerAmount" => "Taker amount (raw protocol units)",
-                "contents.tokenId" => "Outcome token ID (market identity unverified)",
-                "contents.side" => "Side (0 buy, 1 sell)",
-                other => other,
-            }
-            .to_owned();
+            let (path, value) = match field.path.as_str() {
+                "contents.makerAmount" => (
+                    "Maker amount (raw protocol units)",
+                    order.maker_amount.to_string(),
+                ),
+                "contents.takerAmount" => (
+                    "Taker amount (raw protocol units)",
+                    order.taker_amount.to_string(),
+                ),
+                "contents.tokenId" => (
+                    "Outcome token ID (market identity unverified)",
+                    order.token_id.to_string(),
+                ),
+                "contents.side" => (
+                    "Side (0 buy, 1 sell)",
+                    match order.side {
+                        OrderSide::Buy => "0",
+                        OrderSide::Sell => "1",
+                    }
+                    .into(),
+                ),
+                _ => continue,
+            };
+            field.path = path.into();
+            field.value = value;
         }
-        let collateral_key = if prepared.preimage["side"] == 0 {
-            "Maker amount (raw protocol units)"
-        } else {
-            "Taker amount (raw protocol units)"
-        };
-        let collateral = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb";
         let token = bloom_broker_api::tokens_on(137)
-            .find(|token| token.address == collateral)
+            .find(|token| token.address == COLLATERAL)
             .ok_or_else(|| invalid("Polymarket collateral is missing from the compiled catalog"))?;
-        // The typed reader has already coerced this signed uint256 to decimal.
-        // Never format the caller's original spelling (which can be hex).
-        let amount = &review
-            .fields
-            .iter()
-            .find(|field| field.path == collateral_key)
-            .ok_or_else(|| invalid("decoded order collateral amount is missing"))?
-            .value;
+        let amount = match order.side {
+            OrderSide::Buy => order.maker_amount,
+            OrderSide::Sell => order.taker_amount,
+        }
+        .to_string();
         review.collateral_asset = Some(bloom_evm_clear_signing::FieldAsset {
             chain_id: 137,
             token: bloom_evm_clear_signing::TokenIdentity {
@@ -238,13 +335,13 @@ pub(super) fn decode(
             },
             amount_display: format!(
                 "{} {}",
-                super::format_base_units(amount, token.decimals),
+                super::format_base_units(&amount, token.decimals),
                 token.symbol
             ),
         });
         review.fields.push(MessageField {
             path: "Collateral contract (Polygon)".into(),
-            value: collateral.into(),
+            value: COLLATERAL.into(),
         });
         review.fields.push(MessageField {
             path: "Signed order expiry".into(),
@@ -256,7 +353,11 @@ pub(super) fn decode(
         describe_calls(&prepared.preimage["calls"], &mut review)?;
     }
     review.warnings.push("Deposit-wallet ownership/implementation, live nonce, balances and execution effects are unverified. Draft IDs, intent hashes and acknowledgement flags are unsigned metadata.".into());
-    Ok((preimage, review))
+    Ok(Decoded {
+        preimage,
+        review,
+        order,
+    })
 }
 
 fn describe_calls(value: &Value, review: &mut MessageReview) -> Result<(), ProtocolError> {
@@ -543,7 +644,7 @@ mod tests {
     fn prepared_order_binds_every_signed_field_without_promoting_unsigned_labels() {
         let (prepared, signer) = prepared_order();
         let record = serde_json::to_value(&prepared).unwrap();
-        let (_, review) = decode(
+        let Decoded { review, .. } = decode(
             &serde_json::to_vec(&vec![&record]).unwrap(),
             signer,
             &prepared.intent,
@@ -569,7 +670,15 @@ mod tests {
                 .any(|field| field.value.contains("unsigned-draft"))
         );
         for (field, value) in [
+            ("salt", json!("479249096355")),
+            ("owner", json!("0x0000000000000000000000000000000000000009")),
+            ("token_id", json!("42")),
             ("maker_amount", json!("11782401")),
+            ("taker_amount", json!("21040001")),
+            ("side", json!(1)),
+            ("signature_type", json!(2)),
+            ("timestamp_ms", json!("1765432100001")),
+            ("chain_id", json!(1)),
             ("neg_risk", json!(true)),
             (
                 "funder",
@@ -608,7 +717,9 @@ mod tests {
         let mut hexadecimal = record.clone();
         hexadecimal["preimage"]["maker_amount"] =
             json!(format!("0x{:x}", alloy::primitives::U256::from(11_782_400)));
-        let (_, normalized) = decode(
+        let Decoded {
+            review: normalized, ..
+        } = decode(
             &serde_json::to_vec(&vec![hexadecimal]).unwrap(),
             signer,
             &prepared.intent,
@@ -617,13 +728,78 @@ mod tests {
         assert_eq!(review, normalized);
         let mut changed = record;
         changed["preimage"]["draft_id"] = json!("a different unsigned label");
-        let (_, changed) = decode(
+        let Decoded {
+            review: changed, ..
+        } = decode(
             &serde_json::to_vec(&vec![changed]).unwrap(),
             signer,
             &prepared.intent,
         )
         .unwrap();
         assert_eq!(review, changed);
+    }
+
+    #[test]
+    fn typed_economics_do_not_depend_on_review_labels_or_values() {
+        let (prepared, signer) = prepared_order();
+        let request = session_request(&prepared);
+        let mut decoded = decode(
+            &request.claim_assurance_evidence.as_ref().unwrap().decode(),
+            signer,
+            &prepared.intent,
+        )
+        .unwrap();
+        let order = decoded.order.as_ref().unwrap();
+        assert_eq!(order.side, OrderSide::Buy);
+        assert_eq!(order.maker_amount, U256::from(11_782_400));
+        assert_eq!(order.debit().0.asset, COLLATERAL);
+        assert_eq!(order.debit().1, order.maker_amount);
+        let claim = request.petal_use_claim.as_ref().unwrap();
+        for field in &mut decoded.review.fields {
+            field.path = "Translated display label".into();
+            field.value = "untrusted display value".into();
+        }
+        decoded.review.title.clear();
+        super::super::validate_order_debit(claim, decoded.order.as_ref().unwrap(), true).unwrap();
+        let mut changed = decoded.order.unwrap();
+        changed.maker_amount += U256::from(1);
+        assert!(super::super::validate_order_debit(claim, &changed, true).is_err());
+    }
+
+    #[test]
+    fn malformed_order_economics_are_rejected_before_session_admission() {
+        let (prepared, signer) = prepared_order();
+        for field in [
+            "salt",
+            "token_id",
+            "maker_amount",
+            "taker_amount",
+            "timestamp_ms",
+        ] {
+            for malformed in [
+                json!("-1"),
+                json!("1.2"),
+                json!("not-an-integer"),
+                json!(format!("1{}", "0".repeat(78))),
+                Value::Null,
+                json!({}),
+            ] {
+                let mut record = serde_json::to_value(&prepared).unwrap();
+                record["preimage"][field] = malformed;
+                let mut request = session_request(&prepared);
+                request.claim_assurance_evidence =
+                    Some(bloom_broker_api::Base64UrlBytes::from_bytes(
+                        &serde_json::to_vec(&vec![record]).unwrap(),
+                    ));
+                assert!(
+                    super::super::verify_polymarket_session_use(&request, signer).is_err(),
+                    "{field}"
+                );
+            }
+        }
+        for malformed in [b"not-json".as_slice(), b"[]", b"{}"] {
+            assert!(decode(malformed, signer, &prepared.intent).is_err());
+        }
     }
 
     #[test]
@@ -651,7 +827,7 @@ mod tests {
         prepared.signing_hash = keccak256(&preimage);
         prepared.signing_preimage_hex = hex::encode(preimage);
         let record = serde_json::to_value(&prepared).unwrap();
-        let (_, review) = decode(
+        let Decoded { review, .. } = decode(
             &serde_json::to_vec(&vec![&record]).unwrap(),
             signer,
             &prepared.intent,

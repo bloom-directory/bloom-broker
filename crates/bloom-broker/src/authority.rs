@@ -2541,6 +2541,152 @@ impl BrokerAuthority {
         self.authorize_for_clock_profile(input, true)
     }
 
+    fn verified_request_provenance(
+        &self,
+        terms: &SealedApprovalTerms,
+        request: &MachineSignRequest,
+    ) -> Result<ProvenanceRecord, AuthorityError> {
+        let current_provenance = self.catalog_provenance(&request.provenance)?;
+        let multi_route = matches!(
+            &terms.selector,
+            ApprovalSelector::Petal { route_grants, .. } if !route_grants.is_empty()
+        );
+        let expected_provenance_digest = if multi_route {
+            let ProvenanceSubject::Petal { route, .. } = &request.provenance else {
+                return Err(denied(
+                    "PROVENANCE_MISMATCH",
+                    "multi-route approval requires Petal provenance",
+                ));
+            };
+            let ApprovalSelector::Petal { route_grants, .. } = &terms.selector else {
+                unreachable!("multi_route requires a Petal selector")
+            };
+            route_grants
+                .iter()
+                .find(|grant| &grant.route == route)
+                .map(|grant| grant.provenance_digest.clone())
+                .ok_or_else(|| denied("PROVENANCE_MISMATCH", "executing route is not granted"))?
+        } else {
+            terms.provenance_digest.clone()
+        };
+        verify_provenance(
+            &current_provenance,
+            &self.installer_key_id,
+            &self.installer_key,
+            &expected_provenance_digest,
+        )?;
+        if !multi_route && current_provenance != self.frozen_provenance_for(terms)? {
+            return Err(denied(
+                "PROVENANCE_MISMATCH",
+                "current installer catalog record differs from the approval-frozen record",
+            ));
+        }
+        let subject_matches = if multi_route {
+            matches!(
+                (&terms.subject, &current_provenance.subject),
+                (
+                    ApprovalSubject::Petal { package_hash, .. },
+                    ProvenanceSubject::Petal { package_hash: current_hash, .. }
+                ) if package_hash == current_hash
+            )
+        } else {
+            provenance_subject_matches(&terms.subject, &current_provenance.subject)
+        };
+        if current_provenance.subject != request.provenance || !subject_matches {
+            return Err(denied(
+                "PROVENANCE_MISMATCH",
+                "current provenance differs from the frozen approval record",
+            ));
+        }
+        Ok(current_provenance)
+    }
+
+    /// Read-only admission checks before a supported verifier can offer exact
+    /// review for a valid scope miss. Invalid provenance, claims and selectors
+    /// must never be mistaken for an approvable scope miss.
+    pub fn validate_petal_profile_preflight(
+        &self,
+        input: &AuthorizationInput,
+    ) -> Result<(), AuthorityError> {
+        let request = &input.request;
+        let terms = self
+            .approval_terms(&request.approval_id)?
+            .ok_or_else(|| denied("APPROVAL_NOT_FOUND", "approval does not exist"))?;
+        if terms.key_ref != request.key_ref {
+            return Err(denied(
+                "KEYREF_MISMATCH",
+                "profile request changed the approved key",
+            ));
+        }
+        if self.request_operation_digest(request)? != request.operation_digest {
+            return Err(denied(
+                "OPERATION_ID_CONFLICT",
+                "profile request identity changed",
+            ));
+        }
+        let provenance = self.verified_request_provenance(&terms, request)?;
+        let ApprovalSelector::Petal {
+            package_hash,
+            route,
+            allowed_operation_classes,
+            route_grants,
+            required_claim_assurance,
+        } = &terms.selector
+        else {
+            return Err(denied(
+                "SELECTOR_MISMATCH",
+                "profile requires a Petal selector",
+            ));
+        };
+        let claim = request
+            .petal_use_claim
+            .as_ref()
+            .ok_or_else(|| denied("PETAL_CLAIM_MISMATCH", "profile requires its claim"))?;
+        let (route, classes) = if route_grants.is_empty() {
+            (route, allowed_operation_classes)
+        } else {
+            let grant = route_grants
+                .iter()
+                .find(|grant| grant.route == claim.route)
+                .ok_or_else(|| denied("SELECTOR_MISMATCH", "profile route is not granted"))?;
+            (&grant.route, &grant.allowed_operation_classes)
+        };
+        if !provenance.operation_classes.iter().any(|entry| {
+            entry.operation_class == claim.operation_class
+                && entry.economic_effects_schema == Some(1)
+        }) {
+            return Err(denied(
+                "PROVENANCE_MISMATCH",
+                "profile lacks its certified effects contract",
+            ));
+        }
+        let (_, policy) = self.current_policy(&terms.wallet_id)?;
+        ensure_policy_signing_enabled(&policy)?;
+        if !policy.allowed_petal_packages.contains(package_hash) {
+            return Err(denied(
+                "PROVENANCE_MISMATCH",
+                "wallet policy does not permit this package",
+            ));
+        }
+        let payloads = payload_bytes(&request.payloads);
+        let hashes: Vec<_> = payloads
+            .iter()
+            .map(|payload| suite_hash(request.crypto_suite, payload))
+            .collect();
+        self.validate_petal_claim(
+            &terms,
+            &policy,
+            input,
+            claim,
+            package_hash,
+            route,
+            classes,
+            *required_claim_assurance,
+            &payloads,
+            &hashes,
+        )
+    }
+
     pub fn authorize_for_clock_profile(
         &self,
         input: &AuthorizationInput,
@@ -2610,58 +2756,7 @@ impl BrokerAuthority {
             .iter()
             .map(|payload| suite_hash(input.request.crypto_suite, payload))
             .collect();
-        let current_provenance = self.catalog_provenance(&input.request.provenance)?;
-        let multi_route = matches!(
-            &terms.selector,
-            ApprovalSelector::Petal { route_grants, .. } if !route_grants.is_empty()
-        );
-        let expected_provenance_digest = if multi_route {
-            let ProvenanceSubject::Petal { route, .. } = &input.request.provenance else {
-                return Err(denied(
-                    "PROVENANCE_MISMATCH",
-                    "multi-route approval requires Petal provenance",
-                ));
-            };
-            let ApprovalSelector::Petal { route_grants, .. } = &terms.selector else {
-                unreachable!("multi_route requires a Petal selector")
-            };
-            route_grants
-                .iter()
-                .find(|grant| &grant.route == route)
-                .map(|grant| grant.provenance_digest.clone())
-                .ok_or_else(|| denied("PROVENANCE_MISMATCH", "executing route is not granted"))?
-        } else {
-            terms.provenance_digest.clone()
-        };
-        verify_provenance(
-            &current_provenance,
-            &self.installer_key_id,
-            &self.installer_key,
-            &expected_provenance_digest,
-        )?;
-        if !multi_route && current_provenance != self.frozen_provenance_for(&terms)? {
-            return Err(denied(
-                "PROVENANCE_MISMATCH",
-                "current installer catalog record differs from the approval-frozen record",
-            ));
-        }
-        let subject_matches = if multi_route {
-            matches!(
-                (&terms.subject, &current_provenance.subject),
-                (
-                    ApprovalSubject::Petal { package_hash, .. },
-                    ProvenanceSubject::Petal { package_hash: current_hash, .. }
-                ) if package_hash == current_hash
-            )
-        } else {
-            provenance_subject_matches(&terms.subject, &current_provenance.subject)
-        };
-        if current_provenance.subject != input.request.provenance || !subject_matches {
-            return Err(denied(
-                "PROVENANCE_MISMATCH",
-                "current provenance differs from the frozen approval record",
-            ));
-        }
+        let current_provenance = self.verified_request_provenance(&terms, &input.request)?;
         if input.request.session_use.is_some()
             && !matches!(terms.selector, ApprovalSelector::SystemSession { .. })
         {

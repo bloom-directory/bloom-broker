@@ -4380,3 +4380,147 @@ fn typed_transfer_authority(erc20: bool, opt_in: bool) {
     }
     harness.journal.verify_audit_chain().unwrap();
 }
+
+#[test]
+fn profile_scope_miss_cannot_mask_invalid_provenance_or_claim_binding() {
+    use alloy_dyn_abi::eip712::TypedData;
+    use serde_json::json;
+    let harness = Harness::new();
+    let mut provenance = harness.provenance();
+    provenance.operation_classes = vec![ProvenanceOperationClass {
+        economic_effects_schema: Some(1),
+        operation_class: token("gasless.relay"),
+        fee_asset: None,
+    }];
+    sign_zeroed(
+        &mut provenance,
+        |v| &mut v.installer_signature,
+        PROVENANCE_DOMAIN,
+        &harness.installer_key,
+    );
+    let mut terms = petal_terms(&harness, &provenance);
+    if let ApprovalSelector::Petal {
+        allowed_operation_classes,
+        ..
+    } = &mut terms.selector
+    {
+        *allowed_operation_classes = vec![token("gasless.relay")];
+    }
+    harness.activate(&terms, Some(&provenance));
+    // A complete canonical authorization with an unreviewed receiver and long
+    // validity is a valid scope miss. Its exact typed preimage is still bound.
+    let typed_data = json!({
+        "domain":{"name":"USD Coin","version":"2","chainId":8453,"verifyingContract":"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"},
+        "types":{"EIP712Domain":[{"name":"name","type":"string"},{"name":"version","type":"string"},{"name":"chainId","type":"uint256"},{"name":"verifyingContract","type":"address"}],
+        "ReceiveWithAuthorization":[{"name":"from","type":"address"},{"name":"to","type":"address"},{"name":"value","type":"uint256"},{"name":"validAfter","type":"uint256"},{"name":"validBefore","type":"uint256"},{"name":"nonce","type":"bytes32"}]},
+        "primaryType":"ReceiveWithAuthorization", "message":{"from":"0x0000000000000000000000000000000000000007","to":"0x0000000000000000000000000000000000000008","value":"2500000","validAfter":"0","validBefore":"2000000000","nonce":format!("0x{}","11".repeat(32))}
+    });
+    let typed: TypedData = serde_json::from_value(typed_data.clone()).unwrap();
+    let mut payload = vec![0x19, 0x01];
+    payload.extend_from_slice(typed.domain.separator().as_slice());
+    payload.extend_from_slice(typed.hash_struct().unwrap().as_slice());
+    let mut input = petal_input(
+        &terms,
+        &provenance,
+        operation(100),
+        CryptoSuite::Secp256k1Keccak256Recoverable,
+    );
+    input.request.payloads = SigningPayloads::Single {
+        payload: Base64UrlBytes::from_bytes(&payload),
+    };
+    input.request.claim_assurance_evidence = Some(Base64UrlBytes::from_bytes(
+        &serde_json::to_vec(
+            &json!({"schema":"bloom.message.review.v1","kind":"eip712","typed_data":typed_data}),
+        )
+        .unwrap(),
+    ));
+    let claim = input.request.petal_use_claim.as_mut().unwrap();
+    claim.operation_class = token("gasless.relay");
+    let mut payload_digest = Sha256::new();
+    payload_digest.update(b"bloom.petal.payload-batch.v1\0");
+    payload_digest.update(1u64.to_be_bytes());
+    payload_digest.update((payload.len() as u64).to_be_bytes());
+    payload_digest.update(&payload);
+    claim.payload_digest = Digest32::from_bytes(payload_digest.finalize().into());
+    claim.ordered_hashes = vec![Digest32::from_bytes(
+        alloy::primitives::keccak256(&payload).into(),
+    )];
+    claim.declared_debits = vec![DeclaredDebit {
+        asset: AssetId {
+            chain: token("evm-8453"),
+            asset: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".into(),
+        },
+        amount: DecimalU256::parse("2500000").unwrap(),
+    }];
+    claim.declared_destinations.clear();
+    claim.declared_fee = DeclaredFee::None;
+    bind_operation_digest(&mut input, &terms);
+    harness
+        .authority
+        .validate_petal_profile_preflight(&input)
+        .unwrap();
+    assert!(
+        harness
+            .journal
+            .operation(&input.request.operation_id)
+            .unwrap()
+            .is_none(),
+        "preflight cannot reserve"
+    );
+    let mut changed = input.clone();
+    changed.request.provenance = ProvenanceSubject::Petal {
+        package_hash: digest(9),
+        route: "/unreviewed".into(),
+    };
+    bind_operation_digest(&mut changed, &terms);
+    let error = harness
+        .authority
+        .validate_petal_profile_preflight(&changed)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        bloom_broker::authority::AuthorityError::Denied {
+            code: "PROVENANCE_MISMATCH",
+            ..
+        }
+    ));
+    let mut changed = input.clone();
+    changed
+        .request
+        .petal_use_claim
+        .as_mut()
+        .unwrap()
+        .ordered_hashes[0] = digest(99);
+    bind_operation_digest(&mut changed, &terms);
+    let error = harness
+        .authority
+        .validate_petal_profile_preflight(&changed)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        bloom_broker::authority::AuthorityError::Denied {
+            code: "PETAL_CLAIM_MISMATCH",
+            ..
+        }
+    ));
+    let mut changed = provenance;
+    changed.publisher = token("different-publisher");
+    sign_zeroed(
+        &mut changed,
+        |v| &mut v.installer_signature,
+        PROVENANCE_DOMAIN,
+        &harness.installer_key,
+    );
+    harness.authority.install_provenance(&changed).unwrap();
+    let error = harness
+        .authority
+        .validate_petal_profile_preflight(&input)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        bloom_broker::authority::AuthorityError::Denied {
+            code: "PROVENANCE_MISMATCH",
+            ..
+        }
+    ));
+}

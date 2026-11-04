@@ -24,7 +24,7 @@ function harness(actions, options = {}) {
   let sessionCount = 0;
   const sandbox = {URL,URLSearchParams,Date,Number,JSON,Option:function(text,value){this.value=value;},location,history:{replaceState(){location.hash='';}},document:{getElementById:get,querySelectorAll:()=>[],createElement:element},window:{sessionStorage,addEventListener:(name,fn)=>{listeners[name]=fn;}},setTimeout:()=>1,clearTimeout(){},ResizeObserver:function(){},fetch:async(raw,options={})=>{
     const url = new URL(raw,location); calls.push({url:url.href,body:options.body});
-    if (url.pathname.endsWith('/api/state')) return response(JSON.parse(JSON.stringify(baseState)));
+    if (url.pathname.endsWith('/api/state')) return response(JSON.parse(JSON.stringify(options.state ?? baseState)));
     if (url.pathname.endsWith('/api/action')) {assert.equal(JSON.parse(options.body).action,Array.isArray(expectedAction)?expectedAction.shift():expectedAction); assert.ok(actions.length,'unexpected reconciliation');const data=actions.shift();const n=++actionNumber;if(pauseActions.includes(n))await new Promise(resolve=>releases.set(n,resolve));return response(data);}
     if (url.pathname === '/api/session') return response({ceremony_id:String(++sessionCount).repeat(64),expires_at_ms:Date.now()+60000});
     throw new Error('unexpected fetch '+url);
@@ -52,6 +52,25 @@ const pending = token => ({ceremony_url:'http://localhost:18734/ceremony/'+token
     const invalid=harness([],{hash:'',storage:new Map([[key,JSON.stringify(cached)]])});await invalid.settle();assert.equal(invalid.calls.length,0);assert.equal(invalid.get('next').disabled,true);
   }
   const malformed=harness([],{hash:'#bridge=https://attacker.example/',storage:connected.storage});await malformed.settle();assert.equal(malformed.calls.length,0,'an invalid new fragment cannot fall back to a cached connection');
+
+  // Rearm keeps the exact approval identity through the existing review and
+  // reconciles against Machine; a browser completion message alone cannot unlock.
+  const approval='b'.repeat(64);
+  const retained={approval_id:approval,account:'0',authority:{state:'ACTIVE'},locally_disabled:false,preparation_pending:false};
+  const unlocked=harness([{...pending('R'),data:retained},{data:retained}],{action:'rearm',state:{...baseState,sessions:{data:[retained]}}});
+  await unlocked.settle();
+  await unlocked.hooks.runAction('rearm',{approval});
+  assert.equal(unlocked.hooks.pending.approval,approval);
+  assert.match(unlocked.get('approval-purpose').textContent,/previous usage/);
+  assert.ok(unlocked.calls.filter(c=>c.body).every(c=>JSON.parse(c.body).approval===approval));
+  unlocked.message({origin:'https://attacker.example'});await unlocked.settle();
+  assert.equal(unlocked.calls.filter(c=>c.url.endsWith('/api/action')).length,1);
+  unlocked.message({});await unlocked.settle();
+  assert.equal(unlocked.hooks.pending,null);
+  assert.match(unlocked.get('status').textContent,/unlocked/);
+  assert.ok(unlocked.calls.filter(c=>c.body).every(c=>JSON.parse(c.body).approval===approval));
+  const unchanged=harness([]);await unchanged.settle();
+  await assert.rejects(()=>unchanged.hooks.runAction('rearm'),/Choose one existing permission/);
 
   // DefaultPolicyStatus uses #[serde(tag = "state")]; use the real wire shape.
   const resumed = harness([{data:{state:'applied',petals:['polymarket']}}]); await resumed.settle(); resumed.hooks.showStep(2); await resumed.hooks.runAction('policy'); assert.equal(resumed.hooks.step,4); assert.equal(resumed.get('activate').hidden,true); assert.equal(resumed.hooks.pending,null);

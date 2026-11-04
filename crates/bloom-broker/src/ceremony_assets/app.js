@@ -1203,6 +1203,7 @@ function naturalList(items) {
 // publisher. Always retain the exact package identity in the signed review.
 function describeIntegration(classes, packageHash) {
   const family = classes.length && classes.every(value => value.startsWith('polymarket.')) ? 'Polymarket'
+    : classes.length === 1 && classes[0] === 'gasless.relay' ? 'Gasless Relay'
     : classes.length && classes.every(value => value.startsWith('pumpfun.')) ? 'Pump.fun'
     : classes.length && classes.every(value => value.startsWith('hyperliquid.')) ? 'Hyperliquid' : null;
   return {family, name:family ? `${family} integration` : `Installed app ${shortDigest(packageHash)}`};
@@ -1248,12 +1249,12 @@ function describePetalApproval(manifest) {
   };
   const tokenFacts = budget ? [
     ...(budget.per_action_value_limits || []).map(v => ['Per action', amount(v.asset, v.maximum)]),
-    ...(budget.limits?.value_limits || []).flatMap(v => (v.rolling_windows || []).map(w => ['Rolling allowance', `${amount(v.asset,w.maximum)} per ${Number(w.duration_ms) === 86400000 ? '24 hours' : Number(w.duration_ms) === 604800000 ? '7 days' : fmtRemaining(Number(w.duration_ms))}`]))
+    ...(budget.limits?.value_limits || []).flatMap(v => (v.rolling_windows || []).map(w => ['Rolling allowance', `Can sign ${amount(v.asset,w.maximum)} per ${Number(w.duration_ms) === 86400000 ? '24 hours' : Number(w.duration_ms) === 604800000 ? '7 days' : fmtRemaining(Number(w.duration_ms))}`]))
   ] : [];
   const budgetFacts = budget ? [
     ...tokenFacts,
     ['Allowance identity',plan.session_budget_id,true],
-    ['Accounting','Independent token amounts for this app/account. All reviewed routes share usage. Capacity returns as spending ages out; incoming funds do not replenish it.'],
+    ['Accounting','Independent token amounts for this app/account. All reviewed routes share usage. These allowances add to other app/account allowances. Capacity returns as signed actions age out; incoming funds do not replenish it. Cancelling does not refund signed orders. Open orders are not limited by the window.'],
     ['Token identities',canonicalJson(budget.token_policy?.assets || budget.per_action_value_limits),true],
     ['Reviewed scopes',canonicalJson(budget.token_policy?.member_templates || []),true],
     ['Structural limits',canonicalJson(terms.limits),true],
@@ -1283,6 +1284,7 @@ function describePetalApproval(manifest) {
   const integration = describeIntegration(classes, packageHash);
   const app = integration.name;
   const polymarketBuy = classes.length === 1 && classes[0] === 'polymarket.order.poly1271';
+  const gaslessPayment = classes.length === 1 && classes[0] === 'gasless.relay';
   const actions = [...new Set(classes.map(value => {
     const action = value.includes(".") ? value.slice(value.indexOf(".") + 1) : value;
     return value === 'polymarket.order.poly1271' ? 'Create signed Polymarket BUY orders' : PETAL_ACTIONS[action] || value.replace(/[_-]/g, " ");
@@ -1293,11 +1295,12 @@ function describePetalApproval(manifest) {
   const ceilings = (Array.isArray(plan.asset_amounts) ? plan.asset_amounts : []).filter(v=>v.kind==='value_limit').map(v=>v.display);
   const spending = token ? 'The independent token allowances shown below' : ceilings.length ? `Up to ${naturalList(ceilings)} in total across the whole session, counting fees and any funds sent back to your wallet` : 'None — Bloom will refuse any action that spends funds or pays a fee';
   const primaryFacts = [
-    ['Integration',app],['Permitted actions',naturalList(actions)],...tokenFacts,...(!budget ? [['Spending ceiling',spending]] : []),
-    ['Permission lasts',wallTime(terms.expires_at_ms)]
+    ['Integration',app],['Permitted actions',naturalList(actions)],...(gaslessPayment ? [['Signed receiver','Relay permit receiver: 0xccc88a9d1b4ed6b0eaba998850414b24f1c315be'],['Authorization lifetime','At most 600 seconds remaining when signed']] : []),...tokenFacts,...(!budget ? [['Spending ceiling',spending]] : []),
+    ['Permission lasts',wallTime(terms.expires_at_ms)],
+    ...(budget ? [['Accounting','Independent allowance for this app/account; allowances are additive. Cancelling does not refund signed orders. Open orders are not limited by the rolling window.']] : [])
   ];
   return {
-    primaryFacts,
+    primaryFacts: [...primaryFacts, ...(budget && !rearm ? [['New allowance','This grants new independent spending capacity. Usage from previous packages or grants does not carry into this allowance.']] : [])],
     sentence: rearm ? "Unlock your existing automatic spending permission. Its token limits, previous usage and authority identity stay unchanged. No funds move in this step." : budget
       ? (polymarketBuy ? 'Allow covered BUY orders without another passkey prompt, within the limits below. This approval moves no funds.' : `Allow repeated <strong>${escapeHtml(app)}</strong> actions within the permissions below. This approval moves no funds.`)
       : `Finish setting up a temporary <strong>${escapeHtml(app)}</strong> session. It can sign only the actions listed below until the timer expires. No funds move in this step, and your main wallet key stays inside Bloom.`,
@@ -1308,13 +1311,13 @@ function describePetalApproval(manifest) {
       ["Limit", operationLimit],
       ["Token allowances", spending],
       ["Main wallet key", "Stays inside Bloom"],
-      ...budgetFacts,
+      ...budgetFacts.map(row => row[0] === 'Trust boundary' && (polymarketBuy || gaslessPayment) ? ['Trust boundary',gaslessPayment ? 'Protocol-verified EIP-3009 USDC debit to the reviewed Relay receiver. USDC and receiver upgrades remain trusted; quotes, bridge outputs, fees and settlement are unverified.' : 'Protocol-verified Polymarket BUY maker amount. Exchange and collateral upgrades remain trusted; outcome identity, fees, fill and settlement are unverified.'] : row),
       ...lifetimeFacts
     ],
     title: rearm ? "Unlock existing permission" : budget ? "Automatic spending permission" : "Finish temporary session setup",
     heading: rearm ? `Unlock ${app}` : budget ? (polymarketBuy ? "Allow automatic Polymarket buys" : `Allow automatic actions for ${app}`) : "Create a temporary app session",
     button: rearm ? "Unlock with passkey" : budget ? (polymarketBuy ? "Allow buys within these limits" : "Allow these automatic actions") : "Finish session setup",
-    warning: 'Automatic spending relies on app-reported amounts and supported transaction checks. A buggy or compromised app could misuse this permission.'
+    warning: polymarketBuy ? 'Protocol-verified signed order fields: Bloom reconstructs the exact Polymarket BUY signature and checks its gross pUSD maker amount. The reviewed exchange and collateral contracts can upgrade; wallet implementation, outcome identity, fees, fills and settlement are not verified.' : gaslessPayment ? 'Protocol-verified payment: Bloom binds the exact EIP-3009 USDC debit, signing account, reviewed Relay receiver and at most 600 seconds of remaining validity. USDC and receiver upgrades remain trusted. Relay quotes, bridge outputs, fees and settlement are not verified.' : 'App-reported amounts: Bloom checks declarations and supported transaction formats, but does not independently verify arbitrary-contract maximum spending. A buggy or compromised app could understate spending.'
   };
 }
 // Policy updates: say what changes, in the order a person cares about.

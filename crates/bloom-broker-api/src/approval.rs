@@ -259,7 +259,7 @@ impl SealedApprovalTerms {
                 {
                     return Err(ProtocolError::new(
                         ProtocolErrorCode::SelectorMismatch,
-                        "native sessions require a reviewed USD policy",
+                        "native sessions require a reviewed token policy",
                     ));
                 }
             }

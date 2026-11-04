@@ -15,6 +15,7 @@ const SCHEMA: &str = "bloom.message.review.v1";
 const MAX_FIELDS: usize = 256;
 const MAX_DEPTH: usize = 12;
 
+pub(crate) mod gasless;
 #[cfg(test)]
 mod generic_session_tests;
 mod hyperliquid;
@@ -94,7 +95,7 @@ pub(crate) fn verify_polymarket_session_use(
         .as_ref()
         .ok_or_else(|| invalid("BUY session needs the complete prepared order witness"))?;
     let bytes = evidence.decode();
-    let (preimage, review) = polymarket::decode(&bytes, signer, "polymarket.order.poly1271")?;
+    let decoded = polymarket::decode(&bytes, signer, "polymarket.order.poly1271")?;
     let payload = match &request.payloads {
         bloom_broker_api::SigningPayloads::Single { payload } => payload,
         bloom_broker_api::SigningPayloads::Batch { children } if children.len() == 1 => {
@@ -106,55 +107,42 @@ pub(crate) fn verify_polymarket_session_use(
             ));
         }
     };
-    if payload.decode() != preimage {
+    if payload.decode() != decoded.preimage {
         return Err(invalid("BUY session witness differs from signing bytes"));
     }
-    validate_order_debit(claim, &review, true)
+    validate_order_debit(
+        claim,
+        decoded
+            .order
+            .as_ref()
+            .ok_or_else(|| invalid("BUY session requires a verified order"))?,
+        true,
+    )
 }
 
 fn validate_order_debit(
     claim: &bloom_broker_api::PetalUseClaim,
-    review: &MessageReview,
+    order: &polymarket::VerifiedOrder,
     buy_only: bool,
 ) -> Result<(), ProtocolError> {
-    let field = |name: &str| {
-        review
-            .fields
-            .iter()
-            .find(|f| f.path == name)
-            .map(|f| f.value.as_str())
-            .ok_or_else(|| invalid("Signed order economics are missing"))
-    };
-    let side = field("Side (0 buy, 1 sell)")?;
-    if buy_only && side != "0" {
+    if buy_only && order.side != polymarket::OrderSide::Buy {
         return Err(invalid("A BUY session cannot authorize a SELL"));
     }
-    let amount = field("Maker amount (raw protocol units)")?;
-    let shares = field("Taker amount (raw protocol units)")?;
-    if amount == "0" || shares == "0" || claim.declared_debits.len() != 1 {
+    if order.maker_amount.is_zero()
+        || order.taker_amount.is_zero()
+        || claim.declared_debits.len() != 1
+    {
         return Err(invalid("Order requires one positive signed maker debit"));
     }
-    let asset = match side {
-        "0" => "pusd".to_owned(),
-        "1" => format!(
-            "erc1155:0x4d97dcd97ec945f40cf65f87097ace5ea0476045:{}",
-            field("Outcome token ID (market identity unverified)")?
-        ),
-        _ => return Err(invalid("Unsupported signed order side")),
-    };
+    let (asset, amount) = order.debit();
     let debit = &claim.declared_debits[0];
-    let canonical = debit.asset.chain.as_str() == "evm-137"
-        && debit.asset.asset
-            == if side == "0" {
-                "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb".to_owned()
-            } else {
-                asset.clone()
-            };
+    let canonical = debit.asset == asset;
+    // Retain the legacy claim identity only for the old, non-effects contract.
     let legacy = debit.asset.chain.as_str() == "polygon"
-        && debit.asset.asset == asset
+        && debit.asset.asset == order.legacy_asset()
         && claim.economic_effects.is_none();
     if !(canonical || legacy)
-        || debit.amount.as_str() != amount
+        || debit.amount.as_str() != amount.to_string()
         || !claim.declared_destinations.is_empty()
         || claim.declared_fee != bloom_broker_api::DeclaredFee::None
     {
@@ -214,8 +202,7 @@ pub(crate) fn validate_selector(
             .any(|class| {
                 class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
                     || (bloom_broker_api::message_review_requires_exact(class.as_str())
-                        && !(class.as_str() == "polymarket.order.poly1271"
-                            && terms.session_budget.is_some()))
+                        && !bloom_broker_api::reusable_message_session_class(terms, class.as_str()))
             })
         {
             return Err(invalid(
@@ -869,12 +856,15 @@ pub(crate) fn review(
         .petal_use_claim
         .as_ref()
         .map(|claim| claim.operation_class.as_str());
-    let (preimage, review) = if let Some(class) =
+    let (preimage, review, order) = if let Some(class) =
         class.filter(|class| bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES.contains(class))
     {
-        polymarket::decode(&request.message_review_payloads[0].decode(), signer, class)?
+        let decoded =
+            polymarket::decode(&request.message_review_payloads[0].decode(), signer, class)?;
+        (decoded.preimage, decoded.review, decoded.order)
     } else {
-        decode(&request.message_review_payloads[0].decode(), signer)?
+        let (preimage, review) = decode(&request.message_review_payloads[0].decode(), signer)?;
+        (preimage, review, None)
     };
     if Digest32::from_bytes(Sha256::digest(&preimage).into()) != ordered_payload_digests[0]
         || Digest32::from_bytes(keccak256(&preimage).0) != ordered_hashes[0]
@@ -883,13 +873,14 @@ pub(crate) fn review(
             "message review differs from the exact approved payload",
         ));
     }
-    validate_petal_profile(request, &review)?;
+    validate_petal_profile(request, &review, order.as_ref())?;
     Ok(Some(review))
 }
 
 fn validate_petal_profile(
     request: &ApprovalPrepareRequest,
     review: &MessageReview,
+    order: Option<&polymarket::VerifiedOrder>,
 ) -> Result<(), ProtocolError> {
     let Some(claim) = &request.petal_use_claim else {
         return Ok(());
@@ -903,7 +894,11 @@ fn validate_petal_profile(
         ));
     }
     if class == "polymarket.order.poly1271" && !claim.declared_debits.is_empty() {
-        validate_order_debit(claim, review, false)?;
+        validate_order_debit(
+            claim,
+            order.ok_or_else(|| invalid("Polymarket order requires typed verification"))?,
+            false,
+        )?;
     }
     if bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES.contains(&class)
         && ((class != "polymarket.order.poly1271" && !claim.declared_debits.is_empty())
@@ -1030,7 +1025,7 @@ mod tests {
         Address::with_last_byte(7)
     }
 
-    fn payment_data() -> Value {
+    pub(super) fn payment_data() -> Value {
         json!({
             "types": {
                 "EIP712Domain": [{"name":"name","type":"string"},{"name":"version","type":"string"},{"name":"chainId","type":"uint256"},{"name":"verifyingContract","type":"address"}],
@@ -1042,7 +1037,7 @@ mod tests {
         })
     }
 
-    fn envelope(data: Value) -> Vec<u8> {
+    pub(super) fn envelope(data: Value) -> Vec<u8> {
         serde_json::to_vec(&json!({"schema":SCHEMA,"kind":"eip712","typed_data":data})).unwrap()
     }
 

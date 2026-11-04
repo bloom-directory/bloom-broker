@@ -904,24 +904,28 @@ impl BrokerRpcService {
         {
             return Ok(());
         }
-        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
-            .iter()
-            .copied()
-            .chain([bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS])
-            .chain(
-                bloom_broker_api::PUMPFUN_REVIEW_OPERATION_CLASSES
-                    .iter()
-                    .copied(),
-            )
-        {
-            if self
-                .authority
-                .subject_declares_operation_class(&terms.subject, class)
-                .map_err(authority_error)?
+        let ApprovalSelector::Petal {
+            allowed_operation_classes,
+            route_grants,
+            ..
+        } = &terms.selector
+        else {
+            return Ok(());
+        };
+        for class in allowed_operation_classes.iter().chain(
+            route_grants
+                .iter()
+                .flat_map(|grant| &grant.allowed_operation_classes),
+        ) {
+            let class = class.as_str();
+            if (bloom_broker_api::message_review_requires_exact(class)
+                || class == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
+                || bloom_broker_api::PUMPFUN_REVIEW_OPERATION_CLASSES.contains(&class))
+                && !bloom_broker_api::reusable_message_session_class(terms, class)
             {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::EffectsUnsupported,
-                    "This installed Petal retains its existing stronger approval profile; generic token sessions cannot bypass it",
+                    "This operation retains its stronger exact approval profile; generic token sessions cannot bypass it",
                 ));
             }
         }
@@ -1068,8 +1072,10 @@ impl BrokerRpcService {
                     .any(|class| {
                         class.as_str() == safe_class
                             || (bloom_broker_api::message_review_requires_exact(class.as_str())
-                                && !(class.as_str() == "polymarket.order.poly1271"
-                                    && request.terms.session_budget.is_some()))
+                                && !bloom_broker_api::reusable_message_session_class(
+                                    &request.terms,
+                                    class.as_str(),
+                                ))
                     })
                 {
                     return Err(ProtocolError::new(
@@ -1535,20 +1541,19 @@ impl BrokerRpcService {
         // the only layer that can: authority is synchronous and journal-
         // backed, while the account projection comes from the Signer.
         let expected_signer_public_key = self.resolve_terms_signer_public_key(&terms).await?;
-        let mut reusable_profile = None;
-        if terms.session_budget.is_some() && matches!(terms.subject, ApprovalSubject::Petal { .. })
-        {
-            for profile in bloom_broker_api::reusable_signing_profiles() {
-                if self
-                    .authority
-                    .subject_declares_operation_class(&terms.subject, profile.operation_class)
-                    .map_err(authority_error)?
-                {
-                    reusable_profile = Some(profile);
-                    break;
-                }
-            }
-        }
+        let reusable_profile = request
+            .petal_use_claim
+            .as_ref()
+            .filter(|claim| {
+                matches!(terms.subject, ApprovalSubject::Petal { .. })
+                    && bloom_broker_api::reusable_message_session_class(
+                        &terms,
+                        claim.operation_class.as_str(),
+                    )
+            })
+            .and_then(|claim| {
+                bloom_broker_api::reusable_signing_profile_for_class(claim.operation_class.as_str())
+            });
         if clob_auth || hyperliquid_agent || pump_review || reusable_profile.is_some() {
             let response = self
                 .signer
@@ -1596,6 +1601,23 @@ impl BrokerRpcService {
                     match profile.verifier {
                         bloom_broker_api::ReusableEffectsVerifier::PolymarketBuyV1 => {
                             crate::message_review::verify_polymarket_session_use(&request, owner)?;
+                        }
+                        bloom_broker_api::ReusableEffectsVerifier::GaslessEip3009V1 => {
+                            self.authority
+                                .validate_petal_profile_preflight(&AuthorizationInput {
+                                    request: request.clone(),
+                                    expected_signer_public_key: expected_signer_public_key.clone(),
+                                    reserved_at_ms,
+                                    observed_utc_ms: clock.observed_utc_ms,
+                                    monotonic_anchor_ns: clock.monotonic_anchor_ns,
+                                    clock_boot_epoch: clock.boot_epoch.clone(),
+                                })
+                                .map_err(authority_error)?;
+                            crate::message_review::gasless::verify_use(
+                                &request,
+                                owner,
+                                reserved_at_ms,
+                            )?;
                         }
                     }
                 }

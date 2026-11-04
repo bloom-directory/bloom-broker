@@ -371,17 +371,21 @@ repaired independently; repairing only one does not clear the other's fault.
 ## Owner-reviewed Petal sessions
 
 Persona onboarding reuses Petal Sealed Approvals. The first automatic scope is
-fee-free Polymarket BUY orders on Polygon with positive `polygon:pusd` debits.
-SELLs, allowances, funding, withdrawals, native transfers and other classes do
-not inherit that session. Native `SystemSession` draft terms are refused.
+fee-free Polymarket BUY orders on Polygon with positive canonical
+`evm-137:0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb` pUSD debits. Legacy
+non-effects claims retain `polygon:pusd` compatibility. SELLs, allowances,
+funding, withdrawals and other classes do not inherit that session. Native
+`SystemSession` transfers use separately reviewed token and gas limits; Degen
+can explicitly allow ERC20 transfers to any recipient (see
+[recurring token allowances](docs/generic-sessions.md)).
 
 Machine–Broker uses protocol 1.9 for Broker-owned session descriptors. The
 Broker–Signer edge remains production protocol 1.6. No session-budget API,
 asset conversion, economic ledger or new selector is added to Signer.
 
-Broker owns per-action, lifetime, rolling and shared economic accounting. It
+Broker owns per-action and rolling token accounting for each Petal/account. It
 reconstructs the order from the full prepared witness, compares it to the actual
-signing preimage and checks the declared debit against the signed gross BUY
+signing preimage and derives typed order economics and checks the compatible declared debit against the signed gross BUY
 maker amount before reserving capacity. Missing evidence, SELLs, changed
 amounts, unexpected assets and fees fail closed. This proves the signed order
 terms, not venue execution, deposit-wallet ownership or settlement.
@@ -405,7 +409,11 @@ original result without another reservation. Different member approvals share
 one Broker ledger; their Signer counters remain approval-local. Shared
 signature-count enforcement in Signer is not claimed.
 
-Nominal units are owner-reviewed collateral conventions, not live USD prices.
+Exact token identities and raw quantities govern allowances; no prices or USD
+conversions apply. Limits govern signed volume per rolling window. Cancelling
+does not refund signed orders, and open orders are not limited by that window.
+Petal/account allowances are independent and additive, rather than one
+wallet-wide pool.
 Keep the Broker journal and its accounting history intact. Restoring or losing
 that history must never be treated as unused allowance. Signer archive recovery
 does not restore Broker budgets, and this feature makes no new cross-service

@@ -84,7 +84,7 @@ fn generic_token_envelope_does_not_downgrade_existing_exact_review_classes() {
         &"polymarket.onboard",
         &"polymarket.relayer_batch",
     ]);
-    for class in classes {
+    for class in classes.filter(|class| **class != "gasless.relay") {
         let mut direct = terms(class);
         assert!(validate_selector(&direct, None).is_err(), "{class}");
         // Moving a stronger class into a secondary route must not evade the
@@ -107,39 +107,17 @@ fn generic_token_envelope_does_not_downgrade_existing_exact_review_classes() {
             "secondary {class}"
         );
     }
+    validate_selector(&terms("gasless.relay"), None).unwrap();
     validate_selector(&terms("generic.swap"), None).unwrap();
     validate_selector(&terms("polymarket.order.poly1271"), None).unwrap();
 }
 
-fn order_review(side: &str) -> MessageReview {
-    MessageReview {
-        kind: "polymarket_exact".into(),
-        title: String::new(),
-        signer: String::new(),
-        payload_keccak: String::new(),
-        domain: vec![],
-        fields: vec![
-            MessageField {
-                path: "Side (0 buy, 1 sell)".into(),
-                value: side.into(),
-            },
-            MessageField {
-                path: "Maker amount (raw protocol units)".into(),
-                value: "1000000".into(),
-            },
-            MessageField {
-                path: "Taker amount (raw protocol units)".into(),
-                value: "2000000".into(),
-            },
-            MessageField {
-                path: "Outcome token ID (market identity unverified)".into(),
-                value: "42".into(),
-            },
-        ],
-        warnings: vec![],
-        payment: None,
-        venue_asset: None,
-        collateral_asset: None,
+fn order(side: polymarket::OrderSide) -> polymarket::VerifiedOrder {
+    polymarket::VerifiedOrder {
+        side,
+        maker_amount: alloy::primitives::U256::from(1_000_000),
+        taker_amount: alloy::primitives::U256::from(2_000_000),
+        token_id: alloy::primitives::U256::from(42),
     }
 }
 fn order_claim() -> PetalUseClaim {
@@ -170,7 +148,7 @@ fn order_claim() -> PetalUseClaim {
 }
 #[test]
 fn canonical_pusd_cannot_use_a_legacy_alias_or_hide_sold_outcome_units() {
-    let buy = order_review("0");
+    let buy = order(polymarket::OrderSide::Buy);
     let claim = order_claim();
     validate_order_debit(&claim, &buy, true).unwrap();
     let mut alias = claim.clone();
@@ -183,7 +161,7 @@ fn canonical_pusd_cannot_use_a_legacy_alias_or_hide_sold_outcome_units() {
     // an alternate accounting identity in the new effects contract.
     alias.economic_effects = None;
     validate_order_debit(&alias, &buy, true).unwrap();
-    let sell = order_review("1");
+    let sell = order(polymarket::OrderSide::Sell);
     assert!(validate_order_debit(&claim, &sell, true).is_err());
     let mut shares = claim;
     shares.declared_debits[0].asset.asset =

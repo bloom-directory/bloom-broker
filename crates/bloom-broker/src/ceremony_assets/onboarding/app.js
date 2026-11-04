@@ -48,10 +48,10 @@
     $('review-host').hidden = false;
     $('review-loading').hidden = false; $('approval-retry').hidden = true;
     $('approval-title').hidden = false; $('approval-purpose').hidden = false;
-    $('approval-progress').textContent = action === 'policy' ? 'Wallet policy approval' : spendingReview ? `Spending permission ${spendingReview.index} of ${spendingReview.total}` : 'Spending permissions';
-    $('approval-title').textContent = action === 'policy' ? 'Wallet policy' : spendingReview?.title ?? 'Automatic spending';
+    $('approval-progress').textContent = action === 'policy' ? 'Wallet policy approval' : action === 'rearm' ? 'Unlock existing permission' : spendingReview ? `Spending permission ${spendingReview.index} of ${spendingReview.total}` : 'Spending permissions';
+    $('approval-title').textContent = action === 'policy' ? 'Wallet policy' : action === 'rearm' ? 'Unlock existing permission' : spendingReview?.title ?? 'Automatic spending';
     $('approval-purpose').textContent = action === 'policy' ?
-      'This signature sets wallet policy for your selected apps and transfer destinations. It does not move funds or enable automatic spending.' :
+      'This signature sets wallet policy for your selected apps and transfer destinations. It does not move funds or enable automatic spending.' : action === 'rearm' ? 'Unlock this existing permission after a lock or restart. Its reviewed limits, previous usage and authority identity stay unchanged.' :
       spendingReview?.transfers ? 'This signature enables automatic wallet transfers within the reviewed transfer and gas limits. Other spending permissions require separate review.' :
       'This separate signature enables the automatic actions shown below. Check which integration can act, how much it can spend, and when permission ends.';
     $('review-loading').textContent = checking ? 'Approval received. Checking it with Bloom…' : 'Preparing the exact permissions for your passkey approval…';
@@ -108,6 +108,27 @@
       label.append(input, text); $('wallet-choices').append(label);
     }
   }
+  function renderSessionControls(result) {
+    const scopes = Array.isArray(result?.data) ? result.data : [];
+    $('existing-sessions').hidden = !scopes.length;
+    $('session-controls').replaceChildren();
+    for (const scope of scopes) {
+      const classes = scope.terms?.selector?.allowed_operation_classes ?? [];
+      const profile = state?.reusable_profiles?.find(p => classes.includes(p.operation_class));
+      const name = scope.terms?.subject?.kind === 'system' ? 'Wallet transfers' : profile?.display_name ?? 'App permission';
+      const row = document.createElement('div');
+      const label = document.createElement('p');
+      label.textContent = `${name} · account ${scope.account ?? '?'} · ${scope.locally_disabled ? 'Stopped' : scope.authority?.state ?? 'Pending'}. Independent token allowance; adds to your other app/account allowances. Cancelling does not refund signed orders; open orders are not limited by the rolling window.`;
+      row.append(label);
+      if (!scope.locally_disabled && !scope.preparation_pending && scope.authority?.state === 'ACTIVE' && /^[0-9a-f]{64}$/.test(scope.approval_id)) {
+        const button = document.createElement('button'); button.type = 'button'; button.className = 'secondary';
+        button.textContent = `Unlock ${name}`;
+        button.addEventListener('click', () => perform(() => runAction('rearm', {approval:scope.approval_id})));
+        row.append(button);
+      }
+      $('session-controls').append(row);
+    }
+  }
   function statusText(result, fallback) {
     if (!result) return fallback;
     if (result.error) return `Needs attention: ${display(result.error)}`;
@@ -122,7 +143,7 @@
   async function brokerApi(path, token, options = {}) {
     return fetch(path, {...options, headers: {'x-bloom-ceremony-token':token, ...(options.headers ?? {})}, credentials:'same-origin', redirect:'error', cache:'no-store', referrerPolicy:'no-referrer'});
   }
-  async function review(result, action) {
+  async function review(result, action, approval) {
     const url = new URL(result.ceremony_url);
     // The Machine validates this authority too. Normalize the two loopback
     // spellings to the Broker origin so the passkey frame is always same-origin.
@@ -148,7 +169,7 @@
         title:transfers ? 'Wallet transfers' : profile?.display_name ?? 'App spending'};
     }
     showApprovalStage(action);
-    activeReview = {action, wallet, preset, id:session.ceremony_id};
+    activeReview = {action, wallet, preset, approval, id:session.ceremony_id};
     url.search = 'onboarding=1';
     $('ceremony-frame').src = url.href;
     $('ceremony-page').hidden = false;
@@ -187,7 +208,7 @@
       if (activeReview !== pending) return;
       closeReview(true);
       showApprovalStage(pending.action, true);
-      await runAction(pending.action, {checking:true});
+      await runAction(pending.action, {checking:true,approval:pending.approval});
     });
   });
   $('ceremony-frame').addEventListener('load', () => {
@@ -209,6 +230,7 @@
     $('raw-state').textContent = display(data);
     $('policy-status').textContent = statusText(data.policy, 'Approve the apps you selected with your passkey.');
     $('session-status').textContent = statusText(data.sessions, 'No persona sessions reported.');
+    renderSessionControls(data.sessions);
     if (!hydrated && !dirty) {
       const persona = typeof config.persona === 'string' ? {preset: config.persona} : config.persona;
       $('legacy-note').hidden = !config.setup_complete || !!persona;
@@ -262,16 +284,17 @@
     chosenSetup = payload;
     perform(async () => { resetWalletReview(); showStep(2); showApprovalStage('policy'); notice('Saving your choices…'); const result = await api('setup', payload); activity(result.stdout || display(result)); dirty = false; hydrated = false; await refresh(); showStep(2); await runAction('policy'); });
   });
-  async function runAction(action, {checking = false} = {}) {
-    if (!['policy', 'activate', 'stop', 'refresh'].includes(action)) throw new Error('Unknown setup action.');
+  async function runAction(action, {checking = false, approval} = {}) {
+    if (!['policy', 'activate', 'rearm', 'stop', 'refresh'].includes(action)) throw new Error('Unknown setup action.');
+    if (action === 'rearm' && !/^[0-9a-f]{64}$/.test(approval ?? '')) throw new Error('Choose one existing permission to unlock.');
     if (action === 'stop') { closeReview(); sessionReady = false; }
-    if (action === 'policy' || action === 'activate') showApprovalStage(action, checking);
+    if (action === 'policy' || action === 'activate' || action === 'rearm') showApprovalStage(action, checking);
     else notice('Working with your local Bloom…');
-    const result = await api('action', {action});
+    const result = await api('action', {action,...(action === 'rearm' ? {approval} : {})});
     activity(result.stdout || display(result.data ?? result));
     if (action === 'policy') policyApplied = result.data?.state === 'applied' || (result.data?.state === 'nothing_to_allow' && !(state?.config?.petals?.length));
     await refresh();
-    if (result.ceremony_url) { await review(result, action); return; }
+    if (result.ceremony_url) { await review(result, action, approval); return; }
     if (action === 'policy') {
       if (policyApplied) {
         if (selected() === 'custodian') completeSetup();
@@ -281,6 +304,12 @@
       } else if (result.data?.state === 'busy') { closeReview(); notice('Another approval is being prepared. Try again in a moment.', true); }
       else if (result.data?.state === 'nothing_to_allow') { closeReview(); notice('No installed apps match your selection. Go back and choose an installed app.', true); }
       else { closeReview(); notice('Your wallet is not ready for approval. Refresh and try again.', true); }
+    }
+    if (action === 'rearm') {
+      const scope = result.data;
+      closeReview();
+      if (scope?.approval_id === approval && !scope.locally_disabled && !scope.preparation_pending && scope.authority?.state === 'ACTIVE') notice('Your existing permission is unlocked. Previous usage and limits are unchanged.');
+      else notice('This permission is not unlocked yet. Refresh and try again.', true);
     }
     if (action === 'activate') {
       const scopes = result.data;
@@ -298,8 +327,8 @@
     notice(selected() === 'custodian' ? 'Your setup is complete. Each action needs your approval.' : 'Your setup is complete. Your spending permissions are active.');
   }
   $('approval-retry').addEventListener('click', () => {
-    const action = activeReview?.action;
-    if (action) perform(async () => { closeReview(true); await runAction(action); });
+    const action = activeReview?.action, approval = activeReview?.approval;
+    if (action) perform(async () => { closeReview(true); await runAction(action, {approval}); });
   });
   $('finish').addEventListener('click', () => { if (!busy) completeSetup(); });
   showStep(0);
