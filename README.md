@@ -379,8 +379,8 @@ funding, withdrawals and other classes do not inherit that session. Native
 can explicitly allow ERC20 transfers to any recipient (see
 [recurring token allowances](docs/generic-sessions.md)).
 
-Machine–Broker uses protocol 1.9 for Broker-owned session descriptors. The
-Broker–Signer edge remains production protocol 1.6. No session-budget API,
+Machine–Broker uses protocol 1.10 for Broker-owned session descriptors. The
+Broker–Signer edge uses the pinned Signer protocol 1.8. No session-budget API,
 asset conversion, economic ledger or new selector is added to Signer.
 
 Broker owns per-action and rolling token accounting for each Petal/account. It

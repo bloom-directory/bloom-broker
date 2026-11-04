@@ -1606,7 +1606,7 @@ impl BrokerRpcService {
                             self.authority
                                 .validate_petal_profile_preflight(&AuthorizationInput {
                                     request: request.clone(),
-                                    expected_signer_public_key: expected_signer_public_key.clone(),
+                                    expected_signer_public_key,
                                     reserved_at_ms,
                                     observed_utc_ms: clock.observed_utc_ms,
                                     monotonic_anchor_ns: clock.monotonic_anchor_ns,

@@ -62,8 +62,8 @@ pub const RATE_LIMIT_DETAILS_MINOR: u16 = 4;
 /// predates any field the Broker may emit. Older peers are refused at the
 /// hello before a response can carry a field their strict decoder rejects.
 // Released 1.7 used strict catalog-policy and hash-only caller shapes.
-// Broker-owned session terms extend the strict Machine edge to 1.9.
-// The Broker–Signer edge remains at production 1.6.
+// Broker-owned token sessions use the strict Machine edge at 1.10.
+// The pinned Broker–Signer edge uses Signer protocol 1.8.
 pub const BROKER_API_MINOR_MIN: u16 = 10;
 pub const BROKER_API_MINOR_MAX: u16 = 10;
 pub const BROKER_API_CURRENT: ProtocolVersion =

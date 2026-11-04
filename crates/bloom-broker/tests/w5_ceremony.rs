@@ -11914,6 +11914,8 @@ fn key_scope_and_grouped_session_review_helpers_execute_without_scope_errors() {
     let script = format!(
         r#"
 const fmtRemaining = value => String(value);
+const shortDigest = value => String(value);
+const escapeHtml = value => String(value);
 const canonicalJson = value => JSON.stringify(value);
 {functions}
 const key=describePetalScope({{allowed_operation_classes:["polymarket.order"],maximum_lifetime_ms:"60000",package_hash:"abc"}});
@@ -11923,8 +11925,10 @@ const budget={{per_action_value_limits:[{{asset,maximum:"100000000"}}],limits:{{
 const terms={{subject:{{package_hash:"abc"}},selector:{{kind:"petal",package_hash:"abc",allowed_operation_classes:["polymarket.order.poly1271"]}},limits:{{max_operations:"18446744073709551615"}},session_budget:budget,not_before_ms:"1000",expires_at_ms:"18446744073709551615",activation_mode:{{kind:"durable_local"}}}};
 const session=describePetalApproval({{canonical_plan:JSON.stringify({{terms,session_budget_id:"budget-identity",asset_amounts:[]}})}});
 const facts=JSON.stringify(session.facts);
-for(const needle of ["budget-identity","100 pUSD","1000 pUSD","24 hours","Until you revoke","reviewed-package","reviewed-route","reviewed-provenance","dishonest app"]) {{if(!facts.includes(needle)) throw new Error("token review omitted "+needle);}}
+for(const needle of ["budget-identity","100 pUSD","1000 pUSD","24 hours","Until you revoke","reviewed-package","reviewed-route","reviewed-provenance","Protocol-verified Polymarket BUY maker amount"]) {{if(!facts.includes(needle)) throw new Error("token review omitted "+needle);}}
 if(facts.includes("CoinGecko") || facts.includes("nominal") || facts.includes("USD caps")) throw new Error("retired pricing shown");
+const generic=describePetalApproval({{canonical_plan:JSON.stringify({{terms:{{...terms,selector:{{kind:"petal",allowed_operation_classes:["generic.action"]}}}}}})}});
+if(!generic.warning.includes("App-reported amounts") || !generic.warning.includes("does not independently verify")) throw new Error("generic assurance overstated");
 const nativeScope={{actions:["native_transfer"],chains:[{{chain:"solana-mainnet",genesis_hash:"reviewed-genesis"}}],destinations:[{{chain:"solana-mainnet",destination:"reviewed-recipient"}}],per_action_value_limits:[{{asset:{{chain:"solana-mainnet",asset:"native"}},maximum:"123456789"}}]}};
 const nativeReview=describePetalApproval({{canonical_plan:JSON.stringify({{terms:{{...terms,selector:{{kind:"system_session",scope:nativeScope}}}},session_budget_id:"budget-identity"}})}});
 for(const needle of ["reviewed-genesis","reviewed-recipient","123456789"]) {{if(!JSON.stringify(nativeReview.facts).includes(needle))throw new Error("native scope omitted "+needle);}}
