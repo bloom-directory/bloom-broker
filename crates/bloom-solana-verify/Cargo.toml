@@ -19,6 +19,6 @@ thiserror.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 ed25519-dalek.workspace = true
-solana-message = { version = "4.5.0", features = ["wincode"] }
+solana-message = { version = "5.0.0", features = ["wincode"] }
 solana-system-interface = { version = "3.3.0", features = ["bincode"] }
 solana-transaction = { version = "4.2.0", features = ["verify", "wincode"] }
