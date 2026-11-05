@@ -912,8 +912,93 @@ const system = describeTransfer({{system_use_claim: claim}});
 const label = view => view.facts.find(([, value]) => value === "PumpProgram111")[0];
 if (petal.sentence.includes("address below")) throw new Error(petal.sentence);
 if (label(petal) !== "Declared destinations") throw new Error(label(petal));
-if (!system.sentence.includes("address below")) throw new Error(system.sentence);
+if (system.intent?.action !== "send") throw new Error(JSON.stringify(system.intent));
+if (system.parties.find(party => party.role === "recipient")?.value !== "PumpProgram111") throw new Error("no recipient");
 if (label(system) !== "To") throw new Error(label(system));
+// Only a review bound to the mainnet genesis hash links to a mainnet explorer.
+const solanaAddress = "GWGW3TzM5dEDV38xK1F8chQJptJ6aywQkwksgfhKztEu";
+const mainnet = describeTransfer({{system_use_claim: {{...claim,
+  chain_context: {{chain_family: "solana", genesis_hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"}}}}}});
+if (addressExplorer(mainnet.chainId, solanaAddress)?.url !== `https://solscan.io/account/${{solanaAddress}}`) throw new Error(mainnet.chainId);
+if (addressExplorer(system.chainId, solanaAddress)) throw new Error("unbound cluster links to mainnet");
+process.stdout.write("ok");
+"#
+    );
+    let output = run_node(&script);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "ok");
+}
+
+/// A SOL send once said "to the address below" with no address below. It now
+/// uses the EVM native-send layout: amount card, then sender → recipient.
+#[test]
+fn system_transfer_recipient_is_on_the_primary_review_surface() {
+    let asset = concat!(
+        include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/app.js")
+    );
+    let executable = asset
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0;
+    let script = format!(
+        r#"
+class Node {{
+  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; this.className = ""; }}
+  setAttribute() {{}}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren(...children) {{ this.children = children; }}
+}}
+const nodes = {{}};
+globalThis.document = {{
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
+  createTextNode: text => String(text)
+}};
+globalThis.location = {{hash: "", search: "", pathname: "/"}};
+globalThis.history = {{replaceState: () => {{}}}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {{}};
+{executable}
+const recipient = "GWGW3TzM5dEDV38xK1F8chQJptJ6aywQkwksgfhKztEu";
+renderReview({{
+  ceremony_kind: "sealed_approval",
+  expires_at_ms: Date.now() + 60000,
+  signer_contribution: {{wallet_id: "main", key_ref: {{derivation: {{path: "m/44'/501'/0'/0'"}}}}}},
+  review_manifest: {{canonical_plan: JSON.stringify({{asset_amounts: [{{kind: "declared_debit", display: "0.001 SOL"}}]}}),
+    system_use_claim: {{
+    declared_debits: [{{amount: "1000000", asset: {{chain: "solana", asset: "native"}}}}],
+    declared_destinations: [{{chain: "solana", destination: recipient}}]
+  }}}}
+}});
+// Walk the review, skipping collapsed <details>, and find a recipient row.
+const shown = node => typeof node === "string" ? node
+  : node.name === "details" ? "" : `${{node.textContent}} ${{node.children.map(shown).join(" ")}}`;
+const rows = [];
+const find = node => {{
+  if (typeof node === "string" || node.name === "details") return;
+  if (node.className === "ceremony-party") rows.push(node);
+  node.children.forEach(find);
+}};
+find(nodes.review);
+// Same layout as an EVM native send: sender above recipient, no separate
+// "Signing account" block.
+if (!rows.some(row => shown(row).includes("Recipient") && shown(row).includes(recipient))) {{
+  throw new Error(`recipient missing from the main review: ${{shown(nodes.review)}}`);
+}}
+if (!rows.some(row => shown(row).includes("Sender") && shown(row).includes("main · Solana account 0"))) {{
+  throw new Error(`sender missing from the main review: ${{shown(nodes.review)}}`);
+}}
+if (shown(nodes.review).includes("Signing account")) throw new Error("separate signing account block");
+// The real claim names the asset "native"; the card must name the network's coin.
+if (!shown(nodes.review).includes("Solana") || / native /.test(shown(nodes.review))) {{
+  throw new Error(`asset card does not name Solana: ${{shown(nodes.review)}}`);
+}}
 process.stdout.write("ok");
 "#
     );
@@ -1299,7 +1384,9 @@ if (safeFactText.includes("Token amount (base units): 123") || safeFactText.incl
   throw new Error(`Safe review still dumps action lines: ${{safeFactText}}`);
 }}
 const openTags = nodes.review.children.map(node => node.tagName);
-if (openTags.join(",") !== "P,SECTION,DIV,ASIDE,DETAILS") {{
+// The amount sits in the centred hero, then the parties table.
+if (openTags.join(",") !== "P,DIV,DIV,ASIDE,DETAILS" || nodes.review.children[1].className !== "ceremony-hero"
+    || nodes.review.children[2].className !== "ceremony-rows") {{
   throw new Error(`Safe open view is not summary, decision, warning, details: ${{openTags}}`);
 }}
 const banners = node => !node || typeof node === "string" ? [] : [
@@ -1606,7 +1693,7 @@ for (const empty of [false, true]) {{
   if (!empty) noMinimum.fields.find(field => field.label.startsWith("Requested minimum balance increase")).raw = "0x" + "0".repeat(128);
   if (ensoHasMinimum(noMinimum) || callIntent(noMinimum).heading.includes("swap")) throw new Error("Empty or zero output checks falsely protected");
 }}
-const outputCard = nodes.review.children.find(node => allText(node).includes("1.25 USDC"));
+const outputCard = walk(nodes.review).find(node => node.className === "ceremony-asset" && allText(node).includes("1.25 USDC"));
 if (!outputCard || !allText(outputCard).includes("Minimum output") || !allText(outputCard).includes("+1.25 USDC") ||
     !walk(outputCard).some(node => String(node.className).includes("incoming")) ||
     !allText(nodes.review).includes("reverts if it is not met") || !allText(nodes.review).includes("not a quote or proof of receipt") ||
@@ -1658,7 +1745,7 @@ if (!nodes.review.children.filter(node => node.tagName !== "DETAILS").map(allTex
   throw new Error("An Enso call in a batch hid another transaction's warning");
 }}
 renderReview(previewSession("safe-token-transfer"));
-const safeFlow = nodes.review.children.find(node => String(node.className).includes("ceremony-transfer-path"));
+const safeFlow = walk(nodes.review).find(node => String(node.className).includes("ceremony-transfer-path"));
 if (!safeFlow || !allText(safeFlow).includes("−25 USDC") || !allText(safeFlow).includes("+25 USDC")) {{
   throw new Error("Safe transfer omitted requested sender and recipient deltas");
 }}
@@ -11182,8 +11269,11 @@ if (!view.primary.includes("−250 USDC") || !view.primary.includes("+250 USDC")
 if (!view.technical.includes("Contract behavior has not been verified")) {{
   throw new Error("the interpretation limitation disappeared from details");
 }}
-if (!allText(nodes["page-title"]).includes("Chain ID 8453")) {{
-  throw new Error("the exact EVM chain is missing from the primary context");
+// The header names the network in plain words; the exact chain ID is in
+// the technical details.
+if (!allText(nodes["page-title"]).includes("Base") || allText(nodes["page-title"]).includes("Chain ID")
+    || !view.technical.includes("8453")) {{
+  throw new Error(`network name or exact chain ID missing: ${{allText(nodes["page-title"])}}`);
 }}
 if (!view.primary.includes("USD Coin") || !view.primary.includes("USDC")) {{
   throw new Error("the token's full name is missing from the decision");

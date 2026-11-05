@@ -209,16 +209,23 @@ textarea{resize:vertical}
 .wallet-section-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:14px}
 .wallet-section-heading h2{margin:0;font-size:16px;font-weight:600}
 .wallet-section-heading>span{font-size:13px;color:var(--ceremony-muted)}
-.wallet-address-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
-.wallet-address-card{min-width:0;padding:22px;border:1px solid var(--ceremony-border);border-radius:16px;background:var(--ceremony-surface);box-shadow:0 3px 12px #15130f04}
-.wallet-network{display:flex;align-items:center;gap:12px}
+/* One card per row, so a whole address fits on one line. */
+.wallet-address-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:16px}
+/* QR on the left; name, address and copy stacked beside it. */
+.wallet-address-card{display:grid;grid-template-columns:auto minmax(0,1fr);grid-template-areas:"qr net" "qr addr" "qr copy";column-gap:24px;align-items:start;min-width:0;padding:22px;border:1px solid var(--ceremony-border);border-radius:16px;background:var(--ceremony-surface);box-shadow:0 3px 12px #15130f04}
+.wallet-address-card:not(:has(.wallet-qr)){grid-template-columns:minmax(0,1fr);grid-template-areas:"net" "addr" "copy"}
+.wallet-network{grid-area:net;display:flex;align-items:center;gap:12px}
 .wallet-network-icon{display:flex;align-items:center;justify-content:center;width:42px;height:42px;flex:none;border-radius:13px;background:var(--ceremony-bg)}
 .wallet-network-icon svg,.wallet-network-icon img{width:28px;height:28px}
 .wallet-network h3{margin:0;font-size:16px;font-weight:600}
 .wallet-network p{margin:2px 0 0;font-size:12px;color:var(--ceremony-muted)}
-.wallet-address{margin:22px 0 18px;overflow-wrap:anywhere;user-select:all}
+.wallet-address{grid-area:addr;margin:14px 0;overflow-wrap:anywhere;user-select:all}
 .wallet-address code{font:13px/1.8 var(--ceremony-font-mono)}
-button.wallet-copy{width:100%;min-height:40px;border-radius:9px;font-size:13px;background:var(--ceremony-bg)}
+.wallet-qr{grid-area:qr;width:120px;padding:7px;border:1px solid var(--ceremony-border);border-radius:12px;background:#fff}
+.wallet-qr svg{display:block;width:100%;height:auto}
+.wallet-backup-error{margin:0;max-width:24ch;font-size:13px;color:var(--ceremony-danger,#a3242f)}
+.wallet-backup-error:empty{display:none}
+button.wallet-copy{grid-area:copy;justify-self:start;width:auto;padding:0 20px;min-height:40px;border-radius:9px;font-size:13px;background:var(--ceremony-bg)}
 .wallet-backup{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:20px 28px;padding:26px;border:1px solid #8a2a3a20;border-radius:16px;background:linear-gradient(120deg,#f8f0ed,var(--ceremony-surface))}
 .wallet-eyebrow{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--ceremony-accent)}
 .wallet-backup h2{margin:5px 0 8px;font-size:23px;font-weight:600;letter-spacing:-.025em}
@@ -233,8 +240,11 @@ button.wallet-copy{width:100%;min-height:40px;border-radius:9px;font-size:13px;b
 .wallet-home a{color:var(--ceremony-accent);text-decoration-color:var(--ceremony-border);text-underline-offset:3px}
 @media(max-width:600px){
   .wallet-home{gap:24px}
-  .wallet-address-grid{grid-template-columns:1fr;gap:12px}
-  .wallet-address-card{padding:20px}
+  .wallet-address-grid{gap:12px}
+  .wallet-address-card{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"net qr" "addr addr" "copy copy";column-gap:12px;padding:18px}
+  .wallet-qr{width:84px;padding:5px;border-radius:10px}
+  button.wallet-copy{justify-self:stretch}
+  .wallet-address code{font-size:10.5px}
   .wallet-intro{align-items:flex-start;flex-direction:column;gap:8px}
   .wallet-backup{grid-template-columns:1fr;padding:22px;gap:18px}
   .wallet-backup-actions{align-items:stretch;text-align:center}
@@ -275,3 +285,67 @@ button.wallet-copy{width:100%;min-height:40px;border-radius:9px;font-size:13px;b
   .action-buttons button{flex:1 1 auto}
 }
 @media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+
+/* Shared review layout: the amount centred at the top, then one table of
+   parties and fees. A send's heading repeats the amount, so the amount takes
+   its place on screen; the heading stays for screen readers. */
+.panel:has(.ceremony-hero[data-hero="send"]) .panel-title{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+#review .ceremony-hero{display:grid;justify-items:center;gap:20px;padding:12px 0 8px;text-align:center}
+#review .ceremony-hero .ceremony-asset{display:flex;flex-direction:column;align-items:center;gap:6px;min-width:0;max-width:100%;padding:0;background:none;border:0}
+#review .ceremony-hero .ceremony-asset>*{align-self:center}
+.ceremony-hero .ceremony-token-icon{width:56px;height:56px;margin-bottom:6px}
+.ceremony-hero .ceremony-token-icon svg{width:44px;height:44px}
+#review .ceremony-hero .ceremony-asset-amount{order:1;align-items:center;max-width:100%;gap:4px;padding:0}
+.ceremony-hero .ceremony-asset-amount strong{font-size:44px;line-height:1.1;letter-spacing:-.035em}
+.ceremony-hero .ceremony-asset-amount.outgoing strong{color:var(--ceremony-text)}
+.ceremony-hero .ceremony-amount-label{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}
+/* The amount above already says what moves; the table names who. */
+.panel:has(.ceremony-hero[data-hero="send"]) .ceremony-rows .ceremony-balance-change{display:none}
+.ceremony-hero .ceremony-asset-copy{order:2;display:flex;flex-wrap:wrap;justify-content:center;align-items:baseline;gap:0 6px}
+.ceremony-hero .ceremony-asset-copy .ceremony-party-name{font-size:14px;font-weight:600}
+.ceremony-hero .ceremony-asset-copy .ceremony-party-label{margin:0;font-size:14px}
+.ceremony-hero .ceremony-asset-copy:has(.ceremony-party-label) .ceremony-party-label::before{content:"· "}
+.ceremony-hero .ceremony-asset-address{order:3;justify-content:center}
+.ceremony-hero .ceremony-asset-address code{font-size:12px}
+.ceremony-hero>.ceremony-flow-arrow{margin:0;font-size:22px}
+.ceremony-hero>.ceremony-flow-arrow::after{display:none}
+/* A swap: what you pay beside what you receive. */
+.ceremony-hero-pair{grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:start}
+.ceremony-hero-pair>.ceremony-flow-arrow{align-self:center}
+.ceremony-hero-pair .ceremony-asset-amount strong{font-size:32px}
+.ceremony-hero-pair>.ceremony-flow-arrow{transform:rotate(-90deg)}
+
+/* The table. Addresses scale with its width so a full address stays on one
+   line: 44 monospace characters are about 26.5em. */
+.ceremony-rows{container-type:inline-size;border:1px solid var(--ceremony-border);border-radius:var(--ceremony-radius);background:var(--ceremony-bg);overflow:hidden}
+.ceremony-rows>.ceremony-identity{display:contents}
+.ceremony-rows .ceremony-flow-arrow{display:none}
+#review .ceremony-rows .ceremony-party,#review .ceremony-rows .ceremony-fee,#review .ceremony-rows .ceremony-account{display:grid;grid-template-columns:152px minmax(0,1fr);gap:2px 16px;align-items:baseline;margin:0 0 -1px;padding:14px 16px;border-bottom:1px solid var(--ceremony-border);font-size:15px}
+#review .ceremony-rows .ceremony-party>*{grid-column:2;grid-row:auto;margin:0;text-align:left;font-size:15px}
+#review .ceremony-rows .ceremony-party>.ceremony-party-label{grid-column:1;grid-row:1 / span 3;color:var(--ceremony-muted)}
+#review .ceremony-rows .ceremony-balance-change{font-size:14px}
+#review .ceremony-rows .ceremony-party-address code{flex:0 1 auto;font-size:min(var(--ceremony-address-size),calc((100cqi - 200px) / 27));white-space:nowrap;overflow-wrap:normal}
+#review .ceremony-rows .ceremony-fee-amount{justify-self:start}
+#review .ceremony-rows .ceremony-fee-label{font-size:15px}
+#review .ceremony-rows .ceremony-account dt,#review .ceremony-rows .ceremony-account dd{margin:0}
+.ceremony-card>.ceremony-rows{margin-top:var(--ceremony-space-2)}
+/* A batch card's token address also stays on one line (42 characters). */
+.ceremony-card{container-type:inline-size}
+#review .ceremony-card .ceremony-asset-address code{white-space:nowrap;overflow-wrap:normal;font-size:min(12px,calc((100cqi - 40px) / 25.5))}
+#review .ceremony-card .ceremony-asset-address{grid-column:1 / -1}
+/* Call arguments: small enough that a 42-character address fits; longer
+   byte strings still wrap. */
+.ceremony-call-arguments{container-type:inline-size}
+#review .ceremony-call-arguments dd code{font-size:min(var(--ceremony-address-size),calc((100cqi - 34px) / 25.5))}
+@container (max-width:480px){
+  #review .ceremony-rows .ceremony-party,#review .ceremony-rows .ceremony-fee,#review .ceremony-rows .ceremony-account{grid-template-columns:minmax(0,1fr);padding:12px}
+  #review .ceremony-rows .ceremony-party>.ceremony-party-label{grid-column:1;grid-row:auto;font-size:13px}
+  #review .ceremony-rows .ceremony-party>*{grid-column:1}
+  #review .ceremony-rows .ceremony-account dt,#review .ceremony-rows .ceremony-fee-label{font-size:13px}
+  #review .ceremony-rows .ceremony-party-address code{font-size:min(var(--ceremony-address-size),calc((100cqi - 26px) / 27))}
+}
+@media(max-width:560px){
+  #review .ceremony-hero .ceremony-asset-amount strong{font-size:36px}
+  .ceremony-hero-pair{grid-template-columns:minmax(0,1fr)}
+  .ceremony-hero-pair>.ceremony-flow-arrow{transform:none}
+}

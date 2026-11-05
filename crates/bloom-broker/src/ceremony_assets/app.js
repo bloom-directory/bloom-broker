@@ -163,6 +163,15 @@ function nativeIcon(chainId) {
   const [chain, address] = (asset?.art || ":").split(":");
   return artworkIcon(tokenArt(chain, address));
 }
+// Plain network names for the page header. The exact chain ID stays in the
+// technical details; a chain without a name here shows its ID instead.
+const EVM_NETWORK_NAMES = {1: "Ethereum mainnet", 10: "Optimism", 56: "BNB Chain", 100: "Gnosis",
+  137: "Polygon", 8453: "Base", 42161: "Arbitrum", 43114: "Avalanche", 59144: "Linea", 999: "HyperEVM",
+  4663: "Robinhood", 4217: "Tempo", 5042: "Arc", 11155111: "Sepolia testnet", 84532: "Base Sepolia testnet",
+  31337: "Local test chain"};
+function evmNetworkName(chainId) {
+  return EVM_NETWORK_NAMES[Number(chainId)] || `Chain ID ${chainId}`;
+}
 // Network marks where one is bundled; otherwise the network's native asset.
 function chainIcon(chainId) {
   return {1: "ethereum", 8453: "base", 31337: "test"}[Number(chainId)]
@@ -288,6 +297,11 @@ function chainLabel(chain, ctx) {
 }
 
 function addressExplorer(chainId, address) {
+  // Only a review bound to the mainnet genesis hash gets this ID, so a
+  // devnet or local address never links to mainnet.
+  if (chainId === "solana-mainnet" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) {
+    return {name: "solscan.io", url: `https://solscan.io/account/${address}`};
+  }
   if (!/^0x[0-9a-fA-F]{40}$/.test(address)) return null;
   // Etherscan public chainlist snapshot, 2026-09-22: https://api.etherscan.io/v2/chainlist
   const explorers = {
@@ -678,7 +692,8 @@ function describeTransfer(manifest) {
       const row = [field.path === "chainId" && hyperliquid ? "Signing domain chain ID" : labels[field.path] || field.path,
         field.path === "chainId" && signingChain ? signingChain : field.value, true];
       if (hyperliquid || (polymarket && ["primaryType", "version", "salt", "chainId"].includes(field.path))
-        || (payment && ["primaryType", "version", "salt"].includes(field.path))) extraTechnical.push(row);
+        || (payment && ["primaryType", "version", "salt", "name", "verifyingContract"].includes(field.path))
+        || (field.path === "chainId" && signingChain)) extraTechnical.push(row);
       else primary.push(row);
     }
     if (payment) primary.push(["Valid from", time(payment.valid_after)], ["Valid until", time(payment.valid_before)]);
@@ -733,8 +748,8 @@ function describeTransfer(manifest) {
         : tempo ? "Bloom decoded this payment from the exact bytes the wallet signs. Check the amounts and recipients below."
         : authenticationScope ? "Allow the fixed authentication profile below. Broker checks the fresh message when this permission is used."
         : payment ? "Authorize this exact token payment within the signed validity window." : "Review the exact fields bound to this message signature.",
-      chainId, networkIdentity: solana ? "Solana · cluster not encoded in message" : hyperliquid ? `Hyperliquid · ${venueNetwork || "Unknown environment"}`
-        : chainId ? `${({1:"Ethereum",10:"Optimism",56:"BNB Chain",100:"Gnosis",137:"Polygon",8453:"Base",42161:"Arbitrum",43114:"Avalanche",59144:"Linea",999:"HyperEVM",4663:"Robinhood",4217:"Tempo",5042:"Arc"})[chainId] || "EVM"} · Chain ID ${chainId}` : "Message signature",
+      chainId, networkIdentity: solana ? "Solana · network not stated in the transaction" : hyperliquid ? `Hyperliquid · ${venueNetwork || "Unknown environment"}`
+        : chainId ? evmNetworkName(chainId) : "Message signature",
       networkIcon: solana ? "solana" : chainId ? chainIcon(chainId) : "unknown",
       facts: [], technical: [...(message.payload_keccak ? [["Signing hash", message.payload_keccak, true]] : []),
         ...extraTechnical, ...(message.venue_asset?.base_units ? [["USDC base units", message.venue_asset.base_units, true]] : []),
@@ -776,6 +791,7 @@ function describeTransfer(manifest) {
     }
     else technical.push([label("Native value sent"), payload.value_display]);
     facts.push([label("Network"), chainLabel(payload.chain)]);
+    technical.push([label("Chain ID"), String(payload.chain_id)]);
     // A ceiling on execution gas, computed by Broker from the envelope's own
     // gas limit and price in the chain's authenticated units. It is a maximum
     // for that charge, not an estimate and not a cap on every network charge.
@@ -983,8 +999,7 @@ function describeTransfer(manifest) {
     if (clear) {
       interpretation.push(["Assurance class", clear.assurance]);
     }
-    const networkIdentity = oneNetwork
-      ? `EVM · ${network} · Chain ID ${first.chain_id}` : "EVM · Multiple networks";
+    const networkIdentity = oneNetwork ? evmNetworkName(first.chain_id) : "Multiple networks";
     // The amount, the token mark, and the counterparties are on the page.
     // A sentence that points at a closed disclosure is how those disappeared.
     const sentence = intent.action === "batch"
@@ -1101,7 +1116,7 @@ function describeTransfer(manifest) {
     for (const row of rows.filter(safeTechnical)) {
       technical.push([row.label, row.value, /^0x[0-9a-fA-F]{40}$/.test(row.value) || row.label === "Contract code"]);
     }
-    technical.push(["Signing owner", safe.owner, true]);
+    technical.push(["Chain ID", String(safe.chain_id)], ["Signing owner", safe.owner, true]);
     if (safe.destination.toLowerCase() !== safe.safe.toLowerCase()) technical.push(["Calls", safe.destination, true]);
     if (safe.operation === "delegatecall") technical.push(["Operation", "delegatecall"]);
     technical.push(["Safe transaction hash", safe.safe_tx_hash, true]);
@@ -1157,7 +1172,7 @@ function describeTransfer(manifest) {
     const safeMovement = !permission && directToken && safeRecipient && amount ? amount : null;
     return {sentence, facts, technical, warnings, willVerify: true, heading, safeMovement,
       button: "Approve Safe signature", chainId: safe.chain_id, tokenAsset, safeCards, safeParties,
-      networkIdentity: `EVM · ${network} · Chain ID ${safe.chain_id}`,
+      networkIdentity: evmNetworkName(safe.chain_id),
       networkIcon: chainIcon(safe.chain_id)};
   }
   if (!claim) return null;
@@ -1189,10 +1204,9 @@ function describeTransfer(manifest) {
   const facts = [];
   if (to.length) facts.push([isTransfer ? "To" : "Declared destinations", to.join(", "), true]);
   if (amounts.length) facts.push(["Amount", amounts.join(" + ")]);
-  if (fee && fee.amount) {
-    const reviewedFee = reviewed.find(a => a.kind === "declared_fee");
-    facts.push(["Estimated network fee", reviewedFee?.display || `${fee.amount} ${fee.asset}`]);
-  }
+  const feeDisplay = fee?.amount
+    ? reviewed.find(a => a.kind === "declared_fee")?.display || `${fee.amount} ${fee.asset}` : "";
+  if (feeDisplay) facts.push(["Estimated network fee", feeDisplay]);
   facts.push(["Network", network]);
   if (claim.route) facts.push(["Requested by", `Petal ${claim.route}`]);
   const assurance = claim.claim_assurance?.kind || manifest?.claim_assurance?.kind;
@@ -1202,7 +1216,20 @@ function describeTransfer(manifest) {
       ? "Required before signing — Bloom will decode the transaction and require it to match this summary"
       : "No — these figures are claimed, not verified"]);
   }
-  return {sentence, facts, willVerify};
+  // A single native send uses the same layout as an EVM native send:
+  // asset card, sender → recipient, fee. The claim carries no sender
+  // address, so the sender row names the signing account only.
+  if (isTransfer && amounts.length === 1 && to.length === 1) {
+    const native = chain === "solana" ? "solana" : "token";
+    return {intent: {action: "send", eyebrow: "Native transfer", heading: `Send ${amounts[0]}`, detail: ""},
+      sentence: "", facts, willVerify,
+      chainId: network === "Solana mainnet" ? "solana-mainnet" : chain,
+      parties: [{role: "source", value: ""}, {role: "recipient", label: "Recipient", value: to[0]}],
+      sendAsset: {native, title: native === "solana" ? "Solana" : debits[0].asset.asset, amount: amounts[0], amountLabel: "Amount", tone: "outgoing"},
+      fee: feeDisplay ? {native, amount: feeDisplay} : null,
+      networkIdentity: network, networkIcon: native};
+  }
+  return {sentence, facts, willVerify, recipients: isTransfer ? to : [], chainId: chain};
 }
 // Turn a Signer key reference into "Solana account 0 (m/44'/501'/0'/0')".
 function describeKey(ref) {
@@ -1489,6 +1516,7 @@ function renderReview(session) {
       el("p", {class: "ceremony-party-label"}, party.label));
     if (party.name) row.append(el("p", {class: "ceremony-party-name"}, party.name));
     if (party.change) row.append(el("span", {class: `ceremony-balance-change ${party.role === "source" ? "outgoing" : "incoming"}`}, party.change));
+    if (!party.value) return row;
     const address = el("code", {}, party.value);
     const explorer = addressExplorer(party.chainId || transfer?.chainId, party.value);
     const identity = explorer ? el("a", {class: "ceremony-address-link", href: explorer.url,
@@ -1527,6 +1555,12 @@ function renderReview(session) {
     decision.push(el("dl", {class: "facts ceremony-account"},
       el("dt", {}, "Signing account"),
       el("dd", {}, [walletName, accountLabel].filter(Boolean).join(" · "))));
+  }
+  // A multi-recipient claim says "to the address below", so the addresses
+  // must be here, not only in the collapsed technical details.
+  for (const value of transfer?.recipients || []) {
+    decision.push(el("div", {class: "ceremony-identity ceremony-transfer-path"},
+      partyRow({role: "recipient", label: "Recipient", value})));
   }
   if (transfer?.tokenAsset) {
     decision.push(assetCard(transfer.tokenAsset));
@@ -1574,6 +1608,8 @@ function renderReview(session) {
         amountLabel: sending ? "Amount" : "Spending limit",
         tone: unlimited ? "danger" : sending ? "outgoing" : "permission"
       }));
+    } else if (transfer.sendAsset) {
+      decision.push(assetCard(transfer.sendAsset));
     } else if (transfer.intent.action === "send") {
       decision.push(assetCard({
         ...nativeCard(transfer.payloads?.[0]?.chain_id),
@@ -1788,6 +1824,11 @@ function renderReview(session) {
     decision.push(el("div", {class: "ceremony-fee", "aria-label": "Execution gas only; other network charges may apply"},
       el("span", {class: "ceremony-fee-label"}, label), amount));
   }
+  if (transfer?.fee) {
+    decision.push(el("div", {class: "ceremony-fee"},
+      el("span", {class: "ceremony-fee-label"}, "Network fee"),
+      el("span", {class: "ceremony-fee-amount"}, reviewIcon(transfer.fee.native), el("span", {}, transfer.fee.amount))));
+  }
   if (meta.warn) primaryWarnings.unshift(meta.warn);
   for (const note of detailNotes) evidence.push(el("p", {class: "ceremony-assurance"}, note));
 
@@ -1835,14 +1876,33 @@ function renderReview(session) {
   const primary = [];
   if (outputWarning) primary.push(outputWarning);
   if (summaryHtml) primary.push(el("p", {class: "summary", html: summaryHtml}));
+  // Every review has the same shape: the amounts, centred, then one table of
+  // parties and fees. Batch cards repeat that table inside each card.
   const hero = decision.filter(node => String(node.className || "").includes("ceremony-asset"));
   const rest = decision.filter(node => !String(node.className || "").includes("ceremony-asset"));
   const enso = transfer?.payloads?.some(payload => payload.contract_call?.contract_name === "Enso Router V2");
-  hero.forEach((card, index) => {
-    if (enso && index) primary.push(el("div", {class: "ceremony-flow-arrow", "aria-hidden": "true"}, "↓"));
-    primary.push(card);
-  });
-  primary.push(...rest);
+  if (hero.length) {
+    const action = ["send", "transfer"].includes(transfer?.intent?.action) ? "send" : "other";
+    const stage = el("div", {class: hero.length > 1 ? "ceremony-hero ceremony-hero-pair" : "ceremony-hero",
+      "data-hero": action});
+    hero.forEach((card, index) => {
+      if (enso && index) stage.append(el("div", {class: "ceremony-flow-arrow", "aria-hidden": "true"}, "↓"));
+      stage.append(card);
+    });
+    primary.push(stage);
+  }
+  const rowLike = node => /\bceremony-(identity|party|fee|account)\b/.test(String(node?.className || ""));
+  const groupRows = nodes => nodes.reduce((out, node) => {
+    const last = out[out.length - 1];
+    if (!rowLike(node)) out.push(node);
+    else if (String(last?.className || "") === "ceremony-rows") last.append(node);
+    else out.push(el("div", {class: "ceremony-rows"}, node));
+    return out;
+  }, []);
+  for (const node of rest) {
+    if (String(node.className || "").includes("ceremony-card")) node.replaceChildren(...groupRows([...node.children]));
+  }
+  primary.push(...groupRows(rest));
   if (warning) primary.push(warning);
   reviewNode.replaceChildren(...primary,
     el("details", {class: "ceremony-details ceremony-evidence"},
@@ -1863,6 +1923,9 @@ function markDone(title) {
 
 function renderResult(session, plaintext) {
   const kind = session.ceremony_kind;
+  // The approval deadline no longer applies once the result is shown.
+  document.getElementById("review-deadline").textContent = "";
+  document.getElementById("action-expiry").textContent = "";
   const text = new TextDecoder().decode(plaintext).trim();
   let parsed = null;
   try { parsed = JSON.parse(text); } catch (_) {}
@@ -1903,9 +1966,20 @@ function renderResult(session, plaintext) {
     el("p", {}, el("a", {href: walletPageUrl(session.signer_contribution.wallet_id)}, "Return to wallet")));
 }
 
+// The Broker renders the QR as SVG; it is parsed as SVG, never as HTML.
+function addressQr(svg) {
+  if (typeof svg !== "string") return null;
+  const parsed = new DOMParser().parseFromString(svg, "image/svg+xml").documentElement;
+  if (parsed.nodeName !== "svg") return null;
+  parsed.setAttribute("role", "img");
+  parsed.setAttribute("aria-label", "Address QR code");
+  return el("div", {class: "wallet-qr"}, document.importNode(parsed, true));
+}
 function walletPageUrl(wallet) { return "/wallet/" + encodeURIComponent(wallet); }
-function createdWalletView(accounts, created = true) {
-  markDone(created ? "Wallet created" : accounts.wallet_id);
+// `title` names a just-finished ceremony; the plain wallet page passes none.
+function createdWalletView(accounts, title = "Wallet created") {
+  const created = Boolean(title);
+  markDone(title || accounts.wallet_id);
   document.getElementById("review-deadline").textContent = "";
   document.getElementById("action-expiry").textContent = "";
   document.getElementById("ceremony-actions").hidden = true;
@@ -1934,21 +2008,35 @@ function createdWalletView(accounts, created = true) {
           el("div", {}, el("h3", {}, chain.chain_family === "evm" ? "Ethereum & EVM" : label),
             el("p", {}, describeKey(account.key_ref).account.replace(/ \(m\/[^)]*\)$/, "") || "Initial account"))),
         el("p", {class: "wallet-address"}, el("code", {}, chain.address)),
+        addressQr(chain.address_qr),
         copy));
     }
   }
   if (!accounts.accounts?.length) parts.push(el("p", {class: "ceremony-warning"}, "Addresses could not be loaded. Your wallet was created; do not create it again."));
   const backup = el("button", {type: "button"}, "Back up wallet");
+  // Beside the button, so a refused backup never looks like a dead click.
+  const backupError = el("p", {class: "wallet-backup-error", role: "alert"});
+  const backupUrl = `/api/wallet/${encodeURIComponent(accounts.wallet_id)}/backup`;
   backup.onclick = async () => {
     backup.disabled = true;
+    backupError.textContent = "";
     try {
-      const prepared = await mutate(`/api/wallet/${encodeURIComponent(accounts.wallet_id)}/backup`, {});
+      let prepared;
+      try { prepared = await mutate(backupUrl, {}); }
+      catch (error) {
+        // Opening a backup that another tab left open cancels it, and that
+        // cancellation starts a short cooldown. Wait it out once, visibly.
+        if (!(error.retryAfterMs > 0 && error.retryAfterMs <= 10_000)) throw error;
+        backupError.textContent = "Opening backup…";
+        await new Promise(resolve => setTimeout(resolve, error.retryAfterMs + 200));
+        prepared = await mutate(backupUrl, {});
+      }
       const target = new URL(prepared.ceremony_url, location.href);
       if (target.origin !== location.origin || !target.pathname.startsWith("/ceremony/")) throw new Error("Unexpected backup destination");
       location.assign(target.href);
     } catch (error) {
       backup.disabled = false;
-      statusNode.textContent = Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0
+      backupError.textContent = Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0
         ? `Please wait ${Math.ceil(error.retryAfterMs / 1000)} seconds before starting another backup.`
         : "Could not open backup. Finish or cancel any pending wallet request, then try again.";
     }
@@ -1959,7 +2047,7 @@ function createdWalletView(accounts, created = true) {
       el("h2", {}, "Back up your wallet"),
       el("p", {}, "Save your recovery phrase offline. It restores your wallet if you lose access to your passkey.")),
     el("div", {class: "wallet-backup-actions"}, backup,
-      el("span", {}, "Requires your passkey"),
+      el("span", {}, "Requires your passkey"), backupError,
       created ? el("a", {href: walletPageUrl(accounts.wallet_id)}, "Later — return to wallet") : null),
     el("details", {class: "wallet-backup-details"},
       el("summary", {}, "About your backup"),
@@ -1991,6 +2079,8 @@ function showRecoveryCode(recovery) {
 // read right after a registration means "not yet", not "no wallet", and the
 // caller there waits. On the load path one read answers a different question,
 // whether a wallet is already there, and must not stall the form.
+// Creating or importing a wallet ends on its addresses and backup.
+function opensWallet(kind) { return kind === "wallet_registration" || kind === "wallet_import"; }
 async function showCreatedWallet(session, attempts = 1) {
   const wallet = session.signer_contribution?.wallet_id;
   if (!wallet || remoteCeremony) return false;
@@ -1998,7 +2088,7 @@ async function showCreatedWallet(session, attempts = 1) {
     if (attempt) await new Promise(resolve => setTimeout(resolve, 300));
     const response = await fetch(`/api/wallet/${encodeURIComponent(wallet)}`, {credentials: "same-origin", cache: "no-store"});
     if (response.ok) {
-      createdWalletView(await response.json());
+      createdWalletView(await response.json(), session.ceremony_kind === "wallet_import" ? "Wallet imported" : "Wallet created");
       return true;
     }
   }
@@ -3432,6 +3522,22 @@ const PREVIEWS = {
     session.preview_status = "Synthetic DAI transfer · Not a live request";
     return session;
   },
+  "transfer-uni": () => {
+    const token = {address: "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", name: "Uniswap", symbol: "UNI", decimals: 18};
+    const session = previewApproval([previewPayload({chain_id: "1", chain: "ethereum", destination: token.address,
+      contract_call: previewCall("transfer", "40000000000000000000", "40 UNI", "finite", [], token)
+    })], previewClearSigning("1", token.address));
+    session.preview_status = "Synthetic UNI transfer · Not a live request";
+    return session;
+  },
+  "allowance-crv": () => {
+    const token = {address: "0xD533a949740bb3306d119CC777fa900bA034cd52", name: "Curve DAO Token", symbol: "CRV", decimals: 18};
+    const session = previewApproval([previewPayload({chain_id: "1", chain: "ethereum", destination: token.address,
+      contract_call: previewCall("allowance", "500000000000000000000", "500 CRV", "finite", [PREVIEW_ALLOWANCE_ADVISORY], token)
+    })], previewClearSigning("1", token.address));
+    session.preview_status = "Synthetic CRV spending permission · Not a live request";
+    return session;
+  },
   "allowance-finite": () => previewApproval([previewPayload({
     contract_call: previewCall("allowance", "100000000", "100 USDC", "finite", [
       PREVIEW_ALLOWANCE_ADVISORY,
@@ -3451,6 +3557,21 @@ const PREVIEWS = {
   "opaque-call": () => previewApproval([previewPayload({calldata_hex:
     "0xa9059cbb" + PREVIEW_SPENDER.slice(2).toLowerCase().padStart(64, "0") +
     (250000000n).toString(16).padStart(64, "0")})], null),
+  "solana-send": () => ({
+    ceremony_kind: "sealed_approval", expires_at_ms: Date.now() + 9 * 60 * 1000,
+    signer_contribution: {wallet_id: "main", key_ref: {derivation: {path: "m/44'/501'/0'/0'"}}},
+    review_manifest: {
+      canonical_plan: JSON.stringify({asset_amounts: [{kind: "declared_debit", display: "0.001 SOL"},
+        {kind: "declared_fee", display: "0.000005 SOL"}]}),
+      system_use_claim: {
+        declared_debits: [{amount: "1000000", asset: {chain: "solana", asset: "native"}}],
+        declared_destinations: [{chain: "solana", destination: "GWGW3TzM5dEDV38xK1F8chQJptJ6aywQkwksgfhKztEu"}],
+        declared_fee: {kind: "fee", chain: "solana", asset: "lamports", amount: "5000"},
+        chain_context: {chain_family: "solana", genesis_hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"},
+        claim_assurance: {kind: "proof_verified"}
+      }
+    }
+  }),
   "native-send": () => previewApproval([previewPayload({
     destination: PREVIEW_SPENDER, value: "10000000000000000", value_display: "0.01 ETH",
     calldata_bytes: "0", calldata_keccak: undefined
@@ -3582,7 +3703,7 @@ async function load() {
     const wallet = decodeURIComponent(walletPath.slice("/wallet/".length));
     const response = await fetch(`/api/wallet/${encodeURIComponent(wallet)}`, {credentials: "same-origin", cache: "no-store"});
     if (!response.ok) throw new Error("Wallet is unavailable on this Bloom host");
-    createdWalletView(await response.json(), false);
+    createdWalletView(await response.json(), null);
     approve.hidden = true;
     cancel.hidden = true;
     statusNode.textContent = "";
@@ -3606,7 +3727,10 @@ async function load() {
             "enso-shortcut": "Enso edge case · No output protection · Runtime-dependent calls",
             "transfer-ethereum": "USDC transfer · Ethereum · ordinary wallet",
             "transfer-dai": "DAI transfer · Ethereum · ordinary wallet",
+            "transfer-uni": "UNI transfer · Ethereum · ordinary wallet",
+            "allowance-crv": "CRV spending permission · Ethereum · ordinary wallet",
             "native-send": "Ether transfer · Base · ordinary wallet",
+            "solana-send": "SOL transfer · Solana mainnet · ordinary wallet",
             "safe-token-transfer": "USDC transfer · Base · Safe signature",
             "safe-allowance-unlimited": "Unlimited USDC permission · Safe signature",
             "structural-transfer": "Unverified token identity · transfer-shaped calldata"
@@ -3680,7 +3804,7 @@ async function load() {
     if (result.encrypted_browser_result) outputRecipient = await outputRecipientFor(session, true);
     return finishBrowserResult(session, result);
   }
-  if (session.ceremony_kind === "wallet_registration" && await showCreatedWallet(session)) {
+  if (opensWallet(session.ceremony_kind) && await showCreatedWallet(session)) {
     approvalTerminal = true;
     approve.hidden = true;
     cancel.hidden = true;
@@ -3910,7 +4034,7 @@ async function run(session) {
     if (genericKinds.has(kind)) {
       let effect = {kind};
       if (kind === "wallet_export") {
-        const format = document.querySelector('input[name="export-format"]:checked')?.value;
+        const format = document.querySelector('input[name="export-format"]')?.value;
         if (!format) throw new Error("Choose what to export");
         effect = {format, kind};
       } else if (!scopedPetalKey && !genericFields.hidden) {
@@ -3999,7 +4123,7 @@ async function finishBrowserResult(session, result) {
       te.encode(outputAad),
       result.encrypted_browser_result
     );
-    if (session.ceremony_kind === "wallet_registration") {
+    if (opensWallet(session.ceremony_kind)) {
       // Custody has committed, and the wallet view below is best effort, so a
       // registration must not lapse to failed because that view would not
       // render. Other results are acknowledged only once they are drawn.
@@ -4007,7 +4131,7 @@ async function finishBrowserResult(session, result) {
       let recovery;
       try { recovery = JSON.parse(new TextDecoder().decode(plaintext)); } catch (_) {}
       if (!await showCreatedWallet(session, 10)) {
-        statusNode.textContent = "Wallet created. Its addresses are not readable here yet; open Bloom to see them.";
+        statusNode.textContent = `${session.ceremony_kind === "wallet_import" ? "Wallet imported" : "Wallet created"}. Its addresses are not readable here yet; open Bloom to see them.`;
       }
       // After the wallet view, which replaces the review contents.
       showRecoveryCode(recovery);
@@ -4016,7 +4140,7 @@ async function finishBrowserResult(session, result) {
       await mutate(`/api/session/${ceremonyId}/ack`, {});
     }
   } else {
-    if (session.ceremony_kind !== "wallet_registration" || !await showCreatedWallet(session)) renderDone(session, result);
+    if (!opensWallet(session.ceremony_kind) || !await showCreatedWallet(session)) renderDone(session, result);
   }
   await clearBrowserState(ceremonyId);
 }
