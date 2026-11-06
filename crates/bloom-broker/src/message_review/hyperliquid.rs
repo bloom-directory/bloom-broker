@@ -95,6 +95,125 @@ struct CancelByCloid {
     cloid: String,
 }
 
+/// The review field holding Broker's own bound on an order's builder fee, in
+/// micro-USDC, rounded up. Present exactly when the order carries a builder.
+pub(super) const BUILDER_FEE_FIELD: &str = "Maximum builder fee (micro-USDC, rounded up)";
+/// The operation class every builder-bearing order must sign under.
+pub(crate) const BUILDER_ORDER_CLASS: &str = "hyperliquid.builder_order";
+/// Asset IDs from here on are spot, builder-deployed (HIP-3) or outcome
+/// markets, whose builder fee may not be paid in USDC.
+const SPOT_ASSET_ID_OFFSET: u32 = 10_000;
+
+/// Broker's own upper bound on the builder fee `orders` can pay at `rate`
+/// tenths of a basis point of notional, from the signed prices and sizes.
+/// Only legs Broker can bound in USDC are accepted: core-perp limit orders.
+/// A buy fills at or below its limit; a sell must be post-only (`Alo`), so it
+/// fills at exactly its limit rather than at a lower resting bid.
+fn builder_fee_bound(orders: &[Order], rate: u32) -> Result<u64, ProtocolError> {
+    let mut total = 0_u64;
+    for order in orders {
+        let Some(limit) = &order.t.limit else {
+            return Err(invalid(
+                "a trigger order fills at the market, so its builder fee cannot be bounded",
+            ));
+        };
+        if order.a >= SPOT_ASSET_ID_OFFSET {
+            return Err(invalid(
+                "Bloom bounds builder fees only on core perpetual orders, which pay them in USDC",
+            ));
+        }
+        if !order.b && limit.tif != "Alo" {
+            return Err(invalid(
+                "a sell carrying a builder fee must be post-only (Alo) so it fills at its limit",
+            ));
+        }
+        total = total
+            .checked_add(leg_fee_micros(&order.p, &order.s, rate)?)
+            .ok_or_else(|| invalid("builder fee exceeds the supported USDC amount"))?;
+    }
+    Ok(total)
+}
+
+/// `price * size * rate / 10^5` in micro-USDC, rounded up, from the exact
+/// signed decimals.
+fn leg_fee_micros(price: &str, size: &str, rate: u32) -> Result<u64, ProtocolError> {
+    use alloy::primitives::U256;
+    let decimal = |raw: &str| -> Result<(U256, usize), ProtocolError> {
+        let (whole, fraction) = raw.split_once('.').unwrap_or((raw, ""));
+        if whole.is_empty()
+            || !format!("{whole}{fraction}")
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+        {
+            return Err(invalid("order price or size is not a plain decimal"));
+        }
+        let mantissa = U256::from_str_radix(&format!("{whole}{fraction}"), 10)
+            .map_err(|_| invalid("order price or size is too large"))?;
+        Ok((mantissa, fraction.len()))
+    };
+    let overflow = || invalid("builder fee exceeds the supported USDC amount");
+    let (price, price_scale) = decimal(price)?;
+    let (size, size_scale) = decimal(size)?;
+    // 1 USDC is 10^6 micros and a tenth of a basis point is 1/10^5.
+    let numerator = price
+        .checked_mul(size)
+        .and_then(|value| value.checked_mul(U256::from(rate)))
+        .and_then(|value| value.checked_mul(U256::from(10)))
+        .ok_or_else(overflow)?;
+    let denominator = U256::from(10)
+        .checked_pow(U256::from(price_scale + size_scale))
+        .ok_or_else(overflow)?;
+    let mut bound = numerator / denominator;
+    if numerator % denominator != U256::ZERO {
+        bound += U256::from(1);
+    }
+    bound.try_into().map_err(|_| overflow())
+}
+
+/// A builder fee needs [`BUILDER_ORDER_CLASS`], and that class needs a builder
+/// fee declared in HyperCore USDC at no less than Broker's own bound. Every
+/// other class must declare no fee for a builder to be paid.
+pub(super) fn validate_builder_fee(
+    claim: &bloom_broker_api::PetalUseClaim,
+    review: &MessageReview,
+) -> Result<(), ProtocolError> {
+    let bound = review
+        .fields
+        .iter()
+        .find(|field| field.path == BUILDER_FEE_FIELD)
+        .map(|field| field.value.parse::<u64>())
+        .transpose()
+        .map_err(|_| invalid("invalid builder fee bound"))?;
+    let builder_class = claim.operation_class.as_str() == BUILDER_ORDER_CLASS;
+    match (bound, builder_class) {
+        (None, false) => Ok(()),
+        (Some(_), false) => Err(invalid(
+            "an order carrying a builder fee must sign under hyperliquid.builder_order",
+        )),
+        (None, true) => Err(invalid(
+            "hyperliquid.builder_order requires an order carrying a builder fee",
+        )),
+        (Some(bound), true) => match &claim.declared_fee {
+            bloom_broker_api::DeclaredFee::Fee {
+                chain,
+                asset,
+                amount,
+            } if chain.as_str() == "hyperliquid"
+                && asset == "usdc"
+                && amount
+                    .as_str()
+                    .parse::<alloy::primitives::U256>()
+                    .is_ok_and(|amount| amount >= alloy::primitives::U256::from(bound)) =>
+            {
+                Ok(())
+            }
+            _ => Err(invalid(&format!(
+                "the declared builder fee must be HyperCore USDC of at least {bound} micro-USDC, Bloom's bound from the signed order"
+            ))),
+        },
+    }
+}
+
 fn field(path: impl Into<String>, value: impl ToString) -> MessageField {
     MessageField {
         path: path.into(),
@@ -259,6 +378,17 @@ pub(super) fn rebuild(
         ),
     ];
     collect(&canonical, "action", &mut fields, field_limit)?;
+    if let Action::Order {
+        orders,
+        builder: Some(builder),
+        ..
+    } = &action
+    {
+        fields.push(field(
+            BUILDER_FEE_FIELD,
+            builder_fee_bound(orders, builder.f)?,
+        ));
+    }
     let title = match action {
         Action::Order { .. } => "Sign exchange orders",
         Action::Cancel { .. } | Action::CancelByCloid { .. } => "Cancel exchange orders",
