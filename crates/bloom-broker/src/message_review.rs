@@ -15,7 +15,7 @@ const SCHEMA: &str = "bloom.message.review.v1";
 const MAX_FIELDS: usize = 256;
 const MAX_DEPTH: usize = 12;
 
-mod hyperliquid;
+pub(crate) mod hyperliquid;
 mod polymarket;
 pub(crate) mod polymarket_auth;
 mod tempo;
@@ -31,12 +31,13 @@ pub(crate) fn verify_hyperliquid_agent_use(
         .petal_use_claim
         .as_ref()
         .ok_or_else(|| invalid("Agent action requires its claim"))?;
-    if claim.operation_class.as_str() != "hyperliquid.agent_action"
+    let builder_order = claim.operation_class.as_str() == hyperliquid::BUILDER_ORDER_CLASS;
+    if !(builder_order || claim.operation_class.as_str() == "hyperliquid.agent_action")
         || request.crypto_suite != CryptoSuite::Secp256k1Keccak256Recoverable
         || claim.crypto_suite != request.crypto_suite
         || !claim.declared_debits.is_empty()
         || !claim.declared_destinations.is_empty()
-        || claim.declared_fee != bloom_broker_api::DeclaredFee::None
+        || (!builder_order && claim.declared_fee != bloom_broker_api::DeclaredFee::None)
     {
         return Err(invalid(
             "Agent action has an unsupported class, suite or financial claim",
@@ -65,6 +66,7 @@ pub(crate) fn verify_hyperliquid_agent_use(
             "Agent action witness differs from its actual signing bytes",
         ));
     }
+    hyperliquid::validate_builder_fee(claim, &review)?;
     Ok(review)
 }
 
@@ -939,6 +941,9 @@ fn validate_petal_profile(
             "Polymarket exact review derives its facts from signed fields, not financial claim overrides",
         ));
     }
+    if review.kind == "hyperliquid_l1" {
+        hyperliquid::validate_builder_fee(claim, review)?;
+    }
     if let Some(primary) = match class {
         "hyperliquid.approve_agent" => Some("HyperliquidTransaction:ApproveAgent"),
         "hyperliquid.usd_send" => Some("HyperliquidTransaction:UsdSend"),
@@ -1767,6 +1772,135 @@ mod tests {
             )];
             assert!(review(&request, signer()).is_err(), "{path}");
         }
+    }
+
+    /// Broker bounds a builder order's fee from the signed order itself and
+    /// refuses a claim that declares less, or a builder under any other class.
+    #[test]
+    fn builder_fee_is_bounded_from_the_signed_order() {
+        use bloom_broker_api::{
+            ClaimAssurance, DeclaredFee, MachineSignRequest, PetalUseClaim, ProvenanceSubject,
+            SigningPayloads,
+        };
+        let builder = format!("{:#x}", Address::with_last_byte(0xbb));
+        let order = |a: u32, buy: bool, tif: &str| json!({"a":a,"b":buy,"p":"50000","s":"0.01","r":false,"t":{"limit":{"tif":tif}}});
+        let base = request(
+            serde_json::to_vec(
+                &json!({"schema":SCHEMA,"kind":"hyperliquid_l1","network":"mainnet",
+                "action":{"type":"cancel","cancels":[{"a":0,"o":42}]},"nonce":1u64}),
+            )
+            .unwrap(),
+        );
+        let use_request =
+            |orders: Value, builder_fee: Option<u32>, class: &str, fee: DeclaredFee| {
+                let mut action = json!({"type":"order","orders":orders,"grouping":"na"});
+                if let Some(f) = builder_fee {
+                    action["builder"] = json!({"b":builder,"f":f});
+                }
+                let witness = json!({"schema":SCHEMA,"kind":"hyperliquid_l1","network":"mainnet",
+                "action":action,"nonce":1_700_000_000_000u64});
+                let bytes = serde_json::to_vec(&witness).unwrap();
+                let raw = decode(&bytes, signer())
+                    .map(|(raw, _)| raw)
+                    .unwrap_or_default();
+                MachineSignRequest {
+                    operation_id: base.operation_id.clone(),
+                    operation_digest: Digest32::from_bytes([4; 32]),
+                    approval_id: Digest32::from_bytes([5; 32]),
+                    key_ref: base.terms.key_ref.clone(),
+                    crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+                    payloads: SigningPayloads::Single {
+                        payload: Base64UrlBytes::from_bytes(&raw),
+                    },
+                    petal_use_claim: Some(PetalUseClaim {
+                        package_hash: Digest32::from_bytes([1; 32]),
+                        route: "agent/order".into(),
+                        operation_class: Token::new(class).unwrap(),
+                        crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+                        payload_digest: Digest32::from_bytes([6; 32]),
+                        ordered_hashes: vec![],
+                        declared_debits: vec![],
+                        declared_destinations: vec![],
+                        declared_fee: fee,
+                        nonce: RequestNonce::from_bytes([7; 16]),
+                        claim_assurance: ClaimAssurance::MachineAsserted,
+                    }),
+                    system_use_claim: None,
+                    claim_assurance_evidence: Some(Base64UrlBytes::from_bytes(&bytes)),
+                    provenance: ProvenanceSubject::Petal {
+                        package_hash: Digest32::from_bytes([1; 32]),
+                        route: "agent/order".into(),
+                    },
+                }
+            };
+        let usdc = |amount: &str| DeclaredFee::Fee {
+            chain: Token::new("hyperliquid").unwrap(),
+            asset: "usdc".into(),
+            amount: bloom_broker_api::DecimalU256::parse(amount).unwrap(),
+        };
+        let builder_class = hyperliquid::BUILDER_ORDER_CLASS;
+        let check = |orders: Value, f: Option<u32>, class: &str, fee: DeclaredFee| {
+            verify_hyperliquid_agent_use(&use_request(orders, f, class, fee), signer())
+        };
+        let buy = json!([order(0, true, "Gtc")]);
+
+        // 50000 * 0.01 notional at 10 tenths of a basis point is 0.05 USDC.
+        let reading = check(buy.clone(), Some(10), builder_class, usdc("50000")).unwrap();
+        assert!(reading.fields.iter().any(|field| {
+            field.path == hyperliquid::BUILDER_FEE_FIELD && field.value == "50000"
+        }));
+        check(buy.clone(), Some(10), builder_class, usdc("60000")).unwrap();
+        for fee in [usdc("49999"), DeclaredFee::None] {
+            assert!(check(buy.clone(), Some(10), builder_class, fee).is_err());
+        }
+        let other_asset = DeclaredFee::Fee {
+            chain: Token::new("hyperliquid").unwrap(),
+            asset: "usdt".into(),
+            amount: bloom_broker_api::DecimalU256::parse("50000").unwrap(),
+        };
+        assert!(check(buy.clone(), Some(10), builder_class, other_asset).is_err());
+        // A builder needs the fee-bearing class, and that class needs a builder.
+        assert!(
+            check(
+                buy.clone(),
+                Some(10),
+                "hyperliquid.agent_action",
+                DeclaredFee::None
+            )
+            .is_err()
+        );
+        assert!(check(buy.clone(), None, builder_class, usdc("0")).is_err());
+        check(buy, None, "hyperliquid.agent_action", DeclaredFee::None).unwrap();
+
+        // A post-only sell fills at its limit; any other sell, a spot or
+        // HIP-3 leg, or a trigger order cannot be bounded.
+        check(
+            json!([order(0, false, "Alo")]),
+            Some(10),
+            builder_class,
+            usdc("50000"),
+        )
+        .unwrap();
+        let trigger = json!([{"a":0,"b":true,"p":"50000","s":"0.01","r":false,
+            "t":{"trigger":{"isMarket":true,"triggerPx":"49000","tpsl":"sl"}}}]);
+        for orders in [
+            json!([order(0, false, "Gtc")]),
+            json!([order(10_001, true, "Gtc")]),
+            json!([order(100_001, true, "Gtc")]),
+            trigger,
+        ] {
+            assert!(
+                check(orders.clone(), Some(10), builder_class, usdc("1000000000")).is_err(),
+                "{orders}"
+            );
+        }
+
+        // Each leg rounds up: 1.001 * 1 at one tenth of a basis point is
+        // 10.01 micro-USDC.
+        let leg =
+            json!([{"a":0,"b":true,"p":"1.001","s":"1","r":false,"t":{"limit":{"tif":"Gtc"}}}]);
+        assert!(check(leg.clone(), Some(1), builder_class, usdc("10")).is_err());
+        check(leg, Some(1), builder_class, usdc("11")).unwrap();
     }
 
     #[test]
