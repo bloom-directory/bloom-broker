@@ -749,19 +749,15 @@ function describeTransfer(manifest) {
       ? ["Relay's final destination and quoted output are separate Petal claims. This signature authorizes the payment to the recipient shown above."]
       : claim && !["venice-x402.topup", "hyperliquid.usd_send", "hyperliquid.withdraw", "polymarket.clob_auth.v1"].includes(claim.operation_class)
         ? ["The Petal reports the destination and policy limits. These claims are not established by the message signature; review them separately from the signed authorization."] : [];
-    // One order reads as a sentence: "Buy 0.0045 on market 1 at up to 2260 USDC".
-    const order = name => fields.find(field => field.path === `Order 1 · ${name}`)?.value;
-    const orderHeading = singleOrder && `${order("Side")} ${order("Size")} on market ${order("Market ID (identity unverified)")} at ${
-      order("Side") === "Buy" ? "up to" : "at least"} ${order("Limit price (USDC)")} USDC`;
     return {
-      intent: {action: "sign_message", heading: orderHeading || message.title || "Sign a message"},
+      intent: {action: "sign_message", heading: message.title || "Sign a message"},
       button: solana ? "Approve Solana transaction" : tempo ? "Approve Tempo payment" : authenticationScope ? "Allow one authentication" : payment ? "Approve payment authorization" : agent ? "Authorize trading agent"
         : hyperliquid ? "Approve exchange action" : "Approve message signature",
       sentence: solana ? "Approve one transaction. Only its recent blockhash may refresh; every other signed byte remains bound to this review."
         : tempo ? "Bloom decoded this payment from the exact bytes the wallet signs. Check the amounts and recipients below."
         : authenticationScope ? "Allow the fixed authentication profile below. Broker checks the fresh message when this permission is used."
         : payment ? "Authorize this exact token payment within the signed validity window."
-        : orderHeading ? "Bloom read this order from the exact bytes you sign. It does not check which coin a market number is."
+        : singleOrder ? "Bloom read this order from the exact bytes you sign."
         : "Review the exact fields bound to this message signature.",
       chainId, networkIdentity: solana ? "Solana · network not stated in the transaction" : hyperliquid ? `Hyperliquid · ${venueNetwork || "Unknown environment"}`
         : chainId ? evmNetworkName(chainId) : "Message signature",
@@ -3624,11 +3620,11 @@ const PREVIEWS = {
   "hyperliquid-order": () => {
     const session = previewAccountOne(previewApproval([], null));
     session.review_manifest.canonical_plan = JSON.stringify({message_review: {
-      kind: "hyperliquid_l1", title: "Sign exchange orders", signer: PREVIEW_WALLET,
+      kind: "hyperliquid_l1", title: "Buy 0.0045 ETH for up to 2260 USDC each", signer: PREVIEW_WALLET,
       domain: [{path: "primaryType", value: "Agent"}, {path: "chainId", value: "1337"}],
       fields: [["Hyperliquid environment", "mainnet"], ["Nonce (Unix milliseconds)", "1794017923895"],
         ["Vault account", "None (trades as the signing account)"], ["Expires after (Unix milliseconds)", "1794018223895"],
-        ["Action", "order"], ["Order 1 · Market ID (identity unverified)", "1"], ["Order 1 · Side", "Buy"],
+        ["Action", "order"], ["Order 1 · Market", "ETH perpetual (market 1)"], ["Order 1 · Side", "Buy"],
         ["Order 1 · Limit price (USDC)", "2260"], ["Order 1 · Size", "0.0045"], ["Order 1 · Reduce only", "No"],
         ["Order 1 · Time in force", "Immediate or cancel (unfilled size is cancelled)"],
         ["Order 1 · Client order ID", "0x06b811d5b12547d5b2e90ddd3f99e7cb"], ["Linked orders", "None"]]

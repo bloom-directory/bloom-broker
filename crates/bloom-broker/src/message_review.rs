@@ -514,7 +514,7 @@ fn decode_with_exchange_limit(
             review.kind = "hyperliquid_l1".into();
             review.title = title;
             review.fields = fields;
-            review.warnings.push("Bloom rebuilt the exchange action's MessagePack commitment. Market IDs, order bounds and fees are signed; Bloom has not checked market identity, available balance, fills or venue execution.".into());
+            review.warnings.push("Bloom rebuilt the exchange action's MessagePack commitment. Market IDs, order bounds and fees are signed. Market names come from a list bundled with this Bloom release; Bloom has not checked available balance, fills or venue execution.".into());
             return Ok((preimage, review));
         }
         Envelope::TempoTransaction {
@@ -1553,9 +1553,13 @@ mod tests {
                     .iter()
                     .any(|field| field.path == label && field.value == value)
             );
-            assert!(reading.fields.iter().any(|field| field.path
-                == "cancels[1] · Market ID (identity unverified)"
-                && field.value == "0"));
+            assert!(
+                reading
+                    .fields
+                    .iter()
+                    .any(|field| field.path == "cancels[1] · Market"
+                        && field.value == "Market 0 (testnet; Bloom has no testnet market names)")
+            );
             input.claim_assurance_evidence = None;
             assert!(verify_hyperliquid_agent_use(&input, signer()).is_err());
             let mut changed = record["witness"].clone();
