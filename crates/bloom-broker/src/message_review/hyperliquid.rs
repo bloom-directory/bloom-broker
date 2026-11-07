@@ -129,25 +129,69 @@ fn collect(
             }
         }
         value => {
+            let raw = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            let yes_no = |v: &Value| match v.as_bool() {
+                Some(true) => "Yes".to_owned(),
+                Some(false) => "No".to_owned(),
+                None => raw.clone(),
+            };
+            let mut shown = raw.clone();
             let label = match path {
                 "action.type" => "Action".into(),
                 "action.asset" => "Market ID (identity unverified)".into(),
-                "action.isCross" => "Cross margin".into(),
+                "action.isCross" => {
+                    shown = yes_no(value);
+                    "Cross margin".into()
+                }
                 "action.leverage" => "Leverage".into(),
                 "action.time" => "Scheduled cancellation (Unix milliseconds)".into(),
-                "action.f" => "Fast cancellation".into(),
-                "action.grouping" => "Order grouping".into(),
+                "action.f" => {
+                    shown = yes_no(value);
+                    "Fast cancellation".into()
+                }
+                "action.grouping" => {
+                    shown = match raw.as_str() {
+                        "na" => "None".into(),
+                        "normalTpsl" => "Take-profit/stop-loss for these orders".into(),
+                        "positionTpsl" => "Take-profit/stop-loss for the whole position".into(),
+                        _ => raw.clone(),
+                    };
+                    "Linked orders".into()
+                }
                 "action.builder.b" => "Builder fee recipient".into(),
                 "action.builder.f" => "Builder fee rate (tenths of a basis point)".into(),
                 _ if path.starts_with("action.orders[") => {
                     let (order, suffix) = path
                         .split_once(']')
                         .ok_or_else(|| invalid("invalid order path"))?;
+                    match suffix {
+                        ".b" => {
+                            shown = if value.as_bool() == Some(true) {
+                                "Buy"
+                            } else {
+                                "Sell"
+                            }
+                            .into()
+                        }
+                        ".r" | ".t.trigger.isMarket" => shown = yes_no(value),
+                        ".t.limit.tif" => {
+                            shown = match raw.as_str() {
+                                "Ioc" => "Immediate or cancel (unfilled size is cancelled)".into(),
+                                "Gtc" => "Good until cancelled".into(),
+                                "Alo" => "Post only (cancelled if it would fill at once)".into(),
+                                _ => raw.clone(),
+                            }
+                        }
+                        _ => {}
+                    }
                     let name = match suffix {
                         ".a" => "Market ID (identity unverified)",
-                        ".b" => "Buy side (false means sell)",
-                        ".p" => "Limit price (venue quote units)",
-                        ".s" => "Size (venue base units)",
+                        ".b" => "Side",
+                        ".p" => "Limit price (USDC)",
+                        ".s" => "Size",
                         ".r" => "Reduce only",
                         ".c" => "Client order ID",
                         ".t.limit.tif" => "Time in force",
@@ -156,7 +200,8 @@ fn collect(
                         ".t.trigger.tpsl" => "Take-profit / stop-loss type",
                         _ => suffix,
                     };
-                    format!("{}] · {name}", order.trim_start_matches("action."))
+                    let index = order.trim_start_matches("action.orders[");
+                    format!("Order {index} · {name}")
                 }
                 _ if path.starts_with("action.cancels[") => {
                     let (cancel, suffix) = path
@@ -172,13 +217,7 @@ fn collect(
                 }
                 _ => path.trim_start_matches("action.").into(),
             };
-            fields.push(field(
-                label,
-                value
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| value.to_string()),
-            ));
+            fields.push(field(label, shown));
         }
     }
     Ok(())
@@ -249,7 +288,7 @@ pub(super) fn rebuild(
             "Vault account",
             vault
                 .map(|address| format!("{address:#x}"))
-                .unwrap_or_else(|| "None; signing account".into()),
+                .unwrap_or_else(|| "None (trades as the signing account)".into()),
         ),
         field(
             "Expires after (Unix milliseconds)",
@@ -549,9 +588,30 @@ mod tests {
             assert!(
                 fields
                     .iter()
-                    .any(|f| f.path == "Fast cancellation" && f.value == "true")
+                    .any(|f| f.path == "Fast cancellation" && f.value == "Yes")
             );
         }
+    }
+    #[test]
+    fn orders_read_in_plain_words() {
+        let action = json!({"type":"order","orders":[{"a":1,"b":true,"p":"2260","s":"0.0045","r":false,"t":{"limit":{"tif":"Ioc"}}}],"grouping":"na"});
+        let (_, fields, _) =
+            rebuild("mainnet", action, 1, None, None, super::super::MAX_FIELDS).unwrap();
+        let shown = |path: &str| {
+            fields
+                .iter()
+                .find(|f| f.path == path)
+                .map(|f| f.value.as_str())
+        };
+        assert_eq!(shown("Order 1 · Side"), Some("Buy"));
+        assert_eq!(shown("Order 1 · Reduce only"), Some("No"));
+        assert_eq!(shown("Order 1 · Size"), Some("0.0045"));
+        assert_eq!(shown("Order 1 · Limit price (USDC)"), Some("2260"));
+        assert_eq!(
+            shown("Order 1 · Time in force"),
+            Some("Immediate or cancel (unfilled size is cancelled)")
+        );
+        assert_eq!(shown("Linked orders"), Some("None"));
     }
     #[test]
     fn venue_usdc_quantities_are_exact_and_never_rounded() {

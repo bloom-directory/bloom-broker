@@ -1536,7 +1536,7 @@ mod tests {
                     reading
                         .fields
                         .iter()
-                        .any(|field| field.path == "Fast cancellation" && field.value == "true")
+                        .any(|field| field.path == "Fast cancellation" && field.value == "Yes")
                 );
             }
             let (label, value) = if by_client_id {
