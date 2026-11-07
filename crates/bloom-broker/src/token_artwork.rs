@@ -277,6 +277,7 @@ pub(crate) fn image(name: &str) -> Option<&'static [u8]> {
         "664735244c3757290027920aece1f7f9028aae0bee4ed3771127879989b76ddc.png" => Some(include_bytes!("ceremony_assets/tokens/generated/664735244c3757290027920aece1f7f9028aae0bee4ed3771127879989b76ddc.png")),
         "670d4dad369cd3878d720d30692772d25e3510090b0b850e6feaa87a93505017.png" => Some(include_bytes!("ceremony_assets/tokens/generated/670d4dad369cd3878d720d30692772d25e3510090b0b850e6feaa87a93505017.png")),
         "670f486eb14c9d21e83ac2e3f2ce6347bfb7db1b53c609a2824636cd7df3e317.png" => Some(include_bytes!("ceremony_assets/tokens/generated/670f486eb14c9d21e83ac2e3f2ce6347bfb7db1b53c609a2824636cd7df3e317.png")),
+        "6738fbab8aa2ae7623cf70ba276de46b644e9d13eb014514ce5e6efbfa7e08f1.png" => Some(include_bytes!("ceremony_assets/tokens/generated/6738fbab8aa2ae7623cf70ba276de46b644e9d13eb014514ce5e6efbfa7e08f1.png")),
         "6768b3400edac5d8c8244c273f12f2d2a40a9f945b29adc8a0903be62d195f89.png" => Some(include_bytes!("ceremony_assets/tokens/generated/6768b3400edac5d8c8244c273f12f2d2a40a9f945b29adc8a0903be62d195f89.png")),
         "6773f1d98c961aeb3104a520273a6652c27a6ce06fd9bf1a121976f4b0ded99d.png" => Some(include_bytes!("ceremony_assets/tokens/generated/6773f1d98c961aeb3104a520273a6652c27a6ce06fd9bf1a121976f4b0ded99d.png")),
         "678627424f74ac3650191c83267d43d43a8719e1938f5216101946a2307394f6.png" => Some(include_bytes!("ceremony_assets/tokens/generated/678627424f74ac3650191c83267d43d43a8719e1938f5216101946a2307394f6.png")),
