@@ -1908,7 +1908,7 @@ renderReview({{
 const rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
 for (const expected of [
   "Allow exact transactions on evm-31337",
-  "any address through the deployment workflow, including contract creation",
+  "Any address through the deployment workflow, including contract creation",
   "every transaction still needs its own approval",
   "Allow sending to",
   "0x000000000000000000000000000000000000dEaD",
@@ -1920,6 +1920,10 @@ for (const expected of [
 for (const stale of ["Allow deploying contracts on", "Stop allowing contract deployment on"]) {{
   if (rendered.includes(stale)) throw new Error(`stale policy wording ${{stale}}: ${{rendered}}`);
 }}
+// Each rule is listed on the page with a name, not only in technical details.
+const named = describePolicy({{authority_diff: {{added_destinations: [
+  {{chain: "base", destination: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"}}]}}}});
+if (named.rules[0]?.name !== "USD Coin (USDC) on Base") throw new Error(`unnamed rule: ${{JSON.stringify(named.rules)}}`);
 const migration = describePolicy({{authority_diff: {{
   removed_legacy_clear_signing: {{
     catalog_id: "old-catalog", signature_threshold: 1,
@@ -1929,7 +1933,7 @@ const migration = describePolicy({{authority_diff: {{
     opaque_exact_allowed: false, unlimited_allowance_allowed: false
   }}
 }}}});
-const migrationText = migration.facts.flat().join(" ");
+const migrationText = migration.rules.map(rule => [rule.label, rule.name, rule.value]).flat().join(" ");
 for (const expected of ["old-catalog", "publisher-one", "observation limit",
   "old-reader", "old-digest", "Allow opaque exact review", "Allow unlimited allowance review",
   "do not enforce the removed rules"]) {{

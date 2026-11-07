@@ -684,6 +684,8 @@ function describeTransfer(manifest) {
       } catch (_) {}
       return `${value} Unix seconds`;
     };
+    const singleOrder = hyperliquid && fields.some(field => field.path === "Order 1 · Side")
+      && !fields.some(field => field.path.startsWith("Order 2 · "));
     const primary = [];
     const solanaFeeBudget = solana && fields.some(field => field.path === "Requested priority fee ceiling");
     const solanaCompute = new Set(solanaFeeBudget ? fields.filter(field => /^Instruction \d+$/.test(field.path)
@@ -698,7 +700,9 @@ function describeTransfer(manifest) {
     }
     if (payment) primary.push(["Valid from", time(payment.valid_after)], ["Valid until", time(payment.valid_before)]);
     else for (const field of fields) {
-      const row = [hyperliquid ? messageLabels[field.path] || field.path : field.path, field.value, true];
+      const row = hyperliquid
+        ? [(messageLabels[field.path] || field.path).replace(singleOrder ? /^Order 1 · / : /^$/, ""), field.value, /^0x/.test(field.value)]
+        : [field.path, field.value, true];
       if (solana && (["Transaction binding (recent blockhash excluded)", "Recent blockhash (refreshable)", "Message SHA-256"].includes(field.path)
         || field.path.endsWith(" · Exact instruction bytes") || field.path.endsWith(" · Program")
         || ([...solanaCompute].some(prefix => field.path === prefix || field.path.startsWith(`${prefix} ·`)))
@@ -725,7 +729,12 @@ function describeTransfer(manifest) {
           extraTechnical.push(row); continue;
         }
       }
-      if (hyperliquid && (["nonce", "time", "Nonce (Unix milliseconds)"].includes(field.path)
+      if (hyperliquid && field.path === "Expires after (Unix milliseconds)" && /^\d+$/.test(field.value)) {
+        primary.push(["Signature expires", new Date(Number(field.value)).toLocaleString()]);
+        extraTechnical.push(row); continue;
+      }
+      if (hyperliquid && (["nonce", "time", "Nonce (Unix milliseconds)", "Action", "Hyperliquid environment"].includes(field.path)
+        || field.path.endsWith(" · Client order ID")
         || (message.venue_asset && field.path === "USDC amount (HyperCore venue units)"))) extraTechnical.push(row);
       else primary.push(row);
     }
@@ -747,7 +756,9 @@ function describeTransfer(manifest) {
       sentence: solana ? "Approve one transaction. Only its recent blockhash may refresh; every other signed byte remains bound to this review."
         : tempo ? "Bloom decoded this payment from the exact bytes the wallet signs. Check the amounts and recipients below."
         : authenticationScope ? "Allow the fixed authentication profile below. Broker checks the fresh message when this permission is used."
-        : payment ? "Authorize this exact token payment within the signed validity window." : "Review the exact fields bound to this message signature.",
+        : payment ? "Authorize this exact token payment within the signed validity window."
+        : singleOrder ? "Bloom read this order from the exact bytes you sign."
+        : "Review the exact fields bound to this message signature.",
       chainId, networkIdentity: solana ? "Solana · network not stated in the transaction" : hyperliquid ? `Hyperliquid · ${venueNetwork || "Unknown environment"}`
         : chainId ? evmNetworkName(chainId) : "Message signature",
       networkIcon: solana ? "solana" : chainId ? chainIcon(chainId) : "unknown",
@@ -1330,53 +1341,69 @@ function describePetalApproval(manifest) {
     warning: `${app} creates transactions within these permissions; if compromised, it could use the remaining session capacity before the timer expires.`
   };
 }
-// Policy updates: say what changes, in the order a person cares about.
+// Policy updates: list every rule on the page, named where Bloom can.
+const POLICY_CHAIN_IDS = {ethereum: 1, mainnet: 1, base: 8453, arbitrum: 42161, optimism: 10, polygon: 137};
+function policyChainId(chain) {
+  const name = String(chain || "");
+  return POLICY_CHAIN_IDS[name] || (/^evm-\d+$/.test(name) ? Number(name.slice(4)) : null);
+}
+function policyDestinationName(d) {
+  const chainId = policyChainId(d.chain);
+  const token = chainId && tokenArt(chainId, d.destination);
+  const name = token ? `${token.name} (${token.symbol})` : chainId && catalogPartyName(chainId, d.destination);
+  return name ? `${name} on ${chainLabel(d.chain)}` : `Address on ${chainLabel(d.chain)}`;
+}
 function describePolicy(manifest) {
   const diff = manifest?.authority_diff;
   if (!diff) return null;
-  const lines = [];
-  const dest = d => `${d.destination || d.address || canonicalJson(d)} (${chainLabel(d.chain)})`;
+  const rules = [];
+  const rule = (label, name, value, chainId) => rules.push({role: "policy", label, name, value, chainId});
+  const dest = (label, d) => rule(label, policyDestinationName(d), d.destination || d.address || canonicalJson(d), policyChainId(d.chain));
   // The "exact" sentinel on a numeric EVM chain is a contract-deployment
   // opt-in, not a destination: saying "sending to" inverts what is granted.
   const isDeployGrant = d => d.destination === "exact" && String(d.chain || "").startsWith("evm-");
   for (const d of diff.added_destinations || []) {
-    if (isDeployGrant(d)) lines.push([`Allow exact transactions on ${chainLabel(d.chain)}`,
-      "any address through the deployment workflow, including contract creation, and Safe owner signing; every transaction still needs its own approval"]);
-    else lines.push(["Allow sending to", dest(d), true]);
+    if (isDeployGrant(d)) rule(`Allow exact transactions on ${chainLabel(d.chain)}`,
+      "Any address through the deployment workflow, including contract creation, and Safe owner signing; every transaction still needs its own approval");
+    else dest("Allow sending to", d);
   }
   for (const d of diff.removed_destinations || []) {
-    if (isDeployGrant(d)) lines.push([`Stop allowing exact transactions on ${chainLabel(d.chain)}`,
-      "deployment transactions need listed recipients again; contract creation and Safe owner signing are refused"]);
-    else lines.push(["Stop allowing sending to", dest(d), true]);
+    if (isDeployGrant(d)) rule(`Stop allowing exact transactions on ${chainLabel(d.chain)}`,
+      "Deployment transactions need listed recipients again; contract creation and Safe owner signing are refused");
+    else dest("Stop allowing sending to", d);
   }
-  for (const p of diff.added_petal_packages || []) lines.push(["Allow app (petal)", shortDigest(p), true]);
-  for (const p of diff.removed_petal_packages || []) lines.push(["Remove app (petal)", shortDigest(p), true]);
-  for (const v of diff.added_required_verifiers || []) lines.push(["Require verifier", v.verifier_id || canonicalJson(v), true]);
-  for (const v of diff.removed_required_verifiers || []) lines.push(["Drop verifier", v.verifier_id || canonicalJson(v), true]);
+  const facts = [];
+  for (const [label, packages] of [["Allow app (Petal)", diff.added_petal_packages], ["Remove app (Petal)", diff.removed_petal_packages]]) {
+    for (const p of packages || []) {
+      rule(label, "Package fingerprint", shortDigest(p));
+      facts.push([`${label} · full fingerprint`, p, true]);
+    }
+  }
+  for (const v of diff.added_required_verifiers || []) rule("Require verifier", v.verifier_id || canonicalJson(v));
+  for (const v of diff.removed_required_verifiers || []) rule("Drop verifier", v.verifier_id || canonicalJson(v));
   const legacy = diff.removed_legacy_clear_signing;
   if (legacy) {
-    lines.push(["Remove legacy catalog trust", `${legacy.catalog_id}: ${legacy.signature_threshold} trusted signature(s), keys ${legacy.trusted_keys.map(key => key.key_id).join(", ")}`]);
-    lines.push(["Remove observation freshness rule", `The previous ${fmtRemaining(Number(legacy.maximum_observation_age_ms))} observation limit stops being enforced`]);
-    lines.push(["Remove pinned catalog verifier", `${legacy.verifier.verifier_id} (${legacy.verifier.verifier_digest})`, true]);
-    if (!legacy.opaque_exact_allowed) lines.push(["Allow opaque exact review", "Unknown calls may be reviewed as exact bytes with warnings"]);
-    if (!legacy.unlimited_allowance_allowed) lines.push(["Allow unlimited allowance review", "Maximum allowances may be requested with explicit warnings"]);
-    lines.push(["Use compiled descriptions", "Descriptions and warnings come from the Broker release; they do not enforce the removed rules"]);
+    rule("Remove legacy catalog trust", `${legacy.catalog_id}: ${legacy.signature_threshold} trusted signature(s), keys ${legacy.trusted_keys.map(key => key.key_id).join(", ")}`);
+    rule("Remove observation freshness rule", `The previous ${fmtRemaining(Number(legacy.maximum_observation_age_ms))} observation limit stops being enforced`);
+    rule("Remove pinned catalog verifier", legacy.verifier.verifier_id, legacy.verifier.verifier_digest);
+    if (!legacy.opaque_exact_allowed) rule("Allow opaque exact review", "Unknown calls may be reviewed as exact bytes with warnings");
+    if (!legacy.unlimited_allowance_allowed) rule("Allow unlimited allowance review", "Maximum allowances may be requested with explicit warnings");
+    rule("Use compiled descriptions", "Descriptions and warnings come from the Broker release; they do not enforce the removed rules");
   }
   const before = Number(diff.maximum_approval_lifetime_ms_before);
   const after = Number(diff.maximum_approval_lifetime_ms_after);
   if (Number.isFinite(before) && Number.isFinite(after) && before !== after) {
-    lines.push(["Max approval lifetime", `${fmtRemaining(before)} → ${fmtRemaining(after)}`]);
+    rule("Max approval lifetime", `${fmtRemaining(before)} → ${fmtRemaining(after)}`);
   }
-  const n = lines.length;
+  const n = rules.length;
   const sentence = n === 0
     ? "No rule changes are proposed."
-    : `Change <strong>${n} rule${n === 1 ? "" : "s"}</strong> for this wallet; nothing moves, and Bloom applies the new rules to future transactions.`;
+    : "Nothing moves. Bloom applies these rules to future transactions.";
   const intent = n === 0 ? null : {
     action: "policy", eyebrow: "Wallet policy change",
-    heading: `Change ${n} wallet rule${n === 1 ? "" : "s"}`,
-    detail: "These rules apply to future requests. Approving them moves no funds."
+    heading: `Change ${n} wallet rule${n === 1 ? "" : "s"}`
   };
-  return {sentence, intent, facts: lines};
+  return {sentence, intent, rules, facts};
 }
 function planDisclosures(manifest) {
   try {
@@ -1619,6 +1646,8 @@ function renderReview(session) {
       }));
     }
     if (transfer.intent.detail) decision.push(intentBlock(transfer.intent));
+    if (transfer.rules?.length) decision.push(el("div", {class: "ceremony-identity ceremony-permission"},
+      ...transfer.rules.map(partyRow)));
     for (const [index, payload] of (transfer.payloads || []).entries()) {
       const call = reviewedContractCall(payload);
       if (!call || call.intent_summary) continue;
@@ -3572,6 +3601,37 @@ const PREVIEWS = {
       }
     }
   }),
+  "policy-update": () => ({
+    ceremony_kind: "policy_update", expires_at_ms: Date.now() + 9 * 60 * 1000,
+    signer_contribution: {wallet_id: "main"},
+    review_manifest: {
+      schema: "bloom.policy_update_review.v1", wallet_id: "main",
+      authority_diff: {
+        maximum_approval_lifetime_ms_before: "600000", maximum_approval_lifetime_ms_after: "600000",
+        added_petal_packages: ["80f26b1b6c4eda85f2870e2baac9f6366f1f35e861ebb855bf234550e591ad21"],
+        removed_petal_packages: [],
+        added_destinations: [
+          {chain: "polygon", destination: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"},
+          {chain: "base", destination: "0xF75584eF6673aD213a685a1B58Cc0330B8eA22Cf"}],
+        removed_destinations: [], added_required_verifiers: [], removed_required_verifiers: []
+      }
+    }
+  }),
+  "hyperliquid-order": () => {
+    const session = previewAccountOne(previewApproval([], null));
+    session.review_manifest.canonical_plan = JSON.stringify({message_review: {
+      kind: "hyperliquid_l1", title: "Buy 0.0045 ETH for up to 2260 USDC each", signer: PREVIEW_WALLET,
+      domain: [{path: "primaryType", value: "Agent"}, {path: "chainId", value: "1337"}],
+      fields: [["Hyperliquid environment", "mainnet"], ["Nonce (Unix milliseconds)", "1794017923895"],
+        ["Vault account", "None (trades as the signing account)"], ["Expires after (Unix milliseconds)", "1794018223895"],
+        ["Action", "order"], ["Order 1 · Market", "ETH perpetual (market 1)"], ["Order 1 · Side", "Buy"],
+        ["Order 1 · Limit price (USDC)", "2260"], ["Order 1 · Size", "0.0045"], ["Order 1 · Reduce only", "No"],
+        ["Order 1 · Time in force", "Immediate or cancel (unfilled size is cancelled)"],
+        ["Order 1 · Client order ID", "0x06b811d5b12547d5b2e90ddd3f99e7cb"], ["Linked orders", "None"]]
+        .map(([path, value]) => ({path, value}))
+    }});
+    return session;
+  },
   "native-send": () => previewApproval([previewPayload({
     destination: PREVIEW_SPENDER, value: "10000000000000000", value_display: "0.01 ETH",
     calldata_bytes: "0", calldata_keccak: undefined

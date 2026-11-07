@@ -95,6 +95,42 @@ struct CancelByCloid {
     cloid: String,
 }
 
+#[derive(Deserialize)]
+struct Markets {
+    perps: Vec<String>,
+    spot: std::collections::BTreeMap<String, [String; 2]>,
+}
+/// Mainnet market names from `scripts/bundle-hyperliquid-markets.py`. Perp
+/// IDs are universe positions (delisted perps keep their slot); spot IDs are
+/// 10000 + the pair index. A market listed later has no name here.
+static MARKETS: std::sync::LazyLock<Markets> = std::sync::LazyLock::new(|| {
+    serde_json::from_str(include_str!("hyperliquid-markets.json"))
+        .expect("bundled Hyperliquid market list is valid JSON")
+});
+const MARKET_ID: &str = "Market ID (identity unverified)";
+
+/// The coin and quote asset for a mainnet asset ID, plus whether it is spot.
+fn market(network: &str, id: u32) -> Option<(&'static str, &'static str, bool)> {
+    if network != "mainnet" {
+        return None;
+    }
+    if let Some(name) = MARKETS.perps.get(usize::try_from(id).ok()?) {
+        return Some((name, "USDC", false));
+    }
+    let [base, quote] = MARKETS.spot.get(&id.to_string())?;
+    Some((base, quote, true))
+}
+fn market_label(network: &str, id: u32) -> String {
+    match market(network, id) {
+        Some((base, quote, true)) => format!("{base}/{quote} spot (market {id})"),
+        Some((base, _, false)) => format!("{base} perpetual (market {id})"),
+        None if network == "mainnet" => {
+            format!("Market {id} (not in this Bloom release's market list)")
+        }
+        None => format!("Market {id} (testnet; Bloom has no testnet market names)"),
+    }
+}
+
 fn field(path: impl Into<String>, value: impl ToString) -> MessageField {
     MessageField {
         path: path.into(),
@@ -129,25 +165,69 @@ fn collect(
             }
         }
         value => {
+            let raw = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            let yes_no = |v: &Value| match v.as_bool() {
+                Some(true) => "Yes".to_owned(),
+                Some(false) => "No".to_owned(),
+                None => raw.clone(),
+            };
+            let mut shown = raw.clone();
             let label = match path {
                 "action.type" => "Action".into(),
                 "action.asset" => "Market ID (identity unverified)".into(),
-                "action.isCross" => "Cross margin".into(),
+                "action.isCross" => {
+                    shown = yes_no(value);
+                    "Cross margin".into()
+                }
                 "action.leverage" => "Leverage".into(),
                 "action.time" => "Scheduled cancellation (Unix milliseconds)".into(),
-                "action.f" => "Fast cancellation".into(),
-                "action.grouping" => "Order grouping".into(),
+                "action.f" => {
+                    shown = yes_no(value);
+                    "Fast cancellation".into()
+                }
+                "action.grouping" => {
+                    shown = match raw.as_str() {
+                        "na" => "None".into(),
+                        "normalTpsl" => "Take-profit/stop-loss for these orders".into(),
+                        "positionTpsl" => "Take-profit/stop-loss for the whole position".into(),
+                        _ => raw.clone(),
+                    };
+                    "Linked orders".into()
+                }
                 "action.builder.b" => "Builder fee recipient".into(),
                 "action.builder.f" => "Builder fee rate (tenths of a basis point)".into(),
                 _ if path.starts_with("action.orders[") => {
                     let (order, suffix) = path
                         .split_once(']')
                         .ok_or_else(|| invalid("invalid order path"))?;
+                    match suffix {
+                        ".b" => {
+                            shown = if value.as_bool() == Some(true) {
+                                "Buy"
+                            } else {
+                                "Sell"
+                            }
+                            .into()
+                        }
+                        ".r" | ".t.trigger.isMarket" => shown = yes_no(value),
+                        ".t.limit.tif" => {
+                            shown = match raw.as_str() {
+                                "Ioc" => "Immediate or cancel (unfilled size is cancelled)".into(),
+                                "Gtc" => "Good until cancelled".into(),
+                                "Alo" => "Post only (cancelled if it would fill at once)".into(),
+                                _ => raw.clone(),
+                            }
+                        }
+                        _ => {}
+                    }
                     let name = match suffix {
                         ".a" => "Market ID (identity unverified)",
-                        ".b" => "Buy side (false means sell)",
-                        ".p" => "Limit price (venue quote units)",
-                        ".s" => "Size (venue base units)",
+                        ".b" => "Side",
+                        ".p" => "Limit price (USDC)",
+                        ".s" => "Size",
                         ".r" => "Reduce only",
                         ".c" => "Client order ID",
                         ".t.limit.tif" => "Time in force",
@@ -156,7 +236,8 @@ fn collect(
                         ".t.trigger.tpsl" => "Take-profit / stop-loss type",
                         _ => suffix,
                     };
-                    format!("{}] · {name}", order.trim_start_matches("action."))
+                    let index = order.trim_start_matches("action.orders[");
+                    format!("Order {index} · {name}")
                 }
                 _ if path.starts_with("action.cancels[") => {
                     let (cancel, suffix) = path
@@ -172,13 +253,7 @@ fn collect(
                 }
                 _ => path.trim_start_matches("action.").into(),
             };
-            fields.push(field(
-                label,
-                value
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| value.to_string()),
-            ));
+            fields.push(field(label, shown));
         }
     }
     Ok(())
@@ -249,7 +324,7 @@ pub(super) fn rebuild(
             "Vault account",
             vault
                 .map(|address| format!("{address:#x}"))
-                .unwrap_or_else(|| "None; signing account".into()),
+                .unwrap_or_else(|| "None (trades as the signing account)".into()),
         ),
         field(
             "Expires after (Unix milliseconds)",
@@ -259,8 +334,33 @@ pub(super) fn rebuild(
         ),
     ];
     collect(&canonical, "action", &mut fields, field_limit)?;
+    for field in &mut fields {
+        if let Some(prefix) = field.path.strip_suffix(MARKET_ID)
+            && let Ok(id) = field.value.parse::<u32>()
+        {
+            field.path = format!("{prefix}Market");
+            field.value = escaped(&market_label(network, id));
+        }
+    }
+    let order_title = match &action {
+        Action::Order { orders, .. } if orders.len() == 1 => {
+            let order = &orders[0];
+            let side = if order.b { "Buy" } else { "Sell" };
+            let bound = if order.b { "for up to" } else { "for at least" };
+            Some(match market(network, order.a) {
+                Some((base, quote, _)) => {
+                    format!("{side} {} {base} {bound} {} {quote} each", order.s, order.p)
+                }
+                None => format!(
+                    "{side} {} on market {} {bound} {} each",
+                    order.s, order.a, order.p
+                ),
+            })
+        }
+        _ => None,
+    };
     let title = match action {
-        Action::Order { .. } => "Sign exchange orders",
+        Action::Order { .. } => order_title.as_deref().unwrap_or("Sign exchange orders"),
         Action::Cancel { .. } | Action::CancelByCloid { .. } => "Cancel exchange orders",
         Action::ScheduleCancel { time: Some(_) } => "Schedule exchange cancellation",
         Action::ScheduleCancel { time: None } => "Remove scheduled exchange cancellation",
@@ -538,9 +638,12 @@ mod tests {
         ] {
             let (_, fields, _) =
                 rebuild("mainnet", action, 123, None, None, super::super::MAX_FIELDS).unwrap();
-            assert!(fields.iter().any(|f| f.path
-                == "cancels[1] · Market ID (identity unverified)"
-                && f.value == "7"));
+            assert!(
+                fields
+                    .iter()
+                    .any(|f| f.path == "cancels[1] · Market"
+                        && f.value == "BNB perpetual (market 7)")
+            );
             assert!(
                 fields
                     .iter()
@@ -549,9 +652,44 @@ mod tests {
             assert!(
                 fields
                     .iter()
-                    .any(|f| f.path == "Fast cancellation" && f.value == "true")
+                    .any(|f| f.path == "Fast cancellation" && f.value == "Yes")
             );
         }
+    }
+    #[test]
+    fn orders_read_in_plain_words() {
+        let action = json!({"type":"order","orders":[{"a":1,"b":true,"p":"2260","s":"0.0045","r":false,"t":{"limit":{"tif":"Ioc"}}}],"grouping":"na"});
+        let (_, fields, title) =
+            rebuild("mainnet", action, 1, None, None, super::super::MAX_FIELDS).unwrap();
+        let shown = |path: &str| {
+            fields
+                .iter()
+                .find(|f| f.path == path)
+                .map(|f| f.value.as_str())
+        };
+        assert_eq!(shown("Order 1 · Side"), Some("Buy"));
+        assert_eq!(shown("Order 1 · Reduce only"), Some("No"));
+        assert_eq!(shown("Order 1 · Size"), Some("0.0045"));
+        assert_eq!(shown("Order 1 · Limit price (USDC)"), Some("2260"));
+        assert_eq!(
+            shown("Order 1 · Time in force"),
+            Some("Immediate or cancel (unfilled size is cancelled)")
+        );
+        assert_eq!(shown("Linked orders"), Some("None"));
+        assert_eq!(shown("Order 1 · Market"), Some("ETH perpetual (market 1)"));
+        assert_eq!(title, "Buy 0.0045 ETH for up to 2260 USDC each");
+        let spot = json!({"type":"order","orders":[{"a":10107,"b":false,"p":"40","s":"2","r":false,"t":{"limit":{"tif":"Gtc"}}}],"grouping":"na"});
+        let (_, _, title) =
+            rebuild("mainnet", spot, 1, None, None, super::super::MAX_FIELDS).unwrap();
+        assert_eq!(title, "Sell 2 HYPE for at least 40 USDC each");
+        let unknown = json!({"type":"order","orders":[{"a":9999,"b":true,"p":"1","s":"1","r":false,"t":{"limit":{"tif":"Gtc"}}}],"grouping":"na"});
+        let (_, fields, _) =
+            rebuild("testnet", unknown, 1, None, None, super::super::MAX_FIELDS).unwrap();
+        assert!(
+            fields
+                .iter()
+                .any(|f| f.value == "Market 9999 (testnet; Bloom has no testnet market names)")
+        );
     }
     #[test]
     fn venue_usdc_quantities_are_exact_and_never_rounded() {
