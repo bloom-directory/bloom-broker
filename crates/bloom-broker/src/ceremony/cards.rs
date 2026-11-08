@@ -36,6 +36,18 @@ const MAX_ORDER_FIELDS: usize = 60;
 mod tests {
     use super::*;
 
+    #[test]
+    fn intake_retries_resource_and_connection_errors_but_not_bad_listener() {
+        for code in [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::ECONNABORTED] {
+            assert!(transient_accept_error(&std::io::Error::from_raw_os_error(
+                code
+            )));
+        }
+        assert!(!transient_accept_error(&std::io::Error::from_raw_os_error(
+            libc::EBADF
+        )));
+    }
+
     fn check(label: &str, value: &str) -> bool {
         checked_order_fields(vec![OrderField {
             label: label.into(),
@@ -707,8 +719,19 @@ pub async fn serve_checkout_listener(
 ) -> std::io::Result<()> {
     let slots = Arc::new(tokio::sync::Semaphore::new(16));
     loop {
-        let (stream, _) = listener.accept().await?;
-        if stream.peer_cred()?.uid() != checkout_uid {
+        let (stream, _) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(error) if transient_accept_error(&error) => {
+                tracing::warn!(%error, "checkout intake accept failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if !stream
+            .peer_cred()
+            .is_ok_and(|peer| peer.uid() == checkout_uid)
+        {
             continue;
         }
         let Ok(slot) = slots.clone().try_acquire_owned() else {
@@ -745,4 +768,16 @@ pub async fn serve_checkout_listener(
             }
         });
     }
+}
+
+fn transient_accept_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::WouldBlock
+    ) || matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS)
+    )
 }

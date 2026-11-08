@@ -821,11 +821,12 @@ async fn run_with_paths(
                 let listener = bloom_broker::ceremony::bind_checkout_intake(path)?;
                 let ceremony = ceremony.clone();
                 Some(tokio::spawn(async move {
-                    if bloom_broker::ceremony::serve_checkout_listener(ceremony, listener, uid)
-                        .await
-                        .is_err()
+                    if let Err(error) =
+                        bloom_broker::ceremony::serve_checkout_listener(ceremony, listener, uid)
+                            .await
                     {
-                        tracing::error!("checkout intake stopped");
+                        tracing::error!(%error, "checkout intake stopped; restarting Broker");
+                        std::process::exit(1);
                     }
                 }))
             }
