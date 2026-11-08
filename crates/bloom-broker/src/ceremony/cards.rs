@@ -41,11 +41,28 @@ mod tests {
             label: label.into(),
             value: value.into(),
         }])
-        .is_ok()
+        .is_ok_and(|fields| fields[0].value == value)
     }
 
     #[test]
-    fn order_fields_reject_card_numbers_even_under_innocent_labels() {
+    fn order_fields_hide_suspicious_value_without_rejecting_other_fields() {
+        let fields = checked_order_fields(vec![
+            OrderField {
+                label: "Phone".into(),
+                value: "54 9 11 2345 6788".into(),
+            },
+            OrderField {
+                label: "Seat".into(),
+                value: "12A".into(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(fields[0].value, "(hidden)");
+        assert_eq!(fields[1].value, "12A");
+    }
+
+    #[test]
+    fn order_fields_hide_card_numbers_even_under_innocent_labels() {
         for value in [
             "4111111111111111",
             "4111 1111 1111 1111",
@@ -59,7 +76,7 @@ mod tests {
     }
 
     #[test]
-    fn order_fields_reject_security_codes_but_allow_other_short_numbers() {
+    fn order_fields_hide_security_codes_but_allow_other_short_numbers() {
         for label in ["CVC", "cvv2", "Security code", "Card SECURITY"] {
             for value in ["123", "1234"] {
                 assert!(!check(label, value));
@@ -70,7 +87,7 @@ mod tests {
     }
 
     #[test]
-    fn order_fields_reject_disguised_card_numbers_and_foreign_cvc_labels() {
+    fn order_fields_hide_disguised_card_numbers_and_foreign_cvc_labels() {
         for value in [
             "4111.1111.1111.1111",
             "4111111111111111\n",
@@ -142,22 +159,24 @@ fn security_code_label(label: &str) -> bool {
         || SECURITY_CODE_LABELS.iter().any(|word| label.contains(word))
 }
 
-fn checked_order_fields(fields: Vec<OrderField>) -> Result<Vec<OrderField>, ProtocolError> {
+fn checked_order_fields(mut fields: Vec<OrderField>) -> Result<Vec<OrderField>, ProtocolError> {
     if fields.len() > MAX_ORDER_FIELDS
-        || fields.iter().any(|f| {
-            let value: String = f.value.nfkc().collect();
-            let label = f.label.nfkc().collect::<String>().to_lowercase();
-            let code = value.trim();
-            let security_code = (3..=4).contains(&code.len())
-                && code.bytes().all(|b| b.is_ascii_digit())
-                && security_code_label(&label);
-            f.label.chars().count() > 120
-                || f.value.chars().count() > 200
-                || contains_card_number(&value)
-                || security_code
-        })
+        || fields
+            .iter()
+            .any(|f| f.label.chars().count() > 120 || f.value.chars().count() > 200)
     {
         return Err(kind_mismatch());
+    }
+    for f in &mut fields {
+        let value: String = f.value.nfkc().collect();
+        let label = f.label.nfkc().collect::<String>().to_lowercase();
+        let code = value.trim();
+        let security_code = (3..=4).contains(&code.len())
+            && code.bytes().all(|b| b.is_ascii_digit())
+            && security_code_label(&label);
+        if contains_card_number(&value) || security_code {
+            f.value = "(hidden)".to_owned();
+        }
     }
     Ok(fields)
 }
