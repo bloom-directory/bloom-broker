@@ -855,7 +855,7 @@ async fn private_traveler_save_and_release_use_real_signer_and_hide_values() {
                 fields: vec![TravelerField::GivenName, TravelerField::FamilyName],
             },
             recipient_key: recipient.public_key().clone(),
-            challenge_url: "http://localhost:28740/private?token=synthetic".into(),
+            challenge_url: "http://127.0.0.1:28740/private?token=synthetic".into(),
         },
     )
     .await

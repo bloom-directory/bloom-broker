@@ -574,7 +574,7 @@ impl CeremonyBroker {
         let url = url::Url::parse(&challenge_url).map_err(|_| kind_mismatch())?;
         if challenge_url.len() > 256
             || url.scheme() != "http"
-            || url.host_str() != Some("localhost")
+            || !matches!(url.host_str(), Some("localhost" | "127.0.0.1"))
             || url.port().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
