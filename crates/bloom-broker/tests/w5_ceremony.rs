@@ -1553,6 +1553,42 @@ async fn a_lost_card_completion_response_is_reconciled_as_success() {
     assert_eq!(broker.card_list().unwrap().len(), 1);
 }
 
+#[tokio::test]
+async fn a_lost_card_response_and_status_leave_the_outcome_unknown() {
+    use bloom_signer_api::CardEffect;
+    let signer = real_ceremony_signer();
+    signer.lose_card_response.store(true, Ordering::SeqCst);
+    signer.lose_card_status.store(true, Ordering::SeqCst);
+    let broker = CeremonyBroker::new(signer.clone());
+    let prepared = broker
+        .prepare_card(
+            operation("99"),
+            CardEffect::Add {
+                card_id: Token::new("card-one").unwrap(),
+                label: "Synthetic card".into(),
+            },
+            card_test_now(),
+        )
+        .unwrap();
+    let session = card_session_json(&broker, &prepared).await;
+    let handle: Base64UrlBytes =
+        serde_json::from_value(session["webauthn_options"]["registration_user_handle"].clone())
+            .unwrap();
+    let auth = VirtualAuthenticator::generate_for_registration(handle, "http://localhost:18734");
+    let input = serde_json::json!({"credential_prf":Base64UrlBytes::from_bytes(&auth.deterministic_prf()),"card":{"number":"4242424242424242","expiry_month":12,"expiry_year":2034,"name":"Synthetic Card"}});
+    let (status, _) = card_approve(&broker, &prepared, &auth, input, 1).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        broker.status(&operation("99")),
+        Some(CeremonyState::Verifying)
+    );
+    signer.lose_card_status.store(false, Ordering::SeqCst);
+    assert_eq!(
+        signer.card_status(&operation("99")).unwrap().state,
+        bloom_signer_api::CardOperationState::Succeeded
+    );
+}
+
 /// Bind IPv4 on port 0, hold it, bind IPv6 on the same selected port, and
 /// return the held pair plus its explicit nonzero endpoint. Retries selection
 /// if the second bind collides. Test setup only, never 18734.
@@ -3621,6 +3657,7 @@ struct RealSigner {
     engine: Option<Arc<SignerEngine>>,
     /// Commit card completions but lose the response, as a dropped socket would.
     lose_card_response: AtomicBool,
+    lose_card_status: AtomicBool,
 }
 
 fn real_ceremony_signer() -> Arc<RealSigner> {
@@ -3649,6 +3686,7 @@ fn real_ceremony_signer() -> Arc<RealSigner> {
         service,
         engine: Some(engine),
         lose_card_response: AtomicBool::new(false),
+        lose_card_status: AtomicBool::new(false),
     })
 }
 
@@ -3964,6 +4002,12 @@ impl CeremonySigner for RealSigner {
         &self,
         operation_id: &OperationId,
     ) -> Result<bloom_signer_api::CardOperationStatus, bloom_signer_api::ProtocolError> {
+        if self.lose_card_status.load(Ordering::SeqCst) {
+            return Err(bloom_signer_api::ProtocolError::new(
+                bloom_signer_api::ProtocolErrorCode::ServiceUnavailable,
+                "card status unavailable",
+            ));
+        }
         self.service.card_status(operation_id, card_test_now())
     }
     fn card_cancel(
@@ -11155,6 +11199,7 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
         service,
         engine: None,
         lose_card_response: AtomicBool::new(false),
+        lose_card_status: AtomicBool::new(false),
     }));
     for index in 0..4_u8 {
         let operation_id = operation(&format!("d{index}"));

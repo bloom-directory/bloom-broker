@@ -610,7 +610,7 @@ pub(super) fn complete_card_session(
     body: BrowserComplete,
 ) -> Response {
     let now_ms = unix_time_ms();
-    let result = broker
+    let completion = broker
         .inner
         .signer
         .complete_card(
@@ -624,17 +624,27 @@ pub(super) fn complete_card_session(
             },
             now_ms,
         )
-        .map_err(signer_error_to_machine)
-        // A lost Signer response is an unknown outcome, not a failure: ask
-        // Signer what it committed before telling the owner anything.
-        .or_else(
-            |error| match broker.card_status_with_receipt(&session.operation_id) {
-                Ok(status) if status.state == CardOperationState::Succeeded => {
-                    status.receipt.map(|r| *r).ok_or(error)
-                }
-                _ => Err(error),
-            },
-        );
+        .map_err(signer_error_to_machine);
+    let result = match completion {
+        Ok(receipt) => Ok(receipt),
+        Err(_) => match broker.card_status_with_receipt(&session.operation_id) {
+            Ok(status) if status.state == CardOperationState::Succeeded => {
+                status.receipt.map(|r| *r).ok_or(false)
+            }
+            Ok(status)
+                if matches!(
+                    status.state,
+                    CardOperationState::Failed
+                        | CardOperationState::Cancelled
+                        | CardOperationState::Expired
+                        | CardOperationState::Missing
+                ) =>
+            {
+                Err(true)
+            }
+            _ => Err(false),
+        },
+    };
     let response = match result {
         Ok(receipt) => {
             if receipt.ceremony_kind != session.ceremony_kind
@@ -658,7 +668,8 @@ pub(super) fn complete_card_session(
             Json(serde_json::json!({"state":session.state, "challenge_url":challenge_url}))
                 .into_response()
         }
-        Err(_) => {
+        Err(false) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"message":"Card approval outcome is unknown. Do not retry this request."}))).into_response(),
+        Err(true) => {
             session.state = CeremonyState::Failed;
             (StatusCode::CONFLICT, Json(serde_json::json!({"message":"Card approval failed or its disclosure outcome is unknown. Do not retry this request."}))).into_response()
         }
