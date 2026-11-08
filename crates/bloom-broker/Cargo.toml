@@ -30,6 +30,7 @@ bs58.workspace = true
 config.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 num-bigint.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
