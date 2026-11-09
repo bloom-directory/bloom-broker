@@ -1120,8 +1120,7 @@ async fn card_checkout_private_delivery_replays_and_manual_has_no_release() {
         .unwrap();
     let value: serde_json::Value = serde_json::from_slice(plaintext.expose_to_backend()).unwrap();
     assert!(value["number"] == "4242424242424242" && value["cvc"] == "937");
-    // A lost response is recovered by asking again: the same sealed receipt
-    // and AAD come back, never a second release.
+    // A second read has only a public receipt, never the one-use CVC.
     match card_intake(
         &socket,
         CheckoutIntakeRequest::Result {
@@ -1135,10 +1134,11 @@ async fn card_checkout_private_delivery_replays_and_manual_has_no_release() {
             output_aad: Some(again_aad),
             ..
         } => {
-            assert_eq!(again, receipt);
+            assert!(again.encrypted_browser_result.is_none());
+            assert_eq!(again.receipt_digest, receipt.receipt_digest);
             assert_eq!(*again_aad, aad);
         }
-        _ => panic!("receipt not replayed"),
+        _ => panic!("public receipt missing"),
     }
     // Machine's status never carries the sealed receipt.
     let public = broker.card_status(&operation("a2")).unwrap();
@@ -1464,7 +1464,7 @@ async fn released_broker_never_reads_a_pending_card_session() {
     };
     let broker = open();
     let (pending, cancelled) = (operation("96"), operation("97"));
-    for id in [&pending, &cancelled] {
+    for id in [&cancelled, &pending] {
         let card_id = Token::new(format!("card-{}", &id.as_str()[..4])).unwrap();
         broker
             .prepare_card(
@@ -1476,8 +1476,10 @@ async fn released_broker_never_reads_a_pending_card_session() {
                 card_test_now(),
             )
             .unwrap();
+        if id == &cancelled {
+            broker.cancel(&cancelled, card_test_now()).unwrap();
+        }
     }
-    broker.cancel(&cancelled, card_test_now()).unwrap();
     let released_rows = || -> Vec<(String, String)> {
         let db = rusqlite::Connection::open(&journal_path).unwrap();
         let mut statement = db
@@ -1582,7 +1584,17 @@ async fn a_lost_card_response_and_status_leave_the_outcome_unknown() {
         broker.status(&operation("99")),
         Some(CeremonyState::Verifying)
     );
+    broker.expire_sessions(card_test_now() + 1_000_000).unwrap();
+    assert_eq!(
+        broker.status(&operation("99")),
+        Some(CeremonyState::Verifying)
+    );
     signer.lose_card_status.store(false, Ordering::SeqCst);
+    broker.expire_sessions(card_test_now() + 1_000_000).unwrap();
+    assert_eq!(
+        broker.status(&operation("99")),
+        Some(CeremonyState::Succeeded)
+    );
     assert_eq!(
         signer.card_status(&operation("99")).unwrap().state,
         bloom_signer_api::CardOperationState::Succeeded

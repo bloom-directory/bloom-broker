@@ -2951,16 +2951,25 @@ impl CeremonyBroker {
                 .get(&ceremony_id)
                 .is_some_and(|s| cards::is_card(s.ceremony_kind))
             {
-                if let Err(error) = self.cancel_signer_or_already_released(&operation_id, true) {
-                    // The Signer's own expiry still closes a prepared card
-                    // operation; record why this cancel did not.
-                    tracing::warn!(
-                        event = "ceremony.card_cancel_failed",
-                        operation_id = operation_id.as_str(),
-                        code = ?error.code,
-                        "Broker could not cancel an expiring card operation in Signer"
-                    );
+                use bloom_signer_api::CardOperationState;
+                let Ok(mut status) = self.card_status_with_receipt(&operation_id) else {
+                    continue; // Unavailable custody is unresolved, not expired.
+                };
+                if status.state == CardOperationState::Prepared {
+                    let Ok(cancelled) = self.inner.signer.card_cancel(&operation_id) else {
+                        continue; // Completion may have won the race.
+                    };
+                    status = cancelled;
                 }
+                let terminal = match status.state {
+                    CardOperationState::Succeeded => CeremonyState::Succeeded,
+                    CardOperationState::Failed => CeremonyState::Failed,
+                    CardOperationState::Cancelled => CeremonyState::Cancelled,
+                    CardOperationState::Expired | CardOperationState::Missing => {
+                        CeremonyState::Expired
+                    }
+                    CardOperationState::Prepared | CardOperationState::Consumed => continue,
+                };
                 let mut snapshot = self
                     .inner
                     .sessions
@@ -2968,7 +2977,7 @@ impl CeremonyBroker {
                     .get(&ceremony_id)
                     .cloned()
                     .ok_or_else(not_found)?;
-                snapshot.state = CeremonyState::Expired;
+                snapshot.state = terminal;
                 latch_terminal(&mut snapshot, now_ms);
                 self.persist_session(&snapshot)?;
                 self.inner.sessions.lock().insert(ceremony_id, snapshot);

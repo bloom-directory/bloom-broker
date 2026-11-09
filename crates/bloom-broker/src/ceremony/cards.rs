@@ -7,10 +7,13 @@ use bloom_signer_api::{
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use unicode_normalization::UnicodeNormalization;
+use zeroize::Zeroize;
 
 #[derive(Default)]
 pub(super) struct CardChannels {
     channels: Mutex<HashMap<OperationId, Channel>>,
+    // One delivery to Checkout, never journaled or replayed after a restart.
+    outputs: Mutex<HashMap<OperationId, (u64, CustodyResult, CustodyOutputHpkeAad)>>,
 }
 struct Channel {
     challenge_url: String,
@@ -21,6 +24,18 @@ struct Channel {
     /// Labels and values entered on the merchant page, shown on the review
     /// page only and kept in memory for the same reason.
     order_fields: Vec<OrderField>,
+}
+impl Drop for Channel {
+    fn drop(&mut self) {
+        self.challenge_url.zeroize();
+        if let Some(preview) = &mut self.order_preview {
+            preview.zeroize();
+        }
+        for field in &mut self.order_fields {
+            field.label.zeroize();
+            field.value.zeroize();
+        }
+    }
 }
 
 /// One filled field on the merchant's page, as checkout read it.
@@ -312,7 +327,7 @@ impl CeremonyBroker {
         status.output_aad = None;
         Ok(status)
     }
-    fn card_status_with_receipt(
+    pub(super) fn card_status_with_receipt(
         &self,
         operation_id: &OperationId,
     ) -> Result<CardOperationStatus, ProtocolError> {
@@ -352,10 +367,6 @@ impl CeremonyBroker {
             return response;
         }
         self.enforce_creation_bounds(None, true, now_ms)?;
-        let card = self
-            .card_list()?
-            .into_iter()
-            .find(|c| Some(&c.card_id) == request.effect.card_id());
         let prepared = self
             .inner
             .signer
@@ -370,6 +381,11 @@ impl CeremonyBroker {
         {
             return Err(operation_conflict());
         }
+        // Signer now reserves custody before we read the reviewed projection.
+        let card = self
+            .card_list()?
+            .into_iter()
+            .find(|c| Some(&c.card_id) == request.effect.card_id());
         let kind = request.effect.ceremony_kind();
         let host = match &request.effect {
             CardEffect::Checkout { facts, .. } | CardEffect::SiteCheckout { facts, .. } => {
@@ -540,11 +556,19 @@ impl CeremonyBroker {
             }
             CheckoutIntakeRequest::Result { operation_id } => {
                 self.expire_sessions(now_ms)?;
-                // Signer keeps the sealed receipt, so a lost response or a
-                // Broker restart does not strand an approved release.
                 let mut status = self.card_status_with_receipt(&operation_id)?;
-                let receipt = status.receipt.take();
-                let output_aad = status.output_aad.take().map(Box::new);
+                let mut outputs = self.inner.cards.outputs.lock();
+                outputs.retain(|_, (expires, _, _)| *expires > now_ms);
+                let output = outputs.remove(&operation_id);
+                let (receipt, output_aad) = match output {
+                    Some((_, receipt, aad)) => (Some(Box::new(receipt)), Some(Box::new(aad))),
+                    None => (
+                        status.receipt.take(),
+                        status.output_aad.take().map(Box::new),
+                    ),
+                };
+                status.receipt = None;
+                status.output_aad = None;
                 Ok(CheckoutIntakeResponse::Result {
                     status,
                     receipt,
@@ -665,6 +689,26 @@ pub(super) fn complete_card_session(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
             session.state = CeremonyState::Succeeded;
+            if receipt.encrypted_browser_result.is_some() {
+                let contribution: CustodySignerContribution = match serde_json::from_value(session.projection.signer_contribution.clone()) {
+                    Ok(value) => value,
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                };
+                let aad = CustodyOutputHpkeAad {
+                    surface: contribution.surface.clone(),
+                    ceremony_id: contribution.ceremony_id.clone(),
+                    ceremony_kind: contribution.ceremony_kind,
+                    custody_operation_id: session.operation_id.clone(),
+                    signer_contribution_digest: match contribution.digest() {
+                        Ok(value) => value,
+                        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    },
+                    public_binding_digest: receipt.receipt_digest.clone(),
+                };
+                let mut outputs = broker.inner.cards.outputs.lock();
+                outputs.retain(|_, (expires, _, _)| *expires > now_ms);
+                outputs.insert(session.operation_id.clone(), (now_ms.saturating_add(60_000), receipt, aad));
+            }
             // Never persist release ciphertext or expose a challenge URL via result/status.
             let challenge_url = (session.ceremony_kind == CeremonyKind::CardCheckout)
                 .then(|| {
@@ -686,6 +730,12 @@ pub(super) fn complete_card_session(
             (StatusCode::CONFLICT, Json(serde_json::json!({"message":"Card approval failed or its disclosure outcome is unknown. Do not retry this request."}))).into_response()
         }
     };
+    broker
+        .inner
+        .cards
+        .channels
+        .lock()
+        .remove(&session.operation_id);
     session.terminal_result = None;
     latch_terminal(&mut session, now_ms);
     if broker.persist_session(&session).is_err() {
