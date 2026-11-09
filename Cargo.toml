@@ -12,13 +12,13 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "MIT"
 
 [workspace.dependencies]
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "48b83c54c1787b4aff2456bd3adbe18856902e45" }
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "a8f8394a60f946fc208fde2b0b0075486d9c284f" }
-bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "a8f8394a60f946fc208fde2b0b0075486d9c284f" }
+bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "bbdea47f51e826522c66c936f3a219a3616d6890" }
+bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "bbdea47f51e826522c66c936f3a219a3616d6890" }
 bloom-solana-verify = { path = "crates/bloom-solana-verify" }
 bloom-solana-clear-signing = { path = "crates/bloom-solana-clear-signing" }
 bloom-relay-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "8464a60bad159d1336e3c2df303d4a5f7114eec2" }
