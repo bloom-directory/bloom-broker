@@ -251,6 +251,15 @@ let expiryTimer = null;
 // Once this page observes a terminal outcome, late async failures cannot
 // reopen approval. The server remains authoritative for all mutations.
 let approvalTerminal = false;
+let orderPreviewUrl = null;
+function clearPrivateReview() {
+  if (orderPreviewUrl) URL.revokeObjectURL(orderPreviewUrl);
+  orderPreviewUrl = null;
+  for (const fields of [cardFields, travelerFields, cardCvcFields]) {
+    for (const input of fields.querySelectorAll?.("input, textarea, select") || []) input.value = "";
+  }
+  for (const node of reviewNode.querySelectorAll?.(".order-preview, .order-fields") || []) node.remove();
+}
 function startExpiry(session, node) {
   clearInterval(expiryTimer);
   expiryTimer = null;
@@ -283,6 +292,7 @@ function startExpiry(session, node) {
     countdown.className = `review-countdown ${left <= 0 ? "expired" : left < 60000 ? "expiry soon" : "expiry"}`;
     if (left <= 0) {
       approvalTerminal = true;
+      clearPrivateReview();
       approve.disabled = true;
       statusNode.textContent = session.is_preview ? "Preview only — nothing can be approved."
         : "This ceremony has expired. Nothing was changed.";
@@ -1458,8 +1468,15 @@ function renderCardReview(session) {
       BHD:3,IQD:3,JOD:3,KWD:3,LYD:3,OMR:3,TND:3,
       CLF:4,UYW:4,
     })[payment.currency] ?? 2;
-    const amount = payment.total_minor / (10 ** scale);
-    const money = value => new Intl.NumberFormat("en", {style: "currency", currency: payment.currency, minimumFractionDigits: scale, maximumFractionDigits: scale}).format(value);
+    const money = minor => {
+      if (!Number.isSafeInteger(minor) || minor < 0) throw new Error("Invalid checkout amount");
+      const units = 10n ** BigInt(scale);
+      const exact = BigInt(minor);
+      return new Intl.NumberFormat("en", {style: "currency", currency: payment.currency, minimumFractionDigits: scale, maximumFractionDigits: scale})
+        .formatToParts(exact / units)
+        .map(part => part.type === "fraction" ? String(exact % units).padStart(scale, "0") : part.value).join("");
+    };
+    const amount = payment.total_minor;
     // A trial charges nothing today, so the figure that matters is the one
     // below it. Saying "$0.00" invites reading this as a free transaction
     // rather than as putting a card on file.
@@ -1473,7 +1490,7 @@ function renderCardReview(session) {
     // What the subscription costs later is the part a trial price hides, so
     // it goes next to the charge rather than behind the word "recurring".
     if (payment.renewal_minor && every) {
-      const renewal = money(payment.renewal_minor / (10 ** scale));
+      const renewal = money(payment.renewal_minor);
       fact("Recurring charge", payment.renewal_starts_on
         ? `${renewal} every ${every}, from ${payment.renewal_starts_on}`
         : `${renewal} every ${every}`);
@@ -1486,7 +1503,7 @@ function renderCardReview(session) {
       el("div", {class: "order-preview-frame"}, image));
     fetch(`/api/session/${session.ceremony_id}/order-preview`, {headers: authHeaders, credentials: "same-origin"})
       .then(response => response.ok ? response.blob() : null)
-      .then(blob => { if (blob?.type === "image/jpeg") { image.src = URL.createObjectURL(blob); preview.hidden = false; } })
+      .then(blob => { if (!approvalTerminal && blob?.type === "image/jpeg") { orderPreviewUrl = URL.createObjectURL(blob); image.src = orderPreviewUrl; preview.hidden = false; } })
       .catch(() => {});
     // Every field filled on the merchant's page, read just before this
     // review, so passenger, contact and card-holder details can be checked.
@@ -1495,7 +1512,7 @@ function renderCardReview(session) {
     fetch(`/api/session/${session.ceremony_id}/order-fields`, {headers: authHeaders, credentials: "same-origin"})
       .then(response => response.ok ? response.json() : [])
       .then(fields => {
-        if (!Array.isArray(fields) || !fields.length) return;
+        if (approvalTerminal || !Array.isArray(fields) || !fields.length) return;
         const table = el("table", {});
         for (const field of fields) table.append(el("tr", {}, el("th", {scope: "row"}, field.label || "(no label)"), el("td", {}, field.value)));
         entered.append(table, el("p", {class: "order-fields-note"}, "Read from the page as it will be submitted. Card number and security code are not shown."));
@@ -2565,6 +2582,7 @@ async function outputRecipientFor(session, existingOnly = false) {
   }
 }
 async function clearBrowserState(id) {
+  clearPrivateReview();
   clearSessionToken();
   if (!id || !globalThis.indexedDB) return;
   let database;
@@ -4429,6 +4447,7 @@ function browserResultAad(session, contribution) {
 }
 async function finishBrowserResult(session, result) {
   approvalTerminal = true;
+  clearPrivateReview();
   approve.disabled = true;
   if (session.ceremony_kind.startsWith("card_")) {
     const effect = session.review_manifest.card_effect;
@@ -4446,6 +4465,9 @@ async function finishBrowserResult(session, result) {
       const link = el("a", {href: result.challenge_url, target: "_blank", rel: "noopener noreferrer"}, effect.kind === "manual_checkout" && !effect.card_id ? "Open Bloom's browser" : "Open private checkout view");
       reviewNode.append(el("p", {}, link));
       window.open(result.challenge_url, "_blank", "noopener,noreferrer");
+      // Popup blockers need a retry link. Retain this capability for at most
+      // one minute, then require a fresh status/view from Checkout.
+      setTimeout(() => { link.removeAttribute("href"); link.remove(); }, 60_000);
     }
     await clearBrowserState(ceremonyId);
     return;

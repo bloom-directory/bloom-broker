@@ -768,6 +768,60 @@ async fn card_approve(
 }
 
 #[tokio::test]
+async fn failed_verifying_write_leaves_card_ceremony_retryable() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("journal.sqlite");
+    let journal = Arc::new(BrokerJournal::open(&path, Arc::new(ServiceTestAuditSigner)).unwrap());
+    let broker = CeremonyBroker::open(
+        directory.path().join("ceremonies.sqlite"),
+        real_ceremony_signer(),
+        journal,
+    )
+    .unwrap();
+    let id = operation("b1");
+    let prepared = broker
+        .prepare_card(
+            id.clone(),
+            bloom_signer_api::CardEffect::SaveTraveler {
+                traveler_id: Token::new("self").unwrap(),
+                label: "Me".into(),
+            },
+            card_test_now(),
+        )
+        .unwrap();
+    let session = card_session_json(&broker, &prepared).await;
+    let auth = VirtualAuthenticator::generate_for_registration(
+        serde_json::from_value(session["webauthn_options"]["registration_user_handle"].clone())
+            .unwrap(),
+        "http://localhost:18734",
+    );
+    let input = serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&auth.deterministic_prf()),
+        "traveler": {"given_name":"Synthetic", "family_name":"Traveler"}
+    });
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER fail_verifying BEFORE INSERT ON pending_card_sessions
+        BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+    )
+    .unwrap();
+    assert_eq!(
+        card_approve(&broker, &prepared, &auth, input.clone(), 1)
+            .await
+            .0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(broker.status(&id), Some(CeremonyState::AwaitingUser));
+    assert!(broker.traveler_list().unwrap().is_empty());
+    db.execute_batch("DROP TRIGGER fail_verifying").unwrap();
+    assert_eq!(
+        card_approve(&broker, &prepared, &auth, input, 1).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(broker.traveler_list().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn private_traveler_save_and_release_use_real_signer_and_hide_values() {
     use bloom_broker::ceremony::{
         CheckoutIntakeRequest, CheckoutIntakeResponse, bind_checkout_intake,

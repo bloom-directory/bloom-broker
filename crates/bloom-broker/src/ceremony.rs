@@ -4701,19 +4701,15 @@ async fn complete_session(
             session.projection.clone(),
             verifying_snapshot.clone(),
         );
-        if cards::is_card(session.ceremony_kind) {
-            sessions.insert(ceremony_id.clone(), verifying_snapshot);
+        // Hold the session lock until durable state is committed. A failed
+        // write leaves the live ceremony retryable, and concurrent completes
+        // cannot both cross the AwaitingUser boundary.
+        if broker.persist_session(&verifying_snapshot).is_err() {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+        sessions.insert(ceremony_id.clone(), verifying_snapshot);
         prepared_completion
     };
-    if broker.persist_session(&verifying_snapshot).is_err() {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    broker
-        .inner
-        .sessions
-        .lock()
-        .insert(ceremony_id.clone(), verifying_snapshot.clone());
     if cards::is_card(ceremony_kind) {
         return cards::complete_card_session(&broker, &ceremony_id, verifying_snapshot, body);
     }

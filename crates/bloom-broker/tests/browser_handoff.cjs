@@ -77,6 +77,8 @@ for (const [currency, total_minor, installments, total, installment] of [
   ["COP", 12345678, 2, "123,456.78", "61,728.39"],
   ["IQD", 1250125, 1, "1,250.125", "1,250.125"],
   ["VND", 18062176, 2, "18,062,176", "9,031,088"],
+  ["USD", 9007199254740991, 1, "90,071,992,547,409.91", "90,071,992,547,409.91"],
+  ["KWD", 9007199254740991, 1, "9,007,199,254,740.991", "9,007,199,254,740.991"],
 ]) {
   renderCardReview({...session, expires_at_ms: now + 120000,
     review_manifest: {host: "example.com", card_effect: {kind: "checkout",
@@ -123,4 +125,51 @@ renderCardReview({...session, expires_at_ms: now + 120000,
   assert(nodes["page-lede"].textContent.includes("nothing today"), nodes["page-lede"].textContent);
   assert(nodes["page-lede"].textContent.includes("cannot cap"), nodes["page-lede"].textContent);
 }
-console.log("browser-handoff-ok");
+(async () => {
+  approvalTerminal = false;
+  let made = 0;
+  const revoked = [];
+  URL.createObjectURL = () => `blob:preview-${++made}`;
+  URL.revokeObjectURL = url => revoked.push(url);
+  globalThis.fetch = async url => url.endsWith("order-preview")
+    ? {ok: true, blob: async () => ({type: "image/jpeg"})}
+    : {ok: true, json: async () => [{label: "Passenger", value: "Private Name"}]};
+  const checkout = {...session, expires_at_ms: now + 120000, review_manifest: {card_effect: {kind: "checkout",
+    agent_description: "Fixture", facts: {origin: "https://example.com",
+      payment_frame_origins: [], currency: "USD", total_minor: 199, installments: 1}}}};
+  renderCardReview(checkout);
+  await new Promise(setImmediate);
+  const artifacts = nodes.review.children.filter(node => ["section", "figure"].includes(node.name));
+  artifacts.forEach(node => node.remove = () => { node.removed = true; node.children = []; });
+  nodes.review.querySelectorAll = () => artifacts;
+  const secret = {value: "123"};
+  nodes["card-cvc-fields"].querySelectorAll = () => [secret];
+  globalThis.window = {open() {}};
+  const timers = [];
+  globalThis.setTimeout = (fn, ms) => timers.push([fn, ms]);
+  Node.prototype.remove = function () { this.removed = true; };
+  await finishBrowserResult(checkout, {challenge_url: "http://127.0.0.1:1234/view#fixture"});
+  assert.deepEqual(revoked, ["blob:preview-1"]);
+  assert.equal(secret.value, "");
+  assert(artifacts.every(node => node.removed));
+  const link = nodes.review.children.at(-1).children[0];
+  assert(link.attributes.has("href"));
+  const timer = timers.find(([, ms]) => ms === 60000);
+  assert(timer, "private fallback must expire");
+  timer[0]();
+  assert(!link.attributes.has("href") && link.removed);
+
+  // Late private responses must not recreate artifacts after completion.
+  const pending = [];
+  globalThis.fetch = () => new Promise(resolve => pending.push(resolve));
+  approvalTerminal = false;
+  renderCardReview(checkout);
+  approvalTerminal = true;
+  clearPrivateReview();
+  pending[0]({ok: true, blob: async () => ({type: "image/jpeg"})});
+  pending[1]({ok: true, json: async () => [{label: "Late", value: "Private"}]});
+  await new Promise(setImmediate);
+  assert.equal(made, 1);
+  assert(nodes.review.children[1].hidden !== false);
+  console.log("browser-handoff-ok");
+})().catch(error => { console.error(error); process.exitCode = 1; });
