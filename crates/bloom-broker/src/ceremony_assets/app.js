@@ -1445,6 +1445,7 @@ function renderCardReview(session) {
   panelKicker.textContent = "Step 1 of 2 · Check";
   const facts = el("dl", {class: "facts"});
   const fact = (name, value) => facts.append(el("dt", {}, name), el("dd", {}, value));
+  savedCardBrand = manifest.card?.brand;
   if (manifest.card) fact("Card", `${manifest.card.brand} ending ${manifest.card.last4} (“${manifest.card.label}”)`);
   if (effect.kind === "add") fact("Label", effect.label);
   if (effect.kind === "checkout" || effect.kind === "site_checkout") {
@@ -2353,8 +2354,14 @@ const CARD_CHECKS = {
     return {value: {month, year}};
   },
   "card-name": raw => raw ? {value: raw} : {error: "Enter the name as printed on the card."},
-  "card-cvc": raw => /^\d{3,4}$/.test(raw) ? {value: raw} : {error: "Enter the 3 or 4 digit security code."}
+  "card-cvc": raw => {
+    // Signer names the saved card's brand; unknown brands keep 3 or 4 digits.
+    const length = CARD_BRANDS.find(b => b.name === savedCardBrand)?.cvc;
+    if (length ? raw.length === length && /^\d+$/.test(raw) : /^\d{3,4}$/.test(raw)) return {value: raw};
+    return {error: `Enter the ${length || "3 or 4"} digit security code.`};
+  }
 };
+let savedCardBrand = null;
 
 function checkCardField(id) {
   const input = document.getElementById(id);
@@ -2406,6 +2413,7 @@ function cardFieldsInput(session) {
   }
   const ids = session.review_manifest.card_effect.kind === "add" ? ["card-number", "card-expiry", "card-name"]
     : session.review_manifest.card_effect.kind === "checkout" ? ["card-cvc"] : [];
+  savedCardBrand = session.review_manifest.card?.brand;
   const results = Object.fromEntries(ids.map(id => [id, checkCardField(id)]));
   const invalid = ids.find(id => results[id].error);
   if (invalid) {

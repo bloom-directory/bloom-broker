@@ -1279,6 +1279,147 @@ async fn card_checkout_private_delivery_replays_and_manual_has_no_release() {
     denied.abort();
 }
 
+/// Signer commits before Broker publishes the one-time output. A `Result`
+/// arriving in that gap must wait for the output, not report bare success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn card_result_never_reports_success_before_its_private_output() {
+    use bloom_broker::ceremony::{
+        CheckoutIntakeRequest, CheckoutIntakeResponse, bind_checkout_intake,
+        serve_checkout_listener,
+    };
+    use bloom_signer_api::{CardEffect, CheckoutFacts};
+    use std::os::unix::fs::PermissionsExt;
+    let signer = real_ceremony_signer();
+    let broker = CeremonyBroker::new(signer.clone());
+    let card_id = Token::new("private-card").unwrap();
+    let added = broker
+        .prepare_card(
+            operation("e1"),
+            CardEffect::Add {
+                card_id: card_id.clone(),
+                label: "Test card".into(),
+            },
+            card_test_now(),
+        )
+        .unwrap();
+    let session = card_session_json(&broker, &added).await;
+    let auth = VirtualAuthenticator::generate_for_registration(
+        serde_json::from_value(session["webauthn_options"]["registration_user_handle"].clone())
+            .unwrap(),
+        "http://localhost:18734",
+    );
+    let prf = Base64UrlBytes::from_bytes(&auth.deterministic_prf());
+    let input = serde_json::json!({"credential_prf":prf,"card":{"number":"4242424242424242",
+        "expiry_month":12,"expiry_year":2034,"name":"Synthetic Card"}});
+    assert_eq!(
+        card_approve(&broker, &added, &auth, input, 1).await.0,
+        StatusCode::OK
+    );
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o710)).unwrap();
+    let socket = dir.path().join("facts.sock");
+    let listener = bind_checkout_intake(&socket).unwrap();
+    let service = tokio::spawn(serve_checkout_listener(
+        broker.clone(),
+        listener,
+        fs::metadata(dir.path()).unwrap().uid(),
+    ));
+    let recipient = HpkeRecipient::generate();
+    let prepared = match card_intake(
+        &socket,
+        CheckoutIntakeRequest::Prepare {
+            operation_id: operation("e2"),
+            card_id,
+            facts: CheckoutFacts {
+                origin: "https://merchant.example".into(),
+                payment_frame_origins: vec!["https://js.stripe.com".into()],
+                total_minor: 399,
+                currency: "USD".into(),
+                installments: 1,
+                recurring: false,
+                renewal_minor: None,
+                renewal_period: None,
+                renewal_starts_on: None,
+            },
+            recipient_key: recipient.public_key().clone(),
+            agent_description: "Unverified description".into(),
+            challenge_url: "http://localhost:28740/private?token=test-capability".into(),
+            order_preview: None,
+            order_fields: Vec::new(),
+        },
+    )
+    .await
+    {
+        CheckoutIntakeResponse::Prepared(prepared) => prepared,
+        _ => panic!("checkout prepare rejected"),
+    };
+    let (committed_tx, committed) = std::sync::mpsc::channel();
+    let (go, go_rx) = std::sync::mpsc::channel();
+    *signer.pause_after_card_commit.lock() = Some((committed_tx, go_rx));
+    let approving = tokio::spawn({
+        let broker = broker.clone();
+        async move {
+            card_approve(
+                &broker,
+                &prepared,
+                &auth,
+                serde_json::json!({"credential_prf":prf,"cvc":"937"}),
+                2,
+            )
+            .await
+            .0
+        }
+    });
+    tokio::task::spawn_blocking(move || committed.recv().unwrap())
+        .await
+        .unwrap();
+    let result = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            card_intake(
+                &socket,
+                CheckoutIntakeRequest::Result {
+                    operation_id: operation("e2"),
+                },
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    go.send(()).unwrap();
+    assert_eq!(approving.await.unwrap(), StatusCode::OK);
+    match result.await.unwrap() {
+        CheckoutIntakeResponse::Result {
+            receipt: Some(receipt),
+            output_aad: Some(_),
+            ..
+        } => assert!(receipt.encrypted_browser_result.is_some()),
+        _ => panic!("Result reported success without the private output"),
+    }
+    service.abort();
+}
+
+#[test]
+fn a_failed_card_projection_read_releases_the_signer_reservation() {
+    use bloom_signer_api::CardEffect;
+    let signer = real_ceremony_signer();
+    let broker = CeremonyBroker::new(signer.clone());
+    let save = |id: &str| CardEffect::SaveTraveler {
+        traveler_id: Token::new(id).unwrap(),
+        label: "Synthetic".into(),
+    };
+    signer.fail_card_list.store(true, Ordering::SeqCst);
+    assert!(
+        broker
+            .prepare_card(operation("f1"), save("one"), card_test_now())
+            .is_err()
+    );
+    signer.fail_card_list.store(false, Ordering::SeqCst);
+    broker
+        .prepare_card(operation("f2"), save("two"), card_test_now())
+        .unwrap();
+}
+
 /// Take-over and the merchant's saved payment method release no card.
 #[tokio::test]
 async fn card_takeover_and_site_checkout_release_no_card() {
@@ -3822,7 +3963,12 @@ struct RealSigner {
     /// Commit card completions but lose the response, as a dropped socket would.
     lose_card_response: AtomicBool,
     lose_card_status: AtomicBool,
+    fail_card_list: AtomicBool,
+    /// After a card completion commits, report it and wait for the go signal.
+    pause_after_card_commit: CardCommitPause,
 }
+type CardCommitPause =
+    parking_lot::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>;
 
 fn real_ceremony_signer() -> Arc<RealSigner> {
     let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
@@ -3851,6 +3997,8 @@ fn real_ceremony_signer() -> Arc<RealSigner> {
         engine: Some(engine),
         lose_card_response: AtomicBool::new(false),
         lose_card_status: AtomicBool::new(false),
+        fail_card_list: AtomicBool::new(false),
+        pause_after_card_commit: Default::default(),
     })
 }
 
@@ -4137,6 +4285,12 @@ impl CeremonySigner for RealSigner {
     fn card_list(
         &self,
     ) -> Result<Vec<bloom_signer_api::CardPublic>, bloom_signer_api::ProtocolError> {
+        if self.fail_card_list.load(Ordering::SeqCst) {
+            return Err(bloom_signer_api::ProtocolError::new(
+                bloom_signer_api::ProtocolErrorCode::ServiceUnavailable,
+                "card listing unavailable",
+            ));
+        }
         self.service.card_list()
     }
     fn prepare_card(
@@ -4154,6 +4308,10 @@ impl CeremonySigner for RealSigner {
         now_ms: u64,
     ) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
         let result = self.service.complete_card(request, now_ms)?;
+        if let Some((committed, go)) = self.pause_after_card_commit.lock().take() {
+            committed.send(()).unwrap();
+            let _ = go.recv_timeout(std::time::Duration::from_secs(10));
+        }
         if self.lose_card_response.load(Ordering::SeqCst) {
             return Err(bloom_signer_api::ProtocolError::new(
                 bloom_signer_api::ProtocolErrorCode::ServiceUnavailable,
@@ -11364,6 +11522,8 @@ fn requested_wallet_ids_still_count_as_new_registration_attempts() {
         engine: None,
         lose_card_response: AtomicBool::new(false),
         lose_card_status: AtomicBool::new(false),
+        fail_card_list: AtomicBool::new(false),
+        pause_after_card_commit: Default::default(),
     }));
     for index in 0..4_u8 {
         let operation_id = operation(&format!("d{index}"));

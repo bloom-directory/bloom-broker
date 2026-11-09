@@ -387,73 +387,82 @@ impl CeremonyBroker {
             return Err(operation_conflict());
         }
         // Signer now reserves custody before we read the reviewed projection.
-        let card = self
-            .card_list()?
-            .into_iter()
-            .find(|c| Some(&c.card_id) == request.effect.card_id());
-        let kind = request.effect.ceremony_kind();
-        let host = match &request.effect {
-            CardEffect::Checkout { facts, .. } | CardEffect::SiteCheckout { facts, .. } => {
-                url::Url::parse(&facts.origin)
-                    .ok()
-                    .and_then(|u| u.host_str().map(str::to_owned))
-            }
-            _ => None,
-        };
-        let traveler_id = match &request.effect {
-            CardEffect::SaveTraveler { traveler_id, .. }
-            | CardEffect::DeleteTraveler { traveler_id }
-            | CardEffect::FillTraveler { traveler_id, .. } => Some(traveler_id),
-            _ => None,
-        };
-        let traveler = if let Some(id) = traveler_id {
-            self.traveler_list()?
+        // Signer holds one custody slot, so release it if any later step fails.
+        let reserved = operation_id.clone();
+        let published = (|| {
+            let card = self
+                .card_list()?
                 .into_iter()
-                .find(|t| &t.traveler_id == id)
-        } else {
-            None
-        };
-        let review = serde_json::json!({"card_effect":request.effect, "card":card, "traveler":traveler, "host":host});
-        let origin = self.origin_for_surface(&prepared.contribution.surface)?;
-        let contribution_digest = prepared
-            .contribution
-            .digest()
-            .map_err(signer_error_to_machine)?;
-        // RPC peers sample time independently. Clamp the browser session to
-        // Broker's fifteen-minute deadline instead of rejecting transport latency.
-        let expires_at_ms = prepared
-            .contribution
-            .expires_at_ms
-            .get()
-            .min(now_ms.saturating_add(900_000));
-        let ceremony_id = prepared.contribution.ceremony_id.clone();
-        let session = self.new_session(NewBrowserSession {
-            operation_id: operation_id.clone(),
-            request_digest,
-            wallet_id: None,
-            anonymous_registration: true,
-            ceremony_kind: kind,
-            ceremony_id: ceremony_id.clone(),
-            review_manifest: Some(review),
-            challenges: prepared.challenges,
-            signer_contribution: serde_json::to_value(prepared.contribution).map_err(malformed)?,
-            webauthn_options: prepared.webauthn_options,
-            verification_credentials: prepared.verification_credentials,
-            policy_update: None,
-            expires_at_ms,
-            created_at_ms: now_ms,
-            origin,
-        })?;
-        let url = new_session_url(&session)?;
-        self.insert_session(ceremony_id, session)?;
-        Ok(CustodyPrepareResponse {
-            ceremony_kind: kind_to_machine(kind),
-            custody_operation_id: operation_id,
-            state: CustodyPrepareState::AwaitingUser,
-            ceremony_url: url,
-            ceremony_expires_at_ms: DecimalU64::new(expires_at_ms),
-            signer_contribution_digest: contribution_digest,
-        })
+                .find(|c| Some(&c.card_id) == request.effect.card_id());
+            let kind = request.effect.ceremony_kind();
+            let host = match &request.effect {
+                CardEffect::Checkout { facts, .. } | CardEffect::SiteCheckout { facts, .. } => {
+                    url::Url::parse(&facts.origin)
+                        .ok()
+                        .and_then(|u| u.host_str().map(str::to_owned))
+                }
+                _ => None,
+            };
+            let traveler_id = match &request.effect {
+                CardEffect::SaveTraveler { traveler_id, .. }
+                | CardEffect::DeleteTraveler { traveler_id }
+                | CardEffect::FillTraveler { traveler_id, .. } => Some(traveler_id),
+                _ => None,
+            };
+            let traveler = if let Some(id) = traveler_id {
+                self.traveler_list()?
+                    .into_iter()
+                    .find(|t| &t.traveler_id == id)
+            } else {
+                None
+            };
+            let review = serde_json::json!({"card_effect":request.effect, "card":card, "traveler":traveler, "host":host});
+            let origin = self.origin_for_surface(&prepared.contribution.surface)?;
+            let contribution_digest = prepared
+                .contribution
+                .digest()
+                .map_err(signer_error_to_machine)?;
+            // RPC peers sample time independently. Clamp the browser session to
+            // Broker's fifteen-minute deadline instead of rejecting transport latency.
+            let expires_at_ms = prepared
+                .contribution
+                .expires_at_ms
+                .get()
+                .min(now_ms.saturating_add(900_000));
+            let ceremony_id = prepared.contribution.ceremony_id.clone();
+            let session = self.new_session(NewBrowserSession {
+                operation_id: operation_id.clone(),
+                request_digest,
+                wallet_id: None,
+                anonymous_registration: true,
+                ceremony_kind: kind,
+                ceremony_id: ceremony_id.clone(),
+                review_manifest: Some(review),
+                challenges: prepared.challenges,
+                signer_contribution: serde_json::to_value(prepared.contribution)
+                    .map_err(malformed)?,
+                webauthn_options: prepared.webauthn_options,
+                verification_credentials: prepared.verification_credentials,
+                policy_update: None,
+                expires_at_ms,
+                created_at_ms: now_ms,
+                origin,
+            })?;
+            let url = new_session_url(&session)?;
+            self.insert_session(ceremony_id, session)?;
+            Ok(CustodyPrepareResponse {
+                ceremony_kind: kind_to_machine(kind),
+                custody_operation_id: operation_id,
+                state: CustodyPrepareState::AwaitingUser,
+                ceremony_url: url,
+                ceremony_expires_at_ms: DecimalU64::new(expires_at_ms),
+                signer_contribution_digest: contribution_digest,
+            })
+        })();
+        if published.is_err() {
+            let _ = self.inner.signer.card_cancel(&reserved);
+        }
+        published
     }
 
     fn checkout_intake(
@@ -655,6 +664,9 @@ pub(super) fn complete_card_session(
     body: BrowserComplete,
 ) -> Response {
     let now_ms = unix_time_ms();
+    // Hold the output map until the one-time output is published, so a
+    // concurrent `Result` cannot see Signer success without it.
+    let mut outputs = broker.inner.cards.outputs.lock();
     let completion = broker
         .inner
         .signer
@@ -714,7 +726,6 @@ pub(super) fn complete_card_session(
                     },
                     public_binding_digest: receipt.receipt_digest.clone(),
                 };
-                let mut outputs = broker.inner.cards.outputs.lock();
                 outputs.retain(|_, (expires, _, _)| *expires > now_ms);
                 outputs.insert(session.operation_id.clone(), (now_ms.saturating_add(60_000), receipt, aad));
             }
@@ -739,6 +750,7 @@ pub(super) fn complete_card_session(
             (StatusCode::CONFLICT, Json(serde_json::json!({"message":"Card approval failed or its disclosure outcome is unknown. Do not retry this request."}))).into_response()
         }
     };
+    drop(outputs);
     broker
         .inner
         .cards

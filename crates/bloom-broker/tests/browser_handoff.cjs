@@ -171,5 +171,19 @@ renderCardReview({...session, expires_at_ms: now + 120000,
   await new Promise(setImmediate);
   assert.equal(made, 1);
   assert(nodes.review.children[1].hidden !== false);
+
+  // CVC length follows the saved card's brand; unknown brands allow 3 or 4.
+  document.getElementById("card-cvc").focus = () => {};
+  const cvc = (brand, value) => {
+    nodes["card-cvc"].value = value;
+    const manifest = {...checkout.review_manifest, card: brand && {brand}};
+    try { return cardFieldsInput({...checkout, review_manifest: manifest}).cvc; } catch { return null; }
+  };
+  assert.equal(cvc("Amex", "123"), null);
+  assert.equal(cvc("Amex", "1234"), "1234");
+  assert.equal(cvc("Visa", "1234"), null);
+  assert.equal(cvc("Visa", "123"), "123");
+  assert.equal(cvc("Card", "1234"), "1234");
+  assert.equal(cvc(null, "123"), "123");
   console.log("browser-handoff-ok");
 })().catch(error => { console.error(error); process.exitCode = 1; });
