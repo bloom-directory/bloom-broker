@@ -1035,85 +1035,78 @@ async fn serve_remote_tls_reconciled(
                 }) {
                     material_worker.take().unwrap().1.abort();
                 }
-                if material_worker.is_none() {
-                    if let (Some(key), Some(name), Some(id)) =
+                if material_worker.is_none()
+                    && let (Some(key), Some(name), Some(id)) =
                         (worker_key, hostname.clone(), installation_id)
-                    {
-                        let material_config = config.clone();
-                        let material_ceremony = ceremony.clone();
-                        let worker = tokio::spawn(async move {
-                            let mut fast_rounds = FAST_CERTIFICATE_ROUNDS;
-                            loop {
-                                let mut relay_not_ready = false;
-                                if let Err(error) = remote_material::ensure_acme_account(
+                {
+                    let material_config = config.clone();
+                    let material_ceremony = ceremony.clone();
+                    let worker = tokio::spawn(async move {
+                        let mut fast_rounds = FAST_CERTIFICATE_ROUNDS;
+                        loop {
+                            let mut relay_not_ready = false;
+                            if let Err(error) =
+                                remote_material::ensure_acme_account(&material_config, broker_uid)
+                                    .await
+                            {
+                                tracing::warn!(event = "broker.acme_account_pending", %error);
+                            }
+                            if desired_remote {
+                                match remote_material::maintain_scoped_credentials(
                                     &material_config,
+                                    id,
                                     broker_uid,
                                 )
                                 .await
                                 {
-                                    tracing::warn!(event = "broker.acme_account_pending", %error);
-                                }
-                                if desired_remote {
-                                    match remote_material::maintain_scoped_credentials(
-                                        &material_config,
-                                        id,
-                                        broker_uid,
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => {
-                                            if material_ceremony
-                                                .set_remote_credentials_rejected(false)
-                                            {
-                                                tracing::info!(
-                                                    event = "broker.remote_credentials_restored"
-                                                );
-                                            }
-                                        }
-                                        // Past the relay's renewal grace (or revoked): retrying
-                                        // cannot help, so report it once and keep the tunnel
-                                        // down until the Signer administrator re-provisions.
-                                        Err(error)
-                                            if remote_material::credentials_rejected(&error) =>
+                                    Ok(()) => {
+                                        if material_ceremony.set_remote_credentials_rejected(false)
                                         {
-                                            if !material_ceremony
-                                                .set_remote_credentials_rejected(true)
-                                            {
-                                                tracing::error!(
-                                                    event = "broker.remote_credentials_expired",
-                                                    %error,
-                                                    repair = "sudo bloom-signer admin provision --login-uid <uid>",
-                                                    "relay refuses to renew the scoped credentials; remote ceremonies are off until the Signer administrator re-provisions"
-                                                );
-                                            }
-                                        }
-                                        Err(error) => {
-                                            tracing::warn!(event = "broker.remote_credential_maintenance_pending", %error);
+                                            tracing::info!(
+                                                event = "broker.remote_credentials_restored"
+                                            );
                                         }
                                     }
-                                    let certificate = remote_material::maintain_certificate(
-                                        &material_config,
-                                        &name,
-                                        id,
-                                        broker_uid,
-                                    )
-                                    .await;
-                                    relay_not_ready = certificate
-                                        .as_ref()
-                                        .is_err_and(remote_material::relay_not_ready);
-                                    if let Err(error) = certificate {
-                                        tracing::warn!(event = "broker.remote_certificate_pending", %error);
+                                    // Past the relay's renewal grace (or revoked): retrying
+                                    // cannot help, so report it once and keep the tunnel
+                                    // down until the Signer administrator re-provisions.
+                                    Err(error) if remote_material::credentials_rejected(&error) => {
+                                        if !material_ceremony.set_remote_credentials_rejected(true)
+                                        {
+                                            tracing::error!(
+                                                event = "broker.remote_credentials_expired",
+                                                %error,
+                                                repair = "sudo bloom-signer admin provision --login-uid <uid>",
+                                                "relay refuses to renew the scoped credentials; remote ceremonies are off until the Signer administrator re-provisions"
+                                            );
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(event = "broker.remote_credential_maintenance_pending", %error);
                                     }
                                 }
-                                tokio::time::sleep(material_round_pause(
-                                    relay_not_ready,
-                                    &mut fast_rounds,
-                                ))
+                                let certificate = remote_material::maintain_certificate(
+                                    &material_config,
+                                    &name,
+                                    id,
+                                    broker_uid,
+                                )
                                 .await;
+                                relay_not_ready = certificate
+                                    .as_ref()
+                                    .is_err_and(remote_material::relay_not_ready);
+                                if let Err(error) = certificate {
+                                    tracing::warn!(event = "broker.remote_certificate_pending", %error);
+                                }
                             }
-                        });
-                        material_worker = Some((key, worker));
-                    }
+                            tokio::time::sleep(material_round_pause(
+                                relay_not_ready,
+                                &mut fast_rounds,
+                            ))
+                            .await;
+                        }
+                    });
+                    material_worker = Some((key, worker));
                 }
                 let material_ready = hostname.as_deref().is_some_and(|name| {
                     remote_material::load_published_bundle(&config.bundle_path, name, broker_uid)
@@ -1164,22 +1157,21 @@ async fn serve_remote_tls_reconciled(
                 let tls_ready = active.is_some() && material_ready && externally_ready;
                 let routing_ready = tunnel_ready && externally_ready;
                 let remote_closed = active.is_none();
-                if status.desired_revision != status.effective_revision
+                if (status.desired_revision != status.effective_revision
                     || status.remote_tls_ready != tls_ready
                     || status.remote_routing_ready != routing_ready
                     || (desired_remote
                         && status.effective_mode != ExposureMode::RemoteEnabled
                         && externally_ready)
-                    || (!desired_remote && status.effective_mode != ExposureMode::LocalhostOnly)
-                {
-                    if let Err(error) = ceremony.report_surface_effective(SurfaceEffectiveReport {
+                    || (!desired_remote && status.effective_mode != ExposureMode::LocalhostOnly))
+                    && let Err(error) = ceremony.report_surface_effective(SurfaceEffectiveReport {
                         desired_revision: status.desired_revision,
                         remote_tls_ready: tls_ready,
                         remote_routing_ready: routing_ready,
                         remote_closed,
-                    }) {
-                        tracing::warn!(event = "broker.remote_readiness_report_failed", %error);
-                    }
+                    })
+                {
+                    tracing::warn!(event = "broker.remote_readiness_report_failed", %error);
                 }
             }
             Err(error) => tracing::warn!(event = "broker.remote_surface_unavailable", %error),
@@ -2189,13 +2181,13 @@ fn insert_audit_verifying_key(
     key_id: &str,
     key: VerifyingKey,
 ) -> Result<(), ProtocolError> {
-    if let Some(existing) = keys.insert(key_id.to_owned(), key) {
-        if existing != key {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::MalformedFrame,
-                format!("audit key ID {key_id} has conflicting public keys"),
-            ));
-        }
+    if let Some(existing) = keys.insert(key_id.to_owned(), key)
+        && existing != key
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::MalformedFrame,
+            format!("audit key ID {key_id} has conflicting public keys"),
+        ));
     }
     Ok(())
 }

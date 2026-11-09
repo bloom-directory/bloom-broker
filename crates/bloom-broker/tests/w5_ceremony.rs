@@ -4775,12 +4775,12 @@ impl CeremonySigner for MockSigner {
         &self,
         operation_id: &OperationId,
     ) -> Result<SignerCeremonyStatus, bloom_signer_api::ProtocolError> {
-        if let Some((completed_operation, result)) = self.completed_custody.lock().as_ref() {
-            if completed_operation == operation_id {
-                return Ok(SignerCeremonyStatus::CompletedCustody(Box::new(
-                    result.clone(),
-                )));
-            }
+        if let Some((completed_operation, result)) = self.completed_custody.lock().as_ref()
+            && completed_operation == operation_id
+        {
+            return Ok(SignerCeremonyStatus::CompletedCustody(Box::new(
+                result.clone(),
+            )));
         }
         Ok(if self.pending.lock().contains(operation_id) {
             SignerCeremonyStatus::Pending

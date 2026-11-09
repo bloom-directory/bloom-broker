@@ -283,10 +283,9 @@ fn persist_response_checkpoint(
         operation_id,
         peer_head,
         "broker_signer_response",
-    ) {
-        if !is_read_only_method(method) {
-            return Err(error);
-        }
+    ) && !is_read_only_method(method)
+    {
+        return Err(error);
     }
     Ok(())
 }

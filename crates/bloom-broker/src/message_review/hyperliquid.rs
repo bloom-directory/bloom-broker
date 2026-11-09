@@ -209,15 +209,13 @@ pub(super) fn rebuild(
     if let Action::Order {
         orders, grouping, ..
     } = &action
-    {
-        if orders.is_empty()
+        && (orders.is_empty()
             || !matches!(grouping.as_str(), "na" | "normalTpsl" | "positionTpsl")
             || orders
                 .iter()
-                .any(|order| order.t.limit.is_some() == order.t.trigger.is_some())
-        {
-            return Err(invalid("unsupported exchange order grouping or type"));
-        }
+                .any(|order| order.t.limit.is_some() == order.t.trigger.is_some()))
+    {
+        return Err(invalid("unsupported exchange order grouping or type"));
     }
     let vault = vault
         .map(str::parse::<Address>)

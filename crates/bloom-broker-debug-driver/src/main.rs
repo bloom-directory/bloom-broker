@@ -137,10 +137,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if kind != CeremonyKind::WalletRecovery && seed.is_none() {
         return Err("ceremony requires an authenticator seed".into());
     }
-    if let (Some(input), Some(output)) = (&recovery_record_file, &browser_result_file) {
-        if input == output {
-            return Err("recovery input and result paths must differ".into());
-        }
+    if let (Some(input), Some(output)) = (&recovery_record_file, &browser_result_file)
+        && input == output
+    {
+        return Err("recovery input and result paths must differ".into());
     }
     if browser_result_file
         .as_ref()

@@ -925,10 +925,9 @@ fn decode_stored_browser_session(encoded: &str) -> Result<BrowserSession, serde_
             .and_then(serde_json::Value::as_object_mut)
             .and_then(|policy| policy.get_mut("custody"))
             .and_then(serde_json::Value::as_object_mut)
+            && !policy_custody.contains_key("surface")
         {
-            if !policy_custody.contains_key("surface") {
-                policy_custody.insert("surface".to_owned(), legacy_surface.clone());
-            }
+            policy_custody.insert("surface".to_owned(), legacy_surface.clone());
         }
         if let Some(projection) = session
             .get_mut("projection")
@@ -956,10 +955,9 @@ fn decode_stored_browser_session(encoded: &str) -> Result<BrowserSession, serde_
                     if let Some(binding) = challenge
                         .get_mut("binding")
                         .and_then(serde_json::Value::as_object_mut)
+                        && !binding.contains_key("surface")
                     {
-                        if !binding.contains_key("surface") {
-                            binding.insert("surface".to_owned(), legacy_surface.clone());
-                        }
+                        binding.insert("surface".to_owned(), legacy_surface.clone());
                     }
                 }
             }
@@ -4449,15 +4447,14 @@ async fn prepare_wallet_backup(
         if broker.cancel(&session.operation_id, now).is_err() {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
-    } else if let Some(session) = pending {
-        if let Some(response) =
+    } else if let Some(session) = pending
+        && let Some(response) =
             broker.stable_custody_response(&session.operation_id, &session.request_digest)
-        {
-            return match response {
-                Ok(value) => Json(value).into_response(),
-                Err(_) => StatusCode::CONFLICT.into_response(),
-            };
-        }
+    {
+        return match response {
+            Ok(value) => Json(value).into_response(),
+            Err(_) => StatusCode::CONFLICT.into_response(),
+        };
     }
     let mut bytes = [0; 32];
     if SysRng.try_fill_bytes(&mut bytes).is_err() {
@@ -5114,13 +5111,13 @@ impl CeremonyBroker {
                 )
             })?;
             for part in field.split(';').map(str::trim) {
-                if let Some(value) = part.strip_prefix(&cookie_name) {
-                    if cookie_value.replace(value).is_some() {
-                        return Err(protocol(
-                            ProtocolErrorCode::UnauthenticatedPeer,
-                            "duplicate remote ceremony cookie",
-                        ));
-                    }
+                if let Some(value) = part.strip_prefix(&cookie_name)
+                    && cookie_value.replace(value).is_some()
+                {
+                    return Err(protocol(
+                        ProtocolErrorCode::UnauthenticatedPeer,
+                        "duplicate remote ceremony cookie",
+                    ));
                 }
             }
         }
