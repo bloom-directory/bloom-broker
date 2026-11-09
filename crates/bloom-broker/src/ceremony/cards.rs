@@ -232,6 +232,7 @@ const MAX_INTAKE_LINE_BYTES: usize = 1_500_000;
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CheckoutIntakeRequest {
+    Saved,
     TravelerInfo {
         traveler_id: Token,
     },
@@ -283,6 +284,10 @@ pub enum CheckoutIntakeRequest {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CheckoutIntakeResponse {
+    Saved {
+        cards: Vec<CardPublic>,
+        travelers: Vec<bloom_signer_api::TravelerPublic>,
+    },
     Traveler {
         traveler: bloom_signer_api::TravelerPublic,
     },
@@ -457,6 +462,10 @@ impl CeremonyBroker {
     ) -> Result<CheckoutIntakeResponse, ProtocolError> {
         let now_ms = unix_time_ms();
         match request {
+            CheckoutIntakeRequest::Saved => Ok(CheckoutIntakeResponse::Saved {
+                cards: self.card_list()?,
+                travelers: self.traveler_list()?,
+            }),
             CheckoutIntakeRequest::TravelerInfo { traveler_id } => {
                 let traveler = self
                     .traveler_list()?

@@ -897,6 +897,17 @@ async fn private_traveler_save_and_release_use_real_signer_and_hide_values() {
         fs::metadata(dir.path()).unwrap().uid(),
     ));
     let recipient = HpkeRecipient::generate();
+    let saved = card_intake(&socket, CheckoutIntakeRequest::Saved).await;
+    match saved {
+        CheckoutIntakeResponse::Saved { cards, travelers } => {
+            assert!(cards.is_empty());
+            assert_eq!(travelers.len(), 2);
+            let projection = serde_json::to_string(&travelers).unwrap();
+            assert!(!projection.contains("SyntheticWife"));
+            assert!(!projection.contains("SyntheticSelf"));
+        }
+        _ => panic!("saved metadata unavailable"),
+    }
     let prepared = match card_intake(
         &socket,
         CheckoutIntakeRequest::Traveler {
