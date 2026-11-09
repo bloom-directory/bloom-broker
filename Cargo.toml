@@ -17,8 +17,8 @@ license = "MIT"
 
 [workspace.dependencies]
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "48b83c54c1787b4aff2456bd3adbe18856902e45" }
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "5f2910c16acaf4c5c5eedea22bfe35e33c829d3d" }
-bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "5f2910c16acaf4c5c5eedea22bfe35e33c829d3d" }
+bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "a8f8394a60f946fc208fde2b0b0075486d9c284f" }
+bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "a8f8394a60f946fc208fde2b0b0075486d9c284f" }
 bloom-solana-verify = { path = "crates/bloom-solana-verify" }
 bloom-solana-clear-signing = { path = "crates/bloom-solana-clear-signing" }
 bloom-relay-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "8464a60bad159d1336e3c2df303d4a5f7114eec2" }
@@ -47,7 +47,7 @@ sha2 = "0.11"
 sha3 = "0.12"
 hex = "0.4"
 ed25519-dalek = "3"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 num-bigint = "0.5"
 parking_lot = "0.12"
 p256 = { version = "0.14", features = ["ecdsa"] }

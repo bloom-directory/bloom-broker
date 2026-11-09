@@ -1288,7 +1288,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=5f2910c16acaf4c5c5eedea22bfe35e33c829d3d#5f2910c16acaf4c5c5eedea22bfe35e33c829d3d"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a8f8394a60f946fc208fde2b0b0075486d9c284f#a8f8394a60f946fc208fde2b0b0075486d9c284f"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1336,7 +1336,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=5f2910c16acaf4c5c5eedea22bfe35e33c829d3d#5f2910c16acaf4c5c5eedea22bfe35e33c829d3d"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a8f8394a60f946fc208fde2b0b0075486d9c284f#a8f8394a60f946fc208fde2b0b0075486d9c284f"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek 3.0.0",
@@ -1352,7 +1352,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-backend-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=5f2910c16acaf4c5c5eedea22bfe35e33c829d3d#5f2910c16acaf4c5c5eedea22bfe35e33c829d3d"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a8f8394a60f946fc208fde2b0b0075486d9c284f#a8f8394a60f946fc208fde2b0b0075486d9c284f"
 dependencies = [
  "bloom-signer-api",
  "serde",
@@ -1363,7 +1363,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-backend-local"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=5f2910c16acaf4c5c5eedea22bfe35e33c829d3d#5f2910c16acaf4c5c5eedea22bfe35e33c829d3d"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a8f8394a60f946fc208fde2b0b0075486d9c284f#a8f8394a60f946fc208fde2b0b0075486d9c284f"
 dependencies = [
  "bip32 0.6.0-rc.0",
  "bloom-signer-api",
@@ -1386,7 +1386,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=5f2910c16acaf4c5c5eedea22bfe35e33c829d3d#5f2910c16acaf4c5c5eedea22bfe35e33c829d3d"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a8f8394a60f946fc208fde2b0b0075486d9c284f#a8f8394a60f946fc208fde2b0b0075486d9c284f"
 dependencies = [
  "bip39",
  "ed25519-dalek 3.0.0",
@@ -1403,7 +1403,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-process-hardening"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=5f2910c16acaf4c5c5eedea22bfe35e33c829d3d#5f2910c16acaf4c5c5eedea22bfe35e33c829d3d"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a8f8394a60f946fc208fde2b0b0075486d9c284f#a8f8394a60f946fc208fde2b0b0075486d9c284f"
 dependencies = [
  "libc",
  "zeroize",
@@ -1412,7 +1412,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-vectors"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=5f2910c16acaf4c5c5eedea22bfe35e33c829d3d#5f2910c16acaf4c5c5eedea22bfe35e33c829d3d"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=a8f8394a60f946fc208fde2b0b0075486d9c284f#a8f8394a60f946fc208fde2b0b0075486d9c284f"
 
 [[package]]
 name = "bloom-solana-clear-signing"
@@ -3479,9 +3479,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.2"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -4310,9 +4310,9 @@ checksum = "48fd7bd8a6377e15ad9d42a8ec25371b94ddc67abe7c8b9127bec79bebaaae18"
 
 [[package]]
 name = "rusqlite"
-version = "0.40.2"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags 2.13.1",
  "fallible-iterator",
@@ -5263,7 +5263,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
