@@ -537,6 +537,9 @@ impl BrokerAuthority {
                 snapshot_jcs TEXT NOT NULL,
                 policy_jcs TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS wallet_deletion_audit
+              ON audit_chain(json_extract(payload_jcs, '$.wallet_id'))
+              WHERE event_type = 'wallet.projection_deleted';
             CREATE TABLE IF NOT EXISTS wallet_epochs (
                 wallet_id TEXT PRIMARY KEY,
                 epoch TEXT NOT NULL,
@@ -728,6 +731,7 @@ impl BrokerAuthority {
         let snapshot_jcs = serde_jcs::to_string(snapshot).map_err(storage)?;
         let policy_jcs = serde_jcs::to_string(&policy).map_err(storage)?;
         let connection = self.lock()?;
+        require_wallet_not_deleted(&connection, &snapshot.wallet_id)?;
         let exact: Option<(u64, String)> = connection
             .query_row(
                 "SELECT version, snapshot_jcs FROM policies WHERE wallet_id = ?1",
@@ -750,6 +754,9 @@ impl BrokerAuthority {
         drop(connection);
         let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
+        // Deletion can commit between the read-only exact-match check and
+        // acquiring this transaction. Fence that in-flight policy read too.
+        require_wallet_not_deleted(&transaction, &snapshot.wallet_id)?;
         let existing: Option<(u64, String)> = transaction
             .query_row(
                 "SELECT version, snapshot_jcs FROM policies WHERE wallet_id = ?1",
@@ -878,7 +885,7 @@ impl BrokerAuthority {
                 "DELETE FROM policies WHERE wallet_id = ?1",
                 [wallet_id.as_str()],
             )?;
-            if removed != 0 {
+            if removed != 0 || !wallet_was_deleted(&transaction, wallet_id)? {
                 self.journal.append_external_audit(
                     &transaction,
                     "wallet.projection_deleted",
@@ -2323,8 +2330,16 @@ impl BrokerAuthority {
 
     pub fn wallet_ids(&self) -> Result<Vec<Token>, AuthorityError> {
         let connection = self.lock()?;
-        let mut statement =
-            connection.prepare("SELECT wallet_id FROM policies ORDER BY wallet_id")?;
+        // Released Brokers could reinstall an in-flight snapshot after
+        // deletion. The verified journal event remains authoritative even
+        // when such a stale policy row survived a restart.
+        let mut statement = connection.prepare(
+            "SELECT p.wallet_id FROM policies p WHERE NOT EXISTS (
+                SELECT 1 FROM audit_chain a
+                WHERE a.event_type = 'wallet.projection_deleted'
+                  AND json_extract(a.payload_jcs, '$.wallet_id') = p.wallet_id
+             ) ORDER BY p.wallet_id",
+        )?;
         statement
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?
@@ -3249,6 +3264,7 @@ impl BrokerAuthority {
         wallet_id: &Token,
     ) -> Result<(SignedPolicySnapshot, CanonicalWalletPolicy), AuthorityError> {
         let connection = self.lock()?;
+        require_wallet_not_deleted(&connection, wallet_id)?;
         connection
             .query_row(
                 "SELECT snapshot_jcs, policy_jcs FROM policies WHERE wallet_id = ?1",
@@ -3365,6 +3381,28 @@ impl BrokerAuthority {
             .lock()
             .map_err(|_| AuthorityError::Storage("authorization barrier poisoned".into()))
     }
+}
+
+fn wallet_was_deleted(connection: &Connection, wallet_id: &Token) -> Result<bool, AuthorityError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM audit_chain
+         WHERE event_type = 'wallet.projection_deleted'
+           AND json_extract(payload_jcs, '$.wallet_id') = ?1)",
+            [wallet_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn require_wallet_not_deleted(
+    connection: &Connection,
+    wallet_id: &Token,
+) -> Result<(), AuthorityError> {
+    if wallet_was_deleted(connection, wallet_id)? {
+        return Err(denied("POLICY_NOT_FOUND", "wallet was deleted"));
+    }
+    Ok(())
 }
 
 fn petal_payload_batch_digest(payloads: &[Vec<u8>]) -> Digest32 {

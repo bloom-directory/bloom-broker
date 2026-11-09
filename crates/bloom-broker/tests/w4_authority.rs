@@ -4398,3 +4398,114 @@ fn key_stop_admission_rolls_back_and_replay_preserves_fresh_exact() {
         Some(bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony)
     );
 }
+
+fn delete_fixture_wallet(harness: &Harness) {
+    let mut receipt = CustodyResult {
+        surface: Some(bloom_broker_api::CeremonySurfaceRef {
+            surface_id: token("local"),
+            identity_digest: digest(91),
+        }),
+        credential_authority_generation: Some(DecimalU64::new(0)),
+        ceremony_kind: CeremonyKind::WalletDelete,
+        custody_operation_id: operation(90),
+        public_status: CeremonyState::Succeeded,
+        wallet_id: Some(harness.wallet.clone()),
+        public_key_refs: Vec::new(),
+        credential_summaries: Vec::new(),
+        initial_policy: None,
+        receipt_digest: digest(90),
+        encrypted_browser_result: None,
+        signer_key_id: token("ceremony-key"),
+        signer_signature: Base64UrlBytes::from_bytes(&[]),
+    };
+    sign_custody_receipt(&mut receipt, &harness.ceremony_key);
+    harness
+        .authority
+        .adopt_custody_receipt(&receipt, 1_000)
+        .unwrap();
+}
+
+#[test]
+fn deleted_wallet_policy_cannot_be_reinstalled_by_a_late_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let harness = Harness::open_at(directory.path());
+    let stale = harness.authority.policy_snapshot(&harness.wallet).unwrap();
+    delete_fixture_wallet(&harness);
+    assert!(harness.authority.wallet_ids().unwrap().is_empty());
+    assert!(
+        harness.authority.install_policy(&stale).is_err(),
+        "a signed snapshot obtained before deletion must not resurrect its wallet"
+    );
+    drop(harness);
+    let reopened = Harness::open_at(directory.path());
+    assert!(reopened.authority.install_policy(&stale).is_err());
+    assert!(reopened.authority.wallet_ids().unwrap().is_empty());
+}
+
+#[test]
+fn legacy_resurrected_policy_is_not_projected_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let harness = Harness::open_at(directory.path());
+    let connection = rusqlite::Connection::open(directory.path().join("journal.sqlite")).unwrap();
+    let row: (String, String, String, String, String) = connection
+        .query_row(
+            "SELECT wallet_id,version,digest,snapshot_jcs,policy_jcs FROM policies",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    delete_fixture_wallet(&harness);
+    // Model a released Broker installing its in-flight policy read after
+    // committing the deletion. Its verified deletion event remains durable.
+    connection
+        .execute(
+            "INSERT INTO policies VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params![row.0, row.1, row.2, row.3, row.4],
+        )
+        .unwrap();
+    drop(connection);
+    drop(harness);
+    let reopened = Harness::open_at(directory.path());
+    assert!(reopened.authority.wallet_ids().unwrap().is_empty());
+    assert!(
+        reopened
+            .authority
+            .policy_snapshot(&reopened.wallet)
+            .is_err()
+    );
+    assert!(
+        reopened
+            .authority
+            .install_policy(&reopened.policy_snapshot(1))
+            .is_err()
+    );
+}
+
+#[test]
+fn deletion_without_a_cached_policy_still_prevents_late_installation() {
+    let directory = tempfile::tempdir().unwrap();
+    let harness = Harness::open_at(directory.path());
+    let connection = rusqlite::Connection::open(directory.path().join("journal.sqlite")).unwrap();
+    connection
+        .execute(
+            "DELETE FROM policies WHERE wallet_id = ?1",
+            [harness.wallet.as_str()],
+        )
+        .unwrap();
+    drop(connection);
+    delete_fixture_wallet(&harness);
+    assert!(
+        harness
+            .authority
+            .install_policy(&harness.policy_snapshot(1))
+            .is_err()
+    );
+}
