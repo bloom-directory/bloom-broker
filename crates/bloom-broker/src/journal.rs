@@ -2251,8 +2251,9 @@ impl BrokerJournal {
     }
 
     /// Verify the already-locked journal target used during legacy migration.
-    /// Runtime mutations must obtain a verified guard through
-    /// `lock_for_mutation` instead.
+    /// Reuses the chain verification from `open` while no write has touched
+    /// the journal since; otherwise re-verifies the whole chain. Runtime
+    /// mutations must obtain a verified guard through `lock_for_mutation`.
     pub(crate) fn verify_migration_target(
         &self,
         connection: &Connection,
@@ -2260,7 +2261,7 @@ impl BrokerJournal {
         if self.audit_degraded() {
             return Err(audit_degraded());
         }
-        if let Err(error) = verify_audit_chain_connection(connection, self.audit_signer.as_ref()) {
+        if let Err(error) = self.cached_audit_head(connection) {
             self.latch_degradation(DegradationCause::journal("journal_verification_failed"));
             return Err(error);
         }
