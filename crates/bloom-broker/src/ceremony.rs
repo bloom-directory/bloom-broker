@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Version, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri, Version, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -373,6 +373,15 @@ const APP_JS: &str = concat!(
     include_str!("ceremony_assets/token-artwork.js"),
     include_str!("ceremony_assets/app.js")
 );
+const ONBOARDING_HTML: &str = include_str!("ceremony_assets/onboarding/index.html");
+const ONBOARDING_JS: &str = include_str!("ceremony_assets/onboarding/app.js");
+const ONBOARDING_CSS: &str = include_str!("ceremony_assets/onboarding/style.css");
+
+#[derive(Clone, Copy)]
+enum PageSecurity {
+    Onboarding,
+    EmbeddedLocalCeremony,
+}
 const STYLE_CSS: &str = include_str!("ceremony_assets/style.css");
 const BLOOM_PRIMARY_SVG: &str = include_str!("ceremony_assets/bloom-primary.svg");
 const SOLANA_NETWORK_SVG: &str = include_str!("ceremony_assets/networks/solana.svg");
@@ -397,6 +406,9 @@ pub fn install_owner_theme_css(css: String) {
 
 #[derive(Clone, Debug, Default)]
 pub struct ReviewManifestContext {
+    pub package_display_name: Option<String>,
+    pub standing_rearm: bool,
+    pub session_budget: Option<bloom_broker_api::SessionBudget>,
     pub petal_use_claim: Option<PetalUseClaim>,
     pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance: Option<ClaimAssurance>,
@@ -409,6 +421,12 @@ pub struct ReviewManifestContext {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReviewManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing_rearm: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_budget: Option<bloom_broker_api::SessionBudget>,
     pub schema: Token,
     pub approval_id: Digest32,
     pub approval_digest: Digest32,
@@ -436,6 +454,8 @@ impl ReviewManifest {
     fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
         #[derive(Serialize)]
         struct Unsigned<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            package_display_name: &'a Option<String>,
             schema: &'a Token,
             approval_id: &'a Digest32,
             approval_digest: &'a Digest32,
@@ -458,6 +478,7 @@ impl ReviewManifest {
             broker_key_id: &'a Token,
         }
         serde_jcs::to_vec(&Unsigned {
+            package_display_name: &self.package_display_name,
             schema: &self.schema,
             approval_id: &self.approval_id,
             approval_digest: &self.approval_digest,
@@ -2702,6 +2723,9 @@ impl CeremonyBroker {
     pub fn router(&self) -> Router {
         let router = Router::new()
             .route("/", get(shell))
+            .route("/onboarding/", get(onboarding_shell))
+            .route("/onboarding/app.js", get(onboarding_js))
+            .route("/onboarding/style.css", get(onboarding_css))
             .route("/.well-known/bloom/relay-health", get(remote_health))
             .route("/ceremony/{token}", get(ceremony_shell))
             .route("/api/session/exchange", post(exchange_remote_fragment))
@@ -3628,6 +3652,7 @@ impl CeremonyBroker {
             .map_err(signer_error_to_machine)?;
         let disclosures = review_disclosures(
             request,
+            manifest.session_budget.as_ref(),
             manifest.claim_assurance.as_ref(),
             manifest.petal_use_claim.as_ref(),
             manifest.system_use_claim.as_ref(),
@@ -3637,12 +3662,15 @@ impl CeremonyBroker {
         );
         let canonical_plan = canonical_review_plan(
             request,
+            manifest.session_budget.as_ref(),
             &disclosures,
             manifest.petal_use_claim.as_ref(),
             manifest.system_use_claim.as_ref(),
             manifest.evm_review.as_ref(),
             manifest.safe_review.as_ref(),
             manifest.message_review.as_ref(),
+            manifest.standing_rearm == Some(true),
+            manifest.package_display_name.as_deref(),
         )?;
         if manifest.approval_id != approval_id
             || manifest.approval_digest != approval_digest
@@ -3678,6 +3706,7 @@ impl CeremonyBroker {
             })?;
         let disclosures = review_disclosures(
             request,
+            context.session_budget.as_ref(),
             context.claim_assurance.as_ref(),
             context.petal_use_claim.as_ref(),
             context.system_use_claim.as_ref(),
@@ -3687,14 +3716,20 @@ impl CeremonyBroker {
         );
         let canonical_plan = canonical_review_plan(
             request,
+            context.session_budget.as_ref(),
             &disclosures,
             context.petal_use_claim.as_ref(),
             context.system_use_claim.as_ref(),
             context.evm_review.as_ref(),
             context.safe_review.as_ref(),
             context.message_review.as_ref(),
+            context.standing_rearm,
+            context.package_display_name.as_deref(),
         )?;
         let mut manifest = ReviewManifest {
+            package_display_name: context.package_display_name,
+            standing_rearm: context.standing_rearm.then_some(true),
+            session_budget: context.session_budget.clone(),
             schema: Token::new("bloom.review-manifest.v1")?,
             approval_id: request
                 .terms
@@ -3919,6 +3954,40 @@ async fn shell(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Resp
     Redirect::to("https://bloom.directory/#").into_response()
 }
 
+async fn onboarding_shell(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    if !broker.serves_local() || broker.validate_served_host(&headers).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let mut response = Html(ONBOARDING_HTML).into_response();
+    response.extensions_mut().insert(PageSecurity::Onboarding);
+    response
+}
+
+async fn onboarding_js(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    if !broker.serves_local() || broker.validate_served_host(&headers).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        ONBOARDING_JS,
+    )
+        .into_response()
+}
+
+async fn onboarding_css(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    if !broker.serves_local() || broker.validate_served_host(&headers).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        ONBOARDING_CSS,
+    )
+        .into_response()
+}
+
 async fn ceremony_resume_shell(
     State(broker): State<CeremonyBroker>,
     headers: HeaderMap,
@@ -4017,6 +4086,7 @@ async fn exchange_remote_fragment(
 async fn ceremony_shell(
     State(broker): State<CeremonyBroker>,
     Path(token): Path<String>,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Response {
     if broker.validate_served_host(&headers).is_err() || !broker.serves_local() {
@@ -4029,7 +4099,15 @@ async fn ceremony_shell(
         broker.record_invalid_browser_token();
         return StatusCode::NOT_FOUND.into_response();
     }
-    Html(SHELL_HTML).into_response()
+    let mut response = Html(SHELL_HTML).into_response();
+    // This opt-in changes framing only after the local browser capability has
+    // authenticated. Remote hosted ceremonies and ordinary launches stay DENY.
+    if uri.query() == Some("onboarding=1") {
+        response
+            .extensions_mut()
+            .insert(PageSecurity::EmbeddedLocalCeremony);
+    }
+    response
 }
 
 #[cfg(feature = "triad-dev-harness")]
@@ -5076,6 +5154,7 @@ fn normalize_http2_authority(request: &mut Request<Body>) -> Result<(), ()> {
 }
 
 fn apply_security_headers(response: &mut Response) {
+    let page_security = response.extensions().get::<PageSecurity>().copied();
     let headers = response.headers_mut();
     // This marker is diagnostic only. It lets a Machine whose authenticated
     // Unix edge is unavailable report that a Bloom-shaped listener appears to
@@ -5097,6 +5176,23 @@ fn apply_security_headers(response: &mut Response) {
         HeaderName::from_static("x-frame-options"),
         HeaderValue::from_static("DENY"),
     );
+    match page_security {
+        Some(PageSecurity::Onboarding) => {
+            headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(
+                "default-src 'none'; script-src 'self'; connect-src 'self' http://127.0.0.1:*; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-src 'self'; frame-ancestors 'none'",
+            ));
+        }
+        Some(PageSecurity::EmbeddedLocalCeremony) => {
+            headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(
+                "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'",
+            ));
+            headers.insert(
+                HeaderName::from_static("x-frame-options"),
+                HeaderValue::from_static("SAMEORIGIN"),
+            );
+        }
+        None => {}
+    }
     headers.insert(
         HeaderName::from_static("referrer-policy"),
         HeaderValue::from_static("no-referrer"),
@@ -5385,14 +5481,18 @@ pub(crate) fn format_base_units(base_units: &str, decimals: usize) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn canonical_review_plan(
     request: &CeremonyPrepareRequest,
+    session_budget: Option<&bloom_broker_api::SessionBudget>,
     security_disclosures: &[String],
     claim: Option<&PetalUseClaim>,
     system_claim: Option<&SystemUseClaim>,
     evm_review: Option<&crate::evm_review::EvmReview>,
     safe_review: Option<&crate::safe_review::SafeReview>,
     message_review: Option<&crate::message_review::MessageReview>,
+    standing_rearm: bool,
+    package_display_name: Option<&str>,
 ) -> Result<String, ProtocolError> {
     #[derive(Serialize)]
     struct AssetAmountReview {
@@ -5406,9 +5506,15 @@ fn canonical_review_plan(
 
     #[derive(Serialize)]
     struct Plan<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        package_display_name: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        standing_rearm: Option<bool>,
         schema: &'static str,
         asset_amounts: Vec<AssetAmountReview>,
-        terms: &'a bloom_signer_api::SealedApprovalTerms,
+        terms: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_budget_id: Option<Digest32>,
         exact_ordered_payload_digests: &'a [Digest32],
         exact_ordered_hashes: &'a [Digest32],
         replacement_approval_id: &'a Option<Digest32>,
@@ -5520,9 +5626,50 @@ fn canonical_review_plan(
     }
 
     serde_jcs::to_string(&Plan {
+        package_display_name,
+        standing_rearm: standing_rearm.then_some(true),
         schema: "bloom-review-plan/v1",
         asset_amounts,
-        terms: &request.terms,
+        terms: {
+            let mut terms = serde_json::to_value(&request.terms).map_err(malformed)?;
+            if let Some(budget) = session_budget {
+                terms["session_budget"] = serde_json::to_value(budget).map_err(malformed)?;
+                if matches!(
+                    request.terms.selector,
+                    bloom_signer_api::ApprovalSelector::System { .. }
+                ) {
+                    let policy = budget.token_policy.as_ref().ok_or_else(|| {
+                        protocol(
+                            ProtocolErrorCode::SelectorMismatch,
+                            "System review requires token member templates",
+                        )
+                    })?;
+                    let template = policy
+                        .member_templates
+                        .iter()
+                        .find(|template| {
+                            let mut projected = (*template).clone();
+                            projected.session_budget = Some(budget.clone());
+                            projected
+                                .signer_request_nonce()
+                                .is_ok_and(|nonce| nonce == request.terms.request_nonce)
+                        })
+                        .ok_or_else(|| {
+                            protocol(
+                                ProtocolErrorCode::SelectorMismatch,
+                                "System review cannot locate exact bound member scope",
+                            )
+                        })?;
+                    terms["selector"] =
+                        serde_json::to_value(&template.selector).map_err(malformed)?;
+                }
+            }
+            terms
+        },
+        session_budget_id: session_budget
+            .map(bloom_broker_api::SessionBudget::budget_id)
+            .transpose()
+            .map_err(malformed)?,
         exact_ordered_payload_digests: &request.exact_ordered_payload_digests,
         exact_ordered_hashes: &request.exact_ordered_hashes,
         replacement_approval_id: &request.replacement_approval_id,
@@ -5534,8 +5681,10 @@ fn canonical_review_plan(
     .map_err(malformed)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn review_disclosures(
     request: &CeremonyPrepareRequest,
+    session_budget: Option<&bloom_broker_api::SessionBudget>,
     assurance: Option<&ClaimAssurance>,
     claim: Option<&PetalUseClaim>,
     system_claim: Option<&SystemUseClaim>,
@@ -5544,6 +5693,29 @@ fn review_disclosures(
     message_review: Option<&crate::message_review::MessageReview>,
 ) -> Vec<String> {
     let mut disclosures = Vec::new();
+    if let Some(budget) = session_budget {
+        disclosures.push("Token allowances use exact chain and token identities. Each token has an independent rolling limit; capacity returns as spending ages out. Incoming funds do not replenish it. Unlisted assets and continuing approvals/delegations require separate owner approval.".into());
+        disclosures.push("Generic spending is declared by the named Petal and Machine, not independently established from signed bytes. Signer does not enforce token economics. Existing venue permissions are separate.".into());
+        for cap in &budget.per_action_value_limits {
+            disclosures.push(format!(
+                "Per action: {} raw units of {} on {}.",
+                cap.maximum.as_str(),
+                cap.asset.asset,
+                cap.asset.chain.as_str()
+            ));
+        }
+        for cap in &budget.limits.value_limits {
+            for window in &cap.rolling_windows {
+                disclosures.push(format!(
+                    "Rolling allowance: {} raw units of {} on {} per {} milliseconds.",
+                    window.maximum.as_str(),
+                    cap.asset.asset,
+                    cap.asset.chain.as_str(),
+                    window.duration_ms.get()
+                ));
+            }
+        }
+    }
     if evm_review.is_none()
         && safe_review.is_none()
         && message_review.is_none()
@@ -5618,33 +5790,10 @@ fn review_disclosures(
     // Exact EVM and Safe reviews are rebuilt from transaction bytes and do
     // not display Petal-asserted limits. Keep this disclosure for the claim
     // pages where those limits are actually part of the review.
-    if machine_asserted && message_review.is_some() {
-        let bound_payment = message_review
-            .is_some_and(|review| review.payment.is_some() || review.venue_asset.is_some())
-            && claim.is_some_and(|claim| {
-                matches!(
-                    claim.operation_class.as_str(),
-                    "gasless.relay"
-                        | "venice-x402.topup"
-                        | "hyperliquid.usd_send"
-                        | "hyperliquid.withdraw"
-                )
-            });
-        disclosures.push(if bound_payment {
-            "Bloom matched the declared payment debit and approval amount to the signed message. Route quotes, other claims and execution effects remain unverified."
-        } else {
-            "Bloom verified the exact signed message fields. Petal-reported limits and other claims are separate; Bloom has not established them from this signature."
-        }.into());
-    } else if machine_asserted && evm_review.is_none() && safe_review.is_none() {
-        let source = if system_claim.is_some() {
-            "the named system component"
-        } else {
-            "the named Petal"
-        };
-        disclosures.push(format!(
-            "The displayed limits are asserted by {source}. Bloom does not verify them against the payload, and a compromised Petal or Machine can consume the full remaining capacity."
-        ));
+    if machine_asserted && evm_review.is_none() && safe_review.is_none() {
+        disclosures.push("Amounts are reported by the named reviewed Bloom package. Automatic coverage uses its declared effects; Bloom does not independently verify those declarations against the signed bytes.".into());
     }
+
     disclosures
 }
 
@@ -6304,6 +6453,9 @@ mod compatibility_tests {
     #[test]
     fn absent_evm_review_preserves_legacy_manifest_bytes() {
         let manifest = ReviewManifest {
+            package_display_name: None,
+            standing_rearm: None,
+            session_budget: None,
             schema: Token::new("bloom.review-manifest.v1").unwrap(),
             approval_id: Digest32::from_bytes([1; 32]),
             approval_digest: Digest32::from_bytes([2; 32]),

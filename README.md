@@ -366,3 +366,39 @@ Signer and Broker keep independent clocks. An ordinary confirmed reboot allows
 each to recover from a nondecreasing wall clock. If either service rejects a
 rollback, same-boot jump, or unknown-domain jump, that affected service must be
 repaired independently; repairing only one does not clear the other's fault.
+
+
+## Owner-reviewed declared-effects sessions
+
+Automatic Petal coverage trusts the pinned, installer-signed package's explicit
+effects-v1 declaration. Broker validates provenance, exact key and payload
+identity, network/account contexts, positive checked token quantities and
+owner-reviewed per-action and rolling limits. It independently binds generic
+EIP-712 or EIP-191 review artifacts to the actual signing bytes; it does not
+compare the package's economic declaration with those bytes.
+
+Trader and Degen grants may list certified zero-spend classes under an explicitly
+reviewed total rate cap per grant. Those classes are network-unrestricted and
+have no token spending limit; exact account, package, class and payload indexes
+still bind each use. A zero declaration cannot contain any debit or fee.
+Institutional has no automatic grants. Missing declarations, uncovered assets
+and exhausted token/rate limits need exact review. Invalid provenance, malformed
+claims and mismatched review bytes are rejected.
+
+Every automatic action binds one signing payload. One zero-spend use therefore
+cannot authorize a batch of signatures under one rate slot. The zero-use marker
+is part of the authenticated session record, and its rate check shares the same
+SQLite transaction as the existing token reservation. Retries deduplicate and
+rearm preserves usage. Separate token budgets are additive; member approvals
+within one budget share token usage and retain separate zero-spend rate caps.
+Cancelling signed orders does not refund usage; windows do not bound open orders.
+
+Native wallet transfers retain independent standard EVM, ERC20 and SOL byte
+checks. The north selector is `native_session`; the old draft wire name is not
+accepted. Machine–Broker uses protocol 1.11; the pinned Signer edge remains 1.8.
+The complete budget, including persona/rate terms, stays in Broker and commits
+through the existing Signer request nonce. Signer receives no economics.
+
+See [recurring allowances](docs/generic-sessions.md) for accounting and trust
+semantics. The [source guard](scripts/test-no-petal-logic.py) freezes the reviewed
+master's pre-existing exact-review references; its allowlist can only shrink.

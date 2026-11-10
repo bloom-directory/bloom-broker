@@ -500,69 +500,6 @@ fn usdc_base_units(value: &str) -> Result<String, ProtocolError> {
         .ok_or_else(|| invalid("HyperCore amount is too large"))
 }
 
-pub(super) fn validate_payment(
-    request: &bloom_broker_api::ApprovalPrepareRequest,
-    review: &MessageReview,
-    class: &str,
-) -> Result<(), ProtocolError> {
-    if !matches!(class, "hyperliquid.usd_send" | "hyperliquid.withdraw") {
-        return Ok(());
-    }
-    let value = |name: &str| {
-        review
-            .fields
-            .iter()
-            .find(|field| field.path == name)
-            .map(|field| field.value.as_str())
-            .ok_or_else(|| invalid("HyperCore payment field is missing"))
-    };
-    let amount = usdc_base_units(value("USDC amount (HyperCore venue units)")?)?;
-    let recipient = value("destination")?
-        .parse::<Address>()
-        .map_err(|_| invalid("invalid HyperCore payment destination"))?;
-    let claim = request
-        .petal_use_claim
-        .as_ref()
-        .ok_or_else(|| invalid("HyperCore payment claim is missing"))?;
-    let [debit] = claim.declared_debits.as_slice() else {
-        return Err(invalid(
-            "HyperCore payment must declare its exact USDC debit",
-        ));
-    };
-    if debit.asset.chain.as_str() != "hyperliquid"
-        || debit.asset.asset != "usdc"
-        || debit.amount.as_str() != amount
-        || !request
-            .terms
-            .limits
-            .value_limits
-            .iter()
-            .any(|limit| limit.asset == debit.asset && limit.lifetime.as_str() == amount)
-    {
-        return Err(invalid(
-            "HyperCore payment claim or approval differs from the signed debit",
-        ));
-    }
-    let expected_chain = if class == "hyperliquid.withdraw" {
-        "arbitrum"
-    } else {
-        "hyperliquid"
-    };
-    let [destination] = claim.declared_destinations.as_slice() else {
-        return Err(invalid(
-            "HyperCore payment must declare its signed destination",
-        ));
-    };
-    if destination.chain.as_str() != expected_chain
-        || destination.destination.parse::<Address>().ok() != Some(recipient)
-    {
-        return Err(invalid(
-            "HyperCore payment claim differs from the signed destination",
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

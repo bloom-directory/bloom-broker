@@ -235,7 +235,7 @@ pub(crate) fn prepare(
         fields,
         payment: None,
         venue_asset: None,
-        collateral_asset: None,
+
         warnings,
     })
 }

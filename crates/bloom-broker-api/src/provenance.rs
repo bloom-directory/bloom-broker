@@ -37,6 +37,8 @@ pub enum ProvenanceSubject {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_display_name: Option<String>,
     pub subject: ProvenanceSubject,
     pub publisher: Token,
     /// Installer-verified publisher/controller assertion that this package is
@@ -62,6 +64,10 @@ pub struct PetalLineageMembership {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceOperationClass {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub zero_spend: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub economic_effects_schema: Option<u16>,
     pub operation_class: Token,
     pub fee_asset: Option<ProvenanceFeeAsset>,
 }
@@ -121,7 +127,13 @@ impl ProvenanceCatalog {
             // still rejects an empty class list.
             let lineage_only = matches!(record.subject, ProvenanceSubject::Petal { .. })
                 && record.petal_lineage.is_some();
-            if !subjects.insert(subject)
+            if record.package_display_name.as_ref().is_some_and(|name| {
+                name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control)
+            }) || record
+                .operation_classes
+                .iter()
+                .any(|entry| entry.zero_spend && entry.economic_effects_schema != Some(1))
+                || !subjects.insert(subject)
                 || (record.operation_classes.is_empty() && !lineage_only)
                 || record
                     .operation_classes
@@ -182,16 +194,23 @@ impl ProvenanceCatalog {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn record(subject: ProvenanceSubject) -> ProvenanceRecord {
         ProvenanceRecord {
+            package_display_name: None,
             subject,
             publisher: Token::new("bloom-installer").unwrap(),
             petal_lineage: None,
             operation_classes: vec![ProvenanceOperationClass {
+                zero_spend: false,
+                economic_effects_schema: None,
                 operation_class: Token::new("transaction.confirm").unwrap(),
                 fee_asset: None,
             }],

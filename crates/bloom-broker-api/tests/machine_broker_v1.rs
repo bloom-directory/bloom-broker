@@ -56,6 +56,7 @@ fn approval_terms() -> SealedApprovalTerms {
         not_before_ms: DecimalU64::new(10),
         expires_at_ms: DecimalU64::new(20),
         renewal_of: None,
+        session_budget: None,
     }
 }
 
@@ -205,6 +206,7 @@ fn signing_result() -> SigningResult {
 
 fn machine_sign() -> MachineSignRequest {
     MachineSignRequest {
+        session_use: None,
         operation_id: operation(30),
         operation_digest: digest(31),
         approval_id: digest(35),
@@ -267,7 +269,12 @@ fn machine_requests() -> Vec<MachineBrokerRequest> {
         operation_id: operation(30),
     };
     vec![
-        MachineBrokerRequest::SystemHello(hello()),
+        MachineBrokerRequest::SessionStop(SessionStopRequest {
+            budget_id: digest(76),
+            operation_id: operation(77),
+            reason: "owner stopped".into(),
+        }),
+        MachineBrokerRequest::SystemHello(historical_hello()),
         MachineBrokerRequest::BrokerReadiness(Empty {}),
         MachineBrokerRequest::BrokerCapabilities(Empty {}),
         MachineBrokerRequest::CeremonySurfaceStatus(Empty {}),
@@ -476,9 +483,14 @@ fn machine_responses() -> Vec<MachineBrokerResponse> {
         signer_contribution_digest: digest(55),
     };
     vec![
-        MachineBrokerResponse::SystemHello(hello()),
+        MachineBrokerResponse::SessionStop(SessionStopResponse {
+            budget_id: digest(76),
+            revoked: vec![],
+            pending: vec![],
+        }),
+        MachineBrokerResponse::SystemHello(historical_hello()),
         MachineBrokerResponse::BrokerReadiness(readiness()),
-        MachineBrokerResponse::BrokerCapabilities(capabilities()),
+        MachineBrokerResponse::BrokerCapabilities(historical_capabilities()),
         MachineBrokerResponse::CeremonySurfaceStatus(CeremonyExposureStatus {
             desired_mode: CeremonyExposureMode::LocalhostOnly,
             desired_revision: DecimalU64::new(1),
@@ -508,6 +520,7 @@ fn machine_responses() -> Vec<MachineBrokerResponse> {
             committed_signatures: DecimalU64::new(0),
             reserved_signatures: DecimalU64::new(0),
             quarantined_signatures: DecimalU64::new(0),
+            session_budget_state: None,
         }),
         MachineBrokerResponse::SealedApprovalRevoke(approval_status()),
         MachineBrokerResponse::SealedApprovalRevokeForKey(vec![approval_status()]),
@@ -582,19 +595,21 @@ where
 
 #[test]
 fn every_machine_broker_variant_matches_frozen_v1_frames() {
-    // The signing release's 1.8 fixture combines the remote-ceremony methods and
+    // The generic session release's 1.10 fixture includes token allowances and scope stop.
+    // Existing optional session fields are omitted from these baseline frames.
+    // The signing fixture combines the remote-ceremony methods and
     // surface selection with native and Safe review fields. Empty review
     // vectors remain omitted from pre-existing approval request frames.
-    assert_eq!(MachineBrokerMethod::ALL.len(), 45);
+    assert_eq!(MachineBrokerMethod::ALL.len(), 46);
     assert_wire_digest(
         "machine requests",
         machine_requests(),
-        "1749dae9a684ec9a1be412c4a94d584485cc1f0fb28a468afb3f1dcf405e62a4",
+        "15e1760f60f13ebe007d3d329f2247cf25ab0da9698c9acdaf864501dba5ff51",
     );
     assert_wire_digest(
         "machine responses",
         machine_responses(),
-        "32bd9b02398991399b065111e6cacfa8c98667f5454babca2873dab05d314276",
+        "683efeec9c8ccd03a3e03575438ce378f5ebfec930c5579db1055f40992468e6",
     );
 }
 
@@ -655,4 +670,18 @@ fn capabilities_advertise_only_the_broker_owned_api_range() {
     assert_eq!(advertised.protocol_minor_max, BROKER_API_RANGE.minor_max);
     assert_eq!(advertised.protocol_major, BROKER_API_CURRENT.major);
     assert_eq!(advertised.protocol_minor_max, BROKER_API_CURRENT.minor);
+}
+
+// Freeze the historical vectors separately from current strict negotiation.
+// Optional session fields must remain omitted to preserve old signed bytes.
+fn historical_hello() -> HelloChallenge {
+    let mut hello = hello();
+    hello.protocol.minor = 7;
+    hello
+}
+fn historical_capabilities() -> ServiceCapabilities {
+    let mut capabilities = capabilities();
+    capabilities.protocol_minor_min = 7;
+    capabilities.protocol_minor_max = 7;
+    capabilities
 }

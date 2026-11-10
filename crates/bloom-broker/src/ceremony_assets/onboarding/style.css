@@ -1,0 +1,14 @@
+/* The outer setup context stays visible while Broker loads exact reviews. */
+.setup-summary {padding:20px var(--ceremony-padding);border-top:1px solid var(--ceremony-border);background:var(--ceremony-bg)}
+.setup-summary dl {display:grid;grid-template-columns:150px minmax(0,1fr);gap:8px 20px;margin:0;font-size:14px}
+.setup-summary dt {color:var(--ceremony-muted)}
+.setup-summary dd {margin:0;overflow-wrap:anywhere}
+.setup-summary p {margin:16px 0 0;font-size:14px;line-height:1.6}
+.setup-review {padding:24px var(--ceremony-padding);border-top:1px solid var(--ceremony-border)}
+.setup-review h2 {font-size:22px;margin:8px 0}
+.setup-review>p {line-height:1.6;max-width:65ch}
+.setup-progress {font-size:13px;font-weight:600;color:var(--ceremony-accent)}
+#review-loading {padding:28px 0;color:var(--ceremony-muted)}
+#ceremony-frame {display:block;width:100%;min-height:420px;border:0;margin-top:20px}
+#ceremony-frame[hidden] {display:none}
+@media(max-width:600px){.setup-summary dl{grid-template-columns:1fr;gap:4px}.setup-summary dd{margin-bottom:8px}}

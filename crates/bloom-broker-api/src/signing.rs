@@ -18,6 +18,8 @@ pub struct MachineSignRequest {
     pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance_evidence: Option<Base64UrlBytes>,
     pub provenance: ProvenanceSubject,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_use: Option<crate::SystemSessionUse>,
 }
 
 /// This is intentionally distinct from the Broker's wire-level
