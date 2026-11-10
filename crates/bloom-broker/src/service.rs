@@ -142,10 +142,22 @@ impl BrokerRpcService {
         &self,
         request: bloom_broker_api::CustodyPrepareRequest,
     ) -> Result<bloom_signer_api::CustodyPrepareRequest, ProtocolError> {
-        let surface = self
-            .ceremony
-            .select_surface(request.surface_selection)?
-            .reference();
+        use bloom_broker_api::CeremonyKind::{WalletImport, WalletRecovery, WalletRegistration};
+        // Every other custody kind is approved by one of the wallet's passkeys.
+        let surface = match &request.wallet_id {
+            Some(wallet_id)
+                if request.legacy_passkey_migration.is_none()
+                    && !matches!(
+                        request.ceremony_kind,
+                        WalletRegistration | WalletImport | WalletRecovery
+                    ) =>
+            {
+                self.ceremony
+                    .select_wallet_surface(request.surface_selection, wallet_id)?
+            }
+            _ => self.ceremony.select_surface(request.surface_selection)?,
+        }
+        .reference();
         Ok(translate_custody::prepare_to_signer(request, surface))
     }
 
@@ -829,6 +841,22 @@ impl BrokerRpcService {
                         "This message operation requires a review envelope; upgrade Bloom Machine and the Petal",
                     ));
                 }
+                if crate::message_review::is_system_x402(&request.terms.subject)
+                    && request.message_review_payloads.is_empty()
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "Machine x402 payment approval requires its payment review envelope; upgrade Bloom Machine",
+                    ));
+                }
+                if crate::message_review::is_system_mpp(&request.terms.subject)
+                    && request.message_review_payloads.is_empty()
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "Machine MPP payment approval requires its payment review envelope; upgrade Bloom Machine",
+                    ));
+                }
                 if safe_petal && request.safe_review_payloads.is_empty() {
                     return Err(ProtocolError::new(
                         ProtocolErrorCode::SelectorMismatch,
@@ -998,7 +1026,7 @@ impl BrokerRpcService {
         let ceremony_request = bloom_signer_api::CeremonyPrepareRequest {
             surface: self
                 .ceremony
-                .select_surface(request.surface_selection)?
+                .select_wallet_surface(request.surface_selection, &request.terms.wallet_id)?
                 .reference(),
             activation_operation_id: request.operation_id.clone(),
             terms: translate_approval::validated_terms_to_signer(request.terms.clone()),
@@ -1044,7 +1072,7 @@ impl BrokerRpcService {
         {
             let _ = self
                 .ceremony
-                .cancel(&request.operation_id, self.clock.now_ms(false)?);
+                .roll_back(&request.operation_id, self.clock.now_ms(false)?);
             return Err(error);
         }
         Ok(response)
@@ -1100,11 +1128,11 @@ impl BrokerRpcService {
         if matches!(
             status.state,
             ApprovalLifecycleState::Prepared | ApprovalLifecycleState::AwaitingCeremony
-        ) && self
+        ) && let Some(ending) = self
             .ceremony
-            .approval_ceremony_unreachable(&status.approval_id)
+            .unreachable_approval_ending(&status.approval_id)
         {
-            status.state = ApprovalLifecycleState::Expired;
+            status.state = ending;
         }
         Ok(())
     }
@@ -1171,7 +1199,10 @@ impl BrokerRpcService {
                 custody: bloom_signer_api::CustodyPrepareRequest {
                     surface: self
                         .ceremony
-                        .select_surface(bloom_broker_api::CeremonySurfaceSelection::Default)?
+                        .select_wallet_surface(
+                            bloom_broker_api::CeremonySurfaceSelection::Default,
+                            &request.wallet_id,
+                        )?
                         .reference(),
                     ceremony_kind: bloom_signer_api::CeremonyKind::PolicyUpdate,
                     custody_operation_id: request.operation_id.clone(),
@@ -2649,7 +2680,9 @@ fn jcs_digest(value: &impl serde::Serialize) -> Result<Digest32, ProtocolError> 
 fn authority_error(error: AuthorityError) -> ProtocolError {
     let (error_kind, denial_code, reason) = match &error {
         AuthorityError::Journal(_) => ("journal", "", ""),
-        AuthorityError::Storage(_) => ("storage", "", ""),
+        AuthorityError::Storage(_) | AuthorityError::UnsupportedStoreVersion(_) => {
+            ("storage", "", "")
+        }
         AuthorityError::Denied { code, message } => ("denied", *code, message.as_str()),
     };
     // Several denial codes reach the Machine as CLAIM_INVALID, so the code
@@ -2665,6 +2698,9 @@ fn authority_error(error: AuthorityError) -> ProtocolError {
         AuthorityError::Journal(error) => journal_error(error),
         AuthorityError::Storage(message) => {
             ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, message)
+        }
+        AuthorityError::UnsupportedStoreVersion(error) => {
+            ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, error.to_string())
         }
         AuthorityError::Denied { code, message } => {
             let protocol_code = match code {

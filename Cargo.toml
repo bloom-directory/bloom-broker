@@ -16,9 +16,9 @@ rust-version = "1.85"
 license = "MIT"
 
 [workspace.dependencies]
-bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "bc88ad690757165ebf1978410ea5c7ec652215d3" }
-bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "bc88ad690757165ebf1978410ea5c7ec652215d3" }
+bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "48b83c54c1787b4aff2456bd3adbe18856902e45" }
+bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "c157444af1b118a2d03f1ac5ce7a04933669c084" }
+bloom-signer-vectors = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "c157444af1b118a2d03f1ac5ce7a04933669c084" }
 bloom-solana-verify = { path = "crates/bloom-solana-verify" }
 bloom-solana-clear-signing = { path = "crates/bloom-solana-clear-signing" }
 bloom-relay-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "8464a60bad159d1336e3c2df303d4a5f7114eec2" }
@@ -30,13 +30,14 @@ bloom-evm-clear-signing = { path = "crates/bloom-evm-clear-signing" }
 alloy-dyn-abi = "1.7.3"
 alloy-json-abi = "1.7.3"
 alloy-primitives = "1.7.3"
+bech32 = "0.11"
 bs58 = "0.5"
-bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
-bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
-bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
-bloom-service-observability = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
-bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
-bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
+bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "48b83c54c1787b4aff2456bd3adbe18856902e45" }
+bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "48b83c54c1787b4aff2456bd3adbe18856902e45" }
+bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "48b83c54c1787b4aff2456bd3adbe18856902e45" }
+bloom-service-observability = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "48b83c54c1787b4aff2456bd3adbe18856902e45" }
+bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "48b83c54c1787b4aff2456bd3adbe18856902e45" }
+bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "48b83c54c1787b4aff2456bd3adbe18856902e45" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls"] }
 serde = { version = "1", features = ["derive"] }
@@ -70,3 +71,10 @@ futures-util = "0.3"
 x509-parser = "0.18"
 ureq = { version = "3.4.2", default-features = false, features = ["platform-verifier", "rustls"] }
 url = "2.5"
+
+# Match bloom's workspace: optimise dependencies in dev builds. Unoptimised
+# curve25519-dalek makes ed25519 verification ~90x slower, which turns the
+# startup audit-checkpoint scan into minutes on a long-lived developer root.
+[profile.dev.package."*"]
+debug = false
+opt-level = 1

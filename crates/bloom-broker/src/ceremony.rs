@@ -1,6 +1,6 @@
 use crate::{
     authority::PolicyAuthorityDiff,
-    journal::BrokerJournal,
+    journal::{BrokerJournal, UnsupportedStoreVersion},
     translation::{
         ceremony::{kind_to_machine, state_to_machine},
         error::signer_error_to_machine,
@@ -1252,6 +1252,49 @@ impl CeremonyBroker {
         }
     }
 
+    /// Resolve the surface for a ceremony that one of `wallet_id`'s passkeys
+    /// approves. An explicit selection is honored as is. By default the
+    /// default surface approves when the wallet has an active passkey there,
+    /// otherwise the local one does: a hosted link for a wallet whose
+    /// passkeys are all on localhost offers the browser no credential and
+    /// can never be approved. With neither, the ceremony is refused here
+    /// instead of reaching `AWAITING_USER`.
+    pub fn select_wallet_surface(
+        &self,
+        selection: CeremonySurfaceSelection,
+        wallet_id: &Token,
+    ) -> Result<SurfaceDescriptor, ProtocolError> {
+        if selection != CeremonySurfaceSelection::Default {
+            return self.select_surface(selection);
+        }
+        let credentials = self
+            .inner
+            .signer
+            .credential_list_public(bloom_signer_api::WalletRequest {
+                wallet_id: wallet_id.clone(),
+            })
+            .map_err(signer_error_to_machine)?;
+        let local = self.select_surface(CeremonySurfaceSelection::Local)?;
+        let only_local_passkeys = credentials.iter().all(|credential| {
+            credential.state != bloom_signer_api::CredentialState::Active
+                || credential.surface == local.reference()
+        });
+        match self.select_surface(CeremonySurfaceSelection::Default) {
+            Ok(surface) if has_active_passkey_on(&credentials, &surface) => Ok(surface),
+            // An unusable hosted surface is an outage, not a reason to move a
+            // wallet with hosted passkeys to localhost.
+            Err(error) if !only_local_passkeys => Err(error),
+            _ if has_active_passkey_on(&credentials, &local) => Ok(local),
+            _ => Err(protocol(
+                ProtocolErrorCode::ApprovalNotFound,
+                format!(
+                    "wallet {} has no active passkey on a usable ceremony surface",
+                    wallet_id.as_str()
+                ),
+            )),
+        }
+    }
+
     /// Records whether the relay refuses to renew Broker's scoped credentials.
     /// Returns the previous value, so a caller can report only the change.
     pub fn set_remote_credentials_rejected(&self, rejected: bool) -> bool {
@@ -2365,16 +2408,27 @@ impl CeremonyBroker {
         })
     }
 
-    /// True when every owner ceremony minted for this approval died without
-    /// activating it. No URL exists for the owner and none can appear, so a
-    /// caller waiting on this approval is waiting on nothing.
+    /// How the approval's last owner ceremony ended, when every ceremony
+    /// minted for it died without activating it. No URL exists for the owner
+    /// and none can appear, so a caller waiting on this approval is waiting
+    /// on nothing. A deliberate cancel (the owner's browser or a Machine
+    /// cancel request) is `Cancelled`, so a caller can tell it from a timeout;
+    /// any other ending, including shutdown and rollback, is `Expired`. `None`
+    /// while any ceremony is still live.
     ///
     /// A completed ceremony is deliberately not counted: that approval is on
     /// its way to `Active`, and reporting it dead would strand a signature the
     /// owner already authorised.
-    pub fn approval_ceremony_unreachable(&self, approval_id: &Digest32) -> bool {
-        let mut saw_ceremony = false;
-        for session in self.inner.sessions.lock().values() {
+    pub fn unreachable_approval_ending(
+        &self,
+        approval_id: &Digest32,
+    ) -> Option<bloom_broker_api::ApprovalLifecycleState> {
+        // Ordered by ending time, then creation time, then ceremony ID, so
+        // rows that end in the same millisecond still pick one answer however
+        // the map iterates.
+        let mut last: Option<((u64, u64, &str), CeremonyState)> = None;
+        let sessions = self.inner.sessions.lock();
+        for (ceremony_id, session) in sessions.iter() {
             if session.ceremony_kind != CeremonyKind::SealedApproval {
                 continue;
             }
@@ -2391,11 +2445,21 @@ impl CeremonyBroker {
                 session.state,
                 CeremonyState::Cancelled | CeremonyState::Expired | CeremonyState::Failed
             ) {
-                return false;
+                return None;
             }
-            saw_ceremony = true;
+            let order = (
+                session.terminal_at_ms.unwrap_or(session.created_at_ms),
+                session.created_at_ms,
+                ceremony_id.as_str(),
+            );
+            if last.is_none_or(|(at, _)| order > at) {
+                last = Some((order, session.state));
+            }
         }
-        saw_ceremony
+        last.map(|(_, state)| match state {
+            CeremonyState::Cancelled => bloom_broker_api::ApprovalLifecycleState::Cancelled,
+            _ => bloom_broker_api::ApprovalLifecycleState::Expired,
+        })
     }
 
     pub fn completed_policy_update(
@@ -2435,7 +2499,24 @@ impl CeremonyBroker {
     }
 
     pub fn cancel(&self, operation_id: &OperationId, now_ms: u64) -> Result<(), ProtocolError> {
-        self.cancel_with_backoff(operation_id, now_ms, BackoffClock::Trusted)
+        self.cancel_with_backoff(
+            operation_id,
+            now_ms,
+            BackoffClock::Trusted,
+            CeremonyState::Cancelled,
+        )
+    }
+
+    /// Release a ceremony the Broker itself failed to finish preparing. Like
+    /// `cancel`, but it ends `Failed`: nobody refused, so the approval must
+    /// not read as cancelled.
+    pub fn roll_back(&self, operation_id: &OperationId, now_ms: u64) -> Result<(), ProtocolError> {
+        self.cancel_with_backoff(
+            operation_id,
+            now_ms,
+            BackoffClock::Trusted,
+            CeremonyState::Failed,
+        )
     }
 
     fn cancel_from_browser(
@@ -2443,7 +2524,12 @@ impl CeremonyBroker {
         operation_id: &OperationId,
         now_ms: u64,
     ) -> Result<(), ProtocolError> {
-        self.cancel_with_backoff(operation_id, now_ms, BackoffClock::Monotonic)
+        self.cancel_with_backoff(
+            operation_id,
+            now_ms,
+            BackoffClock::Monotonic,
+            CeremonyState::Cancelled,
+        )
     }
 
     fn cancel_signer_or_already_released(
@@ -2470,6 +2556,7 @@ impl CeremonyBroker {
         operation_id: &OperationId,
         now_ms: u64,
         backoff_clock: BackoffClock,
+        ending: CeremonyState,
     ) -> Result<(), ProtocolError> {
         let _guard = self.inner.creation_admission.lock();
         self.expire_sessions(now_ms)?;
@@ -2505,7 +2592,7 @@ impl CeremonyBroker {
                 ));
             }
             let mut snapshot = session.clone();
-            snapshot.state = CeremonyState::Cancelled;
+            snapshot.state = ending;
             latch_terminal(&mut snapshot, now_ms);
             (session.wallet_id.clone(), snapshot)
         };
@@ -2533,7 +2620,7 @@ impl CeremonyBroker {
             .map(|(id, session)| (id.clone(), session.clone()))
             .collect::<Vec<_>>();
         for (id, mut source) in auxiliary {
-            source.state = CeremonyState::Cancelled;
+            source.state = ending;
             latch_terminal(&mut source, now_ms);
             self.persist_session(&source)?;
             self.inner.sessions.lock().insert(id, source);
@@ -2576,8 +2663,10 @@ impl CeremonyBroker {
                     continue;
                 }
                 let mut snapshot = session.clone();
+                // Nobody refused, so an owner-awaiting ceremony expires
+                // rather than reading as a cancellation.
                 snapshot.state = if state == CeremonyState::AwaitingUser {
-                    CeremonyState::Cancelled
+                    CeremonyState::Expired
                 } else {
                     CeremonyState::Failed
                 };
@@ -4114,8 +4203,38 @@ async fn read_wallet(
         &descriptors,
         &crate::translation::wallet_account::production_chain_targets(),
     ) {
-        Ok(accounts) => Json(accounts).into_response(),
+        Ok(accounts) => match serde_json::to_value(accounts) {
+            Ok(mut value) => {
+                add_address_qr_codes(&mut value);
+                Json(value).into_response()
+            }
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+/// Add an `address_qr` SVG beside each chain address, so the wallet page can
+/// show a scannable deposit code without a script-side encoder.
+fn add_address_qr_codes(accounts: &mut serde_json::Value) {
+    let chains = accounts["accounts"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .filter_map(|account| account["chain_projections"].as_array_mut())
+        .flatten();
+    for chain in chains {
+        let Some(address) = chain["address"].as_str() else {
+            continue;
+        };
+        if let Ok(code) = qrcode::QrCode::new(address.as_bytes()) {
+            let svg = code
+                .render::<qrcode::render::svg::Color>()
+                // The page frames it with a white margin instead.
+                .quiet_zone(false)
+                .build();
+            chain["address_qr"] = serde_json::Value::String(svg);
+        }
     }
 }
 
@@ -5055,16 +5174,21 @@ fn approving_surface(
     destination: &SurfaceDescriptor,
     other: Option<SurfaceDescriptor>,
 ) -> Option<SurfaceDescriptor> {
-    let has_passkey_on = |surface: &SurfaceRef| {
-        credentials.iter().any(|credential| {
-            credential.state == bloom_signer_api::CredentialState::Active
-                && &credential.surface == surface
-        })
-    };
-    if has_passkey_on(&destination.reference()) {
+    if has_active_passkey_on(credentials, destination) {
         return Some(destination.clone());
     }
-    other.filter(|other| has_passkey_on(&other.reference()))
+    other.filter(|other| has_active_passkey_on(credentials, other))
+}
+
+fn has_active_passkey_on(
+    credentials: &[bloom_signer_api::CredentialPublic],
+    surface: &SurfaceDescriptor,
+) -> bool {
+    let surface = surface.reference();
+    credentials.iter().any(|credential| {
+        credential.state == bloom_signer_api::CredentialState::Active
+            && credential.surface == surface
+    })
 }
 
 fn latch_terminal(session: &mut BrowserSession, now_ms: u64) {
@@ -5223,6 +5347,9 @@ pub(crate) fn native_asset_metadata(chain: &str, asset: &str) -> Option<(u8, &'s
         ("evm-56", "native") => Some((18, "BNB")),
         ("evm-43114", "native") => Some((18, "AVAX")),
         ("evm-999", "native") => Some((18, "HYPE")),
+        // Arc's gas token is USDC: 18 decimals natively, 6 only through its
+        // ERC-20 interface. Tempo has no native asset, so it stays unlisted.
+        ("evm-5042", "native") => Some((18, "USDC")),
         _ => None,
     }
 }
@@ -5565,21 +5692,14 @@ fn storage(error: impl std::fmt::Display) -> ProtocolError {
 // See the authority migration: ceremony state formerly lived in a separate
 // SQLite file, which cannot commit atomically with the Broker audit chain.
 // Import it once into the consolidated journal database and retain the source
-// file untouched as a rollback artifact.
+// file untouched as a rollback artifact. The legacy file is only opened when
+// it is there and is never created, so a fresh home grows no empty store and a
+// dangling link, a vanished target or a mistyped directory fails startup.
 fn open_audited_ceremony_store(
     legacy_path: impl AsRef<FsPath>,
     journal: &Arc<BrokerJournal>,
 ) -> Result<Arc<std::sync::Mutex<Connection>>, ProtocolError> {
-    let legacy = Connection::open(legacy_path).map_err(storage)?;
-    legacy
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS ceremony_sessions (
-                ceremony_id TEXT PRIMARY KEY,
-                operation_id TEXT NOT NULL UNIQUE,
-                session_jcs TEXT NOT NULL
-            );",
-        )
-        .map_err(storage)?;
+    let legacy = crate::legacy_store::open(legacy_path.as_ref(), "ceremony").map_err(storage)?;
     let database = journal.shared_connection();
     {
         let mut connection = database.lock().map_err(|_| {
@@ -5598,7 +5718,9 @@ fn open_audited_ceremony_store(
                 );",
             )
             .map_err(storage)?;
-        migrate_legacy_ceremonies(&mut connection, &legacy, journal)?;
+        if let Some(legacy) = &legacy {
+            migrate_legacy_ceremonies(&mut connection, legacy, journal)?;
+        }
         let transaction = connection.transaction().map_err(storage)?;
         if migrate_pairing_session_index(&transaction)? {
             journal
@@ -5674,13 +5796,33 @@ fn migrate_pairing_session_index(
 /// are decoded by the normal legacy session migration path before this gate
 /// advances the marker.
 fn guard_ceremony_storage_version(connection: &Connection) -> Result<(), ProtocolError> {
-    let version: i64 = connection
+    let found: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(storage)?;
-    if !(0..=CEREMONY_STORAGE_VERSION).contains(&version) {
-        return Err(storage("unsupported ceremony storage version"));
+    supported_ceremony_storage_version(found).map_err(storage)
+}
+
+/// Startup check of the same gate with a typed refusal, so the Broker can log
+/// why it will not open a journal a newer Broker wrote.
+pub fn require_supported_ceremony_storage(
+    journal: &BrokerJournal,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let found: i64 = journal
+        .shared_connection()
+        .lock()
+        .map_err(|_| "ceremony database mutex poisoned")?
+        .pragma_query_value(None, "user_version", |row| row.get(0))?;
+    Ok(supported_ceremony_storage_version(found)?)
+}
+
+fn supported_ceremony_storage_version(found: i64) -> Result<(), UnsupportedStoreVersion> {
+    if (0..=CEREMONY_STORAGE_VERSION).contains(&found) {
+        return Ok(());
     }
-    Ok(())
+    Err(UnsupportedStoreVersion::CeremonyStorage {
+        found,
+        supported: CEREMONY_STORAGE_VERSION,
+    })
 }
 
 fn migrate_legacy_ceremonies(
@@ -5688,6 +5830,11 @@ fn migrate_legacy_ceremonies(
     legacy: &Connection,
     journal: &BrokerJournal,
 ) -> Result<(), ProtocolError> {
+    // The legacy file is opened as it is and is no longer given the table,
+    // so one without it, such as an empty file, has nothing to migrate.
+    if !crate::legacy_store::has_table(legacy, "ceremony_sessions").map_err(storage)? {
+        return Ok(());
+    }
     let legacy_path: String = legacy
         .query_row(
             "SELECT file FROM pragma_database_list WHERE name='main'",
@@ -5732,8 +5879,7 @@ fn migrate_legacy_ceremonies(
     if migrated {
         return Ok(());
     }
-    target
-        .execute("ATTACH DATABASE ?1 AS ceremony_legacy", [&legacy_path])
+    crate::legacy_store::attach(target, &legacy_path, "ceremony_legacy", "ceremony")
         .map_err(storage)?;
     journal.verify_migration_target(target).map_err(storage)?;
     let migration = (|| -> Result<(), ProtocolError> {
@@ -6058,6 +6204,52 @@ mod remote_storage_tests {
         transaction.commit().unwrap();
     }
 
+    /// A fresh install creates `ceremony_sessions` without the old UNIQUE
+    /// constraint on `operation_id`, so it takes the branch that only adds
+    /// the partial index, never the rebuild above. On every fresh install
+    /// that index is all that keeps one primary session per operation.
+    #[test]
+    fn a_fresh_ceremony_table_still_allows_one_primary_session_per_operation() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ceremony_sessions (
+                    ceremony_id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL,
+                    session_jcs TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(
+            !migrate_pairing_session_index(&transaction).unwrap(),
+            "a fresh table has nothing to rebuild"
+        );
+        transaction.commit().unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO ceremony_sessions VALUES ('destination', 'operation', '{}')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO ceremony_sessions VALUES ('source', 'operation', ?1)",
+                [r#"{"auxiliary":true}"#],
+            )
+            .expect("an auxiliary session may share the primary's operation");
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO ceremony_sessions VALUES ('duplicate', 'operation', '{}')",
+                    [],
+                )
+                .is_err(),
+            "a second primary session for one operation must be refused"
+        );
+    }
+
     #[test]
     fn precommit_cookie_expires_even_while_browser_cookie_remains_present() {
         let auth = RemoteBrowserAuth {
@@ -6225,5 +6417,69 @@ mod origin_tests {
     fn matching_origin_passes() {
         check_origin(Some("http://localhost:28736"), "http://localhost:28736")
             .expect("exact origin match must pass");
+    }
+}
+
+#[cfg(test)]
+mod legacy_attach_tests {
+    use super::*;
+    use crate::legacy_store::TestAuditSigner;
+
+    /// The startup probe opens the legacy store without the create flag, but
+    /// the migration attaches it afresh on the journal connection, which does
+    /// create. A store that disappears between the two would come back as an
+    /// empty file, and every later start would read that file as a home with
+    /// nothing to migrate.
+    #[test]
+    fn a_legacy_ceremony_store_that_vanishes_before_the_attach_is_not_recreated() {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy_path = directory.path().join("ceremonies.sqlite");
+        let legacy = Connection::open(&legacy_path).unwrap();
+        // One row, so the migration has something to carry and reaches the
+        // attach.
+        legacy
+            .execute_batch(
+                "CREATE TABLE ceremony_sessions (
+                    ceremony_id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL UNIQUE,
+                    session_jcs TEXT NOT NULL
+                );
+                INSERT INTO ceremony_sessions VALUES ('ceremony', 'operation', '{}');",
+            )
+            .unwrap();
+        // The open connection keeps the file; only its directory entry goes,
+        // which is what the migration sees when the store vanishes after the
+        // probe.
+        std::fs::remove_file(&legacy_path).unwrap();
+
+        let journal = BrokerJournal::open(
+            directory.path().join("journal.sqlite"),
+            Arc::new(TestAuditSigner),
+        )
+        .unwrap();
+        let connection = journal.shared_connection();
+        let mut target = connection.lock().unwrap();
+        target
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS ceremony_sessions (
+                    ceremony_id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL,
+                    session_jcs TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+
+        let error = migrate_legacy_ceremonies(&mut target, &legacy, &journal)
+            .expect_err("a legacy store that is gone cannot be migrated");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot attach the legacy ceremony store"),
+            "the error must say which store could not be attached: {error}"
+        );
+        assert!(
+            !legacy_path.exists(),
+            "the attach must not recreate a vanished legacy store"
+        );
     }
 }

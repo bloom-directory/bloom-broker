@@ -247,6 +247,11 @@ impl Harness {
         let ceremony_key = SigningKey::from_bytes(&[3; 32]);
         let revocation_key = SigningKey::from_bytes(&[4; 32]);
         let wallet = token("wallet-1");
+        // Authority state lives in the journal, so a home is new exactly when
+        // its journal does not exist yet. The legacy `authority.sqlite` is
+        // only a migration source and is never created, so it cannot say.
+        let first_open =
+            directory.is_none_or(|directory| !directory.join("journal.sqlite").exists());
         let journal = Arc::new(match directory {
             None => BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).expect("journal"),
             Some(directory) => {
@@ -260,42 +265,32 @@ impl Harness {
             (token("policy-key"), policy_key.verifying_key()),
         );
         let registry = AssuranceRegistry::compiled(verifiers).unwrap();
-        let (authority, first_open) = match directory {
-            None => (
-                BrokerAuthority::open_in_memory(
-                    journal.clone(),
-                    policy_keys,
-                    token("installer-key"),
-                    installer_key.verifying_key(),
-                    token("ceremony-key"),
-                    ceremony_key.verifying_key(),
-                    token("revocation-key"),
-                    revocation_key.verifying_key(),
-                    registry,
-                )
-                .unwrap(),
-                true,
-            ),
-            Some(directory) => {
-                let path = directory.join("authority.sqlite");
-                let first_open = !path.exists();
-                (
-                    BrokerAuthority::open(
-                        &path,
-                        journal.clone(),
-                        policy_keys,
-                        token("installer-key"),
-                        installer_key.verifying_key(),
-                        token("ceremony-key"),
-                        ceremony_key.verifying_key(),
-                        token("revocation-key"),
-                        revocation_key.verifying_key(),
-                        registry,
-                    )
-                    .unwrap(),
-                    first_open,
-                )
-            }
+        let authority = match directory {
+            None => BrokerAuthority::open_in_memory(
+                journal.clone(),
+                policy_keys,
+                token("installer-key"),
+                installer_key.verifying_key(),
+                token("ceremony-key"),
+                ceremony_key.verifying_key(),
+                token("revocation-key"),
+                revocation_key.verifying_key(),
+                registry,
+            )
+            .unwrap(),
+            Some(directory) => BrokerAuthority::open(
+                directory.join("authority.sqlite"),
+                journal.clone(),
+                policy_keys,
+                token("installer-key"),
+                installer_key.verifying_key(),
+                token("ceremony-key"),
+                ceremony_key.verifying_key(),
+                token("revocation-key"),
+                revocation_key.verifying_key(),
+                registry,
+            )
+            .unwrap(),
         };
         let harness = Self {
             authority,
@@ -562,6 +557,330 @@ fn ac18_forced_authority_audit_write_failure_rolls_back_quota_effect() {
             .is_err(),
         "the failed audited mutation must not have consumed quota"
     );
+}
+
+/// Authority state lives in the journal; the legacy store exists only as a
+/// migration source. Creating an empty one puts a plausible-looking but always
+/// empty database exactly where someone debugging authority state looks first.
+#[test]
+fn a_home_with_nothing_to_migrate_grows_no_legacy_authority_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("journal.sqlite");
+    let legacy_path = directory.path().join("authority.sqlite");
+
+    let journal =
+        Arc::new(BrokerJournal::open(&journal_path, Arc::new(TestAuditSigner)).expect("journal"));
+    let authority = BrokerAuthority::open(
+        &legacy_path,
+        journal,
+        BTreeMap::new(),
+        token("installer-key"),
+        SigningKey::from_bytes(&[2; 32]).verifying_key(),
+        token("ceremony-key"),
+        SigningKey::from_bytes(&[3; 32]).verifying_key(),
+        token("revocation-key"),
+        SigningKey::from_bytes(&[4; 32]).verifying_key(),
+        AssuranceRegistry::compiled(vec![]).unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        !legacy_path.exists(),
+        "opening a fresh home must not create an empty legacy authority store"
+    );
+    drop(authority);
+}
+
+/// Legacy authority files with nothing to migrate open, and are left exactly
+/// as they were, with no migration recorded. Every release before this one
+/// created the file on every start and never wrote to it, so an empty file is
+/// the shape most upgraded homes have; only the `policies` check keeps them
+/// starting. An empty database, or one with other tables only, has nothing to
+/// migrate either.
+#[test]
+fn a_legacy_authority_file_without_policies_is_left_untouched() {
+    let directory = tempfile::tempdir().unwrap();
+    fn older_release(path: &std::path::Path) {
+        std::fs::write(path, b"").unwrap();
+    }
+    fn empty_database(path: &std::path::Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 1;")
+            .unwrap();
+    }
+    fn other_tables(path: &std::path::Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch("CREATE TABLE ceremony_sessions(ceremony_id TEXT PRIMARY KEY);")
+            .unwrap();
+    }
+    let shapes = [
+        (
+            "an older release's empty file",
+            older_release as fn(&std::path::Path),
+        ),
+        ("an empty database", empty_database),
+        ("a file with other tables only", other_tables),
+    ];
+
+    for (index, (shape, write)) in shapes.into_iter().enumerate() {
+        let legacy_path = directory.path().join(format!("authority-{index}.sqlite"));
+        write(&legacy_path);
+        let before = std::fs::read(&legacy_path).unwrap();
+        let journal = Arc::new(
+            BrokerJournal::open(
+                directory.path().join(format!("journal-{index}.sqlite")),
+                Arc::new(TestAuditSigner),
+            )
+            .unwrap(),
+        );
+
+        let authority = BrokerAuthority::open(
+            &legacy_path,
+            journal.clone(),
+            BTreeMap::new(),
+            token("installer-key"),
+            SigningKey::from_bytes(&[2; 32]).verifying_key(),
+            token("ceremony-key"),
+            SigningKey::from_bytes(&[3; 32]).verifying_key(),
+            token("revocation-key"),
+            SigningKey::from_bytes(&[4; 32]).verifying_key(),
+            AssuranceRegistry::compiled(vec![]).unwrap(),
+        )
+        .unwrap_or_else(|error| panic!("{shape} means nothing to migrate: {error}"));
+        drop(authority);
+
+        assert_eq!(
+            std::fs::read(&legacy_path).unwrap(),
+            before,
+            "{shape} must not be written to"
+        );
+        assert!(
+            !journal
+                .audit_entries()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.event_type == "storage.authority_migrated"),
+            "{shape} must not record a migration"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn open_authority_at(
+    legacy_path: &std::path::Path,
+    journal_path: &std::path::Path,
+) -> Result<BrokerAuthority, bloom_broker::authority::AuthorityError> {
+    let journal =
+        Arc::new(BrokerJournal::open(journal_path, Arc::new(TestAuditSigner)).expect("journal"));
+    BrokerAuthority::open(
+        legacy_path,
+        journal,
+        BTreeMap::new(),
+        token("installer-key"),
+        SigningKey::from_bytes(&[2; 32]).verifying_key(),
+        token("ceremony-key"),
+        SigningKey::from_bytes(&[3; 32]).verifying_key(),
+        token("revocation-key"),
+        SigningKey::from_bytes(&[4; 32]).verifying_key(),
+        AssuranceRegistry::compiled(vec![]).unwrap(),
+    )
+}
+
+/// A legacy store reached through a symlink whose target is missing is not
+/// "nothing to migrate": the entry is there, its state is not. Starting
+/// without it would drop the authority state the upgrade was meant to carry
+/// over, so startup fails and no empty store is created at the target.
+///
+/// The target's directory exists, as for a mounted volume whose file is
+/// gone. Inside a missing directory the open could not create the file
+/// anyway, and the last assertion would hold whatever the code did.
+#[cfg(unix)]
+#[test]
+fn a_dangling_legacy_store_symlink_fails_startup_instead_of_skipping_migration() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("journal.sqlite");
+    let legacy_path = directory.path().join("authority.sqlite");
+    let volume = directory.path().join("mounted-volume");
+    std::fs::create_dir(&volume).unwrap();
+    let target = volume.join("authority.sqlite");
+    std::os::unix::fs::symlink(&target, &legacy_path).unwrap();
+
+    let error = open_authority_at(&legacy_path, &journal_path)
+        .err()
+        .expect("a dangling legacy store symlink must fail startup");
+    assert!(
+        error.to_string().contains("authority.sqlite"),
+        "the error must name the legacy store: {error}"
+    );
+    assert!(
+        !target.exists(),
+        "a missing target must not be created by the open"
+    );
+}
+
+/// A missing directory in the configured path is a misconfiguration, not a
+/// home with nothing to migrate: the store the Broker was told to carry over
+/// can never be found there. Startup fails and nothing is created.
+#[cfg(unix)]
+#[test]
+fn a_missing_legacy_store_directory_fails_startup_instead_of_skipping_migration() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("journal.sqlite");
+    let legacy_path = directory
+        .path()
+        .join("no-such-dir")
+        .join("authority.sqlite");
+
+    let error = open_authority_at(&legacy_path, &journal_path)
+        .err()
+        .expect("a legacy store path inside a missing directory must fail startup");
+    assert!(
+        error.to_string().contains("no-such-dir"),
+        "the error must name the missing directory: {error}"
+    );
+    assert!(!legacy_path.parent().unwrap().exists());
+}
+
+/// Only a missing entry means there is nothing to migrate. When the entry
+/// cannot be inspected at all, because a component of the path is a file or
+/// a symlink loop, the Broker cannot tell whether a store is there, and
+/// reading that as "absent" would skip the migration. Startup fails instead.
+#[cfg(unix)]
+#[test]
+fn an_uninspectable_legacy_store_path_fails_startup_instead_of_skipping_migration() {
+    let directory = tempfile::tempdir().unwrap();
+    let plain_file = directory.path().join("plain-file");
+    std::fs::write(&plain_file, b"not a directory").unwrap();
+    let looping = directory.path().join("loop");
+    std::os::unix::fs::symlink(&looping, &looping).unwrap();
+
+    for (index, parent) in [&plain_file, &looping].into_iter().enumerate() {
+        let legacy_path = parent.join("authority.sqlite");
+        let journal_path = directory.path().join(format!("journal-{index}.sqlite"));
+        let error = open_authority_at(&legacy_path, &journal_path)
+            .err()
+            .unwrap_or_else(|| panic!("{} must fail startup", legacy_path.display()));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot tell whether the legacy authority store"),
+            "{error}"
+        );
+    }
+}
+
+/// A directory the Broker may not search hides whether a store is there, so
+/// startup fails rather than reading the store as absent. Root can search any
+/// directory, so the case cannot be set up as root and is skipped there.
+#[cfg(unix)]
+#[test]
+fn a_legacy_store_in_an_unsearchable_directory_fails_startup() {
+    use std::os::unix::fs::PermissionsExt as _;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root can search a mode 000 directory");
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let locked = directory.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = open_authority_at(
+        &locked.join("authority.sqlite"),
+        &directory.path().join("journal.sqlite"),
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let error = result
+        .err()
+        .expect("a legacy store in an unsearchable directory must fail startup");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot tell whether the legacy authority store"),
+        "{error}"
+    );
+}
+
+/// The symlink itself is not the problem: a legacy store that is reachable
+/// through one opens and migrates exactly as a regular file does.
+#[cfg(unix)]
+#[test]
+fn a_legacy_store_reached_through_a_symlink_is_migrated() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("journal.sqlite");
+    let target = directory.path().join("volume").join("authority.sqlite");
+    seed_legacy_store(&target);
+    let legacy_path = directory.path().join("authority.sqlite");
+    std::os::unix::fs::symlink(&target, &legacy_path).unwrap();
+
+    let authority = open_authority_at(&legacy_path, &journal_path)
+        .expect("a legacy store behind a live symlink must open");
+    drop(authority);
+
+    assert_eq!(
+        migrated_quota(&journal_path),
+        "2",
+        "the legacy row must be carried over through the symlink"
+    );
+}
+
+/// The migration attaches the legacy store through a `file:` URI, where `%`,
+/// `?` and `#` are syntax. A store whose path contains them must still be the
+/// one that is attached, as must one whose path has a space, `+` or non-ASCII
+/// text, which a form-style encoder would rewrite.
+#[cfg(unix)]
+#[test]
+fn a_legacy_store_whose_path_contains_uri_syntax_is_migrated() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("journal.sqlite");
+    let legacy_path = directory
+        .path()
+        .join("odd %41?#+é dir")
+        .join("authority.sqlite");
+    seed_legacy_store(&legacy_path);
+
+    let authority = open_authority_at(&legacy_path, &journal_path)
+        .expect("a legacy store at an unusual path must open");
+    drop(authority);
+
+    assert_eq!(migrated_quota(&journal_path), "2");
+}
+
+/// Writes a legacy authority store with the old schema and one row that a
+/// migration has to carry over.
+#[cfg(unix)]
+fn seed_legacy_store(path: &std::path::Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let legacy = rusqlite::Connection::open(path).unwrap();
+    legacy
+        .execute_batch(
+            "CREATE TABLE policies(wallet_id TEXT PRIMARY KEY, version TEXT NOT NULL, digest TEXT NOT NULL, snapshot_jcs TEXT NOT NULL, policy_jcs TEXT NOT NULL);
+             CREATE TABLE wallet_epochs(wallet_id TEXT PRIMARY KEY, epoch TEXT NOT NULL, reconciled INTEGER NOT NULL);
+             CREATE TABLE provenance_catalog(subject_jcs TEXT PRIMARY KEY, record_digest TEXT NOT NULL, record_jcs TEXT NOT NULL);
+             CREATE TABLE mutation_quota(principal TEXT PRIMARY KEY, window_started_ms TEXT NOT NULL, mutations TEXT NOT NULL);
+             CREATE TABLE signer_approval_tombstones(approval_id TEXT PRIMARY KEY, wallet_id TEXT NOT NULL, tombstone_jcs TEXT NOT NULL);
+             CREATE TABLE pending_petal_key_scopes(custody_operation_id TEXT PRIMARY KEY, scope_digest TEXT NOT NULL, scope_jcs TEXT NOT NULL);
+             CREATE TABLE petal_key_scopes(key_ref_jcs TEXT PRIMARY KEY, scope_digest TEXT NOT NULL, scope_jcs TEXT NOT NULL, activated_at_ms TEXT NOT NULL, expires_at_ms TEXT NOT NULL, custody_receipt_digest TEXT NOT NULL);
+             INSERT INTO mutation_quota VALUES ('linked-principal', '100', '2');",
+        )
+        .unwrap();
+}
+
+/// The `linked-principal` row from [`seed_legacy_store`], read back from the
+/// journal it was migrated into.
+#[cfg(unix)]
+fn migrated_quota(journal_path: &std::path::Path) -> String {
+    rusqlite::Connection::open(journal_path)
+        .unwrap()
+        .query_row(
+            "SELECT mutations FROM mutation_quota WHERE principal='linked-principal'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 #[test]
@@ -1854,6 +2173,279 @@ fn native_solana_destination_refusal_names_the_conflicting_policy_chain() {
     assert!(error.contains(&destination.to_string()));
     assert!(error.contains("chain \"localnet\""));
     assert!(error.contains("only matches the declared chain \"solana\""));
+}
+
+/// Letter case means different things on different chains, and the Broker has
+/// to read each chain's own rule rather than compare strings. EIP-55 spells a
+/// checksum in case, so the mixed-case and lowercase forms of one EVM account
+/// are one destination. Base58 spells data in case, so two Solana spellings
+/// are two accounts. A string comparison gets exactly one of these right.
+/// The refusal's "policy carries this destination under chain X" hint has
+/// two arms: identical spelling, and the same account spelled differently.
+/// The existing conflicting-chain test uses identical strings, so the
+/// literal arm short-circuits and the decoded arm could regress to never
+/// firing with everything still green. This pins it, and pins that a policy
+/// listing the entry twice names the chain once.
+#[test]
+fn destination_refusal_hint_fires_across_spellings_and_names_each_chain_once() {
+    const CHECKSUMMED: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    const LOWERCASE: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+
+    let harness = Harness::new();
+    let provenance = harness.provenance();
+    let mut policy: CanonicalWalletPolicy =
+        serde_json::from_slice(&harness.policy_snapshot(1).canonical_policy.decode()).unwrap();
+    // Twice, deliberately: the hint must not repeat the chain.
+    for _ in 0..2 {
+        policy.allowed_destinations.push(PolicyDestination {
+            chain: token("base"),
+            destination: CHECKSUMMED.into(),
+        });
+    }
+    let snapshot = signed_policy_snapshot(&harness, 2, &policy);
+    harness.authority.install_policy(&snapshot).unwrap();
+
+    let mut terms = petal_terms(&harness, &provenance);
+    terms.policy_version = snapshot.version.clone();
+    terms.policy_digest = snapshot.policy_digest.clone();
+    harness.activate(&terms, Some(&provenance));
+
+    // The lowercase spelling, declared under a chain the policy does not
+    // carry it on: refused, and the hint must find the checksummed entry.
+    let mut input = petal_input(
+        &terms,
+        &provenance,
+        operation(95),
+        CryptoSuite::Secp256k1Sha256Recoverable,
+    );
+    input
+        .request
+        .petal_use_claim
+        .as_mut()
+        .unwrap()
+        .declared_destinations = vec![DeclaredDestination {
+        chain: token("optimism"),
+        destination: LOWERCASE.into(),
+    }];
+    bind_operation_digest(&mut input, &terms);
+
+    let error = error_code(harness.authority.authorize(&input).unwrap_err());
+    assert!(error.contains("DESTINATION_NOT_ALLOWED"), "{error}");
+    assert!(
+        error.contains("policy carries this destination under chain \"base\""),
+        "the decoded arm must find the checksummed entry: {error}"
+    );
+    assert!(
+        error.contains("only matches the declared chain \"optimism\""),
+        "{error}"
+    );
+    assert_eq!(
+        error.matches("\"base\"").count(),
+        1,
+        "a duplicated policy entry must name its chain once: {error}"
+    );
+}
+
+#[test]
+fn destination_case_is_read_by_each_chains_own_rule() {
+    const EVM_CHECKSUMMED: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    const EVM_LOWERCASE: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    // Two valid 32-byte Solana addresses that differ only in case.
+    const SOLANA_MIXED: &str = "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8";
+    const SOLANA_LOWERCASE: &str = "cktruq2mttgrgkxjtyksdkhjudc2c4tgdzyb98oezy8";
+
+    let harness = Harness::new();
+    let provenance = harness.provenance();
+    let mut policy: CanonicalWalletPolicy =
+        serde_json::from_slice(&harness.policy_snapshot(1).canonical_policy.decode()).unwrap();
+    policy.allowed_destinations.extend([
+        PolicyDestination {
+            chain: token("ethereum"),
+            destination: EVM_CHECKSUMMED.into(),
+        },
+        // Stored the other way round, so this cannot pass by lowercasing the
+        // claim and comparing against a policy that is lowercase already.
+        PolicyDestination {
+            chain: token("base"),
+            destination: EVM_LOWERCASE.into(),
+        },
+        PolicyDestination {
+            chain: token("solana"),
+            destination: SOLANA_MIXED.into(),
+        },
+    ]);
+    let snapshot = signed_policy_snapshot(&harness, 2, &policy);
+    harness.authority.install_policy(&snapshot).unwrap();
+
+    let mut terms = petal_terms(&harness, &provenance);
+    terms.policy_version = snapshot.version.clone();
+    terms.policy_digest = snapshot.policy_digest.clone();
+    // Four authorizations, so the approval needs headroom in the limits this
+    // test is not about.
+    terms.limits.max_operations = DecimalU64::new(8);
+    terms.limits.max_signatures = DecimalU64::new(8);
+    terms.limits.value_limits = vec![
+        value_limit("ethereum", "token", "1000"),
+        value_limit("ethereum", "eth", "1000"),
+    ];
+    harness.activate(&terms, Some(&provenance));
+
+    let declaring = |operation_id, chain: &str, destination: &str| {
+        let mut input = petal_input(
+            &terms,
+            &provenance,
+            operation_id,
+            CryptoSuite::Secp256k1Sha256Recoverable,
+        );
+        input
+            .request
+            .petal_use_claim
+            .as_mut()
+            .unwrap()
+            .declared_destinations = vec![DeclaredDestination {
+            chain: token(chain),
+            destination: destination.into(),
+        }];
+        bind_operation_digest(&mut input, &terms);
+        input
+    };
+
+    // One EVM account in two spellings, in both storage directions.
+    harness
+        .authority
+        .authorize(&declaring(operation(91), "ethereum", EVM_LOWERCASE))
+        .expect("the lowercase spelling of a checksummed policy entry is the same account");
+    harness
+        .authority
+        .authorize(&declaring(operation(92), "base", EVM_CHECKSUMMED))
+        .expect("and the checksummed spelling of a lowercase policy entry is too");
+
+    // Two Solana accounts that differ only in case stay two accounts.
+    let error = error_code(
+        harness
+            .authority
+            .authorize(&declaring(operation(93), "solana", SOLANA_LOWERCASE))
+            .unwrap_err(),
+    );
+    assert!(error.contains("DESTINATION_NOT_ALLOWED"), "{error}");
+
+    // ...and the spelling the policy does carry is still allowed, so the
+    // refusal above is about the case and not about Solana in general.
+    harness
+        .authority
+        .authorize(&declaring(operation(94), "solana", SOLANA_MIXED))
+        .expect("the exact policy spelling is allowed");
+}
+
+/// A policy entry allows a destination on its own chain only. The comparison
+/// key is `(chain, decoded destination)` for every kind of entry, and the
+/// decoded value carries no chain: the same 20 bytes, the same bech32 string
+/// or the same `petal:` class reduce alike under any chain. Dropping the chain
+/// from the key for any one family would widen every policy entry of that
+/// family to every other chain, so each family is pinned here, each with its
+/// own-chain control. For EVM that matters most: the same 20 bytes on another
+/// chain can be an undeployed address or someone else's contract.
+#[test]
+fn a_destination_allowed_on_one_chain_is_refused_on_another() {
+    const EVM_CHECKSUMMED: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    const EVM_LOWERCASE: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    const COSMOS: &str = "cosmos1w508d6qejxtdg4y5r3zarvary0c5xw7k6ah60c";
+    const PETAL_CLASS: &str = "petal:near-intents";
+    // Undecodable on a chain this build does not know, so compared by its
+    // exact spelling.
+    const LITERAL: &str = "Whatever-This-Is";
+
+    // (entry chain, entry, other chain, declared spellings, family)
+    let cases = [
+        (
+            "base",
+            EVM_CHECKSUMMED,
+            "optimism",
+            &[EVM_CHECKSUMMED, EVM_LOWERCASE][..],
+            "EVM",
+        ),
+        ("cosmos", COSMOS, "osmosis", &[COSMOS][..], "Cosmos"),
+        (
+            "base",
+            PETAL_CLASS,
+            "solana",
+            &[PETAL_CLASS][..],
+            "petal class",
+        ),
+        ("localnet", LITERAL, "devnet", &[LITERAL][..], "literal"),
+    ];
+
+    let harness = Harness::new();
+    let provenance = harness.provenance();
+    let mut policy: CanonicalWalletPolicy =
+        serde_json::from_slice(&harness.policy_snapshot(1).canonical_policy.decode()).unwrap();
+    for (chain, destination, ..) in cases {
+        policy.allowed_destinations.push(PolicyDestination {
+            chain: token(chain),
+            destination: destination.into(),
+        });
+    }
+    let snapshot = signed_policy_snapshot(&harness, 2, &policy);
+    harness.authority.install_policy(&snapshot).unwrap();
+
+    let mut terms = petal_terms(&harness, &provenance);
+    terms.policy_version = snapshot.version.clone();
+    terms.policy_digest = snapshot.policy_digest.clone();
+    terms.limits.max_operations = DecimalU64::new(16);
+    terms.limits.max_signatures = DecimalU64::new(16);
+    terms.limits.value_limits = vec![
+        value_limit("ethereum", "token", "1000"),
+        value_limit("ethereum", "eth", "1000"),
+    ];
+    harness.activate(&terms, Some(&provenance));
+
+    let declaring = |operation_id, chain: &str, destination: &str| {
+        let mut input = petal_input(
+            &terms,
+            &provenance,
+            operation_id,
+            CryptoSuite::Secp256k1Sha256Recoverable,
+        );
+        input
+            .request
+            .petal_use_claim
+            .as_mut()
+            .unwrap()
+            .declared_destinations = vec![DeclaredDestination {
+            chain: token(chain),
+            destination: destination.into(),
+        }];
+        bind_operation_digest(&mut input, &terms);
+        input
+    };
+
+    let mut operation_id = 100;
+    for (chain, _, other_chain, spellings, family) in cases {
+        for spelling in spellings {
+            operation_id += 1;
+            let error = error_code(
+                harness
+                    .authority
+                    .authorize(&declaring(operation(operation_id), other_chain, spelling))
+                    .unwrap_err(),
+            );
+            assert!(
+                error.contains("DESTINATION_NOT_ALLOWED"),
+                "a {family} entry under {chain} must not allow {spelling} under {other_chain}: {error}"
+            );
+        }
+        // The chain the entry names still allows it, so the refusals above
+        // are about the chain and nothing else.
+        operation_id += 1;
+        harness
+            .authority
+            .authorize(&declaring(
+                operation(operation_id),
+                chain,
+                spellings.last().unwrap(),
+            ))
+            .unwrap_or_else(|error| panic!("a {family} entry must allow its own chain: {error:?}"));
+    }
 }
 
 #[test]
