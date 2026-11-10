@@ -1,8 +1,18 @@
 use super::*;
 use crate::legacy_store::TestAuditSigner;
-use bloom_broker_api::{CeremonyKind, DecimalU64};
+use bloom_audit_checkpoint::{AppendOutcome, CheckpointError, CheckpointSink};
+use bloom_broker_api::{BootEpoch, CeremonyKind, DecimalU64, SignedJournalHead};
+use bloom_triad_local_transport::LocalIdentity;
 use ed25519_dalek::{Signer as _, SigningKey};
-use std::{sync::mpsc, thread, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
+};
 
 fn token(value: &str) -> Token {
     Token::new(value).unwrap()
@@ -31,6 +41,47 @@ fn authority(journal: Arc<BrokerJournal>) -> Arc<BrokerAuthority> {
 struct Fixture {
     authority: Arc<BrokerAuthority>,
     journal: Arc<BrokerJournal>,
+}
+
+struct FailingSelfCheckpoint;
+
+impl CheckpointSink for FailingSelfCheckpoint {
+    fn append_peer_head(
+        &self,
+        _peer_head: &SignedJournalHead,
+    ) -> Result<AppendOutcome, CheckpointError> {
+        Err(CheckpointError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "forced self-checkpoint failure",
+        )))
+    }
+}
+
+#[derive(Default)]
+struct FailOnceCheckpoint(AtomicUsize);
+
+impl CheckpointSink for FailOnceCheckpoint {
+    fn append_peer_head(
+        &self,
+        _peer_head: &SignedJournalHead,
+    ) -> Result<AppendOutcome, CheckpointError> {
+        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(CheckpointError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "forced one-shot self-checkpoint failure",
+            )));
+        }
+        Ok(AppendOutcome::Appended)
+    }
+}
+
+fn broker_identity() -> LocalIdentity {
+    LocalIdentity {
+        service_id: token("bloom-broker"),
+        boot_epoch: BootEpoch::from_bytes([0x41; 16]),
+        application_key_id: token("broker-app"),
+        signing_key: Arc::new(SigningKey::from_bytes(&[0x42; 32])),
+    }
 }
 impl Fixture {
     fn open(path: Option<&Path>) -> Self {
@@ -324,5 +375,86 @@ fn cleanup_does_not_mutate_a_degraded_journal() {
             .unwrap()
             .iter()
             .any(|entry| entry.event_type == "wallet.legacy_projection_removed")
+    );
+}
+
+#[test]
+fn exact_preserved_row_registration_marks_a_new_incarnation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("journal.sqlite");
+    let fixture = Fixture::open(Some(&path));
+    fixture.initial(CeremonyKind::WalletRegistration, 1, 1);
+    fixture.delete();
+    fixture.released_late_read(&policy(9, 1), false);
+    drop(fixture);
+
+    let fixture = Fixture::open(Some(&path));
+    fixture.initial(CeremonyKind::WalletImport, 2, 9);
+    fixture.authority.install_policy(&policy(9, 2)).unwrap();
+    drop(fixture);
+
+    let reopened = Fixture::open(Some(&path));
+    assert_eq!(
+        reopened
+            .authority
+            .policy_snapshot(&token("reusable-name"))
+            .unwrap(),
+        policy(9, 2),
+        "authorized import must establish a new incarnation before cleanup"
+    );
+}
+
+#[test]
+fn registration_replay_finishes_effects_after_checkpoint_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("journal.sqlite");
+    let registration = receipt(CeremonyKind::WalletRegistration, 1, Some(policy(1, 1)));
+    let fixture = Fixture::open(Some(&path));
+    fixture
+        .journal
+        .install_self_checkpoint(broker_identity(), Arc::new(FailingSelfCheckpoint))
+        .unwrap();
+    assert!(
+        fixture
+            .authority
+            .adopt_custody_receipt(&registration, 1_000)
+            .is_err()
+    );
+    assert!(
+        fixture
+            .authority
+            .policy_verification_key(&token("reusable-name"))
+            .is_ok(),
+        "the committed row's key is pinned even when checkpointing fails"
+    );
+    assert!(
+        fixture
+            .authority
+            .adopt_custody_receipt(&registration, 1_000)
+            .is_err(),
+        "a degraded journal must not report replay success"
+    );
+    drop(fixture);
+
+    let fixture = Fixture::open(Some(&path));
+    let checkpoint = Arc::new(FailOnceCheckpoint(AtomicUsize::new(1)));
+    fixture
+        .journal
+        .install_self_checkpoint(broker_identity(), checkpoint.clone())
+        .unwrap();
+    fixture
+        .authority
+        .adopt_custody_receipt(&registration, 1_000)
+        .unwrap();
+    assert!(
+        fixture
+            .authority
+            .policy_verification_key(&token("reusable-name"))
+            .is_ok()
+    );
+    assert_eq!(
+        checkpoint.0.load(Ordering::SeqCst),
+        2,
+        "successful replay must retry the durable checkpoint"
     );
 }

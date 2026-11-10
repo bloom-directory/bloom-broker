@@ -700,11 +700,13 @@ impl BrokerAuthority {
         }
         // A repeated completion of an earlier registration/import must not
         // recreate its policy after a later deletion or replace a new incarnation.
+        // It still finishes the post-commit effects an earlier attempt may have
+        // missed, for whatever row is current. A degraded journal refuses.
         if let (Some(operation), Some(receipt)) = (
             &correlation.operation_id,
             &correlation.ceremony_receipt_digest,
         ) {
-            let connection = self.lock()?;
+            let connection = self.lock_for_mutation()?;
             let adopted: bool = connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM audit_chain WHERE event_type = 'policy.installed'
                  AND json_extract(payload_jcs, '$.wallet_id') = ?1
@@ -718,18 +720,48 @@ impl BrokerAuthority {
                 |row| row.get(0),
             )?;
             if adopted {
-                return Ok(());
+                let current = connection
+                    .query_row(
+                        "SELECT snapshot_jcs FROM policies WHERE wallet_id = ?1",
+                        [snapshot.wallet_id.as_str()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|stored| serde_json::from_str::<SignedPolicySnapshot>(&stored))
+                    .transpose()
+                    .map_err(storage)?;
+                drop(connection);
+                return self.finish_initial_policy(current.as_ref());
             }
         }
-        let mut keys = self
+        let mut candidate_keys = self
             .policy_keys
             .lock()
-            .map_err(|_| storage("policy key registry lock poisoned"))?;
-        let mut candidate_keys = keys.clone();
+            .map_err(|_| storage("policy key registry lock poisoned"))?
+            .clone();
         enroll_policy_key_from_snapshot(snapshot, &mut candidate_keys)?;
         let policy = verify_policy_snapshot(snapshot, &candidate_keys)?;
         self.persist_verified_policy(snapshot, &policy, correlation)?;
-        *keys = candidate_keys;
+        self.finish_initial_policy(Some(snapshot))
+    }
+
+    /// Post-commit effects of an initial policy, shared by first execution
+    /// and receipt replay: pin the key of the committed row, then checkpoint.
+    /// Both steps are idempotent. The authorization barrier must be held.
+    fn finish_initial_policy(
+        &self,
+        committed: Option<&SignedPolicySnapshot>,
+    ) -> Result<(), AuthorityError> {
+        if let Some(snapshot) = committed {
+            let mut keys = self
+                .policy_keys
+                .lock()
+                .map_err(|_| storage("policy key registry lock poisoned"))?;
+            let mut candidate_keys = keys.clone();
+            enroll_policy_key_from_snapshot(snapshot, &mut candidate_keys)?;
+            *keys = candidate_keys;
+        }
+        self.journal.checkpoint_committed_head()?;
         Ok(())
     }
 
@@ -751,15 +783,28 @@ impl BrokerAuthority {
                 hook();
             }
         }
-        self.persist_verified_policy(snapshot, &policy, correlation)
+        if self.persist_verified_policy(snapshot, &policy, correlation)? {
+            self.journal.checkpoint_committed_head()?;
+        }
+        Ok(())
     }
 
+    /// Commits the policy row and its `policy.installed` event. Returns false
+    /// when nothing was written. The caller checkpoints after a commit.
     fn persist_verified_policy(
         &self,
         snapshot: &SignedPolicySnapshot,
         policy: &CanonicalWalletPolicy,
         correlation: &PolicyInstallCorrelation,
-    ) -> Result<(), AuthorityError> {
+    ) -> Result<bool, AuthorityError> {
+        // A correlated version-1 install is the durable marker of a new wallet
+        // incarnation, which startup cleanup relies on. Record it even when
+        // the row is already byte-identical (for example a preserved row).
+        let new_incarnation = snapshot.version.get() == 1
+            && correlation.operation_id.is_some()
+            && correlation.ceremony_receipt_digest.is_some()
+            && correlation.validation_receipt_digest.is_none()
+            && correlation.commit_receipt_digest.is_none();
         for required in &policy.required_verifiers {
             // Retain the released verifier pin for inspection/migration.
             // The signing guard refuses it; it never becomes a substitute verifier.
@@ -793,10 +838,12 @@ impl BrokerAuthority {
                     .map_err(storage)
             })
             .transpose()?;
-        if exact.as_ref().is_some_and(|(version, stored)| {
-            *version == snapshot.version.get() && stored == &snapshot_jcs
-        }) {
-            return Ok(());
+        if !new_incarnation
+            && exact.as_ref().is_some_and(|(version, stored)| {
+                *version == snapshot.version.get() && stored == &snapshot_jcs
+            })
+        {
+            return Ok(false);
         }
         drop(connection);
         let mut connection = self.lock_for_mutation()?;
@@ -816,10 +863,11 @@ impl BrokerAuthority {
             })
             .transpose()?;
         if let Some((version, stored)) = existing {
-            if snapshot.version.get() == version && snapshot_jcs == stored {
-                return Ok(());
+            let identical = snapshot.version.get() == version && snapshot_jcs == stored;
+            if identical && !new_incarnation {
+                return Ok(false);
             }
-            if snapshot.version.get() <= version {
+            if !identical && snapshot.version.get() <= version {
                 return Err(denied(
                     "POLICY_ROLLBACK",
                     "policy version must advance monotonically",
@@ -860,9 +908,7 @@ impl BrokerAuthority {
             }),
         )?;
         transaction.commit()?;
-        drop(connection);
-        self.journal.checkpoint_committed_head()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Verifies and adopts a completed Signer custody receipt. The outer
