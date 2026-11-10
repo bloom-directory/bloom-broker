@@ -1379,8 +1379,13 @@ function describePolicy(manifest) {
       facts.push([`${label} · full fingerprint`, p, true]);
     }
   }
-  for (const v of diff.added_required_verifiers || []) rule("Require verifier", v.verifier_id || canonicalJson(v));
-  for (const v of diff.removed_required_verifiers || []) rule("Drop verifier", v.verifier_id || canonicalJson(v));
+  // Policy binds (verifier_id, verifier_digest); the digest names the exact artifact.
+  for (const [label, verifiers] of [["Require verifier", diff.added_required_verifiers], ["Drop verifier", diff.removed_required_verifiers]]) {
+    for (const v of verifiers || []) {
+      rule(label, v.verifier_id || canonicalJson(v), shortDigest(v.verifier_digest));
+      if (v.verifier_digest) facts.push([`${label} · ${v.verifier_id} digest`, v.verifier_digest, true]);
+    }
+  }
   const legacy = diff.removed_legacy_clear_signing;
   if (legacy) {
     rule("Remove legacy catalog trust", `${legacy.catalog_id}: ${legacy.signature_threshold} trusted signature(s), keys ${legacy.trusted_keys.map(key => key.key_id).join(", ")}`);

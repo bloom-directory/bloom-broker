@@ -1939,6 +1939,19 @@ for (const expected of ["old-catalog", "publisher-one", "observation limit",
   "do not enforce the removed rules"]) {{
   if (!migrationText.includes(expected)) throw new Error(`missing migration explanation ${{expected}}`);
 }}
+// Swapping a verifier's artifact under the same ID must show both digests.
+const oldDigest = "11".repeat(32), newDigest = "22".repeat(32);
+const swap = describePolicy({{authority_diff: {{
+  added_required_verifiers: [{{verifier_id: "reader", verifier_digest: newDigest}}],
+  removed_required_verifiers: [{{verifier_id: "reader", verifier_digest: oldDigest}}]
+}}}});
+const swapRules = swap.rules.map(rule => [rule.label, rule.name, rule.value].join(" "));
+if (swapRules.join() !== [`Require verifier reader ${{shortDigest(newDigest)}}`, `Drop verifier reader ${{shortDigest(oldDigest)}}`].join())
+  throw new Error(`verifier rules hide the digest: ${{JSON.stringify(swapRules)}}`);
+if (JSON.stringify(swap.facts) !== JSON.stringify([
+  ["Require verifier · reader digest", newDigest, true],
+  ["Drop verifier · reader digest", oldDigest, true]]))
+  throw new Error(`verifier digests missing from technical facts: ${{JSON.stringify(swap.facts)}}`);
 "#
     );
     let output = run_node(&script);

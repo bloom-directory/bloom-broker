@@ -108,6 +108,8 @@ static MARKETS: std::sync::LazyLock<Markets> = std::sync::LazyLock::new(|| {
         .expect("bundled Hyperliquid market list is valid JSON")
 });
 const MARKET_ID: &str = "Market ID (identity unverified)";
+const LIMIT_PRICE: &str = "Limit price";
+const TRIGGER_PRICE: &str = "Trigger price";
 
 /// The coin and quote asset for a mainnet asset ID, plus whether it is spot.
 fn market(network: &str, id: u32) -> Option<(&'static str, &'static str, bool)> {
@@ -212,7 +214,21 @@ fn collect(
                             }
                             .into()
                         }
-                        ".r" | ".t.trigger.isMarket" => shown = yes_no(value),
+                        ".r" => shown = yes_no(value),
+                        ".t.trigger.isMarket" => {
+                            shown = match value.as_bool() {
+                                Some(true) => "Market order".into(),
+                                Some(false) => "Limit order".into(),
+                                None => raw.clone(),
+                            }
+                        }
+                        ".t.trigger.tpsl" => {
+                            shown = match raw.as_str() {
+                                "tp" => "Take profit".into(),
+                                "sl" => "Stop loss".into(),
+                                _ => raw.clone(),
+                            }
+                        }
                         ".t.limit.tif" => {
                             shown = match raw.as_str() {
                                 "Ioc" => "Immediate or cancel (unfilled size is cancelled)".into(),
@@ -226,14 +242,14 @@ fn collect(
                     let name = match suffix {
                         ".a" => "Market ID (identity unverified)",
                         ".b" => "Side",
-                        ".p" => "Limit price (USDC)",
+                        ".p" => LIMIT_PRICE,
                         ".s" => "Size",
                         ".r" => "Reduce only",
                         ".c" => "Client order ID",
                         ".t.limit.tif" => "Time in force",
-                        ".t.trigger.isMarket" => "Market trigger",
-                        ".t.trigger.triggerPx" => "Trigger price",
-                        ".t.trigger.tpsl" => "Take-profit / stop-loss type",
+                        ".t.trigger.isMarket" => "Execution after trigger",
+                        ".t.trigger.triggerPx" => TRIGGER_PRICE,
+                        ".t.trigger.tpsl" => "Trigger type",
                         _ => suffix,
                     };
                     let index = order.trim_start_matches("action.orders[");
@@ -340,6 +356,20 @@ pub(super) fn rebuild(
         {
             field.path = format!("{prefix}Market");
             field.value = escaped(&market_label(network, id));
+        }
+    }
+    // Prices are in the market's quote asset; an unlisted market shows no unit.
+    if let Action::Order { orders, .. } = &action {
+        for (index, order) in orders.iter().enumerate() {
+            let Some((_, quote, _)) = market(network, order.a) else {
+                continue;
+            };
+            for name in [LIMIT_PRICE, TRIGGER_PRICE] {
+                let path = format!("Order {} · {name}", index + 1);
+                if let Some(field) = fields.iter_mut().find(|field| field.path == path) {
+                    field.path = format!("{path} ({quote})");
+                }
+            }
         }
     }
     let order_title = match &action {
@@ -682,6 +712,39 @@ mod tests {
         let (_, _, title) =
             rebuild("mainnet", spot, 1, None, None, super::super::MAX_FIELDS).unwrap();
         assert_eq!(title, "Sell 2 HYPE for at least 40 USDC each");
+        let batch = json!({"type":"order","orders":[
+            {"a":10207,"b":true,"p":"40","s":"1","r":false,"t":{"limit":{"tif":"Gtc"}}},
+            {"a":1,"b":false,"p":"2000","s":"1","r":true,"t":{"trigger":{"isMarket":true,"triggerPx":"2100","tpsl":"tp"}}},
+            {"a":9999,"b":false,"p":"1","s":"1","r":true,"t":{"trigger":{"isMarket":false,"triggerPx":"2","tpsl":"sl"}}}
+        ],"grouping":"normalTpsl"});
+        let (_, fields, title) =
+            rebuild("mainnet", batch, 1, None, None, super::super::MAX_FIELDS).unwrap();
+        let shown = |path: &str| {
+            fields
+                .iter()
+                .find(|f| f.path == path)
+                .map(|f| f.value.as_str())
+        };
+        assert_eq!(title, "Sign exchange orders");
+        assert_eq!(
+            shown("Order 1 · Market"),
+            Some("HYPE/USDT0 spot (market 10207)")
+        );
+        assert_eq!(shown("Order 1 · Limit price (USDT0)"), Some("40"));
+        assert_eq!(shown("Order 2 · Limit price (USDC)"), Some("2000"));
+        assert_eq!(shown("Order 2 · Trigger price (USDC)"), Some("2100"));
+        assert_eq!(
+            shown("Order 2 · Execution after trigger"),
+            Some("Market order")
+        );
+        assert_eq!(shown("Order 2 · Trigger type"), Some("Take profit"));
+        assert_eq!(shown("Order 3 · Limit price"), Some("1"));
+        assert_eq!(shown("Order 3 · Trigger price"), Some("2"));
+        assert_eq!(
+            shown("Order 3 · Execution after trigger"),
+            Some("Limit order")
+        );
+        assert_eq!(shown("Order 3 · Trigger type"), Some("Stop loss"));
         let unknown = json!({"type":"order","orders":[{"a":9999,"b":true,"p":"1","s":"1","r":false,"t":{"limit":{"tif":"Gtc"}}}],"grouping":"na"});
         let (_, fields, _) =
             rebuild("testnet", unknown, 1, None, None, super::super::MAX_FIELDS).unwrap();
