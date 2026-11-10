@@ -636,11 +636,11 @@ use bloom_broker::{
     signer_client::BrokerSignerClient,
 };
 use bloom_broker_api::{
-    ActivationMode, ApprovalLimits, ApprovalPrepareRequest, ApprovalSelector, ApprovalSubject,
-    AssetId, Base64UrlBytes, BootEpoch, CanonicalWalletPolicy, CeremonyState, ClaimAssurance,
-    ClaimAssuranceLevel, CryptoSuite, CustodyPrepareResponse, DecimalU64, DecimalU256,
-    DeclaredDebit, DeclaredDestination, DeclaredFee, Digest32, KeyRef, KeySpec,
-    MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
+    ActivationMode, ApprovalLifecycleState, ApprovalLimits, ApprovalPrepareRequest,
+    ApprovalSelector, ApprovalSubject, AssetId, Base64UrlBytes, BootEpoch, CanonicalWalletPolicy,
+    CeremonyState, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite, CustodyPrepareResponse,
+    DecimalU64, DecimalU256, DeclaredDebit, DeclaredDestination, DeclaredFee, Digest32, KeyRef,
+    KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
     OperationId, OperationRequest, PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope,
     PetalLineageMembership, PetalUseClaim, PolicyCommitUpdateRequest, PolicyDestination,
     PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceOperationClass,
@@ -1908,7 +1908,7 @@ renderReview({{
 const rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
 for (const expected of [
   "Allow exact transactions on evm-31337",
-  "any address through the deployment workflow, including contract creation",
+  "Any address through the deployment workflow, including contract creation",
   "every transaction still needs its own approval",
   "Allow sending to",
   "0x000000000000000000000000000000000000dEaD",
@@ -1920,6 +1920,10 @@ for (const expected of [
 for (const stale of ["Allow deploying contracts on", "Stop allowing contract deployment on"]) {{
   if (rendered.includes(stale)) throw new Error(`stale policy wording ${{stale}}: ${{rendered}}`);
 }}
+// Each rule is listed on the page with a name, not only in technical details.
+const named = describePolicy({{authority_diff: {{added_destinations: [
+  {{chain: "base", destination: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"}}]}}}});
+if (named.rules[0]?.name !== "USD Coin (USDC) on Base") throw new Error(`unnamed rule: ${{JSON.stringify(named.rules)}}`);
 const migration = describePolicy({{authority_diff: {{
   removed_legacy_clear_signing: {{
     catalog_id: "old-catalog", signature_threshold: 1,
@@ -1929,12 +1933,25 @@ const migration = describePolicy({{authority_diff: {{
     opaque_exact_allowed: false, unlimited_allowance_allowed: false
   }}
 }}}});
-const migrationText = migration.facts.flat().join(" ");
+const migrationText = migration.rules.map(rule => [rule.label, rule.name, rule.value]).flat().join(" ");
 for (const expected of ["old-catalog", "publisher-one", "observation limit",
   "old-reader", "old-digest", "Allow opaque exact review", "Allow unlimited allowance review",
   "do not enforce the removed rules"]) {{
   if (!migrationText.includes(expected)) throw new Error(`missing migration explanation ${{expected}}`);
 }}
+// Swapping a verifier's artifact under the same ID must show both digests.
+const oldDigest = "11".repeat(32), newDigest = "22".repeat(32);
+const swap = describePolicy({{authority_diff: {{
+  added_required_verifiers: [{{verifier_id: "reader", verifier_digest: newDigest}}],
+  removed_required_verifiers: [{{verifier_id: "reader", verifier_digest: oldDigest}}]
+}}}});
+const swapRules = swap.rules.map(rule => [rule.label, rule.name, rule.value].join(" "));
+if (swapRules.join() !== [`Require verifier reader ${{shortDigest(newDigest)}}`, `Drop verifier reader ${{shortDigest(oldDigest)}}`].join())
+  throw new Error(`verifier rules hide the digest: ${{JSON.stringify(swapRules)}}`);
+if (JSON.stringify(swap.facts) !== JSON.stringify([
+  ["Require verifier · reader digest", newDigest, true],
+  ["Drop verifier · reader digest", oldDigest, true]]))
+  throw new Error(`verifier digests missing from technical facts: ${{JSON.stringify(swap.facts)}}`);
 "#
     );
     let output = run_node(&script);
@@ -1983,6 +2000,32 @@ fn browser_cancel_disables_approve_before_awaiting_and_reports_the_outcome() {
             "cancel handler must provide {why}: {needle}"
         );
     }
+}
+
+#[test]
+fn hyperliquid_expiry_beyond_date_range_shows_exact_unix_milliseconds() {
+    let helper = include_str!("../src/ceremony_assets/app.js")
+        .split_once("\nfunction unixMsLabel")
+        .and_then(|(_, rest)| rest.split_once("\nfunction el("))
+        .expect("asset must define unixMsLabel before el")
+        .0;
+    let script = format!(
+        r#"
+const assert = require("node:assert/strict");
+function unixMsLabel{helper}
+assert.equal(unixMsLabel("8640000000000000"), new Date(8640000000000000).toLocaleString());
+assert.equal(unixMsLabel("1794018223895"), new Date(1794018223895).toLocaleString());
+for (const value of ["8640000000000001", "18446744073709551615"]) {{
+  assert.equal(unixMsLabel(value), `${{value}} Unix milliseconds`);
+}}
+"#
+    );
+    let output = run_node(&script);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -6788,11 +6831,11 @@ async fn independently_read_message_fields_are_bound_into_the_signed_manifest() 
 }
 
 #[tokio::test]
-async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
+async fn an_approval_whose_only_ceremony_expired_is_reported_expired() {
     let signer = Arc::new(MockSigner::new());
     let now_ms: u64 = 1_700_000_000_000;
     let broker = CeremonyBroker::new_with_manifest_signer(
-        signer,
+        signer.clone(),
         Token::new("broker-review-key").unwrap(),
         SigningKey::from_bytes(&[33; 32]),
     );
@@ -6808,8 +6851,9 @@ async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
             .is_some(),
         "a live ceremony hands the owner a URL to complete"
     );
-    assert!(
-        !broker.approval_ceremony_unreachable(&approval_id),
+    assert_eq!(
+        broker.unreachable_approval_ending(&approval_id),
+        None,
         "an approval the owner can still complete is not unreachable"
     );
 
@@ -6820,10 +6864,126 @@ async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
             .is_none(),
         "an expired ceremony must not hand out a URL"
     );
-    assert!(
-        broker.approval_ceremony_unreachable(&approval_id),
+    assert_eq!(
+        broker.unreachable_approval_ending(&approval_id),
+        Some(ApprovalLifecycleState::Expired),
         "once the ceremony expires the owner has no way to reach this approval, so the caller \
          must be told to start a fresh lineage rather than poll AwaitingCeremony with no URL"
+    );
+    assert_eq!(
+        signer.completions.load(Ordering::SeqCst),
+        0,
+        "nothing was signed"
+    );
+}
+
+#[tokio::test]
+async fn an_approval_the_owner_cancelled_is_reported_cancelled_not_expired() {
+    let signer = Arc::new(MockSigner::new());
+    let now_ms: u64 = 1_700_000_000_000;
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        signer.clone(),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[35; 32]),
+    );
+    let response = broker
+        .prepare_approval(approval_request(), ReviewManifestContext::default(), now_ms)
+        .unwrap();
+
+    broker.cancel(&operation("17"), now_ms + 1).unwrap();
+
+    assert!(
+        broker
+            .pending_approval_ceremony(&response.approval_id, now_ms + 2)
+            .unwrap()
+            .is_none(),
+        "a cancelled ceremony must not hand out a URL"
+    );
+    assert_eq!(
+        broker.unreachable_approval_ending(&response.approval_id),
+        Some(ApprovalLifecycleState::Cancelled),
+        "the owner refused before the deadline; reporting EXPIRED hides that refusal"
+    );
+    assert_eq!(
+        signer.completions.load(Ordering::SeqCst),
+        0,
+        "nothing was signed"
+    );
+}
+
+#[tokio::test]
+async fn a_rolled_back_approval_ceremony_is_not_reported_cancelled() {
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        Arc::new(MockSigner::new()),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[37; 32]),
+    );
+    let now_ms: u64 = 1_700_000_000_000;
+    let response = broker
+        .prepare_approval(approval_request(), ReviewManifestContext::default(), now_ms)
+        .unwrap();
+
+    broker.roll_back(&operation("17"), now_ms + 1).unwrap();
+
+    assert_eq!(broker.status(&operation("17")), Some(CeremonyState::Failed));
+    assert_eq!(
+        broker.unreachable_approval_ending(&response.approval_id),
+        Some(ApprovalLifecycleState::Expired),
+        "the Broker abandoned its own preparation; nobody refused"
+    );
+}
+
+#[tokio::test]
+async fn ceremonies_ending_in_the_same_millisecond_report_one_ending_across_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("ceremony.sqlite");
+    let journal = Arc::new(
+        BrokerJournal::open(
+            directory.path().join("journal.sqlite"),
+            Arc::new(ServiceTestAuditSigner),
+        )
+        .unwrap(),
+    );
+    let open = || {
+        CeremonyBroker::open_with_manifest_signer(
+            &path,
+            Arc::new(MockSigner::new()),
+            Token::new("broker-review-key").unwrap(),
+            SigningKey::from_bytes(&[36; 32]),
+            journal.clone(),
+        )
+        .unwrap()
+    };
+    let now_ms: u64 = 1_700_000_000_000;
+    let tie_ms = now_ms + 10_001;
+    let broker = open();
+    let first = broker
+        .prepare_approval(approval_request(), ReviewManifestContext::default(), now_ms)
+        .unwrap();
+    // The retry's prepare sweeps the first ceremony to `Expired` at `tie_ms`,
+    // and the owner cancels the retry in that same millisecond.
+    let mut retry = approval_request();
+    retry.activation_operation_id = operation("18");
+    let second = broker
+        .prepare_approval(retry, ReviewManifestContext::default(), tie_ms)
+        .unwrap();
+    assert_eq!(first.approval_id, second.approval_id);
+    broker.cancel(&operation("18"), tie_ms).unwrap();
+    assert_eq!(
+        broker.status(&operation("17")),
+        Some(CeremonyState::Expired)
+    );
+
+    // Both rows end at `tie_ms`; the later-created retry is the last word.
+    assert_eq!(
+        broker.unreachable_approval_ending(&first.approval_id),
+        Some(ApprovalLifecycleState::Cancelled)
+    );
+    drop(broker);
+    assert_eq!(
+        open().unreachable_approval_ending(&first.approval_id),
+        Some(ApprovalLifecycleState::Cancelled),
+        "reloading the same rows in another order must not change the answer"
     );
 }
 
@@ -8673,7 +8833,8 @@ fn login_session_disconnect_terminalizes_every_live_browser_session() {
     broker.terminate_live_sessions(10_001).unwrap();
 
     let status = broker.public_status(&operation_id).unwrap();
-    assert_eq!(status.state, CeremonyState::Cancelled);
+    // Nobody refused: logout is cleanup, so it must not read as a cancel.
+    assert_eq!(status.state, CeremonyState::Expired);
     assert!(status.ceremony_url.is_none());
     assert_eq!(signer.cancellations.load(Ordering::SeqCst), 1);
     prepare(&broker, operation("b0"), Some(wallet), 10_002);

@@ -3,6 +3,10 @@
     "source_url": "https://assets.coingecko.com/coins/images/39926/large/usds.webp?1726666683",
     "identity_source": "https://github.com/sky-ecosystem/spells-mainnet/blob/103976e788905dca2271314bb12f13737c38ccab/src/test/addresses_optimism.sol"
   },
+  "137:0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb": {
+    "source_url": "https://assets.coingecko.com/coins/images/102173037/large/polymarket.png?1777389002",
+    "identity_source": "https://github.com/Polymarket/py-clob-client-v2/blob/f11b2c090c7751fafc3a62fc62c39f0ae9037d51/py_clob_client_v2/config.py"
+  },
   "4217:0x20c0000000000000000000000000000000000000": {
     "source_url": "https://raw.githubusercontent.com/tempoxyz/tempo-apps/1a58df74607dbf6a544a7cd120ac0bb4d7eb7ef4/apps/tokenlist/data/4217/icons/0x20c0000000000000000000000000000000000000.svg",
     "identity_source": "https://github.com/tempoxyz/tempo-apps/tree/1a58df74607dbf6a544a7cd120ac0bb4d7eb7ef4/apps/tokenlist/data/4217/icons"

@@ -10,39 +10,39 @@
     },
     "robinhood": {
       "url": "https://api.robinhood.com/rhj/assets",
-      "sha256": "b1abbd790b9a9960eca02ad9a85f44977ba7299188113889a016d17dd0c12fbd"
+      "sha256": "60fbbaa145807b2f78b4862d767b9a06e11332504d56ac32462664506e137cd9"
     },
     "ethereum": {
       "url": "https://tokens.coingecko.com/ethereum/all.json",
-      "sha256": "c27206f22f7c5230749883e848189f66e619297a6ace942c523201deddd2c832"
+      "sha256": "3a389cf2631669293635f28c30284005c794842ba44314e3c234af3fa3f2f38f"
     },
     "optimism": {
       "url": "https://tokens.coingecko.com/optimistic-ethereum/all.json",
-      "sha256": "f5d14a00f07164d01cda67ef0c2144b05edaff443359d7a5a42b0567f14c5178"
+      "sha256": "10c0340872c72f6e4b8c599f3e43e12f651d6243aff4cc23f3d36b009f00de1e"
     },
     "base": {
       "url": "https://tokens.coingecko.com/base/all.json",
-      "sha256": "e473c372ecc1a2d538b1a0f00dc775080479a1aac4e34c535e0681654b8115a4"
+      "sha256": "2c4ced79da027c0430028a2998e265fe625d161dd40726ac580fd75a129c4ab5"
     },
     "arbitrum": {
       "url": "https://tokens.coingecko.com/arbitrum-one/all.json",
-      "sha256": "9a8dad4340761b4b77f3e4b63e48205976b728fba8028f5cf4f77ee2a0d6735e"
+      "sha256": "faee34896002592aeae1b4cf4a7071ecd5a286a8fcdbb2d141db978bc2295991"
     },
     "bsc": {
       "url": "https://tokens.coingecko.com/binance-smart-chain/all.json",
-      "sha256": "fae1732fb7caf9ff6c9b0e807df9fc84782101bcf9a89bcce640a479f84b4d0b"
+      "sha256": "c045d7a3144b53fcf297d1cb52f58e6e934c4ffcaa16009264a35dd29c4de1a8"
     },
     "polygon": {
       "url": "https://tokens.coingecko.com/polygon-pos/all.json",
-      "sha256": "f58a7b34c6ccb68e2addc3c546ad59baa2b93a9d03861f95e20c4c2ac95b7ba6"
+      "sha256": "9b54d2dc24f34b702825169e1533638a86442d3065260c49f4ed6beaaa78f7b5"
     },
     "linea": {
       "url": "https://tokens.coingecko.com/linea/all.json",
-      "sha256": "c98ce2a0726d2390e754f464bb13acb0a3397407b365af5ac18c17aba25102b9"
+      "sha256": "584ce4d6264c7d6f2d96a9d3bdbb62f61d348dd20cf7c4f74236cbaeb03038eb"
     },
     "hyperevm": {
       "url": "https://tokens.coingecko.com/hyperevm/all.json",
-      "sha256": "638531b0e200b4e39055f0db8d77dc14359c52e26e30c7b1198ca000307c0311"
+      "sha256": "3e33277a1b4781f6563179d43320f74eca4e6c644df32726285bcb910a3bb929"
     }
   },
   "tokens": [
@@ -6666,8 +6666,10 @@
       "address": "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb",
       "symbol": "pUSD",
       "name": "Polymarket USD",
-      "source": "reviewed-neutral",
-      "missing_reason": "Polymarket USD is not Circle USDC; no issuer artwork has been reviewed"
+      "source": "reviewed-deployment",
+      "source_url": "https://assets.coingecko.com/coins/images/102173037/large/polymarket.png?1777389002",
+      "identity_source": "https://github.com/Polymarket/py-clob-client-v2/blob/f11b2c090c7751fafc3a62fc62c39f0ae9037d51/py_clob_client_v2/config.py",
+      "file": "6738fbab8aa2ae7623cf70ba276de46b644e9d13eb014514ce5e6efbfa7e08f1.png"
     },
     {
       "chain_id": 137,
