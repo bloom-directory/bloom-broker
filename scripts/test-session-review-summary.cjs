@@ -33,3 +33,18 @@ assert.match(JSON.stringify(describe()),/Any recipient \(ERC20 transfers only\)/
 terms.selector.kind='system_session';assert.equal(describe(),null,'deleted draft selector must not render as active authority');
 assert.ok(!source.includes('function describeIntegration('));
 console.log('generic grant review: signed package name, real amounts, explicit zero scope/rate, additive capacity and unchanged rearm passed');
+// Upstream policy cards must retain persona sentinels as permissions, not addresses.
+vm.runInContext(source.slice(source.indexOf('// Policy updates:'), source.indexOf('function planDisclosures(')),ctx);
+ctx.chainLabel=chain=>chain;
+const policy=ctx.describePolicy({authority_diff:{
+  added_destinations:[{chain:'evm-1',destination:'erc20:any-recipient'}],
+  removed_destinations:[{chain:'evm-137',destination:'erc20:any-recipient'}],
+  maximum_approval_lifetime_ms_before:'3600000',maximum_approval_lifetime_ms_after:'9007199254740991'
+}});
+assert.equal(policy.rules.length,3);
+assert.match(policy.rules[0].label,/Allow ERC20 transfers to any recipient/);
+assert.match(policy.rules[0].name,/separately approved token and gas allowance/);
+assert.match(policy.rules[1].label,/Stop allowing ERC20 transfers/);
+assert.match(policy.rules[2].name,/Until revoked/);
+assert.ok(policy.rules.every(rule=>rule.value===undefined));
+console.log('policy cards retain any-recipient scope and standing lifetime');

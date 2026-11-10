@@ -462,7 +462,7 @@ fn decode_with_exchange_limit(
             review.kind = "hyperliquid_l1".into();
             review.title = title;
             review.fields = fields;
-            review.warnings.push("Bloom rebuilt the exchange action's MessagePack commitment. Market IDs, order bounds and fees are signed; Bloom has not checked market identity, available balance, fills or venue execution.".into());
+            review.warnings.push("Bloom rebuilt the exchange action's MessagePack commitment. Market IDs, order bounds and fees are signed. Market names come from a list bundled with this Bloom release; Bloom has not checked available balance, fills or venue execution.".into());
             return Ok((preimage, review));
         }
         Envelope::TempoTransaction {

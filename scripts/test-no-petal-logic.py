@@ -16,10 +16,10 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BASELINE = ROOT / 'scripts/fixtures/source-guard-master.json'
 ALLOWLIST = ROOT / 'scripts/fixtures/source-guard-allowlist.json'
-# Frozen from reviewed master history. The November merge adds only two UI
-# lines present verbatim in 0a9a8da; previous_master_commit records the earlier
+# Frozen from reviewed master history. November merges add only lines present
+# verbatim in reviewed_merge_commits; previous_master_commit records the original
 # baseline. Changing this is a guard policy change, not an automatic update.
-BASELINE_SHA256 = 'aef9d8ca191af719a8249d8f431f55ba4ecf171a09e6ddfe0e1ef6c3ab97567a'
+BASELINE_SHA256 = '7083afcf897522448e854636953f7d01f362e1a02ccc29a8d72fd076da53753a'
 WORDS = re.compile(r'polymarket|gasless|venice|hyperliquid|near-intents|pendle|privacy-pools|enso|relay|pumpfun', re.I)
 LITERALS = re.compile(r'r(#{0,32})".*?"\1|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])\'|//[^\n]*|/\*.*?\*/', re.S)
 
