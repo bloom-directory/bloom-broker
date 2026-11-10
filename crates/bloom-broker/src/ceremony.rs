@@ -2428,9 +2428,10 @@ impl CeremonyBroker {
     /// How the approval's last owner ceremony ended, when every ceremony
     /// minted for it died without activating it. No URL exists for the owner
     /// and none can appear, so a caller waiting on this approval is waiting
-    /// on nothing. An owner's Cancel is `Cancelled`, so a caller can tell a
-    /// refusal from a timeout; any other ending is `Expired`. `None` while any
-    /// ceremony is still live.
+    /// on nothing. A deliberate cancel (the owner's browser or a Machine
+    /// cancel request) is `Cancelled`, so a caller can tell it from a timeout;
+    /// any other ending, including shutdown and rollback, is `Expired`. `None`
+    /// while any ceremony is still live.
     ///
     /// A completed ceremony is deliberately not counted: that approval is on
     /// its way to `Active`, and reporting it dead would strand a signature the
@@ -2439,8 +2440,12 @@ impl CeremonyBroker {
         &self,
         approval_id: &Digest32,
     ) -> Option<bloom_broker_api::ApprovalLifecycleState> {
-        let mut last: Option<(u64, CeremonyState)> = None;
-        for session in self.inner.sessions.lock().values() {
+        // Ordered by ending time, then creation time, then ceremony ID, so
+        // rows that end in the same millisecond still pick one answer however
+        // the map iterates.
+        let mut last: Option<((u64, u64, &str), CeremonyState)> = None;
+        let sessions = self.inner.sessions.lock();
+        for (ceremony_id, session) in sessions.iter() {
             if session.ceremony_kind != CeremonyKind::SealedApproval {
                 continue;
             }
@@ -2459,9 +2464,13 @@ impl CeremonyBroker {
             ) {
                 return None;
             }
-            let ended_at = session.terminal_at_ms.unwrap_or(session.created_at_ms);
-            if last.is_none_or(|(at, _)| ended_at >= at) {
-                last = Some((ended_at, session.state));
+            let order = (
+                session.terminal_at_ms.unwrap_or(session.created_at_ms),
+                session.created_at_ms,
+                ceremony_id.as_str(),
+            );
+            if last.is_none_or(|(at, _)| order > at) {
+                last = Some((order, session.state));
             }
         }
         last.map(|(_, state)| match state {
@@ -2507,7 +2516,24 @@ impl CeremonyBroker {
     }
 
     pub fn cancel(&self, operation_id: &OperationId, now_ms: u64) -> Result<(), ProtocolError> {
-        self.cancel_with_backoff(operation_id, now_ms, BackoffClock::Trusted)
+        self.cancel_with_backoff(
+            operation_id,
+            now_ms,
+            BackoffClock::Trusted,
+            CeremonyState::Cancelled,
+        )
+    }
+
+    /// Release a ceremony the Broker itself failed to finish preparing. Like
+    /// `cancel`, but it ends `Failed`: nobody refused, so the approval must
+    /// not read as cancelled.
+    pub fn roll_back(&self, operation_id: &OperationId, now_ms: u64) -> Result<(), ProtocolError> {
+        self.cancel_with_backoff(
+            operation_id,
+            now_ms,
+            BackoffClock::Trusted,
+            CeremonyState::Failed,
+        )
     }
 
     fn cancel_from_browser(
@@ -2515,7 +2541,12 @@ impl CeremonyBroker {
         operation_id: &OperationId,
         now_ms: u64,
     ) -> Result<(), ProtocolError> {
-        self.cancel_with_backoff(operation_id, now_ms, BackoffClock::Monotonic)
+        self.cancel_with_backoff(
+            operation_id,
+            now_ms,
+            BackoffClock::Monotonic,
+            CeremonyState::Cancelled,
+        )
     }
 
     fn cancel_signer_or_already_released(
@@ -2542,6 +2573,7 @@ impl CeremonyBroker {
         operation_id: &OperationId,
         now_ms: u64,
         backoff_clock: BackoffClock,
+        ending: CeremonyState,
     ) -> Result<(), ProtocolError> {
         let _guard = self.inner.creation_admission.lock();
         self.expire_sessions(now_ms)?;
@@ -2577,7 +2609,7 @@ impl CeremonyBroker {
                 ));
             }
             let mut snapshot = session.clone();
-            snapshot.state = CeremonyState::Cancelled;
+            snapshot.state = ending;
             latch_terminal(&mut snapshot, now_ms);
             (session.wallet_id.clone(), snapshot)
         };
@@ -2605,7 +2637,7 @@ impl CeremonyBroker {
             .map(|(id, session)| (id.clone(), session.clone()))
             .collect::<Vec<_>>();
         for (id, mut source) in auxiliary {
-            source.state = CeremonyState::Cancelled;
+            source.state = ending;
             latch_terminal(&mut source, now_ms);
             self.persist_session(&source)?;
             self.inner.sessions.lock().insert(id, source);
@@ -2648,8 +2680,10 @@ impl CeremonyBroker {
                     continue;
                 }
                 let mut snapshot = session.clone();
+                // Nobody refused, so an owner-awaiting ceremony expires
+                // rather than reading as a cancellation.
                 snapshot.state = if state == CeremonyState::AwaitingUser {
-                    CeremonyState::Cancelled
+                    CeremonyState::Expired
                 } else {
                     CeremonyState::Failed
                 };

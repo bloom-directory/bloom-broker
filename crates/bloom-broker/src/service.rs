@@ -1072,7 +1072,7 @@ impl BrokerRpcService {
         {
             let _ = self
                 .ceremony
-                .cancel(&request.operation_id, self.clock.now_ms(false)?);
+                .roll_back(&request.operation_id, self.clock.now_ms(false)?);
             return Err(error);
         }
         Ok(response)
