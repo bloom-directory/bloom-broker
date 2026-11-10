@@ -1908,7 +1908,7 @@ renderReview({{
 const rendered = [nodes["page-title"], nodes["panel-title"], nodes.review].map(allText).join(" ");
 for (const expected of [
   "Allow exact transactions on evm-31337",
-  "any address through the deployment workflow, including contract creation",
+  "Any address through the deployment workflow, including contract creation",
   "every transaction still needs its own approval",
   "Allow sending to",
   "0x000000000000000000000000000000000000dEaD",
@@ -1920,6 +1920,10 @@ for (const expected of [
 for (const stale of ["Allow deploying contracts on", "Stop allowing contract deployment on"]) {{
   if (rendered.includes(stale)) throw new Error(`stale policy wording ${{stale}}: ${{rendered}}`);
 }}
+// Each rule is listed on the page with a name, not only in technical details.
+const named = describePolicy({{authority_diff: {{added_destinations: [
+  {{chain: "base", destination: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"}}]}}}});
+if (named.rules[0]?.name !== "USD Coin (USDC) on Base") throw new Error(`unnamed rule: ${{JSON.stringify(named.rules)}}`);
 const migration = describePolicy({{authority_diff: {{
   removed_legacy_clear_signing: {{
     catalog_id: "old-catalog", signature_threshold: 1,
@@ -1929,12 +1933,25 @@ const migration = describePolicy({{authority_diff: {{
     opaque_exact_allowed: false, unlimited_allowance_allowed: false
   }}
 }}}});
-const migrationText = migration.facts.flat().join(" ");
+const migrationText = migration.rules.map(rule => [rule.label, rule.name, rule.value]).flat().join(" ");
 for (const expected of ["old-catalog", "publisher-one", "observation limit",
   "old-reader", "old-digest", "Allow opaque exact review", "Allow unlimited allowance review",
   "do not enforce the removed rules"]) {{
   if (!migrationText.includes(expected)) throw new Error(`missing migration explanation ${{expected}}`);
 }}
+// Swapping a verifier's artifact under the same ID must show both digests.
+const oldDigest = "11".repeat(32), newDigest = "22".repeat(32);
+const swap = describePolicy({{authority_diff: {{
+  added_required_verifiers: [{{verifier_id: "reader", verifier_digest: newDigest}}],
+  removed_required_verifiers: [{{verifier_id: "reader", verifier_digest: oldDigest}}]
+}}}});
+const swapRules = swap.rules.map(rule => [rule.label, rule.name, rule.value].join(" "));
+if (swapRules.join() !== [`Require verifier reader ${{shortDigest(newDigest)}}`, `Drop verifier reader ${{shortDigest(oldDigest)}}`].join())
+  throw new Error(`verifier rules hide the digest: ${{JSON.stringify(swapRules)}}`);
+if (JSON.stringify(swap.facts) !== JSON.stringify([
+  ["Require verifier · reader digest", newDigest, true],
+  ["Drop verifier · reader digest", oldDigest, true]]))
+  throw new Error(`verifier digests missing from technical facts: ${{JSON.stringify(swap.facts)}}`);
 "#
     );
     let output = run_node(&script);
@@ -1983,6 +2000,32 @@ fn browser_cancel_disables_approve_before_awaiting_and_reports_the_outcome() {
             "cancel handler must provide {why}: {needle}"
         );
     }
+}
+
+#[test]
+fn hyperliquid_expiry_beyond_date_range_shows_exact_unix_milliseconds() {
+    let helper = include_str!("../src/ceremony_assets/app.js")
+        .split_once("\nfunction unixMsLabel")
+        .and_then(|(_, rest)| rest.split_once("\nfunction el("))
+        .expect("asset must define unixMsLabel before el")
+        .0;
+    let script = format!(
+        r#"
+const assert = require("node:assert/strict");
+function unixMsLabel{helper}
+assert.equal(unixMsLabel("8640000000000000"), new Date(8640000000000000).toLocaleString());
+assert.equal(unixMsLabel("1794018223895"), new Date(1794018223895).toLocaleString());
+for (const value of ["8640000000000001", "18446744073709551615"]) {{
+  assert.equal(unixMsLabel(value), `${{value}} Unix milliseconds`);
+}}
+"#
+    );
+    let output = run_node(&script);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
