@@ -2003,6 +2003,32 @@ fn browser_cancel_disables_approve_before_awaiting_and_reports_the_outcome() {
 }
 
 #[test]
+fn hyperliquid_expiry_beyond_date_range_shows_exact_unix_milliseconds() {
+    let helper = include_str!("../src/ceremony_assets/app.js")
+        .split_once("\nfunction unixMsLabel")
+        .and_then(|(_, rest)| rest.split_once("\nfunction el("))
+        .expect("asset must define unixMsLabel before el")
+        .0;
+    let script = format!(
+        r#"
+const assert = require("node:assert/strict");
+function unixMsLabel{helper}
+assert.equal(unixMsLabel("8640000000000000"), new Date(8640000000000000).toLocaleString());
+assert.equal(unixMsLabel("1794018223895"), new Date(1794018223895).toLocaleString());
+for (const value of ["8640000000000001", "18446744073709551615"]) {{
+  assert.equal(unixMsLabel(value), `${{value}} Unix milliseconds`);
+}}
+"#
+    );
+    let output = run_node(&script);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn key_derive_primary_review_explains_the_session_without_internal_scope_json() {
     let asset = concat!(
         include_str!("../src/ceremony_assets/token-artwork.js"),

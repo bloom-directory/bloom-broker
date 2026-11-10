@@ -90,6 +90,12 @@ const KINDS = {
   }
 };
 
+// A signed u64 can exceed Date's range (8.64e15 ms); show those values exactly.
+function unixMsLabel(value) {
+  const date = new Date(Number(value));
+  return Number.isNaN(date.getTime()) ? `${value} Unix milliseconds` : date.toLocaleString();
+}
+
 function el(tag, attrs = {}, ...children) {
   const node = ["svg", "path", "circle", "rect"].includes(tag)
     ? document.createElementNS("http://www.w3.org/2000/svg", tag)
@@ -730,7 +736,7 @@ function describeTransfer(manifest) {
         }
       }
       if (hyperliquid && field.path === "Expires after (Unix milliseconds)" && /^\d+$/.test(field.value)) {
-        primary.push(["Signature expires", new Date(Number(field.value)).toLocaleString()]);
+        primary.push(["Signature expires", unixMsLabel(field.value)]);
         extraTechnical.push(row); continue;
       }
       if (hyperliquid && (["nonce", "time", "Nonce (Unix milliseconds)", "Action", "Hyperliquid environment"].includes(field.path)

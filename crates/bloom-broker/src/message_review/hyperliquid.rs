@@ -233,7 +233,7 @@ fn collect(
                             shown = match raw.as_str() {
                                 "Ioc" => "Immediate or cancel (unfilled size is cancelled)".into(),
                                 "Gtc" => "Good until cancelled".into(),
-                                "Alo" => "Post only (cancelled if it would fill at once)".into(),
+                                "Alo" => "Post only (rejected if it would fill immediately)".into(),
                                 _ => raw.clone(),
                             }
                         }
@@ -701,10 +701,22 @@ mod tests {
         assert_eq!(shown("Order 1 · Reduce only"), Some("No"));
         assert_eq!(shown("Order 1 · Size"), Some("0.0045"));
         assert_eq!(shown("Order 1 · Limit price (USDC)"), Some("2260"));
-        assert_eq!(
-            shown("Order 1 · Time in force"),
-            Some("Immediate or cancel (unfilled size is cancelled)")
-        );
+        // Wording follows the Hyperliquid Petal's order.json `t` description.
+        for (tif, meaning) in [
+            ("Gtc", "Good until cancelled"),
+            ("Ioc", "Immediate or cancel (unfilled size is cancelled)"),
+            ("Alo", "Post only (rejected if it would fill immediately)"),
+        ] {
+            let action = json!({"type":"order","orders":[{"a":1,"b":true,"p":"2260","s":"0.0045","r":false,"t":{"limit":{"tif":tif}}}],"grouping":"na"});
+            let (_, fields, _) =
+                rebuild("mainnet", action, 1, None, None, super::super::MAX_FIELDS).unwrap();
+            assert!(
+                fields
+                    .iter()
+                    .any(|f| f.path == "Order 1 · Time in force" && f.value == meaning),
+                "{tif}"
+            );
+        }
         assert_eq!(shown("Linked orders"), Some("None"));
         assert_eq!(shown("Order 1 · Market"), Some("ETH perpetual (market 1)"));
         assert_eq!(title, "Buy 0.0045 ETH for up to 2260 USDC each");
