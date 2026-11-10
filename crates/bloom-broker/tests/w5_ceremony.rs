@@ -636,11 +636,11 @@ use bloom_broker::{
     signer_client::BrokerSignerClient,
 };
 use bloom_broker_api::{
-    ActivationMode, ApprovalLimits, ApprovalPrepareRequest, ApprovalSelector, ApprovalSubject,
-    AssetId, Base64UrlBytes, BootEpoch, CanonicalWalletPolicy, CeremonyState, ClaimAssurance,
-    ClaimAssuranceLevel, CryptoSuite, CustodyPrepareResponse, DecimalU64, DecimalU256,
-    DeclaredDebit, DeclaredDestination, DeclaredFee, Digest32, KeyRef, KeySpec,
-    MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
+    ActivationMode, ApprovalLifecycleState, ApprovalLimits, ApprovalPrepareRequest,
+    ApprovalSelector, ApprovalSubject, AssetId, Base64UrlBytes, BootEpoch, CanonicalWalletPolicy,
+    CeremonyState, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite, CustodyPrepareResponse,
+    DecimalU64, DecimalU256, DeclaredDebit, DeclaredDestination, DeclaredFee, Digest32, KeyRef,
+    KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
     OperationId, OperationRequest, PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope,
     PetalLineageMembership, PetalUseClaim, PolicyCommitUpdateRequest, PolicyDestination,
     PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceOperationClass,
@@ -6788,11 +6788,11 @@ async fn independently_read_message_fields_are_bound_into_the_signed_manifest() 
 }
 
 #[tokio::test]
-async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
+async fn an_approval_whose_only_ceremony_expired_is_reported_expired() {
     let signer = Arc::new(MockSigner::new());
     let now_ms: u64 = 1_700_000_000_000;
     let broker = CeremonyBroker::new_with_manifest_signer(
-        signer,
+        signer.clone(),
         Token::new("broker-review-key").unwrap(),
         SigningKey::from_bytes(&[33; 32]),
     );
@@ -6808,8 +6808,9 @@ async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
             .is_some(),
         "a live ceremony hands the owner a URL to complete"
     );
-    assert!(
-        !broker.approval_ceremony_unreachable(&approval_id),
+    assert_eq!(
+        broker.unreachable_approval_ending(&approval_id),
+        None,
         "an approval the owner can still complete is not unreachable"
     );
 
@@ -6820,10 +6821,50 @@ async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
             .is_none(),
         "an expired ceremony must not hand out a URL"
     );
-    assert!(
-        broker.approval_ceremony_unreachable(&approval_id),
+    assert_eq!(
+        broker.unreachable_approval_ending(&approval_id),
+        Some(ApprovalLifecycleState::Expired),
         "once the ceremony expires the owner has no way to reach this approval, so the caller \
          must be told to start a fresh lineage rather than poll AwaitingCeremony with no URL"
+    );
+    assert_eq!(
+        signer.completions.load(Ordering::SeqCst),
+        0,
+        "nothing was signed"
+    );
+}
+
+#[tokio::test]
+async fn an_approval_the_owner_cancelled_is_reported_cancelled_not_expired() {
+    let signer = Arc::new(MockSigner::new());
+    let now_ms: u64 = 1_700_000_000_000;
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        signer.clone(),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[35; 32]),
+    );
+    let response = broker
+        .prepare_approval(approval_request(), ReviewManifestContext::default(), now_ms)
+        .unwrap();
+
+    broker.cancel(&operation("17"), now_ms + 1).unwrap();
+
+    assert!(
+        broker
+            .pending_approval_ceremony(&response.approval_id, now_ms + 2)
+            .unwrap()
+            .is_none(),
+        "a cancelled ceremony must not hand out a URL"
+    );
+    assert_eq!(
+        broker.unreachable_approval_ending(&response.approval_id),
+        Some(ApprovalLifecycleState::Cancelled),
+        "the owner refused before the deadline; reporting EXPIRED hides that refusal"
+    );
+    assert_eq!(
+        signer.completions.load(Ordering::SeqCst),
+        0,
+        "nothing was signed"
     );
 }
 

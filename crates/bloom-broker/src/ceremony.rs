@@ -2425,15 +2425,21 @@ impl CeremonyBroker {
         }))
     }
 
-    /// True when every owner ceremony minted for this approval died without
-    /// activating it. No URL exists for the owner and none can appear, so a
-    /// caller waiting on this approval is waiting on nothing.
+    /// How the approval's last owner ceremony ended, when every ceremony
+    /// minted for it died without activating it. No URL exists for the owner
+    /// and none can appear, so a caller waiting on this approval is waiting
+    /// on nothing. An owner's Cancel is `Cancelled`, so a caller can tell a
+    /// refusal from a timeout; any other ending is `Expired`. `None` while any
+    /// ceremony is still live.
     ///
     /// A completed ceremony is deliberately not counted: that approval is on
     /// its way to `Active`, and reporting it dead would strand a signature the
     /// owner already authorised.
-    pub fn approval_ceremony_unreachable(&self, approval_id: &Digest32) -> bool {
-        let mut saw_ceremony = false;
+    pub fn unreachable_approval_ending(
+        &self,
+        approval_id: &Digest32,
+    ) -> Option<bloom_broker_api::ApprovalLifecycleState> {
+        let mut last: Option<(u64, CeremonyState)> = None;
         for session in self.inner.sessions.lock().values() {
             if session.ceremony_kind != CeremonyKind::SealedApproval {
                 continue;
@@ -2451,11 +2457,17 @@ impl CeremonyBroker {
                 session.state,
                 CeremonyState::Cancelled | CeremonyState::Expired | CeremonyState::Failed
             ) {
-                return false;
+                return None;
             }
-            saw_ceremony = true;
+            let ended_at = session.terminal_at_ms.unwrap_or(session.created_at_ms);
+            if last.is_none_or(|(at, _)| ended_at >= at) {
+                last = Some((ended_at, session.state));
+            }
         }
-        saw_ceremony
+        last.map(|(_, state)| match state {
+            CeremonyState::Cancelled => bloom_broker_api::ApprovalLifecycleState::Cancelled,
+            _ => bloom_broker_api::ApprovalLifecycleState::Expired,
+        })
     }
 
     pub fn completed_policy_update(

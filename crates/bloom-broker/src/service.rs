@@ -1110,11 +1110,11 @@ impl BrokerRpcService {
         if matches!(
             status.state,
             ApprovalLifecycleState::Prepared | ApprovalLifecycleState::AwaitingCeremony
-        ) && self
+        ) && let Some(ending) = self
             .ceremony
-            .approval_ceremony_unreachable(&status.approval_id)
+            .unreachable_approval_ending(&status.approval_id)
         {
-            status.state = ApprovalLifecycleState::Expired;
+            status.state = ending;
         }
         Ok(())
     }
