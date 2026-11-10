@@ -636,11 +636,11 @@ use bloom_broker::{
     signer_client::BrokerSignerClient,
 };
 use bloom_broker_api::{
-    ActivationMode, ApprovalLimits, ApprovalPrepareRequest, ApprovalSelector, ApprovalSubject,
-    AssetId, Base64UrlBytes, BootEpoch, CanonicalWalletPolicy, CeremonyState, ClaimAssurance,
-    ClaimAssuranceLevel, CryptoSuite, CustodyPrepareResponse, DecimalU64, DecimalU256,
-    DeclaredDebit, DeclaredDestination, DeclaredFee, Digest32, KeyRef, KeySpec,
-    MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
+    ActivationMode, ApprovalLifecycleState, ApprovalLimits, ApprovalPrepareRequest,
+    ApprovalSelector, ApprovalSubject, AssetId, Base64UrlBytes, BootEpoch, CanonicalWalletPolicy,
+    CeremonyState, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite, CustodyPrepareResponse,
+    DecimalU64, DecimalU256, DeclaredDebit, DeclaredDestination, DeclaredFee, Digest32, KeyRef,
+    KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
     OperationId, OperationRequest, PROVENANCE_RECORD_SIGNATURE_DOMAIN, PetalKeyScope,
     PetalLineageMembership, PetalUseClaim, PolicyCommitUpdateRequest, PolicyDestination,
     PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceOperationClass,
@@ -6831,11 +6831,11 @@ async fn independently_read_message_fields_are_bound_into_the_signed_manifest() 
 }
 
 #[tokio::test]
-async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
+async fn an_approval_whose_only_ceremony_expired_is_reported_expired() {
     let signer = Arc::new(MockSigner::new());
     let now_ms: u64 = 1_700_000_000_000;
     let broker = CeremonyBroker::new_with_manifest_signer(
-        signer,
+        signer.clone(),
         Token::new("broker-review-key").unwrap(),
         SigningKey::from_bytes(&[33; 32]),
     );
@@ -6851,8 +6851,9 @@ async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
             .is_some(),
         "a live ceremony hands the owner a URL to complete"
     );
-    assert!(
-        !broker.approval_ceremony_unreachable(&approval_id),
+    assert_eq!(
+        broker.unreachable_approval_ending(&approval_id),
+        None,
         "an approval the owner can still complete is not unreachable"
     );
 
@@ -6863,10 +6864,126 @@ async fn an_approval_whose_only_ceremony_expired_is_reported_unreachable() {
             .is_none(),
         "an expired ceremony must not hand out a URL"
     );
-    assert!(
-        broker.approval_ceremony_unreachable(&approval_id),
+    assert_eq!(
+        broker.unreachable_approval_ending(&approval_id),
+        Some(ApprovalLifecycleState::Expired),
         "once the ceremony expires the owner has no way to reach this approval, so the caller \
          must be told to start a fresh lineage rather than poll AwaitingCeremony with no URL"
+    );
+    assert_eq!(
+        signer.completions.load(Ordering::SeqCst),
+        0,
+        "nothing was signed"
+    );
+}
+
+#[tokio::test]
+async fn an_approval_the_owner_cancelled_is_reported_cancelled_not_expired() {
+    let signer = Arc::new(MockSigner::new());
+    let now_ms: u64 = 1_700_000_000_000;
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        signer.clone(),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[35; 32]),
+    );
+    let response = broker
+        .prepare_approval(approval_request(), ReviewManifestContext::default(), now_ms)
+        .unwrap();
+
+    broker.cancel(&operation("17"), now_ms + 1).unwrap();
+
+    assert!(
+        broker
+            .pending_approval_ceremony(&response.approval_id, now_ms + 2)
+            .unwrap()
+            .is_none(),
+        "a cancelled ceremony must not hand out a URL"
+    );
+    assert_eq!(
+        broker.unreachable_approval_ending(&response.approval_id),
+        Some(ApprovalLifecycleState::Cancelled),
+        "the owner refused before the deadline; reporting EXPIRED hides that refusal"
+    );
+    assert_eq!(
+        signer.completions.load(Ordering::SeqCst),
+        0,
+        "nothing was signed"
+    );
+}
+
+#[tokio::test]
+async fn a_rolled_back_approval_ceremony_is_not_reported_cancelled() {
+    let broker = CeremonyBroker::new_with_manifest_signer(
+        Arc::new(MockSigner::new()),
+        Token::new("broker-review-key").unwrap(),
+        SigningKey::from_bytes(&[37; 32]),
+    );
+    let now_ms: u64 = 1_700_000_000_000;
+    let response = broker
+        .prepare_approval(approval_request(), ReviewManifestContext::default(), now_ms)
+        .unwrap();
+
+    broker.roll_back(&operation("17"), now_ms + 1).unwrap();
+
+    assert_eq!(broker.status(&operation("17")), Some(CeremonyState::Failed));
+    assert_eq!(
+        broker.unreachable_approval_ending(&response.approval_id),
+        Some(ApprovalLifecycleState::Expired),
+        "the Broker abandoned its own preparation; nobody refused"
+    );
+}
+
+#[tokio::test]
+async fn ceremonies_ending_in_the_same_millisecond_report_one_ending_across_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("ceremony.sqlite");
+    let journal = Arc::new(
+        BrokerJournal::open(
+            directory.path().join("journal.sqlite"),
+            Arc::new(ServiceTestAuditSigner),
+        )
+        .unwrap(),
+    );
+    let open = || {
+        CeremonyBroker::open_with_manifest_signer(
+            &path,
+            Arc::new(MockSigner::new()),
+            Token::new("broker-review-key").unwrap(),
+            SigningKey::from_bytes(&[36; 32]),
+            journal.clone(),
+        )
+        .unwrap()
+    };
+    let now_ms: u64 = 1_700_000_000_000;
+    let tie_ms = now_ms + 10_001;
+    let broker = open();
+    let first = broker
+        .prepare_approval(approval_request(), ReviewManifestContext::default(), now_ms)
+        .unwrap();
+    // The retry's prepare sweeps the first ceremony to `Expired` at `tie_ms`,
+    // and the owner cancels the retry in that same millisecond.
+    let mut retry = approval_request();
+    retry.activation_operation_id = operation("18");
+    let second = broker
+        .prepare_approval(retry, ReviewManifestContext::default(), tie_ms)
+        .unwrap();
+    assert_eq!(first.approval_id, second.approval_id);
+    broker.cancel(&operation("18"), tie_ms).unwrap();
+    assert_eq!(
+        broker.status(&operation("17")),
+        Some(CeremonyState::Expired)
+    );
+
+    // Both rows end at `tie_ms`; the later-created retry is the last word.
+    assert_eq!(
+        broker.unreachable_approval_ending(&first.approval_id),
+        Some(ApprovalLifecycleState::Cancelled)
+    );
+    drop(broker);
+    assert_eq!(
+        open().unreachable_approval_ending(&first.approval_id),
+        Some(ApprovalLifecycleState::Cancelled),
+        "reloading the same rows in another order must not change the answer"
     );
 }
 
@@ -8716,7 +8833,8 @@ fn login_session_disconnect_terminalizes_every_live_browser_session() {
     broker.terminate_live_sessions(10_001).unwrap();
 
     let status = broker.public_status(&operation_id).unwrap();
-    assert_eq!(status.state, CeremonyState::Cancelled);
+    // Nobody refused: logout is cleanup, so it must not read as a cancel.
+    assert_eq!(status.state, CeremonyState::Expired);
     assert!(status.ceremony_url.is_none());
     assert_eq!(signer.cancellations.load(Ordering::SeqCst), 1);
     prepare(&broker, operation("b0"), Some(wallet), 10_002);
