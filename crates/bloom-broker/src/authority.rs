@@ -434,6 +434,15 @@ pub struct BrokerAuthority {
     revocation_key_id: Token,
     revocation_key: VerifyingKey,
     assurance: AssuranceRegistry,
+    #[cfg(test)]
+    race_hooks: PolicyRaceHooks,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PolicyRaceHooks {
+    verified: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    barrier_contended: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -518,6 +527,8 @@ impl BrokerAuthority {
         assurance: AssuranceRegistry,
     ) -> Result<Self, AuthorityError> {
         let connection = journal.shared_connection();
+        let retired_policy_keys;
+        let cleanup_committed;
         {
             let mut connection = connection
                 .lock()
@@ -537,9 +548,6 @@ impl BrokerAuthority {
                 snapshot_jcs TEXT NOT NULL,
                 policy_jcs TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS wallet_deletion_audit
-              ON audit_chain(json_extract(payload_jcs, '$.wallet_id'))
-              WHERE event_type = 'wallet.projection_deleted';
             CREATE TABLE IF NOT EXISTS wallet_epochs (
                 wallet_id TEXT PRIMARY KEY,
                 epoch TEXT NOT NULL,
@@ -598,8 +606,16 @@ impl BrokerAuthority {
                 migrate_legacy_authority(&mut connection, legacy, &journal)?;
             }
             enforce_authority_state_floor(&connection)?;
+            (retired_policy_keys, cleanup_committed) =
+                recover_legacy_deleted_policies(&mut connection, &journal)?;
+        }
+        if cleanup_committed {
+            journal.checkpoint_committed_head()?;
         }
         let mut policy_keys = policy_keys;
+        for wallet in retired_policy_keys {
+            policy_keys.remove(&wallet);
+        }
         {
             let connection = connection
                 .lock()
@@ -625,6 +641,8 @@ impl BrokerAuthority {
             revocation_key_id,
             revocation_key,
             assurance,
+            #[cfg(test)]
+            race_hooks: PolicyRaceHooks::default(),
         })
     }
 
@@ -680,6 +698,29 @@ impl BrokerAuthority {
                 "initial wallet custody must install policy version 1",
             ));
         }
+        // A repeated completion of an earlier registration/import must not
+        // recreate its policy after a later deletion or replace a new incarnation.
+        if let (Some(operation), Some(receipt)) = (
+            &correlation.operation_id,
+            &correlation.ceremony_receipt_digest,
+        ) {
+            let connection = self.lock()?;
+            let adopted: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM audit_chain WHERE event_type = 'policy.installed'
+                 AND json_extract(payload_jcs, '$.wallet_id') = ?1
+                 AND json_extract(payload_jcs, '$.operation_id') = ?2
+                 AND json_extract(payload_jcs, '$.ceremony_receipt_digest') = ?3)",
+                params![
+                    snapshot.wallet_id.as_str(),
+                    operation.as_str(),
+                    receipt.as_str()
+                ],
+                |row| row.get(0),
+            )?;
+            if adopted {
+                return Ok(());
+            }
+        }
         let mut keys = self
             .policy_keys
             .lock()
@@ -703,6 +744,13 @@ impl BrokerAuthority {
             .map_err(|_| storage("policy key registry lock poisoned"))?;
         let policy = verify_policy_snapshot(snapshot, &keys)?;
         drop(keys);
+        #[cfg(test)]
+        {
+            let hook = self.race_hooks.verified.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         self.persist_verified_policy(snapshot, &policy, correlation)
     }
 
@@ -731,7 +779,6 @@ impl BrokerAuthority {
         let snapshot_jcs = serde_jcs::to_string(snapshot).map_err(storage)?;
         let policy_jcs = serde_jcs::to_string(&policy).map_err(storage)?;
         let connection = self.lock()?;
-        require_wallet_not_deleted(&connection, &snapshot.wallet_id)?;
         let exact: Option<(u64, String)> = connection
             .query_row(
                 "SELECT version, snapshot_jcs FROM policies WHERE wallet_id = ?1",
@@ -754,9 +801,6 @@ impl BrokerAuthority {
         drop(connection);
         let mut connection = self.lock_for_mutation()?;
         let transaction = connection.transaction()?;
-        // Deletion can commit between the read-only exact-match check and
-        // acquiring this transaction. Fence that in-flight policy read too.
-        require_wallet_not_deleted(&transaction, &snapshot.wallet_id)?;
         let existing: Option<(u64, String)> = transaction
             .query_row(
                 "SELECT version, snapshot_jcs FROM policies WHERE wallet_id = ?1",
@@ -879,26 +923,48 @@ impl BrokerAuthority {
                     "wallet deletion receipt retained public custody projections",
                 ));
             }
+            // Keep verification/persistence and deletion in the same ordering
+            // domain. Unpinning alone cannot invalidate an already-verified read.
+            let _barrier = self.lock_authorization_barrier()?;
             let mut connection = self.lock_for_mutation()?;
+            let adopted: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM audit_chain
+                 WHERE event_type = 'wallet.projection_deleted'
+                   AND json_extract(payload_jcs, '$.wallet_id') = ?1
+                   AND json_extract(payload_jcs, '$.custody_operation_id') = ?2
+                   AND json_extract(payload_jcs, '$.receipt_digest') = ?3)",
+                params![
+                    wallet_id.as_str(),
+                    receipt.custody_operation_id.as_str(),
+                    receipt.receipt_digest.as_str()
+                ],
+                |row| row.get(0),
+            )?;
+            if adopted {
+                return Ok(());
+            }
             let transaction = connection.transaction()?;
-            let removed = transaction.execute(
+            transaction.execute(
                 "DELETE FROM policies WHERE wallet_id = ?1",
                 [wallet_id.as_str()],
             )?;
-            if removed != 0 || !wallet_was_deleted(&transaction, wallet_id)? {
-                self.journal.append_external_audit(
-                    &transaction,
-                    "wallet.projection_deleted",
-                    &serde_json::json!({
-                        "wallet_id": wallet_id,
-                        "custody_operation_id": receipt.custody_operation_id,
-                        "receipt_digest": receipt.receipt_digest,
-                        "observed_at_ms": now_ms.to_string()
-                    }),
-                )?;
-            }
+            // Also retain deletion evidence when the policy was not cached.
+            self.journal.append_external_audit(
+                &transaction,
+                "wallet.projection_deleted",
+                &serde_json::json!({
+                    "wallet_id": wallet_id,
+                    "custody_operation_id": receipt.custody_operation_id,
+                    "receipt_digest": receipt.receipt_digest,
+                    "observed_at_ms": now_ms.to_string()
+                }),
+            )?;
             transaction.commit()?;
             drop(connection);
+            self.policy_keys
+                .lock()
+                .map_err(|_| storage("policy key registry lock poisoned"))?
+                .remove(wallet_id.as_str());
             self.journal.checkpoint_committed_head()?;
             return Ok(());
         }
@@ -2330,16 +2396,8 @@ impl BrokerAuthority {
 
     pub fn wallet_ids(&self) -> Result<Vec<Token>, AuthorityError> {
         let connection = self.lock()?;
-        // Released Brokers could reinstall an in-flight snapshot after
-        // deletion. The verified journal event remains authoritative even
-        // when such a stale policy row survived a restart.
-        let mut statement = connection.prepare(
-            "SELECT p.wallet_id FROM policies p WHERE NOT EXISTS (
-                SELECT 1 FROM audit_chain a
-                WHERE a.event_type = 'wallet.projection_deleted'
-                  AND json_extract(a.payload_jcs, '$.wallet_id') = p.wallet_id
-             ) ORDER BY p.wallet_id",
-        )?;
+        let mut statement =
+            connection.prepare("SELECT wallet_id FROM policies ORDER BY wallet_id")?;
         statement
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?
@@ -3264,7 +3322,6 @@ impl BrokerAuthority {
         wallet_id: &Token,
     ) -> Result<(SignedPolicySnapshot, CanonicalWalletPolicy), AuthorityError> {
         let connection = self.lock()?;
-        require_wallet_not_deleted(&connection, wallet_id)?;
         connection
             .query_row(
                 "SELECT snapshot_jcs, policy_jcs FROM policies WHERE wallet_id = ?1",
@@ -3377,32 +3434,128 @@ impl BrokerAuthority {
     }
 
     fn lock_authorization_barrier(&self) -> Result<MutexGuard<'_, ()>, AuthorityError> {
+        #[cfg(test)]
+        {
+            let hook = self.race_hooks.barrier_contended.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                match self.authorization_barrier.try_lock() {
+                    Ok(guard) => return Ok(guard),
+                    Err(std::sync::TryLockError::WouldBlock) => hook(),
+                    Err(_) => return Err(storage("authorization barrier poisoned")),
+                }
+            }
+        }
         self.authorization_barrier
             .lock()
             .map_err(|_| AuthorityError::Storage("authorization barrier poisoned".into()))
     }
 }
 
-fn wallet_was_deleted(connection: &Connection, wallet_id: &Token) -> Result<bool, AuthorityError> {
-    connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM audit_chain
-         WHERE event_type = 'wallet.projection_deleted'
-           AND json_extract(payload_jcs, '$.wallet_id') = ?1)",
-            [wallet_id.as_str()],
-            |row| row.get(0),
-        )
-        .map_err(Into::into)
-}
-
-fn require_wallet_not_deleted(
-    connection: &Connection,
-    wallet_id: &Token,
-) -> Result<(), AuthorityError> {
-    if wallet_was_deleted(connection, wallet_id)? {
-        return Err(denied("POLICY_NOT_FOUND", "wallet was deleted"));
+/// Remove only rows proven to have been reinstalled by a released late read.
+/// The journal is verified before using its event order as migration authority.
+/// A later initial policy with custody-receipt correlation starts a new wallet
+/// incarnation; policy updates and ordinary reads cannot do that.
+fn recover_legacy_deleted_policies(
+    connection: &mut Connection,
+    journal: &BrokerJournal,
+) -> Result<(BTreeSet<String>, bool), AuthorityError> {
+    if journal.audit_degraded() {
+        return Ok((BTreeSet::new(), false));
     }
-    Ok(())
+    journal.verify_migration_target(connection)?;
+    // wallet -> (latest deletion sequence, latest uncorrelated install proof)
+    type ReadProof = (i64, String, String);
+    let mut deleted: BTreeMap<String, (i64, Option<ReadProof>)> = BTreeMap::new();
+    {
+        let mut statement = connection.prepare(
+            "SELECT sequence, event_type, payload_jcs FROM audit_chain
+             WHERE event_type IN ('wallet.projection_deleted', 'policy.installed')
+             ORDER BY sequence",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (sequence, event, encoded) = row?;
+            let value: serde_json::Value = serde_json::from_str(&encoded).map_err(storage)?;
+            let Some(wallet) = value["wallet_id"].as_str() else {
+                continue;
+            };
+            if event == "wallet.projection_deleted" {
+                deleted.insert(wallet.to_owned(), (sequence, None));
+                continue;
+            }
+            let initial_custody = value["version"].as_str() == Some("1")
+                && value["operation_id"].as_str().is_some()
+                && value["ceremony_receipt_digest"].as_str().is_some()
+                && value["validation_receipt_digest"].is_null()
+                && value["commit_receipt_digest"].is_null();
+            if initial_custody {
+                // This correlation is emitted only after adopting the verified
+                // registration/import receipt, not by an ordinary policy read.
+                deleted.remove(wallet);
+            } else if let Some((_, latest)) = deleted.get_mut(wallet) {
+                *latest = match (value["version"].as_str(), value["policy_digest"].as_str()) {
+                    (Some(version), Some(digest)) if value["ceremony_receipt_digest"].is_null() => {
+                        Some((sequence, version.to_owned(), digest.to_owned()))
+                    }
+                    _ => None,
+                };
+            }
+        }
+    }
+    let mut unpin = BTreeSet::new();
+    let mut stale = Vec::new();
+    for (wallet, (deletion_sequence, proof)) in deleted {
+        let current: Option<(String, String)> = connection
+            .query_row(
+                "SELECT version, digest FROM policies WHERE wallet_id = ?1",
+                [&wallet],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match (current, proof) {
+            (None, _) => {
+                unpin.insert(wallet);
+            }
+            (Some((version, digest)), Some((install_sequence, proven_version, proven_digest)))
+                if version == proven_version && digest == proven_digest =>
+            {
+                stale.push((wallet, deletion_sequence, install_sequence, version, digest));
+            }
+            _ => {
+                // Incomplete or contradictory history is not authority to
+                // delete a row. Preserve it for explicit investigation.
+                tracing::warn!(
+                    event = "wallet.legacy_projection_unclassified",
+                    "Retained a wallet policy without conclusive late-read evidence"
+                );
+            }
+        }
+    }
+    if stale.is_empty() {
+        return Ok((unpin, false));
+    }
+    let transaction = connection.transaction()?;
+    for (wallet, deletion_sequence, install_sequence, version, digest) in stale {
+        transaction.execute("DELETE FROM policies WHERE wallet_id = ?1", [&wallet])?;
+        journal.append_external_audit(
+            &transaction,
+            "wallet.legacy_projection_removed",
+            &serde_json::json!({
+                "wallet_id": wallet, "deletion_sequence": deletion_sequence,
+                "policy_install_sequence": install_sequence, "version": version,
+                "policy_digest": digest,
+            }),
+        )?;
+        unpin.insert(wallet);
+    }
+    transaction.commit()?;
+    Ok((unpin, true))
 }
 
 fn petal_payload_batch_digest(payloads: &[Vec<u8>]) -> Digest32 {
@@ -4364,3 +4517,7 @@ mod legacy_attach_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "authority/deletion_tests.rs"]
+mod deletion_tests;

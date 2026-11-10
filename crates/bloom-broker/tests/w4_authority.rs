@@ -4443,7 +4443,7 @@ fn deleted_wallet_policy_cannot_be_reinstalled_by_a_late_read() {
 }
 
 #[test]
-fn legacy_resurrected_policy_is_not_projected_after_restart() {
+fn legacy_policy_row_without_late_read_evidence_is_preserved() {
     let directory = tempfile::tempdir().unwrap();
     let harness = Harness::open_at(directory.path());
     let connection = rusqlite::Connection::open(directory.path().join("journal.sqlite")).unwrap();
@@ -4463,8 +4463,8 @@ fn legacy_resurrected_policy_is_not_projected_after_restart() {
         )
         .unwrap();
     delete_fixture_wallet(&harness);
-    // Model a released Broker installing its in-flight policy read after
-    // committing the deletion. Its verified deletion event remains durable.
+    // A row alone is not proof of a released late read: deliberately omit
+    // its policy.installed audit entry and require non-destructive handling.
     connection
         .execute(
             "INSERT INTO policies VALUES (?1,?2,?3,?4,?5)",
@@ -4474,19 +4474,11 @@ fn legacy_resurrected_policy_is_not_projected_after_restart() {
     drop(connection);
     drop(harness);
     let reopened = Harness::open_at(directory.path());
-    assert!(reopened.authority.wallet_ids().unwrap().is_empty());
-    assert!(
-        reopened
-            .authority
-            .policy_snapshot(&reopened.wallet)
-            .is_err()
+    assert_eq!(
+        reopened.authority.wallet_ids().unwrap(),
+        vec![reopened.wallet.clone()]
     );
-    assert!(
-        reopened
-            .authority
-            .install_policy(&reopened.policy_snapshot(1))
-            .is_err()
-    );
+    assert!(reopened.authority.policy_snapshot(&reopened.wallet).is_ok());
 }
 
 #[test]
@@ -4508,4 +4500,50 @@ fn deletion_without_a_cached_policy_still_prevents_late_installation() {
             .install_policy(&harness.policy_snapshot(1))
             .is_err()
     );
+}
+
+#[test]
+fn deletion_allows_a_later_authorized_registration_or_import() {
+    for kind in [CeremonyKind::WalletRegistration, CeremonyKind::WalletImport] {
+        let directory = tempfile::tempdir().unwrap();
+        let harness = Harness::open_at(directory.path());
+        delete_fixture_wallet(&harness);
+        let policy = harness.policy_snapshot(1);
+        let mut receipt = CustodyResult {
+            surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                surface_id: token("local"),
+                identity_digest: digest(91),
+            }),
+            credential_authority_generation: Some(DecimalU64::new(0)),
+            ceremony_kind: kind,
+            custody_operation_id: operation(91),
+            public_status: kind.successful_terminal_state().unwrap(),
+            wallet_id: Some(harness.wallet.clone()),
+            public_key_refs: Vec::new(),
+            credential_summaries: Vec::new(),
+            initial_policy: Some(policy.clone()),
+            receipt_digest: digest(91),
+            encrypted_browser_result: None,
+            signer_key_id: token("ceremony-key"),
+            signer_signature: Base64UrlBytes::from_bytes(&[]),
+        };
+        sign_custody_receipt(&mut receipt, &harness.ceremony_key);
+        harness
+            .authority
+            .adopt_custody_receipt(&receipt, 2_000)
+            .expect("a new authorized custody incarnation must not be blocked by an old deletion");
+        assert_eq!(
+            harness.authority.policy_snapshot(&harness.wallet).unwrap(),
+            policy
+        );
+        drop(harness);
+        let reopened = Harness::open_at(directory.path());
+        assert_eq!(
+            reopened
+                .authority
+                .policy_snapshot(&reopened.wallet)
+                .unwrap(),
+            policy
+        );
+    }
 }
