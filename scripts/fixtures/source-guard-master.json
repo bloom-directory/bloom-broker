@@ -1,5 +1,5 @@
 {
-  "master_commit": "b6c273397ca0f24f85e7279390fd59f502f290e4",
+  "master_commit": "0a9a8dae12e86237cb9d6ba63a2456d7c0871cf9",
   "contract_addresses": [
     "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
     "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
@@ -416,7 +416,9 @@
     "crates/bloom-evm-clear-signing/src/render.rs:warnings.push(\"This Enso call has no output minimums. The receiver field alone does not require any funds to arrive.\".into());",
     "crates/bloom-evm-clear-signing/src/render.rs:| AdmittedFormat::EnsoShortcut => {",
     "crates/bloom-evm-clear-signing/src/render.rs:| AdmittedFormat::EnsoToken(_)",
-    "crates/bloom-evm-clear-signing/src/render.rs:| AdmittedFormat::EnsoTokenOutput(_)"
+    "crates/bloom-evm-clear-signing/src/render.rs:| AdmittedFormat::EnsoTokenOutput(_)",
+    "crates/bloom-broker/src/ceremony_assets/app.js:chainId, networkIdentity: solana ? \"Solana \u00b7 network not stated in the transaction\" : hyperliquid ? `Hyperliquid \u00b7 ${venueNetwork || \"Unknown environment\"}`",
+    "crates/bloom-broker/src/ceremony_assets/app.js:if (enso && index) stage.append(el(\"div\", {class: \"ceremony-flow-arrow\", \"aria-hidden\": \"true\"}, \"\u2193\"));"
   ],
   "initial_allowlist": [
     "crates/bloom-broker-api/src/address.rs:| \"hyperliquid\" | \"linea\" | \"optimism\" | \"polygon\" | \"robinhood\" | \"tempo\" => {",
@@ -698,6 +700,9 @@
     "crates/bloom-evm-clear-signing/src/render.rs:warnings.push(\"This Enso call has no output minimums. The receiver field alone does not require any funds to arrive.\".into());",
     "crates/bloom-evm-clear-signing/src/render.rs:| AdmittedFormat::EnsoShortcut => {",
     "crates/bloom-evm-clear-signing/src/render.rs:| AdmittedFormat::EnsoToken(_)",
-    "crates/bloom-evm-clear-signing/src/render.rs:| AdmittedFormat::EnsoTokenOutput(_)"
-  ]
+    "crates/bloom-evm-clear-signing/src/render.rs:| AdmittedFormat::EnsoTokenOutput(_)",
+    "crates/bloom-broker/src/ceremony_assets/app.js:chainId, networkIdentity: solana ? \"Solana \u00b7 network not stated in the transaction\" : hyperliquid ? `Hyperliquid \u00b7 ${venueNetwork || \"Unknown environment\"}`",
+    "crates/bloom-broker/src/ceremony_assets/app.js:if (enso && index) stage.append(el(\"div\", {class: \"ceremony-flow-arrow\", \"aria-hidden\": \"true\"}, \"\u2193\"));"
+  ],
+  "previous_master_commit": "b6c273397ca0f24f85e7279390fd59f502f290e4"
 }

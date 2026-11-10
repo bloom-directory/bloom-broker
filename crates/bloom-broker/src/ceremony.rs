@@ -4252,8 +4252,38 @@ async fn read_wallet(
         &descriptors,
         &crate::translation::wallet_account::production_chain_targets(),
     ) {
-        Ok(accounts) => Json(accounts).into_response(),
+        Ok(accounts) => match serde_json::to_value(accounts) {
+            Ok(mut value) => {
+                add_address_qr_codes(&mut value);
+                Json(value).into_response()
+            }
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+/// Add an `address_qr` SVG beside each chain address, so the wallet page can
+/// show a scannable deposit code without a script-side encoder.
+fn add_address_qr_codes(accounts: &mut serde_json::Value) {
+    let chains = accounts["accounts"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .filter_map(|account| account["chain_projections"].as_array_mut())
+        .flatten();
+    for chain in chains {
+        let Some(address) = chain["address"].as_str() else {
+            continue;
+        };
+        if let Ok(code) = qrcode::QrCode::new(address.as_bytes()) {
+            let svg = code
+                .render::<qrcode::render::svg::Color>()
+                // The page frames it with a white margin instead.
+                .quiet_zone(false)
+                .build();
+            chain["address_qr"] = serde_json::Value::String(svg);
+        }
     }
 }
 
