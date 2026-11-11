@@ -177,13 +177,7 @@ pub(super) fn validate_builder_fee(
     claim: &bloom_broker_api::PetalUseClaim,
     review: &MessageReview,
 ) -> Result<(), ProtocolError> {
-    let bound = review
-        .fields
-        .iter()
-        .find(|field| field.path == BUILDER_FEE_FIELD)
-        .map(|field| field.value.parse::<u64>())
-        .transpose()
-        .map_err(|_| invalid("invalid builder fee bound"))?;
+    let bound = review.builder_fee_bound;
     let builder_class = claim.operation_class.as_str() == BUILDER_ORDER_CLASS;
     match (bound, builder_class) {
         (None, false) => Ok(()),
@@ -401,7 +395,7 @@ pub(super) fn rebuild(
     vault: Option<&str>,
     expires: Option<u64>,
     field_limit: usize,
-) -> Result<(Value, Vec<MessageField>, String), ProtocolError> {
+) -> Result<(Value, Vec<MessageField>, String, Option<u64>), ProtocolError> {
     let source = match network {
         "mainnet" => "a",
         "testnet" => "b",
@@ -469,16 +463,16 @@ pub(super) fn rebuild(
         ),
     ];
     collect(&canonical, "action", &mut fields, field_limit)?;
-    if let Action::Order {
-        orders,
-        builder: Some(builder),
-        ..
-    } = &action
-    {
-        fields.push(field(
-            BUILDER_FEE_FIELD,
-            builder_fee_bound(orders, builder.f)?,
-        ));
+    let fee_bound = match &action {
+        Action::Order {
+            orders,
+            builder: Some(builder),
+            ..
+        } => Some(builder_fee_bound(orders, builder.f)?),
+        _ => None,
+    };
+    if let Some(bound) = fee_bound {
+        fields.push(field(BUILDER_FEE_FIELD, bound));
     }
     for field in &mut fields {
         if let Some(prefix) = field.path.strip_suffix(MARKET_ID)
@@ -526,7 +520,7 @@ pub(super) fn rebuild(
         Action::ScheduleCancel { time: None } => "Remove scheduled exchange cancellation",
         Action::UpdateLeverage { .. } => "Change exchange leverage",
     };
-    Ok((typed, fields, title.into()))
+    Ok((typed, fields, title.into(), fee_bound))
 }
 
 pub(super) fn decorate(typed: &alloy_dyn_abi::eip712::TypedData, review: &mut MessageReview) {
@@ -711,7 +705,7 @@ mod tests {
                 vector["messagepack"],
                 "{vector}"
             );
-            let (typed, _, _) = rebuild(
+            let (typed, _, _, _) = rebuild(
                 vector["network"].as_str().unwrap(),
                 vector["action"].clone(),
                 vector["nonce"].as_u64().unwrap(),
@@ -796,7 +790,7 @@ mod tests {
                 "0x00000000000000000000000000000001",
             ),
         ] {
-            let (_, fields, _) =
+            let (_, fields, _, _) =
                 rebuild("mainnet", action, 123, None, None, super::super::MAX_FIELDS).unwrap();
             assert!(
                 fields
@@ -819,7 +813,7 @@ mod tests {
     #[test]
     fn orders_read_in_plain_words() {
         let action = json!({"type":"order","orders":[{"a":1,"b":true,"p":"2260","s":"0.0045","r":false,"t":{"limit":{"tif":"Ioc"}}}],"grouping":"na"});
-        let (_, fields, title) =
+        let (_, fields, title, _) =
             rebuild("mainnet", action, 1, None, None, super::super::MAX_FIELDS).unwrap();
         let shown = |path: &str| {
             fields
@@ -838,7 +832,7 @@ mod tests {
             ("Alo", "Post only (rejected if it would fill immediately)"),
         ] {
             let action = json!({"type":"order","orders":[{"a":1,"b":true,"p":"2260","s":"0.0045","r":false,"t":{"limit":{"tif":tif}}}],"grouping":"na"});
-            let (_, fields, _) =
+            let (_, fields, _, _) =
                 rebuild("mainnet", action, 1, None, None, super::super::MAX_FIELDS).unwrap();
             assert!(
                 fields
@@ -851,7 +845,7 @@ mod tests {
         assert_eq!(shown("Order 1 · Market"), Some("ETH perpetual (market 1)"));
         assert_eq!(title, "Buy 0.0045 ETH for up to 2260 USDC each");
         let spot = json!({"type":"order","orders":[{"a":10107,"b":false,"p":"40","s":"2","r":false,"t":{"limit":{"tif":"Gtc"}}}],"grouping":"na"});
-        let (_, _, title) =
+        let (_, _, title, _) =
             rebuild("mainnet", spot, 1, None, None, super::super::MAX_FIELDS).unwrap();
         assert_eq!(title, "Sell 2 HYPE for at least 40 USDC each");
         let batch = json!({"type":"order","orders":[
@@ -859,7 +853,7 @@ mod tests {
             {"a":1,"b":false,"p":"2000","s":"1","r":true,"t":{"trigger":{"isMarket":true,"triggerPx":"2100","tpsl":"tp"}}},
             {"a":9999,"b":false,"p":"1","s":"1","r":true,"t":{"trigger":{"isMarket":false,"triggerPx":"2","tpsl":"sl"}}}
         ],"grouping":"normalTpsl"});
-        let (_, fields, title) =
+        let (_, fields, title, _) =
             rebuild("mainnet", batch, 1, None, None, super::super::MAX_FIELDS).unwrap();
         let shown = |path: &str| {
             fields
@@ -888,7 +882,7 @@ mod tests {
         );
         assert_eq!(shown("Order 3 · Trigger type"), Some("Stop loss"));
         let unknown = json!({"type":"order","orders":[{"a":9999,"b":true,"p":"1","s":"1","r":false,"t":{"limit":{"tif":"Gtc"}}}],"grouping":"na"});
-        let (_, fields, _) =
+        let (_, fields, _, _) =
             rebuild("testnet", unknown, 1, None, None, super::super::MAX_FIELDS).unwrap();
         assert!(
             fields
@@ -908,7 +902,7 @@ mod tests {
     #[test]
     fn ordered_messagepack_matches_official_sdk_vault_and_expiry_vector() {
         let action = json!({"type":"order","orders":[{"a":0,"b":true,"p":"100","s":"0.01","r":false,"t":{"limit":{"tif":"Gtc"}}}],"grouping":"na"});
-        let (typed, fields, _) = rebuild(
+        let (typed, fields, _, _) = rebuild(
             "mainnet",
             action.clone(),
             123,

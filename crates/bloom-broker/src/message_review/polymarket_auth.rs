@@ -82,7 +82,7 @@ pub(crate) fn review(
     Ok(MessageReview {
         kind:"polymarket_auth_scope".into(), title:"Allow one Polymarket CLOB authentication".into(),
         signer:format!("{owner:#x}"), payload_keccak:String::new(), payment:None,
-        venue_asset:None, collateral_asset:None,
+        venue_asset:None, collateral_asset:None, builder_fee_bound: None,
         domain:vec![field("name","ClobAuthDomain"),field("version","1"),field("chainId","137")],
         fields:vec![field("Permission profile",POLYMARKET_CLOB_AUTH_CLASS),field("Signed attestation",ATTESTATION),
             field("Nonce","0"),field("Signature limit","One signature in one operation"),

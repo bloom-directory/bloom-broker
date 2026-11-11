@@ -126,6 +126,10 @@ pub struct MessageReview {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collateral_asset: Option<bloom_evm_clear_signing::FieldAsset>,
     pub warnings: Vec<String>,
+    /// Broker's bound on an L1 order's builder fee in micro-USDC, checked
+    /// against the claim. Never read back from the displayed fields.
+    #[serde(skip)]
+    pub builder_fee_bound: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -485,7 +489,7 @@ fn decode_with_exchange_limit(
     let envelope: Envelope =
         serde_json::from_slice(bytes).map_err(|_| invalid("invalid message review envelope"))?;
     let mut review = MessageReview { kind: String::new(), title: String::new(), signer: format!("{signer:#x}"),
-        payload_keccak: String::new(), domain: Vec::new(), fields: Vec::new(), payment: None, venue_asset: None, collateral_asset: None,
+        payload_keccak: String::new(), domain: Vec::new(), fields: Vec::new(), payment: None, venue_asset: None, collateral_asset: None, builder_fee_bound: None,
         warnings: vec!["Bloom verified the signed fields, not their execution effects or the identity of an unlisted application.".into()] };
     let preimage = match envelope {
         Envelope::HyperliquidL1 {
@@ -500,7 +504,7 @@ fn decode_with_exchange_limit(
                 return Err(invalid("unsupported message review schema"));
             }
             bounded(&action, 0, &mut 0)?;
-            let (typed_data, fields, title) = hyperliquid::rebuild(
+            let (typed_data, fields, title, builder_fee_bound) = hyperliquid::rebuild(
                 &network,
                 action,
                 nonce,
@@ -516,6 +520,7 @@ fn decode_with_exchange_limit(
             review.kind = "hyperliquid_l1".into();
             review.title = title;
             review.fields = fields;
+            review.builder_fee_bound = builder_fee_bound;
             review.warnings.push("Bloom rebuilt the exchange action's MessagePack commitment. Market IDs, order bounds and fees are signed. Market names come from a list bundled with this Bloom release; Bloom has not checked available balance, fills or venue execution.".into());
             return Ok((preimage, review));
         }
@@ -939,6 +944,13 @@ fn validate_petal_profile(
     {
         return Err(invalid(
             "Polymarket exact review derives its facts from signed fields, not financial claim overrides",
+        ));
+    }
+    // A generic `Agent` envelope signs the same bytes but hides the order, so
+    // a builder order must arrive as an L1 action Broker can bound.
+    if class == hyperliquid::BUILDER_ORDER_CLASS && review.kind != "hyperliquid_l1" {
+        return Err(invalid(
+            "hyperliquid.builder_order requires its Hyperliquid L1 action review",
         ));
     }
     if review.kind == "hyperliquid_l1" {
@@ -1417,6 +1429,59 @@ mod tests {
         reading.domain.retain(|field| field.path != "primaryType");
         let error = validate_petal_profile(&request, &reading).unwrap_err();
         assert!(error.message.contains("ERC-3009"), "{}", error.message);
+    }
+
+    /// An exact builder order sent as a generic `Agent` envelope signs the
+    /// same bytes but hides the order, so it must not skip the fee bound.
+    #[test]
+    fn exact_builder_order_requires_its_l1_review() {
+        use bloom_broker_api::{ClaimAssurance, DeclaredFee, PetalUseClaim};
+        let builder = format!("{:#x}", Address::with_last_byte(0xbb));
+        let action = json!({"type":"order","orders":[{"a":0,"b":true,"p":"50000","s":"0.01",
+            "r":false,"t":{"limit":{"tif":"Gtc"}}}],"grouping":"na","builder":{"b":builder,"f":10}});
+        let l1 = serde_json::to_vec(&json!({"schema":SCHEMA,"kind":"hyperliquid_l1",
+            "network":"mainnet","action":action.clone(),"nonce":1u64}))
+        .unwrap();
+        let (typed, ..) =
+            hyperliquid::rebuild("mainnet", action, 1, None, None, MAX_FIELDS).unwrap();
+        let generic =
+            serde_json::to_vec(&json!({"schema":SCHEMA,"kind":"eip712","typed_data":typed}))
+                .unwrap();
+        let (l1_bytes, l1_review) = decode(&l1, signer()).unwrap();
+        let (generic_bytes, generic_review) = decode(&generic, signer()).unwrap();
+        assert_eq!(l1_bytes, generic_bytes);
+
+        let mut request = request(generic);
+        request.petal_use_claim = Some(PetalUseClaim {
+            package_hash: Digest32::from_bytes([1; 32]),
+            route: "agent/order".into(),
+            operation_class: Token::new(hyperliquid::BUILDER_ORDER_CLASS).unwrap(),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: Digest32::from_bytes([2; 32]),
+            ordered_hashes: vec![],
+            declared_debits: vec![],
+            declared_destinations: vec![],
+            // The order's bound is 50000 micro-USDC.
+            declared_fee: DeclaredFee::Fee {
+                chain: Token::new("hyperliquid").unwrap(),
+                asset: "usdc".into(),
+                amount: bloom_broker_api::DecimalU256::parse("1").unwrap(),
+            },
+            nonce: RequestNonce::from_bytes([3; 16]),
+            claim_assurance: ClaimAssurance::MachineAsserted,
+        });
+        let error = validate_petal_profile(&request, &generic_review).unwrap_err();
+        assert!(
+            error.message.contains("L1 action review"),
+            "{}",
+            error.message
+        );
+        let error = validate_petal_profile(&request, &l1_review).unwrap_err();
+        assert!(
+            error.message.contains("at least 50000"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
