@@ -2138,6 +2138,13 @@ async function showCreatedWallet(session, attempts = 1) {
 function renderDone(session, result) {
   const meta = KINDS[session.ceremony_kind] || {};
   const receipt = result?.receipt_digest || result?.approval_id || "";
+  const crossWallet = session.cross_surface?.wallet_id ||
+    (session.review_manifest?.schema === "bloom.cross_surface_add_review.v1" && session.review_manifest.wallet_name);
+  if (crossWallet) {
+    // A reopened paired enrollment ends exactly like one finished in place.
+    showCrossOutcome(crossDoneOutcome(crossWallet, receipt));
+    return;
+  }
   markDone(`${meta.title || "Ceremony"} — done`);
   reviewNode.replaceChildren(
     el("h3", {class: "result-title ok"}, `${meta.title || "Ceremony"} — done`),
@@ -2522,6 +2529,139 @@ function validateCrossPrepared(session, prepared, pairingId) {
     throw new Error("Paired enrollment binding changed");
   }
 }
+// ---- Paired add-passkey presentation ----------------------------------
+// Two people (or one person on two devices) take turns: the new device asks,
+// an existing passkey approves, the new device creates its passkey. The page
+// shows both people, whose turn it is, and one action at a time. None of this
+// changes what is signed, bound or sent.
+function crossIcon(name) {
+  const svg = el("svg", {viewBox: "0 0 24 24", "aria-hidden": "true", focusable: "false",
+    fill: "none", stroke: "currentColor", "stroke-width": "1.8", "stroke-linecap": "round", "stroke-linejoin": "round"});
+  const paths = {
+    person: [["circle", {cx: "12", cy: "8", r: "3.6"}], ["path", {d: "M4.8 20c.6-3.9 3.4-6 7.2-6s6.6 2.1 7.2 6"}]],
+    check: [["path", {d: "M5.5 12.5l4.2 4.2L18.5 7.8"}]],
+    info: [["path", {d: "M12 11v6"}], ["path", {d: "M12 7.4v.2"}]],
+    stop: [["path", {d: "M8 8l8 8M16 8l-8 8"}]],
+    clock: [["circle", {cx: "12", cy: "12", r: "7.5"}], ["path", {d: "M12 8v4.4l2.8 1.8"}]]
+  };
+  for (const [tag, attrs] of paths[name]) svg.append(el(tag, attrs));
+  return svg;
+}
+// The shared loading indicator: decorative only, its words carry the state.
+function spinner() { return el("span", {class: "spinner", "aria-hidden": "true"}); }
+function setBusy(button, label) {
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  button.replaceChildren(spinner(), label);
+}
+function setAction(button, label) {
+  button.removeAttribute("aria-busy");
+  button.textContent = label;
+}
+
+const CROSS_STEPS = [
+  {by: "requester", title: "Get an approval link"},
+  {by: "approver", title: "Check the code and approve"},
+  {by: "requester", title: "Create the new passkey"}
+];
+function crossPeople(cross) {
+  const isSource = cross.role === "source";
+  const wallet = cross.wallet_id;
+  const columns = {};
+  const person = (key, name, role) => {
+    const steps = el("ol", {class: "cross-steps"});
+    CROSS_STEPS.forEach((step, index) => {
+      if (step.by === key) steps.append(el("li", {"data-step": String(index + 1)},
+        el("span", {class: "cross-step-mark", "aria-hidden": "true"}), el("span", {}, step.title)));
+    });
+    const chip = el("p", {class: "cross-chip"});
+    const node = el("div", {class: "cross-person"},
+      el("div", {class: "cross-avatar"}, crossIcon("person")),
+      el("p", {class: "cross-person-name"}, name),
+      el("p", {class: "cross-person-role"}, role),
+      chip, steps);
+    columns[key] = {node, chip, steps, you: (key === "approver") === isSource};
+    return node;
+  };
+  const root = el("div", {class: "cross-people", role: "group", "aria-label": "Who does what"},
+    person("requester", isSource ? "New device" : "You",
+      isSource ? "Will get its own passkey" : "This device gets the new passkey"),
+    el("div", {class: "cross-connector", "aria-hidden": "true"}, el("span", {})),
+    person("approver", isSource ? "You" : "Approver",
+      isSource ? `Your passkey for ${wallet} approves` : `Already has a passkey for ${wallet}`));
+  // `current` is the 1-based step in progress.
+  const setStep = current => {
+    for (const [key, column] of Object.entries(columns)) {
+      const mine = CROSS_STEPS.map((step, i) => ({...step, n: i + 1})).filter(step => step.by === key);
+      const active = CROSS_STEPS[current - 1]?.by === key;
+      const finished = mine.every(step => step.n < current);
+      column.node.dataset.state = active ? "active" : finished ? "done" : "waiting";
+      column.chip.replaceChildren(...(active && !column.you ? [spinner()] : []),
+        active ? (column.you ? "Your turn" : "Their turn") : finished ? "Done" : "Waiting");
+      for (const item of column.steps.children) {
+        const n = Number(item.dataset.step);
+        item.dataset.state = n < current ? "done" : n === current ? "active" : "pending";
+        item.firstChild.replaceChildren(n < current ? crossIcon("check") : String(n));
+      }
+    }
+  };
+  return {root, setStep};
+}
+function crossDetails(cross) {
+  const sameSite = cross.source_origin === cross.destination_origin;
+  return el("details", {class: "ceremony-details"}, el("summary", {}, "Details"),
+    el("dl", {class: "facts"},
+      el("dt", {}, "Wallet"), el("dd", {}, cross.wallet_id),
+      ...(sameSite
+        ? [el("dt", {}, "Site"), el("dd", {}, cross.destination_origin)]
+        : [el("dt", {}, "Existing passkey"), el("dd", {}, cross.source_origin),
+          el("dt", {}, "New passkey"), el("dd", {}, cross.destination_origin)])));
+}
+function crossCode(code, caption) {
+  return el("div", {class: "cross-code"},
+    el("p", {class: "cross-code-label"}, "Confirmation code"),
+    el("p", {class: "cross-code-digits", "aria-label": code.split("").join(" ")},
+      code.slice(0, 3), el("span", {class: "cross-code-gap"}), code.slice(3)),
+    caption ? el("p", {class: "cross-code-caption"}, caption) : null);
+}
+function walletName(name) { return el("strong", {class: "cross-wallet"}, name); }
+// A finished paired enrollment, whatever its outcome, is one short message:
+// no code, countdown, steps or controls are left on screen.
+function showCrossOutcome({tone, title, lines = [], receipt = ""}) {
+  approvalTerminal = true;
+  clearInterval(expiryTimer);
+  const deadline = document.getElementById("review-deadline");
+  if (deadline) deadline.textContent = "";
+  approve.hidden = true;
+  cancel.hidden = true;
+  const actions = document.getElementById("ceremony-actions");
+  if (actions) actions.hidden = true;
+  document.getElementById("ceremony-page")?.classList.add("cross-outcome");
+  const pageTitle = document.getElementById("page-title");
+  if (pageTitle) pageTitle.textContent = "";
+  const pageLede = document.getElementById("page-lede");
+  if (pageLede) pageLede.textContent = "Add a passkey";
+  document.getElementById("cross-outcome-icon")?.remove();
+  panelTitle.before?.(el("div", {id: "cross-outcome-icon", class: "cross-outcome-icon", "data-tone": tone},
+    crossIcon({success: "check", info: "info", danger: "stop", expired: "clock"}[tone] || "info")));
+  panelTitle.textContent = title;
+  statusNode.textContent = "";
+  reviewNode.replaceChildren(
+    ...lines.map(line => el("p", {class: "summary"}, ...[].concat(line))),
+    ...(receipt ? [el("details", {class: "ceremony-details"}, el("summary", {}, "Receipt"),
+      el("dl", {class: "facts"}, el("dt", {}, "Receipt"), el("dd", {}, el("code", {}, receipt))))] : []));
+  // The control that had focus is gone; move focus to the outcome so it is
+  // read out and keyboard users are not left on the document.
+  panelTitle.setAttribute?.("tabindex", "-1");
+  panelTitle.focus?.({preventScroll: true});
+}
+function crossDoneOutcome(wallet, receipt) {
+  return {tone: "success", title: "Passkey added", receipt, lines: [
+    ["This device can now approve for ", walletName(wallet), "."],
+    "The wallet and its addresses are unchanged. You can close this tab."
+  ]};
+}
+
 async function finishAlreadyRegistered(session, state) {
   const wallet = session.cross_surface.wallet_id;
   try {
@@ -2535,15 +2675,10 @@ async function finishAlreadyRegistered(session, state) {
   if (crossSurfaceState === state) stopCrossSurface();
   clearInterval(expiryTimer);
   clearSessionToken();
-  approve.hidden = true;
-  cancel.hidden = true;
-  markDone(`This device can already approve for ${wallet}`);
-  statusNode.textContent = "Nothing to add.";
-  reviewNode.replaceChildren(
-    el("h3", {class: "result-title ok"}, `This device can already approve for ${wallet}`),
-    el("p", {class: "summary"}, `Your passkey provider already has a passkey for ${wallet}, so there's nothing to add. This usually means your passkeys sync between your devices (for example through iCloud Keychain, Google Password Manager or 1Password), or you registered this device earlier.`),
-    el("p", {class: "summary"}, "You can close this page. Nothing has changed.")
-  );
+  showCrossOutcome({tone: "info", title: "This device already has a passkey", lines: [
+    ["Your passkey provider already has a passkey for ", walletName(wallet), ", so there's nothing to add. This usually means your passkeys sync between your devices (for example through iCloud Keychain, Google Password Manager or 1Password), or you registered this device earlier."],
+    "Nothing has changed. You can close this tab."
+  ]});
 }
 async function loadCrossSurface(session) {
   const cross = session.cross_surface;
@@ -2558,61 +2693,77 @@ async function loadCrossSurface(session) {
     throw new Error("Paired enrollment expired");
   }
   crossSurfaceState = state;
-  const terminate = message => {
+  const wallet = cross.wallet_id;
+  // Set once Broker confirms the approval or enrollment; nothing stale may
+  // repaint over that outcome.
+  let confirmed = false;
+  const terminate = outcome => {
     if (crossSurfaceState !== state) return;
     stopCrossSurface();
     approve.disabled = true;
     cancel.disabled = true;
     clearInterval(expiryTimer);
-    statusNode.textContent = message;
+    showCrossOutcome(outcome);
   };
-  state.expiry = setTimeout(() => terminate("Paired enrollment expired. Start again from Bloom."),
+  const expired = {tone: "expired", title: "This request expired", lines: [
+    ["Start again from Bloom if you still want to add a passkey to ", walletName(wallet), "."]
+  ]};
+  state.expiry = setTimeout(() => terminate(expired),
     Math.min(state.expiresAt - Date.now(), 10 * 60 * 1000));
   for (const fields of [recoveryFields, exportFields, importFields, genericFields]) fields.hidden = true;
-  document.getElementById("page-title").textContent = "Add a wallet passkey";
-  document.getElementById("page-lede").textContent = "Approve with a passkey this wallet already has, then create one on the new device.";
-  panelTitle.textContent = cross.role === "source" ? "Approve the new device" : "Prepare this device";
-  panelKicker.textContent = "Paired enrollment";
-  const sameSite = cross.source_origin === cross.destination_origin;
-  const facts = el("dl", {class: "facts"},
-    el("dt", {}, "Wallet"), el("dd", {}, cross.wallet_id),
-    ...(sameSite
-      ? [el("dt", {}, "Site"), el("dd", {}, cross.destination_origin)]
-      : [el("dt", {}, "Existing passkey"), el("dd", {}, cross.source_origin),
-        el("dt", {}, "New passkey"), el("dd", {}, cross.destination_origin)]));
-  const instructions = el("p", {class: "summary"});
-  const step = el("div");
-  const expiry = el("p", {class: "expiry"});
-  reviewNode.replaceChildren(facts, instructions, step, expiry);
-  startExpiry(session, expiry);
+  const isSource = cross.role === "source";
+  document.getElementById("ceremony-page")?.classList.add("cross-page");
+  document.getElementById("page-lede").textContent = "Add a passkey";
+  const pageTitle = document.getElementById("page-title");
+  panelKicker.textContent = "Add a passkey";
+  panelTitle.replaceChildren(isSource ? "Approve a new passkey for " : "Add a passkey to ", walletName(wallet));
+  const people = crossPeople(cross);
+  const card = el("section", {class: "cross-card", "aria-live": "polite"});
+  const showCard = (step, title, ...body) => {
+    pageTitle.textContent = `Step ${step} of 3`;
+    people.setStep(step);
+    card.replaceChildren(el("h2", {class: "cross-card-title"}, title), ...body);
+  };
+  reviewNode.replaceChildren(people.root, card, crossDetails(cross));
+  // The header keeps the one deadline; nothing in the body repeats it.
+  startExpiry(session, el("span"));
   cancel.onclick = async () => {
     // Discard the local recipient immediately even if cancellation cannot reach Broker.
-    terminate("Cancelled. You may close this tab.");
+    terminate({tone: "info", title: "Cancelled", lines: isSource
+      ? [["You cancelled this approval for ", walletName(wallet), "."], "You can close this tab."]
+      : [["You cancelled adding a passkey to ", walletName(wallet), "."], "You can close this tab."]});
     try { await mutate(`/api/session/${ceremonyId}/cancel`, {}); }
-    catch (_) { statusNode.textContent = "This tab is cancelled. The server will also expire the request."; }
+    catch (_) {
+      if (!confirmed) statusNode.textContent = "This tab is cancelled. The server will also expire the request.";
+    }
   };
   const fail = error => {
-    terminate("Paired enrollment could not finish. Start again from Bloom.");
     // Never log request bodies, capabilities or passkey extension output.
-    if (error?.name === "NotSupportedError") {
-      statusNode.textContent = "This browser or passkey does not support the required PRF extension. Use a supported browser and passkey.";
-    }
+    const lines = error?.name === "NotSupportedError"
+      ? ["This browser or passkey does not support the required PRF extension. Use a supported browser and passkey, then start again from Bloom."]
+      : ["Something went wrong before this finished. Start again from Bloom to try again."];
+    terminate({tone: "danger", title: "Couldn't add the passkey", lines});
     void mutate(`/api/session/${ceremonyId}/cancel`, {}).catch(() => {});
   };
-  if (cross.role === "source") {
+  if (isSource) {
     const prepared = cross.source_prepared;
     validateCrossPrepared(session, prepared);
-    instructions.textContent = "Compare this code with the one on the new device. Continue only if you started this there and the codes match.";
-    step.append(el("p", {}, el("strong", {}, prepared.pairing.confirmation_code)));
+    const code = prepared.pairing.confirmation_code;
     const confirmed = el("input", {type: "checkbox"});
-    step.append(el("label", {}, confirmed, " I started this on the new device and the code matches"));
-    approve.textContent = "Approve with existing passkey";
+    showCard(2, "Check the code",
+      el("p", {class: "summary"}, "Someone — maybe you, on another device — asked to add a passkey to ",
+        walletName(wallet), ". Your existing passkey is needed to approve it."),
+      crossCode(code, "The new device shows a code too. Only approve if it's the same."),
+      el("label", {class: "choice cross-confirm"}, confirmed,
+        el("span", {}, "I know about this request and the new device shows this code")));
+    setAction(approve, "Approve with passkey");
     approve.disabled = true;
     confirmed.onchange = () => { approve.disabled = !confirmed.checked || crossSurfaceState !== state; };
-    statusNode.textContent = "Check the code on the new device before approving.";
+    statusNode.textContent = "";
     approve.onclick = async () => {
       if (!confirmed.checked) return;
-      approve.disabled = true;
+      confirmed.disabled = true;
+      setBusy(approve, "Waiting for passkey…");
       let prf;
       try {
         requireCrossSurface(state);
@@ -2621,6 +2772,9 @@ async function loadCrossSurface(session) {
         if (!prf || prf.length !== 32) {
           throw new DOMException("Passkey PRF is required", "NotSupportedError");
         }
+        // A prompt can resolve after cancel or expiry; never redraw a finished page.
+        requireCrossSurface(state);
+        setBusy(approve, "Sending approval…");
         const encrypted = await hpkeSeal(decodeUrl(prepared.source_hpke_recipient_key),
           te.encode("bloom-cross-surface-source-prf/v1"),
           te.encode(canonicalJson(crossSurfaceAad(prepared, "source_prf"))), prf);
@@ -2628,18 +2782,29 @@ async function loadCrossSurface(session) {
         await mutate(`/api/cross/${ceremonyId}/authorize`, {
           authority_assertion: assertionJson(credential), encrypted_authority_prf: encrypted
         });
-        terminate("Approved. Finish on the new device, where its passkey is created. Nothing is active until then.");
+        const approved = {tone: "success", title: "Approved", lines: [
+          "Now finish on the new device: it will ask to create its passkey.",
+          ["Nothing changes on ", walletName(wallet), " until then. You can close this tab."]
+        ]};
+        confirmed = true;
+        terminate(approved);
+        // Broker accepted the approval; that outranks a local cancel or
+        // expiry that landed while the request was in flight.
+        showCrossOutcome(approved);
       } catch (error) { fail(error); }
       finally { prf?.fill(0); }
     };
     return;
   }
-  instructions.textContent = "Keep this page open. Next you get a link to approve with a passkey this wallet already has.";
-  statusNode.textContent = "Prepare this device to receive the approval.";
-  approve.textContent = "Prepare enrollment";
+  showCard(1, "Get an approval link",
+    el("p", {class: "summary"}, "Adding a passkey takes two people, or you on two devices. Someone who already has a passkey for ",
+      walletName(wallet), " approves, then this device creates its own passkey."),
+    el("p", {class: "summary muted"}, "Keep this page open until you're done."));
+  statusNode.textContent = "";
+  setAction(approve, "Get approval link");
   approve.disabled = false;
   approve.onclick = async () => {
-    approve.disabled = true;
+    setBusy(approve, "Getting link…");
     try {
       requireCrossSurface(state);
       const pair = await crypto.subtle.generateKey({name: "X25519"}, false, ["deriveBits"]);
@@ -2658,28 +2823,34 @@ async function loadCrossSurface(session) {
       state.expiresAt = Math.min(state.expiresAt, Number(started.expires_at_ms));
       if (!Number.isFinite(state.expiresAt)) throw new Error("Invalid pairing expiry");
       const hostOnly = cross.source_origin.startsWith("http://localhost:");
-      const linkActions = el("div", {class: "result-actions"});
-      if (typeof navigator.share === "function") {
-        const share = el("button", {type: "button"}, "Share link");
-        share.onclick = () => { navigator.share({url: sourceUrl.href}).catch(() => {}); };
-        linkActions.append(share);
-      }
-      if (navigator.clipboard?.writeText) {
-        const copy = el("button", {type: "button"}, "Copy link");
-        copy.onclick = () => {
-          navigator.clipboard.writeText(sourceUrl.href)
-            .then(() => { copy.textContent = "Copied"; })
-            .catch(() => {});
-        };
-        linkActions.append(copy);
-      }
-      step.replaceChildren(el("p", {}, el("strong", {}, started.confirmation_code)),
-        el("a", {href: sourceUrl.href, target: "_blank", rel: "noopener noreferrer"}, "Open approval link"),
-        linkActions,
-        el("p", {}, hostOnly
-          ? "Open this link in a browser on your Bloom host. Compare the code before approving."
-          : `Open this link on a device that already has a passkey for ${cross.wallet_id}, such as the one you first set it up on. Compare the code before approving.`));
-      statusNode.textContent = "Waiting for your existing passkey approval…";
+      // The link is shown as text and copied; it is never opened from here.
+      const linkField = el("input", {type: "text", readonly: "", class: "cross-link-field",
+        "aria-label": "Approval link", spellcheck: "false"});
+      linkField.value = sourceUrl.href;
+      linkField.onfocus = () => linkField.select();
+      const copy = el("button", {type: "button", class: "secondary cross-copy"}, "Copy link");
+      copy.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(sourceUrl.href);
+          copy.replaceChildren(crossIcon("check"), "Copied");
+          setTimeout(() => { copy.textContent = "Copy link"; }, 2000);
+        } catch (_) {
+          // Without clipboard access the selected text can still be copied by hand.
+          linkField.focus();
+          linkField.select();
+        }
+      };
+      showCard(2, "Send this link to the approver",
+        el("p", {class: "summary"}, ...(hostOnly
+          ? ["Open it in a browser on your Bloom host — that's where the passkey for ", walletName(wallet), " is."]
+          : ["Send it to someone who already has a passkey for ", walletName(wallet),
+            ", or open it on another of your devices that has one."])),
+        el("div", {class: "cross-link"}, linkField, copy),
+        crossCode(started.confirmation_code, "The approver sees this code too. They should only approve if it matches."));
+      // Nothing to press until the approver acts; the action bar shows the wait
+      // where every other step shows its progress.
+      statusNode.textContent = "";
+      setBusy(approve, "Waiting for approver…");
       const poll = async () => {
         try {
           requireCrossSurface(state);
@@ -2705,12 +2876,15 @@ async function loadCrossSurface(session) {
             te.encode(canonicalJson(crossSurfaceAad(prepared, "handoff"))), handoff.encrypted_capability);
           requireCrossSurface(state);
           if (state.capability.length !== 32) throw new Error("Invalid handoff");
-          step.replaceChildren(el("p", {}, "The existing passkey authorized this destination. Create the new passkey here to finish."));
-          statusNode.textContent = "Ready to enroll. Your wallet's addresses stay the same.";
-          approve.textContent = "Create destination passkey";
+          showCard(3, "Create the passkey on this device",
+            el("p", {class: "summary"}, "The approver said yes. Your device will now ask you to create a passkey for ",
+              walletName(wallet), ". The wallet's addresses stay the same."));
+          statusNode.textContent = "";
+          setAction(approve, "Create passkey");
+          approve.hidden = false;
           approve.disabled = false;
           approve.onclick = async () => {
-            approve.disabled = true;
+            setBusy(approve, "Waiting for passkey…");
             let newPrf;
             try {
               requireCrossSurface(state);
@@ -2732,6 +2906,8 @@ async function loadCrossSurface(session) {
               // Both attestation and a fresh assertion are mandatory on this leg.
               newPrf = await ensureNewCredentialPrf(options, created, 1, true);
               if (newPrf.prf.length !== 32) throw new Error("Invalid passkey PRF");
+              requireCrossSurface(state);
+              setBusy(approve, "Adding passkey…");
               const encrypted = await hpkeSeal(decodeUrl(prepared.destination_hpke_recipient_key),
                 te.encode("bloom-cross-surface-destination-prf/v1"),
                 te.encode(canonicalJson(crossSurfaceAad(prepared, "destination_prf"))), newPrf.prf);
@@ -2750,11 +2926,13 @@ async function loadCrossSurface(session) {
                 if (!recovered.ok) throw error;
                 result = await recovered.json();
               }
-              terminate("New passkey enrolled.");
-              renderDone(session, result);
+              const receipt = result?.receipt_digest || result?.approval_id || "";
+              confirmed = true;
+              terminate(crossDoneOutcome(wallet, receipt));
+              // Enrollment committed; that outranks a local cancel or expiry
+              // that landed while the request was in flight.
+              showCrossOutcome(crossDoneOutcome(wallet, receipt));
               clearSessionToken();
-              approve.hidden = true;
-              cancel.hidden = true;
             } catch (error) { fail(error); }
             finally { newPrf?.prf.fill(0); }
           };
@@ -3769,7 +3947,12 @@ function renderPreview(name) {
   if (actions) actions.hidden = true;
 }
 
+// The page opens with a loading indicator; whatever load() ends on replaces it.
 async function load() {
+  try { return await loadCeremony(); }
+  finally { statusNode.removeAttribute?.("data-busy"); }
+}
+async function loadCeremony() {
   if (walletPath) {
     const wallet = decodeURIComponent(walletPath.slice("/wallet/".length));
     const response = await fetch(`/api/wallet/${encodeURIComponent(wallet)}`, {credentials: "same-origin", cache: "no-store"});
