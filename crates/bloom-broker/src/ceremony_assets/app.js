@@ -2749,20 +2749,20 @@ async function loadCrossSurface(session) {
     const prepared = cross.source_prepared;
     validateCrossPrepared(session, prepared);
     const code = prepared.pairing.confirmation_code;
-    const confirmed = el("input", {type: "checkbox"});
+    const codeChecked = el("input", {type: "checkbox"});
     showCard(2, "Check the code",
       el("p", {class: "summary"}, "Someone — maybe you, on another device — asked to add a passkey to ",
         walletName(wallet), ". Your existing passkey is needed to approve it."),
       crossCode(code, "The new device shows a code too. Only approve if it's the same."),
-      el("label", {class: "choice cross-confirm"}, confirmed,
+      el("label", {class: "choice cross-confirm"}, codeChecked,
         el("span", {}, "I know about this request and the new device shows this code")));
     setAction(approve, "Approve with passkey");
     approve.disabled = true;
-    confirmed.onchange = () => { approve.disabled = !confirmed.checked || crossSurfaceState !== state; };
+    codeChecked.onchange = () => { approve.disabled = !codeChecked.checked || crossSurfaceState !== state; };
     statusNode.textContent = "";
     approve.onclick = async () => {
-      if (!confirmed.checked) return;
-      confirmed.disabled = true;
+      if (!codeChecked.checked) return;
+      codeChecked.disabled = true;
       setBusy(approve, "Waiting for passkey…");
       let prf;
       try {
