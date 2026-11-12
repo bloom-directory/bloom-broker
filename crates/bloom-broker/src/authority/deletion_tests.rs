@@ -109,6 +109,10 @@ impl Fixture {
         receipt
     }
     fn released_late_read(&self, snapshot: &SignedPolicySnapshot, record_install: bool) {
+        self.released_late_install(snapshot, record_install.then_some(None));
+    }
+    /// `Some(Some(byte))` records a correlated policy-update install.
+    fn released_late_install(&self, snapshot: &SignedPolicySnapshot, install: Option<Option<u8>>) {
         let mut connection = self.journal.lock_for_mutation().unwrap();
         let tx = connection.transaction().unwrap();
         tx.execute(
@@ -122,15 +126,18 @@ impl Fixture {
             ],
         )
         .unwrap();
-        if record_install {
+        if let Some(correlated) = install {
             self.journal
                 .append_external_audit(
                     &tx,
                     "policy.installed",
                     &serde_json::json!({
                         "wallet_id": snapshot.wallet_id, "version": snapshot.version,
-                        "policy_digest": snapshot.policy_digest, "ceremony_receipt_digest": null,
-                        "validation_receipt_digest": null, "commit_receipt_digest": null,
+                        "policy_digest": snapshot.policy_digest,
+                        "operation_id": correlated.map(|byte| OperationId::from_bytes([byte; 32])),
+                        "ceremony_receipt_digest": correlated.map(digest),
+                        "validation_receipt_digest": correlated.map(|byte| digest(byte + 1)),
+                        "commit_receipt_digest": correlated.map(|byte| digest(byte + 2)),
                     }),
                 )
                 .unwrap();
@@ -284,6 +291,28 @@ fn startup_removes_only_a_proven_released_late_read_and_is_idempotent() {
         );
         reopened.journal.verify_audit_chain().unwrap();
     }
+}
+
+#[test]
+fn startup_removes_a_released_correlated_update_after_deletion() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("journal.sqlite");
+    let fixture = Fixture::open(Some(&path));
+    fixture.initial(CeremonyKind::WalletRegistration, 1, 1);
+    fixture.delete();
+    fixture.released_late_install(&policy(1, 2), Some(Some(30)));
+    drop(fixture);
+    let reopened = Fixture::open(Some(&path));
+    assert!(reopened.authority.wallet_ids().unwrap().is_empty());
+    // The stale version 2 no longer blocks a new incarnation's version 1.
+    reopened.initial(CeremonyKind::WalletRegistration, 2, 9);
+    assert_eq!(
+        reopened
+            .authority
+            .policy_snapshot(&token("reusable-name"))
+            .unwrap(),
+        policy(9, 1)
+    );
 }
 
 #[test]

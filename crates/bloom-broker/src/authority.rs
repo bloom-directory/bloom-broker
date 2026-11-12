@@ -3497,7 +3497,8 @@ impl BrokerAuthority {
     }
 }
 
-/// Remove only rows proven to have been reinstalled by a released late read.
+/// Remove only rows proven to have been reinstalled by a released late read
+/// or policy update.
 /// The journal is verified before using its event order as migration authority.
 /// A later initial policy with custody-receipt correlation starts a new wallet
 /// incarnation; policy updates and ordinary reads cannot do that.
@@ -3509,7 +3510,7 @@ fn recover_legacy_deleted_policies(
         return Ok((BTreeSet::new(), false));
     }
     journal.verify_migration_target(connection)?;
-    // wallet -> (latest deletion sequence, latest uncorrelated install proof)
+    // wallet -> (latest deletion sequence, latest post-deletion install proof)
     type ReadProof = (i64, String, String);
     let mut deleted: BTreeMap<String, (i64, Option<ReadProof>)> = BTreeMap::new();
     {
@@ -3545,8 +3546,11 @@ fn recover_legacy_deleted_policies(
                 // registration/import receipt, not by an ordinary policy read.
                 deleted.remove(wallet);
             } else if let Some((_, latest)) = deleted.get_mut(wallet) {
+                // Any other install after deletion belongs to the deleted
+                // incarnation, including a correlated policy update that
+                // committed after the deletion in released builds.
                 *latest = match (value["version"].as_str(), value["policy_digest"].as_str()) {
-                    (Some(version), Some(digest)) if value["ceremony_receipt_digest"].is_null() => {
+                    (Some(version), Some(digest)) => {
                         Some((sequence, version.to_owned(), digest.to_owned()))
                     }
                     _ => None,
