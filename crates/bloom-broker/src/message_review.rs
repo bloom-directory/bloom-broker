@@ -15,7 +15,7 @@ const SCHEMA: &str = "bloom.message.review.v1";
 const MAX_FIELDS: usize = 256;
 const MAX_DEPTH: usize = 12;
 
-mod hyperliquid;
+pub(crate) mod hyperliquid;
 mod polymarket;
 pub(crate) mod polymarket_auth;
 mod tempo;
@@ -31,12 +31,13 @@ pub(crate) fn verify_hyperliquid_agent_use(
         .petal_use_claim
         .as_ref()
         .ok_or_else(|| invalid("Agent action requires its claim"))?;
-    if claim.operation_class.as_str() != "hyperliquid.agent_action"
+    let builder_order = claim.operation_class.as_str() == hyperliquid::BUILDER_ORDER_CLASS;
+    if !(builder_order || claim.operation_class.as_str() == "hyperliquid.agent_action")
         || request.crypto_suite != CryptoSuite::Secp256k1Keccak256Recoverable
         || claim.crypto_suite != request.crypto_suite
         || !claim.declared_debits.is_empty()
         || !claim.declared_destinations.is_empty()
-        || claim.declared_fee != bloom_broker_api::DeclaredFee::None
+        || (!builder_order && claim.declared_fee != bloom_broker_api::DeclaredFee::None)
     {
         return Err(invalid(
             "Agent action has an unsupported class, suite or financial claim",
@@ -65,6 +66,7 @@ pub(crate) fn verify_hyperliquid_agent_use(
             "Agent action witness differs from its actual signing bytes",
         ));
     }
+    hyperliquid::validate_builder_fee(claim, &review)?;
     Ok(review)
 }
 
@@ -124,6 +126,10 @@ pub struct MessageReview {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collateral_asset: Option<bloom_evm_clear_signing::FieldAsset>,
     pub warnings: Vec<String>,
+    /// Broker's bound on an L1 order's builder fee in micro-USDC, checked
+    /// against the claim. Never read back from the displayed fields.
+    #[serde(skip)]
+    pub builder_fee_bound: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -483,7 +489,7 @@ fn decode_with_exchange_limit(
     let envelope: Envelope =
         serde_json::from_slice(bytes).map_err(|_| invalid("invalid message review envelope"))?;
     let mut review = MessageReview { kind: String::new(), title: String::new(), signer: format!("{signer:#x}"),
-        payload_keccak: String::new(), domain: Vec::new(), fields: Vec::new(), payment: None, venue_asset: None, collateral_asset: None,
+        payload_keccak: String::new(), domain: Vec::new(), fields: Vec::new(), payment: None, venue_asset: None, collateral_asset: None, builder_fee_bound: None,
         warnings: vec!["Bloom verified the signed fields, not their execution effects or the identity of an unlisted application.".into()] };
     let preimage = match envelope {
         Envelope::HyperliquidL1 {
@@ -498,7 +504,7 @@ fn decode_with_exchange_limit(
                 return Err(invalid("unsupported message review schema"));
             }
             bounded(&action, 0, &mut 0)?;
-            let (typed_data, fields, title) = hyperliquid::rebuild(
+            let (typed_data, fields, title, builder_fee_bound) = hyperliquid::rebuild(
                 &network,
                 action,
                 nonce,
@@ -514,6 +520,7 @@ fn decode_with_exchange_limit(
             review.kind = "hyperliquid_l1".into();
             review.title = title;
             review.fields = fields;
+            review.builder_fee_bound = builder_fee_bound;
             review.warnings.push("Bloom rebuilt the exchange action's MessagePack commitment. Market IDs, order bounds and fees are signed. Market names come from a list bundled with this Bloom release; Bloom has not checked available balance, fills or venue execution.".into());
             return Ok((preimage, review));
         }
@@ -938,6 +945,16 @@ fn validate_petal_profile(
         return Err(invalid(
             "Polymarket exact review derives its facts from signed fields, not financial claim overrides",
         ));
+    }
+    // A generic `Agent` envelope signs the same bytes but hides the order, so
+    // a builder order must arrive as an L1 action Broker can bound.
+    if class == hyperliquid::BUILDER_ORDER_CLASS && review.kind != "hyperliquid_l1" {
+        return Err(invalid(
+            "hyperliquid.builder_order requires its Hyperliquid L1 action review",
+        ));
+    }
+    if review.kind == "hyperliquid_l1" {
+        hyperliquid::validate_builder_fee(claim, review)?;
     }
     if let Some(primary) = match class {
         "hyperliquid.approve_agent" => Some("HyperliquidTransaction:ApproveAgent"),
@@ -1414,6 +1431,59 @@ mod tests {
         assert!(error.message.contains("ERC-3009"), "{}", error.message);
     }
 
+    /// An exact builder order sent as a generic `Agent` envelope signs the
+    /// same bytes but hides the order, so it must not skip the fee bound.
+    #[test]
+    fn exact_builder_order_requires_its_l1_review() {
+        use bloom_broker_api::{ClaimAssurance, DeclaredFee, PetalUseClaim};
+        let builder = format!("{:#x}", Address::with_last_byte(0xbb));
+        let action = json!({"type":"order","orders":[{"a":0,"b":true,"p":"50000","s":"0.01",
+            "r":false,"t":{"limit":{"tif":"Gtc"}}}],"grouping":"na","builder":{"b":builder,"f":10}});
+        let l1 = serde_json::to_vec(&json!({"schema":SCHEMA,"kind":"hyperliquid_l1",
+            "network":"mainnet","action":action.clone(),"nonce":1u64}))
+        .unwrap();
+        let (typed, ..) =
+            hyperliquid::rebuild("mainnet", action, 1, None, None, MAX_FIELDS).unwrap();
+        let generic =
+            serde_json::to_vec(&json!({"schema":SCHEMA,"kind":"eip712","typed_data":typed}))
+                .unwrap();
+        let (l1_bytes, l1_review) = decode(&l1, signer()).unwrap();
+        let (generic_bytes, generic_review) = decode(&generic, signer()).unwrap();
+        assert_eq!(l1_bytes, generic_bytes);
+
+        let mut request = request(generic);
+        request.petal_use_claim = Some(PetalUseClaim {
+            package_hash: Digest32::from_bytes([1; 32]),
+            route: "agent/order".into(),
+            operation_class: Token::new(hyperliquid::BUILDER_ORDER_CLASS).unwrap(),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: Digest32::from_bytes([2; 32]),
+            ordered_hashes: vec![],
+            declared_debits: vec![],
+            declared_destinations: vec![],
+            // The order's bound is 50000 micro-USDC.
+            declared_fee: DeclaredFee::Fee {
+                chain: Token::new("hyperliquid").unwrap(),
+                asset: "usdc".into(),
+                amount: bloom_broker_api::DecimalU256::parse("1").unwrap(),
+            },
+            nonce: RequestNonce::from_bytes([3; 16]),
+            claim_assurance: ClaimAssurance::MachineAsserted,
+        });
+        let error = validate_petal_profile(&request, &generic_review).unwrap_err();
+        assert!(
+            error.message.contains("L1 action review"),
+            "{}",
+            error.message
+        );
+        let error = validate_petal_profile(&request, &l1_review).unwrap_err();
+        assert!(
+            error.message.contains("at least 50000"),
+            "{}",
+            error.message
+        );
+    }
+
     #[test]
     fn tempo_reviews_belong_only_to_machine_mpp_approvals() {
         let class = bloom_broker_api::SYSTEM_MPP_OPERATION_CLASS;
@@ -1771,6 +1841,135 @@ mod tests {
             )];
             assert!(review(&request, signer()).is_err(), "{path}");
         }
+    }
+
+    /// Broker bounds a builder order's fee from the signed order itself and
+    /// refuses a claim that declares less, or a builder under any other class.
+    #[test]
+    fn builder_fee_is_bounded_from_the_signed_order() {
+        use bloom_broker_api::{
+            ClaimAssurance, DeclaredFee, MachineSignRequest, PetalUseClaim, ProvenanceSubject,
+            SigningPayloads,
+        };
+        let builder = format!("{:#x}", Address::with_last_byte(0xbb));
+        let order = |a: u32, buy: bool, tif: &str| json!({"a":a,"b":buy,"p":"50000","s":"0.01","r":false,"t":{"limit":{"tif":tif}}});
+        let base = request(
+            serde_json::to_vec(
+                &json!({"schema":SCHEMA,"kind":"hyperliquid_l1","network":"mainnet",
+                "action":{"type":"cancel","cancels":[{"a":0,"o":42}]},"nonce":1u64}),
+            )
+            .unwrap(),
+        );
+        let use_request =
+            |orders: Value, builder_fee: Option<u32>, class: &str, fee: DeclaredFee| {
+                let mut action = json!({"type":"order","orders":orders,"grouping":"na"});
+                if let Some(f) = builder_fee {
+                    action["builder"] = json!({"b":builder,"f":f});
+                }
+                let witness = json!({"schema":SCHEMA,"kind":"hyperliquid_l1","network":"mainnet",
+                "action":action,"nonce":1_700_000_000_000u64});
+                let bytes = serde_json::to_vec(&witness).unwrap();
+                let raw = decode(&bytes, signer())
+                    .map(|(raw, _)| raw)
+                    .unwrap_or_default();
+                MachineSignRequest {
+                    operation_id: base.operation_id.clone(),
+                    operation_digest: Digest32::from_bytes([4; 32]),
+                    approval_id: Digest32::from_bytes([5; 32]),
+                    key_ref: base.terms.key_ref.clone(),
+                    crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+                    payloads: SigningPayloads::Single {
+                        payload: Base64UrlBytes::from_bytes(&raw),
+                    },
+                    petal_use_claim: Some(PetalUseClaim {
+                        package_hash: Digest32::from_bytes([1; 32]),
+                        route: "agent/order".into(),
+                        operation_class: Token::new(class).unwrap(),
+                        crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+                        payload_digest: Digest32::from_bytes([6; 32]),
+                        ordered_hashes: vec![],
+                        declared_debits: vec![],
+                        declared_destinations: vec![],
+                        declared_fee: fee,
+                        nonce: RequestNonce::from_bytes([7; 16]),
+                        claim_assurance: ClaimAssurance::MachineAsserted,
+                    }),
+                    system_use_claim: None,
+                    claim_assurance_evidence: Some(Base64UrlBytes::from_bytes(&bytes)),
+                    provenance: ProvenanceSubject::Petal {
+                        package_hash: Digest32::from_bytes([1; 32]),
+                        route: "agent/order".into(),
+                    },
+                }
+            };
+        let usdc = |amount: &str| DeclaredFee::Fee {
+            chain: Token::new("hyperliquid").unwrap(),
+            asset: "usdc".into(),
+            amount: bloom_broker_api::DecimalU256::parse(amount).unwrap(),
+        };
+        let builder_class = hyperliquid::BUILDER_ORDER_CLASS;
+        let check = |orders: Value, f: Option<u32>, class: &str, fee: DeclaredFee| {
+            verify_hyperliquid_agent_use(&use_request(orders, f, class, fee), signer())
+        };
+        let buy = json!([order(0, true, "Gtc")]);
+
+        // 50000 * 0.01 notional at 10 tenths of a basis point is 0.05 USDC.
+        let reading = check(buy.clone(), Some(10), builder_class, usdc("50000")).unwrap();
+        assert!(reading.fields.iter().any(|field| {
+            field.path == hyperliquid::BUILDER_FEE_FIELD && field.value == "50000"
+        }));
+        check(buy.clone(), Some(10), builder_class, usdc("60000")).unwrap();
+        for fee in [usdc("49999"), DeclaredFee::None] {
+            assert!(check(buy.clone(), Some(10), builder_class, fee).is_err());
+        }
+        let other_asset = DeclaredFee::Fee {
+            chain: Token::new("hyperliquid").unwrap(),
+            asset: "usdt".into(),
+            amount: bloom_broker_api::DecimalU256::parse("50000").unwrap(),
+        };
+        assert!(check(buy.clone(), Some(10), builder_class, other_asset).is_err());
+        // A builder needs the fee-bearing class, and that class needs a builder.
+        assert!(
+            check(
+                buy.clone(),
+                Some(10),
+                "hyperliquid.agent_action",
+                DeclaredFee::None
+            )
+            .is_err()
+        );
+        assert!(check(buy.clone(), None, builder_class, usdc("0")).is_err());
+        check(buy, None, "hyperliquid.agent_action", DeclaredFee::None).unwrap();
+
+        // A post-only sell fills at its limit; any other sell, a spot or
+        // HIP-3 leg, or a trigger order cannot be bounded.
+        check(
+            json!([order(0, false, "Alo")]),
+            Some(10),
+            builder_class,
+            usdc("50000"),
+        )
+        .unwrap();
+        let trigger = json!([{"a":0,"b":true,"p":"50000","s":"0.01","r":false,
+            "t":{"trigger":{"isMarket":true,"triggerPx":"49000","tpsl":"sl"}}}]);
+        for orders in [
+            json!([order(0, false, "Gtc")]),
+            json!([order(10_001, true, "Gtc")]),
+            json!([order(100_001, true, "Gtc")]),
+            trigger,
+        ] {
+            assert!(
+                check(orders.clone(), Some(10), builder_class, usdc("1000000000")).is_err(),
+                "{orders}"
+            );
+        }
+
+        // Each leg rounds up: 1.001 * 1 at one tenth of a basis point is
+        // 10.01 micro-USDC.
+        let leg =
+            json!([{"a":0,"b":true,"p":"1.001","s":"1","r":false,"t":{"limit":{"tif":"Gtc"}}}]);
+        assert!(check(leg.clone(), Some(1), builder_class, usdc("10")).is_err());
+        check(leg, Some(1), builder_class, usdc("11")).unwrap();
     }
 
     #[test]

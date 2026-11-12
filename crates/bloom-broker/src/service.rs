@@ -823,9 +823,12 @@ impl BrokerRpcService {
                 .map_err(authority_error)?;
         let mut message_petal = false;
         if matches!(request.terms.subject, ApprovalSubject::Petal { .. }) {
+            // Builder orders stay out of the exact-only list, since sessions
+            // sign them under reusable grants, but an exact one is reviewed.
             for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
                 .iter()
                 .chain(bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES)
+                .chain([&crate::message_review::hyperliquid::BUILDER_ORDER_CLASS])
             {
                 message_petal |= self
                     .authority
@@ -1275,10 +1278,14 @@ impl BrokerRpcService {
                 ProtocolError::new(ProtocolErrorCode::ApprovalNotFound, "approval not found")
             })?;
         let clob_auth = crate::message_review::polymarket_auth::is_scope(&terms);
-        let hyperliquid_agent = request
-            .petal_use_claim
-            .as_ref()
-            .is_some_and(|claim| claim.operation_class.as_str() == "hyperliquid.agent_action");
+        // A session's builder order is signed under a reusable grant, so its
+        // fee is checked here; an exact approval checked it at preparation.
+        let hyperliquid_agent = request.petal_use_claim.as_ref().is_some_and(|claim| {
+            claim.operation_class.as_str() == "hyperliquid.agent_action"
+                || (claim.operation_class.as_str()
+                    == crate::message_review::hyperliquid::BUILDER_ORDER_CLASS
+                    && matches!(terms.selector, ApprovalSelector::Petal { .. }))
+        });
         let pump_review = crate::solana_review::is_scope(&terms)
             || request.petal_use_claim.as_ref().is_some_and(|c| {
                 bloom_broker_api::pumpfun_review_required(c.operation_class.as_str())
