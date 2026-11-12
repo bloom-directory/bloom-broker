@@ -349,3 +349,74 @@ button.wallet-copy{grid-area:copy;justify-self:start;width:auto;padding:0 20px;m
   .ceremony-hero-pair{grid-template-columns:minmax(0,1fr)}
   .ceremony-hero-pair>.ceremony-flow-arrow{transform:none}
 }
+
+/* Loading indicator. Decorative: the words beside it carry the state. Any
+   status line or button can show one; #status[data-busy] is the page load. */
+@keyframes ceremony-spin{to{transform:rotate(360deg)}}
+.spinner,#status[data-busy]::before{display:inline-block;flex:none;width:1em;height:1em;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;opacity:.75;animation:ceremony-spin .75s linear infinite}
+#status[data-busy]::before{content:"";margin-right:8px;vertical-align:-.15em}
+#status:has(.spinner){display:flex;align-items:center;gap:8px}
+button[aria-busy="true"]{display:inline-flex;align-items:center;justify-content:center;gap:10px}
+button[aria-busy="true"]:disabled{opacity:.8;cursor:progress}
+
+/* Adding a passkey: two people take turns. */
+.cross-wallet{font-weight:inherit;color:inherit}
+.panel-title .cross-wallet{color:var(--ceremony-accent-deep)}
+.summary .cross-wallet{font-weight:600}
+.summary.muted{color:var(--ceremony-muted);font-size:14px}
+.cross-people{display:grid;grid-template-columns:minmax(0,1fr) 56px minmax(0,1fr);align-items:start;padding:20px;border:1px solid var(--ceremony-border);border-radius:var(--ceremony-radius);background:var(--ceremony-bg)}
+.cross-person{display:grid;justify-items:center;gap:4px;min-width:0;text-align:center}
+.cross-avatar{display:grid;place-items:center;width:52px;height:52px;margin-bottom:4px;border:1px solid var(--ceremony-border);border-radius:50%;background:var(--ceremony-surface);color:var(--ceremony-muted);transition:color .2s,border-color .2s,background .2s}
+.cross-avatar svg{width:28px;height:28px}
+.cross-person[data-state="active"] .cross-avatar{border-color:var(--ceremony-accent);background:var(--ceremony-accent);color:var(--ceremony-surface)}
+.cross-person[data-state="done"] .cross-avatar{border-color:var(--ceremony-success);color:var(--ceremony-success)}
+.cross-person-name{margin:0;font-weight:600}
+.cross-person-role{margin:0;max-width:24ch;color:var(--ceremony-muted);font-size:13px;line-height:1.4;overflow-wrap:anywhere}
+.cross-chip{display:inline-flex;align-items:center;gap:6px;margin:6px 0 0;padding:2px 10px;border-radius:999px;background:var(--ceremony-surface);border:1px solid var(--ceremony-border);color:var(--ceremony-muted);font-size:12px;font-weight:600}
+.cross-chip .spinner{width:10px;height:10px;border-width:1.5px}
+.cross-person[data-state="active"] .cross-chip{border-color:transparent;background:var(--ceremony-accent);color:var(--ceremony-surface)}
+.cross-person[data-state="done"] .cross-chip{border-color:transparent;background:#355f4718;color:var(--ceremony-success)}
+.cross-connector{display:flex;align-items:center;height:52px}
+.cross-connector span{flex:1;border-top:2px dashed var(--ceremony-border)}
+.cross-steps{display:grid;gap:6px;width:100%;max-width:240px;margin:12px 0 0;padding:12px 0 0;border-top:1px solid var(--ceremony-border);list-style:none;text-align:left;font-size:14px;line-height:1.35}
+.cross-steps li{display:flex;align-items:flex-start;gap:8px;color:var(--ceremony-muted)}
+.cross-step-mark{display:grid;place-items:center;flex:none;width:20px;height:20px;border:1px solid var(--ceremony-border);border-radius:50%;background:var(--ceremony-surface);font-size:11px;font-weight:600;line-height:1}
+.cross-step-mark svg{width:13px;height:13px;stroke-width:2.6}
+.cross-steps li[data-state="active"]{color:var(--ceremony-text);font-weight:600}
+.cross-steps li[data-state="active"] .cross-step-mark{border-color:var(--ceremony-accent);background:var(--ceremony-accent);color:var(--ceremony-surface)}
+.cross-steps li[data-state="done"] .cross-step-mark{border-color:var(--ceremony-success);color:var(--ceremony-success)}
+.cross-card{display:grid;gap:14px;padding:4px 0 0}
+.cross-card-title{margin:0;font:600 19px/1.4 var(--ceremony-font-display);letter-spacing:-.02em}
+.cross-link{display:flex;gap:8px}
+.cross-link-field{flex:1 1 auto;min-width:0;min-height:44px;font-size:13px;color:var(--ceremony-muted);text-overflow:ellipsis;background:var(--ceremony-bg)}
+button.cross-copy{display:inline-flex;align-items:center;justify-content:center;gap:6px;flex:none}
+button.cross-copy svg{width:16px;height:16px}
+.cross-code{display:grid;justify-items:center;gap:4px;padding:18px 16px;border:1px solid var(--ceremony-border);border-radius:var(--ceremony-radius);text-align:center}
+.cross-code p{margin:0}
+.cross-code-label{color:var(--ceremony-muted);font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}
+.cross-code-digits{display:flex;align-items:center;font:600 36px/1.2 var(--ceremony-font-mono);letter-spacing:.12em;font-variant-numeric:tabular-nums;color:var(--ceremony-text)}
+.cross-code-gap{width:.5em}
+.cross-code-caption{max-width:44ch;color:var(--ceremony-muted);font-size:14px}
+label.cross-confirm{display:flex;align-items:flex-start;gap:12px;margin:0;padding:14px 16px;border:1px solid var(--ceremony-border);border-radius:var(--ceremony-radius);cursor:pointer}
+label.cross-confirm input{flex:none;width:20px;height:20px;margin:2px 0 0;padding:0;accent-color:var(--ceremony-accent)}
+label.cross-confirm:has(input:checked){border-color:var(--ceremony-accent);background:#8a2a3a08}
+/* A finished request is one centred message. */
+.cross-outcome .panel-header{display:grid;justify-items:center;padding-top:40px;text-align:center}
+.cross-outcome #review{display:grid;justify-items:center;gap:var(--ceremony-space-1);padding-bottom:40px;text-align:center}
+.cross-outcome #review>*+*{margin-top:0}
+.cross-outcome #review .summary{max-width:46ch}
+.cross-outcome #review details{justify-self:stretch;margin-top:var(--ceremony-space-2);text-align:left}
+.cross-outcome-icon{display:grid;place-items:center;width:64px;height:64px;margin-bottom:16px;border-radius:50%;background:var(--ceremony-bg);color:var(--ceremony-muted)}
+.cross-outcome-icon svg{width:32px;height:32px;stroke-width:2.2}
+.cross-outcome-icon[data-tone="success"]{background:#355f4718;color:var(--ceremony-success)}
+.cross-outcome-icon[data-tone="danger"]{background:var(--ceremony-danger-surface);color:var(--ceremony-danger)}
+.cross-outcome-icon[data-tone="expired"]{background:var(--ceremony-warning-surface);color:var(--ceremony-warning)}
+@media(max-width:560px){
+  .cross-people{grid-template-columns:minmax(0,1fr) 20px minmax(0,1fr);padding:16px 10px}
+  .cross-avatar{width:44px;height:44px}
+  .cross-connector{height:44px}
+  .cross-steps{font-size:13px}
+  .cross-code-digits{font-size:30px}
+  .cross-link{flex-direction:column}
+}
+.panel-title[tabindex="-1"]:focus{outline:none}
