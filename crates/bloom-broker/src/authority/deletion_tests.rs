@@ -1,5 +1,4 @@
 use super::*;
-use crate::legacy_store::TestAuditSigner;
 use bloom_audit_checkpoint::{AppendOutcome, CheckpointError, CheckpointSink};
 use bloom_broker_api::{BootEpoch, CeremonyKind, DecimalU64, SignedJournalHead};
 use bloom_triad_local_transport::LocalIdentity;
@@ -14,6 +13,29 @@ use std::{
     time::Duration,
 };
 
+struct TestAuditSigner;
+
+impl crate::journal::AuditSigner for TestAuditSigner {
+    fn key_id(&self) -> Token {
+        Token::new("broker-audit-test").unwrap()
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<bloom_broker_api::Base64UrlBytes, String> {
+        Ok(bloom_broker_api::Base64UrlBytes::from_bytes(message))
+    }
+
+    fn verify(
+        &self,
+        key_id: &Token,
+        message: &[u8],
+        signature: &bloom_broker_api::Base64UrlBytes,
+    ) -> Result<(), String> {
+        (key_id == &self.key_id() && signature.decode() == message)
+            .then_some(())
+            .ok_or_else(|| "test audit signature mismatch".into())
+    }
+}
+
 fn token(value: &str) -> Token {
     Token::new(value).unwrap()
 }
@@ -23,7 +45,7 @@ fn digest(byte: u8) -> Digest32 {
 
 fn authority(journal: Arc<BrokerJournal>) -> Arc<BrokerAuthority> {
     Arc::new(
-        BrokerAuthority::open_in_memory(
+        BrokerAuthority::open(
             journal,
             BTreeMap::new(),
             token("installer"),
@@ -84,7 +106,7 @@ fn broker_identity() -> LocalIdentity {
     }
 }
 impl Fixture {
-    fn open(path: Option<&Path>) -> Self {
+    fn open(path: Option<&std::path::Path>) -> Self {
         let journal = Arc::new(match path {
             Some(path) => BrokerJournal::open(path, Arc::new(TestAuditSigner)).unwrap(),
             None => BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).unwrap(),

@@ -334,12 +334,10 @@ pub fn connect_signer(
 
 /// Broker authority trusting the Signer's fixed ceremony and revocation keys.
 pub fn broker_authority(
-    path: impl AsRef<Path>,
     journal: &Arc<BrokerJournal>,
     policy_keys: BTreeMap<String, (Token, VerifyingKey)>,
 ) -> BrokerAuthority {
     BrokerAuthority::open(
-        path.as_ref(),
         journal.clone(),
         policy_keys,
         Token::new("installer-key").unwrap(),
@@ -354,12 +352,10 @@ pub fn broker_authority(
 }
 
 pub fn manifest_ceremony(
-    path: impl AsRef<Path>,
     signer_client: &BrokerSignerClient,
     journal: &Arc<BrokerJournal>,
 ) -> CeremonyBroker {
     CeremonyBroker::open_with_manifest_signer(
-        path.as_ref(),
         Arc::new(signer_client.clone()),
         Token::new("broker-app-1").unwrap(),
         SigningKey::from_bytes(&[7; 32]),

@@ -25,7 +25,6 @@ use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -454,68 +453,9 @@ pub struct PolicyInstallCorrelation {
 }
 
 impl BrokerAuthority {
+    /// Opens the authority tables in the journal database.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
-        path: impl AsRef<Path>,
-        journal: Arc<BrokerJournal>,
-        policy_keys: BTreeMap<String, (Token, VerifyingKey)>,
-        installer_key_id: Token,
-        installer_key: VerifyingKey,
-        ceremony_key_id: Token,
-        ceremony_key: VerifyingKey,
-        revocation_key_id: Token,
-        revocation_key: VerifyingKey,
-        assurance: AssuranceRegistry,
-    ) -> Result<Self, AuthorityError> {
-        // Only a legacy store that is actually there is opened, and never
-        // created; the real tables live in the journal. A dangling link, a
-        // vanished target or a mistyped directory fails startup instead of
-        // reading as a home with nothing to migrate.
-        let legacy = crate::legacy_store::open(path.as_ref(), "authority")
-            .map_err(AuthorityError::Storage)?;
-        Self::from_connection(
-            legacy,
-            journal,
-            policy_keys,
-            installer_key_id,
-            installer_key,
-            ceremony_key_id,
-            ceremony_key,
-            revocation_key_id,
-            revocation_key,
-            assurance,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_in_memory(
-        journal: Arc<BrokerJournal>,
-        policy_keys: BTreeMap<String, (Token, VerifyingKey)>,
-        installer_key_id: Token,
-        installer_key: VerifyingKey,
-        ceremony_key_id: Token,
-        ceremony_key: VerifyingKey,
-        revocation_key_id: Token,
-        revocation_key: VerifyingKey,
-        assurance: AssuranceRegistry,
-    ) -> Result<Self, AuthorityError> {
-        Self::from_connection(
-            None,
-            journal,
-            policy_keys,
-            installer_key_id,
-            installer_key,
-            ceremony_key_id,
-            ceremony_key,
-            revocation_key_id,
-            revocation_key,
-            assurance,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn from_connection(
-        legacy_connection: Option<Connection>,
         journal: Arc<BrokerJournal>,
         policy_keys: BTreeMap<String, (Token, VerifyingKey)>,
         installer_key_id: Token,
@@ -602,10 +542,6 @@ impl BrokerAuthority {
             );
             ",
             )?;
-            if let Some(legacy) = &legacy_connection {
-                migrate_legacy_authority(&mut connection, legacy, &journal)?;
-            }
-            enforce_authority_state_floor(&connection)?;
             (retired_policy_keys, cleanup_committed) =
                 recover_legacy_deleted_policies(&mut connection, &journal)?;
         }
@@ -3619,86 +3555,6 @@ fn petal_payload_batch_digest(payloads: &[Vec<u8>]) -> Digest32 {
     Digest32::from_bytes(digest.finalize().into())
 }
 
-// AC-18 requires Broker authority effects and the Broker audit record to share
-// one SQLite commit. Older packages stored authority tables in a second file.
-// On first open, copy that file into the journal database and record the source
-// path so subsequent starts are idempotent. The legacy file is intentionally
-// left untouched as a rollback artifact; all subsequent reads and writes use
-// the consolidated database.
-fn migrate_legacy_authority(
-    target: &mut Connection,
-    legacy: &Connection,
-    journal: &BrokerJournal,
-) -> Result<(), AuthorityError> {
-    if !crate::legacy_store::has_table(legacy, "policies")? {
-        return Ok(());
-    }
-    let legacy_path: String = legacy.query_row(
-        "SELECT file FROM pragma_database_list WHERE name='main'",
-        [],
-        |row| row.get(0),
-    )?;
-    let target_path: String = target.query_row(
-        "SELECT file FROM pragma_database_list WHERE name='main'",
-        [],
-        |row| row.get(0),
-    )?;
-    if legacy_path.is_empty() || legacy_path == target_path {
-        return Ok(());
-    }
-    target.execute_batch(
-        "CREATE TABLE IF NOT EXISTS broker_store_migrations (
-            source_kind TEXT NOT NULL,
-            source_path TEXT NOT NULL,
-            PRIMARY KEY(source_kind, source_path)
-        );",
-    )?;
-    let migrated: bool = target.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM broker_store_migrations
-            WHERE source_kind='authority' AND source_path=?1
-        )",
-        [&legacy_path],
-        |row| row.get(0),
-    )?;
-    if migrated {
-        return Ok(());
-    }
-    crate::legacy_store::attach(target, &legacy_path, "authority_legacy", "authority")
-        .map_err(AuthorityError::Storage)?;
-    journal.verify_migration_target(target)?;
-    let migration = (|| -> Result<(), AuthorityError> {
-        let transaction = target.transaction()?;
-        transaction.execute_batch(
-            "INSERT INTO policies SELECT * FROM authority_legacy.policies;
-             INSERT INTO wallet_epochs SELECT * FROM authority_legacy.wallet_epochs;
-             INSERT INTO provenance_catalog SELECT * FROM authority_legacy.provenance_catalog;
-             INSERT INTO mutation_quota SELECT * FROM authority_legacy.mutation_quota;
-             INSERT INTO signer_approval_tombstones
-                SELECT * FROM authority_legacy.signer_approval_tombstones;
-             INSERT INTO pending_petal_key_scopes
-                SELECT * FROM authority_legacy.pending_petal_key_scopes;
-             INSERT INTO petal_key_scopes SELECT * FROM authority_legacy.petal_key_scopes;",
-        )?;
-        transaction.execute(
-            "INSERT INTO broker_store_migrations(source_kind, source_path)
-             VALUES ('authority', ?1)",
-            [&legacy_path],
-        )?;
-        journal.append_external_audit(
-            &transaction,
-            "storage.authority_migrated",
-            &serde_json::json!({"legacy_path": legacy_path}),
-        )?;
-        transaction.commit()?;
-        Ok(())
-    })();
-    let detach = target.execute_batch("DETACH DATABASE authority_legacy;");
-    migration?;
-    detach?;
-    Ok(())
-}
-
 /// The allocated path must match the profile's frozen template. An explicit
 /// account is pinned exactly. An omitted EVM account means account zero, while
 /// an omitted Solana account delegates selection of the next canonical account
@@ -4518,53 +4374,6 @@ mod path_index_tests {
             "m/44'/501'/1'/0'",
             Some(0),
         ));
-    }
-}
-
-#[cfg(test)]
-mod legacy_attach_tests {
-    use super::*;
-    use crate::legacy_store::TestAuditSigner;
-
-    /// The startup probe opens the legacy store without the create flag, but
-    /// the migration attaches it afresh on the journal connection, which does
-    /// create. A store that disappears between the two would come back as an
-    /// empty file, and every later start would read that file as a home with
-    /// nothing to migrate, even where the store sits behind a link that would
-    /// otherwise fail startup.
-    #[test]
-    fn a_legacy_store_that_vanishes_before_the_attach_is_not_recreated() {
-        let directory = tempfile::tempdir().unwrap();
-        let legacy_path = directory.path().join("authority.sqlite");
-        let legacy = Connection::open(&legacy_path).unwrap();
-        legacy
-            .execute_batch("CREATE TABLE policies(wallet_id TEXT PRIMARY KEY);")
-            .unwrap();
-        // The open connection keeps the file; only its directory entry goes,
-        // which is what the migration sees when the store vanishes after the
-        // probe.
-        std::fs::remove_file(&legacy_path).unwrap();
-
-        let journal = BrokerJournal::open(
-            directory.path().join("journal.sqlite"),
-            Arc::new(TestAuditSigner),
-        )
-        .unwrap();
-        let connection = journal.shared_connection();
-        let mut target = connection.lock().unwrap();
-
-        let error = migrate_legacy_authority(&mut target, &legacy, &journal)
-            .expect_err("a legacy store that is gone cannot be migrated");
-        assert!(
-            error
-                .to_string()
-                .contains("cannot attach the legacy authority store"),
-            "the error must say which store could not be attached: {error}"
-        );
-        assert!(
-            !legacy_path.exists(),
-            "the attach must not recreate a vanished legacy store"
-        );
     }
 }
 

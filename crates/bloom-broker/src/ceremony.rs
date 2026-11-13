@@ -48,7 +48,6 @@ use std::{
     collections::HashMap,
     future::{Future, IntoFuture},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
-    path::Path as FsPath,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -1065,20 +1064,18 @@ impl CeremonyBroker {
     }
 
     pub fn open(
-        legacy_path: impl AsRef<FsPath>,
         signer: Arc<dyn CeremonySigner>,
         journal: Arc<BrokerJournal>,
     ) -> Result<Self, ProtocolError> {
-        Self::open_with_endpoint(legacy_path, signer, journal, CeremonyEndpoint::default())
+        Self::open_with_endpoint(signer, journal, CeremonyEndpoint::default())
     }
 
     pub fn open_with_endpoint(
-        legacy_path: impl AsRef<FsPath>,
         signer: Arc<dyn CeremonySigner>,
         journal: Arc<BrokerJournal>,
         endpoint: CeremonyEndpoint,
     ) -> Result<Self, ProtocolError> {
-        let database = open_audited_ceremony_store(legacy_path, &journal)?;
+        let database = open_audited_ceremony_store(&journal)?;
         let broker = Self::from_parts(
             signer,
             endpoint,
@@ -1092,14 +1089,12 @@ impl CeremonyBroker {
     }
 
     pub fn open_with_manifest_signer(
-        path: impl AsRef<FsPath>,
         signer: Arc<dyn CeremonySigner>,
         broker_key_id: Token,
         signing_key: SigningKey,
         journal: Arc<BrokerJournal>,
     ) -> Result<Self, ProtocolError> {
         Self::open_with_manifest_signer_audited(
-            path,
             signer,
             broker_key_id,
             signing_key,
@@ -1109,7 +1104,6 @@ impl CeremonyBroker {
     }
 
     pub fn open_with_manifest_signer_audited(
-        legacy_path: impl AsRef<FsPath>,
         signer: Arc<dyn CeremonySigner>,
         broker_key_id: Token,
         signing_key: SigningKey,
@@ -1117,7 +1111,6 @@ impl CeremonyBroker {
         limits: CeremonyLimits,
     ) -> Result<Self, ProtocolError> {
         Self::open_with_manifest_signer_audited_and_endpoint(
-            legacy_path,
             signer,
             broker_key_id,
             signing_key,
@@ -1128,7 +1121,6 @@ impl CeremonyBroker {
     }
 
     pub fn open_with_manifest_signer_audited_and_endpoint(
-        legacy_path: impl AsRef<FsPath>,
         signer: Arc<dyn CeremonySigner>,
         broker_key_id: Token,
         signing_key: SigningKey,
@@ -1136,7 +1128,7 @@ impl CeremonyBroker {
         limits: CeremonyLimits,
         endpoint: CeremonyEndpoint,
     ) -> Result<Self, ProtocolError> {
-        let database = open_audited_ceremony_store(legacy_path, &journal)?;
+        let database = open_audited_ceremony_store(&journal)?;
         let broker = Self::from_parts(
             signer,
             endpoint,
@@ -5652,17 +5644,11 @@ fn storage(error: impl std::fmt::Display) -> ProtocolError {
     )
 }
 
-// See the authority migration: ceremony state formerly lived in a separate
-// SQLite file, which cannot commit atomically with the Broker audit chain.
-// Import it once into the consolidated journal database and retain the source
-// file untouched as a rollback artifact. The legacy file is only opened when
-// it is there and is never created, so a fresh home grows no empty store and a
-// dangling link, a vanished target or a mistyped directory fails startup.
+// Ceremony state lives in the journal database so it commits atomically with
+// the Broker audit chain.
 fn open_audited_ceremony_store(
-    legacy_path: impl AsRef<FsPath>,
     journal: &Arc<BrokerJournal>,
 ) -> Result<Arc<std::sync::Mutex<Connection>>, ProtocolError> {
-    let legacy = crate::legacy_store::open(legacy_path.as_ref(), "ceremony").map_err(storage)?;
     let database = journal.shared_connection();
     {
         let mut connection = database.lock().map_err(|_| {
@@ -5681,9 +5667,6 @@ fn open_audited_ceremony_store(
                 );",
             )
             .map_err(storage)?;
-        if let Some(legacy) = &legacy {
-            migrate_legacy_ceremonies(&mut connection, legacy, journal)?;
-        }
         let transaction = connection.transaction().map_err(storage)?;
         if migrate_pairing_session_index(&transaction)? {
             journal
@@ -5786,95 +5769,6 @@ fn supported_ceremony_storage_version(found: i64) -> Result<(), UnsupportedStore
         found,
         supported: CEREMONY_STORAGE_VERSION,
     })
-}
-
-fn migrate_legacy_ceremonies(
-    target: &mut Connection,
-    legacy: &Connection,
-    journal: &BrokerJournal,
-) -> Result<(), ProtocolError> {
-    // The legacy file is opened as it is and is no longer given the table,
-    // so one without it, such as an empty file, has nothing to migrate.
-    if !crate::legacy_store::has_table(legacy, "ceremony_sessions").map_err(storage)? {
-        return Ok(());
-    }
-    let legacy_path: String = legacy
-        .query_row(
-            "SELECT file FROM pragma_database_list WHERE name='main'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(storage)?;
-    let legacy_session_count: i64 = legacy
-        .query_row("SELECT COUNT(*) FROM ceremony_sessions", [], |row| {
-            row.get(0)
-        })
-        .map_err(storage)?;
-    let target_path: String = target
-        .query_row(
-            "SELECT file FROM pragma_database_list WHERE name='main'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(storage)?;
-    if legacy_path.is_empty() || legacy_path == target_path || legacy_session_count == 0 {
-        return Ok(());
-    }
-    target
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS broker_store_migrations (
-                source_kind TEXT NOT NULL,
-                source_path TEXT NOT NULL,
-                PRIMARY KEY(source_kind, source_path)
-            );",
-        )
-        .map_err(storage)?;
-    let migrated: bool = target
-        .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM broker_store_migrations
-                WHERE source_kind='ceremony' AND source_path=?1
-            )",
-            [&legacy_path],
-            |row| row.get(0),
-        )
-        .map_err(storage)?;
-    if migrated {
-        return Ok(());
-    }
-    crate::legacy_store::attach(target, &legacy_path, "ceremony_legacy", "ceremony")
-        .map_err(storage)?;
-    journal.verify_migration_target(target).map_err(storage)?;
-    let migration = (|| -> Result<(), ProtocolError> {
-        let transaction = target.transaction().map_err(storage)?;
-        transaction
-            .execute(
-                "INSERT INTO ceremony_sessions
-                 SELECT * FROM ceremony_legacy.ceremony_sessions",
-                [],
-            )
-            .map_err(storage)?;
-        transaction
-            .execute(
-                "INSERT INTO broker_store_migrations(source_kind, source_path)
-                 VALUES ('ceremony', ?1)",
-                [&legacy_path],
-            )
-            .map_err(storage)?;
-        journal
-            .append_external_audit(
-                &transaction,
-                "storage.ceremony_migrated",
-                &serde_json::json!({"legacy_path": legacy_path}),
-            )
-            .map_err(storage)?;
-        transaction.commit().map_err(storage)?;
-        Ok(())
-    })();
-    let detach = target.execute_batch("DETACH DATABASE ceremony_legacy;");
-    migration?;
-    detach.map_err(storage)?;
-    Ok(())
 }
 
 fn protocol(code: ProtocolErrorCode, message: impl Into<String>) -> ProtocolError {
@@ -6380,69 +6274,5 @@ mod origin_tests {
     fn matching_origin_passes() {
         check_origin(Some("http://localhost:28736"), "http://localhost:28736")
             .expect("exact origin match must pass");
-    }
-}
-
-#[cfg(test)]
-mod legacy_attach_tests {
-    use super::*;
-    use crate::legacy_store::TestAuditSigner;
-
-    /// The startup probe opens the legacy store without the create flag, but
-    /// the migration attaches it afresh on the journal connection, which does
-    /// create. A store that disappears between the two would come back as an
-    /// empty file, and every later start would read that file as a home with
-    /// nothing to migrate.
-    #[test]
-    fn a_legacy_ceremony_store_that_vanishes_before_the_attach_is_not_recreated() {
-        let directory = tempfile::tempdir().unwrap();
-        let legacy_path = directory.path().join("ceremonies.sqlite");
-        let legacy = Connection::open(&legacy_path).unwrap();
-        // One row, so the migration has something to carry and reaches the
-        // attach.
-        legacy
-            .execute_batch(
-                "CREATE TABLE ceremony_sessions (
-                    ceremony_id TEXT PRIMARY KEY,
-                    operation_id TEXT NOT NULL UNIQUE,
-                    session_jcs TEXT NOT NULL
-                );
-                INSERT INTO ceremony_sessions VALUES ('ceremony', 'operation', '{}');",
-            )
-            .unwrap();
-        // The open connection keeps the file; only its directory entry goes,
-        // which is what the migration sees when the store vanishes after the
-        // probe.
-        std::fs::remove_file(&legacy_path).unwrap();
-
-        let journal = BrokerJournal::open(
-            directory.path().join("journal.sqlite"),
-            Arc::new(TestAuditSigner),
-        )
-        .unwrap();
-        let connection = journal.shared_connection();
-        let mut target = connection.lock().unwrap();
-        target
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS ceremony_sessions (
-                    ceremony_id TEXT PRIMARY KEY,
-                    operation_id TEXT NOT NULL,
-                    session_jcs TEXT NOT NULL
-                );",
-            )
-            .unwrap();
-
-        let error = migrate_legacy_ceremonies(&mut target, &legacy, &journal)
-            .expect_err("a legacy store that is gone cannot be migrated");
-        assert!(
-            error
-                .to_string()
-                .contains("cannot attach the legacy ceremony store"),
-            "the error must say which store could not be attached: {error}"
-        );
-        assert!(
-            !legacy_path.exists(),
-            "the attach must not recreate a vanished legacy store"
-        );
     }
 }

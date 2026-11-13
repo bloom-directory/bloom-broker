@@ -135,12 +135,8 @@ fn open_broker(root: &Path, socket_path: &Path) -> (Arc<BrokerRpcService>, Arc<B
         .unwrap(),
     );
     let signer_client = connect_signer(socket_path, &broker_identity, &signer_acl, &journal);
-    let authority = Arc::new(broker_authority(
-        root.join("broker-authority.sqlite"),
-        &journal,
-        BTreeMap::new(),
-    ));
-    let ceremony = manifest_ceremony(root.join("ceremony.sqlite"), &signer_client, &journal);
+    let authority = Arc::new(broker_authority(&journal, BTreeMap::new()));
+    let ceremony = manifest_ceremony(&signer_client, &journal);
     let broker = Arc::new(broker_service(
         authority.clone(),
         &journal,

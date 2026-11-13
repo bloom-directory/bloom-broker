@@ -23,7 +23,6 @@ async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
     let signer_acl = peer_acl(&signer_identity, effective_uid);
     let broker_acl = peer_acl(&broker_identity, effective_uid);
     let broker_journal_path = directory.path().join("broker-journal.sqlite");
-    let broker_authority_path = directory.path().join("broker-authority.sqlite");
     let journal = Arc::new(
         BrokerJournal::open(&broker_journal_path, Arc::new(ServiceTestAuditSigner)).unwrap(),
     );
@@ -42,16 +41,8 @@ async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
         signer_engine.clone(),
     );
     let signer_client = connect_signer(&socket_path, &broker_identity, &signer_acl, &journal);
-    let authority = Arc::new(broker_authority(
-        &broker_authority_path,
-        &journal,
-        BTreeMap::new(),
-    ));
-    let ceremony = manifest_ceremony(
-        directory.path().join("ceremony.sqlite"),
-        &signer_client,
-        &journal,
-    );
+    let authority = Arc::new(broker_authority(&journal, BTreeMap::new()));
+    let ceremony = manifest_ceremony(&signer_client, &journal);
     let broker = broker_service(
         authority.clone(),
         &journal,
@@ -250,7 +241,7 @@ async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
         );
         committed.committed
     };
-    let reopened = broker_authority(&broker_authority_path, &journal, BTreeMap::new());
+    let reopened = broker_authority(&journal, BTreeMap::new());
     assert_eq!(reopened.policy_snapshot(&wallet_id).unwrap(), current);
     let authority = Arc::new(reopened);
     let broker = broker_service(
@@ -3560,7 +3551,6 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let signer_acl = peer_acl(&signer_identity, effective_uid);
     let broker_acl = peer_acl(&broker_identity, effective_uid);
     let broker_journal_path = directory.path().join("broker-journal.sqlite");
-    let broker_authority_path = directory.path().join("broker-authority.sqlite");
     let journal = Arc::new(
         BrokerJournal::open(&broker_journal_path, Arc::new(ServiceTestAuditSigner)).unwrap(),
     );
@@ -3579,16 +3569,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         signer_engine.clone(),
     );
     let signer_client = connect_signer(&socket_path, &broker_identity, &signer_acl, &journal);
-    let authority = Arc::new(broker_authority(
-        &broker_authority_path,
-        &journal,
-        BTreeMap::new(),
-    ));
-    let ceremony = manifest_ceremony(
-        directory.path().join("ceremony.sqlite"),
-        &signer_client,
-        &journal,
-    );
+    let authority = Arc::new(broker_authority(&journal, BTreeMap::new()));
+    let ceremony = manifest_ceremony(&signer_client, &journal);
     let broker = broker_service(
         authority.clone(),
         &journal,
@@ -3711,12 +3693,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     );
     assert_eq!(adoption_observer.custody_attempts.load(Ordering::SeqCst), 1);
 
-    let restarted_ceremony = CeremonyBroker::open(
-        directory.path().join("ceremony.sqlite"),
-        Arc::new(signer_client.clone()),
-        journal.clone(),
-    )
-    .unwrap();
+    let restarted_ceremony =
+        CeremonyBroker::open(Arc::new(signer_client.clone()), journal.clone()).unwrap();
     restarted_ceremony
         .set_completion_observer(adoption_observer.clone(), now_ms)
         .unwrap();
@@ -5043,20 +5021,12 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             VerifyingKey::from_bytes(&policy_key_bytes).unwrap(),
         ),
     );
-    let restarted_authority = Arc::new(broker_authority(
-        &broker_authority_path,
-        &restarted_journal,
-        restarted_policy_keys,
-    ));
+    let restarted_authority = Arc::new(broker_authority(&restarted_journal, restarted_policy_keys));
     let replay_authority = restarted_authority.clone();
     let restarted_scoped_broker = broker_service(
         restarted_authority,
         &restarted_journal,
-        manifest_ceremony(
-            directory.path().join("scoped-restart-ceremony.sqlite"),
-            &restarted_signer_client,
-            &restarted_journal,
-        ),
+        manifest_ceremony(&restarted_signer_client, &restarted_journal),
         restarted_signer_client,
         test_time_source(),
         &broker_identity.boot_epoch,
@@ -5671,12 +5641,7 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let restarted_broker = broker_service(
         authority.clone(),
         &journal,
-        CeremonyBroker::open(
-            directory.path().join("restarted-ceremony.sqlite"),
-            Arc::new(signer_client.clone()),
-            journal.clone(),
-        )
-        .unwrap(),
+        CeremonyBroker::open(Arc::new(signer_client.clone()), journal.clone()).unwrap(),
         signer_client,
         test_time_source(),
         &broker_identity.boot_epoch,
@@ -6147,7 +6112,6 @@ async fn a_rolled_back_approval_ceremony_is_not_reported_cancelled() {
 #[tokio::test]
 async fn ceremonies_ending_in_the_same_millisecond_report_one_ending_across_reopen() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("ceremony.sqlite");
     let journal = Arc::new(
         BrokerJournal::open(
             directory.path().join("journal.sqlite"),
@@ -6157,7 +6121,6 @@ async fn ceremonies_ending_in_the_same_millisecond_report_one_ending_across_reop
     );
     let open = || {
         CeremonyBroker::open_with_manifest_signer(
-            &path,
             Arc::new(MockSigner::new()),
             Token::new("broker-review-key").unwrap(),
             SigningKey::from_bytes(&[36; 32]),
@@ -8073,7 +8036,6 @@ fn ac18_forced_ceremony_audit_write_failure_rolls_back_session() {
     );
     let signer = Arc::new(MockSigner::new());
     let broker = CeremonyBroker::open_with_manifest_signer_audited(
-        directory.path().join("ceremonies.sqlite"),
         signer,
         Token::new("broker-review-key").unwrap(),
         SigningKey::from_bytes(&[7; 32]),
@@ -8121,432 +8083,6 @@ fn ac18_forced_ceremony_audit_write_failure_rolls_back_session() {
 }
 
 #[test]
-fn ac18_populated_ceremony_migration_is_atomic_idempotent_and_retains_source() {
-    let directory = tempfile::tempdir().unwrap();
-    let legacy_path = directory.path().join("legacy-ceremony.sqlite");
-    let legacy_journal =
-        Arc::new(BrokerJournal::open(&legacy_path, Arc::new(ServiceTestAuditSigner)).unwrap());
-    let operation_id = operation("39");
-    let legacy_broker = CeremonyBroker::open_with_manifest_signer_audited(
-        &legacy_path,
-        Arc::new(MockSigner::new()),
-        Token::new("broker-review-key").unwrap(),
-        SigningKey::from_bytes(&[7; 32]),
-        legacy_journal,
-        CeremonyLimits::default(),
-    )
-    .unwrap();
-    legacy_broker
-        .prepare_custody(
-            CustodyPrepareRequest {
-                surface: bloom_signer_api::legacy_local_surface(),
-                ceremony_kind: CeremonyKind::WalletDelete,
-                custody_operation_id: operation_id.clone(),
-                wallet_id: Some(Token::new("wallet-migrated").unwrap()),
-                key_ref: None,
-                exact_terms_digest: digest("39"),
-                expected_input_class: Token::new("policy-document").unwrap(),
-                browser_output_recipient_key: None,
-                petal_key_scope: None,
-                legacy_passkey_migration: None,
-                wallet_seed_profile: None,
-                derivation_requests: Vec::new(),
-            },
-            50_000,
-        )
-        .unwrap();
-    legacy_broker.cancel(&operation_id, 50_001).unwrap();
-    drop(legacy_broker);
-    let source = rusqlite::Connection::open(&legacy_path).unwrap();
-    let source_jcs: String = source
-        .query_row(
-            "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
-            [operation_id.as_str()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    drop(source);
-
-    let failed_target_path = directory.path().join("failed-target-journal.sqlite");
-    let fail = Arc::new(AtomicBool::new(false));
-    let failed_journal = Arc::new(
-        BrokerJournal::open(
-            &failed_target_path,
-            Arc::new(SwitchableAuditSigner(fail.clone())),
-        )
-        .unwrap(),
-    );
-    fail.store(true, Ordering::SeqCst);
-    assert!(
-        CeremonyBroker::open(
-            &legacy_path,
-            Arc::new(MockSigner::new()),
-            failed_journal.clone(),
-        )
-        .is_err()
-    );
-    let failed_target = rusqlite::Connection::open(&failed_target_path).unwrap();
-    assert_eq!(
-        failed_target
-            .query_row("SELECT COUNT(*) FROM ceremony_sessions", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        failed_target
-            .query_row("SELECT COUNT(*) FROM broker_store_migrations", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-        0
-    );
-    assert!(failed_journal.audit_entries().unwrap().is_empty());
-    let source = rusqlite::Connection::open(&legacy_path).unwrap();
-    assert_eq!(
-        source
-            .query_row(
-                "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
-                [operation_id.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-        source_jcs
-    );
-    drop(source);
-    drop(failed_target);
-    drop(failed_journal);
-
-    let target_path = directory.path().join("target-journal.sqlite");
-    let target_journal =
-        Arc::new(BrokerJournal::open(&target_path, Arc::new(ServiceTestAuditSigner)).unwrap());
-    let migrated = CeremonyBroker::open(
-        &legacy_path,
-        Arc::new(MockSigner::new()),
-        target_journal.clone(),
-    )
-    .unwrap();
-    assert_eq!(
-        migrated.status(&operation_id),
-        Some(CeremonyState::Cancelled)
-    );
-    assert_eq!(
-        target_journal
-            .audit_entries()
-            .unwrap()
-            .iter()
-            .filter(|entry| entry.event_type == "storage.ceremony_migrated")
-            .count(),
-        1
-    );
-    drop(migrated);
-    let reopened = CeremonyBroker::open(
-        &legacy_path,
-        Arc::new(MockSigner::new()),
-        target_journal.clone(),
-    )
-    .unwrap();
-    assert_eq!(
-        reopened.status(&operation_id),
-        Some(CeremonyState::Cancelled)
-    );
-    assert_eq!(
-        target_journal
-            .audit_entries()
-            .unwrap()
-            .iter()
-            .filter(|entry| entry.event_type == "storage.ceremony_migrated")
-            .count(),
-        1
-    );
-    let source = rusqlite::Connection::open(&legacy_path).unwrap();
-    assert_eq!(
-        source
-            .query_row(
-                "SELECT session_jcs FROM ceremony_sessions WHERE operation_id=?1",
-                [operation_id.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-        source_jcs
-    );
-    drop(source);
-
-    let conflict_path = directory.path().join("conflict-ceremony.sqlite");
-    std::fs::copy(&legacy_path, &conflict_path).unwrap();
-    assert!(
-        CeremonyBroker::open(
-            &conflict_path,
-            Arc::new(MockSigner::new()),
-            target_journal.clone(),
-        )
-        .is_err()
-    );
-    let target = rusqlite::Connection::open(&target_path).unwrap();
-    let marker: i64 = target
-        .query_row(
-            "SELECT COUNT(*) FROM broker_store_migrations WHERE source_kind='ceremony' AND source_path=?1",
-            [conflict_path.to_string_lossy().as_ref()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(marker, 0);
-}
-
-fn open_ceremony_at(
-    legacy_path: &std::path::Path,
-    journal_path: &std::path::Path,
-) -> Result<CeremonyBroker, ProtocolError> {
-    let journal =
-        Arc::new(BrokerJournal::open(journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
-    CeremonyBroker::open(legacy_path, Arc::new(MockSigner::new()), journal)
-}
-
-/// Writes a legacy ceremony store holding one cancelled session and returns
-/// that session's operation.
-fn seed_legacy_ceremony_store(path: &std::path::Path) -> OperationId {
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    // Older packages kept sessions in their own file. A broker whose journal
-    // is that file writes real sessions there; the file then also holds the
-    // journal's other tables, which the migration ignores.
-    let journal = Arc::new(BrokerJournal::open(path, Arc::new(ServiceTestAuditSigner)).unwrap());
-    let broker = CeremonyBroker::open_with_manifest_signer_audited(
-        path,
-        Arc::new(MockSigner::new()),
-        Token::new("broker-review-key").unwrap(),
-        SigningKey::from_bytes(&[7; 32]),
-        journal,
-        CeremonyLimits::default(),
-    )
-    .unwrap();
-    let operation_id = operation("3a");
-    broker
-        .prepare_custody(
-            CustodyPrepareRequest {
-                surface: bloom_signer_api::legacy_local_surface(),
-                ceremony_kind: CeremonyKind::WalletDelete,
-                custody_operation_id: operation_id.clone(),
-                wallet_id: Some(Token::new("wallet-legacy-store").unwrap()),
-                key_ref: None,
-                exact_terms_digest: digest("3a"),
-                expected_input_class: Token::new("policy-document").unwrap(),
-                browser_output_recipient_key: None,
-                petal_key_scope: None,
-                legacy_passkey_migration: None,
-                wallet_seed_profile: None,
-                derivation_requests: Vec::new(),
-            },
-            50_000,
-        )
-        .unwrap();
-    broker.cancel(&operation_id, 50_001).unwrap();
-    operation_id
-}
-
-/// Ceremony state lives in the journal; the legacy file is only a migration
-/// source. Creating it puts an empty store exactly where someone debugging
-/// ceremony state looks first.
-#[test]
-fn a_home_with_nothing_to_migrate_grows_no_legacy_ceremony_file() {
-    let directory = tempfile::tempdir().unwrap();
-    let legacy_path = directory.path().join("ceremonies.sqlite");
-
-    let broker = open_ceremony_at(&legacy_path, &directory.path().join("journal.sqlite"))
-        .expect("a fresh home opens");
-    drop(broker);
-
-    assert!(
-        !legacy_path.exists(),
-        "opening a fresh home must not create an empty legacy ceremony store"
-    );
-}
-
-/// Legacy ceremony files with nothing to migrate open, and are left exactly
-/// as they were, with no migration recorded. Every release before this one
-/// gave the file an empty `ceremony_sessions` table, so that is the shape most
-/// upgraded homes have; a file without the table, empty or not, has nothing
-/// to migrate either.
-#[test]
-fn a_legacy_ceremony_file_without_sessions_is_left_untouched() {
-    let directory = tempfile::tempdir().unwrap();
-    fn older_release(path: &std::path::Path) {
-        rusqlite::Connection::open(path)
-            .unwrap()
-            .execute_batch(
-                "CREATE TABLE ceremony_sessions (
-                    ceremony_id TEXT PRIMARY KEY,
-                    operation_id TEXT NOT NULL UNIQUE,
-                    session_jcs TEXT NOT NULL
-                );",
-            )
-            .unwrap();
-    }
-    fn other_tables(path: &std::path::Path) {
-        rusqlite::Connection::open(path)
-            .unwrap()
-            .execute_batch("CREATE TABLE policies(wallet_id TEXT PRIMARY KEY);")
-            .unwrap();
-    }
-    fn empty_file(path: &std::path::Path) {
-        std::fs::write(path, b"").unwrap();
-    }
-    let shapes = [
-        (
-            "an older release's empty table",
-            older_release as fn(&std::path::Path),
-        ),
-        ("a file with other tables only", other_tables),
-        ("an empty file", empty_file),
-    ];
-
-    for (index, (shape, write)) in shapes.into_iter().enumerate() {
-        let legacy_path = directory.path().join(format!("ceremonies-{index}.sqlite"));
-        write(&legacy_path);
-        let before = std::fs::read(&legacy_path).unwrap();
-        let journal = Arc::new(
-            BrokerJournal::open(
-                directory.path().join(format!("journal-{index}.sqlite")),
-                Arc::new(ServiceTestAuditSigner),
-            )
-            .unwrap(),
-        );
-
-        let broker =
-            CeremonyBroker::open(&legacy_path, Arc::new(MockSigner::new()), journal.clone())
-                .unwrap_or_else(|error| panic!("{shape} means nothing to migrate: {error}"));
-        drop(broker);
-
-        assert_eq!(
-            std::fs::read(&legacy_path).unwrap(),
-            before,
-            "{shape} must not be written to"
-        );
-        assert!(
-            !journal
-                .audit_entries()
-                .unwrap()
-                .iter()
-                .any(|entry| entry.event_type == "storage.ceremony_migrated"),
-            "{shape} must not record a migration"
-        );
-    }
-}
-
-/// A legacy store reached through a symlink whose target is missing is not
-/// "nothing to migrate": the entry is there, its sessions are not. The
-/// target's directory exists, as for a mounted volume whose file is gone, so
-/// an open that could create would succeed and leave an empty store there.
-#[test]
-fn a_dangling_legacy_ceremony_symlink_fails_startup_and_creates_nothing() {
-    let directory = tempfile::tempdir().unwrap();
-    let legacy_path = directory.path().join("ceremonies.sqlite");
-    let volume = directory.path().join("mounted-volume");
-    std::fs::create_dir(&volume).unwrap();
-    let target = volume.join("ceremonies.sqlite");
-    std::os::unix::fs::symlink(&target, &legacy_path).unwrap();
-
-    let error = open_ceremony_at(&legacy_path, &directory.path().join("journal.sqlite"))
-        .err()
-        .expect("a dangling legacy ceremony symlink must fail startup");
-    assert!(
-        error.to_string().contains("ceremonies.sqlite"),
-        "the error must name the legacy store: {error}"
-    );
-    assert!(
-        !target.exists(),
-        "a missing target must not be created by the open"
-    );
-}
-
-/// A missing directory in the configured path, or a path that cannot be
-/// inspected because a component is a file or a symlink loop, cannot be read
-/// as a home with nothing to migrate.
-#[test]
-fn an_unreachable_legacy_ceremony_path_fails_startup() {
-    let directory = tempfile::tempdir().unwrap();
-    let plain_file = directory.path().join("plain-file");
-    std::fs::write(&plain_file, b"not a directory").unwrap();
-    let looping = directory.path().join("loop");
-    std::os::unix::fs::symlink(&looping, &looping).unwrap();
-
-    for (index, (parent, expected)) in [
-        (
-            directory.path().join("no-such-dir"),
-            "cannot read the legacy ceremony store's directory",
-        ),
-        (plain_file, "cannot tell whether the legacy ceremony store"),
-        (looping, "cannot tell whether the legacy ceremony store"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let legacy_path = parent.join("ceremonies.sqlite");
-        let journal_path = directory.path().join(format!("journal-{index}.sqlite"));
-        let error = open_ceremony_at(&legacy_path, &journal_path)
-            .err()
-            .unwrap_or_else(|| panic!("{} must fail startup", legacy_path.display()));
-        assert!(error.to_string().contains(expected), "{error}");
-    }
-    assert!(!directory.path().join("no-such-dir").exists());
-}
-
-/// A directory the Broker may not search hides whether a store is there, so
-/// startup fails rather than reading the store as absent. Root can search any
-/// directory, so the case cannot be set up as root and is skipped there.
-#[test]
-fn a_legacy_ceremony_store_in_an_unsearchable_directory_fails_startup() {
-    use std::os::unix::fs::PermissionsExt as _;
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("skipped: root can search a mode 000 directory");
-        return;
-    }
-    let directory = tempfile::tempdir().unwrap();
-    let locked = directory.path().join("locked");
-    std::fs::create_dir(&locked).unwrap();
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-    let result = open_ceremony_at(
-        &locked.join("ceremonies.sqlite"),
-        &directory.path().join("journal.sqlite"),
-    );
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-    let error = result
-        .err()
-        .expect("a legacy store in an unsearchable directory must fail startup");
-    assert!(
-        error
-            .to_string()
-            .contains("cannot tell whether the legacy ceremony store"),
-        "{error}"
-    );
-}
-
-/// A populated legacy store behind a live symlink, in a directory whose name
-/// is URI syntax for the migration's `file:` attach or would be rewritten by a
-/// form-style encoder, still has its sessions carried over.
-#[test]
-fn a_legacy_ceremony_store_behind_a_symlink_at_an_unusual_path_is_migrated() {
-    let directory = tempfile::tempdir().unwrap();
-    let target = directory
-        .path()
-        .join("volume %41?#+é dir")
-        .join("ceremonies.sqlite");
-    let operation_id = seed_legacy_ceremony_store(&target);
-    let legacy_path = directory.path().join("ceremonies.sqlite");
-    std::os::unix::fs::symlink(&target, &legacy_path).unwrap();
-
-    let migrated = open_ceremony_at(&legacy_path, &directory.path().join("journal.sqlite"))
-        .expect("a legacy store behind a live symlink must open");
-    assert_eq!(
-        migrated.status(&operation_id),
-        Some(CeremonyState::Cancelled),
-        "the legacy session must be carried over"
-    );
-}
-
-#[test]
 fn schema1_release_state_migrates_pending_and_preserves_completed_receipt() {
     const SCHEMA1_BROKER_COMMIT: &str = "dd2add2b9d41540521d08c77d19fb467a2d8029e";
     const FIXTURE_SHA256: &str = "27772833a792ddcfb1d1493fa56bd6c7efdd06bcbc2b12edd749aea2dc8bb825";
@@ -8586,11 +8122,7 @@ fn schema1_release_state_migrates_pending_and_preserves_completed_receipt() {
 
     let journal =
         Arc::new(BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
-    let authority = broker_authority(
-        directory.path().join("authority.sqlite"),
-        &journal,
-        BTreeMap::new(),
-    );
+    let authority = broker_authority(&journal, BTreeMap::new());
     let policy = authority
         .policy_snapshot(&Token::new("quiet-lilac").unwrap())
         .expect("current startup must preserve schema-1 authority state");
@@ -8600,12 +8132,7 @@ fn schema1_release_state_migrates_pending_and_preserves_completed_receipt() {
     let completed_operation = operation("e1");
     let signer = Arc::new(MockSigner::new());
     signer.pending.lock().insert(pending_operation.clone());
-    let migrated = CeremonyBroker::open(
-        directory.path().join("ceremony.sqlite"),
-        signer.clone(),
-        journal.clone(),
-    )
-    .unwrap();
+    let migrated = CeremonyBroker::open(signer.clone(), journal.clone()).unwrap();
     assert_eq!(signer.cancellations.load(Ordering::SeqCst), 1);
     assert_eq!(
         migrated.status(&pending_operation),
@@ -8642,12 +8169,7 @@ fn schema1_release_state_migrates_pending_and_preserves_completed_receipt() {
         .expect("schema-1 completed receipt digest must survive migration");
     drop(migrated);
 
-    let reopened = CeremonyBroker::open(
-        directory.path().join("ceremony.sqlite"),
-        Arc::new(MockSigner::new()),
-        journal,
-    )
-    .unwrap();
+    let reopened = CeremonyBroker::open(Arc::new(MockSigner::new()), journal).unwrap();
     assert_eq!(
         reopened
             .public_status(&completed_operation)
@@ -8722,17 +8244,12 @@ fn schema1_receipt_reconciliation_preserves_committed_and_awaiting_delivery() {
         (directory, journal_path, receipt_value, receipt)
     };
 
-    let (commit_directory, commit_path, receipt_value, receipt) = prepare("VERIFYING", None);
+    let (_commit_directory, commit_path, receipt_value, receipt) = prepare("VERIFYING", None);
     let journal =
         Arc::new(BrokerJournal::open(&commit_path, Arc::new(ServiceTestAuditSigner)).unwrap());
     let signer = Arc::new(MockSigner::new());
     *signer.completed_custody.lock() = Some((completed_operation.clone(), receipt));
-    let committed = CeremonyBroker::open(
-        commit_directory.path().join("ceremony.sqlite"),
-        signer.clone(),
-        journal,
-    )
-    .unwrap();
+    let committed = CeremonyBroker::open(signer.clone(), journal).unwrap();
     assert_eq!(signer.cancellations.load(Ordering::SeqCst), 0);
     assert_eq!(
         committed.status(&completed_operation),
@@ -8756,18 +8273,13 @@ fn schema1_receipt_reconciliation_preserves_committed_and_awaiting_delivery() {
     );
     drop(committed_store);
 
-    let (wallet_directory, wallet_path, wallet_receipt_value, wallet_receipt) =
+    let (_wallet_directory, wallet_path, wallet_receipt_value, wallet_receipt) =
         prepare("WALLET_COMMITTED", None);
     let wallet_journal =
         Arc::new(BrokerJournal::open(&wallet_path, Arc::new(ServiceTestAuditSigner)).unwrap());
     let wallet_signer = Arc::new(MockSigner::new());
     *wallet_signer.completed_custody.lock() = Some((completed_operation.clone(), wallet_receipt));
-    let wallet = CeremonyBroker::open(
-        wallet_directory.path().join("ceremony.sqlite"),
-        wallet_signer.clone(),
-        wallet_journal,
-    )
-    .unwrap();
+    let wallet = CeremonyBroker::open(wallet_signer.clone(), wallet_journal).unwrap();
     assert_eq!(wallet_signer.cancellations.load(Ordering::SeqCst), 0);
     assert_eq!(
         wallet.status(&completed_operation),
@@ -8786,19 +8298,14 @@ fn schema1_receipt_reconciliation_preserves_committed_and_awaiting_delivery() {
         wallet_receipt_value
     );
 
-    let (awaiting_directory, awaiting_path, awaiting_receipt_value, awaiting_receipt) =
+    let (_awaiting_directory, awaiting_path, awaiting_receipt_value, awaiting_receipt) =
         prepare("AWAITING_RECOVERY_ACK", Some(9_999_999_999_999));
     let awaiting_journal =
         Arc::new(BrokerJournal::open(&awaiting_path, Arc::new(ServiceTestAuditSigner)).unwrap());
     let awaiting_signer = Arc::new(MockSigner::new());
     *awaiting_signer.completed_custody.lock() =
         Some((completed_operation.clone(), awaiting_receipt));
-    let awaiting = CeremonyBroker::open(
-        awaiting_directory.path().join("ceremony.sqlite"),
-        awaiting_signer.clone(),
-        awaiting_journal,
-    )
-    .unwrap();
+    let awaiting = CeremonyBroker::open(awaiting_signer.clone(), awaiting_journal).unwrap();
     assert_eq!(awaiting_signer.cancellations.load(Ordering::SeqCst), 0);
     assert_eq!(
         awaiting.status(&completed_operation),
@@ -8830,11 +8337,9 @@ fn schema1_receipt_reconciliation_preserves_committed_and_awaiting_delivery() {
 fn ac18_ceremony_status_survives_latched_audit_tamper_while_new_sessions_fail() {
     let directory = tempfile::tempdir().unwrap();
     let journal_path = directory.path().join("journal.sqlite");
-    let ceremony_path = directory.path().join("ceremonies.sqlite");
     let journal =
         Arc::new(BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
     let broker = CeremonyBroker::open_with_manifest_signer_audited(
-        &ceremony_path,
         Arc::new(MockSigner::new()),
         Token::new("broker-review-key").unwrap(),
         SigningKey::from_bytes(&[7; 32]),
@@ -8862,7 +8367,6 @@ fn ac18_ceremony_status_survives_latched_audit_tamper_while_new_sessions_fail() 
         Arc::new(BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
     assert!(degraded_journal.audit_degraded());
     let restarted = CeremonyBroker::open_with_manifest_signer_audited(
-        &ceremony_path,
         Arc::new(MockSigner::new()),
         Token::new("broker-review-key").unwrap(),
         SigningKey::from_bytes(&[7; 32]),
@@ -8903,7 +8407,7 @@ fn restart_expires_nonterminal_session_and_persists_only_token_hash() {
     let path = directory.path().join("ceremonies.sqlite");
     let signer = Arc::new(MockSigner::new());
     let journal = Arc::new(BrokerJournal::open(&path, Arc::new(ServiceTestAuditSigner)).unwrap());
-    let broker = CeremonyBroker::open(&path, signer.clone(), journal.clone()).unwrap();
+    let broker = CeremonyBroker::open(signer.clone(), journal.clone()).unwrap();
     let prepared = prepare(
         &broker,
         operation("31"),
@@ -8921,7 +8425,7 @@ fn restart_expires_nonterminal_session_and_persists_only_token_hash() {
         "launch token plaintext must not be durable"
     );
 
-    let restarted = CeremonyBroker::open(&path, signer.clone(), journal).unwrap();
+    let restarted = CeremonyBroker::open(signer.clone(), journal).unwrap();
     assert_eq!(signer.cancellations.load(Ordering::SeqCst), 1);
     assert_eq!(
         restarted.status(&operation("31")),
@@ -8961,7 +8465,7 @@ async fn rejected_proof_stays_verifying_until_a_retried_cancel_releases_the_sign
     let path = directory.path().join("ceremonies.sqlite");
     let signer = Arc::new(MockSigner::rejecting_proof(true));
     let journal = Arc::new(BrokerJournal::open(&path, Arc::new(ServiceTestAuditSigner)).unwrap());
-    let broker = CeremonyBroker::open(&path, signer.clone(), journal.clone()).unwrap();
+    let broker = CeremonyBroker::open(signer.clone(), journal.clone()).unwrap();
     let wallet = Token::new("wallet-stale-counter").unwrap();
     // The browser completion path stamps itself from the real clock, so the
     // session has to be staged against it to still be live when it posts.
@@ -9047,7 +8551,7 @@ async fn rejected_proof_stays_verifying_until_a_retried_cancel_releases_the_sign
     signer.restore_cancellation();
     drop(app);
     drop(broker);
-    let restarted = CeremonyBroker::open(&path, signer.clone(), journal).unwrap();
+    let restarted = CeremonyBroker::open(signer.clone(), journal).unwrap();
     assert_eq!(
         signer.cancellations.load(Ordering::SeqCst),
         3,

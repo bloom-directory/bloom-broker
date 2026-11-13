@@ -65,8 +65,13 @@ mod remote_material;
 #[serde(deny_unknown_fields)]
 struct BrokerConfig {
     journal_path: PathBuf,
-    authority_path: PathBuf,
-    ceremony_path: PathBuf,
+    // Paths of the separate authority and ceremony stores that predate the
+    // journal. No released Broker kept state there, but installed configs
+    // still carry the keys, so they are accepted and ignored.
+    #[serde(default, rename = "authority_path")]
+    _authority_path: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "ceremony_path")]
+    _ceremony_path: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     remote_tls: Option<RemoteTlsConfig>,
     signer_socket_path: PathBuf,
@@ -740,7 +745,6 @@ async fn run_with_paths(
             return Ok(());
         }
         let authority = Arc::new(BrokerAuthority::open(
-            &config.authority_path,
             journal.clone(),
             policy_keys,
             Token::new(config.installer_key_id.clone())?,
@@ -785,7 +789,6 @@ async fn run_with_paths(
         }
         let signer_head_exchange = signer.clone();
         let ceremony = CeremonyBroker::open_with_manifest_signer_audited_and_endpoint(
-            &config.ceremony_path,
             Arc::new(signer.clone()),
             Token::new(config.review_manifest_key_id.clone())?,
             review_manifest_signing_key,
@@ -2362,6 +2365,44 @@ fn material_round_pause(relay_not_ready: bool, fast_rounds: &mut u32) -> Duratio
 #[cfg(test)]
 mod startup_failure_tests {
     use super::*;
+
+    /// Installed configs still name the pre-journal stores; they must parse.
+    #[test]
+    fn installed_configs_with_legacy_store_paths_still_parse() {
+        let mut config = serde_json::json!({
+            "journal_path": "/state/journal.db",
+            "authority_path": "/state/authority.db",
+            "ceremony_path": "/state/ceremonies.db",
+            "signer_socket_path": "/run/signer.sock",
+            "broker_signing_key_id": "k", "broker_signing_seed_hex": "s",
+            "audit_key_id": "k", "audit_signing_seed_hex": "s",
+            "review_manifest_key_id": "k", "review_manifest_signing_seed_hex": "s",
+            "installer_key_id": "k", "installer_public_key_hex": "p",
+            "signer_ceremony_key_id": "k", "signer_ceremony_public_key_hex": "p",
+            "signer_revocation_key_id": "k", "signer_revocation_public_key_hex": "p",
+            "provenance_catalog_path": "/etc/catalog.json",
+            "policy_keys": [],
+            "build_digest": "d",
+            "network_containment": null,
+            "maximum_connections": 64,
+            "maximum_in_flight_mutations": 16,
+            "maximum_requests_per_window": 1200,
+            "request_window_ms": 60000,
+            "maximum_journal_admissions_per_window": 120,
+            "journal_window_ms": 60000,
+            "control_maximum_connections": 8,
+            "control_maximum_in_flight_mutations": 4,
+            "control_maximum_requests_per_window": 60,
+            "control_request_window_ms": 60000,
+            "control_maximum_journal_admissions_per_window": 30,
+            "control_journal_window_ms": 60000
+        });
+        serde_json::from_value::<BrokerConfig>(config.clone()).unwrap();
+        let object = config.as_object_mut().unwrap();
+        object.remove("authority_path");
+        object.remove("ceremony_path");
+        serde_json::from_value::<BrokerConfig>(config).unwrap();
+    }
 
     #[test]
     fn certificate_rounds_are_fast_only_while_the_relay_is_not_ready_and_bounded() {

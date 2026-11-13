@@ -198,8 +198,7 @@ impl Harness {
         let revocation_key = SigningKey::from_bytes(&[4; 32]);
         let wallet = token("wallet-1");
         // Authority state lives in the journal, so a home is new exactly when
-        // its journal does not exist yet. The legacy `authority.sqlite` is
-        // only a migration source and is never created, so it cannot say.
+        // its journal does not exist yet.
         let first_open =
             directory.is_none_or(|directory| !directory.join("journal.sqlite").exists());
         let journal = Arc::new(match directory {
@@ -218,33 +217,18 @@ impl Harness {
             (token("policy-key"), policy_key.verifying_key()),
         );
         let registry = AssuranceRegistry::compiled(verifiers).unwrap();
-        let authority = match directory {
-            None => BrokerAuthority::open_in_memory(
-                journal.clone(),
-                policy_keys,
-                token("installer-key"),
-                installer_key.verifying_key(),
-                token("ceremony-key"),
-                ceremony_key.verifying_key(),
-                token("revocation-key"),
-                revocation_key.verifying_key(),
-                registry,
-            )
-            .unwrap(),
-            Some(directory) => BrokerAuthority::open(
-                directory.join("authority.sqlite"),
-                journal.clone(),
-                policy_keys,
-                token("installer-key"),
-                installer_key.verifying_key(),
-                token("ceremony-key"),
-                ceremony_key.verifying_key(),
-                token("revocation-key"),
-                revocation_key.verifying_key(),
-                registry,
-            )
-            .unwrap(),
-        };
+        let authority = BrokerAuthority::open(
+            journal.clone(),
+            policy_keys,
+            token("installer-key"),
+            installer_key.verifying_key(),
+            token("ceremony-key"),
+            ceremony_key.verifying_key(),
+            token("revocation-key"),
+            revocation_key.verifying_key(),
+            registry,
+        )
+        .unwrap();
         let harness = Self {
             authority,
             journal,
@@ -479,7 +463,7 @@ fn ac18_forced_authority_audit_write_failure_rolls_back_quota_effect() {
     let journal = Arc::new(
         BrokerJournal::open_in_memory(Arc::new(SwitchableAuditSigner(fail.clone()))).unwrap(),
     );
-    let authority = BrokerAuthority::open_in_memory(
+    let authority = BrokerAuthority::open(
         journal.clone(),
         BTreeMap::new(),
         token("installer-key"),
@@ -512,343 +496,15 @@ fn ac18_forced_authority_audit_write_failure_rolls_back_quota_effect() {
     );
 }
 
-/// Authority state lives in the journal; the legacy store exists only as a
-/// migration source. Creating an empty one puts a plausible-looking but always
-/// empty database exactly where someone debugging authority state looks first.
-#[test]
-fn a_home_with_nothing_to_migrate_grows_no_legacy_authority_file() {
-    let directory = tempfile::tempdir().unwrap();
-    let journal_path = directory.path().join("journal.sqlite");
-    let legacy_path = directory.path().join("authority.sqlite");
-
-    let journal = Arc::new(
-        BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).expect("journal"),
-    );
-    let authority = BrokerAuthority::open(
-        &legacy_path,
-        journal,
-        BTreeMap::new(),
-        token("installer-key"),
-        SigningKey::from_bytes(&[2; 32]).verifying_key(),
-        token("ceremony-key"),
-        SigningKey::from_bytes(&[3; 32]).verifying_key(),
-        token("revocation-key"),
-        SigningKey::from_bytes(&[4; 32]).verifying_key(),
-        AssuranceRegistry::compiled(vec![]).unwrap(),
-    )
-    .unwrap();
-
-    assert!(
-        !legacy_path.exists(),
-        "opening a fresh home must not create an empty legacy authority store"
-    );
-    drop(authority);
-}
-
-/// Legacy authority files with nothing to migrate open, and are left exactly
-/// as they were, with no migration recorded. Every release before this one
-/// created the file on every start and never wrote to it, so an empty file is
-/// the shape most upgraded homes have; only the `policies` check keeps them
-/// starting. An empty database, or one with other tables only, has nothing to
-/// migrate either.
-#[test]
-fn a_legacy_authority_file_without_policies_is_left_untouched() {
-    let directory = tempfile::tempdir().unwrap();
-    fn older_release(path: &std::path::Path) {
-        std::fs::write(path, b"").unwrap();
-    }
-    fn empty_database(path: &std::path::Path) {
-        rusqlite::Connection::open(path)
-            .unwrap()
-            .execute_batch("PRAGMA user_version = 1;")
-            .unwrap();
-    }
-    fn other_tables(path: &std::path::Path) {
-        rusqlite::Connection::open(path)
-            .unwrap()
-            .execute_batch("CREATE TABLE ceremony_sessions(ceremony_id TEXT PRIMARY KEY);")
-            .unwrap();
-    }
-    let shapes = [
-        (
-            "an older release's empty file",
-            older_release as fn(&std::path::Path),
-        ),
-        ("an empty database", empty_database),
-        ("a file with other tables only", other_tables),
-    ];
-
-    for (index, (shape, write)) in shapes.into_iter().enumerate() {
-        let legacy_path = directory.path().join(format!("authority-{index}.sqlite"));
-        write(&legacy_path);
-        let before = std::fs::read(&legacy_path).unwrap();
-        let journal = Arc::new(
-            BrokerJournal::open(
-                directory.path().join(format!("journal-{index}.sqlite")),
-                Arc::new(ServiceTestAuditSigner),
-            )
-            .unwrap(),
-        );
-
-        let authority = BrokerAuthority::open(
-            &legacy_path,
-            journal.clone(),
-            BTreeMap::new(),
-            token("installer-key"),
-            SigningKey::from_bytes(&[2; 32]).verifying_key(),
-            token("ceremony-key"),
-            SigningKey::from_bytes(&[3; 32]).verifying_key(),
-            token("revocation-key"),
-            SigningKey::from_bytes(&[4; 32]).verifying_key(),
-            AssuranceRegistry::compiled(vec![]).unwrap(),
-        )
-        .unwrap_or_else(|error| panic!("{shape} means nothing to migrate: {error}"));
-        drop(authority);
-
-        assert_eq!(
-            std::fs::read(&legacy_path).unwrap(),
-            before,
-            "{shape} must not be written to"
-        );
-        assert!(
-            !journal
-                .audit_entries()
-                .unwrap()
-                .iter()
-                .any(|entry| entry.event_type == "storage.authority_migrated"),
-            "{shape} must not record a migration"
-        );
-    }
-}
-
-#[cfg(unix)]
-fn open_authority_at(
-    legacy_path: &std::path::Path,
-    journal_path: &std::path::Path,
-) -> Result<BrokerAuthority, bloom_broker::authority::AuthorityError> {
-    let journal = Arc::new(
-        BrokerJournal::open(journal_path, Arc::new(ServiceTestAuditSigner)).expect("journal"),
-    );
-    BrokerAuthority::open(
-        legacy_path,
-        journal,
-        BTreeMap::new(),
-        token("installer-key"),
-        SigningKey::from_bytes(&[2; 32]).verifying_key(),
-        token("ceremony-key"),
-        SigningKey::from_bytes(&[3; 32]).verifying_key(),
-        token("revocation-key"),
-        SigningKey::from_bytes(&[4; 32]).verifying_key(),
-        AssuranceRegistry::compiled(vec![]).unwrap(),
-    )
-}
-
-/// A legacy store reached through a symlink whose target is missing is not
-/// "nothing to migrate": the entry is there, its state is not. Starting
-/// without it would drop the authority state the upgrade was meant to carry
-/// over, so startup fails and no empty store is created at the target.
-///
-/// The target's directory exists, as for a mounted volume whose file is
-/// gone. Inside a missing directory the open could not create the file
-/// anyway, and the last assertion would hold whatever the code did.
-#[cfg(unix)]
-#[test]
-fn a_dangling_legacy_store_symlink_fails_startup_instead_of_skipping_migration() {
-    let directory = tempfile::tempdir().unwrap();
-    let journal_path = directory.path().join("journal.sqlite");
-    let legacy_path = directory.path().join("authority.sqlite");
-    let volume = directory.path().join("mounted-volume");
-    std::fs::create_dir(&volume).unwrap();
-    let target = volume.join("authority.sqlite");
-    std::os::unix::fs::symlink(&target, &legacy_path).unwrap();
-
-    let error = open_authority_at(&legacy_path, &journal_path)
-        .err()
-        .expect("a dangling legacy store symlink must fail startup");
-    assert!(
-        error.to_string().contains("authority.sqlite"),
-        "the error must name the legacy store: {error}"
-    );
-    assert!(
-        !target.exists(),
-        "a missing target must not be created by the open"
-    );
-}
-
-/// A missing directory in the configured path is a misconfiguration, not a
-/// home with nothing to migrate: the store the Broker was told to carry over
-/// can never be found there. Startup fails and nothing is created.
-#[cfg(unix)]
-#[test]
-fn a_missing_legacy_store_directory_fails_startup_instead_of_skipping_migration() {
-    let directory = tempfile::tempdir().unwrap();
-    let journal_path = directory.path().join("journal.sqlite");
-    let legacy_path = directory
-        .path()
-        .join("no-such-dir")
-        .join("authority.sqlite");
-
-    let error = open_authority_at(&legacy_path, &journal_path)
-        .err()
-        .expect("a legacy store path inside a missing directory must fail startup");
-    assert!(
-        error.to_string().contains("no-such-dir"),
-        "the error must name the missing directory: {error}"
-    );
-    assert!(!legacy_path.parent().unwrap().exists());
-}
-
-/// Only a missing entry means there is nothing to migrate. When the entry
-/// cannot be inspected at all, because a component of the path is a file or
-/// a symlink loop, the Broker cannot tell whether a store is there, and
-/// reading that as "absent" would skip the migration. Startup fails instead.
-#[cfg(unix)]
-#[test]
-fn an_uninspectable_legacy_store_path_fails_startup_instead_of_skipping_migration() {
-    let directory = tempfile::tempdir().unwrap();
-    let plain_file = directory.path().join("plain-file");
-    std::fs::write(&plain_file, b"not a directory").unwrap();
-    let looping = directory.path().join("loop");
-    std::os::unix::fs::symlink(&looping, &looping).unwrap();
-
-    for (index, parent) in [&plain_file, &looping].into_iter().enumerate() {
-        let legacy_path = parent.join("authority.sqlite");
-        let journal_path = directory.path().join(format!("journal-{index}.sqlite"));
-        let error = open_authority_at(&legacy_path, &journal_path)
-            .err()
-            .unwrap_or_else(|| panic!("{} must fail startup", legacy_path.display()));
-        assert!(
-            error
-                .to_string()
-                .contains("cannot tell whether the legacy authority store"),
-            "{error}"
-        );
-    }
-}
-
-/// A directory the Broker may not search hides whether a store is there, so
-/// startup fails rather than reading the store as absent. Root can search any
-/// directory, so the case cannot be set up as root and is skipped there.
-#[cfg(unix)]
-#[test]
-fn a_legacy_store_in_an_unsearchable_directory_fails_startup() {
-    use std::os::unix::fs::PermissionsExt as _;
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("skipped: root can search a mode 000 directory");
-        return;
-    }
-    let directory = tempfile::tempdir().unwrap();
-    let locked = directory.path().join("locked");
-    std::fs::create_dir(&locked).unwrap();
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-    let result = open_authority_at(
-        &locked.join("authority.sqlite"),
-        &directory.path().join("journal.sqlite"),
-    );
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-    let error = result
-        .err()
-        .expect("a legacy store in an unsearchable directory must fail startup");
-    assert!(
-        error
-            .to_string()
-            .contains("cannot tell whether the legacy authority store"),
-        "{error}"
-    );
-}
-
-/// The symlink itself is not the problem: a legacy store that is reachable
-/// through one opens and migrates exactly as a regular file does.
-#[cfg(unix)]
-#[test]
-fn a_legacy_store_reached_through_a_symlink_is_migrated() {
-    let directory = tempfile::tempdir().unwrap();
-    let journal_path = directory.path().join("journal.sqlite");
-    let target = directory.path().join("volume").join("authority.sqlite");
-    seed_legacy_store(&target);
-    let legacy_path = directory.path().join("authority.sqlite");
-    std::os::unix::fs::symlink(&target, &legacy_path).unwrap();
-
-    let authority = open_authority_at(&legacy_path, &journal_path)
-        .expect("a legacy store behind a live symlink must open");
-    drop(authority);
-
-    assert_eq!(
-        migrated_quota(&journal_path),
-        "2",
-        "the legacy row must be carried over through the symlink"
-    );
-}
-
-/// The migration attaches the legacy store through a `file:` URI, where `%`,
-/// `?` and `#` are syntax. A store whose path contains them must still be the
-/// one that is attached, as must one whose path has a space, `+` or non-ASCII
-/// text, which a form-style encoder would rewrite.
-#[cfg(unix)]
-#[test]
-fn a_legacy_store_whose_path_contains_uri_syntax_is_migrated() {
-    let directory = tempfile::tempdir().unwrap();
-    let journal_path = directory.path().join("journal.sqlite");
-    let legacy_path = directory
-        .path()
-        .join("odd %41?#+é dir")
-        .join("authority.sqlite");
-    seed_legacy_store(&legacy_path);
-
-    let authority = open_authority_at(&legacy_path, &journal_path)
-        .expect("a legacy store at an unusual path must open");
-    drop(authority);
-
-    assert_eq!(migrated_quota(&journal_path), "2");
-}
-
-/// Writes a legacy authority store with the old schema and one row that a
-/// migration has to carry over.
-#[cfg(unix)]
-fn seed_legacy_store(path: &std::path::Path) {
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let legacy = rusqlite::Connection::open(path).unwrap();
-    legacy
-        .execute_batch(
-            "CREATE TABLE policies(wallet_id TEXT PRIMARY KEY, version TEXT NOT NULL, digest TEXT NOT NULL, snapshot_jcs TEXT NOT NULL, policy_jcs TEXT NOT NULL);
-             CREATE TABLE wallet_epochs(wallet_id TEXT PRIMARY KEY, epoch TEXT NOT NULL, reconciled INTEGER NOT NULL);
-             CREATE TABLE provenance_catalog(subject_jcs TEXT PRIMARY KEY, record_digest TEXT NOT NULL, record_jcs TEXT NOT NULL);
-             CREATE TABLE mutation_quota(principal TEXT PRIMARY KEY, window_started_ms TEXT NOT NULL, mutations TEXT NOT NULL);
-             CREATE TABLE signer_approval_tombstones(approval_id TEXT PRIMARY KEY, wallet_id TEXT NOT NULL, tombstone_jcs TEXT NOT NULL);
-             CREATE TABLE pending_petal_key_scopes(custody_operation_id TEXT PRIMARY KEY, scope_digest TEXT NOT NULL, scope_jcs TEXT NOT NULL);
-             CREATE TABLE petal_key_scopes(key_ref_jcs TEXT PRIMARY KEY, scope_digest TEXT NOT NULL, scope_jcs TEXT NOT NULL, activated_at_ms TEXT NOT NULL, expires_at_ms TEXT NOT NULL, custody_receipt_digest TEXT NOT NULL);
-             INSERT INTO mutation_quota VALUES ('linked-principal', '100', '2');",
-        )
-        .unwrap();
-}
-
-/// The `linked-principal` row from [`seed_legacy_store`], read back from the
-/// journal it was migrated into.
-#[cfg(unix)]
-fn migrated_quota(journal_path: &std::path::Path) -> String {
-    rusqlite::Connection::open(journal_path)
-        .unwrap()
-        .query_row(
-            "SELECT mutations FROM mutation_quota WHERE principal='linked-principal'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap()
-}
-
 #[test]
 fn ac18_authority_reads_survive_latched_audit_tamper_while_mutations_fail() {
     let directory = tempfile::tempdir().unwrap();
     let journal_path = directory.path().join("journal.sqlite");
-    let authority_path = directory.path().join("authority.sqlite");
     let open = || {
         let journal = Arc::new(
             BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).expect("journal"),
         );
         let authority = BrokerAuthority::open(
-            &authority_path,
             journal.clone(),
             BTreeMap::new(),
             token("installer-key"),
@@ -892,160 +548,9 @@ fn ac18_authority_reads_survive_latched_audit_tamper_while_mutations_fail() {
 }
 
 #[test]
-fn ac18_populated_authority_migration_is_atomic_idempotent_and_retains_source() {
-    let directory = tempfile::tempdir().unwrap();
-    let legacy_path = directory.path().join("legacy-authority.sqlite");
-    let journal_path = directory.path().join("journal.sqlite");
-    let legacy = rusqlite::Connection::open(&legacy_path).unwrap();
-    legacy
-        .execute_batch(
-            "CREATE TABLE policies(wallet_id TEXT PRIMARY KEY, version TEXT NOT NULL, digest TEXT NOT NULL, snapshot_jcs TEXT NOT NULL, policy_jcs TEXT NOT NULL);
-             CREATE TABLE wallet_epochs(wallet_id TEXT PRIMARY KEY, epoch TEXT NOT NULL, reconciled INTEGER NOT NULL);
-             CREATE TABLE provenance_catalog(subject_jcs TEXT PRIMARY KEY, record_digest TEXT NOT NULL, record_jcs TEXT NOT NULL);
-             CREATE TABLE mutation_quota(principal TEXT PRIMARY KEY, window_started_ms TEXT NOT NULL, mutations TEXT NOT NULL);
-             CREATE TABLE signer_approval_tombstones(approval_id TEXT PRIMARY KEY, wallet_id TEXT NOT NULL, tombstone_jcs TEXT NOT NULL);
-             CREATE TABLE pending_petal_key_scopes(custody_operation_id TEXT PRIMARY KEY, scope_digest TEXT NOT NULL, scope_jcs TEXT NOT NULL);
-             CREATE TABLE petal_key_scopes(key_ref_jcs TEXT PRIMARY KEY, scope_digest TEXT NOT NULL, scope_jcs TEXT NOT NULL, activated_at_ms TEXT NOT NULL, expires_at_ms TEXT NOT NULL, custody_receipt_digest TEXT NOT NULL);
-             INSERT INTO mutation_quota VALUES ('legacy-principal', '100', '2');",
-        )
-        .unwrap();
-    drop(legacy);
-    let source_before = std::fs::read(&legacy_path).unwrap();
-
-    let failed_target_path = directory.path().join("failed-journal.sqlite");
-    let fail = Arc::new(AtomicBool::new(false));
-    let failed_journal = Arc::new(
-        BrokerJournal::open(
-            &failed_target_path,
-            Arc::new(SwitchableAuditSigner(fail.clone())),
-        )
-        .unwrap(),
-    );
-    fail.store(true, Ordering::SeqCst);
-    assert!(
-        BrokerAuthority::open(
-            &legacy_path,
-            failed_journal.clone(),
-            BTreeMap::new(),
-            token("installer-key"),
-            SigningKey::from_bytes(&[2; 32]).verifying_key(),
-            token("ceremony-key"),
-            SigningKey::from_bytes(&[3; 32]).verifying_key(),
-            token("revocation-key"),
-            SigningKey::from_bytes(&[4; 32]).verifying_key(),
-            AssuranceRegistry::compiled(vec![]).unwrap(),
-        )
-        .is_err()
-    );
-    let failed_target = rusqlite::Connection::open(&failed_target_path).unwrap();
-    assert_eq!(
-        failed_target
-            .query_row("SELECT COUNT(*) FROM mutation_quota", [], |row| row
-                .get::<_, i64>(0))
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        failed_target
-            .query_row("SELECT COUNT(*) FROM broker_store_migrations", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-        0
-    );
-    assert!(failed_journal.audit_entries().unwrap().is_empty());
-    assert_eq!(std::fs::read(&legacy_path).unwrap(), source_before);
-    drop(failed_target);
-    drop(failed_journal);
-
-    let open = || {
-        let journal =
-            Arc::new(BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
-        let authority = BrokerAuthority::open(
-            &legacy_path,
-            journal.clone(),
-            BTreeMap::new(),
-            token("installer-key"),
-            SigningKey::from_bytes(&[2; 32]).verifying_key(),
-            token("ceremony-key"),
-            SigningKey::from_bytes(&[3; 32]).verifying_key(),
-            token("revocation-key"),
-            SigningKey::from_bytes(&[4; 32]).verifying_key(),
-            AssuranceRegistry::compiled(vec![]).unwrap(),
-        )
-        .unwrap();
-        (journal, authority)
-    };
-    let (journal, authority) = open();
-    assert!(
-        authority
-            .consume_mutation_quota("legacy-principal", 101, 1_000, 2)
-            .is_err()
-    );
-    assert_eq!(std::fs::read(&legacy_path).unwrap(), source_before);
-    let migration_events = journal
-        .audit_entries()
-        .unwrap()
-        .into_iter()
-        .filter(|entry| entry.event_type == "storage.authority_migrated")
-        .count();
-    assert_eq!(migration_events, 1);
-    drop(authority);
-    drop(journal);
-    let (journal, _authority) = open();
-    assert_eq!(
-        journal
-            .audit_entries()
-            .unwrap()
-            .into_iter()
-            .filter(|entry| entry.event_type == "storage.authority_migrated")
-            .count(),
-        1
-    );
-
-    let conflict_legacy_path = directory.path().join("conflict-authority.sqlite");
-    std::fs::copy(&legacy_path, &conflict_legacy_path).unwrap();
-    let target = rusqlite::Connection::open(&journal_path).unwrap();
-    target
-        .execute(
-            "INSERT OR REPLACE INTO mutation_quota VALUES ('legacy-principal', '999', '9')",
-            [],
-        )
-        .unwrap();
-    drop(target);
-    let journal =
-        Arc::new(BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
-    assert!(
-        BrokerAuthority::open(
-            &conflict_legacy_path,
-            journal.clone(),
-            BTreeMap::new(),
-            token("installer-key"),
-            SigningKey::from_bytes(&[2; 32]).verifying_key(),
-            token("ceremony-key"),
-            SigningKey::from_bytes(&[3; 32]).verifying_key(),
-            token("revocation-key"),
-            SigningKey::from_bytes(&[4; 32]).verifying_key(),
-            AssuranceRegistry::compiled(vec![]).unwrap(),
-        )
-        .is_err()
-    );
-    let target = rusqlite::Connection::open(&journal_path).unwrap();
-    let marker: i64 = target
-        .query_row(
-            "SELECT COUNT(*) FROM broker_store_migrations WHERE source_kind='authority' AND source_path=?1",
-            [conflict_legacy_path.to_string_lossy().as_ref()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(marker, 0);
-}
-
-#[test]
 fn active_approval_survives_broker_authority_and_journal_restart() {
     let fixture = Harness::new();
     let directory = tempfile::tempdir().unwrap();
-    let authority_path = directory.path().join("authority.sqlite");
     let journal_path = directory.path().join("journal.sqlite");
     let policy_snapshot = fixture.policy_snapshot(1);
     let provenance = fixture.system_provenance();
@@ -1062,7 +567,6 @@ fn active_approval_survives_broker_authority_and_journal_restart() {
             (token("policy-key"), fixture.policy_key.verifying_key()),
         );
         BrokerAuthority::open(
-            &authority_path,
             journal,
             policy_keys,
             token("installer-key"),
