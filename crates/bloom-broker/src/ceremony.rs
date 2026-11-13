@@ -352,13 +352,24 @@ fn bounded(field: &str, value: u64, ceiling: u64) -> Result<(), ProtocolError> {
 }
 
 const SHELL_HTML: &str = include_str!("ceremony_assets/index.html");
-const APP_JS: &str = concat!(
-    "const REVIEWED_ENSO_ROUTER = ",
-    include_str!("../../bloom-evm-clear-signing/catalogs/enso/router-v2.json"),
-    ";\n",
-    include_str!("ceremony_assets/token-artwork.js"),
-    include_str!("ceremony_assets/app.js")
-);
+macro_rules! app_js {
+    ($($preview:expr)?) => {
+        concat!(
+            "const REVIEWED_ENSO_ROUTER = ",
+            include_str!("../../bloom-evm-clear-signing/catalogs/enso/router-v2.json"),
+            ";\n",
+            include_str!("ceremony_assets/token-artwork.js"),
+            $($preview,)?
+            include_str!("ceremony_assets/app.js")
+        )
+    };
+}
+/// The page script. Design-preview fixtures ship only with the developer
+/// harness, the one build that routes `/preview`.
+#[cfg(not(feature = "triad-dev-harness"))]
+const APP_JS: &str = app_js!();
+#[cfg(feature = "triad-dev-harness")]
+const APP_JS: &str = app_js!(include_str!("ceremony_assets/preview.js"));
 const STYLE_CSS: &str = include_str!("ceremony_assets/style.css");
 const BLOOM_PRIMARY_SVG: &str = include_str!("ceremony_assets/bloom-primary.svg");
 const SOLANA_NETWORK_SVG: &str = include_str!("ceremony_assets/networks/solana.svg");

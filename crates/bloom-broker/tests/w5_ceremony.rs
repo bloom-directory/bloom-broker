@@ -519,9 +519,11 @@ use std::sync::{
 };
 use tower::ServiceExt as _;
 
-/// The shipped ceremony page script.
+/// The ceremony page script as a developer-harness Broker serves it, with the
+/// design-preview fixtures the review tests render.
 const PAGE_ASSET: &str = concat!(
     include_str!("../src/ceremony_assets/token-artwork.js"),
+    include_str!("../src/ceremony_assets/preview.js"),
     include_str!("../src/ceremony_assets/app.js")
 );
 
@@ -907,6 +909,7 @@ fn evm_manifest_is_rendered_as_primary_review_facts() {
         include_str!("../../bloom-evm-clear-signing/catalogs/enso/router-v2.json"),
         ";\n",
         include_str!("../src/ceremony_assets/token-artwork.js"),
+        include_str!("../src/ceremony_assets/preview.js"),
         include_str!("../src/ceremony_assets/app.js")
     );
     let executable = asset
