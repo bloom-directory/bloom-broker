@@ -23,7 +23,9 @@ use bloom_broker::{
         CeremonyBroker, CeremonyEndpoint, DEFAULT_CEREMONY_PORT, DEFAULT_REMOTE_UPSTREAM_PORT,
     },
     clock::BrokerClock,
-    journal::{AuditSigner, BrokerJournal, JournalError, UnsupportedStoreVersion},
+    journal::{
+        AuditSigner, BrokerJournal, JournalError, UnsupportedStoreVersion, checkpoint_outcome,
+    },
     service::BrokerRpcService,
     signer_client::BrokerSignerClient,
 };
@@ -1605,6 +1607,41 @@ fn clock_repair_request() -> Result<Option<u64>, Box<dyn std::error::Error>> {
         .transpose()
 }
 
+/// Accept connections until shutdown, holding one semaphore permit per live
+/// connection and serving each on its own task in the caller's span.
+async fn serve_connections<Fut>(
+    listener: UnixListener,
+    maximum_connections: usize,
+    gate_closed: &'static str,
+    shutdown: &mut watch::Receiver<bool>,
+    mut serve: impl FnMut(UnixStream) -> Fut,
+) -> std::io::Result<()>
+where
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let connections = Arc::new(Semaphore::new(maximum_connections));
+    loop {
+        let permit = tokio::select! {
+            _ = wait_for_shutdown(shutdown) => return Ok(()),
+            permit = connections.clone().acquire_owned() => {
+                permit.map_err(|_| std::io::Error::other(gate_closed))?
+            }
+        };
+        let (stream, _) = tokio::select! {
+            _ = wait_for_shutdown(shutdown) => return Ok(()),
+            accepted = listener.accept() => accepted?,
+        };
+        let connection = serve(stream);
+        tokio::spawn(
+            async move {
+                let _permit = permit;
+                connection.await;
+            }
+            .instrument(tracing::Span::current()),
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn serve_rpc(
     listener: UnixListener,
@@ -1616,27 +1653,18 @@ async fn serve_rpc(
     maximum_connections: usize,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    let connections = Arc::new(Semaphore::new(maximum_connections));
-    loop {
-        let permit = tokio::select! {
-            _ = wait_for_shutdown(shutdown) => return Ok(()),
-            permit = connections.clone().acquire_owned() => {
-                permit.map_err(|_| std::io::Error::other("Broker RPC connection gate closed"))?
-            }
-        };
-        let (mut stream, _) = tokio::select! {
-            _ = wait_for_shutdown(shutdown) => return Ok(()),
-            accepted = listener.accept() => accepted?,
-        };
-        let identity = identity.clone();
-        let machine_acl = machine_acl.clone();
-        let quota = quota.clone();
-        let service = service.clone();
-        let journals = journals.clone();
-        let service_span = tracing::Span::current();
-        tokio::spawn(
+    serve_connections(
+        listener,
+        maximum_connections,
+        "Broker RPC connection gate closed",
+        shutdown,
+        |mut stream| {
+            let identity = identity.clone();
+            let machine_acl = machine_acl.clone();
+            let quota = quota.clone();
+            let service = service.clone();
+            let journals = journals.clone();
             async move {
-                let _permit = permit;
                 let _ =
                 bloom_triad_local_transport::dispatch_connection_with_journal_heads_and_context::<
                     MachineBrokerRequest,
@@ -1653,26 +1681,24 @@ async fn serve_rpc(
                     &quota,
                     journals.as_ref(),
                     |request, context| async move {
-                        tracing::info!(
-                            event = "rpc.admitted",
-                            method = context.method.as_str(),
-                            operation_id = context.operation_id.as_str(),
-                            peer_service = context.caller_service_id.as_str(),
-                            peer_key_id = context.caller_application_key_id.as_str(),
-                            "Broker admitted authenticated request"
-                        );
+                        log_rpc_admitted(&context, "Broker admitted authenticated request");
                         let started = Instant::now();
                         let result =
                             MachineBrokerService::dispatch(service.as_ref(), request).await;
-                        log_machine_rpc_completion(&context, started, &result);
+                        log_rpc_completion(
+                            &context,
+                            started,
+                            result.as_ref().err().map(|error| error.code.as_str()),
+                            "Broker authenticated request completed",
+                        );
                         result
                     },
                 )
                 .await;
             }
-            .instrument(service_span),
-        );
-    }
+        },
+    )
+    .await
 }
 
 struct BrokerMachineJournals {
@@ -1799,26 +1825,17 @@ async fn serve_control(
     maximum_connections: usize,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    let connections = Arc::new(Semaphore::new(maximum_connections));
-    loop {
-        let permit = tokio::select! {
-            _ = wait_for_shutdown(shutdown) => return Ok(()),
-            permit = connections.clone().acquire_owned() => {
-                permit.map_err(|_| std::io::Error::other("Broker control connection gate closed"))?
-            }
-        };
-        let (mut stream, _) = tokio::select! {
-            _ = wait_for_shutdown(shutdown) => return Ok(()),
-            accepted = listener.accept() => accepted?,
-        };
-        let identity = identity.clone();
-        let revoke_client_acl = revoke_client_acl.clone();
-        let quota = quota.clone();
-        let service = service.clone();
-        let service_span = tracing::Span::current();
-        tokio::spawn(
+    serve_connections(
+        listener,
+        maximum_connections,
+        "Broker control connection gate closed",
+        shutdown,
+        |mut stream| {
+            let identity = identity.clone();
+            let revoke_client_acl = revoke_client_acl.clone();
+            let quota = quota.clone();
+            let service = service.clone();
             async move {
-                let _permit = permit;
                 let _ = bloom_triad_local_transport::dispatch_connection_with_context::<
                     ControlRequest,
                     ControlResponse,
@@ -1833,40 +1850,24 @@ async fn serve_control(
                     bloom_signer_api::SIGNER_CONTROL_RANGE,
                     &quota,
                     |request, context| async move {
-                        tracing::info!(
-                            event = "rpc.admitted",
-                            method = context.method.as_str(),
-                            operation_id = context.operation_id.as_str(),
-                            peer_service = context.caller_service_id.as_str(),
-                            peer_key_id = context.caller_application_key_id.as_str(),
-                            "Broker admitted authenticated control request"
-                        );
+                        log_rpc_admitted(&context, "Broker admitted authenticated control request");
                         let started = Instant::now();
                         let result =
                             RevocationControlService::dispatch(service.as_ref(), request).await;
-                        log_control_rpc_completion(&context, started, &result);
+                        log_rpc_completion(
+                            &context,
+                            started,
+                            result.as_ref().err().map(|error| error.code.as_str()),
+                            "Broker authenticated control request completed",
+                        );
                         result
                     },
                 )
                 .await;
             }
-            .instrument(service_span),
-        );
-    }
-}
-
-fn checkpoint_outcome(outcome: CheckpointDecisionOutcome) -> &'static str {
-    match outcome {
-        CheckpointDecisionOutcome::Appended => "appended",
-        CheckpointDecisionOutcome::AlreadyPresent => "already_present",
-        CheckpointDecisionOutcome::SequenceRollback => "sequence_rollback",
-        CheckpointDecisionOutcome::SequenceConflict => "sequence_conflict",
-        CheckpointDecisionOutcome::InvalidSignature => "invalid_signature",
-        CheckpointDecisionOutcome::UnpinnedPeer => "unpinned_peer",
-        CheckpointDecisionOutcome::StorageOrConfigurationFailure => {
-            "storage_or_configuration_failure"
-        }
-    }
+        },
+    )
+    .await
 }
 
 fn log_checkpoint_decision(
@@ -1897,37 +1898,23 @@ fn log_checkpoint_decision(
     );
 }
 
-fn log_machine_rpc_completion(
-    context: &AuthenticatedRequestContext,
-    started: Instant,
-    result: &Result<MachineBrokerResponse, ProtocolError>,
-) {
-    let (outcome, code) = match result {
-        Ok(_) => ("ok", None),
-        Err(error) => ("error", Some(error.code.as_str())),
-    };
+fn log_rpc_admitted(context: &AuthenticatedRequestContext, message: &'static str) {
     tracing::info!(
-        event = "rpc.completed",
+        event = "rpc.admitted",
         method = context.method.as_str(),
         operation_id = context.operation_id.as_str(),
         peer_service = context.caller_service_id.as_str(),
         peer_key_id = context.caller_application_key_id.as_str(),
-        duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        outcome,
-        protocol_error_code = code,
-        "Broker authenticated request completed"
+        "{message}"
     );
 }
 
-fn log_control_rpc_completion(
+fn log_rpc_completion(
     context: &AuthenticatedRequestContext,
     started: Instant,
-    result: &Result<ControlResponse, SignerProtocolError>,
+    protocol_error_code: Option<&str>,
+    message: &'static str,
 ) {
-    let (outcome, code) = match result {
-        Ok(_) => ("ok", None),
-        Err(error) => ("error", Some(error.code.as_str())),
-    };
     tracing::info!(
         event = "rpc.completed",
         method = context.method.as_str(),
@@ -1935,9 +1922,13 @@ fn log_control_rpc_completion(
         peer_service = context.caller_service_id.as_str(),
         peer_key_id = context.caller_application_key_id.as_str(),
         duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        outcome,
-        protocol_error_code = code,
-        "Broker authenticated control request completed"
+        outcome = if protocol_error_code.is_some() {
+            "error"
+        } else {
+            "ok"
+        },
+        protocol_error_code,
+        "{message}"
     );
 }
 

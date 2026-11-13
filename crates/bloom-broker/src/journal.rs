@@ -2884,7 +2884,8 @@ fn log_self_checkpoint_decision(decision: &CheckpointDecision, mutations_disable
     );
 }
 
-fn checkpoint_outcome(outcome: CheckpointDecisionOutcome) -> &'static str {
+/// Stable log name for a checkpoint decision outcome.
+pub fn checkpoint_outcome(outcome: CheckpointDecisionOutcome) -> &'static str {
     match outcome {
         CheckpointDecisionOutcome::Appended => "appended",
         CheckpointDecisionOutcome::AlreadyPresent => "already_present",
