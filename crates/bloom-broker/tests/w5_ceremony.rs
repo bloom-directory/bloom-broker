@@ -6845,10 +6845,7 @@ async fn an_approval_whose_only_ceremony_expired_is_reported_expired() {
     let approval_id = response.approval_id.clone();
 
     assert!(
-        broker
-            .pending_approval_ceremony(&approval_id, now_ms)
-            .unwrap()
-            .is_some(),
+        broker.pending_approval_ceremony(&approval_id).is_some(),
         "a live ceremony hands the owner a URL to complete"
     );
     assert_eq!(
@@ -6857,11 +6854,9 @@ async fn an_approval_whose_only_ceremony_expired_is_reported_expired() {
         "an approval the owner can still complete is not unreachable"
     );
 
+    broker.expire_sessions(now_ms + 10_001).unwrap();
     assert!(
-        broker
-            .pending_approval_ceremony(&approval_id, now_ms + 10_001)
-            .unwrap()
-            .is_none(),
+        broker.pending_approval_ceremony(&approval_id).is_none(),
         "an expired ceremony must not hand out a URL"
     );
     assert_eq!(
@@ -6892,10 +6887,10 @@ async fn an_approval_the_owner_cancelled_is_reported_cancelled_not_expired() {
 
     broker.cancel(&operation("17"), now_ms + 1).unwrap();
 
+    broker.expire_sessions(now_ms + 2).unwrap();
     assert!(
         broker
-            .pending_approval_ceremony(&response.approval_id, now_ms + 2)
-            .unwrap()
+            .pending_approval_ceremony(&response.approval_id)
             .is_none(),
         "a cancelled ceremony must not hand out a URL"
     );
@@ -10375,16 +10370,16 @@ fn status_sweeps_an_elapsed_ceremony_before_reporting_it() {
     let wallet = Token::new("wallet-status-expiry").unwrap();
     prepare(&broker, operation("e1"), Some(wallet), 10_000);
 
-    let live = broker
-        .current_public_status(&operation("e1"), 10_001)
-        .unwrap();
+    broker.expire_sessions(10_001).unwrap();
+    let live = broker.public_status(&operation("e1")).unwrap();
     assert_eq!(live.state, CeremonyState::AwaitingUser);
     assert!(live.ceremony_url.is_some());
 
     // Nobody opened the page, so only the status request can observe expiry.
-    let elapsed = broker
-        .current_public_status(&operation("e1"), live.expires_at_ms.get() + 1)
+    broker
+        .expire_sessions(live.expires_at_ms.get() + 1)
         .unwrap();
+    let elapsed = broker.public_status(&operation("e1")).unwrap();
     assert_eq!(elapsed.state, CeremonyState::Expired);
     assert!(elapsed.ceremony_url.is_none());
 }
