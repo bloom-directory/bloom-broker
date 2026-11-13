@@ -39,7 +39,6 @@ rustls.workspace = true
 uuid.workspace = true
 instant-acme.workspace = true
 libc = "0.2"
-futures-util.workspace = true
 x509-parser.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
