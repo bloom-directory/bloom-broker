@@ -23,6 +23,8 @@ fn legacy_removal_diff_matches_machine_vector_without_other_authority_changes() 
     assert_eq!(proposed.required_verifiers.len(), 1);
 }
 
+mod common;
+
 use bloom_broker::{
     assurance_verifiers::SolanaSystemTransferVerifier,
     authority::{
@@ -31,7 +33,7 @@ use bloom_broker::{
         PolicyDestination, ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject,
         VerifierCapability, canonical_policy_authority_diff,
     },
-    journal::{AuditSigner, BrokerJournal},
+    journal::BrokerJournal,
 };
 use bloom_broker_api::{
     AccountTerms, ActivationMode, ApprovalLimits, ApprovalSelector, ApprovalSubject,
@@ -43,6 +45,9 @@ use bloom_broker_api::{
     ProvenanceCatalog, RequestNonce, RevocationState, SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES,
     SOLANA_SYSTEM_TRANSFER_VERIFIER_ID, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
     SystemChainContext, SystemUseClaim, Token, ValueLimit,
+};
+use common::{
+    ServiceTestAuditSigner, SwitchableAuditSigner, evm_family_request, solana_family_request,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
@@ -84,61 +89,6 @@ impl TestSignOperationIdentity {
         hasher.update(SIGN_OPERATION_DOMAIN);
         hasher.update(serde_jcs::to_vec(self).unwrap());
         Digest32::from_bytes(hasher.finalize().into())
-    }
-}
-
-#[derive(Clone)]
-struct TestAuditSigner;
-
-impl AuditSigner for TestAuditSigner {
-    fn key_id(&self) -> Token {
-        token("audit-key")
-    }
-
-    fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String> {
-        Ok(Base64UrlBytes::from_bytes(&Sha256::digest(message)))
-    }
-
-    fn verify(
-        &self,
-        key_id: &Token,
-        message: &[u8],
-        signature: &Base64UrlBytes,
-    ) -> Result<(), String> {
-        if key_id == &self.key_id() && signature.decode() == Sha256::digest(message).as_slice() {
-            Ok(())
-        } else {
-            Err("audit signature mismatch".into())
-        }
-    }
-}
-
-struct SwitchableAuditSigner(Arc<AtomicBool>);
-
-impl AuditSigner for SwitchableAuditSigner {
-    fn key_id(&self) -> Token {
-        token("audit-key")
-    }
-
-    fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String> {
-        if self.0.load(Ordering::SeqCst) {
-            Err("forced authority audit failure".into())
-        } else {
-            Ok(Base64UrlBytes::from_bytes(&Sha256::digest(message)))
-        }
-    }
-
-    fn verify(
-        &self,
-        key_id: &Token,
-        message: &[u8],
-        signature: &Base64UrlBytes,
-    ) -> Result<(), String> {
-        if key_id == &self.key_id() && signature.decode() == Sha256::digest(message).as_slice() {
-            Ok(())
-        } else {
-            Err("audit signature mismatch".into())
-        }
     }
 }
 
@@ -253,11 +203,14 @@ impl Harness {
         let first_open =
             directory.is_none_or(|directory| !directory.join("journal.sqlite").exists());
         let journal = Arc::new(match directory {
-            None => BrokerJournal::open_in_memory(Arc::new(TestAuditSigner)).expect("journal"),
-            Some(directory) => {
-                BrokerJournal::open(directory.join("journal.sqlite"), Arc::new(TestAuditSigner))
-                    .expect("journal")
+            None => {
+                BrokerJournal::open_in_memory(Arc::new(ServiceTestAuditSigner)).expect("journal")
             }
+            Some(directory) => BrokerJournal::open(
+                directory.join("journal.sqlite"),
+                Arc::new(ServiceTestAuditSigner),
+            )
+            .expect("journal"),
         });
         let mut policy_keys = BTreeMap::new();
         policy_keys.insert(
@@ -568,8 +521,9 @@ fn a_home_with_nothing_to_migrate_grows_no_legacy_authority_file() {
     let journal_path = directory.path().join("journal.sqlite");
     let legacy_path = directory.path().join("authority.sqlite");
 
-    let journal =
-        Arc::new(BrokerJournal::open(&journal_path, Arc::new(TestAuditSigner)).expect("journal"));
+    let journal = Arc::new(
+        BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).expect("journal"),
+    );
     let authority = BrokerAuthority::open(
         &legacy_path,
         journal,
@@ -631,7 +585,7 @@ fn a_legacy_authority_file_without_policies_is_left_untouched() {
         let journal = Arc::new(
             BrokerJournal::open(
                 directory.path().join(format!("journal-{index}.sqlite")),
-                Arc::new(TestAuditSigner),
+                Arc::new(ServiceTestAuditSigner),
             )
             .unwrap(),
         );
@@ -672,8 +626,9 @@ fn open_authority_at(
     legacy_path: &std::path::Path,
     journal_path: &std::path::Path,
 ) -> Result<BrokerAuthority, bloom_broker::authority::AuthorityError> {
-    let journal =
-        Arc::new(BrokerJournal::open(journal_path, Arc::new(TestAuditSigner)).expect("journal"));
+    let journal = Arc::new(
+        BrokerJournal::open(journal_path, Arc::new(ServiceTestAuditSigner)).expect("journal"),
+    );
     BrokerAuthority::open(
         legacy_path,
         journal,
@@ -890,7 +845,7 @@ fn ac18_authority_reads_survive_latched_audit_tamper_while_mutations_fail() {
     let authority_path = directory.path().join("authority.sqlite");
     let open = || {
         let journal = Arc::new(
-            BrokerJournal::open(&journal_path, Arc::new(TestAuditSigner)).expect("journal"),
+            BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).expect("journal"),
         );
         let authority = BrokerAuthority::open(
             &authority_path,
@@ -1005,7 +960,7 @@ fn ac18_populated_authority_migration_is_atomic_idempotent_and_retains_source() 
 
     let open = || {
         let journal =
-            Arc::new(BrokerJournal::open(&journal_path, Arc::new(TestAuditSigner)).unwrap());
+            Arc::new(BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
         let authority = BrokerAuthority::open(
             &legacy_path,
             journal.clone(),
@@ -1058,7 +1013,8 @@ fn ac18_populated_authority_migration_is_atomic_idempotent_and_retains_source() 
         )
         .unwrap();
     drop(target);
-    let journal = Arc::new(BrokerJournal::open(&journal_path, Arc::new(TestAuditSigner)).unwrap());
+    let journal =
+        Arc::new(BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
     assert!(
         BrokerAuthority::open(
             &conflict_legacy_path,
@@ -1098,7 +1054,7 @@ fn active_approval_survives_broker_authority_and_journal_restart() {
 
     let open = || {
         let journal = Arc::new(
-            BrokerJournal::open(&journal_path, Arc::new(TestAuditSigner)).expect("journal"),
+            BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).expect("journal"),
         );
         let mut policy_keys = BTreeMap::new();
         policy_keys.insert(
@@ -3634,22 +3590,6 @@ fn multi_family_terms(
         replay_id,
         expires_at_ms: DecimalU64::new(60_000),
         audit_purpose: token("allocate-derived-account"),
-    }
-}
-
-fn evm_family_request() -> DerivedAccountRequest {
-    DerivedAccountRequest {
-        derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
-        requested_role: token("primary-evm"),
-        account: None,
-    }
-}
-
-fn solana_family_request() -> DerivedAccountRequest {
-    DerivedAccountRequest {
-        derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-        requested_role: token("solana-account"),
-        account: None,
     }
 }
 

@@ -13,28 +13,8 @@ async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
         }
     }
     let signer_database = directory.path().join("signer.sqlite");
-    let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
-    let signer_engine = Arc::new(
-        SignerEngine::open(
-            &signer_database,
-            Token::new("broker-app-1").unwrap(),
-            SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            SigningKey::from_bytes(&[6; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            signer_audit_keys(),
-            registry,
-        )
-        .unwrap(),
-    );
-    let signer_ceremony = Arc::new(
-        SignerCeremonyService::new(
-            signer_engine.clone(),
-            Token::new("signer-ceremony-key").unwrap(),
-            SigningKey::from_bytes(&[9; 32]),
-        )
-        .unwrap(),
-    );
+    let signer_engine = open_signer_engine(Some(&signer_database));
+    let signer_ceremony = open_signer_ceremony(signer_engine.clone());
     let socket_path = directory.path().join("signer.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
     let effective_uid = fs::metadata(directory.path()).unwrap().uid();
@@ -47,101 +27,39 @@ async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
     let journal = Arc::new(
         BrokerJournal::open(&broker_journal_path, Arc::new(ServiceTestAuditSigner)).unwrap(),
     );
-    let signer_rpc = Arc::new(SignerRpcService::new(
+    let signer_rpc = open_signer_rpc(
         signer_engine.clone(),
         signer_ceremony.clone(),
-        Arc::new(
-            SignerClock::new(
-                signer_engine.clone(),
-                test_time_source(),
-                signer_identity.boot_epoch.clone(),
-            )
-            .unwrap(),
-        ),
-        signer_identity.boot_epoch.clone(),
-        digest("e2"),
+        test_time_source(),
+        &signer_identity.boot_epoch,
         "test",
-    ));
-    let signer_server = tokio::spawn({
-        let signer_identity = signer_identity.clone();
-        let signer_rpc = signer_rpc.clone();
-        let signer_journals = TestSignerJournalExchange(signer_engine.clone());
-        async move {
-            let quota = EndpointQuota::new(16, 1_000, 60_000, 1_000, 60_000).unwrap();
-            loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                bloom_triad_local_transport::dispatch_connection_with_journal_heads::<
-                    BrokerSignerRequest,
-                    BrokerSignerResponse,
-                    bloom_signer_api::ProtocolError,
-                    _,
-                    _,
-                >(
-                    &mut stream,
-                    &signer_identity,
-                    &broker_acl,
-                    bloom_signer_api::SIGNER_API_CURRENT,
-                    bloom_signer_api::SIGNER_API_RANGE,
-                    &quota,
-                    &signer_journals,
-                    |request| BrokerSignerService::dispatch(signer_rpc.as_ref(), request),
-                )
-                .await
-                .unwrap();
-            }
-        }
-    });
-    let signer_client = BrokerSignerClient::connect_unix(
-        &socket_path,
-        broker_identity.clone(),
-        signer_acl.clone(),
-        journal.clone(),
-        Arc::new(AcceptingCheckpointSink),
-    )
-    .unwrap();
-    let authority = Arc::new(
-        BrokerAuthority::open(
-            &broker_authority_path,
-            journal.clone(),
-            BTreeMap::new(),
-            Token::new("installer-key").unwrap(),
-            SigningKey::from_bytes(&[5; 32]).verifying_key(),
-            Token::new("signer-ceremony-key").unwrap(),
-            SigningKey::from_bytes(&[9; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]).verifying_key(),
-            AssuranceRegistry::compiled(Vec::new()).unwrap(),
-        )
-        .unwrap(),
     );
-    let ceremony = CeremonyBroker::open_with_manifest_signer(
+    let signer_server = spawn_signer_server(
+        listener,
+        signer_identity.clone(),
+        broker_acl,
+        signer_rpc.clone(),
+        signer_engine.clone(),
+    );
+    let signer_client = connect_signer(&socket_path, &broker_identity, &signer_acl, &journal);
+    let authority = Arc::new(broker_authority(
+        &broker_authority_path,
+        &journal,
+        BTreeMap::new(),
+    ));
+    let ceremony = manifest_ceremony(
         directory.path().join("ceremony.sqlite"),
-        Arc::new(signer_client.clone()),
-        Token::new("broker-app-1").unwrap(),
-        SigningKey::from_bytes(&[7; 32]),
-        journal.clone(),
-    )
-    .unwrap();
-    let broker = BrokerRpcService::new(
+        &signer_client,
+        &journal,
+    );
+    let broker = broker_service(
         authority.clone(),
-        journal.clone(),
-        Arc::new(
-            BrokerClock::new(
-                journal.clone(),
-                test_time_source(),
-                broker_identity.boot_epoch.clone(),
-            )
-            .unwrap(),
-        ),
+        &journal,
         ceremony,
         signer_client.clone(),
-        Token::new("broker-app-1").unwrap(),
-        SigningKey::from_bytes(&[7; 32]),
-        broker_identity.boot_epoch.clone(),
-        digest("e3"),
-        "test",
-    )
-    .unwrap();
+        test_time_source(),
+        &broker_identity.boot_epoch,
+    );
 
     let wallet_id = Token::new("quiet-lilac").unwrap();
     let original: SignedPolicySnapshot =
@@ -346,41 +264,17 @@ async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
         );
         committed.committed
     };
-    let reopened = BrokerAuthority::open(
-        &broker_authority_path,
-        journal.clone(),
-        BTreeMap::new(),
-        Token::new("installer-key").unwrap(),
-        SigningKey::from_bytes(&[5; 32]).verifying_key(),
-        Token::new("signer-ceremony-key").unwrap(),
-        SigningKey::from_bytes(&[9; 32]).verifying_key(),
-        Token::new("signer-revocation-key").unwrap(),
-        SigningKey::from_bytes(&[4; 32]).verifying_key(),
-        AssuranceRegistry::compiled(Vec::new()).unwrap(),
-    )
-    .unwrap();
+    let reopened = broker_authority(&broker_authority_path, &journal, BTreeMap::new());
     assert_eq!(reopened.policy_snapshot(&wallet_id).unwrap(), current);
     let authority = Arc::new(reopened);
-    let broker = BrokerRpcService::new(
+    let broker = broker_service(
         authority.clone(),
-        journal.clone(),
-        Arc::new(
-            BrokerClock::new(
-                journal.clone(),
-                test_time_source(),
-                broker_identity.boot_epoch.clone(),
-            )
-            .unwrap(),
-        ),
+        &journal,
         broker.ceremony().clone(),
         signer_client.clone(),
-        Token::new("broker-app-1").unwrap(),
-        SigningKey::from_bytes(&[7; 32]),
-        broker_identity.boot_epoch.clone(),
-        digest("e3"),
-        "test",
-    )
-    .unwrap();
+        test_time_source(),
+        &broker_identity.boot_epoch,
+    );
     let public = match MachineBrokerService::dispatch(
         &broker,
         MachineBrokerRequest::WalletGetPublic(WalletRequest {
@@ -618,26 +512,25 @@ async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
     signer_server.abort();
 }
 
+mod common;
+
 use axum::{
     body::Body,
     http::{Request, StatusCode, Version, header},
 };
-use bloom_audit_checkpoint::{AppendOutcome, CheckpointError, CheckpointSink};
 use bloom_broker::{
-    authority::{AssuranceRegistry, BrokerAuthority, canonical_policy_authority_diff},
+    authority::{BrokerAuthority, canonical_policy_authority_diff},
     ceremony::{
         CEREMONY_ADDR_V4, CEREMONY_OWNER_HEADER, CEREMONY_OWNER_VALUE, CeremonyBroker,
         CeremonyCompletionObserver, CeremonyEndpoint, CeremonyLimits, CeremonySigner,
         ReviewManifestContext,
     },
-    clock::BrokerClock,
-    journal::{AuditSigner, BrokerJournal, NewApprovalRecord},
+    journal::{BrokerJournal, NewApprovalRecord},
     service::BrokerRpcService,
-    signer_client::BrokerSignerClient,
 };
 use bloom_broker_api::{
     ActivationMode, ApprovalLifecycleState, ApprovalLimits, ApprovalPrepareRequest,
-    ApprovalSelector, ApprovalSubject, AssetId, Base64UrlBytes, BootEpoch, CanonicalWalletPolicy,
+    ApprovalSelector, ApprovalSubject, AssetId, Base64UrlBytes, CanonicalWalletPolicy,
     CeremonyState, ClaimAssurance, ClaimAssuranceLevel, CryptoSuite, CustodyPrepareResponse,
     DecimalU64, DecimalU256, DeclaredDebit, DeclaredDestination, DeclaredFee, Digest32, KeyRef,
     KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
@@ -645,30 +538,26 @@ use bloom_broker_api::{
     PetalLineageMembership, PetalUseClaim, PolicyCommitUpdateRequest, PolicyDestination,
     PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceOperationClass,
     ProvenanceRecord, ProvenanceSubject, RateLimitDetails, RequestNonce, RevokeRequest,
-    SealedApprovalTerms, SignedJournalHead, SignedPolicySnapshot, SigningPayloads, Token,
-    WalletRequest,
+    SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads, Token, WalletRequest,
 };
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer::{
     ceremony::SignerCeremonyService,
-    clock::SignerClock,
-    engine::{SignerAuditKeys, SignerEngine},
+    engine::SignerEngine,
     hpke::{CUSTODY_OUTPUT_INFO, HpkeRecipient},
-    registry::BackendRegistry,
-    service::SignerRpcService,
 };
 use bloom_signer_api::{
-    BrokerSignerRequest, BrokerSignerResponse, BrokerSignerService, CeremonyChallenge,
-    CeremonyCompleteRequest, CeremonyKind, CeremonyPhase, CeremonyPrepareRequest,
-    CeremonyWebAuthnOptions, ControlRequest, ControlResponse, CustodyCompleteRequest,
-    CustodyHpkeAad, CustodyOutputHpkeAad, CustodyPrepareRequest, CustodyResult,
-    CustodySignerContribution, LegacyPasskeyMigrationPublic, LocalPrfHpkeAad,
+    CeremonyChallenge, CeremonyCompleteRequest, CeremonyKind, CeremonyPhase,
+    CeremonyPrepareRequest, CeremonyWebAuthnOptions, ControlRequest, ControlResponse,
+    CustodyCompleteRequest, CustodyHpkeAad, CustodyOutputHpkeAad, CustodyPrepareRequest,
+    CustodyResult, CustodySignerContribution, LegacyPasskeyMigrationPublic, LocalPrfHpkeAad,
     PolicyUpdateCeremonyCompleteRequest, PolicyUpdateCeremonyPrepareRequest,
     RevocationControlService, SignerActivationReceipt, SignerCeremonyContribution,
     SignerCeremonyStatus, SignerPreparedApproval, SignerPreparedCustody, WalletOperationRequest,
     WebAuthnCeremonyProof,
 };
-use bloom_triad_local_transport::{EndpointQuota, JournalExchange, LocalIdentity, PeerAcl};
+use bloom_triad_local_transport::EndpointQuota;
+use common::*;
 use ed25519_dalek::{Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use http_body_util::BodyExt as _;
 use sha2::Digest as _;
@@ -712,95 +601,6 @@ fn test_time_source() -> &'static str {
     return "macos-managed-timed";
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     panic!("W5 ceremony tests require a reviewed trusted-time platform");
-}
-
-#[derive(Clone)]
-struct ServiceTestAuditSigner;
-
-impl AuditSigner for ServiceTestAuditSigner {
-    fn key_id(&self) -> Token {
-        Token::new("broker-audit-key").unwrap()
-    }
-
-    fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String> {
-        Ok(Base64UrlBytes::from_bytes(&sha2::Sha256::digest(message)))
-    }
-
-    fn verify(
-        &self,
-        key_id: &Token,
-        message: &[u8],
-        signature: &Base64UrlBytes,
-    ) -> Result<(), String> {
-        if key_id == &self.key_id()
-            && signature.decode() == sha2::Sha256::digest(message).as_slice()
-        {
-            Ok(())
-        } else {
-            Err("audit signature mismatch".into())
-        }
-    }
-}
-
-struct AcceptingCheckpointSink;
-
-impl CheckpointSink for AcceptingCheckpointSink {
-    fn append_peer_head(
-        &self,
-        _peer_head: &SignedJournalHead,
-    ) -> Result<AppendOutcome, CheckpointError> {
-        Ok(AppendOutcome::Appended)
-    }
-}
-
-struct SwitchableAuditSigner(Arc<AtomicBool>);
-
-struct TestSignerJournalExchange(Arc<SignerEngine>);
-
-impl JournalExchange<bloom_signer_api::ProtocolError> for TestSignerJournalExchange {
-    fn checkpoint_request_head(
-        &self,
-        _method: &Token,
-        _peer_head: &SignedJournalHead,
-    ) -> Result<(), bloom_signer_api::ProtocolError> {
-        Ok(())
-    }
-
-    fn local_journal_head(
-        &self,
-        _method: &Token,
-    ) -> Result<(u64, Digest32), bloom_signer_api::ProtocolError> {
-        self.0.verified_audit_head()
-    }
-}
-
-impl AuditSigner for SwitchableAuditSigner {
-    fn key_id(&self) -> Token {
-        Token::new("broker-audit-key").unwrap()
-    }
-
-    fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String> {
-        if self.0.load(Ordering::SeqCst) {
-            Err("forced ceremony audit failure".into())
-        } else {
-            Ok(Base64UrlBytes::from_bytes(&sha2::Sha256::digest(message)))
-        }
-    }
-
-    fn verify(
-        &self,
-        key_id: &Token,
-        message: &[u8],
-        signature: &Base64UrlBytes,
-    ) -> Result<(), String> {
-        if key_id == &self.key_id()
-            && signature.decode() == sha2::Sha256::digest(message).as_slice()
-        {
-            Ok(())
-        } else {
-            Err("audit signature mismatch".into())
-        }
-    }
 }
 
 /// Every custody ceremony the Broker can prepare must be completable in the
@@ -2639,22 +2439,6 @@ fn bip39_browser_export_uses_the_length_neutral_signer_format() {
     assert!(!html.contains("the 24 words that restore this wallet"));
 }
 
-fn digest(byte: &str) -> Digest32 {
-    Digest32::new(byte.repeat(32)).unwrap()
-}
-
-fn signer_audit_keys() -> SignerAuditKeys {
-    SignerAuditKeys {
-        current_key_id: Token::new("signer-audit-key").unwrap(),
-        current_signing_key: SigningKey::from_bytes(&[14; 32]),
-        historical_verifying_keys: BTreeMap::new(),
-    }
-}
-
-fn operation(byte: &str) -> OperationId {
-    OperationId::new(byte.repeat(32)).unwrap()
-}
-
 #[derive(serde::Serialize)]
 struct MachineSignOperationIdentity {
     operation_id: OperationId,
@@ -2863,27 +2647,8 @@ struct RealSigner {
 }
 
 fn real_ceremony_signer() -> Arc<RealSigner> {
-    let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
-    let engine = Arc::new(
-        SignerEngine::open_in_memory(
-            Token::new("broker-app-1").unwrap(),
-            SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            SigningKey::from_bytes(&[6; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            signer_audit_keys(),
-            registry,
-        )
-        .unwrap(),
-    );
-    let service = Arc::new(
-        SignerCeremonyService::new(
-            engine.clone(),
-            Token::new("signer-ceremony-key").unwrap(),
-            SigningKey::from_bytes(&[9; 32]),
-        )
-        .unwrap(),
-    );
+    let engine = open_signer_engine(None);
+    let service = open_signer_ceremony(engine.clone());
     Arc::new(RealSigner {
         service,
         engine: Some(engine),
@@ -3990,56 +3755,13 @@ async fn complete_scoped_ceremony(
     (status, body)
 }
 
-fn url_token(url: &str) -> String {
-    url.rsplit_once("/ceremony/").unwrap().1.to_owned()
-}
-
-fn local_identity(service_id: &str, seed: [u8; 32], epoch: &str) -> LocalIdentity {
-    LocalIdentity {
-        service_id: Token::new(service_id).unwrap(),
-        boot_epoch: BootEpoch::new(epoch.repeat(16)).unwrap(),
-        application_key_id: Token::new(format!("{service_id}-app")).unwrap(),
-        signing_key: Arc::new(SigningKey::from_bytes(&seed)),
-    }
-}
-
-fn peer_acl(identity: &LocalIdentity, effective_uid: u32) -> PeerAcl {
-    PeerAcl {
-        effective_uid,
-        service_id: identity.service_id.clone(),
-        boot_epoch: identity.boot_epoch.clone(),
-        application_key_id: identity.application_key_id.clone(),
-        application_public_key: identity.signing_key.verifying_key().to_bytes(),
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_service_requires_completion_then_commits_and_replays_over_authenticated_rpc() {
     let authenticator = VirtualAuthenticator::generate();
     let directory = tempfile::tempdir().unwrap();
     let signer_database = directory.path().join("signer.sqlite");
-    let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
-    let signer_engine = Arc::new(
-        SignerEngine::open(
-            &signer_database,
-            Token::new("broker-app-1").unwrap(),
-            SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            SigningKey::from_bytes(&[6; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            signer_audit_keys(),
-            registry,
-        )
-        .unwrap(),
-    );
-    let signer_ceremony = Arc::new(
-        SignerCeremonyService::new(
-            signer_engine.clone(),
-            Token::new("signer-ceremony-key").unwrap(),
-            SigningKey::from_bytes(&[9; 32]),
-        )
-        .unwrap(),
-    );
+    let signer_engine = open_signer_engine(Some(&signer_database));
+    let signer_ceremony = open_signer_ceremony(signer_engine.clone());
     let now_ms: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -4058,101 +3780,39 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let journal = Arc::new(
         BrokerJournal::open(&broker_journal_path, Arc::new(ServiceTestAuditSigner)).unwrap(),
     );
-    let signer_rpc = Arc::new(SignerRpcService::new(
+    let signer_rpc = open_signer_rpc(
         signer_engine.clone(),
         signer_ceremony.clone(),
-        Arc::new(
-            SignerClock::new(
-                signer_engine.clone(),
-                test_time_source(),
-                signer_identity.boot_epoch.clone(),
-            )
-            .unwrap(),
-        ),
-        signer_identity.boot_epoch.clone(),
-        digest("e2"),
+        test_time_source(),
+        &signer_identity.boot_epoch,
         "test",
-    ));
-    let signer_server = tokio::spawn({
-        let signer_identity = signer_identity.clone();
-        let signer_rpc = signer_rpc.clone();
-        let signer_journals = TestSignerJournalExchange(signer_engine.clone());
-        async move {
-            let quota = EndpointQuota::new(16, 1_000, 60_000, 1_000, 60_000).unwrap();
-            loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                bloom_triad_local_transport::dispatch_connection_with_journal_heads::<
-                    BrokerSignerRequest,
-                    BrokerSignerResponse,
-                    bloom_signer_api::ProtocolError,
-                    _,
-                    _,
-                >(
-                    &mut stream,
-                    &signer_identity,
-                    &broker_acl,
-                    bloom_signer_api::SIGNER_API_CURRENT,
-                    bloom_signer_api::SIGNER_API_RANGE,
-                    &quota,
-                    &signer_journals,
-                    |request| BrokerSignerService::dispatch(signer_rpc.as_ref(), request),
-                )
-                .await
-                .unwrap();
-            }
-        }
-    });
-    let signer_client = BrokerSignerClient::connect_unix(
-        &socket_path,
-        broker_identity.clone(),
-        signer_acl.clone(),
-        journal.clone(),
-        Arc::new(AcceptingCheckpointSink),
-    )
-    .unwrap();
-    let authority = Arc::new(
-        BrokerAuthority::open(
-            &broker_authority_path,
-            journal.clone(),
-            BTreeMap::new(),
-            Token::new("installer-key").unwrap(),
-            SigningKey::from_bytes(&[5; 32]).verifying_key(),
-            Token::new("signer-ceremony-key").unwrap(),
-            SigningKey::from_bytes(&[9; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]).verifying_key(),
-            AssuranceRegistry::compiled(Vec::new()).unwrap(),
-        )
-        .unwrap(),
     );
-    let ceremony = CeremonyBroker::open_with_manifest_signer(
+    let signer_server = spawn_signer_server(
+        listener,
+        signer_identity.clone(),
+        broker_acl,
+        signer_rpc.clone(),
+        signer_engine.clone(),
+    );
+    let signer_client = connect_signer(&socket_path, &broker_identity, &signer_acl, &journal);
+    let authority = Arc::new(broker_authority(
+        &broker_authority_path,
+        &journal,
+        BTreeMap::new(),
+    ));
+    let ceremony = manifest_ceremony(
         directory.path().join("ceremony.sqlite"),
-        Arc::new(signer_client.clone()),
-        Token::new("broker-app-1").unwrap(),
-        SigningKey::from_bytes(&[7; 32]),
-        journal.clone(),
-    )
-    .unwrap();
-    let broker = BrokerRpcService::new(
+        &signer_client,
+        &journal,
+    );
+    let broker = broker_service(
         authority.clone(),
-        journal.clone(),
-        Arc::new(
-            BrokerClock::new(
-                journal.clone(),
-                test_time_source(),
-                broker_identity.boot_epoch.clone(),
-            )
-            .unwrap(),
-        ),
+        &journal,
         ceremony,
         signer_client.clone(),
-        Token::new("broker-app-1").unwrap(),
-        SigningKey::from_bytes(&[7; 32]),
-        broker_identity.boot_epoch.clone(),
-        digest("e3"),
-        "test",
-    )
-    .unwrap();
+        test_time_source(),
+        &broker_identity.boot_epoch,
+    );
     let adoption_observer = Arc::new(FailOnceAdoptionObserver {
         authority: authority.clone(),
         custody_attempts: AtomicUsize::new(0),
@@ -5686,86 +5346,31 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     // transport and Broker service. The restored process retains the public
     // child and immutable scope, but correctly starts with private signing
     // inactive until an unlock ceremony; Machine owns neither state.
-    let restarted_signer_engine = Arc::new(
-        SignerEngine::open(
-            &signer_database,
-            Token::new("broker-app-1").unwrap(),
-            SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            SigningKey::from_bytes(&[6; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            signer_audit_keys(),
-            Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap()),
-        )
-        .unwrap(),
-    );
-    let restarted_signer_ceremony = Arc::new(
-        SignerCeremonyService::new(
-            restarted_signer_engine.clone(),
-            Token::new("signer-ceremony-key").unwrap(),
-            SigningKey::from_bytes(&[9; 32]),
-        )
-        .unwrap(),
-    );
-    let restarted_signer_rpc = Arc::new(SignerRpcService::new(
+    let restarted_signer_engine = open_signer_engine(Some(&signer_database));
+    let restarted_signer_rpc = open_signer_rpc(
         restarted_signer_engine.clone(),
-        restarted_signer_ceremony,
-        Arc::new(
-            SignerClock::new(
-                restarted_signer_engine.clone(),
-                test_time_source(),
-                signer_identity.boot_epoch.clone(),
-            )
-            .unwrap(),
-        ),
-        signer_identity.boot_epoch.clone(),
-        digest("e2"),
+        open_signer_ceremony(restarted_signer_engine.clone()),
+        test_time_source(),
+        &signer_identity.boot_epoch,
         "test-restarted",
-    ));
+    );
     let restarted_signer_socket = directory.path().join("signer-restarted.sock");
-    let restarted_signer_listener =
-        tokio::net::UnixListener::bind(&restarted_signer_socket).unwrap();
-    let restarted_broker_acl = peer_acl(&broker_identity, effective_uid);
-    let restarted_signer_server = tokio::spawn({
-        let signer_identity = signer_identity.clone();
-        let signer_rpc = restarted_signer_rpc;
-        let signer_journals = TestSignerJournalExchange(restarted_signer_engine.clone());
-        async move {
-            let quota = EndpointQuota::new(16, 1_000, 60_000, 1_000, 60_000).unwrap();
-            loop {
-                let (mut stream, _) = restarted_signer_listener.accept().await.unwrap();
-                bloom_triad_local_transport::dispatch_connection_with_journal_heads::<
-                    BrokerSignerRequest,
-                    BrokerSignerResponse,
-                    bloom_signer_api::ProtocolError,
-                    _,
-                    _,
-                >(
-                    &mut stream,
-                    &signer_identity,
-                    &restarted_broker_acl,
-                    bloom_signer_api::SIGNER_API_CURRENT,
-                    bloom_signer_api::SIGNER_API_RANGE,
-                    &quota,
-                    &signer_journals,
-                    |request| BrokerSignerService::dispatch(signer_rpc.as_ref(), request),
-                )
-                .await
-                .unwrap();
-            }
-        }
-    });
+    let restarted_signer_server = spawn_signer_server(
+        tokio::net::UnixListener::bind(&restarted_signer_socket).unwrap(),
+        signer_identity.clone(),
+        peer_acl(&broker_identity, effective_uid),
+        restarted_signer_rpc,
+        restarted_signer_engine.clone(),
+    );
     let restarted_journal = Arc::new(
         BrokerJournal::open(&broker_journal_path, Arc::new(ServiceTestAuditSigner)).unwrap(),
     );
-    let restarted_signer_client = BrokerSignerClient::connect_unix(
+    let restarted_signer_client = connect_signer(
         &restarted_signer_socket,
-        broker_identity.clone(),
-        signer_acl.clone(),
-        restarted_journal.clone(),
-        Arc::new(AcceptingCheckpointSink),
-    )
-    .unwrap();
+        &broker_identity,
+        &signer_acl,
+        &restarted_journal,
+    );
     let policy_key_bytes: [u8; 32] = committed
         .committed
         .policy_verifying_key
@@ -5780,49 +5385,24 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
             VerifyingKey::from_bytes(&policy_key_bytes).unwrap(),
         ),
     );
-    let restarted_authority = Arc::new(
-        BrokerAuthority::open(
-            &broker_authority_path,
-            restarted_journal.clone(),
-            restarted_policy_keys,
-            Token::new("installer-key").unwrap(),
-            SigningKey::from_bytes(&[5; 32]).verifying_key(),
-            Token::new("signer-ceremony-key").unwrap(),
-            SigningKey::from_bytes(&[9; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]).verifying_key(),
-            AssuranceRegistry::compiled(Vec::new()).unwrap(),
-        )
-        .unwrap(),
-    );
+    let restarted_authority = Arc::new(broker_authority(
+        &broker_authority_path,
+        &restarted_journal,
+        restarted_policy_keys,
+    ));
     let replay_authority = restarted_authority.clone();
-    let restarted_scoped_broker = BrokerRpcService::new(
+    let restarted_scoped_broker = broker_service(
         restarted_authority,
-        restarted_journal.clone(),
-        Arc::new(
-            BrokerClock::new(
-                restarted_journal.clone(),
-                test_time_source(),
-                broker_identity.boot_epoch.clone(),
-            )
-            .unwrap(),
-        ),
-        CeremonyBroker::open_with_manifest_signer(
+        &restarted_journal,
+        manifest_ceremony(
             directory.path().join("scoped-restart-ceremony.sqlite"),
-            Arc::new(restarted_signer_client.clone()),
-            Token::new("broker-app-1").unwrap(),
-            SigningKey::from_bytes(&[7; 32]),
-            restarted_journal.clone(),
-        )
-        .unwrap(),
+            &restarted_signer_client,
+            &restarted_journal,
+        ),
         restarted_signer_client,
-        Token::new("broker-app-1").unwrap(),
-        SigningKey::from_bytes(&[7; 32]),
-        broker_identity.boot_epoch.clone(),
-        digest("e3"),
-        "test",
-    )
-    .unwrap();
+        test_time_source(),
+        &broker_identity.boot_epoch,
+    );
     let restored_backup = restarted_signer_engine
         .export_backup(&wallet_id, None, Vec::new())
         .unwrap();
@@ -6430,17 +6010,9 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     assert_eq!(signer_only_state.wallet_revocation_epoch.get(), 1);
     assert_eq!(authority.wallet_epoch(&wallet_id).unwrap(), 0);
 
-    let restarted_broker = BrokerRpcService::new(
+    let restarted_broker = broker_service(
         authority.clone(),
-        journal.clone(),
-        Arc::new(
-            BrokerClock::new(
-                journal.clone(),
-                test_time_source(),
-                broker_identity.boot_epoch.clone(),
-            )
-            .unwrap(),
-        ),
+        &journal,
         CeremonyBroker::open(
             directory.path().join("restarted-ceremony.sqlite"),
             Arc::new(signer_client.clone()),
@@ -6448,13 +6020,9 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         )
         .unwrap(),
         signer_client,
-        Token::new("broker-app-1").unwrap(),
-        SigningKey::from_bytes(&[7; 32]),
-        broker_identity.boot_epoch,
-        digest("e3"),
-        "test",
-    )
-    .unwrap();
+        test_time_source(),
+        &broker_identity.boot_epoch,
+    );
     restarted_broker.reconcile_all().await.unwrap();
     assert_eq!(authority.wallet_epoch(&wallet_id).unwrap(), 1);
     assert_eq!(
@@ -9452,19 +9020,11 @@ fn schema1_release_state_migrates_pending_and_preserves_completed_receipt() {
 
     let journal =
         Arc::new(BrokerJournal::open(&journal_path, Arc::new(ServiceTestAuditSigner)).unwrap());
-    let authority = BrokerAuthority::open(
+    let authority = broker_authority(
         directory.path().join("authority.sqlite"),
-        journal.clone(),
+        &journal,
         BTreeMap::new(),
-        Token::new("installer-key").unwrap(),
-        SigningKey::from_bytes(&[5; 32]).verifying_key(),
-        Token::new("signer-ceremony-key").unwrap(),
-        SigningKey::from_bytes(&[9; 32]).verifying_key(),
-        Token::new("signer-revocation-key").unwrap(),
-        SigningKey::from_bytes(&[4; 32]).verifying_key(),
-        AssuranceRegistry::compiled(Vec::new()).unwrap(),
-    )
-    .unwrap();
+    );
     let policy = authority
         .policy_snapshot(&Token::new("quiet-lilac").unwrap())
         .expect("current startup must preserve schema-1 authority state");
@@ -10391,27 +9951,8 @@ fn status_sweeps_an_elapsed_ceremony_before_reporting_it() {
 
 #[test]
 fn requested_wallet_ids_still_count_as_new_registration_attempts() {
-    let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
-    let engine = Arc::new(
-        SignerEngine::open_in_memory(
-            Token::new("broker-app-1").unwrap(),
-            SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            SigningKey::from_bytes(&[6; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            signer_audit_keys(),
-            registry,
-        )
-        .unwrap(),
-    );
-    let service = Arc::new(
-        SignerCeremonyService::new(
-            engine,
-            Token::new("signer-ceremony-key").unwrap(),
-            SigningKey::from_bytes(&[9; 32]),
-        )
-        .unwrap(),
-    );
+    let engine = open_signer_engine(None);
+    let service = open_signer_ceremony(engine);
     let broker = CeremonyBroker::new(Arc::new(RealSigner {
         service,
         engine: None,
