@@ -528,6 +528,40 @@ use std::sync::{
 };
 use tower::ServiceExt as _;
 
+/// The shipped ceremony page script.
+const PAGE_ASSET: &str = concat!(
+    include_str!("../src/ceremony_assets/token-artwork.js"),
+    include_str!("../src/ceremony_assets/app.js")
+);
+
+/// [`PAGE_ASSET`] minus its trailing `load()` call.
+fn page_executable() -> &'static str {
+    PAGE_ASSET
+        .split_once("\nload().catch")
+        .expect("asset must invoke load")
+        .0
+}
+
+/// Minimal DOM for running the page script under node.
+const DOM_STUB: &str = r#"class Node {
+  constructor(name) { this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }
+  setAttribute() {}
+  append(...children) { this.children.push(...children); }
+  replaceChildren(...children) { this.children = children; }
+}
+const nodes = {};
+globalThis.document = {
+  getElementById: id => nodes[id] ||= new Node(id),
+  createElement: name => new Node(name),
+  createElementNS: (_, name) => new Node(name),
+  createTextNode: text => String(text)
+};
+globalThis.location = {hash: "", search: "", pathname: "/"};
+globalThis.history = {replaceState: () => {}};
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {};
+"#;
+
 static EPHEMERAL_PORT_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Bind IPv4 on port 0, hold it, bind IPv6 on the same selected port, and
@@ -572,10 +606,7 @@ fn test_time_source() -> &'static str {
 /// completed these ceremonies through the API rather than the page.
 #[test]
 fn the_shipped_page_handles_every_custody_ceremony_kind() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
+    let asset = PAGE_ASSET;
 
     // Kinds whose completion is PRF plus a typed effect, with no operator
     // input. The page must list them, or it sends nothing at all.
@@ -612,14 +643,7 @@ fn the_shipped_page_handles_every_custody_ceremony_kind() {
 
 #[test]
 fn browser_crypto_self_test_executes_the_shipped_asset() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
+    let executable = page_executable();
     let script = format!(
         r#"
 globalThis.crypto = require("node:crypto").webcrypto;
@@ -647,14 +671,7 @@ cryptoSelfTest().then(
 /// recipient. A system transfer's destination is a recipient.
 #[test]
 fn petal_destinations_are_not_shown_as_recipients() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
+    let executable = page_executable();
     let script = format!(
         r#"
 globalThis.document = {{getElementById: () => ({{}})}};
@@ -695,14 +712,7 @@ process.stdout.write("ok");
 /// uses the EVM native-send layout: amount card, then sender → recipient.
 #[test]
 fn system_transfer_recipient_is_on_the_primary_review_surface() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
+    let executable = page_executable();
     let script = format!(
         r#"
 class Node {{
@@ -771,34 +781,10 @@ process.stdout.write("ok");
 
 #[test]
 fn custody_manifest_is_rendered_on_the_primary_review_surface() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
+    let executable = page_executable();
     let script = format!(
         r#"
-class Node {{
-  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
-  setAttribute() {{}}
-  append(...children) {{ this.children.push(...children); }}
-  replaceChildren(...children) {{ this.children = children; }}
-}}
-const nodes = {{}};
-globalThis.document = {{
-  getElementById: id => nodes[id] ||= new Node(id),
-  createElement: name => new Node(name),
-  createElementNS: (_, name) => new Node(name),
-  createTextNode: text => String(text)
-}};
-globalThis.location = {{hash: "", search: "", pathname: "/"}};
-globalThis.history = {{replaceState: () => {{}}}};
-globalThis.setInterval = () => 1;
-globalThis.clearInterval = () => {{}};
-{executable}
+{DOM_STUB}{executable}
 function allText(node) {{
   if (typeof node === "string") return node;
   return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
@@ -841,34 +827,10 @@ if (nodes["page-title"].textContent !== "Remove a passkey from a wallet" ||
 /// the same wallet read.
 #[test]
 fn a_registration_is_acknowledged_even_when_the_new_wallet_cannot_be_read() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
+    let executable = page_executable();
     let script = format!(
         r#"
-class Node {{
-  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
-  setAttribute() {{}}
-  append(...children) {{ this.children.push(...children); }}
-  replaceChildren(...children) {{ this.children = children; }}
-}}
-const nodes = {{}};
-globalThis.document = {{
-  getElementById: id => nodes[id] ||= new Node(id),
-  createElement: name => new Node(name),
-  createElementNS: (_, name) => new Node(name),
-  createTextNode: text => String(text)
-}};
-globalThis.location = {{hash: "", search: "", pathname: "/"}};
-globalThis.history = {{replaceState: () => {{}}}};
-globalThis.setInterval = () => 1;
-globalThis.clearInterval = () => {{}};
-{executable}
+{DOM_STUB}{executable}
 let walletReads = 0;
 let walletReadable = false;
 globalThis.fetch = async url => {{
@@ -1614,34 +1576,10 @@ if (!rendered.includes("Approve a call Bloom cannot read") || rendered.includes(
 
 #[test]
 fn policy_page_states_the_numeric_chain_exact_opt_in_scope() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
+    let executable = page_executable();
     let script = format!(
         r#"
-class Node {{
-  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
-  setAttribute() {{}}
-  append(...children) {{ this.children.push(...children); }}
-  replaceChildren(...children) {{ this.children = children; }}
-}}
-const nodes = {{}};
-globalThis.document = {{
-  getElementById: id => nodes[id] ||= new Node(id),
-  createElement: name => new Node(name),
-  createElementNS: (_, name) => new Node(name),
-  createTextNode: text => String(text)
-}};
-globalThis.location = {{hash: "", search: "", pathname: "/"}};
-globalThis.history = {{replaceState: () => {{}}}};
-globalThis.setInterval = () => 1;
-globalThis.clearInterval = () => {{}};
-{executable}
+{DOM_STUB}{executable}
 function allText(node) {{
   if (typeof node === "string") return node;
   return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
@@ -1722,10 +1660,7 @@ if (JSON.stringify(swap.facts) !== JSON.stringify([
 
 #[test]
 fn browser_cancel_disables_approve_before_awaiting_and_reports_the_outcome() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
+    let asset = PAGE_ASSET;
     // The approval page's handler; paired enrollment installs its own, which
     // disables both buttons synchronously through `terminate` instead.
     let start = asset
@@ -1788,34 +1723,10 @@ for (const value of ["8640000000000001", "18446744073709551615"]) {{
 
 #[test]
 fn key_derive_primary_review_explains_the_session_without_internal_scope_json() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
+    let executable = page_executable();
     let script = format!(
         r#"
-class Node {{
-  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
-  setAttribute() {{}}
-  append(...children) {{ this.children.push(...children); }}
-  replaceChildren(...children) {{ this.children = children; }}
-}}
-const nodes = {{}};
-globalThis.document = {{
-  getElementById: id => nodes[id] ||= new Node(id),
-  createElement: name => new Node(name),
-  createElementNS: (_, name) => new Node(name),
-  createTextNode: text => String(text)
-}};
-globalThis.location = {{hash: "", search: "", pathname: "/"}};
-globalThis.history = {{replaceState: () => {{}}}};
-globalThis.setInterval = () => 1;
-globalThis.clearInterval = () => {{}};
-{executable}
+{DOM_STUB}{executable}
 function allText(node) {{
   if (typeof node === "string") return node;
   return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
@@ -1890,34 +1801,10 @@ if (nodes.approve.textContent !== "Create temporary key") {{
 
 #[test]
 fn reusable_pumpfun_approval_is_plain_language_with_raw_grants_collapsed() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
+    let executable = page_executable();
     let script = format!(
         r#"
-class Node {{
-  constructor(name) {{ this.tagName = name.toUpperCase(); this.name = name; this.children = []; this.textContent = ""; this.innerHTML = ""; }}
-  setAttribute() {{}}
-  append(...children) {{ this.children.push(...children); }}
-  replaceChildren(...children) {{ this.children = children; }}
-}}
-const nodes = {{}};
-globalThis.document = {{
-  getElementById: id => nodes[id] ||= new Node(id),
-  createElement: name => new Node(name),
-  createElementNS: (_, name) => new Node(name),
-  createTextNode: text => String(text)
-}};
-globalThis.location = {{hash: "", search: "", pathname: "/"}};
-globalThis.history = {{replaceState: () => {{}}}};
-globalThis.setInterval = () => 1;
-globalThis.clearInterval = () => {{}};
-{executable}
+{DOM_STUB}{executable}
 function allText(node) {{
   if (typeof node === "string") return node;
   return `${{node.textContent}} ${{node.innerHTML}} ${{node.children.map(allText).join(" ")}}`;
@@ -2007,14 +1894,7 @@ if (!unbudgeted.includes("refuse any action that spends funds") || unbudgeted.in
 /// `MALFORMED_FRAME: Invalid last symbol` from deep inside Signer).
 #[test]
 fn browser_page_accepts_hex_private_keys_and_converts_them_to_base64url() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
+    let executable = page_executable();
     let script = format!(
         r#"
 globalThis.crypto = require("node:crypto").webcrypto;
@@ -2061,10 +1941,7 @@ process.stdout.write("hex-normalization-ok");
 
 #[test]
 fn browser_ceremony_state_survives_reload_and_reuses_one_output_key() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
+    let asset = PAGE_ASSET;
     for required in [
         "tokenFromPath || readSessionToken()",
         "writeSessionToken(tokenFromPath)",
@@ -2095,14 +1972,7 @@ fn browser_ceremony_state_survives_reload_and_reuses_one_output_key() {
 
 #[test]
 fn browser_reload_recovers_the_ceremony_token_from_tab_storage() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
+    let executable = page_executable();
     let encoded_token = serde_json::to_value(Base64UrlBytes::from_bytes(&[31; 32])).unwrap();
     let token = encoded_token.as_str().unwrap();
     let script = format!(
@@ -2136,14 +2006,7 @@ process.stdout.write("browser-reload-ok");
 
 #[test]
 fn browser_approval_failure_is_logged_displayed_and_retryable() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
+    let executable = page_executable();
     let script = format!(
         r#"
 globalThis.crypto = require("node:crypto").webcrypto;
@@ -2188,19 +2051,16 @@ process.stdout.write("browser-error-feedback-ok");
         String::from_utf8_lossy(&output.stdout),
         "browser-error-feedback-ok"
     );
-    assert!(asset.contains("approve.onclick = () => run(session).catch(error => {"));
-    assert!(asset.contains("try { requireLiveApproval(session); }"));
-    assert!(asset.contains("reportApprovalFailure(error);"));
-    assert!(asset.contains("Cancellation failed. Please try again."));
-    assert!(asset.contains("This link couldn’t be opened"));
+    assert!(PAGE_ASSET.contains("approve.onclick = () => run(session).catch(error => {"));
+    assert!(PAGE_ASSET.contains("try { requireLiveApproval(session); }"));
+    assert!(PAGE_ASSET.contains("reportApprovalFailure(error);"));
+    assert!(PAGE_ASSET.contains("Cancellation failed. Please try again."));
+    assert!(PAGE_ASSET.contains("This link couldn’t be opened"));
 }
 
 #[test]
 fn transfer_review_promises_later_verification_without_claiming_it_already_happened() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
+    let asset = PAGE_ASSET;
     assert!(asset.contains("Estimated network fee"));
     assert!(asset.contains("Required before signing"));
     assert!(asset.contains("Bloom will decode the transaction"));
@@ -2287,10 +2147,7 @@ fn ceremony_shell_preserves_bloom_review_layout_and_required_controls() {
 
 #[test]
 fn scoped_petal_key_browser_flow_never_collects_a_namespace_grant() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
+    let asset = PAGE_ASSET;
     assert!(asset.contains("session.signer_contribution?.petal_key_scope"));
     assert!(asset.contains("&& !scopedPetalKey"));
     assert!(asset.contains("Boolean(scopedPetalKey)"));
@@ -2313,10 +2170,7 @@ fn scoped_petal_key_browser_flow_never_collects_a_namespace_grant() {
 
 #[test]
 fn legacy_passkey_browser_flow_uses_assertion_prf_and_hides_raw_key_input() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
+    let asset = PAGE_ASSET;
     assert!(asset.contains("legacy_passkey_v1_prf"));
     assert!(asset.contains("const assertion = await getCredential(session, 0)"));
     assert!(asset.contains("credential_prf: encodeUrl(credentialPrf)"));
@@ -2328,10 +2182,7 @@ fn legacy_passkey_browser_flow_uses_assertion_prf_and_hides_raw_key_input() {
 
 #[test]
 fn bip39_browser_import_uses_profile_to_control_serialization() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
+    let asset = PAGE_ASSET;
     let html = include_str!("../src/ceremony_assets/index.html");
     let css = include_str!("../src/ceremony_assets/style.css");
     let load = asset
@@ -10212,14 +10063,7 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
 /// earned. The logo is decorative; the address stays the identity.
 #[test]
 fn token_artwork_is_selected_by_chain_and_contract_and_nothing_else() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
+    let executable = page_executable();
     let script = format!(
         r#"
 class Node {{
@@ -10348,14 +10192,7 @@ if (!usdcIcon.replacedWith || !isGeneric(usdcIcon.replacedWith)) {{
 /// of the provenance.
 #[test]
 fn the_upgradeable_warning_is_stated_once_per_contract_and_keeps_its_caveat_in_details() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
+    let executable = page_executable();
     let script = format!(
         r#"
 class Node {{
@@ -10502,14 +10339,7 @@ if (!view.primary.includes("can move your tokens later without another approval"
 /// heading, the roles and the classification must not move.
 #[test]
 fn the_clear_signed_review_reads_its_meaning_only_from_the_typed_intent() {
-    let asset = concat!(
-        include_str!("../src/ceremony_assets/token-artwork.js"),
-        include_str!("../src/ceremony_assets/app.js")
-    );
-    let executable = asset
-        .split_once("\nload().catch")
-        .expect("asset must invoke load")
-        .0;
+    let executable = page_executable();
     let script = format!(
         r#"
 class Node {{
