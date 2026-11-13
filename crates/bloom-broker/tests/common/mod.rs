@@ -3,6 +3,10 @@
 //! Broker↔Signer stack.
 #![allow(dead_code)]
 
+use axum::{
+    body::{Body, Bytes},
+    http::{Request, Response, header},
+};
 use bloom_audit_checkpoint::{AppendOutcome, CheckpointError, CheckpointSink};
 use bloom_broker::{
     authority::{AssuranceRegistry, BrokerAuthority},
@@ -28,6 +32,7 @@ use bloom_signer_api::{
 };
 use bloom_triad_local_transport::{EndpointQuota, JournalExchange, LocalIdentity, PeerAcl};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use http_body_util::BodyExt as _;
 use sha2::Digest as _;
 use std::{
     collections::BTreeMap,
@@ -44,6 +49,40 @@ pub fn digest(byte: &str) -> Digest32 {
 
 pub fn url_token(url: &str) -> String {
     url.rsplit_once("/ceremony/").unwrap().1.to_owned()
+}
+
+/// GET on the ceremony host carrying the ceremony token.
+pub fn ceremony_get(uri: impl AsRef<str>, token: impl AsRef<str>) -> Request<Body> {
+    Request::builder()
+        .uri(uri.as_ref())
+        .header(header::HOST, "localhost:18734")
+        .header("x-bloom-ceremony-token", token.as_ref())
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Same-origin JSON POST on the ceremony host carrying the ceremony token.
+pub fn ceremony_post(uri: impl AsRef<str>, token: impl AsRef<str>, body: Body) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri.as_ref())
+        .header(header::HOST, "localhost:18734")
+        .header(header::ORIGIN, "http://localhost:18734")
+        .header("x-bloom-ceremony-token", token.as_ref())
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("sec-fetch-site", "same-origin")
+        .body(body)
+        .unwrap()
+}
+
+pub trait BodyBytes {
+    fn body_bytes(self) -> impl std::future::Future<Output = Bytes>;
+}
+
+impl BodyBytes for Response<Body> {
+    async fn body_bytes(self) -> Bytes {
+        self.into_body().collect().await.unwrap().to_bytes()
+    }
 }
 
 pub fn operation(byte: &str) -> OperationId {

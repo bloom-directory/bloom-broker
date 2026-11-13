@@ -151,25 +151,11 @@ async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
         let session_response = broker
             .ceremony()
             .router()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/session")
-                    .header(header::HOST, "localhost:18734")
-                    .header("x-bloom-ceremony-token", token)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(ceremony_get("/api/session", token))
             .await
             .unwrap();
-        let session: serde_json::Value = serde_json::from_slice(
-            &session_response
-                .into_body()
-                .collect()
-                .await
-                .unwrap()
-                .to_bytes(),
-        )
-        .unwrap();
+        let session: serde_json::Value =
+            serde_json::from_slice(&session_response.body_bytes().await).unwrap();
         assert_eq!(
             session["review_manifest"]["authority_diff"],
             serde_json::to_value(&authority_diff).unwrap()
@@ -382,25 +368,11 @@ async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
     let approval_app = broker.ceremony().router();
     let approval_session_response = approval_app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", &approval_token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get("/api/session", &approval_token))
         .await
         .unwrap();
-    let approval_session: serde_json::Value = serde_json::from_slice(
-        &approval_session_response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .unwrap();
+    let approval_session: serde_json::Value =
+        serde_json::from_slice(&approval_session_response.body_bytes().await).unwrap();
     let approval_challenge: CeremonyChallenge =
         serde_json::from_value(approval_session["challenges"][0]["binding"].clone()).unwrap();
     let approval_contribution: SignerCeremonyContribution =
@@ -438,37 +410,23 @@ async fn released_legacy_policy_migrates_through_the_real_signer_boundary() {
     )
     .unwrap();
     let approval_complete_response = approval_app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{approval_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", &approval_token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({
-                        "proof": {"kind": "assertion", "assertion": approval_assertion},
-                        "encrypted_input": approval_encrypted,
-                        "public_binding_digest": approval_terms.approval_digest().unwrap()
-                    }))
-                    .unwrap(),
-                ))
+        .oneshot(ceremony_post(
+            format!("/api/session/{approval_id}/complete"),
+            &approval_token,
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "proof": {"kind": "assertion", "assertion": approval_assertion},
+                    "encrypted_input": approval_encrypted,
+                    "public_binding_digest": approval_terms.approval_digest().unwrap()
+                }))
                 .unwrap(),
-        )
+            ),
+        ))
         .await
         .unwrap();
     assert_eq!(approval_complete_response.status(), StatusCode::OK);
-    let approval_receipt: SignerActivationReceipt = serde_json::from_slice(
-        &approval_complete_response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .unwrap();
+    let approval_receipt: SignerActivationReceipt =
+        serde_json::from_slice(&approval_complete_response.body_bytes().await).unwrap();
     assert_eq!(
         approval_receipt.approval_id,
         approval_terms.approval_id().unwrap()
@@ -3666,23 +3624,11 @@ async fn complete_scoped_ceremony(
     let app = broker.ceremony().router();
     let session_response = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", &token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get("/api/session", &token))
         .await
         .unwrap();
     let session_status = session_response.status();
-    let session_body = session_response
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes();
+    let session_body = session_response.body_bytes().await;
     if session_status != StatusCode::OK {
         return (session_status, session_body.to_vec());
     }
@@ -3723,35 +3669,22 @@ async fn complete_scoped_ceremony(
     )
     .unwrap();
     let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{ceremony_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", &token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({
-                        "proof": {"kind": "assertion", "assertion": assertion},
-                        "encrypted_input": encrypted,
-                        "public_binding_digest": terms.approval_digest().unwrap()
-                    }))
-                    .unwrap(),
-                ))
+        .oneshot(ceremony_post(
+            format!("/api/session/{ceremony_id}/complete"),
+            &token,
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "proof": {"kind": "assertion", "assertion": assertion},
+                    "encrypted_input": encrypted,
+                    "public_binding_digest": terms.approval_digest().unwrap()
+                }))
                 .unwrap(),
-        )
+            ),
+        ))
         .await
         .unwrap();
     let status = response.status();
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes()
-        .to_vec();
+    let body = response.body_bytes().await.to_vec();
     (status, body)
 }
 
@@ -3860,25 +3793,11 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let registration_app = broker.ceremony().router();
     let session_response = registration_app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", &registration_token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get("/api/session", &registration_token))
         .await
         .unwrap();
-    let session: serde_json::Value = serde_json::from_slice(
-        &session_response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .unwrap();
+    let session: serde_json::Value =
+        serde_json::from_slice(&session_response.body_bytes().await).unwrap();
     let first_challenge: CeremonyChallenge =
         serde_json::from_value(session["challenges"][0]["binding"].clone()).unwrap();
     let second_challenge: CeremonyChallenge =
@@ -3909,15 +3828,10 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     )
     .unwrap();
     let registration_request = || {
-        Request::builder()
-            .method("POST")
-            .uri(format!("/api/session/{registration_id}/complete"))
-            .header(header::HOST, "localhost:18734")
-            .header(header::ORIGIN, "http://localhost:18734")
-            .header("x-bloom-ceremony-token", &registration_token)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("sec-fetch-site", "same-origin")
-            .body(Body::from(
+        ceremony_post(
+            format!("/api/session/{registration_id}/complete"),
+            &registration_token,
+            Body::from(
                 serde_json::to_vec(&serde_json::json!({
                     "proof": {
                         "kind": "registration",
@@ -3928,8 +3842,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
                     "public_binding_digest": digest("a1")
                 }))
                 .unwrap(),
-            ))
-            .unwrap()
+            ),
+        )
     };
     let first_registration_response = registration_app
         .clone()
@@ -3974,15 +3888,8 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .unwrap();
     assert_eq!(registration_response.status(), StatusCode::OK);
     assert_eq!(adoption_observer.custody_attempts.load(Ordering::SeqCst), 3);
-    let registration_result: CustodyResult = serde_json::from_slice(
-        &registration_response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .unwrap();
+    let registration_result: CustodyResult =
+        serde_json::from_slice(&registration_response.body_bytes().await).unwrap();
     let machine_registration_result = custody_result_to_machine(&registration_result);
     let persisted_registration_result = broker_custody_result(&broker, operation("e1")).await;
     assert_eq!(
@@ -4100,25 +4007,11 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let session_response = broker
         .ceremony()
         .router()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get("/api/session", token))
         .await
         .unwrap();
-    let session: serde_json::Value = serde_json::from_slice(
-        &session_response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .unwrap();
+    let session: serde_json::Value =
+        serde_json::from_slice(&session_response.body_bytes().await).unwrap();
     assert_eq!(
         session["review_manifest"]["authority_diff"],
         serde_json::to_value(&authority_diff).unwrap()
@@ -4294,25 +4187,11 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let derive_app = broker.ceremony().router();
     let derive_session_response = derive_app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", &derive_token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get("/api/session", &derive_token))
         .await
         .unwrap();
-    let derive_session: serde_json::Value = serde_json::from_slice(
-        &derive_session_response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .unwrap();
+    let derive_session: serde_json::Value =
+        serde_json::from_slice(&derive_session_response.body_bytes().await).unwrap();
     // The scope is still carried verbatim, but it is no longer the whole
     // manifest: a key derivation now also renders a title, a sentence naming
     // the consequence, and a `canonical_plan` the page shows as prose, so the
@@ -4373,37 +4252,23 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
         .try_into()
         .unwrap();
     let derive_complete_response = derive_app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{derive_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", &derive_token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({
-                        "proof": {"kind": "assertion", "assertion": derive_assertion},
-                        "encrypted_input": derive_encrypted,
-                        "public_binding_digest": scope.request_digest().unwrap()
-                    }))
-                    .unwrap(),
-                ))
+        .oneshot(ceremony_post(
+            format!("/api/session/{derive_id}/complete"),
+            &derive_token,
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "proof": {"kind": "assertion", "assertion": derive_assertion},
+                    "encrypted_input": derive_encrypted,
+                    "public_binding_digest": scope.request_digest().unwrap()
+                }))
                 .unwrap(),
-        )
+            ),
+        ))
         .await
         .unwrap();
     assert_eq!(derive_complete_response.status(), StatusCode::OK);
-    let derive_result: CustodyResult = serde_json::from_slice(
-        &derive_complete_response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .unwrap();
+    let derive_result: CustodyResult =
+        serde_json::from_slice(&derive_complete_response.body_bytes().await).unwrap();
     assert!(derive_result.encrypted_browser_result.is_none());
     assert_eq!(derive_result.public_key_refs.len(), 1);
     let child_key = derive_result.public_key_refs[0].clone();
@@ -4777,14 +4642,10 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let session = broker
         .ceremony()
         .router()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get(
+            "/api/session",
+            url_token(&response.ceremony_url),
+        ))
         .await
         .unwrap();
     let projection: serde_json::Value =
@@ -4852,25 +4713,11 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let approval_app = broker.ceremony().router();
     let approval_session_response = approval_app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", &approval_token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get("/api/session", &approval_token))
         .await
         .unwrap();
-    let approval_session: serde_json::Value = serde_json::from_slice(
-        &approval_session_response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .unwrap();
+    let approval_session: serde_json::Value =
+        serde_json::from_slice(&approval_session_response.body_bytes().await).unwrap();
     let approval_challenge: CeremonyChallenge =
         serde_json::from_value(approval_session["challenges"][0]["binding"].clone()).unwrap();
     let approval_contribution: SignerCeremonyContribution =
@@ -4908,37 +4755,23 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     )
     .unwrap();
     let approval_complete_response = approval_app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{approval_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", &approval_token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({
-                        "proof": {"kind": "assertion", "assertion": approval_assertion},
-                        "encrypted_input": approval_encrypted,
-                        "public_binding_digest": approval_terms.approval_digest().unwrap()
-                    }))
-                    .unwrap(),
-                ))
+        .oneshot(ceremony_post(
+            format!("/api/session/{approval_id}/complete"),
+            &approval_token,
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "proof": {"kind": "assertion", "assertion": approval_assertion},
+                    "encrypted_input": approval_encrypted,
+                    "public_binding_digest": approval_terms.approval_digest().unwrap()
+                }))
                 .unwrap(),
-        )
+            ),
+        ))
         .await
         .unwrap();
     assert_eq!(approval_complete_response.status(), StatusCode::OK);
-    let approval_receipt: SignerActivationReceipt = serde_json::from_slice(
-        &approval_complete_response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .unwrap();
+    let approval_receipt: SignerActivationReceipt =
+        serde_json::from_slice(&approval_complete_response.body_bytes().await).unwrap();
     assert_eq!(
         approval_receipt.approval_id,
         approval_terms.approval_id().unwrap()
@@ -4989,25 +4822,11 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     let exact_app = broker.ceremony().router();
     let exact_session_response = exact_app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", &exact_token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get("/api/session", &exact_token))
         .await
         .unwrap();
-    let exact_session: serde_json::Value = serde_json::from_slice(
-        &exact_session_response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .unwrap();
+    let exact_session: serde_json::Value =
+        serde_json::from_slice(&exact_session_response.body_bytes().await).unwrap();
     let exact_challenge: CeremonyChallenge =
         serde_json::from_value(exact_session["challenges"][0]["binding"].clone()).unwrap();
     let exact_contribution: SignerCeremonyContribution =
@@ -5044,34 +4863,22 @@ async fn policy_service_requires_completion_then_commits_and_replays_over_authen
     )
     .unwrap();
     let exact_complete_response = exact_app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{exact_ceremony_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", &exact_token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({
-                        "proof": {"kind": "assertion", "assertion": exact_assertion},
-                        "encrypted_input": exact_encrypted,
-                        "public_binding_digest": exact_terms.approval_digest().unwrap()
-                    }))
-                    .unwrap(),
-                ))
+        .oneshot(ceremony_post(
+            format!("/api/session/{exact_ceremony_id}/complete"),
+            &exact_token,
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "proof": {"kind": "assertion", "assertion": exact_assertion},
+                    "encrypted_input": exact_encrypted,
+                    "public_binding_digest": exact_terms.approval_digest().unwrap()
+                }))
                 .unwrap(),
-        )
+            ),
+        ))
         .await
         .unwrap();
     let exact_complete_status = exact_complete_response.status();
-    let exact_complete_body = exact_complete_response
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes();
+    let exact_complete_body = exact_complete_response.body_bytes().await;
     assert_eq!(
         exact_complete_status,
         StatusCode::OK,
@@ -6246,14 +6053,10 @@ async fn legacy_passkey_prepare_renders_only_digest_bound_public_migration_terms
         .unwrap();
     let session = broker
         .router()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get(
+            "/api/session",
+            url_token(&response.ceremony_url),
+        ))
         .await
         .unwrap();
     let projection: serde_json::Value =
@@ -6304,14 +6107,7 @@ async fn broker_constructs_and_signs_the_review_plan_from_immutable_terms() {
     let token = url_token(&response.ceremony_url);
     let session = broker
         .router()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get("/api/session", token))
         .await
         .unwrap();
     let projection: serde_json::Value =
@@ -6363,14 +6159,10 @@ async fn independently_read_message_fields_are_bound_into_the_signed_manifest() 
         .unwrap();
     let session = broker
         .router()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get(
+            "/api/session",
+            url_token(&response.ceremony_url),
+        ))
         .await
         .unwrap();
     let projection: serde_json::Value =
@@ -6656,34 +6448,27 @@ async fn cancelling_a_failed_session_with_a_committed_sensitive_result_is_reject
     let token = url_token(&prepared.ceremony_url);
     let completed = broker
         .router()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{ceremony_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({
-                        "proof": {
-                            "kind": "assertion",
-                            "assertion": {
-                                "credential_id": "Y3JlZGVudGlhbA",
-                                "authenticator_data": "YXV0aA",
-                                "client_data_json": "e30",
-                                "signature": "c2ln",
-                                "user_handle": null
-                            }
-                        },
-                        "encrypted_input": null,
-                        "public_binding_digest": digest("33")
-                    }))
-                    .unwrap(),
-                ))
+        .oneshot(ceremony_post(
+            format!("/api/session/{ceremony_id}/complete"),
+            token,
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "proof": {
+                        "kind": "assertion",
+                        "assertion": {
+                            "credential_id": "Y3JlZGVudGlhbA",
+                            "authenticator_data": "YXV0aA",
+                            "client_data_json": "e30",
+                            "signature": "c2ln",
+                            "user_handle": null
+                        }
+                    },
+                    "encrypted_input": null,
+                    "public_binding_digest": digest("33")
+                }))
                 .unwrap(),
-        )
+            ),
+        ))
         .await
         .unwrap();
     assert_eq!(completed.status(), StatusCode::OK);
@@ -6754,14 +6539,10 @@ async fn review_plan_formats_known_asset_base_units_without_hiding_raw_authority
         .unwrap();
     let session = broker
         .router()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get(
+            "/api/session",
+            url_token(&response.ceremony_url),
+        ))
         .await
         .unwrap();
     let projection: serde_json::Value =
@@ -6804,14 +6585,10 @@ async fn unreadable_safe_call_carries_a_signed_inability_to_explain_disclosure()
         .unwrap();
     let session = broker
         .router()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", url_token(&prepared.ceremony_url))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get(
+            "/api/session",
+            url_token(&prepared.ceremony_url),
+        ))
         .await
         .unwrap();
     let projection: serde_json::Value =
@@ -6885,14 +6662,10 @@ async fn review_plan_formats_an_approvals_spending_ceiling() {
         .unwrap();
     let session = broker
         .router()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get(
+            "/api/session",
+            url_token(&response.ceremony_url),
+        ))
         .await
         .unwrap();
     let projection: serde_json::Value =
@@ -6951,14 +6724,7 @@ async fn petal_key_scope_is_the_exact_human_review_and_tampering_fails_closed() 
     let token = url_token(&prepared.ceremony_url);
     let response = broker
         .router()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get("/api/session", token))
         .await
         .unwrap();
     let projection: serde_json::Value =
@@ -7045,14 +6811,7 @@ async fn machine_asserted_reusable_plan_carries_primary_surface_warning() {
     let token = url_token(&response.ceremony_url);
     let session = broker
         .router()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get("/api/session", token))
         .await
         .unwrap();
     let projection: serde_json::Value =
@@ -7269,15 +7028,7 @@ async fn remote_fragment_is_single_use_and_cookie_is_ceremony_scoped() {
         assert_eq!(denied.status(), StatusCode::FORBIDDEN, "{name}");
         assert!(!denied.headers().contains_key(header::SET_COOKIE));
         assert_eq!(denied.headers()[header::CACHE_CONTROL], "no-store");
-        assert!(
-            denied
-                .into_body()
-                .collect()
-                .await
-                .unwrap()
-                .to_bytes()
-                .is_empty()
-        );
+        assert!(denied.body_bytes().await.is_empty());
     }
     let (first, second) = tokio::join!(
         app.clone().oneshot(exchange_request()),
@@ -7291,15 +7042,7 @@ async fn remote_fragment_is_single_use_and_cookie_is_ceremony_scoped() {
     };
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     assert!(!denied.headers().contains_key(header::SET_COOKIE));
-    assert!(
-        denied
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .is_empty()
-    );
+    assert!(denied.body_bytes().await.is_empty());
     assert_eq!(exchange.status(), StatusCode::OK);
     assert_eq!(exchange.headers()[header::CACHE_CONTROL], "no-store");
     let cookie = exchange.headers()[header::SET_COOKIE]
@@ -7755,14 +7498,7 @@ async fn browser_recovery_completion_hides_distinct_signer_failures() {
         let token = url_token(&prepared.ceremony_url);
         let session = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/session")
-                    .header(header::HOST, "localhost:18734")
-                    .header("x-bloom-ceremony-token", &token)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(ceremony_get("/api/session", &token))
             .await
             .unwrap();
         assert_eq!(session.status(), StatusCode::OK);
@@ -8248,28 +7984,14 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
 
     let session_by_launch_token = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", &token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get("/api/session", &token))
         .await
         .unwrap();
     assert_eq!(session_by_launch_token.status(), StatusCode::OK);
 
     let session = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/session/{ceremony_id}"))
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", &token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get(format!("/api/session/{ceremony_id}"), &token))
         .await
         .unwrap();
     assert_eq!(session.status(), StatusCode::OK);
@@ -8313,18 +8035,11 @@ async fn assets_headers_host_origin_token_and_opaque_relay_are_enforced() {
     assert_eq!(missing_origin.status(), StatusCode::FORBIDDEN);
 
     let completed = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{ceremony_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", &token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
+        .oneshot(ceremony_post(
+            format!("/api/session/{ceremony_id}/complete"),
+            &token,
+            Body::from(serde_json::to_vec(&body).unwrap()),
+        ))
         .await
         .unwrap();
     assert_eq!(completed.status(), StatusCode::OK);
@@ -9433,18 +9148,11 @@ async fn rejected_proof_stays_verifying_until_a_retried_cancel_releases_the_sign
 
     let rejected = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{ceremony_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", &token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
+        .oneshot(ceremony_post(
+            format!("/api/session/{ceremony_id}/complete"),
+            &token,
+            Body::from(serde_json::to_vec(&body).unwrap()),
+        ))
         .await
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
@@ -9467,14 +9175,7 @@ async fn rejected_proof_stays_verifying_until_a_retried_cancel_releases_the_sign
     );
     let live = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", &token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get("/api/session", &token))
         .await
         .unwrap();
     assert_eq!(
@@ -9513,14 +9214,7 @@ async fn rejected_proof_stays_verifying_until_a_retried_cancel_releases_the_sign
     );
     let burned = restarted
         .router()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", &token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get("/api/session", &token))
         .await
         .unwrap();
     assert_eq!(
@@ -9867,14 +9561,7 @@ async fn browser_cancellation_uses_monotonic_backoff_despite_trusted_clock_skew(
     let app = broker.router();
     let projection = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get("/api/session", token))
         .await
         .unwrap();
     assert_eq!(projection.status(), StatusCode::OK);
@@ -9883,18 +9570,11 @@ async fn browser_cancellation_uses_monotonic_backoff_despite_trusted_clock_skew(
             .unwrap();
     let ceremony_id = projection["ceremony_id"].as_str().unwrap();
     let cancelled = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{ceremony_id}/cancel"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_post(
+            format!("/api/session/{ceremony_id}/cancel"),
+            token,
+            Body::empty(),
+        ))
         .await
         .unwrap();
     assert_eq!(cancelled.status(), StatusCode::NO_CONTENT);
@@ -10041,26 +9721,15 @@ async fn bip39_import_session_projects_the_authoritative_signer_profile() {
         .unwrap();
     let session_response = broker
         .router()
-        .oneshot(
-            Request::builder()
-                .uri("/api/session")
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", url_token(&response.ceremony_url))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get(
+            "/api/session",
+            url_token(&response.ceremony_url),
+        ))
         .await
         .unwrap();
     assert_eq!(session_response.status(), StatusCode::OK);
-    let session: serde_json::Value = serde_json::from_slice(
-        &session_response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .unwrap();
+    let session: serde_json::Value =
+        serde_json::from_slice(&session_response.body_bytes().await).unwrap();
 
     assert_eq!(
         session["signer_contribution"]["wallet_seed_profile"],
@@ -10112,25 +9781,11 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
     let app = broker.router();
     let session_response = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/session/{ceremony_id}"))
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", &token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get(format!("/api/session/{ceremony_id}"), &token))
         .await
         .unwrap();
-    let session: serde_json::Value = serde_json::from_slice(
-        &session_response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .unwrap();
+    let session: serde_json::Value =
+        serde_json::from_slice(&session_response.body_bytes().await).unwrap();
     let first_challenge: CeremonyChallenge =
         serde_json::from_value(session["challenges"][0]["binding"].clone()).unwrap();
     let second_challenge: CeremonyChallenge =
@@ -10179,18 +9834,11 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         "Broker request body must never contain plaintext PRF"
     );
     let completed = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{ceremony_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", &token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(body))
-                .unwrap(),
-        )
+        .oneshot(ceremony_post(
+            format!("/api/session/{ceremony_id}/complete"),
+            &token,
+            Body::from(body),
+        ))
         .await
         .unwrap();
     assert_eq!(completed.status(), StatusCode::OK);
@@ -10337,23 +9985,16 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
     let export_app = broker.router();
     let bound = export_app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{export_id}/output-key"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", &export_token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({
-                        "recipient_key": output_recipient.public_key()
-                    }))
-                    .unwrap(),
-                ))
+        .oneshot(ceremony_post(
+            format!("/api/session/{export_id}/output-key"),
+            &export_token,
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "recipient_key": output_recipient.public_key()
+                }))
                 .unwrap(),
-        )
+            ),
+        ))
         .await
         .unwrap();
     assert_eq!(bound.status(), StatusCode::OK);
@@ -10405,28 +10046,21 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
     .unwrap();
     let exported = export_app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{export_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", &export_token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({
-                        "proof": {
-                            "kind": "assertion",
-                            "assertion": export_assertion
-                        },
-                        "encrypted_input": export_envelope,
-                        "public_binding_digest": export_terms
-                    }))
-                    .unwrap(),
-                ))
+        .oneshot(ceremony_post(
+            format!("/api/session/{export_id}/complete"),
+            &export_token,
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "proof": {
+                        "kind": "assertion",
+                        "assertion": export_assertion
+                    },
+                    "encrypted_input": export_envelope,
+                    "public_binding_digest": export_terms
+                }))
                 .unwrap(),
-        )
+            ),
+        ))
         .await
         .unwrap();
     assert_eq!(exported.status(), StatusCode::OK);
@@ -10434,14 +10068,10 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         serde_json::from_slice(&exported.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let recovered = export_app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/session/{export_id}/result"))
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", &export_token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get(
+            format!("/api/session/{export_id}/result"),
+            &export_token,
+        ))
         .await
         .unwrap();
     assert_eq!(recovered.status(), StatusCode::OK);
@@ -10471,30 +10101,19 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
     assert_eq!(exported_mnemonic.split_whitespace().count(), 24);
     let acknowledged = export_app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{export_id}/ack"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", &export_token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
+        .oneshot(ceremony_post(
+            format!("/api/session/{export_id}/ack"),
+            &export_token,
+            Body::from("{}"),
+        ))
         .await
         .unwrap();
     assert_eq!(acknowledged.status(), StatusCode::NO_CONTENT);
     let replay_after_ack = export_app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/session/{export_id}/result"))
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", export_token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get(
+            format!("/api/session/{export_id}/result"),
+            export_token,
+        ))
         .await
         .unwrap();
     assert_eq!(replay_after_ack.status(), StatusCode::FORBIDDEN);
@@ -10533,11 +10152,8 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
             .oneshot(backup_request("http://localhost:18734", "{}"))
             .await
             .unwrap()
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes(),
+            .body_bytes()
+            .await,
     )
     .unwrap();
     let first_operation = OperationId::new(first.custody_operation_id.as_str()).unwrap();
@@ -10548,23 +10164,16 @@ async fn browser_to_broker_to_signer_registration_keeps_prf_ciphertext_opaque() 
         .to_string();
     let parked = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{first_id}/output-key"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", url_token(&first.ceremony_url))
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({
-                        "recipient_key": HpkeRecipient::generate().public_key()
-                    }))
-                    .unwrap(),
-                ))
+        .oneshot(ceremony_post(
+            format!("/api/session/{first_id}/output-key"),
+            url_token(&first.ceremony_url),
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "recipient_key": HpkeRecipient::generate().public_key()
+                }))
                 .unwrap(),
-        )
+            ),
+        ))
         .await
         .unwrap();
     assert_eq!(parked.status(), StatusCode::OK);
@@ -11528,26 +11137,12 @@ async fn two_differently_configured_brokers_isolate_ceremony_origin() {
     let app = broker_d.router();
     let session_response = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/session/{ceremony_id}"))
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", &token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get(format!("/api/session/{ceremony_id}"), &token))
         .await
         .unwrap();
     assert_eq!(session_response.status(), StatusCode::OK);
-    let session: serde_json::Value = serde_json::from_slice(
-        &session_response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .unwrap();
+    let session: serde_json::Value =
+        serde_json::from_slice(&session_response.body_bytes().await).unwrap();
     let first_challenge: CeremonyChallenge =
         serde_json::from_value(session["challenges"][0]["binding"].clone()).unwrap();
     let second_challenge: CeremonyChallenge =
@@ -11579,29 +11174,22 @@ async fn two_differently_configured_brokers_isolate_ceremony_origin() {
     )
     .unwrap();
     let completed = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{ceremony_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({
-                        "proof": {
-                            "kind": "registration",
-                            "attestation": attestation,
-                            "prf_assertion": assertion
-                        },
-                        "encrypted_input": envelope,
-                        "public_binding_digest": digest("51")
-                    }))
-                    .unwrap(),
-                ))
+        .oneshot(ceremony_post(
+            format!("/api/session/{ceremony_id}/complete"),
+            token,
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "proof": {
+                        "kind": "registration",
+                        "attestation": attestation,
+                        "prf_assertion": assertion
+                    },
+                    "encrypted_input": envelope,
+                    "public_binding_digest": digest("51")
+                }))
                 .unwrap(),
-        )
+            ),
+        ))
         .await
         .unwrap();
     assert_eq!(completed.status(), StatusCode::OK);

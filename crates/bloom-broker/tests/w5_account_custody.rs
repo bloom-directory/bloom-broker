@@ -5,10 +5,7 @@
 
 mod common;
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode, header},
-};
+use axum::{body::Body, http::StatusCode};
 use bloom_broker::{authority::BrokerAuthority, journal::BrokerJournal, service::BrokerRpcService};
 use bloom_broker_api::{
     AccountTerms, ActivationMode, AddressEncoding, ApprovalLimits, ApprovalSelector,
@@ -163,14 +160,7 @@ async fn get_session(
     let response = broker
         .ceremony()
         .router()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/session/{ceremony_id}"))
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get(format!("/api/session/{ceremony_id}"), token))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -186,18 +176,11 @@ async fn post_complete(
     let response = broker
         .ceremony()
         .router()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{ceremony_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
+        .oneshot(ceremony_post(
+            format!("/api/session/{ceremony_id}/complete"),
+            token,
+            Body::from(serde_json::to_vec(&body).unwrap()),
+        ))
         .await
         .unwrap();
     if response.status() != StatusCode::OK {
@@ -330,23 +313,16 @@ async fn register_bip39_wallet(
             .broker
             .ceremony()
             .router()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/session/{ceremony_id}/output-key"))
-                    .header(header::HOST, "localhost:18734")
-                    .header(header::ORIGIN, "http://localhost:18734")
-                    .header("x-bloom-ceremony-token", &token)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header("sec-fetch-site", "same-origin")
-                    .body(Body::from(
-                        serde_json::to_vec(&serde_json::json!({
-                            "recipient_key": recipient.public_key()
-                        }))
-                        .unwrap(),
-                    ))
+            .oneshot(ceremony_post(
+                format!("/api/session/{ceremony_id}/output-key"),
+                &token,
+                Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "recipient_key": recipient.public_key()
+                    }))
                     .unwrap(),
-            )
+                ),
+            ))
             .await
             .unwrap();
         assert_eq!(bound.status(), StatusCode::OK);
@@ -407,20 +383,11 @@ async fn register_bip39_wallet(
             .broker
             .ceremony()
             .router()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/session/{ceremony_id}/ack"))
-                    .header(header::HOST, "localhost:18734")
-                    .header(header::ORIGIN, "http://localhost:18734")
-                    .header("x-bloom-ceremony-token", &token)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header("sec-fetch-site", "same-origin")
-                    .body(Body::from(
-                        serde_json::to_vec(&serde_json::json!({})).unwrap(),
-                    ))
-                    .unwrap(),
-            )
+            .oneshot(ceremony_post(
+                format!("/api/session/{ceremony_id}/ack"),
+                &token,
+                Body::from(serde_json::to_vec(&serde_json::json!({})).unwrap()),
+            ))
             .await
             .unwrap();
         assert_eq!(ack.status(), StatusCode::NO_CONTENT);
@@ -1234,23 +1201,16 @@ async fn two_passkeys_and_recovery_unlock_the_same_bip39_root_over_real_transpor
         .broker
         .ceremony()
         .router()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{recovery_ceremony_id}/output-key"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", &recovery_token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({
-                        "recipient_key": recovery_recipient.public_key()
-                    }))
-                    .unwrap(),
-                ))
+        .oneshot(ceremony_post(
+            format!("/api/session/{recovery_ceremony_id}/output-key"),
+            &recovery_token,
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "recipient_key": recovery_recipient.public_key()
+                }))
                 .unwrap(),
-        )
+            ),
+        ))
         .await
         .unwrap();
     assert_eq!(bound.status(), StatusCode::OK);
@@ -1317,18 +1277,11 @@ async fn two_passkeys_and_recovery_unlock_the_same_bip39_root_over_real_transpor
         .broker
         .ceremony()
         .router()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{recovery_ceremony_id}/ack"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", &recovery_token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
+        .oneshot(ceremony_post(
+            format!("/api/session/{recovery_ceremony_id}/ack"),
+            &recovery_token,
+            Body::from("{}"),
+        ))
         .await
         .unwrap();
     assert_eq!(ack.status(), StatusCode::NO_CONTENT);
