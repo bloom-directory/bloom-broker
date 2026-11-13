@@ -4040,64 +4040,59 @@ async fn preview_tokens(State(broker): State<CeremonyBroker>, headers: HeaderMap
     Json(bloom_broker_api::known_tokens()).into_response()
 }
 
-async fn app_js(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
-    if broker.validate_served_host(&headers).is_err() {
+/// A static ceremony asset, served only to the expected host.
+fn served_asset(
+    broker: &CeremonyBroker,
+    headers: &HeaderMap,
+    content_type: &'static str,
+    body: impl IntoResponse,
+) -> Response {
+    if broker.validate_served_host(headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    (
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
+    ([(header::CONTENT_TYPE, content_type)], body).into_response()
+}
+
+async fn app_js(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
+    served_asset(
+        &broker,
+        &headers,
+        "application/javascript; charset=utf-8",
         APP_JS,
     )
-        .into_response()
 }
 
 async fn style_css(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
-    if broker.validate_served_host(&headers).is_err() {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        STYLE_CSS,
-    )
-        .into_response()
+    served_asset(&broker, &headers, "text/css; charset=utf-8", STYLE_CSS)
 }
 
 /// The owner's theme, or nothing. An absent theme is an empty stylesheet
 /// rather than a 404, so the default page never reports a missing asset.
 async fn theme_css(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
-    if broker.validate_served_host(&headers).is_err() {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+    served_asset(
+        &broker,
+        &headers,
+        "text/css; charset=utf-8",
         OWNER_THEME_CSS.get().cloned().unwrap_or_default(),
     )
-        .into_response()
 }
 
 async fn bloom_primary_svg(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
-    if broker.validate_served_host(&headers).is_err() {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    (
-        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+    served_asset(
+        &broker,
+        &headers,
+        "image/svg+xml; charset=utf-8",
         BLOOM_PRIMARY_SVG,
     )
-        .into_response()
 }
 
 async fn solana_network_svg(State(broker): State<CeremonyBroker>, headers: HeaderMap) -> Response {
-    if broker.validate_served_host(&headers).is_err() {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    (
-        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+    served_asset(
+        &broker,
+        &headers,
+        "image/svg+xml; charset=utf-8",
         SOLANA_NETWORK_SVG,
     )
-        .into_response()
 }
 
 async fn token_image(
@@ -4384,23 +4379,36 @@ async fn read_result(
         .unwrap_or_else(|| StatusCode::CONFLICT.into_response())
 }
 
+/// Authorize the browser for `ceremony_id`, then run one cross-surface step:
+/// 403 when unauthorized, the step's JSON on success, 409 with its error.
+fn cross_surface_step(
+    broker: &CeremonyBroker,
+    ceremony_id: &str,
+    headers: &HeaderMap,
+    mutating: bool,
+    step: impl FnOnce(&CeremonyBroker, u64) -> Result<serde_json::Value, ProtocolError>,
+) -> Response {
+    if broker
+        .authorize_browser(ceremony_id, headers, mutating)
+        .is_err()
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match step(broker, unix_time_ms()) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(error)).into_response(),
+    }
+}
+
 async fn cross_surface_pair(
     State(broker): State<CeremonyBroker>,
     Path(ceremony_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<CrossPairBody>,
 ) -> Response {
-    if broker
-        .authorize_browser(&ceremony_id, &headers, true)
-        .is_err()
-    {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    let result = broker.pair_cross_surface(&ceremony_id, body, unix_time_ms());
-    match result {
-        Ok(value) => Json(value).into_response(),
-        Err(error) => (StatusCode::CONFLICT, Json(error)).into_response(),
-    }
+    cross_surface_step(&broker, &ceremony_id, &headers, true, |broker, now| {
+        broker.pair_cross_surface(&ceremony_id, body, now)
+    })
 }
 
 async fn cross_surface_authorize(
@@ -4409,16 +4417,9 @@ async fn cross_surface_authorize(
     headers: HeaderMap,
     Json(body): Json<CrossAuthorizeBody>,
 ) -> Response {
-    if broker
-        .authorize_browser(&ceremony_id, &headers, true)
-        .is_err()
-    {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    match broker.authorize_cross_surface(&ceremony_id, body, unix_time_ms()) {
-        Ok(value) => Json(value).into_response(),
-        Err(error) => (StatusCode::CONFLICT, Json(error)).into_response(),
-    }
+    cross_surface_step(&broker, &ceremony_id, &headers, true, |broker, now| {
+        broker.authorize_cross_surface(&ceremony_id, body, now)
+    })
 }
 
 async fn cross_surface_handoff(
@@ -4426,16 +4427,9 @@ async fn cross_surface_handoff(
     Path(ceremony_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if broker
-        .authorize_browser(&ceremony_id, &headers, false)
-        .is_err()
-    {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    match broker.cross_surface_handoff(&ceremony_id, unix_time_ms()) {
-        Ok(value) => Json(value).into_response(),
-        Err(error) => (StatusCode::CONFLICT, Json(error)).into_response(),
-    }
+    cross_surface_step(&broker, &ceremony_id, &headers, false, |broker, now| {
+        broker.cross_surface_handoff(&ceremony_id, now)
+    })
 }
 
 async fn cross_surface_finish(
@@ -4444,16 +4438,9 @@ async fn cross_surface_finish(
     headers: HeaderMap,
     Json(body): Json<CrossFinishBody>,
 ) -> Response {
-    if broker
-        .authorize_browser(&ceremony_id, &headers, true)
-        .is_err()
-    {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    match broker.finish_cross_surface(&ceremony_id, body, unix_time_ms()) {
-        Ok(value) => Json(value).into_response(),
-        Err(error) => (StatusCode::CONFLICT, Json(error)).into_response(),
-    }
+    cross_surface_step(&broker, &ceremony_id, &headers, true, |broker, now| {
+        broker.finish_cross_surface(&ceremony_id, body, now)
+    })
 }
 
 async fn cross_surface_already_registered(
@@ -4462,16 +4449,9 @@ async fn cross_surface_already_registered(
     headers: HeaderMap,
     Json(body): Json<CrossAlreadyRegisteredBody>,
 ) -> Response {
-    if broker
-        .authorize_browser(&ceremony_id, &headers, true)
-        .is_err()
-    {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    match broker.already_registered_cross_surface(&ceremony_id, body, unix_time_ms()) {
-        Ok(value) => Json(value).into_response(),
-        Err(error) => (StatusCode::CONFLICT, Json(error)).into_response(),
-    }
+    cross_surface_step(&broker, &ceremony_id, &headers, true, |broker, now| {
+        broker.already_registered_cross_surface(&ceremony_id, body, now)
+    })
 }
 
 async fn acknowledge_result(

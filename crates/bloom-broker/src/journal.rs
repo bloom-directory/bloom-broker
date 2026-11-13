@@ -1617,18 +1617,7 @@ impl BrokerJournal {
         approval_id: &Digest32,
         operation_id: &OperationId,
     ) -> Result<Option<ReservationState>, JournalError> {
-        let connection = self.lock()?;
-        let value: Option<String> = connection
-            .query_row(
-                "SELECT state FROM reservations
-                 WHERE approval_id = ?1 AND operation_id = ?2",
-                params![approval_id.as_str(), operation_id.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        value
-            .map(|value| parse_reservation_state(&value))
-            .transpose()
+        reservation_state_by_id(&*self.lock()?, approval_id, operation_id)
     }
 
     pub fn reservation_signature_count(
@@ -3041,24 +3030,15 @@ fn reservation_state(
     transaction: &Transaction<'_>,
     request: &ReservationRequest,
 ) -> Result<Option<ReservationState>, JournalError> {
-    let value: Option<String> = transaction
-        .query_row(
-            "SELECT state FROM reservations WHERE approval_id = ?1 AND operation_id = ?2",
-            params![request.approval_id.as_str(), request.operation_id.as_str()],
-            |row| row.get(0),
-        )
-        .optional()?;
-    value
-        .map(|value| parse_reservation_state(&value))
-        .transpose()
+    reservation_state_by_id(transaction, &request.approval_id, &request.operation_id)
 }
 
 fn reservation_state_by_id(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     approval_id: &Digest32,
     operation_id: &OperationId,
 ) -> Result<Option<ReservationState>, JournalError> {
-    let value: Option<String> = transaction
+    let value: Option<String> = connection
         .query_row(
             "SELECT state FROM reservations WHERE approval_id = ?1 AND operation_id = ?2",
             params![approval_id.as_str(), operation_id.as_str()],
