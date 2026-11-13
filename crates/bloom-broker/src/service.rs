@@ -146,11 +146,10 @@ impl BrokerRpcService {
         // Every other custody kind is approved by one of the wallet's passkeys.
         let surface = match &request.wallet_id {
             Some(wallet_id)
-                if request.legacy_passkey_migration.is_none()
-                    && !matches!(
-                        request.ceremony_kind,
-                        WalletRegistration | WalletImport | WalletRecovery
-                    ) =>
+                if !matches!(
+                    request.ceremony_kind,
+                    WalletRegistration | WalletImport | WalletRecovery
+                ) =>
             {
                 self.ceremony
                     .select_wallet_surface(request.surface_selection, wallet_id)?
@@ -2138,10 +2137,9 @@ impl BrokerRpcService {
                     "wallet contains a derivation profile with no chain projection",
                 ));
             }
-            let frozen = translate_wallet_account::derivation_profile_to_machine(
-                descriptor.derivation_profile,
-            )
-            .frozen_crypto_suites();
+            let frozen =
+                translate_key::derivation_profile_to_machine(descriptor.derivation_profile)
+                    .frozen_crypto_suites();
             let recorded: Vec<bloom_broker_api::CryptoSuite> = descriptor
                 .supported_crypto_suites
                 .iter()

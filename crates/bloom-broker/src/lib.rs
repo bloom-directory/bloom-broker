@@ -7,11 +7,12 @@ pub mod clock;
 pub mod config;
 mod evm_review;
 pub mod journal;
-mod legacy_store;
 mod message_review;
 mod safe_review;
 pub mod service;
 pub mod signer_client;
 mod solana_review;
 mod token_artwork;
-mod translation;
+/// Public only so integration tests use the real translations.
+#[doc(hidden)]
+pub mod translation;

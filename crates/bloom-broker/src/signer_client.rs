@@ -25,7 +25,9 @@ use bloom_signer_api::{
 use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
 
 use crate::{
-    ceremony::CeremonySigner, journal::BrokerJournal, translation::error::signer_error_to_machine,
+    ceremony::CeremonySigner,
+    journal::{BrokerJournal, checkpoint_outcome},
+    translation::error::signer_error_to_machine,
 };
 
 type Job = (
@@ -369,20 +371,6 @@ fn log_checkpoint_decision(
         mutations_disabled,
         "Broker-Signer checkpoint decision"
     );
-}
-
-fn checkpoint_outcome(outcome: CheckpointDecisionOutcome) -> &'static str {
-    match outcome {
-        CheckpointDecisionOutcome::Appended => "appended",
-        CheckpointDecisionOutcome::AlreadyPresent => "already_present",
-        CheckpointDecisionOutcome::SequenceRollback => "sequence_rollback",
-        CheckpointDecisionOutcome::SequenceConflict => "sequence_conflict",
-        CheckpointDecisionOutcome::InvalidSignature => "invalid_signature",
-        CheckpointDecisionOutcome::UnpinnedPeer => "unpinned_peer",
-        CheckpointDecisionOutcome::StorageOrConfigurationFailure => {
-            "storage_or_configuration_failure"
-        }
-    }
 }
 
 fn journal_error(error: crate::journal::JournalError) -> ProtocolError {

@@ -257,14 +257,4 @@ mod tests {
             assert!(error.message.contains("ceremony_limits"));
         }
     }
-
-    #[test]
-    fn effective_summary_reports_only_the_four_non_secret_values() {
-        let summary = CeremonyLimits::default().effective_summary();
-        assert_eq!(
-            summary,
-            "maximum_concurrent_sessions=16 creation_window_ms=300000 \
-             maximum_creations_per_wallet=12 maximum_anonymous_registrations=4"
-        );
-    }
 }

@@ -27,8 +27,7 @@ key* is a canonical 32-byte Ed25519 key as 64 lowercase hex characters.
 | Field | Meaning |
 | --- | --- |
 | `journal_path` | Broker's durable audit journal (SQLite). It also holds authority state (approvals, policy, declared usage) and ceremony state, so those commit atomically with their audit records. |
-| `authority_path` | Legacy authority store from older packages. Startup migrates it into the journal once and keeps the file; it is never created, so new installs have none. A dangling link, a missing directory or an unreadable entry here fails startup. |
-| `ceremony_path` | Legacy ceremony store, handled the same way as `authority_path`. |
+| `authority_path`, `ceremony_path` | Optional and ignored. They named separate stores that predate the journal; installed configs still carry them. |
 | `signer_socket_path` | Unix socket Broker dials to reach Signer; the peer is still authenticated against the edge-manifest pin. |
 | `provenance_catalog_path` | Provenance catalog. Its metadata must describe a root-owned, non-symlink regular file that is not group- or other-writable; link count and size are not part of that check. The contents are then read and refused if they exceed 1 MiB, fail to parse, or fail shape validation. |
 
@@ -228,27 +227,6 @@ the operation identity when retrying and do not busy-loop on this error.
 Global concurrency exhaustion is a different class: it returns `QUOTA_EXCEEDED` with
 **no** retry hint, because nothing ages out on a schedule — only when a live
 ceremony ends.
-
-### Why `rate_limit` needs protocol 1.4
-
-`rate_limit` is an optional field, but it could not be added under 1.3, because
-every decoder in this protocol is **strict**: an unknown field fails the whole
-frame rather than being ignored. A 1.3 peer handed a `CEREMONY_RATE_LIMITED`
-carrying `rate_limit` would reject the entire error instead of reading the retry
-hint inside it — turning a routine, retryable rejection into an unreadable one.
-
-There is no way to make that safe by omitting the field selectively, so the
-negotiated range moves as a unit instead. Broker accepts **1.4 only**
-(`BROKER_API_MINOR_MIN == BROKER_API_MINOR_MAX == 4`), which means:
-
-- A **1.3 peer is rejected during the hello**, with `UNSUPPORTED_VERSION`,
-  before any request is served and before any durable work is done. It never
-  reaches a point where a response could carry `rate_limit`.
-- Consequently no *accepted* peer can be handed a field its decoder would
-  refuse — the version gate, not per-response suppression, is what upholds this.
-
-Upgrading a 1.3 Machine is therefore required, not optional; a 1.3 peer does not
-degrade to a subset of functionality, it fails to connect at all.
 
 ## Opt-in ACME staging lifecycle probe
 

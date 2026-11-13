@@ -7,7 +7,6 @@ license.workspace = true
 publish = false
 
 [dependencies]
-bloom-broker-api = { path = "../bloom-broker-api" }
 bloom-signer-api.workspace = true
 bip32.workspace = true
 ciborium.workspace = true

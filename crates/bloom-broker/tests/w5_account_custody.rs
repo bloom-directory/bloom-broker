@@ -3,22 +3,14 @@
 //! projection, replay/cancel/restart behavior, fail-closed paths, the
 //! two-passkey + recovery same-root proof, and a Broker-side secret scan.
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode, header},
-};
-use bloom_broker::{
-    authority::{AssuranceRegistry, BrokerAuthority},
-    ceremony::CeremonyBroker,
-    clock::BrokerClock,
-    journal::{AuditSigner, BrokerJournal},
-    service::BrokerRpcService,
-    signer_client::BrokerSignerClient,
-};
+mod common;
+
+use axum::{body::Body, http::StatusCode};
+use bloom_broker::{authority::BrokerAuthority, journal::BrokerJournal, service::BrokerRpcService};
 use bloom_broker_api::{
     AccountTerms, ActivationMode, AddressEncoding, ApprovalLimits, ApprovalSelector,
-    ApprovalSubject, Base64UrlBytes, BootEpoch, CeremonyKind, CeremonyState, CryptoSuite,
-    DecimalU64, DerivationProfile, DerivedAccountRequest, Digest32, IdRequest, KeyRef, KeySpec,
+    ApprovalSubject, Base64UrlBytes, CeremonyKind, CeremonyState, CryptoSuite, DecimalU64,
+    DerivationProfile, DerivedAccountRequest, Digest32, IdRequest, KeyRef, KeySpec,
     MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
     OperationId, OperationRequest, PROVENANCE_RECORD_SIGNATURE_DOMAIN, ProvenanceOperationClass,
     ProvenanceRecord, ProvenanceSubject, RequestNonce, SealedApprovalTerms, SigningPayloads, Token,
@@ -27,18 +19,14 @@ use bloom_broker_api::{
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer::{
     ceremony::SignerCeremonyService,
-    clock::SignerClock,
-    engine::{SignerAuditKeys, SignerEngine},
+    engine::SignerEngine,
     hpke::{CUSTODY_OUTPUT_INFO, HpkeRecipient, LOCAL_PRF_INFO},
-    registry::BackendRegistry,
-    service::SignerRpcService,
 };
 use bloom_signer_api::{
-    BrokerSignerRequest, BrokerSignerResponse, BrokerSignerService, CeremonyChallenge,
-    CustodyHpkeAad, CustodyOutputHpkeAad, CustodySignerContribution, LocalPrfHpkeAad,
-    SignedJournalHead, SignerCeremonyContribution,
+    CeremonyChallenge, CustodyHpkeAad, CustodyOutputHpkeAad, CustodySignerContribution,
+    LocalPrfHpkeAad, SignerCeremonyContribution,
 };
-use bloom_triad_local_transport::{EndpointQuota, JournalExchange, LocalIdentity, PeerAcl};
+use common::*;
 use ed25519_dalek::SigningKey;
 use http_body_util::BodyExt as _;
 use k256::pkcs8::EncodePublicKey as _;
@@ -54,95 +42,6 @@ fn test_time_source() -> &'static str {
     return "macos-managed-timed";
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     panic!("W5 ceremony tests require a reviewed trusted-time platform");
-}
-
-fn digest(byte: &str) -> Digest32 {
-    Digest32::new(byte.repeat(32)).unwrap()
-}
-
-fn signer_audit_keys() -> SignerAuditKeys {
-    SignerAuditKeys {
-        current_key_id: Token::new("signer-audit-key").unwrap(),
-        current_signing_key: SigningKey::from_bytes(&[14; 32]),
-        historical_verifying_keys: BTreeMap::new(),
-    }
-}
-
-fn local_identity(service_id: &str, seed: [u8; 32], epoch: &str) -> LocalIdentity {
-    LocalIdentity {
-        service_id: Token::new(service_id).unwrap(),
-        boot_epoch: BootEpoch::new(epoch.repeat(16)).unwrap(),
-        application_key_id: Token::new(format!("{service_id}-app")).unwrap(),
-        signing_key: Arc::new(SigningKey::from_bytes(&seed)),
-    }
-}
-
-fn peer_acl(identity: &LocalIdentity, effective_uid: u32) -> PeerAcl {
-    PeerAcl {
-        effective_uid,
-        service_id: identity.service_id.clone(),
-        boot_epoch: identity.boot_epoch.clone(),
-        application_key_id: identity.application_key_id.clone(),
-        application_public_key: identity.signing_key.verifying_key().to_bytes(),
-    }
-}
-
-struct ServiceTestAuditSigner;
-
-impl AuditSigner for ServiceTestAuditSigner {
-    fn key_id(&self) -> Token {
-        Token::new("broker-audit-key").unwrap()
-    }
-
-    fn sign(&self, message: &[u8]) -> Result<Base64UrlBytes, String> {
-        Ok(Base64UrlBytes::from_bytes(&sha2::Sha256::digest(message)))
-    }
-
-    fn verify(
-        &self,
-        key_id: &Token,
-        message: &[u8],
-        signature: &Base64UrlBytes,
-    ) -> Result<(), String> {
-        if key_id == &self.key_id()
-            && signature.decode() == sha2::Sha256::digest(message).as_slice()
-        {
-            Ok(())
-        } else {
-            Err("audit signature mismatch".into())
-        }
-    }
-}
-
-struct SignerJournalExchange(Arc<SignerEngine>);
-
-impl JournalExchange<bloom_signer_api::ProtocolError> for SignerJournalExchange {
-    fn checkpoint_request_head(
-        &self,
-        _method: &Token,
-        _peer_head: &SignedJournalHead,
-    ) -> Result<(), bloom_signer_api::ProtocolError> {
-        Ok(())
-    }
-
-    fn local_journal_head(
-        &self,
-        _method: &Token,
-    ) -> Result<(u64, Digest32), bloom_signer_api::ProtocolError> {
-        self.0.verified_audit_head()
-    }
-}
-
-struct AcceptingCheckpointSink;
-
-impl bloom_audit_checkpoint::CheckpointSink for AcceptingCheckpointSink {
-    fn append_peer_head(
-        &self,
-        _peer_head: &SignedJournalHead,
-    ) -> Result<bloom_audit_checkpoint::AppendOutcome, bloom_audit_checkpoint::CheckpointError>
-    {
-        Ok(bloom_audit_checkpoint::AppendOutcome::Appended)
-    }
 }
 
 /// A live Broker↔Signer stack on real sqlite stores over an authenticated
@@ -182,84 +81,33 @@ async fn account_stack_with_backup(
     tag: &str,
     backup: Option<&bloom_signer::engine::SignerBackupSet>,
 ) -> AccountStack {
-    let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
-    let signer_engine = Arc::new(
-        SignerEngine::open(
-            root.join("signer.sqlite"),
-            Token::new("broker-app-1").unwrap(),
-            SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            SigningKey::from_bytes(&[6; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            signer_audit_keys(),
-            registry,
-        )
-        .unwrap(),
-    );
+    let signer_engine = open_signer_engine(Some(&root.join("signer.sqlite")));
     if let Some(backup) = backup {
         signer_engine
             .restore_backup(backup)
             .expect("restore the exported Signer backup");
     }
-    let signer_ceremony = Arc::new(
-        SignerCeremonyService::new(
-            signer_engine.clone(),
-            Token::new("signer-ceremony-key").unwrap(),
-            SigningKey::from_bytes(&[9; 32]),
-        )
-        .unwrap(),
-    );
+    let signer_ceremony = open_signer_ceremony(signer_engine.clone());
     let effective_uid = fs::metadata(root).unwrap().uid();
     let signer_identity = local_identity("bloom-signer", [0x32; 32], "32");
     let broker_identity = local_identity("bloom-broker", [0x31; 32], "31");
     let broker_acl = peer_acl(&broker_identity, effective_uid);
     let socket_path = root.join(format!("signer-{tag}.sock"));
     let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
-    let signer_rpc = Arc::new(SignerRpcService::new(
+    let signer_rpc = open_signer_rpc(
         signer_engine.clone(),
         signer_ceremony.clone(),
-        Arc::new(
-            SignerClock::new(
-                signer_engine.clone(),
-                test_time_source(),
-                signer_identity.boot_epoch.clone(),
-            )
-            .unwrap(),
-        ),
-        signer_identity.boot_epoch.clone(),
-        digest("e2"),
+        test_time_source(),
+        &signer_identity.boot_epoch,
         "test",
-    ));
-    let server_identity = signer_identity.clone();
-    let server_rpc = signer_rpc.clone();
-    let server_acl = broker_acl.clone();
-    let exchange = SignerJournalExchange(signer_engine.clone());
-    let signer_server = tokio::spawn(async move {
-        let quota = EndpointQuota::new(16, 1_000, 60_000, 1_000, 60_000).unwrap();
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            bloom_triad_local_transport::dispatch_connection_with_journal_heads::<
-                BrokerSignerRequest,
-                BrokerSignerResponse,
-                bloom_signer_api::ProtocolError,
-                _,
-                _,
-            >(
-                &mut stream,
-                &server_identity,
-                &server_acl,
-                bloom_signer_api::SIGNER_API_CURRENT,
-                bloom_signer_api::SIGNER_API_RANGE,
-                &quota,
-                &exchange,
-                |request| BrokerSignerService::dispatch(server_rpc.as_ref(), request),
-            )
-            .await
-            .unwrap();
-        }
-    });
+    );
+    let signer_server = spawn_signer_server(
+        listener,
+        signer_identity,
+        broker_acl,
+        signer_rpc,
+        signer_engine.clone(),
+    );
     let (broker, authority) = open_broker(root, &socket_path);
     AccountStack {
         broker,
@@ -286,64 +134,18 @@ fn open_broker(root: &Path, socket_path: &Path) -> (Arc<BrokerRpcService>, Arc<B
         )
         .unwrap(),
     );
-    let signer_client = BrokerSignerClient::connect_unix(
-        socket_path,
-        broker_identity.clone(),
-        signer_acl.clone(),
-        journal.clone(),
-        Arc::new(AcceptingCheckpointSink),
-    )
-    .unwrap();
-    let authority = Arc::new(
-        BrokerAuthority::open(
-            root.join("broker-authority.sqlite"),
-            journal.clone(),
-            BTreeMap::new(),
-            Token::new("installer-key").unwrap(),
-            SigningKey::from_bytes(&[5; 32]).verifying_key(),
-            Token::new("signer-ceremony-key").unwrap(),
-            SigningKey::from_bytes(&[9; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]).verifying_key(),
-            AssuranceRegistry::compiled(Vec::new()).unwrap(),
-        )
-        .unwrap(),
-    );
-    let ceremony = CeremonyBroker::open_with_manifest_signer(
-        root.join("ceremony.sqlite"),
-        Arc::new(signer_client.clone()),
-        Token::new("broker-app-1").unwrap(),
-        SigningKey::from_bytes(&[7; 32]),
-        journal.clone(),
-    )
-    .unwrap();
-    let broker = Arc::new(
-        BrokerRpcService::new(
-            authority.clone(),
-            journal.clone(),
-            Arc::new(
-                BrokerClock::new(
-                    journal.clone(),
-                    test_time_source(),
-                    broker_identity.boot_epoch.clone(),
-                )
-                .unwrap(),
-            ),
-            ceremony,
-            signer_client.clone(),
-            Token::new("broker-app-1").unwrap(),
-            SigningKey::from_bytes(&[7; 32]),
-            broker_identity.boot_epoch.clone(),
-            digest("e3"),
-            "test",
-        )
-        .unwrap(),
-    );
+    let signer_client = connect_signer(socket_path, &broker_identity, &signer_acl, &journal);
+    let authority = Arc::new(broker_authority(&journal, BTreeMap::new()));
+    let ceremony = manifest_ceremony(&signer_client, &journal);
+    let broker = Arc::new(broker_service(
+        authority.clone(),
+        &journal,
+        ceremony,
+        signer_client,
+        test_time_source(),
+        &broker_identity.boot_epoch,
+    ));
     (broker, authority)
-}
-
-fn url_token(url: &str) -> String {
-    url.rsplit_once("/ceremony/").unwrap().1.to_owned()
 }
 
 async fn get_session(
@@ -354,14 +156,7 @@ async fn get_session(
     let response = broker
         .ceremony()
         .router()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/session/{ceremony_id}"))
-                .header(header::HOST, "localhost:18734")
-                .header("x-bloom-ceremony-token", token)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(ceremony_get(format!("/api/session/{ceremony_id}"), token))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -377,18 +172,11 @@ async fn post_complete(
     let response = broker
         .ceremony()
         .router()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{ceremony_id}/complete"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
+        .oneshot(ceremony_post(
+            format!("/api/session/{ceremony_id}/complete"),
+            token,
+            Body::from(serde_json::to_vec(&body).unwrap()),
+        ))
         .await
         .unwrap();
     if response.status() != StatusCode::OK {
@@ -521,23 +309,16 @@ async fn register_bip39_wallet(
             .broker
             .ceremony()
             .router()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/session/{ceremony_id}/output-key"))
-                    .header(header::HOST, "localhost:18734")
-                    .header(header::ORIGIN, "http://localhost:18734")
-                    .header("x-bloom-ceremony-token", &token)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header("sec-fetch-site", "same-origin")
-                    .body(Body::from(
-                        serde_json::to_vec(&serde_json::json!({
-                            "recipient_key": recipient.public_key()
-                        }))
-                        .unwrap(),
-                    ))
+            .oneshot(ceremony_post(
+                format!("/api/session/{ceremony_id}/output-key"),
+                &token,
+                Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "recipient_key": recipient.public_key()
+                    }))
                     .unwrap(),
-            )
+                ),
+            ))
             .await
             .unwrap();
         assert_eq!(bound.status(), StatusCode::OK);
@@ -598,20 +379,11 @@ async fn register_bip39_wallet(
             .broker
             .ceremony()
             .router()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/session/{ceremony_id}/ack"))
-                    .header(header::HOST, "localhost:18734")
-                    .header(header::ORIGIN, "http://localhost:18734")
-                    .header("x-bloom-ceremony-token", &token)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header("sec-fetch-site", "same-origin")
-                    .body(Body::from(
-                        serde_json::to_vec(&serde_json::json!({})).unwrap(),
-                    ))
-                    .unwrap(),
-            )
+            .oneshot(ceremony_post(
+                format!("/api/session/{ceremony_id}/ack"),
+                &token,
+                Body::from(serde_json::to_vec(&serde_json::json!({})).unwrap()),
+            ))
             .await
             .unwrap();
         assert_eq!(ack.status(), StatusCode::NO_CONTENT);
@@ -829,22 +601,6 @@ fn multi_family_terms(
         replay_id,
         expires_at_ms: DecimalU64::new(now_plus(600)),
         audit_purpose: Token::new("allocate-derived-account").unwrap(),
-    }
-}
-
-fn evm_family_request() -> DerivedAccountRequest {
-    DerivedAccountRequest {
-        derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
-        requested_role: Token::new("primary-evm").unwrap(),
-        account: None,
-    }
-}
-
-fn solana_family_request() -> DerivedAccountRequest {
-    DerivedAccountRequest {
-        derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-        requested_role: Token::new("solana-account").unwrap(),
-        account: None,
     }
 }
 
@@ -1441,23 +1197,16 @@ async fn two_passkeys_and_recovery_unlock_the_same_bip39_root_over_real_transpor
         .broker
         .ceremony()
         .router()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{recovery_ceremony_id}/output-key"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", &recovery_token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({
-                        "recipient_key": recovery_recipient.public_key()
-                    }))
-                    .unwrap(),
-                ))
+        .oneshot(ceremony_post(
+            format!("/api/session/{recovery_ceremony_id}/output-key"),
+            &recovery_token,
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "recipient_key": recovery_recipient.public_key()
+                }))
                 .unwrap(),
-        )
+            ),
+        ))
         .await
         .unwrap();
     assert_eq!(bound.status(), StatusCode::OK);
@@ -1524,18 +1273,11 @@ async fn two_passkeys_and_recovery_unlock_the_same_bip39_root_over_real_transpor
         .broker
         .ceremony()
         .router()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/session/{recovery_ceremony_id}/ack"))
-                .header(header::HOST, "localhost:18734")
-                .header(header::ORIGIN, "http://localhost:18734")
-                .header("x-bloom-ceremony-token", &recovery_token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("sec-fetch-site", "same-origin")
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
+        .oneshot(ceremony_post(
+            format!("/api/session/{recovery_ceremony_id}/ack"),
+            &recovery_token,
+            Body::from("{}"),
+        ))
         .await
         .unwrap();
     assert_eq!(ack.status(), StatusCode::NO_CONTENT);
