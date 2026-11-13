@@ -2060,9 +2060,6 @@ impl CeremonyBroker {
     ) -> Result<CustodyPrepareResponse, ProtocolError> {
         self.expire_sessions(now_ms)?;
         request
-            .validate_legacy_passkey_migration_binding()
-            .map_err(signer_error_to_machine)?;
-        request
             .validate_petal_key_scope_binding()
             .map_err(signer_error_to_machine)?;
         if matches!(
@@ -2092,12 +2089,7 @@ impl CeremonyBroker {
             request.ceremony_kind,
             CeremonyKind::WalletRegistration | CeremonyKind::WalletImport
         ) {
-            let expected_wallet_id = request.wallet_id.as_ref().or_else(|| {
-                request
-                    .legacy_passkey_migration
-                    .as_ref()
-                    .map(|migration| &migration.wallet_name)
-            });
+            let expected_wallet_id = request.wallet_id.as_ref();
             if expected_wallet_id.is_some()
                 && prepared.contribution.wallet_id.as_ref() != expected_wallet_id
             {
@@ -5942,7 +5934,7 @@ fn custody_review_text(kind: CeremonyKind) -> (&'static str, &'static str) {
 /// otherwise falls back to dumping the raw Signer contribution. Returning
 /// `None` therefore asks an owner to authorize custody against a page of
 /// base64, which is not consent in any meaningful sense, so every kind gets a
-/// manifest. Legacy passkey migration keeps its more specific review.
+/// manifest.
 ///
 /// This is what the page displays. The value the passkey binds is the Signer
 /// contribution's own `review_manifest_digest`, so this text must describe
@@ -5953,23 +5945,6 @@ fn custody_review_manifest(
     anonymous_registration: bool,
     account_review: Option<serde_json::Value>,
 ) -> Result<Option<serde_json::Value>, ProtocolError> {
-    if let Some(migration) = &request.legacy_passkey_migration {
-        return Ok(Some(serde_json::json!({
-            "schema": "bloom.legacy_passkey_migration_review.v1",
-            "title": "Import existing passkey wallet into Triad custody",
-            "wallet_name": migration.wallet_name,
-            "address": migration.address,
-            "public_key_fingerprint": migration.public_key_fingerprint,
-            "credential_id_fingerprint": migration.credential_id_fingerprint,
-            "legacy_format_version": migration.legacy_format_version,
-            "bundle_digest": migration.bundle_digest,
-            "policy_mode": migration.policy_mode,
-            "existing_passkey_remains_authority": true,
-            "creates_current_wkek_custody": true,
-            "legacy_policy_is_not_imported": true
-        })));
-    }
-
     // An account ceremony already has a review the Broker authored from the
     // frozen account terms: every requested family with its role and path
     // template. That is a more exact description than anything derivable from

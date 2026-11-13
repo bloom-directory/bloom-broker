@@ -146,11 +146,10 @@ impl BrokerRpcService {
         // Every other custody kind is approved by one of the wallet's passkeys.
         let surface = match &request.wallet_id {
             Some(wallet_id)
-                if request.legacy_passkey_migration.is_none()
-                    && !matches!(
-                        request.ceremony_kind,
-                        WalletRegistration | WalletImport | WalletRecovery
-                    ) =>
+                if !matches!(
+                    request.ceremony_kind,
+                    WalletRegistration | WalletImport | WalletRecovery
+                ) =>
             {
                 self.ceremony
                     .select_wallet_surface(request.surface_selection, wallet_id)?

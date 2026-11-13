@@ -3044,8 +3044,6 @@ async function loadCeremony() {
   }
   if (priorResult.status !== 409) throw new Error("Ceremony is unavailable");
   if (session.cross_surface) return loadCrossSurface(session);
-  const legacyPasskeyImport = session.ceremony_kind === "wallet_import" &&
-    session.signer_contribution?.expected_input_class === "legacy_passkey_v1_prf";
   const bip39Import = session.ceremony_kind === "wallet_import" &&
     session.signer_contribution?.wallet_seed_profile === "bip39-multicurve-v1";
   if (!/^[0-9a-f]{64}$/.test(ceremonyId)) {
@@ -3071,7 +3069,7 @@ async function loadCeremony() {
   renderReview(session);
   recoveryFields.hidden = session.ceremony_kind !== "wallet_recovery";
   exportFields.hidden = session.ceremony_kind !== "wallet_export";
-  importFields.hidden = !(session.ceremony_kind === "wallet_import" && !legacyPasskeyImport);
+  importFields.hidden = session.ceremony_kind !== "wallet_import";
   if (!importFields.hidden) {
     document.getElementById("mnemonic-label").hidden = !bip39Import;
     document.getElementById("raw-key-label").hidden = bip39Import;
@@ -3170,8 +3168,6 @@ async function run(session) {
   approve.disabled = true;
   statusNode.textContent = "Waiting for passkey verification…";
   const kind = session.ceremony_kind;
-  const legacyPasskeyImport = kind === "wallet_import" &&
-    session.signer_contribution?.expected_input_class === "legacy_passkey_v1_prf";
   const bip39Import = kind === "wallet_import" &&
     session.signer_contribution?.wallet_seed_profile === "bip39-multicurve-v1";
   const scopedPetalKey = kind === "key_derive" &&
@@ -3180,7 +3176,7 @@ async function run(session) {
   let secret = null;
   let credentialId = null;
 
-  if (kind === "wallet_registration" || (kind === "wallet_import" && !legacyPasskeyImport)) {
+  if (kind === "wallet_registration" || kind === "wallet_import") {
     const created = await createCredential(session, 0);
     const prf = await ensureNewCredentialPrf(session, created, 1);
     credentialId = encodeUrl(created.rawId);
@@ -3207,15 +3203,6 @@ async function run(session) {
     }
     proof = {kind: "registration", attestation: attestationJson(created),
       prf_assertion: prf.assertion};
-  } else if (legacyPasskeyImport) {
-    const assertion = await getCredential(session, 0);
-    credentialId = encodeUrl(assertion.rawId);
-    const credentialPrf = prfResult(assertion);
-    if (!credentialPrf) throw new Error("This passkey did not return required PRF output");
-    secret = te.encode(canonicalJson({
-      credential_prf: encodeUrl(credentialPrf)
-    }));
-    proof = {kind: "assertion", assertion: assertionJson(assertion)};
   } else if (kind === "wallet_recovery") {
     const created = await createCredential(session, 0);
     const newPrf = await ensureNewCredentialPrf(session, created, 1);

@@ -481,11 +481,10 @@ use bloom_signer_api::{
     CeremonyChallenge, CeremonyCompleteRequest, CeremonyKind, CeremonyPhase,
     CeremonyPrepareRequest, CeremonyWebAuthnOptions, ControlRequest, ControlResponse,
     CustodyCompleteRequest, CustodyHpkeAad, CustodyOutputHpkeAad, CustodyPrepareRequest,
-    CustodyResult, CustodySignerContribution, LegacyPasskeyMigrationPublic, LocalPrfHpkeAad,
-    PolicyUpdateCeremonyCompleteRequest, PolicyUpdateCeremonyPrepareRequest,
-    RevocationControlService, SignerActivationReceipt, SignerCeremonyContribution,
-    SignerCeremonyStatus, SignerPreparedApproval, SignerPreparedCustody, WalletOperationRequest,
-    WebAuthnCeremonyProof,
+    CustodyResult, CustodySignerContribution, LocalPrfHpkeAad, PolicyUpdateCeremonyCompleteRequest,
+    PolicyUpdateCeremonyPrepareRequest, RevocationControlService, SignerActivationReceipt,
+    SignerCeremonyContribution, SignerCeremonyStatus, SignerPreparedApproval,
+    SignerPreparedCustody, WalletOperationRequest, WebAuthnCeremonyProof,
 };
 use bloom_triad_local_transport::EndpointQuota;
 use common::*;
@@ -2145,18 +2144,6 @@ fn scoped_petal_key_browser_flow_never_collects_a_namespace_grant() {
 }
 
 #[test]
-fn legacy_passkey_browser_flow_uses_assertion_prf_and_hides_raw_key_input() {
-    let asset = PAGE_ASSET;
-    assert!(asset.contains("legacy_passkey_v1_prf"));
-    assert!(asset.contains("const assertion = await getCredential(session, 0)"));
-    assert!(asset.contains("credential_prf: encodeUrl(credentialPrf)"));
-    assert!(asset.contains(
-        "importFields.hidden = !(session.ceremony_kind === \"wallet_import\" && !legacyPasskeyImport)"
-    ));
-    assert!(asset.contains("wallet_import\" && !legacyPasskeyImport"));
-}
-
-#[test]
 fn bip39_browser_import_uses_profile_to_control_serialization() {
     let asset = PAGE_ASSET;
     let html = include_str!("../src/ceremony_assets/index.html");
@@ -2898,12 +2885,7 @@ impl CeremonySigner for MockSigner {
         {
             release.recv().unwrap();
         }
-        let effective_wallet_id = request.wallet_id.clone().or_else(|| {
-            request
-                .legacy_passkey_migration
-                .as_ref()
-                .map(|migration| migration.wallet_name.clone())
-        });
+        let effective_wallet_id = request.wallet_id.clone();
         self.pending
             .lock()
             .insert(request.custody_operation_id.clone());
@@ -5481,73 +5463,6 @@ fn stable_url_single_live_wallet_and_cancellation_backoff_hold() {
             .unwrap_err()
             .code,
         ProtocolErrorCode::CeremonyRateLimited
-    );
-}
-
-#[tokio::test]
-async fn legacy_passkey_prepare_renders_only_digest_bound_public_migration_terms() {
-    let signer = Arc::new(MockSigner::new());
-    let broker = CeremonyBroker::new(signer);
-    let now_ms: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
-        .try_into()
-        .unwrap();
-    let operation_id = operation("81");
-    let migration = LegacyPasskeyMigrationPublic {
-        schema: Token::new("bloom.legacy_passkey_migration_receipt.v1").unwrap(),
-        wallet_name: Token::new("wallet").unwrap(),
-        address: "0x1111111111111111111111111111111111111111".into(),
-        public_key_fingerprint: digest("82"),
-        credential_id_fingerprint: digest("83"),
-        legacy_format_version: 1,
-        bundle_digest: digest("84"),
-        policy_mode: Token::new("restrictive_current_policy").unwrap(),
-    };
-    let exact_terms_digest = migration.terms_digest(&operation_id).unwrap();
-    let response = broker
-        .prepare_custody(
-            CustodyPrepareRequest {
-                surface: bloom_signer_api::legacy_local_surface(),
-                ceremony_kind: CeremonyKind::WalletImport,
-                custody_operation_id: operation_id,
-                wallet_id: None,
-                key_ref: None,
-                exact_terms_digest,
-                expected_input_class: Token::new("legacy_passkey_v1_prf").unwrap(),
-                browser_output_recipient_key: None,
-                petal_key_scope: None,
-                legacy_passkey_migration: Some(migration),
-                wallet_seed_profile: None,
-                derivation_requests: Vec::new(),
-            },
-            now_ms,
-        )
-        .unwrap();
-    let session = broker
-        .router()
-        .oneshot(ceremony_get(
-            "/api/session",
-            url_token(&response.ceremony_url),
-        ))
-        .await
-        .unwrap();
-    let projection: serde_json::Value =
-        serde_json::from_slice(&session.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(
-        projection["review_manifest"]["schema"],
-        "bloom.legacy_passkey_migration_review.v1"
-    );
-    assert_eq!(projection["review_manifest"]["wallet_name"], "wallet");
-    assert_eq!(
-        projection["review_manifest"]["creates_current_wkek_custody"],
-        true
-    );
-    assert!(
-        projection["review_manifest"]
-            .get("raw_private_key")
-            .is_none()
     );
 }
 

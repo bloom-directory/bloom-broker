@@ -189,52 +189,12 @@ pub enum ApprovalPrepareState {
     AwaitingCeremony,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyPasskeyMigrationPublic {
-    pub schema: Token,
-    pub wallet_name: Token,
-    pub address: String,
-    pub public_key_fingerprint: Digest32,
-    pub credential_id_fingerprint: Digest32,
-    pub legacy_format_version: u8,
-    pub bundle_digest: Digest32,
-    pub policy_mode: Token,
-}
-
-impl LegacyPasskeyMigrationPublic {
-    pub fn terms_digest(&self, operation_id: &OperationId) -> Result<Digest32, ProtocolError> {
-        #[derive(Serialize)]
-        struct Terms<'a> {
-            schema: &'a Token,
-            operation_id: &'a OperationId,
-            wallet_name: &'a Token,
-            address: &'a str,
-            public_key_fingerprint: &'a Digest32,
-            credential_id_fingerprint: &'a Digest32,
-            legacy_format_version: u8,
-            bundle_digest: &'a Digest32,
-            policy_mode: &'a Token,
-        }
-        Ok(Digest32::from_bytes(
-            Sha256::digest(
-                serde_jcs::to_vec(&Terms {
-                    schema: &self.schema,
-                    operation_id,
-                    wallet_name: &self.wallet_name,
-                    address: &self.address,
-                    public_key_fingerprint: &self.public_key_fingerprint,
-                    credential_id_fingerprint: &self.credential_id_fingerprint,
-                    legacy_format_version: self.legacy_format_version,
-                    bundle_digest: &self.bundle_digest,
-                    policy_mode: &self.policy_mode,
-                })
-                .map_err(canonical_error)?,
-            )
-            .into(),
-        ))
-    }
-}
+/// Retired v1 passkey migration terms. Uninhabited, so the
+/// `legacy_passkey_migration` key still serializes as `null` (keeping request
+/// digests and stored sessions stable) and older peers sending `null` still
+/// decode, while any actual migration terms are rejected.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum RetiredLegacyPasskeyMigration {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -244,8 +204,7 @@ pub struct CustodyPrepareRequest {
     pub surface_selection: CeremonySurfaceSelection,
     pub custody_operation_id: OperationId,
     /// The authoritative wallet ID. New registrations and ordinary imports
-    /// require the caller-selected ID; legacy migration derives it from the
-    /// authenticated migration receipt instead.
+    /// require the caller-selected ID.
     pub wallet_id: Option<Token>,
     pub key_ref: Option<KeyRef>,
     pub exact_terms_digest: Digest32,
@@ -254,7 +213,7 @@ pub struct CustodyPrepareRequest {
     #[serde(default)]
     pub petal_key_scope: Option<PetalKeyScope>,
     #[serde(default)]
-    pub legacy_passkey_migration: Option<LegacyPasskeyMigrationPublic>,
+    pub legacy_passkey_migration: Option<RetiredLegacyPasskeyMigration>,
     /// Selected root seed profile for wallet registration/import.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wallet_seed_profile: Option<crate::WalletSeedProfile>,
@@ -295,46 +254,10 @@ impl CustodyPrepareRequest {
                 "wallet creation derives its root KeyRef inside Signer",
             ));
         }
-        let legacy_import = self.ceremony_kind == CeremonyKind::WalletImport
-            && self.legacy_passkey_migration.is_some();
-        if self.wallet_id.is_none() && !legacy_import {
+        if self.wallet_id.is_none() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
                 "wallet registration and ordinary import require an authoritative wallet ID",
-            ));
-        }
-        if self.wallet_id.is_some() && legacy_import {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::OperationIdConflict,
-                "legacy migration wallet ID must come from its authenticated receipt",
-            ));
-        }
-        Ok(())
-    }
-
-    pub fn validate_legacy_passkey_migration_binding(&self) -> Result<(), ProtocolError> {
-        let Some(migration) = &self.legacy_passkey_migration else {
-            if self.expected_input_class.as_str() == "legacy_passkey_v1_prf" {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::MalformedFrame,
-                    "legacy passkey input class requires public migration terms",
-                ));
-            }
-            return Ok(());
-        };
-        if self.ceremony_kind != CeremonyKind::WalletImport
-            || self.expected_input_class.as_str() != "legacy_passkey_v1_prf"
-            || self.wallet_id.is_some()
-            || self.key_ref.is_some()
-            || self.petal_key_scope.is_some()
-            || migration.schema.as_str() != "bloom.legacy_passkey_migration_receipt.v1"
-            || migration.policy_mode.as_str() != "restrictive_current_policy"
-            || migration.legacy_format_version != 1
-            || self.exact_terms_digest != migration.terms_digest(&self.custody_operation_id)?
-        {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::OperationIdConflict,
-                "legacy passkey migration terms do not match the custody request",
             ));
         }
         Ok(())
@@ -536,7 +459,7 @@ impl CustodyPrepareRequest {
                 "account custody never selects a wallet seed profile",
             ));
         }
-        if self.petal_key_scope.is_some() || self.legacy_passkey_migration.is_some() {
+        if self.petal_key_scope.is_some() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::CeremonyKindMismatch,
                 "account custody cannot carry petal or legacy migration terms",
@@ -898,6 +821,15 @@ mod tests {
                 .code,
             ProtocolErrorCode::MalformedFrame
         );
+    }
+
+    #[test]
+    fn retired_legacy_migration_key_accepts_only_null() {
+        let mut value = serde_json::to_value(registration_prepare(None)).unwrap();
+        assert_eq!(value["legacy_passkey_migration"], serde_json::Value::Null);
+        assert!(serde_json::from_value::<CustodyPrepareRequest>(value.clone()).is_ok());
+        value["legacy_passkey_migration"] = serde_json::json!({"wallet_name": "old"});
+        assert!(serde_json::from_value::<CustodyPrepareRequest>(value).is_err());
     }
 
     fn allocation_terms() -> AccountTerms {
