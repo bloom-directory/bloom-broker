@@ -332,19 +332,6 @@ impl CeremonyLimits {
     pub fn maximum_anonymous_registrations(&self) -> usize {
         self.maximum_anonymous_registrations
     }
-
-    /// The four effective values, and nothing else. Safe to log: none of them
-    /// identifies a wallet, and none of them is secret.
-    pub fn effective_summary(&self) -> String {
-        format!(
-            "maximum_concurrent_sessions={} creation_window_ms={} \
-             maximum_creations_per_wallet={} maximum_anonymous_registrations={}",
-            self.maximum_concurrent_sessions,
-            self.creation_window_ms,
-            self.maximum_creations_per_wallet,
-            self.maximum_anonymous_registrations,
-        )
-    }
 }
 
 fn bounded(field: &str, value: u64, ceiling: u64) -> Result<(), ProtocolError> {
@@ -1403,10 +1390,6 @@ impl CeremonyBroker {
     /// The instance ceremony endpoint (port, addrs, Host, origin, URLs).
     pub fn endpoint(&self) -> CeremonyEndpoint {
         self.inner.endpoint
-    }
-
-    pub fn ceremony_session_url(&self, token: &Base64UrlBytes) -> String {
-        self.inner.endpoint.session_url(token)
     }
 
     fn from_parts(
@@ -3068,12 +3051,6 @@ impl CeremonyBroker {
         Ok(listener)
     }
 
-    /// Exclusively acquire both canonical loopback sockets. There is
-    /// deliberately no fallback address or port.
-    pub fn bind_canonical_loopback() -> Result<(StdTcpListener, StdTcpListener), ProtocolError> {
-        Self::bind_canonical_loopback_for(CeremonyEndpoint::default())
-    }
-
     /// Exclusively acquire both loopback sockets for `endpoint`. There is
     /// deliberately no fallback address or port.
     pub fn bind_canonical_loopback_for(
@@ -3100,17 +3077,6 @@ impl CeremonyBroker {
             )
         })?;
         Ok(listener)
-    }
-
-    /// Bind and serve both configured loopback listeners until `shutdown`
-    /// resolves. macOS-only.
-    pub async fn serve_canonical_loopback_until<F>(self, shutdown: F) -> Result<(), ProtocolError>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        let endpoint = self.inner.endpoint;
-        let (v4, v6) = Self::bind_canonical_loopback_for(endpoint)?;
-        self.serve_loopback_listeners_until(v4, v6, shutdown).await
     }
 
     /// Serve an already-acquired pair of configured loopback listeners until
