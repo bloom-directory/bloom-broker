@@ -17,7 +17,7 @@ pub(crate) fn key_spec_to_machine(value: south::KeySpec) -> north::KeySpec {
     }
 }
 
-pub(crate) fn crypto_suite_to_signer(value: north::CryptoSuite) -> south::CryptoSuite {
+pub fn crypto_suite_to_signer(value: north::CryptoSuite) -> south::CryptoSuite {
     match value {
         north::CryptoSuite::Secp256k1Keccak256Recoverable => {
             south::CryptoSuite::Secp256k1Keccak256Recoverable
@@ -101,7 +101,7 @@ fn derivation_to_machine(value: south::DerivationRef) -> north::DerivationRef {
     }
 }
 
-pub(crate) fn key_ref_to_signer(value: north::KeyRef) -> south::KeyRef {
+pub fn key_ref_to_signer(value: north::KeyRef) -> south::KeyRef {
     south::KeyRef {
         backend: value.backend,
         backend_instance: value.backend_instance,

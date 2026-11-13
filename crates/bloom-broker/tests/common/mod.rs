@@ -51,6 +51,12 @@ pub fn url_token(url: &str) -> String {
     url.rsplit_once("/ceremony/").unwrap().1.to_owned()
 }
 
+/// Sends `request` through a clone of `app`.
+pub async fn send(app: &axum::Router, request: Request<Body>) -> Response<Body> {
+    use tower::ServiceExt as _;
+    app.clone().oneshot(request).await.unwrap()
+}
+
 /// GET on the ceremony host carrying the ceremony token.
 pub fn ceremony_get(uri: impl AsRef<str>, token: impl AsRef<str>) -> Request<Body> {
     Request::builder()

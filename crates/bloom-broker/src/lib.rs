@@ -13,4 +13,6 @@ pub mod service;
 pub mod signer_client;
 mod solana_review;
 mod token_artwork;
-mod translation;
+/// Public only so integration tests use the real translations.
+#[doc(hidden)]
+pub mod translation;

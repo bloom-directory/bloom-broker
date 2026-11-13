@@ -5,7 +5,7 @@ use bloom_signer_api as south;
 
 use super::{ceremony, key, policy};
 
-fn petal_scope_to_signer(value: north::PetalKeyScope) -> south::PetalKeyScope {
+pub fn petal_scope_to_signer(value: north::PetalKeyScope) -> south::PetalKeyScope {
     south::PetalKeyScope {
         wallet_id: value.wallet_id,
         parent_key_ref: key::key_ref_to_signer(value.parent_key_ref),
@@ -104,7 +104,7 @@ fn derived_request_to_signer(value: north::DerivedAccountRequest) -> south::Deri
     }
 }
 
-pub(crate) fn result_to_machine(value: south::CustodyResult) -> north::CustodyResult {
+pub fn result_to_machine(value: south::CustodyResult) -> north::CustodyResult {
     north::CustodyResult {
         surface: value.surface.map(|surface| north::CeremonySurfaceRef {
             surface_id: surface.surface_id,
