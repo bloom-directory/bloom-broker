@@ -487,3 +487,52 @@ fn registration_replay_finishes_effects_after_checkpoint_failure() {
         "successful replay must retry the durable checkpoint"
     );
 }
+
+#[test]
+fn deletion_replay_retries_checkpoint_after_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("journal.sqlite");
+    let deletion = receipt(CeremonyKind::WalletDelete, 20, None);
+    let fixture = Fixture::open(Some(&path));
+    fixture.initial(CeremonyKind::WalletRegistration, 1, 1);
+    fixture
+        .journal
+        .install_self_checkpoint(broker_identity(), Arc::new(FailingSelfCheckpoint))
+        .unwrap();
+    assert!(
+        fixture
+            .authority
+            .adopt_custody_receipt(&deletion, 2_000)
+            .is_err()
+    );
+    assert!(
+        fixture
+            .authority
+            .adopt_custody_receipt(&deletion, 2_000)
+            .is_err(),
+        "a degraded journal must not report replay success"
+    );
+    drop(fixture);
+
+    let fixture = Fixture::open(Some(&path));
+    let checkpoint = Arc::new(FailOnceCheckpoint(AtomicUsize::new(1)));
+    fixture
+        .journal
+        .install_self_checkpoint(broker_identity(), checkpoint.clone())
+        .unwrap();
+    fixture
+        .authority
+        .adopt_custody_receipt(&deletion, 2_000)
+        .unwrap();
+    assert!(
+        fixture
+            .authority
+            .policy_verification_key(&token("reusable-name"))
+            .is_err()
+    );
+    assert_eq!(
+        checkpoint.0.load(Ordering::SeqCst),
+        2,
+        "successful replay must retry the durable checkpoint"
+    );
+}

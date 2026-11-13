@@ -987,6 +987,11 @@ impl BrokerAuthority {
                 |row| row.get(0),
             )?;
             if adopted {
+                // Retry the checkpoint a failed first attempt may have missed.
+                // Leave the key registry alone: the wallet may since have been
+                // registered again.
+                drop(connection);
+                self.journal.checkpoint_committed_head()?;
                 return Ok(());
             }
             let transaction = connection.transaction()?;
