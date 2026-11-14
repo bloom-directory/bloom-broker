@@ -81,8 +81,7 @@ pub(crate) fn validate_selector(
         route_grants,
         ..
     } = &terms.selector
-    {
-        if allowed_operation_classes
+        && allowed_operation_classes
             .iter()
             .chain(
                 route_grants
@@ -93,11 +92,10 @@ pub(crate) fn validate_selector(
                 class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
                     || bloom_broker_api::message_review_requires_exact(class.as_str())
             })
-        {
-            return Err(invalid(
-                "Reviewed signatures cannot use an opaque reusable grant; prepare a new exact approval",
-            ));
-        }
+    {
+        return Err(invalid(
+            "Reviewed signatures cannot use an opaque reusable grant; prepare a new exact approval",
+        ));
     }
     if claim.is_some_and(|claim| {
         claim.operation_class.as_str() == bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS
@@ -982,17 +980,15 @@ fn validate_petal_profile(
         "hyperliquid.schedule_cancel" => Some("scheduleCancel"),
         "hyperliquid.update_leverage" => Some("updateLeverage"),
         _ => None,
-    } {
-        if review.kind != "hyperliquid_l1"
-            || !review
-                .fields
-                .iter()
-                .any(|field| field.path == "Action" && field.value == action)
-        {
-            return Err(invalid(
-                "Hyperliquid operation differs from its MessagePack action",
-            ));
-        }
+    } && (review.kind != "hyperliquid_l1"
+        || !review
+            .fields
+            .iter()
+            .any(|field| field.path == "Action" && field.value == action))
+    {
+        return Err(invalid(
+            "Hyperliquid operation differs from its MessagePack action",
+        ));
     }
     let needs_payment = match class {
         "gasless.relay" => true,

@@ -95,6 +95,12 @@ impl VirtualAuthenticator {
         }
     }
 
+    pub fn generate_for_registration(user_handle: Base64UrlBytes, origin: &str) -> Self {
+        let mut authenticator = Self::generate_with_origin(origin);
+        authenticator.user_handle = user_handle;
+        authenticator
+    }
+
     /// Construct a repeatable software authenticator for an out-of-process
     /// integration run. The seed is test input, never production credential
     /// material. Domain-separated hashes keep the credential ID and user

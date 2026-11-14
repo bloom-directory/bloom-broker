@@ -88,6 +88,43 @@ struct Needle {
     bytes: Zeroizing<Vec<u8>>,
 }
 
+/// Synthetic fixtures only. The short CVC is checked with its field key to
+/// avoid treating an unrelated counter or timestamp as secret disclosure.
+pub(crate) fn assert_card_secret_confinement(
+    roots: &[PathBuf],
+) -> Result<(usize, u64), Box<dyn std::error::Error>> {
+    if roots.is_empty() {
+        return Err("at least one --artifact path is required".into());
+    }
+    let markers = [
+        "4242424242424242",
+        "4242 4242 4242 4242",
+        "4000000000000002",
+        "4000000000003220",
+        "4000002760003184",
+        "Bloom Synthetic Cardholder",
+        "\"cvc\":\"937\"",
+        "\"cvc\": \"937\"",
+        "\"expiry_month\":12,\"expiry_year\":2034",
+    ];
+    let needles = markers
+        .into_iter()
+        .map(|m| Needle {
+            description: "synthetic card marker",
+            bytes: Zeroizing::new(m.as_bytes().to_vec()),
+        })
+        .collect::<Vec<_>>();
+    let files = artifact_files(roots)?;
+    if files.is_empty() {
+        return Err("artifact roots did not contain a regular file".into());
+    }
+    let mut bytes = 0;
+    for file in &files {
+        bytes += scan_file(file, &needles)?;
+    }
+    Ok((files.len(), bytes))
+}
+
 pub(crate) fn assert_machine_secret_confinement(
     signer_database: &Path,
     authenticator_seed: &[u8],
@@ -501,6 +538,33 @@ fn scan_file(path: &Path, needles: &[Needle]) -> Result<u64, Box<dyn std::error:
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn card_scanner_detects_pan_and_contextual_cvc_without_printing_values() {
+        let root = std::env::temp_dir().join(format!(
+            "bloom-card-scan-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let file = root.join("machine-artifact");
+        fs::write(&file, b"public status: filled; count 937").unwrap();
+        assert!(assert_card_secret_confinement(std::slice::from_ref(&file)).is_ok());
+        for bytes in [
+            b"4242424242424242".as_slice(),
+            b"{\"cvc\":\"937\"}".as_slice(),
+        ] {
+            fs::write(&file, bytes).unwrap();
+            let error = assert_card_secret_confinement(std::slice::from_ref(&file))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("synthetic card marker"));
+            assert!(!error.contains(std::str::from_utf8(bytes).unwrap()));
+        }
+    }
 
     #[test]
     fn wrapping_keys_match_independent_hkdf_sha256_vectors() {

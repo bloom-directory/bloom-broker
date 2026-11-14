@@ -78,6 +78,9 @@ pub enum CeremonyKind {
     AccountAllocate,
     AccountRetire,
     PolicyUpdate,
+    CardAdd,
+    CardDelete,
+    CardCheckout,
 }
 
 /// A caller can ask for a specific existing surface. The default is resolved by

@@ -443,12 +443,11 @@ async fn maintain_certificate_with_policy(
 ) -> Result<(), Failure> {
     bloom_relay_protocol::validate_hostname(hostname)?;
     let account = ensure_acme_account_at(config, uid, directory).await?;
-    if let Ok(bundle) = load_published_bundle(&config.bundle_path, hostname, uid) {
-        if let Ok(info) = validate_bundle(&bundle, hostname, now_ms()?) {
-            if !certificate_renewal_due(info.not_after_ms, now_ms()?, renew_before_ms) {
-                return Ok(());
-            }
-        }
+    if let Ok(bundle) = load_published_bundle(&config.bundle_path, hostname, uid)
+        && let Ok(info) = validate_bundle(&bundle, hostname, now_ms()?)
+        && !certificate_renewal_due(info.not_after_ms, now_ms()?, renew_before_ms)
+    {
+        return Ok(());
     }
     let ca = read_control_ca(&config.control_ca_path, uid)?;
     let dns_credential = config.dns_credential_path();
