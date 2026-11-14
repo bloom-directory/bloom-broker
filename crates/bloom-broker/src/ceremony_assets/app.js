@@ -4124,6 +4124,12 @@ async function loadCeremony() {
       approve.disabled = true;
       await clearBrowserState(ceremonyId);
       clearInterval(expiryTimer);
+      // The stopped timer would leave a frozen countdown and the in-progress
+      // status beside the outcome.
+      statusNode.textContent = "";
+      document.getElementById("review-deadline").textContent = "";
+      document.getElementById("action-expiry").textContent = "";
+      document.getElementById("ceremony-actions").hidden = true;
       panelKicker.textContent = "Done";
       panelTitle.textContent = "Cancelled — nothing was signed";
       const pageTitle = document.getElementById("page-title");
