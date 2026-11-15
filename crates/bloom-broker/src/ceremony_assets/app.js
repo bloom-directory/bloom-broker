@@ -4129,6 +4129,7 @@ async function loadCeremony() {
       statusNode.textContent = "";
       document.getElementById("review-deadline").textContent = "";
       document.getElementById("action-expiry").textContent = "";
+      // Hides both buttons with the footer.
       document.getElementById("ceremony-actions").hidden = true;
       panelKicker.textContent = "Done";
       panelTitle.textContent = "Cancelled — nothing was signed";
@@ -4140,8 +4141,6 @@ async function loadCeremony() {
         "You cancelled this ceremony. No signature was created and nothing was broadcast."));
       if (session.ceremony_kind === "wallet_export" && session.signer_contribution?.wallet_id) reviewNode.append(
         el("p", {}, el("a", {href: walletPageUrl(session.signer_contribution.wallet_id)}, "Return to wallet — backup was cancelled")));
-      cancel.hidden = true;
-      approve.hidden = true;
     } catch (error) {
       // An expiry that landed while cancelling stays terminal: its message
       // stands and no control comes back.

@@ -1993,7 +1993,6 @@ fn browser_cancel_disables_approve_before_awaiting_and_reports_the_outcome() {
             "immediate feedback",
         ),
         ("Cancelled — nothing was signed", "terminal outcome message"),
-        ("cancel.hidden = true;", "buttons removed on success"),
         (
             "statusNode.textContent = \"\";",
             "the in-progress status cleared on success",
@@ -2004,7 +2003,7 @@ fn browser_cancel_disables_approve_before_awaiting_and_reports_the_outcome() {
         ),
         (
             "document.getElementById(\"ceremony-actions\").hidden = true;",
-            "no time-left footer beside the outcome",
+            "buttons and time-left footer removed on success",
         ),
     ] {
         assert!(
