@@ -6662,11 +6662,13 @@ mod shell_tests {
     #[test]
     fn every_element_the_ceremony_script_looks_up_exists_in_the_page() {
         // A lookup of a removed element throws and shows every review as an
-        // unavailable link.
+        // unavailable link. An optional lookup (`?.`) may find nothing.
         let missing: Vec<&str> = APP_JS
             .split("getElementById(\"")
             .skip(1)
-            .filter_map(|rest| rest.split('"').next())
+            .filter_map(|rest| rest.split_once('"'))
+            .filter(|(_, after)| !after.starts_with(")?."))
+            .map(|(id, _)| id)
             .filter(|id| !SHELL_HTML.contains(&format!("id=\"{id}\"")))
             .collect();
         assert!(missing.is_empty(), "missing page elements: {missing:?}");
