@@ -95,6 +95,157 @@ struct CancelByCloid {
     cloid: String,
 }
 
+/// The review field holding Broker's own bound on an order's builder fee, in
+/// micro-USDC, rounded up. Present exactly when the order carries a builder.
+pub(super) const BUILDER_FEE_FIELD: &str = "Maximum builder fee (micro-USDC, rounded up)";
+/// The operation class every builder-bearing order must sign under.
+pub(crate) const BUILDER_ORDER_CLASS: &str = "hyperliquid.builder_order";
+/// Asset IDs from here on are spot, builder-deployed (HIP-3) or outcome
+/// markets, whose builder fee may not be paid in USDC.
+const SPOT_ASSET_ID_OFFSET: u32 = 10_000;
+
+/// Broker's own upper bound on the builder fee `orders` can pay at `rate`
+/// tenths of a basis point of notional, from the signed prices and sizes.
+/// Only legs Broker can bound in USDC are accepted: core-perp limit orders.
+/// A buy fills at or below its limit; a sell must be post-only (`Alo`), so it
+/// fills at exactly its limit rather than at a lower resting bid.
+fn builder_fee_bound(orders: &[Order], rate: u32) -> Result<u64, ProtocolError> {
+    let mut total = 0_u64;
+    for order in orders {
+        let Some(limit) = &order.t.limit else {
+            return Err(invalid(
+                "a trigger order fills at the market, so its builder fee cannot be bounded",
+            ));
+        };
+        if order.a >= SPOT_ASSET_ID_OFFSET {
+            return Err(invalid(
+                "Bloom bounds builder fees only on core perpetual orders, which pay them in USDC",
+            ));
+        }
+        if !order.b && limit.tif != "Alo" {
+            return Err(invalid(
+                "a sell carrying a builder fee must be post-only (Alo) so it fills at its limit",
+            ));
+        }
+        total = total
+            .checked_add(leg_fee_micros(&order.p, &order.s, rate)?)
+            .ok_or_else(|| invalid("builder fee exceeds the supported USDC amount"))?;
+    }
+    Ok(total)
+}
+
+/// `price * size * rate / 10^5` in micro-USDC, rounded up, from the exact
+/// signed decimals.
+fn leg_fee_micros(price: &str, size: &str, rate: u32) -> Result<u64, ProtocolError> {
+    use alloy::primitives::U256;
+    let decimal = |raw: &str| -> Result<(U256, usize), ProtocolError> {
+        let (whole, fraction) = raw.split_once('.').unwrap_or((raw, ""));
+        if whole.is_empty()
+            || !format!("{whole}{fraction}")
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+        {
+            return Err(invalid("order price or size is not a plain decimal"));
+        }
+        let mantissa = U256::from_str_radix(&format!("{whole}{fraction}"), 10)
+            .map_err(|_| invalid("order price or size is too large"))?;
+        Ok((mantissa, fraction.len()))
+    };
+    let overflow = || invalid("builder fee exceeds the supported USDC amount");
+    let (price, price_scale) = decimal(price)?;
+    let (size, size_scale) = decimal(size)?;
+    // 1 USDC is 10^6 micros and a tenth of a basis point is 1/10^5.
+    let numerator = price
+        .checked_mul(size)
+        .and_then(|value| value.checked_mul(U256::from(rate)))
+        .and_then(|value| value.checked_mul(U256::from(10)))
+        .ok_or_else(overflow)?;
+    let denominator = U256::from(10)
+        .checked_pow(U256::from(price_scale + size_scale))
+        .ok_or_else(overflow)?;
+    let mut bound = numerator / denominator;
+    if numerator % denominator != U256::ZERO {
+        bound += U256::from(1);
+    }
+    bound.try_into().map_err(|_| overflow())
+}
+
+/// A builder fee needs [`BUILDER_ORDER_CLASS`], and that class needs a builder
+/// fee declared in HyperCore USDC at no less than Broker's own bound. Every
+/// other class must declare no fee for a builder to be paid.
+pub(super) fn validate_builder_fee(
+    claim: &bloom_broker_api::PetalUseClaim,
+    review: &MessageReview,
+) -> Result<(), ProtocolError> {
+    let bound = review.builder_fee_bound;
+    let builder_class = claim.operation_class.as_str() == BUILDER_ORDER_CLASS;
+    match (bound, builder_class) {
+        (None, false) => Ok(()),
+        (Some(_), false) => Err(invalid(
+            "an order carrying a builder fee must sign under hyperliquid.builder_order",
+        )),
+        (None, true) => Err(invalid(
+            "hyperliquid.builder_order requires an order carrying a builder fee",
+        )),
+        (Some(bound), true) => match &claim.declared_fee {
+            bloom_broker_api::DeclaredFee::Fee {
+                chain,
+                asset,
+                amount,
+            } if chain.as_str() == "hyperliquid"
+                && asset == "usdc"
+                && amount
+                    .as_str()
+                    .parse::<alloy::primitives::U256>()
+                    .is_ok_and(|amount| amount >= alloy::primitives::U256::from(bound)) =>
+            {
+                Ok(())
+            }
+            _ => Err(invalid(&format!(
+                "the declared builder fee must be HyperCore USDC of at least {bound} micro-USDC, Bloom's bound from the signed order"
+            ))),
+        },
+    }
+}
+
+#[derive(Deserialize)]
+struct Markets {
+    perps: Vec<String>,
+    spot: std::collections::BTreeMap<String, [String; 2]>,
+}
+/// Mainnet market names from `scripts/bundle-hyperliquid-markets.py`. Perp
+/// IDs are universe positions (delisted perps keep their slot); spot IDs are
+/// 10000 + the pair index. A market listed later has no name here.
+static MARKETS: std::sync::LazyLock<Markets> = std::sync::LazyLock::new(|| {
+    serde_json::from_str(include_str!("hyperliquid-markets.json"))
+        .expect("bundled Hyperliquid market list is valid JSON")
+});
+const MARKET_ID: &str = "Market ID (identity unverified)";
+const LIMIT_PRICE: &str = "Limit price";
+const TRIGGER_PRICE: &str = "Trigger price";
+
+/// The coin and quote asset for a mainnet asset ID, plus whether it is spot.
+fn market(network: &str, id: u32) -> Option<(&'static str, &'static str, bool)> {
+    if network != "mainnet" {
+        return None;
+    }
+    if let Some(name) = MARKETS.perps.get(usize::try_from(id).ok()?) {
+        return Some((name, "USDC", false));
+    }
+    let [base, quote] = MARKETS.spot.get(&id.to_string())?;
+    Some((base, quote, true))
+}
+fn market_label(network: &str, id: u32) -> String {
+    match market(network, id) {
+        Some((base, quote, true)) => format!("{base}/{quote} spot (market {id})"),
+        Some((base, _, false)) => format!("{base} perpetual (market {id})"),
+        None if network == "mainnet" => {
+            format!("Market {id} (not in this Bloom release's market list)")
+        }
+        None => format!("Market {id} (testnet; Bloom has no testnet market names)"),
+    }
+}
+
 fn field(path: impl Into<String>, value: impl ToString) -> MessageField {
     MessageField {
         path: path.into(),
@@ -129,34 +280,93 @@ fn collect(
             }
         }
         value => {
+            let raw = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            let yes_no = |v: &Value| match v.as_bool() {
+                Some(true) => "Yes".to_owned(),
+                Some(false) => "No".to_owned(),
+                None => raw.clone(),
+            };
+            let mut shown = raw.clone();
             let label = match path {
                 "action.type" => "Action".into(),
                 "action.asset" => "Market ID (identity unverified)".into(),
-                "action.isCross" => "Cross margin".into(),
+                "action.isCross" => {
+                    shown = yes_no(value);
+                    "Cross margin".into()
+                }
                 "action.leverage" => "Leverage".into(),
                 "action.time" => "Scheduled cancellation (Unix milliseconds)".into(),
-                "action.f" => "Fast cancellation".into(),
-                "action.grouping" => "Order grouping".into(),
+                "action.f" => {
+                    shown = yes_no(value);
+                    "Fast cancellation".into()
+                }
+                "action.grouping" => {
+                    shown = match raw.as_str() {
+                        "na" => "None".into(),
+                        "normalTpsl" => "Take-profit/stop-loss for these orders".into(),
+                        "positionTpsl" => "Take-profit/stop-loss for the whole position".into(),
+                        _ => raw.clone(),
+                    };
+                    "Linked orders".into()
+                }
                 "action.builder.b" => "Builder fee recipient".into(),
                 "action.builder.f" => "Builder fee rate (tenths of a basis point)".into(),
                 _ if path.starts_with("action.orders[") => {
                     let (order, suffix) = path
                         .split_once(']')
                         .ok_or_else(|| invalid("invalid order path"))?;
+                    match suffix {
+                        ".b" => {
+                            shown = if value.as_bool() == Some(true) {
+                                "Buy"
+                            } else {
+                                "Sell"
+                            }
+                            .into()
+                        }
+                        ".r" => shown = yes_no(value),
+                        ".t.trigger.isMarket" => {
+                            shown = match value.as_bool() {
+                                Some(true) => "Market order".into(),
+                                Some(false) => "Limit order".into(),
+                                None => raw.clone(),
+                            }
+                        }
+                        ".t.trigger.tpsl" => {
+                            shown = match raw.as_str() {
+                                "tp" => "Take profit".into(),
+                                "sl" => "Stop loss".into(),
+                                _ => raw.clone(),
+                            }
+                        }
+                        ".t.limit.tif" => {
+                            shown = match raw.as_str() {
+                                "Ioc" => "Immediate or cancel (unfilled size is cancelled)".into(),
+                                "Gtc" => "Good until cancelled".into(),
+                                "Alo" => "Post only (rejected if it would fill immediately)".into(),
+                                _ => raw.clone(),
+                            }
+                        }
+                        _ => {}
+                    }
                     let name = match suffix {
                         ".a" => "Market ID (identity unverified)",
-                        ".b" => "Buy side (false means sell)",
-                        ".p" => "Limit price (venue quote units)",
-                        ".s" => "Size (venue base units)",
+                        ".b" => "Side",
+                        ".p" => LIMIT_PRICE,
+                        ".s" => "Size",
                         ".r" => "Reduce only",
                         ".c" => "Client order ID",
                         ".t.limit.tif" => "Time in force",
-                        ".t.trigger.isMarket" => "Market trigger",
-                        ".t.trigger.triggerPx" => "Trigger price",
-                        ".t.trigger.tpsl" => "Take-profit / stop-loss type",
+                        ".t.trigger.isMarket" => "Execution after trigger",
+                        ".t.trigger.triggerPx" => TRIGGER_PRICE,
+                        ".t.trigger.tpsl" => "Trigger type",
                         _ => suffix,
                     };
-                    format!("{}] · {name}", order.trim_start_matches("action."))
+                    let index = order.trim_start_matches("action.orders[");
+                    format!("Order {index} · {name}")
                 }
                 _ if path.starts_with("action.cancels[") => {
                     let (cancel, suffix) = path
@@ -172,13 +382,7 @@ fn collect(
                 }
                 _ => path.trim_start_matches("action.").into(),
             };
-            fields.push(field(
-                label,
-                value
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| value.to_string()),
-            ));
+            fields.push(field(label, shown));
         }
     }
     Ok(())
@@ -191,7 +395,7 @@ pub(super) fn rebuild(
     vault: Option<&str>,
     expires: Option<u64>,
     field_limit: usize,
-) -> Result<(Value, Vec<MessageField>, String), ProtocolError> {
+) -> Result<(Value, Vec<MessageField>, String, Option<u64>), ProtocolError> {
     let source = match network {
         "mainnet" => "a",
         "testnet" => "b",
@@ -247,7 +451,7 @@ pub(super) fn rebuild(
             "Vault account",
             vault
                 .map(|address| format!("{address:#x}"))
-                .unwrap_or_else(|| "None; signing account".into()),
+                .unwrap_or_else(|| "None (trades as the signing account)".into()),
         ),
         field(
             "Expires after (Unix milliseconds)",
@@ -257,14 +461,64 @@ pub(super) fn rebuild(
         ),
     ];
     collect(&canonical, "action", &mut fields, field_limit)?;
+    let fee_bound = match &action {
+        Action::Order {
+            orders,
+            builder: Some(builder),
+            ..
+        } => Some(builder_fee_bound(orders, builder.f)?),
+        _ => None,
+    };
+    if let Some(bound) = fee_bound {
+        fields.push(field(BUILDER_FEE_FIELD, bound));
+    }
+    for field in &mut fields {
+        if let Some(prefix) = field.path.strip_suffix(MARKET_ID)
+            && let Ok(id) = field.value.parse::<u32>()
+        {
+            field.path = format!("{prefix}Market");
+            field.value = escaped(&market_label(network, id));
+        }
+    }
+    // Prices are in the market's quote asset; an unlisted market shows no unit.
+    if let Action::Order { orders, .. } = &action {
+        for (index, order) in orders.iter().enumerate() {
+            let Some((_, quote, _)) = market(network, order.a) else {
+                continue;
+            };
+            for name in [LIMIT_PRICE, TRIGGER_PRICE] {
+                let path = format!("Order {} · {name}", index + 1);
+                if let Some(field) = fields.iter_mut().find(|field| field.path == path) {
+                    field.path = format!("{path} ({quote})");
+                }
+            }
+        }
+    }
+    let order_title = match &action {
+        Action::Order { orders, .. } if orders.len() == 1 => {
+            let order = &orders[0];
+            let side = if order.b { "Buy" } else { "Sell" };
+            let bound = if order.b { "for up to" } else { "for at least" };
+            Some(match market(network, order.a) {
+                Some((base, quote, _)) => {
+                    format!("{side} {} {base} {bound} {} {quote} each", order.s, order.p)
+                }
+                None => format!(
+                    "{side} {} on market {} {bound} {} each",
+                    order.s, order.a, order.p
+                ),
+            })
+        }
+        _ => None,
+    };
     let title = match action {
-        Action::Order { .. } => "Sign exchange orders",
+        Action::Order { .. } => order_title.as_deref().unwrap_or("Sign exchange orders"),
         Action::Cancel { .. } | Action::CancelByCloid { .. } => "Cancel exchange orders",
         Action::ScheduleCancel { time: Some(_) } => "Schedule exchange cancellation",
         Action::ScheduleCancel { time: None } => "Remove scheduled exchange cancellation",
         Action::UpdateLeverage { .. } => "Change exchange leverage",
     };
-    Ok((typed, fields, title.into()))
+    Ok((typed, fields, title.into(), fee_bound))
 }
 
 pub(super) fn decorate(typed: &alloy_dyn_abi::eip712::TypedData, review: &mut MessageReview) {
@@ -449,7 +703,7 @@ mod tests {
                 vector["messagepack"],
                 "{vector}"
             );
-            let (typed, _, _) = rebuild(
+            let (typed, _, _, _) = rebuild(
                 vector["network"].as_str().unwrap(),
                 vector["action"].clone(),
                 vector["nonce"].as_u64().unwrap(),
@@ -534,11 +788,14 @@ mod tests {
                 "0x00000000000000000000000000000001",
             ),
         ] {
-            let (_, fields, _) =
+            let (_, fields, _, _) =
                 rebuild("mainnet", action, 123, None, None, super::super::MAX_FIELDS).unwrap();
-            assert!(fields.iter().any(|f| f.path
-                == "cancels[1] · Market ID (identity unverified)"
-                && f.value == "7"));
+            assert!(
+                fields
+                    .iter()
+                    .any(|f| f.path == "cancels[1] · Market"
+                        && f.value == "BNB perpetual (market 7)")
+            );
             assert!(
                 fields
                     .iter()
@@ -547,9 +804,89 @@ mod tests {
             assert!(
                 fields
                     .iter()
-                    .any(|f| f.path == "Fast cancellation" && f.value == "true")
+                    .any(|f| f.path == "Fast cancellation" && f.value == "Yes")
             );
         }
+    }
+    #[test]
+    fn orders_read_in_plain_words() {
+        let action = json!({"type":"order","orders":[{"a":1,"b":true,"p":"2260","s":"0.0045","r":false,"t":{"limit":{"tif":"Ioc"}}}],"grouping":"na"});
+        let (_, fields, title, _) =
+            rebuild("mainnet", action, 1, None, None, super::super::MAX_FIELDS).unwrap();
+        let shown = |path: &str| {
+            fields
+                .iter()
+                .find(|f| f.path == path)
+                .map(|f| f.value.as_str())
+        };
+        assert_eq!(shown("Order 1 · Side"), Some("Buy"));
+        assert_eq!(shown("Order 1 · Reduce only"), Some("No"));
+        assert_eq!(shown("Order 1 · Size"), Some("0.0045"));
+        assert_eq!(shown("Order 1 · Limit price (USDC)"), Some("2260"));
+        // Wording follows the Hyperliquid Petal's order.json `t` description.
+        for (tif, meaning) in [
+            ("Gtc", "Good until cancelled"),
+            ("Ioc", "Immediate or cancel (unfilled size is cancelled)"),
+            ("Alo", "Post only (rejected if it would fill immediately)"),
+        ] {
+            let action = json!({"type":"order","orders":[{"a":1,"b":true,"p":"2260","s":"0.0045","r":false,"t":{"limit":{"tif":tif}}}],"grouping":"na"});
+            let (_, fields, _, _) =
+                rebuild("mainnet", action, 1, None, None, super::super::MAX_FIELDS).unwrap();
+            assert!(
+                fields
+                    .iter()
+                    .any(|f| f.path == "Order 1 · Time in force" && f.value == meaning),
+                "{tif}"
+            );
+        }
+        assert_eq!(shown("Linked orders"), Some("None"));
+        assert_eq!(shown("Order 1 · Market"), Some("ETH perpetual (market 1)"));
+        assert_eq!(title, "Buy 0.0045 ETH for up to 2260 USDC each");
+        let spot = json!({"type":"order","orders":[{"a":10107,"b":false,"p":"40","s":"2","r":false,"t":{"limit":{"tif":"Gtc"}}}],"grouping":"na"});
+        let (_, _, title, _) =
+            rebuild("mainnet", spot, 1, None, None, super::super::MAX_FIELDS).unwrap();
+        assert_eq!(title, "Sell 2 HYPE for at least 40 USDC each");
+        let batch = json!({"type":"order","orders":[
+            {"a":10207,"b":true,"p":"40","s":"1","r":false,"t":{"limit":{"tif":"Gtc"}}},
+            {"a":1,"b":false,"p":"2000","s":"1","r":true,"t":{"trigger":{"isMarket":true,"triggerPx":"2100","tpsl":"tp"}}},
+            {"a":9999,"b":false,"p":"1","s":"1","r":true,"t":{"trigger":{"isMarket":false,"triggerPx":"2","tpsl":"sl"}}}
+        ],"grouping":"normalTpsl"});
+        let (_, fields, title, _) =
+            rebuild("mainnet", batch, 1, None, None, super::super::MAX_FIELDS).unwrap();
+        let shown = |path: &str| {
+            fields
+                .iter()
+                .find(|f| f.path == path)
+                .map(|f| f.value.as_str())
+        };
+        assert_eq!(title, "Sign exchange orders");
+        assert_eq!(
+            shown("Order 1 · Market"),
+            Some("HYPE/USDT0 spot (market 10207)")
+        );
+        assert_eq!(shown("Order 1 · Limit price (USDT0)"), Some("40"));
+        assert_eq!(shown("Order 2 · Limit price (USDC)"), Some("2000"));
+        assert_eq!(shown("Order 2 · Trigger price (USDC)"), Some("2100"));
+        assert_eq!(
+            shown("Order 2 · Execution after trigger"),
+            Some("Market order")
+        );
+        assert_eq!(shown("Order 2 · Trigger type"), Some("Take profit"));
+        assert_eq!(shown("Order 3 · Limit price"), Some("1"));
+        assert_eq!(shown("Order 3 · Trigger price"), Some("2"));
+        assert_eq!(
+            shown("Order 3 · Execution after trigger"),
+            Some("Limit order")
+        );
+        assert_eq!(shown("Order 3 · Trigger type"), Some("Stop loss"));
+        let unknown = json!({"type":"order","orders":[{"a":9999,"b":true,"p":"1","s":"1","r":false,"t":{"limit":{"tif":"Gtc"}}}],"grouping":"na"});
+        let (_, fields, _, _) =
+            rebuild("testnet", unknown, 1, None, None, super::super::MAX_FIELDS).unwrap();
+        assert!(
+            fields
+                .iter()
+                .any(|f| f.value == "Market 9999 (testnet; Bloom has no testnet market names)")
+        );
     }
     #[test]
     fn venue_usdc_quantities_are_exact_and_never_rounded() {
@@ -563,7 +900,7 @@ mod tests {
     #[test]
     fn ordered_messagepack_matches_official_sdk_vault_and_expiry_vector() {
         let action = json!({"type":"order","orders":[{"a":0,"b":true,"p":"100","s":"0.01","r":false,"t":{"limit":{"tif":"Gtc"}}}],"grouping":"na"});
-        let (typed, fields, _) = rebuild(
+        let (typed, fields, _, _) = rebuild(
             "mainnet",
             action.clone(),
             123,

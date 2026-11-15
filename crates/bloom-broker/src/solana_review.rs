@@ -236,6 +236,7 @@ pub(crate) fn prepare(
         payment: None,
         venue_asset: None,
         collateral_asset: None,
+        builder_fee_bound: None,
         warnings,
     })
 }

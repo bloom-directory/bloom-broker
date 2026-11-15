@@ -69,11 +69,11 @@ class ArtworkBoundaryTests(unittest.TestCase):
         for key in json.loads((assets / 'neutral-artwork.json').read_text()):
             self.assertNotIn(key, mapping)
         # Named here, not only in the data file, so editing that file cannot
-        # give these tokens Circle's mark.
-        for key in ('137:0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb',
-                    '56:0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d'):
-            self.assertNotIn(key, mapping)
+        # give these tokens Circle's mark. pUSD shows Polymarket's own logo.
         usdc = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
+        self.assertNotIn('56:0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d', mapping)
+        pusd = mapping['137:0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb']['file']
+        self.assertNotIn(pusd, ('usdc.svg', mapping['1:' + usdc]['file']))
         self.assertIn('1:' + usdc, mapping)
         self.assertNotIn('8453:' + usdc, mapping)
         self.assertNotIn('1:0x' + '11' * 20, mapping)

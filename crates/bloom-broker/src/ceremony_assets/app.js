@@ -97,6 +97,12 @@ const KINDS = {
   }
 };
 
+// A signed u64 can exceed Date's range (8.64e15 ms); show those values exactly.
+function unixMsLabel(value) {
+  const date = new Date(Number(value));
+  return Number.isNaN(date.getTime()) ? `${value} Unix milliseconds` : date.toLocaleString();
+}
+
 function el(tag, attrs = {}, ...children) {
   const node = ["svg", "path", "circle", "rect"].includes(tag)
     ? document.createElementNS("http://www.w3.org/2000/svg", tag)
@@ -710,6 +716,8 @@ function describeTransfer(manifest) {
       } catch (_) {}
       return `${value} Unix seconds`;
     };
+    const singleOrder = hyperliquid && fields.some(field => field.path === "Order 1 · Side")
+      && !fields.some(field => field.path.startsWith("Order 2 · "));
     const primary = [];
     const solanaFeeBudget = solana && fields.some(field => field.path === "Requested priority fee ceiling");
     const solanaCompute = new Set(solanaFeeBudget ? fields.filter(field => /^Instruction \d+$/.test(field.path)
@@ -724,7 +732,9 @@ function describeTransfer(manifest) {
     }
     if (payment) primary.push(["Valid from", time(payment.valid_after)], ["Valid until", time(payment.valid_before)]);
     else for (const field of fields) {
-      const row = [hyperliquid ? messageLabels[field.path] || field.path : field.path, field.value, true];
+      const row = hyperliquid
+        ? [(messageLabels[field.path] || field.path).replace(singleOrder ? /^Order 1 · / : /^$/, ""), field.value, /^0x/.test(field.value)]
+        : [field.path, field.value, true];
       if (solana && (["Transaction binding (recent blockhash excluded)", "Recent blockhash (refreshable)", "Message SHA-256"].includes(field.path)
         || field.path.endsWith(" · Exact instruction bytes") || field.path.endsWith(" · Program")
         || ([...solanaCompute].some(prefix => field.path === prefix || field.path.startsWith(`${prefix} ·`)))
@@ -751,7 +761,12 @@ function describeTransfer(manifest) {
           extraTechnical.push(row); continue;
         }
       }
-      if (hyperliquid && (["nonce", "time", "Nonce (Unix milliseconds)"].includes(field.path)
+      if (hyperliquid && field.path === "Expires after (Unix milliseconds)" && /^\d+$/.test(field.value)) {
+        primary.push(["Signature expires", unixMsLabel(field.value)]);
+        extraTechnical.push(row); continue;
+      }
+      if (hyperliquid && (["nonce", "time", "Nonce (Unix milliseconds)", "Action", "Hyperliquid environment"].includes(field.path)
+        || field.path.endsWith(" · Client order ID")
         || (message.venue_asset && field.path === "USDC amount (HyperCore venue units)"))) extraTechnical.push(row);
       else primary.push(row);
     }
@@ -773,7 +788,9 @@ function describeTransfer(manifest) {
       sentence: solana ? "Approve one transaction. Only its recent blockhash may refresh; every other signed byte remains bound to this review."
         : tempo ? "Bloom decoded this payment from the exact bytes the wallet signs. Check the amounts and recipients below."
         : authenticationScope ? "Allow the fixed authentication profile below. Broker checks the fresh message when this permission is used."
-        : payment ? "Authorize this exact token payment within the signed validity window." : "Review the exact fields bound to this message signature.",
+        : payment ? "Authorize this exact token payment within the signed validity window."
+        : singleOrder ? "Bloom read this order from the exact bytes you sign."
+        : "Review the exact fields bound to this message signature.",
       chainId, networkIdentity: solana ? "Solana · network not stated in the transaction" : hyperliquid ? `Hyperliquid · ${venueNetwork || "Unknown environment"}`
         : chainId ? evmNetworkName(chainId) : "Message signature",
       networkIcon: solana ? "solana" : chainId ? chainIcon(chainId) : "unknown",
@@ -1356,53 +1373,74 @@ function describePetalApproval(manifest) {
     warning: `${app} creates transactions within these permissions; if compromised, it could use the remaining session capacity before the timer expires.`
   };
 }
-// Policy updates: say what changes, in the order a person cares about.
+// Policy updates: list every rule on the page, named where Bloom can.
+const POLICY_CHAIN_IDS = {ethereum: 1, mainnet: 1, base: 8453, arbitrum: 42161, optimism: 10, polygon: 137};
+function policyChainId(chain) {
+  const name = String(chain || "");
+  return POLICY_CHAIN_IDS[name] || (/^evm-\d+$/.test(name) ? Number(name.slice(4)) : null);
+}
+function policyDestinationName(d) {
+  const chainId = policyChainId(d.chain);
+  const token = chainId && tokenArt(chainId, d.destination);
+  const name = token ? `${token.name} (${token.symbol})` : chainId && catalogPartyName(chainId, d.destination);
+  return name ? `${name} on ${chainLabel(d.chain)}` : `Address on ${chainLabel(d.chain)}`;
+}
 function describePolicy(manifest) {
   const diff = manifest?.authority_diff;
   if (!diff) return null;
-  const lines = [];
-  const dest = d => `${d.destination || d.address || canonicalJson(d)} (${chainLabel(d.chain)})`;
+  const rules = [];
+  const rule = (label, name, value, chainId) => rules.push({role: "policy", label, name, value, chainId});
+  const dest = (label, d) => rule(label, policyDestinationName(d), d.destination || d.address || canonicalJson(d), policyChainId(d.chain));
   // The "exact" sentinel on a numeric EVM chain is a contract-deployment
   // opt-in, not a destination: saying "sending to" inverts what is granted.
   const isDeployGrant = d => d.destination === "exact" && String(d.chain || "").startsWith("evm-");
   for (const d of diff.added_destinations || []) {
-    if (isDeployGrant(d)) lines.push([`Allow exact transactions on ${chainLabel(d.chain)}`,
-      "any address through the deployment workflow, including contract creation, and Safe owner signing; every transaction still needs its own approval"]);
-    else lines.push(["Allow sending to", dest(d), true]);
+    if (isDeployGrant(d)) rule(`Allow exact transactions on ${chainLabel(d.chain)}`,
+      "Any address through the deployment workflow, including contract creation, and Safe owner signing; every transaction still needs its own approval");
+    else dest("Allow sending to", d);
   }
   for (const d of diff.removed_destinations || []) {
-    if (isDeployGrant(d)) lines.push([`Stop allowing exact transactions on ${chainLabel(d.chain)}`,
-      "deployment transactions need listed recipients again; contract creation and Safe owner signing are refused"]);
-    else lines.push(["Stop allowing sending to", dest(d), true]);
+    if (isDeployGrant(d)) rule(`Stop allowing exact transactions on ${chainLabel(d.chain)}`,
+      "Deployment transactions need listed recipients again; contract creation and Safe owner signing are refused");
+    else dest("Stop allowing sending to", d);
   }
-  for (const p of diff.added_petal_packages || []) lines.push(["Allow app (petal)", shortDigest(p), true]);
-  for (const p of diff.removed_petal_packages || []) lines.push(["Remove app (petal)", shortDigest(p), true]);
-  for (const v of diff.added_required_verifiers || []) lines.push(["Require verifier", v.verifier_id || canonicalJson(v), true]);
-  for (const v of diff.removed_required_verifiers || []) lines.push(["Drop verifier", v.verifier_id || canonicalJson(v), true]);
+  const facts = [];
+  for (const [label, packages] of [["Allow app (Petal)", diff.added_petal_packages], ["Remove app (Petal)", diff.removed_petal_packages]]) {
+    for (const p of packages || []) {
+      rule(label, "Package fingerprint", shortDigest(p));
+      facts.push([`${label} · full fingerprint`, p, true]);
+    }
+  }
+  // Policy binds (verifier_id, verifier_digest); the digest names the exact artifact.
+  for (const [label, verifiers] of [["Require verifier", diff.added_required_verifiers], ["Drop verifier", diff.removed_required_verifiers]]) {
+    for (const v of verifiers || []) {
+      rule(label, v.verifier_id || canonicalJson(v), shortDigest(v.verifier_digest));
+      if (v.verifier_digest) facts.push([`${label} · ${v.verifier_id} digest`, v.verifier_digest, true]);
+    }
+  }
   const legacy = diff.removed_legacy_clear_signing;
   if (legacy) {
-    lines.push(["Remove legacy catalog trust", `${legacy.catalog_id}: ${legacy.signature_threshold} trusted signature(s), keys ${legacy.trusted_keys.map(key => key.key_id).join(", ")}`]);
-    lines.push(["Remove observation freshness rule", `The previous ${fmtRemaining(Number(legacy.maximum_observation_age_ms))} observation limit stops being enforced`]);
-    lines.push(["Remove pinned catalog verifier", `${legacy.verifier.verifier_id} (${legacy.verifier.verifier_digest})`, true]);
-    if (!legacy.opaque_exact_allowed) lines.push(["Allow opaque exact review", "Unknown calls may be reviewed as exact bytes with warnings"]);
-    if (!legacy.unlimited_allowance_allowed) lines.push(["Allow unlimited allowance review", "Maximum allowances may be requested with explicit warnings"]);
-    lines.push(["Use compiled descriptions", "Descriptions and warnings come from the Broker release; they do not enforce the removed rules"]);
+    rule("Remove legacy catalog trust", `${legacy.catalog_id}: ${legacy.signature_threshold} trusted signature(s), keys ${legacy.trusted_keys.map(key => key.key_id).join(", ")}`);
+    rule("Remove observation freshness rule", `The previous ${fmtRemaining(Number(legacy.maximum_observation_age_ms))} observation limit stops being enforced`);
+    rule("Remove pinned catalog verifier", legacy.verifier.verifier_id, legacy.verifier.verifier_digest);
+    if (!legacy.opaque_exact_allowed) rule("Allow opaque exact review", "Unknown calls may be reviewed as exact bytes with warnings");
+    if (!legacy.unlimited_allowance_allowed) rule("Allow unlimited allowance review", "Maximum allowances may be requested with explicit warnings");
+    rule("Use compiled descriptions", "Descriptions and warnings come from the Broker release; they do not enforce the removed rules");
   }
   const before = Number(diff.maximum_approval_lifetime_ms_before);
   const after = Number(diff.maximum_approval_lifetime_ms_after);
   if (Number.isFinite(before) && Number.isFinite(after) && before !== after) {
-    lines.push(["Max approval lifetime", `${fmtRemaining(before)} → ${fmtRemaining(after)}`]);
+    rule("Max approval lifetime", `${fmtRemaining(before)} → ${fmtRemaining(after)}`);
   }
-  const n = lines.length;
+  const n = rules.length;
   const sentence = n === 0
     ? "No rule changes are proposed."
-    : `Change <strong>${n} rule${n === 1 ? "" : "s"}</strong> for this wallet; nothing moves, and Bloom applies the new rules to future transactions.`;
+    : "Nothing moves. Bloom applies these rules to future transactions.";
   const intent = n === 0 ? null : {
     action: "policy", eyebrow: "Wallet policy change",
-    heading: `Change ${n} wallet rule${n === 1 ? "" : "s"}`,
-    detail: "These rules apply to future requests. Approving them moves no funds."
+    heading: `Change ${n} wallet rule${n === 1 ? "" : "s"}`
   };
-  return {sentence, intent, facts: lines};
+  return {sentence, intent, rules, facts};
 }
 function planDisclosures(manifest) {
   try {
@@ -1780,6 +1818,8 @@ function renderReview(session) {
       }));
     }
     if (transfer.intent.detail) decision.push(intentBlock(transfer.intent));
+    if (transfer.rules?.length) decision.push(el("div", {class: "ceremony-identity ceremony-permission"},
+      ...transfer.rules.map(partyRow)));
     for (const [index, payload] of (transfer.payloads || []).entries()) {
       const call = reviewedContractCall(payload);
       if (!call || call.intent_summary) continue;
@@ -2259,6 +2299,13 @@ async function showCreatedWallet(session, attempts = 1) {
 function renderDone(session, result) {
   const meta = KINDS[session.ceremony_kind] || {};
   const receipt = result?.receipt_digest || result?.approval_id || "";
+  const crossWallet = session.cross_surface?.wallet_id ||
+    (session.review_manifest?.schema === "bloom.cross_surface_add_review.v1" && session.review_manifest.wallet_name);
+  if (crossWallet) {
+    // A reopened paired enrollment ends exactly like one finished in place.
+    showCrossOutcome(crossDoneOutcome(crossWallet, receipt));
+    return;
+  }
   markDone(`${meta.title || "Ceremony"} — done`);
   reviewNode.replaceChildren(
     el("h3", {class: "result-title ok"}, `${meta.title || "Ceremony"} — done`),
@@ -2802,6 +2849,139 @@ function validateCrossPrepared(session, prepared, pairingId) {
     throw new Error("Paired enrollment binding changed");
   }
 }
+// ---- Paired add-passkey presentation ----------------------------------
+// Two people (or one person on two devices) take turns: the new device asks,
+// an existing passkey approves, the new device creates its passkey. The page
+// shows both people, whose turn it is, and one action at a time. None of this
+// changes what is signed, bound or sent.
+function crossIcon(name) {
+  const svg = el("svg", {viewBox: "0 0 24 24", "aria-hidden": "true", focusable: "false",
+    fill: "none", stroke: "currentColor", "stroke-width": "1.8", "stroke-linecap": "round", "stroke-linejoin": "round"});
+  const paths = {
+    person: [["circle", {cx: "12", cy: "8", r: "3.6"}], ["path", {d: "M4.8 20c.6-3.9 3.4-6 7.2-6s6.6 2.1 7.2 6"}]],
+    check: [["path", {d: "M5.5 12.5l4.2 4.2L18.5 7.8"}]],
+    info: [["path", {d: "M12 11v6"}], ["path", {d: "M12 7.4v.2"}]],
+    stop: [["path", {d: "M8 8l8 8M16 8l-8 8"}]],
+    clock: [["circle", {cx: "12", cy: "12", r: "7.5"}], ["path", {d: "M12 8v4.4l2.8 1.8"}]]
+  };
+  for (const [tag, attrs] of paths[name]) svg.append(el(tag, attrs));
+  return svg;
+}
+// The shared loading indicator: decorative only, its words carry the state.
+function spinner() { return el("span", {class: "spinner", "aria-hidden": "true"}); }
+function setBusy(button, label) {
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  button.replaceChildren(spinner(), label);
+}
+function setAction(button, label) {
+  button.removeAttribute("aria-busy");
+  button.textContent = label;
+}
+
+const CROSS_STEPS = [
+  {by: "requester", title: "Get an approval link"},
+  {by: "approver", title: "Check the code and approve"},
+  {by: "requester", title: "Create the new passkey"}
+];
+function crossPeople(cross) {
+  const isSource = cross.role === "source";
+  const wallet = cross.wallet_id;
+  const columns = {};
+  const person = (key, name, role) => {
+    const steps = el("ol", {class: "cross-steps"});
+    CROSS_STEPS.forEach((step, index) => {
+      if (step.by === key) steps.append(el("li", {"data-step": String(index + 1)},
+        el("span", {class: "cross-step-mark", "aria-hidden": "true"}), el("span", {}, step.title)));
+    });
+    const chip = el("p", {class: "cross-chip"});
+    const node = el("div", {class: "cross-person"},
+      el("div", {class: "cross-avatar"}, crossIcon("person")),
+      el("p", {class: "cross-person-name"}, name),
+      el("p", {class: "cross-person-role"}, role),
+      chip, steps);
+    columns[key] = {node, chip, steps, you: (key === "approver") === isSource};
+    return node;
+  };
+  const root = el("div", {class: "cross-people", role: "group", "aria-label": "Who does what"},
+    person("requester", isSource ? "New device" : "You",
+      isSource ? "Will get its own passkey" : "This device gets the new passkey"),
+    el("div", {class: "cross-connector", "aria-hidden": "true"}, el("span", {})),
+    person("approver", isSource ? "You" : "Approver",
+      isSource ? `Your passkey for ${wallet} approves` : `Already has a passkey for ${wallet}`));
+  // `current` is the 1-based step in progress.
+  const setStep = current => {
+    for (const [key, column] of Object.entries(columns)) {
+      const mine = CROSS_STEPS.map((step, i) => ({...step, n: i + 1})).filter(step => step.by === key);
+      const active = CROSS_STEPS[current - 1]?.by === key;
+      const finished = mine.every(step => step.n < current);
+      column.node.dataset.state = active ? "active" : finished ? "done" : "waiting";
+      column.chip.replaceChildren(...(active && !column.you ? [spinner()] : []),
+        active ? (column.you ? "Your turn" : "Their turn") : finished ? "Done" : "Waiting");
+      for (const item of column.steps.children) {
+        const n = Number(item.dataset.step);
+        item.dataset.state = n < current ? "done" : n === current ? "active" : "pending";
+        item.firstChild.replaceChildren(n < current ? crossIcon("check") : String(n));
+      }
+    }
+  };
+  return {root, setStep};
+}
+function crossDetails(cross) {
+  const sameSite = cross.source_origin === cross.destination_origin;
+  return el("details", {class: "ceremony-details"}, el("summary", {}, "Details"),
+    el("dl", {class: "facts"},
+      el("dt", {}, "Wallet"), el("dd", {}, cross.wallet_id),
+      ...(sameSite
+        ? [el("dt", {}, "Site"), el("dd", {}, cross.destination_origin)]
+        : [el("dt", {}, "Existing passkey"), el("dd", {}, cross.source_origin),
+          el("dt", {}, "New passkey"), el("dd", {}, cross.destination_origin)])));
+}
+function crossCode(code, caption) {
+  return el("div", {class: "cross-code"},
+    el("p", {class: "cross-code-label"}, "Confirmation code"),
+    el("p", {class: "cross-code-digits", "aria-label": code.split("").join(" ")},
+      code.slice(0, 3), el("span", {class: "cross-code-gap"}), code.slice(3)),
+    caption ? el("p", {class: "cross-code-caption"}, caption) : null);
+}
+function walletName(name) { return el("strong", {class: "cross-wallet"}, name); }
+// A finished paired enrollment, whatever its outcome, is one short message:
+// no code, countdown, steps or controls are left on screen.
+function showCrossOutcome({tone, title, lines = [], receipt = ""}) {
+  approvalTerminal = true;
+  clearInterval(expiryTimer);
+  const deadline = document.getElementById("review-deadline");
+  if (deadline) deadline.textContent = "";
+  approve.hidden = true;
+  cancel.hidden = true;
+  const actions = document.getElementById("ceremony-actions");
+  if (actions) actions.hidden = true;
+  document.getElementById("ceremony-page")?.classList.add("cross-outcome");
+  const pageTitle = document.getElementById("page-title");
+  if (pageTitle) pageTitle.textContent = "";
+  const pageLede = document.getElementById("page-lede");
+  if (pageLede) pageLede.textContent = "Add a passkey";
+  document.getElementById("cross-outcome-icon")?.remove();
+  panelTitle.before?.(el("div", {id: "cross-outcome-icon", class: "cross-outcome-icon", "data-tone": tone},
+    crossIcon({success: "check", info: "info", danger: "stop", expired: "clock"}[tone] || "info")));
+  panelTitle.textContent = title;
+  statusNode.textContent = "";
+  reviewNode.replaceChildren(
+    ...lines.map(line => el("p", {class: "summary"}, ...[].concat(line))),
+    ...(receipt ? [el("details", {class: "ceremony-details"}, el("summary", {}, "Receipt"),
+      el("dl", {class: "facts"}, el("dt", {}, "Receipt"), el("dd", {}, el("code", {}, receipt))))] : []));
+  // The control that had focus is gone; move focus to the outcome so it is
+  // read out and keyboard users are not left on the document.
+  panelTitle.setAttribute?.("tabindex", "-1");
+  panelTitle.focus?.({preventScroll: true});
+}
+function crossDoneOutcome(wallet, receipt) {
+  return {tone: "success", title: "Passkey added", receipt, lines: [
+    ["This device can now approve for ", walletName(wallet), "."],
+    "The wallet and its addresses are unchanged. You can close this tab."
+  ]};
+}
+
 async function finishAlreadyRegistered(session, state) {
   const wallet = session.cross_surface.wallet_id;
   try {
@@ -2815,15 +2995,10 @@ async function finishAlreadyRegistered(session, state) {
   if (crossSurfaceState === state) stopCrossSurface();
   clearInterval(expiryTimer);
   clearSessionToken();
-  approve.hidden = true;
-  cancel.hidden = true;
-  markDone(`This device can already approve for ${wallet}`);
-  statusNode.textContent = "Nothing to add.";
-  reviewNode.replaceChildren(
-    el("h3", {class: "result-title ok"}, `This device can already approve for ${wallet}`),
-    el("p", {class: "summary"}, `Your passkey provider already has a passkey for ${wallet}, so there's nothing to add. This usually means your passkeys sync between your devices (for example through iCloud Keychain, Google Password Manager or 1Password), or you registered this device earlier.`),
-    el("p", {class: "summary"}, "You can close this page. Nothing has changed.")
-  );
+  showCrossOutcome({tone: "info", title: "This device already has a passkey", lines: [
+    ["Your passkey provider already has a passkey for ", walletName(wallet), ", so there's nothing to add. This usually means your passkeys sync between your devices (for example through iCloud Keychain, Google Password Manager or 1Password), or you registered this device earlier."],
+    "Nothing has changed. You can close this tab."
+  ]});
 }
 async function loadCrossSurface(session) {
   const cross = session.cross_surface;
@@ -2838,61 +3013,77 @@ async function loadCrossSurface(session) {
     throw new Error("Paired enrollment expired");
   }
   crossSurfaceState = state;
-  const terminate = message => {
+  const wallet = cross.wallet_id;
+  // Set once Broker confirms the approval or enrollment; nothing stale may
+  // repaint over that outcome.
+  let confirmed = false;
+  const terminate = outcome => {
     if (crossSurfaceState !== state) return;
     stopCrossSurface();
     approve.disabled = true;
     cancel.disabled = true;
     clearInterval(expiryTimer);
-    statusNode.textContent = message;
+    showCrossOutcome(outcome);
   };
-  state.expiry = setTimeout(() => terminate("Paired enrollment expired. Start again from Bloom."),
+  const expired = {tone: "expired", title: "This request expired", lines: [
+    ["Start again from Bloom if you still want to add a passkey to ", walletName(wallet), "."]
+  ]};
+  state.expiry = setTimeout(() => terminate(expired),
     Math.min(state.expiresAt - Date.now(), 10 * 60 * 1000));
   for (const fields of [recoveryFields, exportFields, importFields, genericFields]) fields.hidden = true;
-  document.getElementById("page-title").textContent = "Add a wallet passkey";
-  document.getElementById("page-lede").textContent = "Approve with a passkey this wallet already has, then create one on the new device.";
-  panelTitle.textContent = cross.role === "source" ? "Approve the new device" : "Prepare this device";
-  panelKicker.textContent = "Paired enrollment";
-  const sameSite = cross.source_origin === cross.destination_origin;
-  const facts = el("dl", {class: "facts"},
-    el("dt", {}, "Wallet"), el("dd", {}, cross.wallet_id),
-    ...(sameSite
-      ? [el("dt", {}, "Site"), el("dd", {}, cross.destination_origin)]
-      : [el("dt", {}, "Existing passkey"), el("dd", {}, cross.source_origin),
-        el("dt", {}, "New passkey"), el("dd", {}, cross.destination_origin)]));
-  const instructions = el("p", {class: "summary"});
-  const step = el("div");
-  const expiry = el("p", {class: "expiry"});
-  reviewNode.replaceChildren(facts, instructions, step, expiry);
-  startExpiry(session, expiry);
+  const isSource = cross.role === "source";
+  document.getElementById("ceremony-page")?.classList.add("cross-page");
+  document.getElementById("page-lede").textContent = "Add a passkey";
+  const pageTitle = document.getElementById("page-title");
+  panelKicker.textContent = "Add a passkey";
+  panelTitle.replaceChildren(isSource ? "Approve a new passkey for " : "Add a passkey to ", walletName(wallet));
+  const people = crossPeople(cross);
+  const card = el("section", {class: "cross-card", "aria-live": "polite"});
+  const showCard = (step, title, ...body) => {
+    pageTitle.textContent = `Step ${step} of 3`;
+    people.setStep(step);
+    card.replaceChildren(el("h2", {class: "cross-card-title"}, title), ...body);
+  };
+  reviewNode.replaceChildren(people.root, card, crossDetails(cross));
+  // The header keeps the one deadline; nothing in the body repeats it.
+  startExpiry(session, el("span"));
   cancel.onclick = async () => {
     // Discard the local recipient immediately even if cancellation cannot reach Broker.
-    terminate("Cancelled. You may close this tab.");
+    terminate({tone: "info", title: "Cancelled", lines: isSource
+      ? [["You cancelled this approval for ", walletName(wallet), "."], "You can close this tab."]
+      : [["You cancelled adding a passkey to ", walletName(wallet), "."], "You can close this tab."]});
     try { await mutate(`/api/session/${ceremonyId}/cancel`, {}); }
-    catch (_) { statusNode.textContent = "This tab is cancelled. The server will also expire the request."; }
+    catch (_) {
+      if (!confirmed) statusNode.textContent = "This tab is cancelled. The server will also expire the request.";
+    }
   };
   const fail = error => {
-    terminate("Paired enrollment could not finish. Start again from Bloom.");
     // Never log request bodies, capabilities or passkey extension output.
-    if (error?.name === "NotSupportedError") {
-      statusNode.textContent = "This browser or passkey does not support the required PRF extension. Use a supported browser and passkey.";
-    }
+    const lines = error?.name === "NotSupportedError"
+      ? ["This browser or passkey does not support the required PRF extension. Use a supported browser and passkey, then start again from Bloom."]
+      : ["Something went wrong before this finished. Start again from Bloom to try again."];
+    terminate({tone: "danger", title: "Couldn't add the passkey", lines});
     void mutate(`/api/session/${ceremonyId}/cancel`, {}).catch(() => {});
   };
-  if (cross.role === "source") {
+  if (isSource) {
     const prepared = cross.source_prepared;
     validateCrossPrepared(session, prepared);
-    instructions.textContent = "Compare this code with the one on the new device. Continue only if you started this there and the codes match.";
-    step.append(el("p", {}, el("strong", {}, prepared.pairing.confirmation_code)));
-    const confirmed = el("input", {type: "checkbox"});
-    step.append(el("label", {}, confirmed, " I started this on the new device and the code matches"));
-    approve.textContent = "Approve with existing passkey";
+    const code = prepared.pairing.confirmation_code;
+    const codeChecked = el("input", {type: "checkbox"});
+    showCard(2, "Check the code",
+      el("p", {class: "summary"}, "Someone — maybe you, on another device — asked to add a passkey to ",
+        walletName(wallet), ". Your existing passkey is needed to approve it."),
+      crossCode(code, "The new device shows a code too. Only approve if it's the same."),
+      el("label", {class: "choice cross-confirm"}, codeChecked,
+        el("span", {}, "I know about this request and the new device shows this code")));
+    setAction(approve, "Approve with passkey");
     approve.disabled = true;
-    confirmed.onchange = () => { approve.disabled = !confirmed.checked || crossSurfaceState !== state; };
-    statusNode.textContent = "Check the code on the new device before approving.";
+    codeChecked.onchange = () => { approve.disabled = !codeChecked.checked || crossSurfaceState !== state; };
+    statusNode.textContent = "";
     approve.onclick = async () => {
-      if (!confirmed.checked) return;
-      approve.disabled = true;
+      if (!codeChecked.checked) return;
+      codeChecked.disabled = true;
+      setBusy(approve, "Waiting for passkey…");
       let prf;
       try {
         requireCrossSurface(state);
@@ -2901,6 +3092,9 @@ async function loadCrossSurface(session) {
         if (!prf || prf.length !== 32) {
           throw new DOMException("Passkey PRF is required", "NotSupportedError");
         }
+        // A prompt can resolve after cancel or expiry; never redraw a finished page.
+        requireCrossSurface(state);
+        setBusy(approve, "Sending approval…");
         const encrypted = await hpkeSeal(decodeUrl(prepared.source_hpke_recipient_key),
           te.encode("bloom-cross-surface-source-prf/v1"),
           te.encode(canonicalJson(crossSurfaceAad(prepared, "source_prf"))), prf);
@@ -2908,18 +3102,29 @@ async function loadCrossSurface(session) {
         await mutate(`/api/cross/${ceremonyId}/authorize`, {
           authority_assertion: assertionJson(credential), encrypted_authority_prf: encrypted
         });
-        terminate("Approved. Finish on the new device, where its passkey is created. Nothing is active until then.");
+        const approved = {tone: "success", title: "Approved", lines: [
+          "Now finish on the new device: it will ask to create its passkey.",
+          ["Nothing changes on ", walletName(wallet), " until then. You can close this tab."]
+        ]};
+        confirmed = true;
+        terminate(approved);
+        // Broker accepted the approval; that outranks a local cancel or
+        // expiry that landed while the request was in flight.
+        showCrossOutcome(approved);
       } catch (error) { fail(error); }
       finally { prf?.fill(0); }
     };
     return;
   }
-  instructions.textContent = "Keep this page open. Next you get a link to approve with a passkey this wallet already has.";
-  statusNode.textContent = "Prepare this device to receive the approval.";
-  approve.textContent = "Prepare enrollment";
+  showCard(1, "Get an approval link",
+    el("p", {class: "summary"}, "Adding a passkey takes two people, or you on two devices. Someone who already has a passkey for ",
+      walletName(wallet), " approves, then this device creates its own passkey."),
+    el("p", {class: "summary muted"}, "Keep this page open until you're done."));
+  statusNode.textContent = "";
+  setAction(approve, "Get approval link");
   approve.disabled = false;
   approve.onclick = async () => {
-    approve.disabled = true;
+    setBusy(approve, "Getting link…");
     try {
       requireCrossSurface(state);
       const pair = await crypto.subtle.generateKey({name: "X25519"}, false, ["deriveBits"]);
@@ -2938,28 +3143,34 @@ async function loadCrossSurface(session) {
       state.expiresAt = Math.min(state.expiresAt, Number(started.expires_at_ms));
       if (!Number.isFinite(state.expiresAt)) throw new Error("Invalid pairing expiry");
       const hostOnly = cross.source_origin.startsWith("http://localhost:");
-      const linkActions = el("div", {class: "result-actions"});
-      if (typeof navigator.share === "function") {
-        const share = el("button", {type: "button"}, "Share link");
-        share.onclick = () => { navigator.share({url: sourceUrl.href}).catch(() => {}); };
-        linkActions.append(share);
-      }
-      if (navigator.clipboard?.writeText) {
-        const copy = el("button", {type: "button"}, "Copy link");
-        copy.onclick = () => {
-          navigator.clipboard.writeText(sourceUrl.href)
-            .then(() => { copy.textContent = "Copied"; })
-            .catch(() => {});
-        };
-        linkActions.append(copy);
-      }
-      step.replaceChildren(el("p", {}, el("strong", {}, started.confirmation_code)),
-        el("a", {href: sourceUrl.href, target: "_blank", rel: "noopener noreferrer"}, "Open approval link"),
-        linkActions,
-        el("p", {}, hostOnly
-          ? "Open this link in a browser on your Bloom host. Compare the code before approving."
-          : `Open this link on a device that already has a passkey for ${cross.wallet_id}, such as the one you first set it up on. Compare the code before approving.`));
-      statusNode.textContent = "Waiting for your existing passkey approval…";
+      // The link is shown as text and copied; it is never opened from here.
+      const linkField = el("input", {type: "text", readonly: "", class: "cross-link-field",
+        "aria-label": "Approval link", spellcheck: "false"});
+      linkField.value = sourceUrl.href;
+      linkField.onfocus = () => linkField.select();
+      const copy = el("button", {type: "button", class: "secondary cross-copy"}, "Copy link");
+      copy.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(sourceUrl.href);
+          copy.replaceChildren(crossIcon("check"), "Copied");
+          setTimeout(() => { copy.textContent = "Copy link"; }, 2000);
+        } catch (_) {
+          // Without clipboard access the selected text can still be copied by hand.
+          linkField.focus();
+          linkField.select();
+        }
+      };
+      showCard(2, "Send this link to the approver",
+        el("p", {class: "summary"}, ...(hostOnly
+          ? ["Open it in a browser on your Bloom host — that's where the passkey for ", walletName(wallet), " is."]
+          : ["Send it to someone who already has a passkey for ", walletName(wallet),
+            ", or open it on another of your devices that has one."])),
+        el("div", {class: "cross-link"}, linkField, copy),
+        crossCode(started.confirmation_code, "The approver sees this code too. They should only approve if it matches."));
+      // Nothing to press until the approver acts; the action bar shows the wait
+      // where every other step shows its progress.
+      statusNode.textContent = "";
+      setBusy(approve, "Waiting for approver…");
       const poll = async () => {
         try {
           requireCrossSurface(state);
@@ -2985,12 +3196,15 @@ async function loadCrossSurface(session) {
             te.encode(canonicalJson(crossSurfaceAad(prepared, "handoff"))), handoff.encrypted_capability);
           requireCrossSurface(state);
           if (state.capability.length !== 32) throw new Error("Invalid handoff");
-          step.replaceChildren(el("p", {}, "The existing passkey authorized this destination. Create the new passkey here to finish."));
-          statusNode.textContent = "Ready to enroll. Your wallet's addresses stay the same.";
-          approve.textContent = "Create destination passkey";
+          showCard(3, "Create the passkey on this device",
+            el("p", {class: "summary"}, "The approver said yes. Your device will now ask you to create a passkey for ",
+              walletName(wallet), ". The wallet's addresses stay the same."));
+          statusNode.textContent = "";
+          setAction(approve, "Create passkey");
+          approve.hidden = false;
           approve.disabled = false;
           approve.onclick = async () => {
-            approve.disabled = true;
+            setBusy(approve, "Waiting for passkey…");
             let newPrf;
             try {
               requireCrossSurface(state);
@@ -3012,6 +3226,8 @@ async function loadCrossSurface(session) {
               // Both attestation and a fresh assertion are mandatory on this leg.
               newPrf = await ensureNewCredentialPrf(options, created, 1, true);
               if (newPrf.prf.length !== 32) throw new Error("Invalid passkey PRF");
+              requireCrossSurface(state);
+              setBusy(approve, "Adding passkey…");
               const encrypted = await hpkeSeal(decodeUrl(prepared.destination_hpke_recipient_key),
                 te.encode("bloom-cross-surface-destination-prf/v1"),
                 te.encode(canonicalJson(crossSurfaceAad(prepared, "destination_prf"))), newPrf.prf);
@@ -3030,11 +3246,13 @@ async function loadCrossSurface(session) {
                 if (!recovered.ok) throw error;
                 result = await recovered.json();
               }
-              terminate("New passkey enrolled.");
-              renderDone(session, result);
+              const receipt = result?.receipt_digest || result?.approval_id || "";
+              confirmed = true;
+              terminate(crossDoneOutcome(wallet, receipt));
+              // Enrollment committed; that outranks a local cancel or expiry
+              // that landed while the request was in flight.
+              showCrossOutcome(crossDoneOutcome(wallet, receipt));
               clearSessionToken();
-              approve.hidden = true;
-              cancel.hidden = true;
             } catch (error) { fail(error); }
             finally { newPrf?.prf.fill(0); }
           };
@@ -3892,6 +4110,37 @@ const PREVIEWS = {
       }
     }
   }),
+  "policy-update": () => ({
+    ceremony_kind: "policy_update", expires_at_ms: Date.now() + 9 * 60 * 1000,
+    signer_contribution: {wallet_id: "main"},
+    review_manifest: {
+      schema: "bloom.policy_update_review.v1", wallet_id: "main",
+      authority_diff: {
+        maximum_approval_lifetime_ms_before: "600000", maximum_approval_lifetime_ms_after: "600000",
+        added_petal_packages: ["80f26b1b6c4eda85f2870e2baac9f6366f1f35e861ebb855bf234550e591ad21"],
+        removed_petal_packages: [],
+        added_destinations: [
+          {chain: "polygon", destination: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"},
+          {chain: "base", destination: "0xF75584eF6673aD213a685a1B58Cc0330B8eA22Cf"}],
+        removed_destinations: [], added_required_verifiers: [], removed_required_verifiers: []
+      }
+    }
+  }),
+  "hyperliquid-order": () => {
+    const session = previewAccountOne(previewApproval([], null));
+    session.review_manifest.canonical_plan = JSON.stringify({message_review: {
+      kind: "hyperliquid_l1", title: "Buy 0.0045 ETH for up to 2260 USDC each", signer: PREVIEW_WALLET,
+      domain: [{path: "primaryType", value: "Agent"}, {path: "chainId", value: "1337"}],
+      fields: [["Hyperliquid environment", "mainnet"], ["Nonce (Unix milliseconds)", "1794017923895"],
+        ["Vault account", "None (trades as the signing account)"], ["Expires after (Unix milliseconds)", "1794018223895"],
+        ["Action", "order"], ["Order 1 · Market", "ETH perpetual (market 1)"], ["Order 1 · Side", "Buy"],
+        ["Order 1 · Limit price (USDC)", "2260"], ["Order 1 · Size", "0.0045"], ["Order 1 · Reduce only", "No"],
+        ["Order 1 · Time in force", "Immediate or cancel (unfilled size is cancelled)"],
+        ["Order 1 · Client order ID", "0x06b811d5b12547d5b2e90ddd3f99e7cb"], ["Linked orders", "None"]]
+        .map(([path, value]) => ({path, value}))
+    }});
+    return session;
+  },
   "native-send": () => previewApproval([previewPayload({
     destination: PREVIEW_SPENDER, value: "10000000000000000", value_display: "0.01 ETH",
     calldata_bytes: "0", calldata_keccak: undefined
@@ -4018,7 +4267,12 @@ function renderPreview(name) {
   if (actions) actions.hidden = true;
 }
 
+// The page opens with a loading indicator; whatever load() ends on replaces it.
 async function load() {
+  try { return await loadCeremony(); }
+  finally { statusNode.removeAttribute?.("data-busy"); }
+}
+async function loadCeremony() {
   if (walletPath) {
     const wallet = decodeURIComponent(walletPath.slice("/wallet/".length));
     const response = await fetch(`/api/wallet/${encodeURIComponent(wallet)}`, {credentials: "same-origin", cache: "no-store"});
