@@ -26,7 +26,7 @@ use bloom_broker_api::{
 };
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer::{
-    ceremony::SignerCeremonyService,
+    ceremony::{CEREMONY_TTL_MS, SignerCeremonyService},
     clock::SignerClock,
     engine::{SignerAuditKeys, SignerEngine},
     hpke::{CUSTODY_OUTPUT_INFO, HpkeRecipient, LOCAL_PRF_INFO},
@@ -174,13 +174,14 @@ impl Drop for AccountStack {
 }
 
 async fn account_stack(root: &Path, tag: &str) -> AccountStack {
-    account_stack_with_backup(root, tag, None).await
+    account_stack_with_backup(root, tag, None, CEREMONY_TTL_MS).await
 }
 
 async fn account_stack_with_backup(
     root: &Path,
     tag: &str,
     backup: Option<&bloom_signer::engine::SignerBackupSet>,
+    ceremony_ttl_ms: u64,
 ) -> AccountStack {
     let registry = Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap());
     let signer_engine = Arc::new(
@@ -207,6 +208,8 @@ async fn account_stack_with_backup(
             Token::new("signer-ceremony-key").unwrap(),
             SigningKey::from_bytes(&[9; 32]),
         )
+        .unwrap()
+        .with_ceremony_ttl_ms(ceremony_ttl_ms)
         .unwrap(),
     );
     let effective_uid = fs::metadata(root).unwrap().uid();
@@ -2647,7 +2650,8 @@ async fn restored_wallet_signs_from_restored_derived_account_over_real_transport
     // Signer engine. This is the realistic "Signer lost and restored, Broker
     // restarted against it" restore.
     fs::remove_file(directory.path().join("signer.sqlite")).unwrap();
-    let mut restored = account_stack_with_backup(directory.path(), "s2", Some(&backup)).await;
+    let mut restored =
+        account_stack_with_backup(directory.path(), "s2", Some(&backup), CEREMONY_TTL_MS).await;
     let accounts = wallet_accounts(&restored, &wallet_id).await;
     assert_eq!(accounts.accounts.len(), 3);
     let evm_projection = accounts
@@ -2772,6 +2776,42 @@ async fn ceremony_status_answers_when_the_expiry_sweep_cannot_run() {
         panic!("unexpected status response: {status:?}");
     };
     assert_eq!(status.state, CeremonyState::AwaitingUser);
+}
+
+/// Nobody opened the page, so only `ceremony.status` can observe expiry:
+/// it sweeps first and reports an overdue ceremony as expired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ceremony_status_reports_an_overdue_ceremony_as_expired() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut stack = account_stack_with_backup(directory.path(), "e2", None, 300).await;
+    let operation = stack.next_operation();
+    MachineBrokerService::dispatch(
+        stack.broker.as_ref(),
+        MachineBrokerRequest::WalletRegistrationPrepare(custody_request(
+            CeremonyKind::WalletRegistration,
+            operation.clone(),
+            Some(Token::new("late-fern").unwrap()),
+            None,
+            digest("61"),
+            Token::new("passkey-prf").unwrap(),
+        )),
+    )
+    .await
+    .unwrap();
+    // The Broker clock is the host's trusted wall clock; it cannot be stepped.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let status = MachineBrokerService::dispatch(
+        stack.broker.as_ref(),
+        MachineBrokerRequest::CeremonyStatus(IdRequest {
+            id: Digest32::new(operation.as_str().to_owned()).unwrap(),
+        }),
+    )
+    .await
+    .unwrap();
+    let MachineBrokerResponse::CeremonyStatus(status) = status else {
+        panic!("unexpected status response: {status:?}");
+    };
+    assert_eq!(status.state, CeremonyState::Expired);
 }
 
 /// Machine's own x402 payment: Broker shows the token, amount, recipient and
