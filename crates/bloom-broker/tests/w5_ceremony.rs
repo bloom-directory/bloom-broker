@@ -1993,7 +1993,18 @@ fn browser_cancel_disables_approve_before_awaiting_and_reports_the_outcome() {
             "immediate feedback",
         ),
         ("Cancelled — nothing was signed", "terminal outcome message"),
-        ("cancel.hidden = true;", "buttons removed on success"),
+        (
+            "statusNode.textContent = \"\";",
+            "the in-progress status cleared on success",
+        ),
+        (
+            "document.getElementById(\"review-deadline\").textContent = \"\";",
+            "no frozen countdown beside the outcome",
+        ),
+        (
+            "document.getElementById(\"ceremony-actions\").hidden = true;",
+            "buttons and time-left footer removed on success",
+        ),
     ] {
         assert!(
             handler.contains(needle),
