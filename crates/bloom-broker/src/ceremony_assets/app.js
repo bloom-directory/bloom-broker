@@ -1379,6 +1379,20 @@ function describePolicy(manifest) {
     else dest("Stop allowing sending to", d);
   }
   const facts = [];
+  // An added or removed account listed in more than one spelling is one rule;
+  // its other spellings are shown beside it.
+  for (const [label, entries] of [["Allow sending to", diff.added_destinations], ["Stop allowing sending to", diff.removed_destinations]]) {
+    for (const d of entries || []) {
+      if (d.also_spelled?.length) facts.push([`${label} · also written as`, d.also_spelled.join(", "), true, policyChainId(d.chain)]);
+    }
+  }
+  // A respelling changes how an allowed account is written, not who can be
+  // paid, so it is shown as a fact and is not counted as a rule change.
+  const respellings = diff.respelled_destinations || [];
+  for (const r of respellings) {
+    facts.push([`Same address, new spelling on ${chainLabel(r.chain)}`,
+      `${(r.before || []).join(", ")} → ${(r.after || []).join(", ")}`, true, policyChainId(r.chain)]);
+  }
   for (const [label, packages] of [["Allow app (Petal)", diff.added_petal_packages], ["Remove app (Petal)", diff.removed_petal_packages]]) {
     for (const p of packages || []) {
       rule(label, "Package fingerprint", shortDigest(p));
@@ -1407,9 +1421,11 @@ function describePolicy(manifest) {
     rule("Max approval lifetime", `${fmtRemaining(before)} → ${fmtRemaining(after)}`);
   }
   const n = rules.length;
-  const sentence = n === 0
-    ? "No rule changes are proposed."
-    : "Nothing moves. Bloom applies these rules to future transactions.";
+  const sentence = n > 0
+    ? "Nothing moves. Bloom applies these rules to future transactions."
+    : respellings.length > 0
+      ? "No rule changes are proposed. Only how an allowed address is written changes; it stays allowed."
+      : "No rule changes are proposed.";
   const intent = n === 0 ? null : {
     action: "policy", eyebrow: "Wallet policy change",
     heading: `Change ${n} wallet rule${n === 1 ? "" : "s"}`
@@ -3794,7 +3810,7 @@ const PREVIEWS = {
     ceremony_kind: "policy_update", expires_at_ms: Date.now() + 9 * 60 * 1000,
     signer_contribution: {wallet_id: "main"},
     review_manifest: {
-      schema: "bloom.policy_update_review.v1", wallet_id: "main",
+      schema: "bloom.policy-update-review/2", wallet_id: "main",
       authority_diff: {
         maximum_approval_lifetime_ms_before: "600000", maximum_approval_lifetime_ms_after: "600000",
         added_petal_packages: ["80f26b1b6c4eda85f2870e2baac9f6366f1f35e861ebb855bf234550e591ad21"],
@@ -3802,7 +3818,25 @@ const PREVIEWS = {
         added_destinations: [
           {chain: "polygon", destination: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"},
           {chain: "base", destination: "0xF75584eF6673aD213a685a1B58Cc0330B8eA22Cf"}],
-        removed_destinations: [], added_required_verifiers: [], removed_required_verifiers: []
+        removed_destinations: [], respelled_destinations: [],
+        added_required_verifiers: [], removed_required_verifiers: []
+      }
+    }
+  }),
+  // Only how an allowed address is written changes, so no rule changes.
+  "policy-respelling": () => ({
+    ceremony_kind: "policy_update", expires_at_ms: Date.now() + 9 * 60 * 1000,
+    signer_contribution: {wallet_id: "main"},
+    review_manifest: {
+      schema: "bloom.policy-update-review/2", wallet_id: "main",
+      authority_diff: {
+        maximum_approval_lifetime_ms_before: "600000", maximum_approval_lifetime_ms_after: "600000",
+        added_petal_packages: [], removed_petal_packages: [],
+        added_destinations: [], removed_destinations: [],
+        respelled_destinations: [{chain: "base",
+          before: ["0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"],
+          after: ["0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"]}],
+        added_required_verifiers: [], removed_required_verifiers: []
       }
     }
   }),
