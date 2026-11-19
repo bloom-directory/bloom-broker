@@ -1,0 +1,854 @@
+//! Card ceremonies share Broker's browser sessions; release delivery is private.
+use super::*;
+use bloom_signer_api::{
+    CardEffect, CardOperationState, CardOperationStatus, CardPrepareRequest, CardPublic,
+    CheckoutFacts, CustodyOutputHpkeAad,
+};
+use std::path::Path;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use unicode_normalization::UnicodeNormalization;
+use zeroize::Zeroize;
+
+#[derive(Default)]
+pub(super) struct CardChannels {
+    channels: Mutex<HashMap<OperationId, Channel>>,
+    // One delivery to Checkout, never journaled or replayed after a restart.
+    outputs: Mutex<HashMap<OperationId, (u64, CustodyResult, CustodyOutputHpkeAad)>>,
+}
+struct Channel {
+    challenge_url: String,
+    expires_at_ms: u64,
+    /// Merchant page as checkout saw it, shown on the review page only. Kept
+    /// in memory: it can show the buyer's address and is not a bound fact.
+    order_preview: Option<Vec<u8>>,
+    /// Labels and values entered on the merchant page, shown on the review
+    /// page only and kept in memory for the same reason.
+    order_fields: Vec<OrderField>,
+}
+impl Drop for Channel {
+    fn drop(&mut self) {
+        self.challenge_url.zeroize();
+        if let Some(preview) = &mut self.order_preview {
+            preview.zeroize();
+        }
+        for field in &mut self.order_fields {
+            field.label.zeroize();
+            field.value.zeroize();
+        }
+    }
+}
+
+/// One filled field on the merchant's page, as checkout read it.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderField {
+    pub label: String,
+    pub value: String,
+}
+const MAX_ORDER_FIELDS: usize = 60;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intake_retries_resource_and_connection_errors_but_not_bad_listener() {
+        for code in [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::ECONNABORTED] {
+            assert!(transient_accept_error(&std::io::Error::from_raw_os_error(
+                code
+            )));
+        }
+        assert!(!transient_accept_error(&std::io::Error::from_raw_os_error(
+            libc::EBADF
+        )));
+    }
+
+    fn check(label: &str, value: &str) -> bool {
+        checked_order_fields(vec![OrderField {
+            label: label.into(),
+            value: value.into(),
+        }])
+        .is_ok_and(|fields| fields[0].value == value)
+    }
+
+    #[test]
+    fn order_fields_hide_suspicious_value_without_rejecting_other_fields() {
+        let fields = checked_order_fields(vec![
+            OrderField {
+                label: "Phone".into(),
+                value: "54 9 11 2345 6788".into(),
+            },
+            OrderField {
+                label: "Seat".into(),
+                value: "12A".into(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(fields[0].value, "(hidden)");
+        assert_eq!(fields[1].value, "12A");
+    }
+
+    #[test]
+    fn order_fields_hide_card_numbers_even_under_innocent_labels() {
+        for value in [
+            "4111111111111111",
+            "4111 1111 1111 1111",
+            "4111-1111-1111-1111",
+            "378282246310005",
+        ] {
+            assert!(!check("Reference", value), "{value}");
+        }
+        assert!(check("Reference", "4111111111111112"));
+        assert!(check("Order", "12345"));
+    }
+
+    #[test]
+    fn order_fields_hide_security_codes_but_allow_other_short_numbers() {
+        for label in ["CVC", "cvv2", "Security code", "Card SECURITY"] {
+            for value in ["123", "1234"] {
+                assert!(!check(label, value));
+            }
+        }
+        assert!(check("Quantity", "123"));
+        assert!(check("Security note", "front desk"));
+    }
+
+    #[test]
+    fn order_fields_hide_disguised_card_numbers_and_foreign_cvc_labels() {
+        for value in [
+            "4111.1111.1111.1111",
+            "4111111111111111\n",
+            "４１１１１１１１１１１１１１１１",
+            "4111/1111/1111/1111",
+        ] {
+            assert!(!check("Reference", value), "{value:?}");
+        }
+        for label in [
+            "Sicherheitscode",
+            "Código de seguridad",
+            "CID",
+            "Prüfnummer",
+        ] {
+            assert!(!check(label, "123"), "{label}");
+            assert!(!check(label, " １２３４ "), "{label}");
+        }
+        assert!(check("Phone", "+54 9 11 4111 1111 1111"));
+        assert!(!check("Booking", "Ref 4111111111111111 seat"));
+        assert!(check("Booking", "Ref 4111111111111112 seat"));
+        assert!(check("Passengers", "2"));
+    }
+}
+
+fn luhn(digits: &[u32]) -> bool {
+    digits
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(i, &d)| {
+            if i % 2 == 1 && d > 0 {
+                (d * 2 - 1) % 9 + 1
+            } else {
+                d
+            }
+        })
+        .sum::<u32>()
+        % 10
+        == 0
+}
+
+/// Any 13–19 digit run (spaces, dots, dashes or slashes allowed between
+/// digits) that passes Luhn, unless it is a `+` phone number.
+fn contains_card_number(value: &str) -> bool {
+    value
+        .split(|c: char| !(c.is_ascii_digit() || c == '+' || " .-/\t\n\r".contains(c)))
+        .filter(|run| !run.trim_start().starts_with('+'))
+        .any(|run| {
+            let digits: Vec<u32> = run.chars().filter_map(|c| c.to_digit(10)).collect();
+            (13..=19).contains(&digits.len()) && luhn(&digits)
+        })
+}
+
+/// Short codes match the start of a word; the rest match anywhere.
+const SECURITY_CODE_WORDS: [&str; 4] = ["cvc", "cvv", "cid", "csc"];
+const SECURITY_CODE_LABELS: [&str; 6] = [
+    "security",
+    "sicherheit",
+    "prüf",
+    "segur",
+    "sécurité",
+    "cryptogram",
+];
+
+fn security_code_label(label: &str) -> bool {
+    label
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| SECURITY_CODE_WORDS.iter().any(|c| w.starts_with(c)))
+        || SECURITY_CODE_LABELS.iter().any(|word| label.contains(word))
+}
+
+fn checked_order_fields(mut fields: Vec<OrderField>) -> Result<Vec<OrderField>, ProtocolError> {
+    if fields.len() > MAX_ORDER_FIELDS
+        || fields
+            .iter()
+            .any(|f| f.label.chars().count() > 120 || f.value.chars().count() > 200)
+    {
+        return Err(kind_mismatch());
+    }
+    for f in &mut fields {
+        let value: String = f.value.nfkc().collect();
+        let label = f.label.nfkc().collect::<String>().to_lowercase();
+        let code = value.trim();
+        let security_code = (3..=4).contains(&code.len())
+            && code.bytes().all(|b| b.is_ascii_digit())
+            && security_code_label(&label);
+        if contains_card_number(&value) || security_code {
+            f.value = "(hidden)".to_owned();
+        }
+    }
+    Ok(fields)
+}
+
+impl CardChannels {
+    pub(super) fn order_fields(&self, operation_id: &OperationId) -> Option<Vec<OrderField>> {
+        Some(self.channels.lock().get(operation_id)?.order_fields.clone())
+    }
+    pub(super) fn forget(&self, operation_id: &OperationId) {
+        self.channels.lock().remove(operation_id);
+    }
+    pub(super) fn order_preview(&self, operation_id: &OperationId) -> Option<Vec<u8>> {
+        self.channels
+            .lock()
+            .get(operation_id)?
+            .order_preview
+            .clone()
+    }
+}
+
+/// A JPEG screenshot of the merchant's order page, at most 1 MiB.
+const MAX_ORDER_PREVIEW_BYTES: usize = 1 << 20;
+/// One intake line carries the base64 preview plus small JSON fields.
+const MAX_INTAKE_LINE_BYTES: usize = 1_500_000;
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CheckoutIntakeRequest {
+    Saved,
+    TravelerInfo {
+        traveler_id: Token,
+    },
+    Traveler {
+        operation_id: OperationId,
+        traveler_id: Token,
+        scope: bloom_signer_api::TravelerFillScope,
+        recipient_key: Base64UrlBytes,
+        challenge_url: String,
+    },
+    Prepare {
+        operation_id: OperationId,
+        card_id: Token,
+        facts: CheckoutFacts,
+        recipient_key: Base64UrlBytes,
+        agent_description: String,
+        challenge_url: String,
+        #[serde(default)]
+        order_preview: Option<Base64UrlBytes>,
+        #[serde(default)]
+        order_fields: Vec<OrderField>,
+    },
+    /// Without a card, the human takes over the browser for a login or code.
+    Manual {
+        operation_id: OperationId,
+        #[serde(default)]
+        card_id: Option<Token>,
+        agent_description: String,
+        challenge_url: String,
+    },
+    /// Pay with the payment method saved in the buyer's merchant account.
+    Site {
+        operation_id: OperationId,
+        facts: CheckoutFacts,
+        agent_description: String,
+        challenge_url: String,
+        #[serde(default)]
+        order_preview: Option<Base64UrlBytes>,
+        #[serde(default)]
+        order_fields: Vec<OrderField>,
+    },
+    Result {
+        operation_id: OperationId,
+    },
+    Cancel {
+        operation_id: OperationId,
+    },
+}
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CheckoutIntakeResponse {
+    Saved {
+        cards: Vec<CardPublic>,
+        travelers: Vec<bloom_signer_api::TravelerPublic>,
+    },
+    Traveler {
+        traveler: bloom_signer_api::TravelerPublic,
+    },
+    Prepared(CustodyPrepareResponse),
+    Result {
+        status: CardOperationStatus,
+        receipt: Option<Box<CustodyResult>>,
+        output_aad: Option<Box<CustodyOutputHpkeAad>>,
+    },
+    Error {
+        message: String,
+    },
+}
+
+pub(super) fn is_card(kind: CeremonyKind) -> bool {
+    matches!(
+        kind,
+        CeremonyKind::CardAdd | CeremonyKind::CardDelete | CeremonyKind::CardCheckout
+    )
+}
+
+impl CeremonyBroker {
+    pub fn traveler_list(&self) -> Result<Vec<bloom_signer_api::TravelerPublic>, ProtocolError> {
+        self.inner
+            .signer
+            .traveler_list()
+            .map_err(signer_error_to_machine)
+    }
+    pub fn card_list(&self) -> Result<Vec<CardPublic>, ProtocolError> {
+        self.inner
+            .signer
+            .card_list()
+            .map_err(signer_error_to_machine)
+    }
+    /// Public status: Signer's retained receipt goes only to Checkout.
+    pub fn card_status(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CardOperationStatus, ProtocolError> {
+        let mut status = self.card_status_with_receipt(operation_id)?;
+        status.receipt = None;
+        status.output_aad = None;
+        Ok(status)
+    }
+    pub(super) fn card_status_with_receipt(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CardOperationStatus, ProtocolError> {
+        self.inner
+            .signer
+            .card_status(operation_id)
+            .map_err(signer_error_to_machine)
+    }
+    pub fn card_cancel(
+        &self,
+        operation_id: &OperationId,
+        now_ms: u64,
+    ) -> Result<CardOperationStatus, ProtocolError> {
+        self.cancel(operation_id, now_ms)?;
+        self.inner.cards.channels.lock().remove(operation_id);
+        self.card_status(operation_id)
+    }
+
+    pub fn prepare_card(
+        &self,
+        operation_id: OperationId,
+        effect: CardEffect,
+        now_ms: u64,
+    ) -> Result<CustodyPrepareResponse, ProtocolError> {
+        self.expire_sessions(now_ms)?;
+        let surface = self
+            .select_surface(CeremonySurfaceSelection::Local)?
+            .reference();
+        let request = CardPrepareRequest {
+            operation_id: operation_id.clone(),
+            surface,
+            effect,
+        };
+        let request_digest = request.digest().map_err(signer_error_to_machine)?;
+        let _guard = self.inner.creation_admission.lock();
+        if let Some(response) = self.stable_custody_response(&operation_id, &request_digest) {
+            return response;
+        }
+        self.enforce_creation_bounds(None, true, now_ms)?;
+        let prepared = self
+            .inner
+            .signer
+            .prepare_card(request.clone(), now_ms)
+            .map_err(signer_error_to_machine)?;
+        if prepared.contribution.review_manifest_digest != request_digest
+            || prepared.contribution.custody_operation_id != operation_id
+            || prepared.contribution.ceremony_kind != request.effect.ceremony_kind()
+            || prepared.contribution.surface != request.surface
+            || prepared.contribution.wallet_id.is_some()
+            || prepared.contribution.expires_at_ms.get() <= now_ms
+        {
+            return Err(operation_conflict());
+        }
+        // Signer now reserves custody before we read the reviewed projection.
+        // Signer holds one custody slot, so release it if any later step fails.
+        let reserved = operation_id.clone();
+        let published = (|| {
+            let card = self
+                .card_list()?
+                .into_iter()
+                .find(|c| Some(&c.card_id) == request.effect.card_id());
+            let kind = request.effect.ceremony_kind();
+            let host = match &request.effect {
+                CardEffect::Checkout { facts, .. } | CardEffect::SiteCheckout { facts, .. } => {
+                    url::Url::parse(&facts.origin)
+                        .ok()
+                        .and_then(|u| u.host_str().map(str::to_owned))
+                }
+                _ => None,
+            };
+            let traveler_id = match &request.effect {
+                CardEffect::SaveTraveler { traveler_id, .. }
+                | CardEffect::DeleteTraveler { traveler_id }
+                | CardEffect::FillTraveler { traveler_id, .. } => Some(traveler_id),
+                _ => None,
+            };
+            let traveler = if let Some(id) = traveler_id {
+                self.traveler_list()?
+                    .into_iter()
+                    .find(|t| &t.traveler_id == id)
+            } else {
+                None
+            };
+            let review = serde_json::json!({"card_effect":request.effect, "card":card, "traveler":traveler, "host":host});
+            let origin = self.origin_for_surface(&prepared.contribution.surface)?;
+            let contribution_digest = prepared
+                .contribution
+                .digest()
+                .map_err(signer_error_to_machine)?;
+            // RPC peers sample time independently. Clamp the browser session to
+            // Broker's fifteen-minute deadline instead of rejecting transport latency.
+            let expires_at_ms = prepared
+                .contribution
+                .expires_at_ms
+                .get()
+                .min(now_ms.saturating_add(900_000));
+            let ceremony_id = prepared.contribution.ceremony_id.clone();
+            let session = self.new_session(NewBrowserSession {
+                operation_id: operation_id.clone(),
+                request_digest,
+                wallet_id: None,
+                anonymous_registration: true,
+                ceremony_kind: kind,
+                ceremony_id: ceremony_id.clone(),
+                review_manifest: Some(review),
+                challenges: prepared.challenges,
+                signer_contribution: serde_json::to_value(prepared.contribution)
+                    .map_err(malformed)?,
+                webauthn_options: prepared.webauthn_options,
+                verification_credentials: prepared.verification_credentials,
+                policy_update: None,
+                expires_at_ms,
+                created_at_ms: now_ms,
+                origin,
+            })?;
+            let url = new_session_url(&session)?;
+            self.insert_session(ceremony_id, session)?;
+            Ok(CustodyPrepareResponse {
+                ceremony_kind: kind_to_machine(kind),
+                custody_operation_id: operation_id,
+                state: CustodyPrepareState::AwaitingUser,
+                ceremony_url: url,
+                ceremony_expires_at_ms: DecimalU64::new(expires_at_ms),
+                signer_contribution_digest: contribution_digest,
+            })
+        })();
+        if published.is_err() {
+            let _ = self.inner.signer.card_cancel(&reserved);
+        }
+        published
+    }
+
+    fn checkout_intake(
+        &self,
+        request: CheckoutIntakeRequest,
+    ) -> Result<CheckoutIntakeResponse, ProtocolError> {
+        let now_ms = unix_time_ms();
+        match request {
+            CheckoutIntakeRequest::Saved => Ok(CheckoutIntakeResponse::Saved {
+                cards: self.card_list()?,
+                travelers: self.traveler_list()?,
+            }),
+            CheckoutIntakeRequest::TravelerInfo { traveler_id } => {
+                let traveler = self
+                    .traveler_list()?
+                    .into_iter()
+                    .find(|t| t.traveler_id == traveler_id)
+                    .ok_or_else(|| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::ServiceUnavailable,
+                            "traveler unavailable",
+                        )
+                    })?;
+                Ok(CheckoutIntakeResponse::Traveler { traveler })
+            }
+            CheckoutIntakeRequest::Traveler {
+                operation_id,
+                traveler_id,
+                scope,
+                recipient_key,
+                challenge_url,
+            } => self.prepare_checkout_channel(
+                operation_id,
+                CardEffect::FillTraveler {
+                    traveler_id,
+                    scope,
+                    recipient_key,
+                },
+                challenge_url,
+                None,
+                Vec::new(),
+                now_ms,
+            ),
+            CheckoutIntakeRequest::Prepare {
+                operation_id,
+                card_id,
+                facts,
+                recipient_key,
+                agent_description,
+                challenge_url,
+                order_preview,
+                order_fields,
+            } => {
+                let order_preview = order_preview_bytes(order_preview)?;
+                let order_fields = checked_order_fields(order_fields)?;
+                // The principal owns this private capability. Never put it in a public projection.
+                let effect = CardEffect::Checkout {
+                    card_id,
+                    facts,
+                    recipient_key,
+                    agent_description,
+                };
+                self.prepare_checkout_channel(
+                    operation_id,
+                    effect,
+                    challenge_url,
+                    order_preview,
+                    order_fields,
+                    now_ms,
+                )
+            }
+            CheckoutIntakeRequest::Manual {
+                operation_id,
+                card_id,
+                agent_description,
+                challenge_url,
+            } => self.prepare_checkout_channel(
+                operation_id,
+                CardEffect::ManualCheckout {
+                    card_id,
+                    agent_description,
+                },
+                challenge_url,
+                None,
+                Vec::new(),
+                now_ms,
+            ),
+            CheckoutIntakeRequest::Site {
+                operation_id,
+                facts,
+                agent_description,
+                challenge_url,
+                order_preview,
+                order_fields,
+            } => {
+                let order_preview = order_preview_bytes(order_preview)?;
+                let order_fields = checked_order_fields(order_fields)?;
+                self.prepare_checkout_channel(
+                    operation_id,
+                    CardEffect::SiteCheckout {
+                        facts,
+                        agent_description,
+                    },
+                    challenge_url,
+                    order_preview,
+                    order_fields,
+                    now_ms,
+                )
+            }
+            CheckoutIntakeRequest::Result { operation_id } => {
+                self.expire_sessions(now_ms)?;
+                let mut status = self.card_status_with_receipt(&operation_id)?;
+                let mut outputs = self.inner.cards.outputs.lock();
+                outputs.retain(|_, (expires, _, _)| *expires > now_ms);
+                let output = outputs.remove(&operation_id);
+                let (receipt, output_aad) = match output {
+                    Some((_, receipt, aad)) => (Some(Box::new(receipt)), Some(Box::new(aad))),
+                    None => (
+                        status.receipt.take(),
+                        status.output_aad.take().map(Box::new),
+                    ),
+                };
+                status.receipt = None;
+                status.output_aad = None;
+                Ok(CheckoutIntakeResponse::Result {
+                    status,
+                    receipt,
+                    output_aad,
+                })
+            }
+            CheckoutIntakeRequest::Cancel { operation_id } => {
+                let status = self.card_cancel(&operation_id, now_ms)?;
+                Ok(CheckoutIntakeResponse::Result {
+                    status,
+                    receipt: None,
+                    output_aad: None,
+                })
+            }
+        }
+    }
+
+    fn prepare_checkout_channel(
+        &self,
+        operation_id: OperationId,
+        effect: CardEffect,
+        challenge_url: String,
+        order_preview: Option<Vec<u8>>,
+        order_fields: Vec<OrderField>,
+        now_ms: u64,
+    ) -> Result<CheckoutIntakeResponse, ProtocolError> {
+        let url = url::Url::parse(&challenge_url).map_err(|_| kind_mismatch())?;
+        if challenge_url.len() > 256
+            || url.scheme() != "http"
+            || !matches!(url.host_str(), Some("localhost" | "127.0.0.1"))
+            || url.port().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(kind_mismatch());
+        }
+        if self
+            .inner
+            .cards
+            .channels
+            .lock()
+            .get(&operation_id)
+            .is_some_and(|c| c.challenge_url != challenge_url)
+        {
+            return Err(operation_conflict());
+        }
+        let prepared = self.prepare_card(operation_id.clone(), effect, now_ms)?;
+        let mut channels = self.inner.cards.channels.lock();
+        channels.retain(|_, c| c.expires_at_ms > now_ms);
+        channels.entry(operation_id).or_insert(Channel {
+            challenge_url,
+            expires_at_ms: prepared.ceremony_expires_at_ms.get(),
+            order_preview,
+            order_fields,
+        });
+        Ok(CheckoutIntakeResponse::Prepared(prepared))
+    }
+}
+
+fn order_preview_bytes(preview: Option<Base64UrlBytes>) -> Result<Option<Vec<u8>>, ProtocolError> {
+    let preview = preview.map(|preview| preview.decode());
+    if preview.as_ref().is_some_and(|jpeg| {
+        jpeg.len() > MAX_ORDER_PREVIEW_BYTES || !jpeg.starts_with(&[0xff, 0xd8, 0xff])
+    }) {
+        return Err(malformed("invalid order preview"));
+    }
+    Ok(preview)
+}
+
+pub(super) fn complete_card_session(
+    broker: &CeremonyBroker,
+    id: &str,
+    mut session: BrowserSession,
+    body: BrowserComplete,
+) -> Response {
+    let now_ms = unix_time_ms();
+    // Hold the output map until the one-time output is published, so a
+    // concurrent `Result` cannot see Signer success without it.
+    let mut outputs = broker.inner.cards.outputs.lock();
+    let completion = broker
+        .inner
+        .signer
+        .complete_card(
+            CustodyCompleteRequest {
+                ceremony_kind: session.ceremony_kind,
+                custody_operation_id: session.operation_id.clone(),
+                ceremony_id: session.projection.ceremony_id.clone(),
+                proof: body.proof,
+                encrypted_input: body.encrypted_input,
+                public_binding_digest: body.public_binding_digest,
+            },
+            now_ms,
+        )
+        .map_err(signer_error_to_machine);
+    let result = match completion {
+        Ok(receipt) => Ok(receipt),
+        Err(_) => match broker.card_status_with_receipt(&session.operation_id) {
+            Ok(status) if status.state == CardOperationState::Succeeded => {
+                status.receipt.map(|r| *r).ok_or(false)
+            }
+            Ok(status)
+                if matches!(
+                    status.state,
+                    CardOperationState::Failed
+                        | CardOperationState::Cancelled
+                        | CardOperationState::Expired
+                        | CardOperationState::Missing
+                ) =>
+            {
+                Err(true)
+            }
+            _ => Err(false),
+        },
+    };
+    let response = match result {
+        Ok(receipt) => {
+            if receipt.ceremony_kind != session.ceremony_kind
+                || receipt.custody_operation_id != session.operation_id
+            {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            session.state = CeremonyState::Succeeded;
+            if receipt.encrypted_browser_result.is_some() {
+                let contribution: CustodySignerContribution = match serde_json::from_value(session.projection.signer_contribution.clone()) {
+                    Ok(value) => value,
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                };
+                let aad = CustodyOutputHpkeAad {
+                    surface: contribution.surface.clone(),
+                    ceremony_id: contribution.ceremony_id.clone(),
+                    ceremony_kind: contribution.ceremony_kind,
+                    custody_operation_id: session.operation_id.clone(),
+                    signer_contribution_digest: match contribution.digest() {
+                        Ok(value) => value,
+                        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    },
+                    public_binding_digest: receipt.receipt_digest.clone(),
+                };
+                outputs.retain(|_, (expires, _, _)| *expires > now_ms);
+                outputs.insert(session.operation_id.clone(), (now_ms.saturating_add(60_000), receipt, aad));
+            }
+            // Never persist release ciphertext or expose a challenge URL via result/status.
+            let challenge_url = (session.ceremony_kind == CeremonyKind::CardCheckout)
+                .then(|| {
+                    broker
+                        .inner
+                        .cards
+                        .channels
+                        .lock()
+                        .get(&session.operation_id)
+                        .map(|c| c.challenge_url.clone())
+                })
+                .flatten();
+            Json(serde_json::json!({"state":session.state, "challenge_url":challenge_url}))
+                .into_response()
+        }
+        Err(false) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"message":"Card approval outcome is unknown. Do not retry this request."}))).into_response(),
+        Err(true) => {
+            session.state = CeremonyState::Failed;
+            (StatusCode::CONFLICT, Json(serde_json::json!({"message":"Card approval failed or its disclosure outcome is unknown. Do not retry this request."}))).into_response()
+        }
+    };
+    drop(outputs);
+    broker
+        .inner
+        .cards
+        .channels
+        .lock()
+        .remove(&session.operation_id);
+    session.terminal_result = None;
+    latch_terminal(&mut session, now_ms);
+    if broker.persist_session(&session).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    broker.inner.sessions.lock().insert(id.to_owned(), session);
+    response
+}
+
+/// Facts and encrypted output cross only this UID-authenticated local edge.
+pub async fn serve_checkout_intake(
+    broker: CeremonyBroker,
+    path: &Path,
+    checkout_uid: u32,
+) -> std::io::Result<()> {
+    let listener = bind_checkout_intake(path)?;
+    serve_checkout_listener(broker, listener, checkout_uid).await
+}
+
+/// Bind before readiness, rejecting live endpoints and substituted paths.
+pub fn bind_checkout_intake(path: &Path) -> std::io::Result<tokio::net::UnixListener> {
+    let listener =
+        bloom_service_activation::bind_owned_unix_listener(path).map_err(std::io::Error::other)?;
+    tokio::net::UnixListener::from_std(listener)
+}
+
+pub async fn serve_checkout_listener(
+    broker: CeremonyBroker,
+    listener: tokio::net::UnixListener,
+    checkout_uid: u32,
+) -> std::io::Result<()> {
+    let slots = Arc::new(tokio::sync::Semaphore::new(16));
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(error) if transient_accept_error(&error) => {
+                tracing::warn!(%error, "checkout intake accept failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if !stream
+            .peer_cred()
+            .is_ok_and(|peer| peer.uid() == checkout_uid)
+        {
+            continue;
+        }
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            continue;
+        };
+        let broker = broker.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let (input, mut output) = stream.into_split();
+            let mut line = String::new();
+            let mut input = BufReader::new(input.take(MAX_INTAKE_LINE_BYTES as u64 + 1));
+            if !matches!(
+                tokio::time::timeout(Duration::from_secs(10), input.read_line(&mut line)).await,
+                Ok(Ok(_))
+            ) || line.len() > MAX_INTAKE_LINE_BYTES
+            {
+                return;
+            }
+            let response = match serde_json::from_str(&line) {
+                Ok(request) => {
+                    broker
+                        .checkout_intake(request)
+                        .unwrap_or(CheckoutIntakeResponse::Error {
+                            message: "Checkout request rejected".into(),
+                        })
+                }
+                Err(_) => CheckoutIntakeResponse::Error {
+                    message: "Invalid checkout request".into(),
+                },
+            };
+            if let Ok(mut bytes) = serde_json::to_vec(&response) {
+                bytes.push(b'\n');
+                let _ = output.write_all(&bytes).await;
+            }
+        });
+    }
+}
+
+fn transient_accept_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::WouldBlock
+    ) || matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS)
+    )
+}
