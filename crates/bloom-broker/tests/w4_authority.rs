@@ -13,7 +13,7 @@ fn legacy_removal_diff_matches_machine_vector_without_other_authority_changes() 
     );
     assert_eq!(
         diff.digest().unwrap().as_str(),
-        "65f348e08a8ded736ad13843456a1afbaacf16bf5518147b1d7d900f703e7401"
+        "8cc51489b9ac2667c953f4c31d9e2b1ae19ac8e3e0596014919a114d6fe970a3"
     );
     assert_eq!(proposed.allowed_destinations, current.allowed_destinations);
     assert_eq!(
@@ -2783,6 +2783,73 @@ fn policy_update_rejects_a_machine_claimed_diff_that_broker_did_not_derive() {
     assert_eq!(
         harness.authority.validate_policy_update(&request).unwrap(),
         exact_diff
+    );
+}
+
+/// pm#88: the diff the owner signs counts accounts, not spellings. One EVM
+/// account added in two spellings is one added destination, and a claim that
+/// diffed spellings, as v1 did, is refused.
+#[test]
+fn policy_update_review_names_an_account_once_whatever_its_spellings() {
+    const CHECKSUMMED: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    const LOWERCASE: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    let harness = Harness::new();
+    let baseline_snapshot = harness.policy_snapshot(1);
+    let baseline: CanonicalWalletPolicy =
+        serde_json::from_slice(&baseline_snapshot.canonical_policy.decode()).unwrap();
+    let mut proposed = baseline.clone();
+    for destination in [LOWERCASE, CHECKSUMMED] {
+        proposed.allowed_destinations.push(PolicyDestination {
+            chain: token("ethereum"),
+            destination: destination.into(),
+        });
+    }
+    let proposed_bytes = serde_jcs::to_vec(&proposed).unwrap();
+    let derived = canonical_policy_authority_diff(&baseline, &proposed);
+    assert_eq!(
+        derived.added_destinations,
+        vec![bloom_broker::authority::PolicyAuthorityDestination {
+            chain: token("ethereum"),
+            destination: CHECKSUMMED.into(),
+            also_spelled: vec![LOWERCASE.into()],
+        }]
+    );
+    assert!(derived.removed_destinations.is_empty());
+    assert!(derived.respelled_destinations.is_empty());
+
+    let mut by_spelling = derived.clone();
+    by_spelling.added_destinations = [CHECKSUMMED, LOWERCASE]
+        .map(
+            |destination| bloom_broker::authority::PolicyAuthorityDestination {
+                chain: token("ethereum"),
+                destination: destination.into(),
+                also_spelled: Vec::new(),
+            },
+        )
+        .to_vec();
+    let mut request = PolicyUpdateRequest {
+        operation_id: operation(91),
+        wallet_id: harness.wallet.clone(),
+        baseline_version: baseline_snapshot.version,
+        baseline_digest: baseline_snapshot.policy_digest,
+        proposed_canonical_policy: Base64UrlBytes::from_bytes(&proposed_bytes),
+        proposed_policy_digest: Digest32::from_bytes(Sha256::digest(&proposed_bytes).into()),
+        authority_diff_digest: by_spelling.digest().unwrap(),
+        assurance_level: token("user_verified"),
+    };
+    assert!(
+        error_code(
+            harness
+                .authority
+                .validate_policy_update(&request)
+                .unwrap_err()
+        )
+        .contains("authority diff digest")
+    );
+    request.authority_diff_digest = derived.digest().unwrap();
+    assert_eq!(
+        harness.authority.validate_policy_update(&request).unwrap(),
+        derived
     );
 }
 

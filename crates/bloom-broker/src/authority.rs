@@ -35,7 +35,6 @@ const SIGNER_CEREMONY_RECEIPT_DOMAIN: &[u8] = b"bloom-signer-ceremony-receipt/v1
 const REVOCATION_STATE_DOMAIN: &[u8] = b"bloom-revocation-state/v1";
 const APPROVAL_TOMBSTONE_DOMAIN: &[u8] = b"bloom-approval-tombstone/v1";
 const WALLET_TOMBSTONE_DOMAIN: &[u8] = b"bloom-wallet-tombstone/v1";
-const POLICY_AUTHORITY_DIFF_DOMAIN: &[u8] = b"bloom-policy-authority-diff/v1";
 const SIGN_OPERATION_DOMAIN: &[u8] = b"bloom-sign-operation/v1";
 pub const BROKER_STATE_VERSION: i64 = 3;
 
@@ -62,120 +61,12 @@ impl MachineSignOperationIdentity {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PolicyAuthorityDiff {
-    pub maximum_approval_lifetime_ms_before: bloom_broker_api::DecimalU64,
-    pub maximum_approval_lifetime_ms_after: bloom_broker_api::DecimalU64,
-    pub added_petal_packages: Vec<Digest32>,
-    pub removed_petal_packages: Vec<Digest32>,
-    pub added_destinations: Vec<PolicyAuthorityDestination>,
-    pub removed_destinations: Vec<PolicyAuthorityDestination>,
-    pub added_required_verifiers: Vec<PolicyAuthorityVerifier>,
-    pub removed_required_verifiers: Vec<PolicyAuthorityVerifier>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub removed_legacy_clear_signing: Option<bloom_broker_api::LegacyClearSigningPolicy>,
-}
-
-impl PolicyAuthorityDiff {
-    pub fn digest(&self) -> Result<Digest32, bloom_broker_api::ProtocolError> {
-        let mut hasher = Sha256::new();
-        hasher.update(POLICY_AUTHORITY_DIFF_DOMAIN);
-        hasher.update(serde_jcs::to_vec(self).map_err(|error| {
-            bloom_broker_api::ProtocolError::new(
-                ProtocolErrorCode::MalformedFrame,
-                format!("policy canonicalization failed: {error}"),
-            )
-        })?);
-        Ok(Digest32::from_bytes(hasher.finalize().into()))
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PolicyAuthorityDestination {
-    pub chain: Token,
-    pub destination: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PolicyAuthorityVerifier {
-    pub verifier_id: Token,
-    pub verifier_digest: Digest32,
-}
-
-pub fn canonical_policy_authority_diff(
-    current: &CanonicalWalletPolicy,
-    proposed: &CanonicalWalletPolicy,
-) -> PolicyAuthorityDiff {
-    fn set_diff<T: Ord + Clone>(
-        before: impl IntoIterator<Item = T>,
-        after: impl IntoIterator<Item = T>,
-    ) -> (Vec<T>, Vec<T>) {
-        let before = before.into_iter().collect::<BTreeSet<_>>();
-        let after = after.into_iter().collect::<BTreeSet<_>>();
-        (
-            after.difference(&before).cloned().collect(),
-            before.difference(&after).cloned().collect(),
-        )
-    }
-
-    let (added_petal_packages, removed_petal_packages) = set_diff(
-        current.allowed_petal_packages.iter().cloned(),
-        proposed.allowed_petal_packages.iter().cloned(),
-    );
-    let (added_destinations, removed_destinations) = set_diff(
-        current
-            .allowed_destinations
-            .iter()
-            .map(|value| PolicyAuthorityDestination {
-                chain: value.chain.clone(),
-                destination: value.destination.clone(),
-            }),
-        proposed
-            .allowed_destinations
-            .iter()
-            .map(|value| PolicyAuthorityDestination {
-                chain: value.chain.clone(),
-                destination: value.destination.clone(),
-            }),
-    );
-    let (added_required_verifiers, removed_required_verifiers) = set_diff(
-        current
-            .required_verifiers
-            .iter()
-            .map(|value| PolicyAuthorityVerifier {
-                verifier_id: value.verifier_id.clone(),
-                verifier_digest: value.verifier_digest.clone(),
-            }),
-        proposed
-            .required_verifiers
-            .iter()
-            .map(|value| PolicyAuthorityVerifier {
-                verifier_id: value.verifier_id.clone(),
-                verifier_digest: value.verifier_digest.clone(),
-            }),
-    );
-
-    PolicyAuthorityDiff {
-        maximum_approval_lifetime_ms_before: bloom_broker_api::DecimalU64::new(
-            current.maximum_approval_lifetime_ms,
-        ),
-        maximum_approval_lifetime_ms_after: bloom_broker_api::DecimalU64::new(
-            proposed.maximum_approval_lifetime_ms,
-        ),
-        added_petal_packages,
-        removed_petal_packages,
-        added_destinations,
-        removed_destinations,
-        added_required_verifiers,
-        removed_required_verifiers,
-        removed_legacy_clear_signing: (current.clear_signing != proposed.clear_signing)
-            .then(|| current.clear_signing.clone())
-            .flatten(),
-    }
-}
+/// The diff, its digest and the function both Broker and Machine derive it
+/// with live in `bloom-broker-api`, so the two cannot drift apart.
+pub use bloom_broker_api::{
+    PolicyAuthorityDestination, PolicyAuthorityDiff, PolicyAuthorityRespelling,
+    PolicyAuthorityVerifier, canonical_policy_authority_diff,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthorityError {

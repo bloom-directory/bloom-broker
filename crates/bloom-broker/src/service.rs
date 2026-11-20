@@ -1167,7 +1167,7 @@ impl BrokerRpcService {
         }
         let now = self.clock.now_ms(true)?;
         let mut review = PolicyUpdateReviewManifest {
-            schema: Token::new("bloom.policy-update-review/1")?,
+            schema: Token::new("bloom.policy-update-review/2")?,
             operation_id: request.operation_id.clone(),
             wallet_id: request.wallet_id.clone(),
             baseline_version: request.baseline_version.clone(),
