@@ -47,13 +47,6 @@ pub use bloom_rpc_wire::{
 };
 
 pub const BROKER_API_MAJOR: u16 = 1;
-/// First minor whose decoders understand [`ProtocolError::rate_limit`].
-///
-/// Every decoder in this protocol is strict: an unknown field fails the frame
-/// rather than being ignored. So the optional `rate_limit` object could not be
-/// added under 1.3 — a 1.3 peer handed one would reject the whole error
-/// instead of reading the retry hint inside it.
-pub const RATE_LIMIT_DETAILS_MINOR: u16 = 4;
 /// The negotiated range moves as a unit, so there is no accepted minor that
 /// predates any field the Broker may emit. Older peers are refused at the
 /// hello before a response can carry a field their strict decoder rejects.
@@ -87,18 +80,6 @@ mod version_tests {
         assert!(!BROKER_API_RANGE.contains(ProtocolVersion::new(
             BROKER_API_MAJOR,
             BROKER_API_MINOR_MAX + 1,
-        )));
-    }
-
-    #[test]
-    fn no_negotiable_minor_predates_the_rate_limit_field() {
-        // The gate is the range itself: nothing below the minor that
-        // introduced `rate_limit` can ever be negotiated, so no accepted peer
-        // can be handed a field its decoder would refuse.
-        const { assert!(BROKER_API_MINOR_MIN >= RATE_LIMIT_DETAILS_MINOR) };
-        assert!(!BROKER_API_RANGE.contains(ProtocolVersion::new(
-            BROKER_API_MAJOR,
-            RATE_LIMIT_DETAILS_MINOR - 1,
         )));
     }
 }

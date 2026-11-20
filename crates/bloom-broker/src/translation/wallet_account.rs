@@ -19,6 +19,8 @@
 use bloom_broker_api as north;
 use bloom_signer_api as south;
 
+use super::key::derivation_profile_to_machine;
+
 use sha2::Digest as _;
 use sha3::Keccak256;
 
@@ -72,38 +74,8 @@ pub(crate) fn wallet_seed_profile_to_machine(
     }
 }
 
-// The three north→south helpers below complete the translation surface but
-// have no production caller in Broker yet: Machine never sends descriptors
-// or address projections south. They are exercised by the round-trip and
-// tamper tests and become live with the deferred import/recovery Broker
-// ceremonies.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn derivation_profile_to_signer(
-    value: north::DerivationProfile,
-) -> south::DerivationProfile {
-    match value {
-        north::DerivationProfile::Bip44EvmSecp256k1V1 => {
-            south::DerivationProfile::Bip44EvmSecp256k1V1
-        }
-        north::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
-            south::DerivationProfile::Bip44SolanaSlip10Ed25519V1
-        }
-    }
-}
-
-pub(crate) fn derivation_profile_to_machine(
-    value: south::DerivationProfile,
-) -> north::DerivationProfile {
-    match value {
-        south::DerivationProfile::Bip44EvmSecp256k1V1 => {
-            north::DerivationProfile::Bip44EvmSecp256k1V1
-        }
-        south::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
-            north::DerivationProfile::Bip44SolanaSlip10Ed25519V1
-        }
-    }
-}
-
+// No production caller yet: Machine never sends address projections south.
+// Exercised by the round-trip test.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn public_key_encoding_to_signer(
     value: north::PublicKeyEncoding,
@@ -341,6 +313,7 @@ fn invalid(message: impl Into<String>) -> north::ProtocolError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::key::derivation_profile_to_signer;
     use super::*;
     use bloom_signer_vectors as vectors;
 

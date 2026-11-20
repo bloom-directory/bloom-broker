@@ -75,7 +75,7 @@ fn selector_to_signer(value: north::ApprovalSelector) -> south::ApprovalSelector
     }
 }
 
-fn activation_to_signer(value: north::ActivationMode) -> south::ActivationMode {
+pub fn activation_to_signer(value: north::ActivationMode) -> south::ActivationMode {
     match value {
         north::ActivationMode::BootBound => south::ActivationMode::BootBound,
         north::ActivationMode::DurableLocal {

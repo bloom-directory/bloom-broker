@@ -7,7 +7,6 @@ description = "Bounded Solana transaction readings, separate from the policy-pin
 
 [dependencies]
 bloom-solana-verify.workspace = true
-bloom-broker-api = { path = "../bloom-broker-api" }
 sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
