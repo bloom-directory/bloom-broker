@@ -1080,7 +1080,7 @@ dependencies = [
  "hex",
  "rustix",
  "serde",
- "serde_jcs",
+ "serde_jcs 0.2.0",
  "serde_json",
  "sha2 0.11.1",
  "thiserror",
@@ -1130,7 +1130,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "serde",
- "serde_jcs",
+ "serde_jcs 0.4.0",
  "serde_json",
  "sha2 0.11.1",
  "sha3 0.12.0",
@@ -1156,7 +1156,7 @@ dependencies = [
  "bs58",
  "hex",
  "serde",
- "serde_jcs",
+ "serde_jcs 0.4.0",
  "serde_json",
  "sha2 0.11.1",
  "thiserror",
@@ -1180,7 +1180,7 @@ dependencies = [
  "rand 0.10.3",
  "rusqlite",
  "serde",
- "serde_jcs",
+ "serde_jcs 0.4.0",
  "serde_json",
  "sha2 0.11.1",
  "ureq",
@@ -1198,7 +1198,7 @@ dependencies = [
  "bloom-broker-api",
  "hex",
  "serde",
- "serde_jcs",
+ "serde_jcs 0.4.0",
  "serde_json",
 ]
 
@@ -1221,7 +1221,7 @@ dependencies = [
  "bloom-relay-protocol",
  "rand 0.8.8",
  "serde",
- "serde_jcs",
+ "serde_jcs 0.2.0",
  "serde_json",
  "thiserror",
  "ureq",
@@ -1256,7 +1256,7 @@ dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
  "serde",
- "serde_jcs",
+ "serde_jcs 0.2.0",
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
@@ -1272,7 +1272,7 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "hex",
  "serde",
- "serde_jcs",
+ "serde_jcs 0.2.0",
  "serde_json",
  "sha2 0.11.1",
  "thiserror",
@@ -1335,7 +1335,7 @@ dependencies = [
  "rand 0.10.3",
  "rusqlite",
  "serde",
- "serde_jcs",
+ "serde_jcs 0.2.0",
  "serde_json",
  "sha2 0.11.1",
  "sha3 0.12.0",
@@ -1356,7 +1356,7 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "hex",
  "serde",
- "serde_jcs",
+ "serde_jcs 0.2.0",
  "serde_json",
  "sha2 0.11.1",
  "thiserror",
@@ -1390,7 +1390,7 @@ dependencies = [
  "parking_lot",
  "rand 0.10.3",
  "serde",
- "serde_jcs",
+ "serde_jcs 0.2.0",
  "serde_json",
  "sha2 0.11.1",
  "sha3 0.12.0",
@@ -1472,7 +1472,7 @@ dependencies = [
  "rand 0.10.3",
  "rustix",
  "serde",
- "serde_jcs",
+ "serde_jcs 0.2.0",
  "serde_json",
  "sha2 0.11.1",
  "tokio",
@@ -4478,6 +4478,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6518fc26bced4d53678a22d6e423e9d8716377def84545fe328236e3af070e7f"
 
 [[package]]
+name = "ryu-js"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f232fd0249f55adbe7f15bee58bbbd3d40708000b84e6482066d2ba599e08a9"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4687,6 +4693,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-transcode"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "655b0cffa180a1a71ed523dc0a9aa9a2711f5d172c2f066393e76f386e9bba3c"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "serde_core"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4712,8 +4727,20 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3a60f3fda61525e439ef6d67422118f11e986566997d9021c56867ad814a0aa"
 dependencies = [
- "ryu-js",
+ "ryu-js 0.2.2",
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "serde_jcs"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4966857b5b2e83ae3cee6ce41480b800b3bf7a74597cf4a1ee47c5d4d63ed002"
+dependencies = [
+ "ryu-js 1.0.4",
+ "serde",
+ "serde-transcode",
  "serde_json",
 ]
 
@@ -5277,7 +5304,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
