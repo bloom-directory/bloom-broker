@@ -4729,7 +4729,7 @@ async function finishBrowserResult(session, result) {
     approve.hidden = true;
     cancel.hidden = true;
     if (result.challenge_url) {
-      const link = el("a", {href: result.challenge_url, target: "_blank", rel: "noopener noreferrer"}, effect.kind === "manual_checkout" && !effect.card_id ? "Open Bloom's browser" : "Open private checkout view");
+      const link = el("a", {href: result.challenge_url, target: "_blank", rel: "noopener noreferrer", class: "primary-link"}, effect.kind === "manual_checkout" && !effect.card_id ? "Open Bloom's browser" : "Open private checkout view");
       reviewNode.append(el("p", {}, link));
       window.open(result.challenge_url, "_blank", "noopener,noreferrer");
       // Popup blockers need a retry link. Retain this capability for at most
