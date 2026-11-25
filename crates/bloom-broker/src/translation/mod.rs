@@ -1,6 +1,7 @@
 //! Explicit nominal translations at the Broker's north/south API boundary.
 
 pub(crate) mod approval;
+pub(crate) mod cards;
 pub(crate) mod ceremony;
 pub(crate) mod custody;
 pub(crate) mod error;
