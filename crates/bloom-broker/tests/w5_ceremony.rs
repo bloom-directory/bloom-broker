@@ -1385,6 +1385,18 @@ async fn card_result_never_reports_success_before_its_private_output() {
             .await
         }
     });
+    // A `Result` for another operation does not wait for this Signer call.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        card_intake(
+            &socket,
+            CheckoutIntakeRequest::Result {
+                operation_id: operation("e1"),
+            },
+        ),
+    )
+    .await
+    .expect("Result for another operation waited on a paused Signer call");
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     go.send(()).unwrap();
     assert_eq!(approving.await.unwrap(), StatusCode::OK);

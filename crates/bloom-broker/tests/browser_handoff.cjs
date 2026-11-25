@@ -185,5 +185,10 @@ renderCardReview({...session, expires_at_ms: now + 120000,
   assert.equal(cvc("Visa", "123"), "123");
   assert.equal(cvc("Card", "1234"), "1234");
   assert.equal(cvc(null, "123"), "123");
+  // Blur checks already know the brand once the review renders.
+  savedCardBrand = null;
+  renderCardReview({...checkout, review_manifest: {...checkout.review_manifest, card: {brand: "Amex", last4: "0005", label: "Test"}}});
+  assert(CARD_CHECKS["card-cvc"]("123").error);
+  assert.equal(CARD_CHECKS["card-cvc"]("1234").value, "1234");
   console.log("browser-handoff-ok");
 })().catch(error => { console.error(error); process.exitCode = 1; });

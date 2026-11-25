@@ -13,7 +13,22 @@ use zeroize::Zeroize;
 pub(super) struct CardChannels {
     channels: Mutex<HashMap<OperationId, Channel>>,
     // One delivery to Checkout, never journaled or replayed after a restart.
-    outputs: Mutex<HashMap<OperationId, (u64, CustodyResult, CustodyOutputHpkeAad)>>,
+    // Each operation has its own slot, so a slow Signer call for one
+    // operation does not block `Result` reads for the others.
+    outputs: Mutex<HashMap<OperationId, OutputSlot>>,
+}
+type OutputSlot = Arc<Mutex<Option<(u64, CustodyResult, CustodyOutputHpkeAad)>>>;
+
+/// Drops expired outputs and finished empty slots. A slot that is locked
+/// belongs to a completion in progress, so it stays.
+fn prune_outputs(outputs: &mut HashMap<OperationId, OutputSlot>, now_ms: u64) {
+    outputs.retain(|_, slot| {
+        slot.try_lock().is_none_or(|output| {
+            output
+                .as_ref()
+                .is_some_and(|(expires, _, _)| *expires > now_ms)
+        })
+    });
 }
 struct Channel {
     challenge_url: String,
@@ -575,9 +590,15 @@ impl CeremonyBroker {
             CheckoutIntakeRequest::Result { operation_id } => {
                 self.expire_sessions(now_ms)?;
                 let mut status = self.card_status_with_receipt(&operation_id)?;
-                let mut outputs = self.inner.cards.outputs.lock();
-                outputs.retain(|_, (expires, _, _)| *expires > now_ms);
-                let output = outputs.remove(&operation_id);
+                let slot = {
+                    let mut outputs = self.inner.cards.outputs.lock();
+                    prune_outputs(&mut outputs, now_ms);
+                    outputs.get(&operation_id).cloned()
+                };
+                // Waits only while this operation's own completion runs.
+                let output = slot
+                    .and_then(|slot| slot.lock().take())
+                    .filter(|(expires, _, _)| *expires > now_ms);
                 let (receipt, output_aad) = match output {
                     Some((_, receipt, aad)) => (Some(Box::new(receipt)), Some(Box::new(aad))),
                     None => (
@@ -664,9 +685,18 @@ pub(super) fn complete_card_session(
     body: BrowserComplete,
 ) -> Response {
     let now_ms = unix_time_ms();
-    // Hold the output map until the one-time output is published, so a
-    // concurrent `Result` cannot see Signer success without it.
+    // Register and lock this operation's output slot before calling Signer,
+    // so a concurrent `Result` cannot see Signer success without the output.
+    // Only `Result` for this same operation waits on the slot.
     let mut outputs = broker.inner.cards.outputs.lock();
+    prune_outputs(&mut outputs, now_ms);
+    let slot = outputs
+        .entry(session.operation_id.clone())
+        .or_default()
+        .clone();
+    let locked = slot.try_lock();
+    drop(outputs);
+    let mut output = locked.unwrap_or_else(|| slot.lock());
     let completion = broker
         .inner
         .signer
@@ -726,8 +756,7 @@ pub(super) fn complete_card_session(
                     },
                     public_binding_digest: receipt.receipt_digest.clone(),
                 };
-                outputs.retain(|_, (expires, _, _)| *expires > now_ms);
-                outputs.insert(session.operation_id.clone(), (now_ms.saturating_add(60_000), receipt, aad));
+                *output = Some((now_ms.saturating_add(60_000), receipt, aad));
             }
             // Never persist release ciphertext or expose a challenge URL via result/status.
             let challenge_url = (session.ceremony_kind == CeremonyKind::CardCheckout)
@@ -750,7 +779,7 @@ pub(super) fn complete_card_session(
             (StatusCode::CONFLICT, Json(serde_json::json!({"message":"Card approval failed or its disclosure outcome is unknown. Do not retry this request."}))).into_response()
         }
     };
-    drop(outputs);
+    drop(output);
     broker
         .inner
         .cards

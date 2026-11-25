@@ -2227,14 +2227,22 @@ fn load_config(path: &Path) -> Result<BrokerConfig, ProtocolError> {
             format!("read {}: {error}", path.display()),
         )
     })?;
-    let decoded = serde_json::from_slice(&bytes).map_err(|error| {
+    let decoded: Result<BrokerConfig, _> = serde_json::from_slice(&bytes).map_err(|error| {
         ProtocolError::new(
             ProtocolErrorCode::MalformedFrame,
             format!("parse Broker config: {error}"),
         )
     });
     bytes.zeroize();
-    decoded
+    let config = decoded?;
+    // UID 0 would let any root process act as Checkout on the intake socket.
+    if config.checkout_uid == Some(0) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::MalformedFrame,
+            "checkout_uid must not be zero",
+        ));
+    }
+    Ok(config)
 }
 
 /// The theme can restyle the approval page, including hiding a warning, so
