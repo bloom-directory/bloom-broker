@@ -144,10 +144,10 @@ fn multi_inputs_are_scoped_to_their_own_element_and_dirty_padding_is_rejected() 
             .starts_with("7 raw units")
     );
     let mut dirty = input(USDC, 1);
-    if let DynSolValue::Tuple(ref mut values) = dirty {
-        if let DynSolValue::Bytes(ref mut bytes) = values[1] {
-            bytes[0] = 1;
-        }
+    if let DynSolValue::Tuple(ref mut values) = dirty
+        && let DynSolValue::Bytes(ref mut bytes) = values[1]
+    {
+        bytes[0] = 1;
     }
     assert!(review(&encode(SINGLE, dirty), 0).is_err());
 }
@@ -351,10 +351,10 @@ fn safe_route_is_bound_to_reviewed_deployments_and_canonical_output_data() {
     ctx.chain_id = 31337;
     assert!(review_call(Catalog::built_in().unwrap(), &ctx).is_err());
     let mut dirty = input(USDC, 2);
-    if let DynSolValue::Tuple(ref mut values) = dirty {
-        if let DynSolValue::Bytes(ref mut bytes) = values[1] {
-            bytes[0] = 1;
-        }
+    if let DynSolValue::Tuple(ref mut values) = dirty
+        && let DynSolValue::Bytes(ref mut bytes) = values[1]
+    {
+        bytes[0] = 1;
     }
     assert!(review(&safe_encode(SAFE_SINGLE, input(USDC, 1), dirty), 0).is_err());
 }

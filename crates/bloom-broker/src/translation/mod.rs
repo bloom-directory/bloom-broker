@@ -21,6 +21,7 @@ macro_rules! unit_enum_translation {
 }
 
 pub mod approval;
+pub(crate) mod cards;
 pub(crate) mod ceremony;
 pub mod custody;
 pub(crate) mod error;

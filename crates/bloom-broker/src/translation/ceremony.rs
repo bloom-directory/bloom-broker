@@ -18,6 +18,9 @@ unit_enum_translation!(CeremonyKind: (pub(crate) kind_to_signer), (pub(crate) ki
     AccountAllocate,
     AccountRetire,
     PolicyUpdate,
+    CardAdd,
+    CardDelete,
+    CardCheckout,
 });
 
 unit_enum_translation!(CeremonyState: _, (pub(crate) state_to_machine) {
