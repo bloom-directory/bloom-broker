@@ -516,6 +516,7 @@ async fn run_with_paths(
         }
         _ => return Err("checkout intake and UID must be configured together".into()),
     }
+    validate_checkout_uid(config.checkout_uid, broker_effective_uid)?;
     // Merge and validate admission limits before any durable state is opened,
     // so a mistyped quota fails startup instead of silently widening
     // admission. The four values are non-secret, so the effective policy is
@@ -2234,15 +2235,19 @@ fn load_config(path: &Path) -> Result<BrokerConfig, ProtocolError> {
         )
     });
     bytes.zeroize();
-    let config = decoded?;
-    // UID 0 would let any root process act as Checkout on the intake socket.
-    if config.checkout_uid == Some(0) {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::MalformedFrame,
-            "checkout_uid must not be zero",
-        ));
+    decoded
+}
+
+/// The intake socket trusts every peer whose UID is `checkout_uid`. Root or
+/// Broker's own UID would let any process under that account act as Checkout.
+fn validate_checkout_uid(checkout_uid: Option<u32>, broker_uid: u32) -> Result<(), String> {
+    match checkout_uid {
+        Some(0) => Err("checkout_uid must not be zero".into()),
+        Some(uid) if uid == broker_uid => Err(format!(
+            "checkout_uid must not equal Broker's effective UID ({uid}); run Checkout under its own account"
+        )),
+        _ => Ok(()),
     }
-    Ok(config)
 }
 
 /// The theme can restyle the approval page, including hiding a warning, so
@@ -2416,6 +2421,15 @@ fn material_round_pause(relay_not_ready: bool, fast_rounds: &mut u32) -> Duratio
 #[cfg(test)]
 mod startup_failure_tests {
     use super::*;
+
+    #[test]
+    fn checkout_uid_must_differ_from_root_and_broker() {
+        assert!(validate_checkout_uid(None, 1000).is_ok());
+        assert!(validate_checkout_uid(Some(1001), 1000).is_ok());
+        assert!(validate_checkout_uid(Some(0), 1000).is_err());
+        let error = validate_checkout_uid(Some(1000), 1000).unwrap_err();
+        assert!(error.contains("Broker's effective UID"), "{error}");
+    }
 
     #[test]
     fn certificate_rounds_are_fast_only_while_the_relay_is_not_ready_and_bounded() {
