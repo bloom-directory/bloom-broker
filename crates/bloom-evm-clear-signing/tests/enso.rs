@@ -64,8 +64,8 @@ fn petal_protected_swap_is_independently_decoded() {
         fixture["sender"].as_str().unwrap().to_lowercase()
     );
     export_ui_fixture("enso-swap", &call);
-    let app = include_str!("../../bloom-broker/src/ceremony_assets/app.js");
-    let source = app
+    let preview = include_str!("../../bloom-broker/src/ceremony_assets/preview.js");
+    let source = preview
         .split_once("const PREVIEW_ENSO_PETAL_SWAP = ")
         .unwrap()
         .1
@@ -75,7 +75,7 @@ fn petal_protected_swap_is_independently_decoded() {
         .0;
     let source: serde_json::Value = serde_json::from_str(&format!("{source}\n}}")).unwrap();
     assert_eq!(source, fixture, "UI must preserve the Petal output bytes");
-    let readings = app
+    let readings = preview
         .split_once("const PREVIEW_PM80_READINGS = ")
         .unwrap()
         .1

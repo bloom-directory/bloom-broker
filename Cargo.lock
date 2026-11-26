@@ -1115,7 +1115,6 @@ dependencies = [
  "config",
  "ed25519-dalek 3.0.0",
  "futures",
- "futures-util",
  "hex",
  "http-body-util",
  "instant-acme",
@@ -1167,7 +1166,6 @@ name = "bloom-broker-debug-driver"
 version = "0.1.0"
 dependencies = [
  "bip32 0.5.3",
- "bloom-broker-api",
  "bloom-signer-api",
  "chacha20poly1305",
  "ciborium",
@@ -1432,7 +1430,6 @@ source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=ea1f7bc9bb
 name = "bloom-solana-clear-signing"
 version = "0.1.0"
 dependencies = [
- "bloom-broker-api",
  "bloom-solana-verify",
  "bs58",
  "hex",
